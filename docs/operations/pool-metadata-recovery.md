@@ -32,6 +32,12 @@ A V3 update first conditionally writes a pending generation containing the last 
 
 Do not hand-edit a pending record or select a replica only because it is in pool zero. Preserve all copies when escalating recovery.
 
+## Committed promotion and peer convergence
+
+`promote_queued_decommission_with_reload` requires the peer reload barrier on every worker attempt, including an unchanged retry. After the barrier returns, `confirm_decommission_peer_convergence` rechecks authoritative identity and replicas, the write gate, namespace fence, durable and local generation, and cancellation before allowing data movement.
+
+When promotion is committed and those checks remain valid, a failed peer reload pauses that active generation for the existing watchdog. The worker releases its exact owner and preserves queued successors; it creates no new progress checkpoint and cannot adopt, copy or clean up objects until a later barrier succeeds. Persisted failed or canceled states and known metadata uncertainty remain authoritative. The notification layer aggregates peer errors, so the returned error preserves that aggregate rather than proving the original remote error type; inspect the failing peer to diagnose the cause.
+
 ## Interrupted native metadata publication
 
 A process kill can leave a pool with two PREPARE heads and two COMMIT heads for the same V3 transaction. Repeating the ordinary read cannot repair that split: the latest-head selection still requires its original quorum. Startup reconciliation holds the same distributed `pool.bin` writer fence as runtime recovery.

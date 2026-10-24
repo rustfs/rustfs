@@ -628,6 +628,58 @@ fn guard_decommission_cancelers(index_cancelers: Vec<(usize, DecommissionCancele
         .collect()
 }
 
+/// A known durable promotion has not yet crossed its peer convergence barrier.
+/// This carries the original error; it grants no permission to move any data.
+#[derive(Debug, thiserror::Error)]
+#[error("decommission pool meta reload failed during promote_queued_decommission for pool {pool_index}: {source}")]
+struct DecommissionPendingConvergence {
+    pool_index: usize,
+    generation: OffsetDateTime,
+    #[source]
+    source: Error,
+}
+
+fn decommission_pending_convergence(err: &Error) -> Option<&DecommissionPendingConvergence> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(error) = current {
+        if let Some(pending) = error.downcast_ref::<DecommissionPendingConvergence>() {
+            return Some(pending);
+        }
+        current = if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            io.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static))
+        } else {
+            error.source()
+        };
+    }
+    None
+}
+
+#[cfg(test)]
+static DECOMMISSION_PROMOTION_RELOAD_FOR_TEST: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<uuid::Uuid, std::collections::VecDeque<Result<()>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn take_decommission_promotion_reload_for_test(store_id: uuid::Uuid) -> Option<Result<()>> {
+    let mut overrides = DECOMMISSION_PROMOTION_RELOAD_FOR_TEST
+        .lock()
+        .expect("promotion reload test lock");
+    let result = overrides.get_mut(&store_id)?.pop_front();
+    if overrides.get(&store_id).is_some_and(std::collections::VecDeque::is_empty) {
+        overrides.remove(&store_id);
+    }
+    result
+}
+
+fn is_decommission_pending_convergence(err: &Error, pool_index: usize) -> bool {
+    err.pool_metadata_failure().is_none()
+        && decommission_pending_convergence(err).is_some_and(|pending| {
+            pending.pool_index == pool_index
+                && !is_err_operation_canceled(&pending.source)
+                && !matches!(pending.source, Error::NamespaceLockQuorumUnavailable { .. })
+        })
+}
+
 async fn await_decommission_worker(idx: usize, worker: tokio::task::JoinHandle<Result<()>>) -> Result<()> {
     worker
         .await
@@ -878,7 +930,8 @@ fn spawn_decommission_index_cancelers(
     tokio::spawn(async move {
         let mut stop_queue = false;
 
-        for (idx, canceler_guard) in index_cancelers {
+        let mut index_cancelers = index_cancelers.into_iter();
+        while let Some((idx, canceler_guard)) = index_cancelers.next() {
             let canceler = canceler_guard.canceler().clone();
             if stop_queue || rx.is_cancelled() {
                 canceler.cancel();
@@ -923,6 +976,16 @@ fn spawn_decommission_index_cancelers(
                     store.release_decommission_canceler_slot(idx, &canceler).await;
                     stop_queue = true;
                     continue;
+                }
+                if store.release_decommission_pending_convergence(idx, &canceler, &err).await {
+                    // Preserve queued successors for the watchdog instead of
+                    // turning this propagation pause into durable cancellation.
+                    for (queued_idx, queued_guard) in index_cancelers {
+                        store
+                            .release_decommission_canceler_slot(queued_idx, queued_guard.canceler())
+                            .await;
+                    }
+                    return;
                 }
                 error!(
                     event = EVENT_DECOMMISSION_STATE,
@@ -15881,6 +15944,29 @@ impl ECStore {
     }
 
     async fn promote_queued_decommission(&self, idx: usize, owner: &DecommissionCanceler) -> Result<OffsetDateTime> {
+        self.promote_queued_decommission_with_reload(idx, owner, || async {
+            #[cfg(test)]
+            if let Some(result) = take_decommission_promotion_reload_for_test(self.id) {
+                return result;
+            }
+            match runtime_sources::notification_sys() {
+                Some(notification_sys) => notification_sys.reload_pool_meta().await,
+                None => Ok(()),
+            }
+        })
+        .await
+    }
+
+    async fn promote_queued_decommission_with_reload<Reload, ReloadFuture>(
+        &self,
+        idx: usize,
+        owner: &DecommissionCanceler,
+        reload: Reload,
+    ) -> Result<OffsetDateTime>
+    where
+        Reload: FnOnce() -> ReloadFuture,
+        ReloadFuture: Future<Output = Result<()>>,
+    {
         // Serialize promotion and generation capture with clear/restart transitions.
         let (changed, generation, save_error) = {
             let _start_guard = self.start_gate.lock().await;
@@ -15976,21 +16062,86 @@ impl ECStore {
         if changed {
             self.ctx.advance_data_movement_operation_epoch();
         }
-        if changed && let Some(notification_sys) = runtime_sources::notification_sys() {
-            let stage = format!("promote_queued_decommission for pool {idx}");
-            if let Err(err) =
-                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
-            {
-                resolve_decommission_terminal_mark_after_error_result(
-                    self.decommission_failed_for_operation(idx, owner).await,
-                    idx,
-                    &err,
-                )?;
-                return Err(err);
-            }
-        }
-
+        // The barrier is required on every worker attempt, including an
+        // unchanged retry after a previously durable promotion.
+        self.confirm_decommission_peer_convergence(idx, owner, generation, reload)
+            .await?;
         Ok(generation)
+    }
+
+    async fn confirm_decommission_peer_convergence<Reload, ReloadFuture>(
+        &self,
+        idx: usize,
+        owner: &DecommissionCanceler,
+        generation: OffsetDateTime,
+        reload: Reload,
+    ) -> Result<()>
+    where
+        Reload: FnOnce() -> ReloadFuture,
+        ReloadFuture: Future<Output = Result<()>>,
+    {
+        let reloaded = reload().await;
+        // A clear, cancellation, lost fence or sticky metadata failure that
+        // raced the RPC must never be reclassified as a propagation pause.
+        let _start_guard = self.start_gate.lock().await;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
+        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        save_guard.ensure_write_safe("decommission convergence recheck failed")?;
+        let pool = self
+            .pools
+            .first()
+            .cloned()
+            .ok_or_else(|| Error::other("decommission convergence has no storage pools"))?;
+        let namespace = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
+        let read_guard = namespace.get_read_lock(get_lock_acquire_timeout()).await?;
+        let snapshot = self
+            .load_runtime_pool_meta_observing(&mut save_guard, "decommission convergence recheck failed")
+            .await?;
+        self.ensure_decommission_not_withdrawn(&snapshot, idx).await?;
+        save_guard.ensure_write_safe("decommission convergence recheck failed")?;
+        ensure_pool_meta_write_fence(&read_guard, "decommission convergence recheck failed")?;
+        if owner.token().is_cancelled() {
+            return Err(Error::OperationCanceled);
+        }
+        ensure_decommission_generation(&snapshot, idx, generation)?;
+        self.ensure_decommission_generation_current(idx, generation).await?;
+        match reloaded {
+            Ok(()) => Ok(()),
+            Err(err)
+                if err.pool_metadata_failure().is_some()
+                    || is_err_operation_canceled(&err)
+                    || matches!(err, Error::NamespaceLockQuorumUnavailable { .. }) =>
+            {
+                Err(err)
+            }
+            Err(source) => Err(Error::other(DecommissionPendingConvergence {
+                pool_index: idx,
+                generation,
+                source,
+            })),
+        }
+    }
+
+    async fn release_decommission_pending_convergence(&self, idx: usize, owner: &DecommissionCanceler, err: &Error) -> bool {
+        if !is_decommission_pending_convergence(err, idx) {
+            return false;
+        }
+        let Some(pending) = decommission_pending_convergence(err) else {
+            return false;
+        };
+        warn!(
+            event = EVENT_DECOMMISSION_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            state = "peer_convergence_pending",
+            pool_index = idx,
+            generation = %pending.generation,
+            error = %err,
+            "Decommission worker paused before data movement while peers converge"
+        );
+        self.release_decommission_canceler_slot(idx, owner).await;
+        true
     }
 
     #[cfg(test)]
@@ -18986,6 +19137,7 @@ impl ECStore {
         let generation = match self.promote_queued_decommission(idx, canceler).await {
             Ok(generation) => generation,
             Err(Error::OperationCanceled) => return Ok(()),
+            Err(err) if is_decommission_pending_convergence(&err, idx) => return Err(err),
             Err(err) if is_decommission_capacity_blocked_error(&err) || is_decommission_target_capacity_error(&err) => {
                 if let Err(pause_err) = self.pause_decommission_for_capacity(idx, &err).await {
                     return Err(decommission_capacity_blocked_error(format!(
@@ -22036,7 +22188,7 @@ mod tests {
     }
 
     /// A two-pool store whose pool 0 can start decommissioning onto pool 1.
-    async fn startable_decommission_store() -> (Vec<tempfile::TempDir>, Arc<ECStore>, Arc<ECStore>) {
+    pub(super) async fn startable_decommission_store() -> (Vec<tempfile::TempDir>, Arc<ECStore>, Arc<ECStore>) {
         let (temp_dirs, store, other_store) =
             Box::pin(crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None)).await;
         crate::services::rebalance::promote_test_pool_meta_to_v2(&store).await;
@@ -23265,18 +23417,31 @@ mod tests {
         let mut v1_meta = store.pool_meta.read().await.clone();
         v1_meta.version = POOL_META_V1_VERSION;
         let v1_data = pool_meta_v1_replica_test_data(&v1_meta);
-        for pool in &store.pools {
-            save_config_with_opts(
-                pool.clone(),
-                POOL_META_NAME,
-                v1_data.clone(),
-                &ObjectOptions {
-                    max_parity: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("the V1 baseline should be persisted to every pool");
+        {
+            // Preserve the normal save-gate -> namespace-writer lock order.
+            let mut write_state = store.pool_meta_save_gate.lock().await;
+            let (guard, _) = store
+                .acquire_pool_meta_write_guard(&mut write_state, "V1 test baseline")
+                .await
+                .expect("the V1 baseline should acquire its write fence");
+            let fence = PoolMetaPersistenceFence::Owned(guard);
+            let reads = read_pool_meta_replicas(store.pools.clone(), true).await;
+            let mut transaction = write_state.arm_transaction();
+            for (pool, read) in store.pools.iter().zip(&reads) {
+                save_pool_meta_object_cas(
+                    pool.clone(),
+                    POOL_META_NAME,
+                    v1_data.clone(),
+                    &read.cas,
+                    &fence,
+                    "test_v1_baseline",
+                    &mut transaction,
+                )
+                .await
+                .expect("the V1 baseline should be persisted to every pool");
+            }
+            fence.ensure_held().expect("the V1 baseline write fence should remain held");
+            transaction.disarm();
         }
         let baseline = load_pool_meta_replicas(store.pools.clone(), true)
             .await
@@ -40025,6 +40190,288 @@ mod pools_tests {
         assert!(!info.canceled);
         assert!(!info.complete);
         assert_eq!(info.start_time, Some(generation));
+    }
+
+    async fn pending_convergence_fixture() -> (Vec<tempfile::TempDir>, Arc<ECStore>, DecommissionCanceler) {
+        let (directories, store, _peer) = super::tests::startable_decommission_store().await;
+        store.pool_meta.write().await.pools[0].decommission = Some(PoolDecommissionInfo {
+            queued: true,
+            ..Default::default()
+        });
+        store
+            .save_current_pool_meta_for_test(&[0])
+            .await
+            .expect("durable queued source");
+        let owner = DecommissionCanceler::new(CancellationToken::new());
+        store.decommission_cancelers.write().await[0] = Some(owner.clone());
+        (directories, store, owner)
+    }
+
+    #[test]
+    fn test_decommission_pending_convergence_is_typed_and_preserves_its_source() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let pending = Error::other(super::DecommissionPendingConvergence {
+            pool_index: 0,
+            generation,
+            source: Error::SlowDown,
+        });
+        let wrapped = Error::other_with_context("outer convergence context", pending);
+        assert!(super::is_decommission_pending_convergence(&wrapped, 0));
+        assert!(!super::is_decommission_pending_convergence(&wrapped, 1));
+        let cause = super::decommission_pending_convergence(&wrapped).expect("typed source remains reachable");
+        assert_eq!(cause.generation, generation);
+        assert!(matches!(cause.source, Error::SlowDown));
+        for err in [
+            Error::SlowDown,
+            Error::OperationCanceled,
+            Error::other("decommission pool meta reload failed during promote_queued_decommission"),
+            Error::other(super::pool_metadata_error(
+                crate::error::PoolMetadataFailure::RecoveryRequired,
+                "test",
+                None,
+            )),
+        ] {
+            assert!(!super::is_decommission_pending_convergence(&err, 0));
+        }
+        let permanent = Error::other(super::DecommissionPendingConvergence {
+            pool_index: 0,
+            generation,
+            source: Error::other(super::pool_metadata_error(
+                crate::error::PoolMetadataFailure::TransactionUnknown,
+                "test",
+                None,
+            )),
+        });
+        assert!(!super::is_decommission_pending_convergence(&permanent, 0));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(pool_meta_version_env)]
+    async fn test_decommission_pending_convergence_retries_unchanged_promotion_before_worker_admission() {
+        let (_directories, store, first_owner) = pending_convergence_fixture().await;
+        super::DECOMMISSION_PROMOTION_RELOAD_FOR_TEST
+            .lock()
+            .expect("reload test lock")
+            .insert(
+                store.id,
+                std::collections::VecDeque::from([Err(Error::SlowDown), Err(Error::SlowDown), Ok(())]),
+            );
+        let err = store
+            .promote_queued_decommission(0, &first_owner)
+            .await
+            .expect_err("first peer barrier fails");
+        assert!(super::is_decommission_pending_convergence(&err, 0));
+        assert!(matches!(
+            super::decommission_pending_convergence(&err)
+                .expect("typed reload failure")
+                .source,
+            Error::SlowDown
+        ));
+        assert!(store.release_decommission_pending_convergence(0, &first_owner, &err).await);
+        assert!(!first_owner.is_active());
+        assert!(store.decommission_cancelers.read().await[0].is_none());
+        let after_first = store.pool_meta.read().await.pools[0].clone();
+        let first_info = after_first.decommission.as_ref().expect("durable promotion remains active");
+        let generation = first_info.start_time.expect("original active generation");
+        assert!(!first_info.queued && !first_info.failed && !first_info.canceled && !first_info.complete);
+        assert_eq!(first_info.items_decommissioned, 0);
+
+        // Exercise the real routine and supervisor on the second failed barrier.
+        let retry_owner = DecommissionCanceler::new(CancellationToken::new());
+        store.decommission_cancelers.write().await[0] = Some(retry_owner.clone());
+        let guards = guard_decommission_cancelers(vec![(0, retry_owner.clone())]);
+        spawn_decommission_index_cancelers(store.clone(), CancellationToken::new(), guards, Arc::new(Semaphore::new(1)))
+            .await
+            .expect("supervisor handles a convergence pause");
+        assert!(!retry_owner.is_active());
+        assert!(store.decommission_cancelers.read().await[0].is_none());
+        let after_second = store.pool_meta.read().await.pools[0].clone();
+        assert_eq!(
+            after_second.last_update, after_first.last_update,
+            "an unchanged retry needs no additional checkpoint"
+        );
+        let info = after_second.decommission.as_ref().expect("active retry state");
+        assert_eq!(info.start_time, Some(generation));
+        assert!(!info.failed && !info.canceled && !info.complete);
+        assert_eq!(info.items_decommissioned, 0, "no copy or source cleanup is admitted before convergence");
+        assert_eq!(
+            super::DECOMMISSION_PROMOTION_RELOAD_FOR_TEST
+                .lock()
+                .expect("reload test lock")
+                .get(&store.id)
+                .map(std::collections::VecDeque::len),
+            Some(1)
+        );
+
+        let final_owner = DecommissionCanceler::new(CancellationToken::new());
+        store.decommission_cancelers.write().await[0] = Some(final_owner.clone());
+        let admitted = store
+            .promote_queued_decommission(0, &final_owner)
+            .await
+            .expect("third barrier converges");
+        assert_eq!(admitted, generation);
+        assert!(
+            !super::DECOMMISSION_PROMOTION_RELOAD_FOR_TEST
+                .lock()
+                .expect("reload test lock")
+                .contains_key(&store.id)
+        );
+        assert_eq!(store.pool_meta.read().await.pools[0].last_update, after_first.last_update);
+        store.release_decommission_canceler_slot(0, &final_owner).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(pool_meta_version_env)]
+    async fn test_decommission_pending_convergence_rechecks_cancel_clear_and_sticky_failure() {
+        for interrupt in ["cancel", "clear", "sticky"] {
+            let (_directories, store, owner) = pending_convergence_fixture().await;
+            let interrupted_store = store.clone();
+            let interrupted_owner = owner.clone();
+            let err = store
+                .promote_queued_decommission_with_reload(0, &owner, || async move {
+                    match interrupt {
+                        "cancel" => interrupted_owner.cancel(),
+                        "clear" => {
+                            interrupted_store.decommission_cancel(0).await?;
+                            interrupted_store.clear_decommission(0).await?;
+                        }
+                        _ => interrupted_store
+                            .pool_meta_save_gate
+                            .lock()
+                            .await
+                            .observe_replicas(super::PoolMetaReplicaState {
+                                needs_repair: true,
+                                repair_write_safe: false,
+                            }),
+                    }
+                    Err(Error::SlowDown)
+                })
+                .await
+                .expect_err("interrupted convergence must not admit a worker");
+            assert!(!super::is_decommission_pending_convergence(&err, 0));
+            if interrupt == "sticky" {
+                assert!(err.pool_metadata_failure().is_some());
+                assert!(!store.pool_meta_writes_ready().await);
+            } else {
+                assert!(matches!(err, Error::OperationCanceled));
+            }
+            if interrupt == "clear" {
+                let local = store.pool_meta.read().await.clone();
+                let mut durable = PoolMeta::default();
+                durable
+                    .load_no_lock_from_replicas(store.pools.clone())
+                    .await
+                    .expect("real clear must remain durable after the stale promotion returns");
+                for (label, snapshot) in [("local", local), ("durable", durable)] {
+                    let info = snapshot.pools[0].decommission.as_ref();
+                    assert!(
+                        info.filter(|info| info.has_decommission_state()).is_none(),
+                        "{label} clear must not resurrect the old generation"
+                    );
+                    // A clear retains the scanner's state-empty tombstone.
+                    if let Some(info) = info {
+                        assert!(info.start_time.is_none(), "{label} clear must remove the generation");
+                        assert!(!info.queued && !info.failed && !info.canceled && !info.complete);
+                        assert_eq!(info.items_decommissioned, 0);
+                    }
+                }
+            }
+            if let Some(info) = store.pool_meta.read().await.pools[0].decommission.as_ref() {
+                assert!(!info.failed && !info.complete);
+                assert_eq!(info.items_decommissioned, 0);
+            }
+            store.release_decommission_canceler_slot(0, &owner).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(pool_meta_version_env)]
+    async fn test_decommission_pending_convergence_supervisor_preserves_queued_successor() {
+        let (_directories, store, _peer) =
+            crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
+        crate::services::rebalance::promote_test_pool_meta_to_v2(&store).await;
+        {
+            let mut meta = store.pool_meta.write().await;
+            for index in [0, 1] {
+                meta.pools[index].decommission = Some(PoolDecommissionInfo {
+                    queued: true,
+                    ..Default::default()
+                });
+            }
+        }
+        store
+            .save_current_pool_meta_for_test(&[0, 1])
+            .await
+            .expect("durable queued sources");
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 100, 100),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 0, 100, 100),
+                DecommissionPoolCapacityInfo::for_test(2, layout, 400, 400, 0),
+            ]],
+        );
+        let first = DecommissionCanceler::new(CancellationToken::new());
+        let queued = DecommissionCanceler::new(CancellationToken::new());
+        {
+            let mut slots = store.decommission_cancelers.write().await;
+            slots[0] = Some(first.clone());
+            slots[1] = Some(queued.clone());
+        }
+        super::DECOMMISSION_PROMOTION_RELOAD_FOR_TEST
+            .lock()
+            .expect("reload test lock")
+            .insert(store.id, std::collections::VecDeque::from([Err(Error::SlowDown)]));
+        let guards = guard_decommission_cancelers(vec![(0, first.clone()), (1, queued.clone())]);
+        spawn_decommission_index_cancelers(store.clone(), CancellationToken::new(), guards, Arc::new(Semaphore::new(1)))
+            .await
+            .expect("convergence pause ends this supervisor round");
+        assert!(!first.is_active() && !queued.is_active());
+        assert!(store.decommission_cancelers.read().await.iter().all(Option::is_none));
+        let meta = store.pool_meta.read().await;
+        let active = meta.pools[0].decommission.as_ref().expect("active first source");
+        let successor = meta.pools[1].decommission.as_ref().expect("queued successor");
+        assert!(!active.failed && !active.canceled && !active.complete);
+        assert!(successor.queued);
+        assert!(!successor.failed && !successor.canceled && !successor.complete);
+        assert_eq!(successor.items_decommissioned, 0);
+    }
+
+    #[tokio::test]
+    async fn test_decommission_pending_convergence_owner_release_preserves_a_replacement_owner() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let old = DecommissionCanceler::new(CancellationToken::new());
+        let replacement = DecommissionCanceler::new(CancellationToken::new());
+        let pool_meta = PoolMeta {
+            pools: vec![decommission_test_pool_status(
+                0,
+                Some(PoolDecommissionInfo {
+                    start_time: Some(generation),
+                    ..Default::default()
+                }),
+            )],
+            ..Default::default()
+        };
+        let store = decommission_worker_test_store(pool_meta, vec![Some(replacement.clone())]);
+        let err = Error::other(super::DecommissionPendingConvergence {
+            pool_index: 0,
+            generation,
+            source: Error::SlowDown,
+        });
+        assert!(store.release_decommission_pending_convergence(0, &old, &err).await);
+        assert!(!old.is_active());
+        assert!(replacement.is_active());
+        assert!(
+            store.decommission_cancelers.read().await[0]
+                .as_ref()
+                .expect("replacement owner remains")
+                .owns_same_operation(&replacement)
+        );
+        let state = store.pool_meta.read().await;
+        let info = state.pools[0].decommission.as_ref().expect("unchanged durable operation");
+        assert_eq!(info.start_time, Some(generation));
+        assert!(!info.failed && !info.canceled);
     }
 
     #[tokio::test]
