@@ -4762,7 +4762,7 @@ mod legacy_artifact_tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn legacy_path_delete_receiver_binds_instance_bootstrap_and_scanner_guard() {
+    async fn legacy_path_delete_receiver_binds_instance_and_bootstrap_snapshot() {
         let _ = rustfs_credentials::set_global_rpc_secret("legacy-path-delete-secret".to_owned());
         let root = tempfile::tempdir().expect("instance receiver root");
         let env = rustfs_test_utils::TestECStoreEnv::builder()
@@ -4832,7 +4832,26 @@ mod legacy_artifact_tests {
                 .expect("captured bootstrap cannot upgrade"),
             DiskError::FileAccessDenied
         );
+    }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_path_delete_receiver_validates_scanner_request_authority() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-path-delete-secret".to_owned());
+        let root = tempfile::tempdir().expect("instance receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("path-instance", true).await;
+        let ready = service_for(&env).await;
+        let instance = crate::storage::storage_api::bootstrap_instance_ctx();
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = ready
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("receiver disk");
         let mut fixture = legacy_path_fixture(&disk, "path-instance", LegacyPathCase::Delete).await;
         let ttl = std::time::Duration::from_millis(crate::storage::storage_api::SCANNER_PUBLICATION_LEASE_TTL_MS);
         let (scanner, _) = env
@@ -4897,7 +4916,26 @@ mod legacy_artifact_tests {
             .expect("captured Ready scanner delete");
         assert_path_mutation_result(&disk, &fixture).await;
         assert!(env.ecstore.release_scanner_publication_lease(scanner).await);
+    }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_path_delete_receiver_rejects_foreign_scanner_instance() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-path-delete-secret".to_owned());
+        let root = tempfile::tempdir().expect("instance receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("path-instance", true).await;
+        let ready = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = ready
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("receiver disk");
+        let ttl = std::time::Duration::from_millis(crate::storage::storage_api::SCANNER_PUBLICATION_LEASE_TTL_MS);
         let other_root = tempfile::tempdir().expect("foreign scanner instance");
         let other = rustfs_test_utils::TestECStoreEnv::builder()
             .base_dir(other_root.path())
@@ -4919,7 +4957,28 @@ mod legacy_artifact_tests {
             .expect_err("cross-instance token rejects");
         assert_eq!(path_delete_snapshot(&fixture.physical), before);
         assert!(other.ecstore.release_scanner_publication_lease(foreign).await);
+    }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_path_delete_receiver_retains_admitted_owner_across_registry_replacement() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-path-delete-secret".to_owned());
+        let root = tempfile::tempdir().expect("instance receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("path-instance", true).await;
+        let ready = service_for(&env).await;
+        let instance = crate::storage::storage_api::bootstrap_instance_ctx();
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = ready
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("receiver disk");
+        let ttl = std::time::Duration::from_millis(crate::storage::storage_api::SCANNER_PUBLICATION_LEASE_TTL_MS);
+        let fixture = legacy_path_fixture(&disk, "path-instance", LegacyPathCase::Delete).await;
         let (scanner, _) = env
             .ecstore
             .acquire_scanner_publication_lease(env.ecstore.scanner_data_movement_generation(), ttl)
@@ -6670,39 +6729,23 @@ mod legacy_artifact_tests {
         assert_eq!(path_delete_snapshot(&env.disk_paths[0].join(bucket)), before);
     }
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn artifact_delete_recovery_receivers_apply_and_rollback_real_ordinary_versions() {
-        use crate::storage::storage_api::ecstore_disk::{CurrentDeleteGeneration, DeleteRecoveryAction, GuardedFileInfoVersions};
-        use crate::storage::storage_api::{ObjectOptions, PutObjReader, contract::object::ObjectIO as _};
-        use std::time::Duration;
+    struct OrdinaryDeleteRecoveryFixture {
+        service: NodeService,
+        disk_ref: String,
+        disk: super::super::DiskStore,
+        bucket: &'static str,
+        object: String,
+        fi: FileInfo,
+        physical: std::path::PathBuf,
+        before: Vec<(std::path::PathBuf, Option<Vec<u8>>)>,
+        transaction: Uuid,
+        opts: DeleteOptions,
+        _env: rustfs_test_utils::TestECStoreEnv,
+        _root: tempfile::TempDir,
+    }
 
-        async fn recover(
-            service: &NodeService,
-            disk: &str,
-            bucket: &str,
-            operation: DeleteRecoveryRpcOperation,
-        ) -> DeleteRecoveryRpcReply {
-            let mut request = Request::new(RecoverDeleteTransactionRequest {
-                disk: disk.to_owned(),
-                volume: bucket.to_owned(),
-                protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
-                operation: rmp_serde::to_vec_named(&operation).expect("named recovery operation").into(),
-            });
-            let body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref())
-                .expect("canonical recovery body");
-            sign_legacy_rpc_request(&mut request, &body, "RecoverDeleteTransaction");
-            verify_legacy_rpc_request(&request, "RecoverDeleteTransaction").expect("real recovery HMAC and replay scope");
-            let response = tokio::time::timeout(Duration::from_secs(30), service.handle_recover_delete_transaction(request))
-                .await
-                .expect("bounded recovery operation")
-                .expect("authenticated recovery response")
-                .into_inner();
-            assert!(response.success, "recovery operation failed: {:?}", response.error);
-            assert!(response.error.is_none());
-            assert_eq!(response.protocol_version, DELETE_RECOVERY_PROTOCOL_VERSION);
-            rustfs_protos::decode_delete_recovery_payload(&response.result).expect("typed recovery reply")
-        }
+    async fn ordinary_delete_recovery_fixture(mode: &str) -> OrdinaryDeleteRecoveryFixture {
+        use crate::storage::storage_api::{ObjectOptions, PutObjReader, contract::object::ObjectIO as _};
 
         let _ = rustfs_credentials::set_global_rpc_secret("ordinary-delete-recovery-test-secret".to_owned());
         let root = tempfile::tempdir().expect("ordinary recovery receiver root");
@@ -6724,152 +6767,234 @@ mod legacy_artifact_tests {
             .find_mutation_disk(&disk_ref)
             .await
             .expect("local receiver disk");
-        for mode in ["single", "batch", "guarded"] {
-            let object = format!("recovery/{mode}");
-            let payload = vec![0x42; 257];
-            env.ecstore
-                .put_object(
-                    bucket,
-                    &object,
-                    &mut PutObjReader::from_vec(payload),
-                    &ObjectOptions {
-                        versioned: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("real versioned ordinary PUT");
-            let fi = disk
-                .read_version(
-                    bucket,
-                    bucket,
-                    &object,
-                    "",
-                    &ReadOptions {
-                        read_data: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("real PUT generation on the receiving disk");
-            assert!(fi.inline_data(), "small real PUT must produce a complete inline rollback fixture");
-            assert!(
-                fi.data.as_ref().is_some_and(|data| !data.is_empty()),
-                "real encoded inline shard is present"
-            );
-            let physical = env.disk_paths[0].join(bucket).join(&object);
-            let before = path_delete_snapshot(&physical);
-            let transaction = Uuid::new_v4();
-            let opts = DeleteOptions {
-                old_data_dir: Some(transaction),
-                delete_recovery_bucket_incarnation: Some(incarnation),
-                ..Default::default()
-            };
-            let group = FileInfoVersions {
-                volume: bucket.to_owned(),
-                name: object.clone(),
-                versions: vec![fi.clone()],
-                ..Default::default()
-            };
-            if mode == "guarded" {
-                let payload = GuardedDeleteVersionsPayload {
-                    versions: vec![GuardedFileInfoVersions {
-                        expected_current: CurrentDeleteGeneration::from_file_info(&fi).expect("actual current generation"),
-                        group,
-                    }],
-                    opts,
-                };
-                payload.validate().expect("valid guarded ordinary request");
-                let mut request = Request::new(GuardedDeleteVersionsRequest {
-                    disk: disk_ref.clone(),
-                    volume: bucket.to_owned(),
-                    probe_only: false,
-                    payload: rmp_serde::to_vec_named(&payload).expect("named guarded request").into(),
-                });
-                let body = rustfs_protos::canonical_guarded_delete_versions_request_body(request.get_ref())
-                    .expect("canonical guarded request");
-                sign_legacy_rpc_request(&mut request, &body, "GuardedDeleteVersions");
-                verify_legacy_rpc_request(&request, "GuardedDeleteVersions").expect("real guarded HMAC and replay scope");
-                let response = tokio::time::timeout(Duration::from_secs(30), service.handle_guarded_delete_versions(request))
-                    .await
-                    .expect("bounded guarded publication")
-                    .expect("authenticated guarded response")
-                    .into_inner();
-                assert_bulk_results(&response, &[None]);
-            } else {
-                let operation = if mode == "single" {
-                    DeleteRecoveryRpcOperation::ApplyVersion {
-                        object: object.clone(),
-                        file_info: Box::new(fi.clone()),
-                        force_del_marker: false,
-                        opts,
-                    }
-                } else {
-                    DeleteRecoveryRpcOperation::ApplyVersions {
-                        versions: vec![group],
-                        opts,
-                    }
-                };
-                match recover(&service, &disk_ref, bucket, operation).await {
-                    DeleteRecoveryRpcReply::AppliedVersion if mode == "single" => {}
-                    DeleteRecoveryRpcReply::AppliedVersions(errors) if mode == "batch" => assert_eq!(errors, vec![None]),
-                    reply => panic!("unexpected apply reply: {reply:?}"),
-                }
-            }
-            let DeleteRecoveryRpcReply::Inspected(state) = recover(
-                &service,
-                &disk_ref,
+        let object = format!("recovery/{mode}");
+        let payload = vec![0x42; 257];
+        env.ecstore
+            .put_object(
                 bucket,
-                DeleteRecoveryRpcOperation::Inspect {
-                    object: object.clone(),
-                    transaction,
+                &object,
+                &mut PutObjReader::from_vec(payload),
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
                 },
             )
             .await
-            else {
-                panic!("typed inspection reply");
-            };
-            assert_eq!(serde_json::to_value(&state.state).expect("serialized recovery state"), "NewPrepared");
-            assert_eq!(state.current_digest, state.journal.as_ref().expect("durable journal").target_digest);
-            assert!(!physical.join("xl.meta").exists(), "real selected version was removed");
-            assert_ne!(path_delete_snapshot(&physical), before, "forward operation must change physical state");
-            let DeleteRecoveryRpcReply::Settled(restored) = recover(
-                &service,
-                &disk_ref,
+            .expect("real versioned ordinary PUT");
+        let fi = disk
+            .read_version(
                 bucket,
-                DeleteRecoveryRpcOperation::Settle {
-                    object: object.clone(),
-                    transaction,
-                    expected_fingerprint: state.fingerprint,
-                    action: DeleteRecoveryAction::Rollback,
+                bucket,
+                &object,
+                "",
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
                 },
             )
             .await
-            else {
-                panic!("typed rollback reply");
-            };
-            assert_eq!(serde_json::to_value(&restored.state).expect("serialized recovery state"), "Absent");
-            assert_eq!(
-                path_delete_snapshot(&physical),
-                before,
-                "rollback restores exact metadata and removes journal residue"
-            );
-            let restored = disk
-                .read_version(
-                    bucket,
-                    bucket,
-                    &object,
-                    &fi.version_id.expect("real version").to_string(),
-                    &ReadOptions {
-                        read_data: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("exact restored ordinary version");
-            assert_eq!(restored.version_id, fi.version_id);
-            assert_eq!(restored.data, fi.data);
+            .expect("real PUT generation on the receiving disk");
+        assert!(fi.inline_data(), "small real PUT must produce a complete inline rollback fixture");
+        assert!(
+            fi.data.as_ref().is_some_and(|data| !data.is_empty()),
+            "real encoded inline shard is present"
+        );
+        let physical = env.disk_paths[0].join(bucket).join(&object);
+        let before = path_delete_snapshot(&physical);
+        let transaction = Uuid::new_v4();
+        let opts = DeleteOptions {
+            old_data_dir: Some(transaction),
+            delete_recovery_bucket_incarnation: Some(incarnation),
+            ..Default::default()
+        };
+        OrdinaryDeleteRecoveryFixture {
+            service,
+            disk_ref,
+            disk,
+            bucket,
+            object,
+            fi,
+            physical,
+            before,
+            transaction,
+            opts,
+            _env: env,
+            _root: root,
         }
+    }
+
+    async fn recover_ordinary_delete_transaction(
+        service: &NodeService,
+        disk: &str,
+        bucket: &str,
+        operation: DeleteRecoveryRpcOperation,
+    ) -> DeleteRecoveryRpcReply {
+        use std::time::Duration;
+
+        let mut request = Request::new(RecoverDeleteTransactionRequest {
+            disk: disk.to_owned(),
+            volume: bucket.to_owned(),
+            protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+            operation: rmp_serde::to_vec_named(&operation).expect("named recovery operation").into(),
+        });
+        let body =
+            rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref()).expect("canonical recovery body");
+        sign_legacy_rpc_request(&mut request, &body, "RecoverDeleteTransaction");
+        verify_legacy_rpc_request(&request, "RecoverDeleteTransaction").expect("real recovery HMAC and replay scope");
+        let response = tokio::time::timeout(Duration::from_secs(30), service.handle_recover_delete_transaction(request))
+            .await
+            .expect("bounded recovery operation")
+            .expect("authenticated recovery response")
+            .into_inner();
+        assert!(response.success, "recovery operation failed: {:?}", response.error);
+        assert!(response.error.is_none());
+        assert_eq!(response.protocol_version, DELETE_RECOVERY_PROTOCOL_VERSION);
+        rustfs_protos::decode_delete_recovery_payload(&response.result).expect("typed recovery reply")
+    }
+
+    async fn assert_ordinary_delete_recovery_rollback(fixture: &OrdinaryDeleteRecoveryFixture) {
+        use crate::storage::storage_api::ecstore_disk::DeleteRecoveryAction;
+
+        let service = &fixture.service;
+        let disk_ref = &fixture.disk_ref;
+        let bucket = fixture.bucket;
+        let object = &fixture.object;
+        let fi = &fixture.fi;
+        let physical = &fixture.physical;
+        let before = &fixture.before;
+        let transaction = fixture.transaction;
+        let DeleteRecoveryRpcReply::Inspected(state) = recover_ordinary_delete_transaction(
+            service,
+            disk_ref,
+            bucket,
+            DeleteRecoveryRpcOperation::Inspect {
+                object: object.clone(),
+                transaction,
+            },
+        )
+        .await
+        else {
+            panic!("typed inspection reply");
+        };
+        assert_eq!(serde_json::to_value(&state.state).expect("serialized recovery state"), "NewPrepared");
+        assert_eq!(state.current_digest, state.journal.as_ref().expect("durable journal").target_digest);
+        assert!(!physical.join("xl.meta").exists(), "real selected version was removed");
+        assert_ne!(path_delete_snapshot(physical), *before, "forward operation must change physical state");
+        let DeleteRecoveryRpcReply::Settled(restored) = recover_ordinary_delete_transaction(
+            service,
+            disk_ref,
+            bucket,
+            DeleteRecoveryRpcOperation::Settle {
+                object: object.clone(),
+                transaction,
+                expected_fingerprint: state.fingerprint,
+                action: DeleteRecoveryAction::Rollback,
+            },
+        )
+        .await
+        else {
+            panic!("typed rollback reply");
+        };
+        assert_eq!(serde_json::to_value(&restored.state).expect("serialized recovery state"), "Absent");
+        assert_eq!(
+            path_delete_snapshot(physical),
+            *before,
+            "rollback restores exact metadata and removes journal residue"
+        );
+        let restored = fixture
+            .disk
+            .read_version(
+                bucket,
+                bucket,
+                object,
+                &fi.version_id.expect("real version").to_string(),
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("exact restored ordinary version");
+        assert_eq!(restored.version_id, fi.version_id);
+        assert_eq!(restored.data, fi.data);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn artifact_delete_recovery_single_receiver_applies_and_rolls_back_real_ordinary_version() {
+        let fixture = ordinary_delete_recovery_fixture("single").await;
+        let operation = DeleteRecoveryRpcOperation::ApplyVersion {
+            object: fixture.object.clone(),
+            file_info: Box::new(fixture.fi.clone()),
+            force_del_marker: false,
+            opts: fixture.opts.clone(),
+        };
+        match recover_ordinary_delete_transaction(&fixture.service, &fixture.disk_ref, fixture.bucket, operation).await {
+            DeleteRecoveryRpcReply::AppliedVersion => {}
+            reply => panic!("unexpected apply reply: {reply:?}"),
+        }
+        assert_ordinary_delete_recovery_rollback(&fixture).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn artifact_delete_recovery_batch_receiver_applies_and_rolls_back_real_ordinary_version() {
+        let fixture = ordinary_delete_recovery_fixture("batch").await;
+        let group = FileInfoVersions {
+            volume: fixture.bucket.to_owned(),
+            name: fixture.object.clone(),
+            versions: vec![fixture.fi.clone()],
+            ..Default::default()
+        };
+        let operation = DeleteRecoveryRpcOperation::ApplyVersions {
+            versions: vec![group],
+            opts: fixture.opts.clone(),
+        };
+        match recover_ordinary_delete_transaction(&fixture.service, &fixture.disk_ref, fixture.bucket, operation).await {
+            DeleteRecoveryRpcReply::AppliedVersions(errors) => assert_eq!(errors, vec![None]),
+            reply => panic!("unexpected apply reply: {reply:?}"),
+        }
+        assert_ordinary_delete_recovery_rollback(&fixture).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn artifact_delete_recovery_guarded_receiver_applies_and_rolls_back_real_ordinary_version() {
+        use crate::storage::storage_api::ecstore_disk::{CurrentDeleteGeneration, GuardedFileInfoVersions};
+        use std::time::Duration;
+
+        let fixture = ordinary_delete_recovery_fixture("guarded").await;
+        let group = FileInfoVersions {
+            volume: fixture.bucket.to_owned(),
+            name: fixture.object.clone(),
+            versions: vec![fixture.fi.clone()],
+            ..Default::default()
+        };
+        let payload = GuardedDeleteVersionsPayload {
+            versions: vec![GuardedFileInfoVersions {
+                expected_current: CurrentDeleteGeneration::from_file_info(&fixture.fi).expect("actual current generation"),
+                group,
+            }],
+            opts: fixture.opts.clone(),
+        };
+        payload.validate().expect("valid guarded ordinary request");
+        let mut request = Request::new(GuardedDeleteVersionsRequest {
+            disk: fixture.disk_ref.clone(),
+            volume: fixture.bucket.to_owned(),
+            probe_only: false,
+            payload: rmp_serde::to_vec_named(&payload).expect("named guarded request").into(),
+        });
+        let body =
+            rustfs_protos::canonical_guarded_delete_versions_request_body(request.get_ref()).expect("canonical guarded request");
+        sign_legacy_rpc_request(&mut request, &body, "GuardedDeleteVersions");
+        verify_legacy_rpc_request(&request, "GuardedDeleteVersions").expect("real guarded HMAC and replay scope");
+        let response = tokio::time::timeout(Duration::from_secs(30), fixture.service.handle_guarded_delete_versions(request))
+            .await
+            .expect("bounded guarded publication")
+            .expect("authenticated guarded response")
+            .into_inner();
+        assert_bulk_results(&response, &[None]);
+        assert_ordinary_delete_recovery_rollback(&fixture).await;
     }
 
     #[tokio::test]

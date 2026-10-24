@@ -3885,8 +3885,7 @@ mod metadata_cache_tests {
 
         let bucket = "late-metadata-identity";
         let object = "late-metadata-identity-object";
-        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
-        let (_dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, ctx).await;
+        let (_fixture, _disks, set) = crate::set_disk::hermetic_set_disks_isolated(4).await;
         set.make_bucket(bucket, &MakeBucketOptions::default())
             .await
             .expect("create real late-read bucket");

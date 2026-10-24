@@ -7256,13 +7256,13 @@ mod tests {
         let (_second_dirs, second_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
         let store =
             Arc::new(new_prepared_reader_test_store_with_ctx(&[Arc::clone(&first_set), Arc::clone(&second_set)], ctx).await);
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
         let bucket = "commit-late-data-movement-put";
         let object = "slow-body.bin";
-        for set in [&first_set, &second_set] {
-            set.make_bucket(bucket, &MakeBucketOptions::default())
-                .await
-                .expect("commit-late PUT bucket should be created");
-        }
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("commit-late PUT bucket should be created");
 
         let payload = b"data movement body".to_vec();
         let mut source_body = PutObjReader::from_vec(payload.clone());
@@ -7659,13 +7659,13 @@ mod tests {
         let (_second_dirs, second_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
         let store =
             Arc::new(new_prepared_reader_test_store_with_ctx(&[Arc::clone(&first_set), Arc::clone(&second_set)], ctx).await);
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
         let bucket = "publication-etag-source-change";
         let object = "source.bin";
-        for set in [&first_set, &second_set] {
-            set.make_bucket(bucket, &MakeBucketOptions::default())
-                .await
-                .expect("publication ETag test bucket should be created");
-        }
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("publication ETag test bucket should be created");
 
         let mut source_body = PutObjReader::from_vec(b"source body".to_vec());
         first_set
@@ -11944,22 +11944,21 @@ mod tests {
     #[serial_test::serial(body_cache_hook)]
     async fn prepared_reader_holds_namespace_lock_until_eof_or_drop() {
         temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("false"))], async {
-            let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
-            let store = new_prepared_reader_test_store(&[set_disks]).await;
+            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            let (_dirs, set_disks) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[set_disks], ctx).await);
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
             let bucket = "prepared-reader-lock-lifetime";
             let object = "object.bin";
             let payload = b"prepared-reader-lock-lifetime-payload-".repeat(40_000);
-            let put_opts = ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            };
+            let put_opts = ObjectOptions::default();
 
-            store.pools[0]
+            store
                 .make_bucket(bucket, &MakeBucketOptions::default())
                 .await
                 .expect("bucket should be created");
             let mut put_reader = PutObjReader::from_vec(payload.clone());
-            store.pools[0]
+            store
                 .put_object(bucket, object, &mut put_reader, &put_opts)
                 .await
                 .expect("object should be written");
