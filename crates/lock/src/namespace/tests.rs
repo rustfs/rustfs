@@ -1257,6 +1257,59 @@ async fn test_namespace_lock_distributed_even_node_read_write_quorum_split() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn test_namespace_lock_read_quorum_is_independent_of_slow_voter_order() {
+    let fast_positions = [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]];
+    for positions in fast_positions {
+        let clients: Vec<Arc<dyn LockClient>> = (0..4)
+            .map(|index| {
+                let inner = Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new())));
+                if positions.contains(&index) {
+                    inner as Arc<dyn LockClient>
+                } else {
+                    Arc::new(DelayedClient {
+                        inner,
+                        delay: Duration::from_secs(3),
+                    }) as Arc<dyn LockClient>
+                }
+            })
+            .collect();
+        let lock = NamespaceLock::with_clients("read-quorum-order".to_string(), clients);
+        let resource = create_test_object_key("bucket", "slow-voters");
+        let result =
+            tokio::time::timeout(Duration::from_millis(900), lock.get_read_lock(resource, "owner", Duration::from_secs(5))).await;
+        let mut guard = result
+            .expect("healthy read quorum must be contacted before the first attempt expires")
+            .expect("two healthy voters must suffice in every ordering");
+        assert!(guard.release(), "the admitted quorum must release");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_namespace_lock_write_quorum_reaches_voters_after_a_silent_prefix() {
+    let clients: Vec<Arc<dyn LockClient>> = (0..8)
+        .map(|index| {
+            let inner = Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new())));
+            if index >= 3 {
+                inner as Arc<dyn LockClient>
+            } else {
+                Arc::new(DelayedClient {
+                    inner,
+                    delay: Duration::from_secs(3),
+                }) as Arc<dyn LockClient>
+            }
+        })
+        .collect();
+    let lock = NamespaceLock::with_clients("write-quorum-order".to_string(), clients);
+    let resource = create_test_object_key("bucket", "slow-voters");
+    let result =
+        tokio::time::timeout(Duration::from_millis(900), lock.get_write_lock(resource, "owner", Duration::from_secs(5))).await;
+    let mut guard = result
+        .expect("healthy write quorum must be contacted within the first attempt")
+        .expect("five healthy voters must suffice");
+    assert!(guard.release());
+}
+
 #[tokio::test]
 async fn test_namespace_lock_distributed_read_lock_returns_after_quorum_without_waiting_for_slow_clients() {
     let manager_fast_1 = Arc::new(GlobalLockManager::new());
