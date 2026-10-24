@@ -53,8 +53,8 @@ pub struct MetadataResolutionParams {
     pub strict: bool,
     /// Number of set drives that were unreachable when the listing snapshot was
     /// taken. Write-quorum enforcement relaxes each version's required quorum by
-    /// this amount (never below `obj_quorum`): a version legally committed at
-    /// write quorum can have that many of its metadata copies on drives no
+    /// this amount, never below the version's data quorum or `obj_quorum`. A
+    /// version legally committed at write quorum can have metadata on drives no
     /// reader could consult, and must not be dropped for it.
     pub write_quorum_slack: usize,
     pub candidates: Vec<Vec<FileMetaShallowVersion>>,
@@ -159,10 +159,11 @@ impl MetaCacheEntry {
 
     pub fn is_latest_delete_marker(&mut self) -> bool {
         if let Some(cached) = &self.cached {
-            if cached.versions.is_empty() {
-                return true;
-            }
-            return cached.versions[0].header.version_type == VersionType::Delete;
+            return cached
+                .versions
+                .iter()
+                .find(|version| !version.header.free_version())
+                .is_none_or(|version| version.header.version_type == VersionType::Delete);
         }
 
         if !FileMeta::is_xl2_v1_format(&self.metadata) {
@@ -179,12 +180,11 @@ impl MetaCacheEntry {
         }
 
         match self.xl_meta() {
-            Ok(res) => {
-                if res.versions.is_empty() {
-                    return true;
-                }
-                res.versions[0].header.version_type == VersionType::Delete
-            }
+            Ok(res) => res
+                .versions
+                .iter()
+                .find(|version| !version.header.free_version())
+                .is_none_or(|version| version.header.version_type == VersionType::Delete),
             Err(_) => true,
         }
     }
@@ -753,16 +753,27 @@ impl MetaCacheEntries {
             return directory.cloned();
         }
 
-        if objs_agree == objs_valid {
+        if objs_agree == objs_valid
+            && (!enforce_write_quorum
+                || (params.requested_versions == 1
+                    && selected_borrowed
+                        .versions
+                        .as_slice()
+                        .first()
+                        .is_some_and(|(header, _, _)| !header.free_version())))
+        {
             let required_quorum = if enforce_write_quorum {
                 selected_borrowed
                     .versions
                     .as_slice()
                     .first()
                     .map(|(hdr, _, meta)| {
-                        crate::filemeta::write_quorum_from_header_and_meta(hdr, meta, params.obj_quorum)
-                            .saturating_sub(params.write_quorum_slack)
-                            .max(params.obj_quorum)
+                        crate::filemeta::listing_quorum_from_header_and_meta(
+                            hdr,
+                            meta,
+                            params.obj_quorum,
+                            params.write_quorum_slack,
+                        )
                     })
                     .unwrap_or(params.obj_quorum)
             } else {
@@ -816,6 +827,10 @@ impl MetaCacheEntries {
         }
         debug_assert_eq!(streams.len(), objs_valid);
 
+        let had_user_versions = enforce_write_quorum
+            && streams
+                .iter()
+                .any(|stream| stream.iter().any(|(header, _)| !header.free_version()));
         let versions = crate::filemeta::merge_file_meta_borrowed_streams(
             params.obj_quorum,
             params.strict,
@@ -824,7 +839,7 @@ impl MetaCacheEntries {
             params.write_quorum_slack,
             streams,
         );
-        if versions.is_empty() {
+        if versions.is_empty() || (had_user_versions && versions.iter().all(|version| version.header.free_version())) {
             debug!(
                 selected = %selected_ref.name,
                 requested_versions = params.requested_versions,
@@ -2859,6 +2874,25 @@ mod tests {
             .expect("resolved committed metadata should decode as file info");
         assert_eq!(info.mod_time, Some(old_mod_time));
         assert_eq!(info.metadata.get("etag").map(String::as_str), Some("old-etag"));
+    }
+
+    #[test]
+    fn listing_quorum_never_relaxes_a_versions_read_quorum() {
+        let time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("fixture time");
+        for (data, parity, copies, expected) in [(8, 8, 8, true), (12, 4, 8, false), (12, 4, 11, false), (12, 4, 12, true)] {
+            let entry = metacache_entry_with_erasure(time, "etag", data, parity);
+            let entries = MetaCacheEntries(vec![Some(entry); copies]);
+            let resolved = entries.resolve_with_write_quorum(MetadataResolutionParams {
+                obj_quorum: 8,
+                dir_quorum: 8,
+                requested_versions: 1,
+                bucket: "bucket".to_string(),
+                strict: true,
+                write_quorum_slack: 16 - copies,
+                ..Default::default()
+            });
+            assert_eq!(resolved.is_some(), expected, "layout {data}+{parity}, {copies} copies");
+        }
     }
 
     #[test]
