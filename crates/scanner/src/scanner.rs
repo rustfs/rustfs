@@ -54,9 +54,9 @@ use rustfs_data_usage::observed_data_usage_is_newer;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_lock::{NamespaceLockGuard, error::LockError};
 use rustfs_scanner_metrics::metrics::{
-    CurrentCycle, Metric, Metrics, RemoteScanProgress, ScanCyclePartialReason, ScanCycleWorkSnapshot, ScannerUsageSaveResult,
-    ScannerWorkSource, emit_scan_cycle_complete, emit_scan_cycle_deferred, emit_scan_cycle_partial_with_source,
-    emit_scan_cycle_superseded, global_metrics,
+    CurrentCycle, Metric, Metrics, RemoteScanProgress, ScanCyclePartialReason, ScanCycleWorkSnapshot,
+    ScannerUsagePublicationObservation, ScannerUsageSaveResult, ScannerWorkSource, emit_scan_cycle_complete,
+    emit_scan_cycle_deferred, emit_scan_cycle_partial_with_source, emit_scan_cycle_superseded, global_metrics,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1793,7 +1793,8 @@ where
     let now = Instant::now();
     cycle_info.started = Utc::now();
 
-    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone(), cycle_budget.remote_scan_progress()).await;
+    let mut cycle_metrics_guard =
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), leader_epoch, cycle_budget.remote_scan_progress()).await;
 
     // Refresh the storage-owned movement snapshot before reading background
     // heal state. A missing heal object yields an in-memory default; do not
@@ -2274,6 +2275,14 @@ where
         mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Failed;
     }
+    cycle_metrics_guard
+        .publication
+        .record(usage_publication_result.observation_for_attempt(
+            leader_epoch,
+            cycle_info.current,
+            !scan_cycle_result.has_usage_update(),
+            usage_persist_outcome,
+        ));
     let required_cycle_floor = scan_cycle_result.required_cycle_floor();
     let pre_commit_outcome = scanner_cycle_pre_commit_outcome(required_cycle_floor, &usage_persist_outcome);
     update_scanner_cache_cycle_recovery_status(
@@ -2641,21 +2650,25 @@ where
 
 struct ScannerCycleMetricsGuard {
     start: Option<ScanCycleWorkSnapshot>,
+    publication: Arc<ScannerUsagePublicationObservation>,
 }
 
 impl ScannerCycleMetricsGuard {
-    async fn new(cycle: CurrentCycle, remote_progress: Arc<RemoteScanProgress>) -> Self {
+    async fn new(cycle: CurrentCycle, leader_epoch: u64, remote_progress: Arc<RemoteScanProgress>) -> Self {
+        let publication = Arc::new(ScannerUsagePublicationObservation::new(leader_epoch, cycle.current));
         Self {
             start: Some(
                 global_metrics()
-                    .start_scan_cycle_work_with_cycle_and_remote_progress(cycle, remote_progress)
+                    .start_scan_cycle_work_with_publication(cycle, remote_progress, publication.clone())
                     .await,
             ),
+            publication,
         }
     }
 
     async fn finish(&mut self, cycle: CurrentCycle) {
         if let Some(start) = self.start {
+            self.publication.finish();
             global_metrics().finish_scan_cycle_work_with_cycle(start, cycle).await;
             self.start = None;
         }
@@ -2665,6 +2678,7 @@ impl ScannerCycleMetricsGuard {
 impl Drop for ScannerCycleMetricsGuard {
     fn drop(&mut self) {
         if let Some(start) = self.start.take() {
+            self.publication.interrupt();
             global_metrics().finish_scan_cycle_work(start);
         }
     }
