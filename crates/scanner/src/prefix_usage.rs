@@ -361,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_set_aggregation_merges_untruncated_set_breakdowns_before_Applying_max_entries() {
+    fn multi_set_aggregation_merges_untruncated_set_breakdowns_before_applying_max_entries() {
         use crate::data_usage_define::{DataUsageCache, DataUsageEntry};
 
         let mut set0 = DataUsageCache::default();
