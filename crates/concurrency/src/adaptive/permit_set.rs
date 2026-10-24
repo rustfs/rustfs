@@ -1,14 +1,14 @@
 // Copyright 2026 RustFS Team
 // Licensed under the Apache License, Version 2.0.
 
-//! Bounded, allocation-free ownership of already admitted resource subsets.
+//! Bounded admission and ownership of physical resource subsets.
 
 use std::io;
 use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{AdaptiveAdmission, AdaptivePermit, MAX_PERMIT_REFERENCES};
+use super::{AdaptiveAdmission, AdaptivePermit, MAX_PERMIT_REFERENCES, NodeAdmission, NodePermit};
 
 /// Matches the bounded physical-device topology. Construct owners during disk
 /// attachment, before object work; this does not acquire or discover resources.
@@ -19,6 +19,7 @@ const MAX_OWNERS: usize = 256;
 /// Different subsets can retain the same admitted unit without charging it twice.
 pub struct AdaptivePermitSetOwner {
     owners: Box<[Arc<AdaptiveAdmission>]>,
+    turn_order: Box<[usize]>,
     capacity: Arc<AdaptiveAdmission>,
     units: Box<[AtomicUsize]>,
 }
@@ -59,10 +60,48 @@ pub struct AdaptivePermitSet {
     slot: usize,
 }
 
+/// A whole resource set and its async scheduling unit. Native work may retain
+/// resource subsets through `resources`, but cannot retain the node unit.
+#[must_use = "retain admission until the async operation finishes"]
+pub struct NodeResourcePermit {
+    resources: AdaptivePermitSet,
+    node: NodePermit,
+}
+
+impl NodeResourcePermit {
+    /// Admitted physical units, available for per-disk native ownership.
+    pub fn resources(&self) -> &AdaptivePermitSet {
+        &self.resources
+    }
+
+    /// Return physical ownership before recording and releasing node progress.
+    pub fn complete(self) {
+        let Self { resources, node } = self;
+        drop(resources);
+        node.complete();
+    }
+}
+
+struct ResourceTurns<'a> {
+    owner: &'a AdaptivePermitSetOwner,
+    held: usize,
+}
+
+impl Drop for ResourceTurns<'_> {
+    fn drop(&mut self) {
+        for owner in &self.owner.owners {
+            owner.queued.fetch_sub(1, Ordering::AcqRel);
+        }
+        for index in self.owner.turn_order[..self.held].iter().rev() {
+            self.owner.owners[*index].turn.add_permits(1);
+        }
+    }
+}
+
 impl AdaptivePermitSetOwner {
     /// Reserve a bounded carrier pool outside object work. `maximum` bounds
-    /// concurrent captured subsets, including native tails. Resource admission
-    /// itself remains the caller's responsibility, before storage locks.
+    /// concurrent captured subsets, including native tails. Admission must run
+    /// before storage locks; capturing already admitted subsets never waits.
     pub fn new(maximum: NonZeroU16, owners: Vec<Arc<AdaptiveAdmission>>) -> io::Result<Arc<Self>> {
         if owners.is_empty()
             || owners.len() > MAX_OWNERS
@@ -79,8 +118,13 @@ impl AdaptivePermitSetOwner {
         let mut units = Vec::new();
         units.try_reserve_exact(count * owners.len()).map_err(io::Error::other)?;
         units.extend((0..count * owners.len()).map(|_| AtomicUsize::new(0)));
+        // All overlapping sets take FIFO turns in the same order, irrespective
+        // of disk attachment order. Strong references keep these addresses stable.
+        let mut turn_order: Vec<_> = (0..owners.len()).collect();
+        turn_order.sort_unstable_by_key(|index| Arc::as_ptr(&owners[*index]));
         Ok(Arc::new(Self {
             owners: owners.into_boxed_slice(),
+            turn_order: turn_order.into_boxed_slice(),
             capacity: AdaptiveAdmission::new(maximum, u32::from(maximum.get())),
             units: units.into_boxed_slice(),
         }))
@@ -121,13 +165,130 @@ impl AdaptivePermitSetOwner {
             self.release_units(index, retained);
             return Err(error);
         }
-        // Transfer the private pool lease to the carrier. Only this local
+        Ok(self.finish_capture(index))
+    }
+
+    /// Retain only this owner's physical leaves from an admitted parent set.
+    /// Owner identity also rejects stale device incarnations. No new admission,
+    /// allocation, or wait occurs while projecting native I/O ownership.
+    pub fn capture_from(self: &Arc<Self>, source: &AdaptivePermitSet) -> Result<AdaptivePermitSet, CaptureError> {
+        if Arc::ptr_eq(self, &source.owner) {
+            // A single-disk plan is already its native subset. Reuse that row
+            // so a full carrier pool does not block its own admitted operation.
+            return Ok(source.clone());
+        }
+        let slot = self.capacity.try_acquire().ok_or(CaptureError::Full)?;
+        let first_unit = slot.slot * self.owners.len();
+        let source_first = source.slot * source.owner.owners.len();
+        for (index, expected) in self.owners.iter().enumerate() {
+            let Some(source_index) = source.owner.owners.iter().position(|owner| Arc::ptr_eq(owner, expected)) else {
+                self.release_units(slot.slot, index);
+                return Err(CaptureError::ResourceOwner);
+            };
+            // The borrowed source keeps every referenced unit alive throughout
+            // projection, even if other carriers release their references.
+            let unit_slot = source.owner.units[source_first + source_index].load(Ordering::Relaxed);
+            if expected.slots[unit_slot / 64].references[unit_slot % 64]
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |references| {
+                    (references < MAX_PERMIT_REFERENCES).then(|| references + 1)
+                })
+                .is_err()
+            {
+                self.release_units(slot.slot, index);
+                return Err(CaptureError::ReferenceOverflow);
+            }
+            self.units[first_unit + index].store(unit_slot, Ordering::Relaxed);
+        }
+        Ok(self.finish_capture(slot.slot))
+    }
+
+    /// Attempt the whole set without waiting or retaining a partial grant.
+    pub fn try_acquire_with_node(self: &Arc<Self>, node: &Arc<NodeAdmission>) -> Option<NodeResourcePermit> {
+        let slot = self.capacity.try_acquire()?;
+        let node = node.try_acquire()?;
+        let resources = self.acquire_units(slot.slot, false).ok()?;
+        Some(NodeResourcePermit { resources, node })
+    }
+
+    /// Acquire physical FIFO turns in stable owner order, then wait for node
+    /// capacity only when all physical leaves are ready. No physical or node
+    /// unit is held while waiting for a physical leaf. Callers must impose their
+    /// cancellation/deadline and enter before cache or namespace locks.
+    pub async fn acquire_with_node(
+        self: &Arc<Self>,
+        node: &Arc<NodeAdmission>,
+    ) -> Result<NodeResourcePermit, tokio::sync::AcquireError> {
+        if let Some(permit) = self.try_acquire_with_node(node) {
+            return Ok(permit);
+        }
+        // This reserves bookkeeping only, not a physical or scheduling unit.
+        let slot = self.capacity.acquire().await;
+        for owner in &self.owners {
+            owner.queued.fetch_add(1, Ordering::AcqRel);
+        }
+        let mut turns = ResourceTurns { owner: self, held: 0 };
+        for index in &self.turn_order {
+            self.owners[*index].turn.acquire().await?.forget();
+            turns.held += 1;
+        }
+        loop {
+            for owner in &self.owners {
+                Self::wait_available(owner).await;
+            }
+            let node = node.acquire().await;
+            match self.acquire_units(slot.slot, true) {
+                Ok(resources) => return Ok(NodeResourcePermit { resources, node }),
+                Err(index) => {
+                    // A leaf may shrink or expire during the node wait. Return
+                    // node capacity before any further wait on that leaf.
+                    drop(node);
+                    Self::wait_available(&self.owners[index]).await;
+                }
+            }
+        }
+    }
+
+    async fn wait_available(owner: &AdaptiveAdmission) {
+        loop {
+            let notified = owner.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let snapshot = owner.snapshot();
+            if snapshot.active < snapshot.limit && owner.slots.iter().any(|slots| slots.free.load(Ordering::Acquire) != 0) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn acquire_units(self: &Arc<Self>, slot: usize, owns_turns: bool) -> Result<AdaptivePermitSet, usize> {
+        let first_unit = slot * self.owners.len();
+        for (index, owner) in self.owners.iter().enumerate() {
+            let unit = if owns_turns {
+                owner.acquire_capacity()
+            } else {
+                owner.try_acquire()
+            };
+            let Some(unit) = unit else {
+                self.release_units(slot, index);
+                return Err(index);
+            };
+            // This newly acquired unit has only its local reference, so adding
+            // the carrier reference cannot overflow. Its local drop leaves one.
+            owner.slots[unit.slot / 64].references[unit.slot % 64].fetch_add(1, Ordering::Relaxed);
+            self.units[first_unit + index].store(unit.slot, Ordering::Relaxed);
+        }
+        Ok(self.finish_capture(slot))
+    }
+
+    fn finish_capture(self: &Arc<Self>, index: usize) -> AdaptivePermitSet {
+        // Transfer the private pool lease to the carrier. Only the local
         // permit owns the new slot; its drop below leaves one retained reference.
         self.capacity.slots[index / 64].references[index % 64].fetch_add(1, Ordering::Relaxed);
-        Ok(AdaptivePermitSet {
+        AdaptivePermitSet {
             owner: self.clone(),
             slot: index,
-        })
+        }
     }
 
     fn release_units(&self, slot: usize, count: usize) {
@@ -169,6 +330,11 @@ impl Drop for AdaptivePermitSet {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Waker};
+    use std::time::Duration;
+
     use super::*;
 
     fn maximum(value: u16) -> NonZeroU16 {
@@ -177,6 +343,319 @@ mod tests {
 
     fn gate(limit: u16) -> Arc<AdaptiveAdmission> {
         AdaptiveAdmission::new(maximum(limit), u32::from(limit))
+    }
+
+    fn node(limit: u16) -> Arc<NodeAdmission> {
+        let node = NodeAdmission::new(maximum(limit));
+        node.capacity.set_limit(u32::from(limit));
+        node
+    }
+
+    fn assert_pending<T>(future: Pin<&mut impl Future<Output = T>>) {
+        assert!(future.poll(&mut Context::from_waker(Waker::noop())).is_pending());
+    }
+
+    #[tokio::test]
+    async fn cancelled_group_wait_returns_all_turns_without_holding_partial_capacity() {
+        let a = gate(1);
+        let b = gate(1);
+        b.set_limit(0);
+        let node = node(1);
+        let group = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("group");
+        assert!(group.try_acquire_with_node(&node).is_none());
+        let mut pending = Box::pin(group.acquire_with_node(&node));
+        assert_pending(pending.as_mut());
+        assert_eq!(a.snapshot().active, 0, "partial physical capacity is never held across a wait");
+        assert_eq!(b.snapshot().active, 0);
+        assert_eq!(node.snapshot().active, 0, "a blocked disk cannot reserve node capacity");
+        assert_eq!(group.capacity.snapshot().active, 1, "only a bookkeeping row is reserved");
+        drop(pending);
+        assert_eq!(group.capacity.snapshot().active, 0);
+        for owner in [&a, &b] {
+            assert_eq!(owner.queued.load(Ordering::Acquire), 0);
+            assert_eq!(owner.turn.available_permits(), 1);
+        }
+        assert!(a.try_acquire().is_some());
+        b.set_limit(1);
+        group
+            .try_acquire_with_node(&node)
+            .expect("cancel returned every reservation")
+            .complete();
+        assert_eq!(node.completed(), Some(1));
+        assert_eq!(node.snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn shrink_during_node_wait_refunds_node_before_waiting_again() {
+        let a = gate(1);
+        let b = gate(1);
+        let c = gate(1);
+        let node = node(1);
+        let group = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("group");
+        let unrelated = AdaptivePermitSetOwner::new(maximum(1), vec![c.clone()]).expect("unrelated group");
+        let busy = node.try_acquire().expect("busy node");
+        let mut pending = Box::pin(group.acquire_with_node(&node));
+        assert_pending(pending.as_mut());
+        assert_eq!(a.snapshot().active, 0);
+        assert_eq!(b.snapshot().active, 0);
+        b.set_limit(0);
+        drop(busy);
+        assert_pending(pending.as_mut());
+        assert_eq!(a.snapshot().active, 0, "failed acquisition returned its prefix");
+        assert_eq!(node.snapshot().active, 0, "node is refunded before waiting on the shrunken leaf");
+        unrelated
+            .try_acquire_with_node(&node)
+            .expect("healthy device can progress")
+            .complete();
+        assert_eq!(node.completed(), Some(1));
+        b.set_limit(1);
+        let admitted = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("group resumes after capacity returns")
+            .expect("turns stay open");
+        assert_eq!(a.snapshot().active, 1);
+        assert_eq!(b.snapshot().active, 1);
+        drop(admitted);
+        assert_eq!(node.completed(), Some(1), "cancellation does not count completed work");
+    }
+
+    #[tokio::test]
+    async fn reversed_attachment_order_uses_one_turn_order_and_blocks_fast_bargers() {
+        let a = gate(1);
+        let b = gate(1);
+        let node = node(2);
+        let ab = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("ab");
+        let ba = AdaptivePermitSetOwner::new(maximum(1), vec![b.clone(), a.clone()]).expect("ba");
+        for (ab_index, ba_index) in ab.turn_order.iter().zip(ba.turn_order.iter()) {
+            assert!(Arc::ptr_eq(&ab.owners[*ab_index], &ba.owners[*ba_index]));
+        }
+        let held = b.try_acquire().expect("prior native unit");
+        let mut first = Box::pin(ab.acquire_with_node(&node));
+        let mut second = Box::pin(ba.acquire_with_node(&node));
+        assert_pending(first.as_mut());
+        assert_pending(second.as_mut());
+        for _ in 0..1_000 {
+            assert!(a.try_acquire().is_none(), "fast path cannot steal a queued group's leaf");
+            assert!(ba.try_acquire_with_node(&node).is_none());
+        }
+        drop(held);
+        let first = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("first group progresses")
+            .expect("open turns");
+        assert_pending(second.as_mut());
+        first.complete();
+        tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("reverse group progresses")
+            .expect("open turns")
+            .complete();
+        assert_eq!(node.completed(), Some(2));
+        for owner in [&a, &b] {
+            assert_eq!(owner.snapshot().active, 0);
+            assert_eq!(owner.queued.load(Ordering::Acquire), 0);
+            assert_eq!(owner.turn.available_permits(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_turn_failure_returns_prior_turns_and_bookkeeping() {
+        let a = gate(1);
+        let b = gate(1);
+        let group = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("group");
+        let node = node(1);
+        let held = node.try_acquire().expect("force slow path");
+        group.owners[group.turn_order[1]].turn.close();
+        assert!(group.acquire_with_node(&node).await.is_err());
+        assert_eq!(group.capacity.snapshot().active, 0);
+        assert_eq!(group.owners[group.turn_order[0]].turn.available_permits(), 1);
+        for owner in [&a, &b] {
+            assert_eq!(owner.queued.load(Ordering::Acquire), 0);
+            assert_eq!(owner.snapshot().active, 0);
+        }
+        drop(held);
+        assert_eq!(node.snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_a_later_turn_refunds_only_owned_turns() {
+        let group = AdaptivePermitSetOwner::new(maximum(1), vec![gate(1), gate(1)]).expect("group");
+        let node = node(1);
+        let node_busy = node.try_acquire().expect("force slow path");
+        let second = &group.owners[group.turn_order[1]];
+        let second_busy = second.turn.acquire().await.expect("prior turn holder");
+        let mut pending = Box::pin(group.acquire_with_node(&node));
+        assert_pending(pending.as_mut());
+        drop(pending);
+        assert_eq!(group.capacity.snapshot().active, 0);
+        assert_eq!(group.owners[group.turn_order[0]].turn.available_permits(), 1);
+        assert_eq!(second.turn.available_permits(), 0, "another holder's turn must not be refunded");
+        for owner in &group.owners {
+            assert_eq!(owner.queued.load(Ordering::Acquire), 0);
+            assert_eq!(owner.snapshot().active, 0);
+        }
+        drop((second_busy, node_busy));
+        group.acquire_with_node(&node).await.expect("turns recovered").complete();
+        assert_eq!(node.completed(), Some(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_groups_survive_concurrent_shrink_cancellation_and_native_tails() {
+        let a = gate(2);
+        let b = gate(2);
+        let node = node(2);
+        let ab = AdaptivePermitSetOwner::new(maximum(8), vec![a.clone(), b.clone()]).expect("ab");
+        let ba = AdaptivePermitSetOwner::new(maximum(8), vec![b.clone(), a.clone()]).expect("ba");
+        let native = AdaptivePermitSetOwner::new(maximum(8), vec![b.clone()]).expect("native leaf");
+        let mut jobs = tokio::task::JoinSet::new();
+        for worker in 0..8 {
+            let group = if worker % 2 == 0 { ab.clone() } else { ba.clone() };
+            let node = node.clone();
+            let native = native.clone();
+            jobs.spawn(async move {
+                for iteration in 0..100 {
+                    let parent = group.acquire_with_node(&node).await.expect("open turns");
+                    let tail = native.capture_from(parent.resources()).expect("native subset");
+                    if iteration % 2 == 0 {
+                        parent.complete();
+                    } else {
+                        drop(parent);
+                    }
+                    tokio::task::yield_now().await;
+                    drop(tail);
+                }
+            });
+        }
+        let resized = b.clone();
+        jobs.spawn(async move {
+            for _ in 0..500 {
+                resized.set_limit(0);
+                tokio::task::yield_now().await;
+                resized.set_limit(2);
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(result) = jobs.join_next().await {
+                result.expect("workers finish without panic");
+            }
+        })
+        .await
+        .expect("all groups retain progress under finite resizes and tails");
+        assert_eq!(node.completed(), Some(400), "cancelled operations never count as completed");
+        assert_eq!(node.snapshot().active, 0);
+        for owner in [&a, &b] {
+            assert_eq!(owner.snapshot().active, 0);
+            assert_eq!(owner.queued.load(Ordering::Acquire), 0);
+            assert_eq!(owner.turn.available_permits(), 1);
+        }
+        for group in [&ab, &ba, &native] {
+            assert_eq!(group.capacity.snapshot().active, 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_leaf_after_node_wait_does_not_use_its_old_capacity() {
+        let physical = gate(1);
+        physical.set_sampled_limit(1, Duration::from_secs(1));
+        let group = AdaptivePermitSetOwner::new(maximum(1), vec![physical.clone()]).expect("group");
+        let node = node(1);
+        let busy = node.try_acquire().expect("busy node");
+        let mut pending = Box::pin(group.acquire_with_node(&node));
+        assert_pending(pending.as_mut());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        drop(busy);
+        assert_pending(pending.as_mut());
+        assert_eq!(physical.snapshot().active, 0);
+        assert_eq!(node.snapshot().active, 0);
+        physical.set_sampled_limit(1, Duration::from_secs(1));
+        pending.await.expect("renewal resumes admission").complete();
+        assert_eq!(node.completed(), Some(1));
+    }
+
+    #[test]
+    fn projected_native_alias_retains_only_its_leaf_after_parent_cancellation() {
+        let a = gate(1);
+        let b = gate(1);
+        let node = node(1);
+        let group = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("group");
+        let healthy = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone()]).expect("healthy");
+        let source = AdaptivePermitSetOwner::new(maximum(1), vec![b.clone()]).expect("source");
+        let target = AdaptivePermitSetOwner::new(maximum(1), vec![b.clone()]).expect("target alias");
+        let parent = group.try_acquire_with_node(&node).expect("whole group");
+        let read = source.capture_from(parent.resources()).expect("native source");
+        let write = target.capture_from(parent.resources()).expect("target shares physical unit");
+        assert_eq!(b.snapshot().active, 1);
+        drop(parent);
+        assert_eq!(node.snapshot().active, 0);
+        assert_eq!(node.completed(), Some(0));
+        assert_eq!(a.snapshot().active, 0);
+        healthy
+            .try_acquire_with_node(&node)
+            .expect("healthy device resumes")
+            .complete();
+        b.set_limit(0);
+        drop(read);
+        assert_eq!(b.snapshot().active, 1, "target native I/O still owns the original unit");
+        drop(write);
+        assert_eq!(b.snapshot().active, 0);
+        assert!(b.try_acquire().is_none(), "native completion cannot reopen an expired or closed owner");
+    }
+
+    #[test]
+    fn identical_native_subset_reuses_the_parent_carrier_at_capacity_one() {
+        let physical = gate(1);
+        let group = AdaptivePermitSetOwner::new(maximum(1), vec![physical.clone()]).expect("single disk plan");
+        let node = node(1);
+        let parent = group.try_acquire_with_node(&node).expect("parent owns the sole carrier");
+        let native = group
+            .capture_from(parent.resources())
+            .expect("same subset shares its carrier");
+        drop(parent);
+        assert_eq!(node.snapshot().active, 0);
+        assert_eq!(physical.snapshot().active, 1);
+        assert!(group.try_acquire_with_node(&node).is_none());
+        drop(native);
+        assert_eq!(physical.snapshot().active, 0);
+        group
+            .try_acquire_with_node(&node)
+            .expect("native released the shared carrier")
+            .complete();
+        assert_eq!(node.completed(), Some(1));
+    }
+
+    #[test]
+    fn projection_rejects_replacement_and_overflow_without_leaking_prefix() {
+        let a = gate(1);
+        let b = gate(1);
+        let replacement = gate(1);
+        let node = node(1);
+        let group = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("group");
+        let parent = group.try_acquire_with_node(&node).expect("parent");
+        let wrong = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), replacement]).expect("replacement subset");
+        assert_eq!(
+            wrong.capture_from(parent.resources()).expect_err("wrong incarnation"),
+            CaptureError::ResourceOwner
+        );
+        assert_eq!(wrong.capacity.snapshot().active, 0);
+        let same = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("same subset");
+        let b_slot = group.units[parent.resources.slot * 2 + 1].load(Ordering::Relaxed);
+        let count = &b.slots[b_slot / 64].references[b_slot % 64];
+        count.store(MAX_PERMIT_REFERENCES, Ordering::Relaxed);
+        assert_eq!(
+            same.capture_from(parent.resources()).expect_err("overflow"),
+            CaptureError::ReferenceOverflow
+        );
+        assert_eq!(count.load(Ordering::Relaxed), MAX_PERMIT_REFERENCES);
+        count.store(1, Ordering::Relaxed);
+        let captured = same
+            .capture_from(parent.resources())
+            .expect("rejected projection freed carrier");
+        assert_eq!(same.capture_from(parent.resources()).expect_err("live carrier"), CaptureError::Full);
+        drop((parent, captured));
+        assert_eq!(a.snapshot().active, 0, "both rejected prefixes were refunded");
+        assert_eq!(b.snapshot().active, 0);
+        assert_eq!(node.snapshot().active, 0);
     }
 
     #[test]
