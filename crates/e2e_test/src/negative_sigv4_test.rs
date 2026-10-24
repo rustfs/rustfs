@@ -230,6 +230,302 @@ fn encode_unsigned_aws_chunked_with_sha256_trailer(decoded: &[u8]) -> Vec<u8> {
     encoded
 }
 
+/// Sign the data and terminating chunks independently of the server decoder.
+fn encode_signed_aws_chunked(signer: &SigV4, headers: &SignedHeaders, decoded: &[u8], trailer: bool) -> Vec<u8> {
+    let mut previous = headers
+        .authorization
+        .rsplit_once("Signature=")
+        .expect("seed signature")
+        .1
+        .to_string();
+    let mut encoded = Vec::new();
+    for chunk in [decoded, b"".as_slice()] {
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{previous}\n{}\n{}",
+            headers.amz_date,
+            get_scope(REGION, signer.time, "s3"),
+            sha256_hex(b""),
+            sha256_hex(chunk),
+        );
+        previous = get_signature(get_signing_key(&signer.secret_key, REGION, signer.time, "s3"), &string_to_sign);
+        encoded.extend_from_slice(format!("{:x};chunk-signature={previous}\r\n", chunk.len()).as_bytes());
+        encoded.extend_from_slice(chunk);
+        encoded.extend_from_slice(b"\r\n");
+    }
+    if trailer {
+        let checksum = sha256_base64(decoded);
+        let canonical = format!("x-amz-checksum-sha256:{checksum}\n");
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256-TRAILER\n{}\n{}\n{previous}\n{}",
+            headers.amz_date,
+            get_scope(REGION, signer.time, "s3"),
+            sha256_hex(canonical.as_bytes()),
+        );
+        let signature = get_signature(get_signing_key(&signer.secret_key, REGION, signer.time, "s3"), &string_to_sign);
+        encoded.extend_from_slice(
+            format!("x-amz-checksum-sha256:{checksum}\r\nx-amz-trailer-signature:{signature}\r\n\r\n").as_bytes(),
+        );
+    }
+    encoded
+}
+
+/// Exercise decoder failures through both storage publication boundaries.
+#[tokio::test]
+async fn aws_chunked_named_errors_reject_put_and_upload_part() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+    let client = env.create_s3_client();
+    let decoded = b"private-chunked-fixture-body";
+    let mut failures = Vec::new();
+    for multipart in [false, true] {
+        for (case, expected_status, expected_code) in [
+            ("signature", 403, "SignatureDoesNotMatch"),
+            ("final-signature", 403, "SignatureDoesNotMatch"),
+            ("format", 400, "IncompleteBody"),
+            ("metadata-at-limit", 400, "IncompleteBody"),
+            ("metadata-over-limit", 400, "EntityTooLarge"),
+            ("chunk-over-limit", 400, "EntityTooLarge"),
+            ("trailers-over-limit", 400, "IncompleteBody"),
+            ("too-many-trailers", 400, "IncompleteBody"),
+        ] {
+            let key = format!("chunked-{case}-{multipart}.bin");
+            let upload_id = if multipart {
+                Some(
+                    client
+                        .create_multipart_upload()
+                        .bucket(BUCKET)
+                        .key(&key)
+                        .send()
+                        .await?
+                        .upload_id()
+                        .ok_or("missing upload ID")?
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
+            let query = upload_id
+                .as_ref()
+                .map(|id| format!("partNumber=1&uploadId={}", urlencoding::encode(id)))
+                .unwrap_or_default();
+            let path = format!("/{BUCKET}/{key}");
+            let target = if query.is_empty() {
+                path.clone()
+            } else {
+                format!("{path}?{query}")
+            };
+            let signer = SigV4::new(&env);
+            let unsigned = matches!(case, "trailers-over-limit" | "too-many-trailers");
+            let mode = if unsigned {
+                UNSIGNED_PAYLOAD_TRAILER
+            } else {
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+            };
+            let length = decoded.len().to_string();
+            let mut extra = vec![
+                ("content-encoding", "aws-chunked"),
+                ("x-amz-decoded-content-length", length.as_str()),
+            ];
+            if unsigned {
+                extra.push(("x-amz-trailer", "x-amz-checksum-sha256"));
+            }
+            let headers = signer.sign_with_extra_headers("PUT", &path, &query, mode, &extra);
+            let encoded = match case {
+                "signature" | "final-signature" => {
+                    let mut body = encode_signed_aws_chunked(&signer, &headers, decoded, false);
+                    let offset = if case == "signature" {
+                        body.windows(2).position(|w| w == b"\r\n").expect("chunk header") + 2
+                    } else {
+                        body.len() - 5
+                    };
+                    body[offset] = if body[offset] == b'a' { b'b' } else { b'a' };
+                    body
+                }
+                "format" => b"invalid-chunk-size\r\n".to_vec(),
+                "metadata-at-limit" | "metadata-over-limit" => {
+                    let size = if case == "metadata-at-limit" { 1024 } else { 1025 };
+                    let mut body = vec![b'z'; size - 2];
+                    body.extend_from_slice(b"\r\n");
+                    body
+                }
+                "chunk-over-limit" => format!("10000001;chunk-signature={}\r\n", "0".repeat(64)).into_bytes(),
+                "trailers-over-limit" | "too-many-trailers" => {
+                    let mut body = format!("{:x}\r\n", decoded.len()).into_bytes();
+                    body.extend_from_slice(decoded);
+                    body.extend_from_slice(b"\r\n0\r\n");
+                    if case == "trailers-over-limit" {
+                        body.extend_from_slice(format!("x-private:{}\r\n\r\n", "v".repeat(16385 - 14)).as_bytes());
+                    } else {
+                        body.extend_from_slice("x-private:v\r\n".repeat(101).as_bytes());
+                        body.extend_from_slice(b"\r\n");
+                    }
+                    body
+                }
+                _ => unreachable!("all fixtures are enumerated"),
+            };
+            let mut request = local_http_client()
+                .put(format!("{}{target}", env.url))
+                .header("authorization", &headers.authorization)
+                .header("x-amz-content-sha256", &headers.content_sha256)
+                .header("x-amz-date", &headers.amz_date);
+            for (name, value) in extra {
+                request = request.header(name, value);
+            }
+            let response = request
+                .body(encoded)
+                .timeout(std::time::Duration::from_secs(20))
+                .send()
+                .await?;
+            let status = response.status().as_u16();
+            let body = response.text().await?;
+            eprintln!("aws-chunked {case} multipart={multipart}: HTTP {status}, {body}");
+            if status != expected_status || !body.contains(&format!("<Code>{expected_code}</Code>")) {
+                failures.push(format!(
+                    "{case} multipart={multipart}: expected {expected_status} {expected_code}, got {status} {body}"
+                ));
+            }
+            for private in [
+                "private-chunked-fixture-body",
+                "chunk-signature=",
+                "AwsChunkedStreamError",
+                "x-private",
+            ] {
+                if body.contains(private) {
+                    failures.push(format!("{case}: response exposed {private}"));
+                }
+            }
+            if let Some(id) = upload_id {
+                let parts = client.list_parts().bucket(BUCKET).key(&key).upload_id(&id).send().await?;
+                assert!(parts.parts().is_empty(), "{case}: rejected UploadPart published a part");
+                client
+                    .abort_multipart_upload()
+                    .bucket(BUCKET)
+                    .key(&key)
+                    .upload_id(id)
+                    .send()
+                    .await?;
+            }
+            let absent = client
+                .get_object()
+                .bucket(BUCKET)
+                .key(&key)
+                .send()
+                .await
+                .expect_err("a rejected body must not publish an object");
+            assert_eq!(absent.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn aws_chunked_valid_signed_and_trailer_boundaries_succeed() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+    let client = env.create_s3_client();
+    let decoded = b"valid-chunked-control";
+    for (case, multipart) in ["signed", "signed-trailer", "trailer-size-limit", "trailer-count-limit"]
+        .into_iter()
+        .flat_map(|case| [false, true].map(|multipart| (case, multipart)))
+    {
+        let key = format!("{case}-{multipart}");
+        let upload_id = if multipart {
+            Some(
+                client
+                    .create_multipart_upload()
+                    .bucket(BUCKET)
+                    .key(&key)
+                    .send()
+                    .await?
+                    .upload_id()
+                    .ok_or("missing upload ID")?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        let query = upload_id
+            .as_ref()
+            .map(|id| format!("partNumber=1&uploadId={}", urlencoding::encode(id)))
+            .unwrap_or_default();
+        let signer = SigV4::new(&env);
+        let path = format!("/{BUCKET}/{key}");
+        let target = if query.is_empty() {
+            path.clone()
+        } else {
+            format!("{path}?{query}")
+        };
+        let length = decoded.len().to_string();
+        let mode = match case {
+            "signed" => "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            "signed-trailer" => "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            _ => UNSIGNED_PAYLOAD_TRAILER,
+        };
+        let mut extra = vec![
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-decoded-content-length", length.as_str()),
+        ];
+        if case != "signed" {
+            extra.push(("x-amz-trailer", "x-amz-checksum-sha256"));
+        }
+        let headers = signer.sign_with_extra_headers("PUT", &path, &query, mode, &extra);
+        let mut encoded = if case.starts_with("signed") {
+            encode_signed_aws_chunked(&signer, &headers, decoded, case == "signed-trailer")
+        } else {
+            encode_unsigned_aws_chunked_with_sha256_trailer(decoded)
+        };
+        if !case.starts_with("signed") {
+            encoded.truncate(encoded.len() - 2);
+            if case == "trailer-size-limit" {
+                let checksum_line_size = format!("x-amz-checksum-sha256:{}\r\n", sha256_base64(decoded)).len();
+                encoded.extend_from_slice(format!("x-padding:{}\r\n", "v".repeat(16384 - checksum_line_size - 14)).as_bytes());
+            } else {
+                encoded.extend_from_slice("x-padding:v\r\n".repeat(99).as_bytes());
+            }
+            encoded.extend_from_slice(b"\r\n");
+        }
+        let mut request = local_http_client()
+            .put(format!("{}{target}", env.url))
+            .header("authorization", &headers.authorization)
+            .header("x-amz-content-sha256", &headers.content_sha256)
+            .header("x-amz-date", &headers.amz_date);
+        for (name, value) in extra {
+            request = request.header(name, value);
+        }
+        let response = request
+            .body(encoded)
+            .timeout(std::time::Duration::from_secs(20))
+            .send()
+            .await?;
+        let status = response.status();
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response.text().await?;
+        assert_eq!(status.as_u16(), 200, "{case}: {body}");
+        if let Some(id) = upload_id {
+            let part = aws_sdk_s3::types::CompletedPart::builder()
+                .part_number(1)
+                .e_tag(etag.ok_or("successful UploadPart omitted ETag")?)
+                .build();
+            client
+                .complete_multipart_upload()
+                .bucket(BUCKET)
+                .key(&key)
+                .upload_id(id)
+                .multipart_upload(aws_sdk_s3::types::CompletedMultipartUpload::builder().parts(part).build())
+                .send()
+                .await?;
+        }
+        let object = client.get_object().bucket(BUCKET).key(&key).send().await?;
+        assert_eq!(object.body.collect().await?.into_bytes().as_ref(), decoded, "{case}");
+    }
+    Ok(())
+}
+
 /// Positive control: a correctly hand-signed request must succeed. Without
 /// this, every negative assertion below could pass for the wrong reason (a
 /// broken signer that never produces a valid signature).

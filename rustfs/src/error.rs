@@ -554,6 +554,7 @@ fn body_read_error_code(err: &(dyn std::error::Error + 'static)) -> Option<S3Err
     let mut server_source_failed = false;
     let mut client_body_timed_out = false;
     let mut body_size_exceeded = false;
+    let mut aws_chunked_error = None;
     let mut incomplete_body = false;
     let digest = error_chain_find(err, |error| {
         if error.is::<rustfs_rio::Sha256Mismatch>()
@@ -569,14 +570,15 @@ fn body_read_error_code(err: &(dyn std::error::Error + 'static)) -> Option<S3Err
         server_source_failed |= error.is::<ServerSideSourceReadError>();
         client_body_timed_out |= error.is::<ClientBodyReadTimeout>();
         body_size_exceeded |= error.is::<s3s::BodySizeLimitExceeded>();
+        if let Some(chunked) = error.downcast_ref::<AwsChunkedStreamError>()
+            && !matches!(chunked, AwsChunkedStreamError::Underlying(_))
+        {
+            aws_chunked_error = Some(chunked.to_s3_error_code());
+        }
         incomplete_body |= error.is::<rustfs_rio::IncompleteBody>()
             || matches!(
                 error.downcast_ref::<UploadStreamError>(),
                 Some(UploadStreamError::LengthMismatch | UploadStreamError::Incomplete)
-            )
-            || matches!(
-                error.downcast_ref::<AwsChunkedStreamError>(),
-                Some(AwsChunkedStreamError::LengthMismatch | AwsChunkedStreamError::Incomplete)
             )
             || is_hyper_body_eof(error);
         None
@@ -590,6 +592,8 @@ fn body_read_error_code(err: &(dyn std::error::Error + 'static)) -> Option<S3Err
             Some(S3ErrorCode::RequestTimeout)
         } else if body_size_exceeded {
             Some(S3ErrorCode::EntityTooLarge)
+        } else if let Some(code) = aws_chunked_error {
+            Some(code)
         } else if incomplete_body {
             Some(S3ErrorCode::IncompleteBody)
         } else {
@@ -1440,6 +1444,137 @@ mod tests {
                 assert_eq!(error.code, S3ErrorCode::InternalError);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn aws_chunked_named_errors_preserve_http_contract_across_io_boundaries() {
+        use http_body_util::BodyExt as _;
+
+        for storage in [false, true] {
+            for nested in [false, true] {
+                for error in [
+                    AwsChunkedStreamError::SignatureMismatch,
+                    AwsChunkedStreamError::FormatError,
+                    AwsChunkedStreamError::Incomplete,
+                    AwsChunkedStreamError::LengthMismatch,
+                    AwsChunkedStreamError::ChunkMetaTooLarge(1025, 1024),
+                    AwsChunkedStreamError::ChunkDataTooLarge(257, 256),
+                    AwsChunkedStreamError::TrailersTooLarge(16385, 16384),
+                    AwsChunkedStreamError::TooManyTrailerHeaders(101, 100),
+                ] {
+                    let expected = error.to_s3_error_code();
+                    let expected_status = if expected == S3ErrorCode::SignatureDoesNotMatch {
+                        StatusCode::FORBIDDEN
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    };
+                    let error = IoError::other(error);
+                    let error = if nested {
+                        IoError::other(AwsChunkedStreamError::Underlying(Box::new(IoError::other(error))))
+                    } else {
+                        error
+                    };
+                    let api_error = if storage {
+                        ApiError::from(StorageError::Io(error))
+                    } else {
+                        ApiError::from(error)
+                    };
+                    assert_eq!(api_error.code, expected);
+                    assert_eq!(api_error.message, ApiError::error_code_to_message(&expected));
+                    assert!(error_chain_has_type::<AwsChunkedStreamError>(&api_error));
+                    let response = S3Error::from(api_error).to_http_response().expect("serialize chunked error");
+                    assert_eq!(response.status(), expected_status);
+                    let body = response
+                        .into_body()
+                        .collect()
+                        .await
+                        .expect("read chunked error XML")
+                        .to_bytes();
+                    let xml = std::str::from_utf8(&body).expect("error XML is UTF-8");
+                    assert!(xml.contains(&format!("<Code>{}</Code>", expected.as_str())));
+                    assert!(!xml.contains("AwsChunkedStreamError"));
+                    assert!(!xml.contains("16385"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aws_chunked_underlying_errors_retain_typed_marker_precedence() {
+        for storage in [false, true] {
+            for (inner, expected) in [
+                (IoError::other(UploadStreamError::Sha256Mismatch), CONTENT_SHA256_MISMATCH_CODE),
+                (IoError::other(UploadLimitExceeded { limit: 5 }), "EntityTooLarge"),
+                (
+                    IoError::other(ClientBodyReadTimeout {
+                        timeout: std::time::Duration::from_secs(300),
+                        raw_bytes_received: 0,
+                    }),
+                    "RequestTimeout",
+                ),
+                (IoError::other(s3s::BodySizeLimitExceeded { size: 6, limit: 5 }), "EntityTooLarge"),
+                (IoError::other("private underlying body diagnostic"), "InternalError"),
+            ] {
+                let error = IoError::other(AwsChunkedStreamError::Underlying(Box::new(inner)));
+                let error = if storage {
+                    ApiError::from(StorageError::Io(error))
+                } else {
+                    ApiError::from(error)
+                };
+                assert_eq!(error.code.as_str(), expected);
+            }
+            for chunked in [
+                AwsChunkedStreamError::SignatureMismatch,
+                AwsChunkedStreamError::FormatError,
+                AwsChunkedStreamError::ChunkDataTooLarge(257, 256),
+            ] {
+                let error = IoError::other(ServerSideSourceReadError::new("CopyObject", IoError::other(chunked)));
+                let error = if storage {
+                    ApiError::from(StorageError::Io(error))
+                } else {
+                    ApiError::from(error)
+                };
+                assert_eq!(error.code, S3ErrorCode::ServiceUnavailable);
+            }
+        }
+    }
+
+    #[test]
+    fn aws_chunked_classification_does_not_format_private_diagnostics() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        #[derive(Debug)]
+        struct Diagnostic {
+            displays: Arc<AtomicUsize>,
+            source: AwsChunkedStreamError,
+        }
+        impl std::fmt::Display for Diagnostic {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.displays.fetch_add(1, Ordering::Relaxed);
+                f.write_str("private chunk signature and body diagnostic")
+            }
+        }
+        impl std::error::Error for Diagnostic {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.source)
+            }
+        }
+        let displays = Arc::new(AtomicUsize::new(0));
+        let error = ApiError::from(IoError::other(Diagnostic {
+            displays: Arc::clone(&displays),
+            source: AwsChunkedStreamError::SignatureMismatch,
+        }));
+        assert_eq!(
+            displays.load(Ordering::Relaxed),
+            0,
+            "classified failures must not format discarded diagnostics"
+        );
+        assert_eq!(error.code, S3ErrorCode::SignatureDoesNotMatch);
+        assert!(!error.message.contains("private"));
+        assert!(error_chain_has_type::<AwsChunkedStreamError>(&error));
     }
 
     #[test]
