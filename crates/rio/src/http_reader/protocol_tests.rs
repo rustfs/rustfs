@@ -14,7 +14,7 @@
 
 use super::*;
 use axum::body::Body;
-use futures::stream;
+use futures::{StreamExt as _, stream};
 use hyper::{
     Request, Response,
     body::Incoming,
@@ -37,6 +37,7 @@ struct TlsPeer {
     outbound_tls: rustfs_tls_runtime::GlobalPublishedOutboundTlsState,
     connections: Arc<std::sync::atomic::AtomicUsize>,
     held_body_started: Arc<Notify>,
+    short_body_eof: Arc<Notify>,
     task: JoinHandle<()>,
 }
 
@@ -66,6 +67,8 @@ impl TlsPeer {
         let accepted = connections.clone();
         let held_body_started = Arc::new(Notify::new());
         let held_started = held_body_started.clone();
+        let short_body_eof = Arc::new(Notify::new());
+        let short_eof = short_body_eof.clone();
         let task = tokio::spawn(async move {
             let mut tasks = JoinSet::new();
             loop {
@@ -75,21 +78,42 @@ impl TlsPeer {
                         let acceptor = acceptor.clone();
                         let accepted = accepted.clone();
                         let held_started = held_started.clone();
+                        let short_eof = short_eof.clone();
                         tasks.spawn(async move {
                             let socket = acceptor.accept(socket).await.expect("TLS handshake");
                             accepted.fetch_add(1, Ordering::SeqCst);
                             let is_h2 = socket.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
                             let service = service_fn(move |request: Request<Incoming>| {
                                 let held_started = held_started.clone();
+                                let short_eof = short_eof.clone();
                                 async move {
-                                    let held = request.uri().path() == "/held";
-                                    let body = Body::from_stream(stream::once(async move {
+                                    let path = request.uri().path();
+                                    let held = path == "/held";
+                                    let bounded = path == "/bounded";
+                                    let short = path == "/short";
+                                    let delay_eof = bounded || path == "/unframed";
+                                    let body_stream = stream::once(async move {
                                         if held {
                                             held_started.notify_one();
                                         }
-                                        Ok::<_, Infallible>(Bytes::from(vec![0x5a; PAYLOAD_SIZE]))
-                                    }));
-                                    Ok::<_, Infallible>(Response::new(body))
+                                        let length = if short { PAYLOAD_SIZE / 2 } else { PAYLOAD_SIZE };
+                                        Ok::<_, Infallible>(Bytes::from(vec![0x5a; length]))
+                                    });
+                                    let body = if delay_eof {
+                                        Body::from_stream(body_stream.chain(stream::pending()))
+                                    } else if short {
+                                        Body::from_stream(body_stream.chain(stream::once(async move {
+                                            short_eof.notified().await;
+                                            Ok::<_, Infallible>(Bytes::new())
+                                        })))
+                                    } else {
+                                        Body::from_stream(body_stream)
+                                    };
+                                    let mut response = Response::new(body);
+                                    if bounded || short {
+                                        response.headers_mut().insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(PAYLOAD_SIZE));
+                                    }
+                                    Ok::<_, Infallible>(response)
                                 }
                             });
                             if is_h2 {
@@ -112,6 +136,7 @@ impl TlsPeer {
             },
             connections,
             held_body_started,
+            short_body_eof,
             task,
         }
     }
@@ -210,4 +235,65 @@ async fn auto_h2_shares_receive_credit_until_paused_body_is_dropped() {
     })
     .await
     .expect("releasing held credit must restore HTTP/2 progress");
+}
+
+#[tokio::test]
+async fn exact_length_framing_reuses_tls_connections_without_polling_eof() {
+    time::timeout(Duration::from_secs(10), async {
+        for (path, expected_connections) in [("unframed", 3), ("bounded", 1)] {
+            let peer = TlsPeer::start().await;
+            let client = peer.client(InternodeHttpProtocol::Http1).await;
+            for _ in 0..3 {
+                let mut response = client
+                    .get(format!("{}/{path}", peer.url))
+                    .send()
+                    .await
+                    .expect("bounded response headers");
+                assert_eq!(response.version(), Version::HTTP_11);
+                let mut received = Vec::new();
+                while received.len() < PAYLOAD_SIZE {
+                    let chunk = response
+                        .chunk()
+                        .await
+                        .expect("bounded body chunk")
+                        .expect("body must reach the requested length");
+                    received.extend_from_slice(&chunk);
+                }
+                assert_eq!(received, vec![0x5a; PAYLOAD_SIZE]);
+                // Match the EC consumer: stop at the known length without an EOF poll.
+                drop(response);
+            }
+            assert_eq!(peer.connections.load(Ordering::SeqCst), expected_connections, "framing: {path}");
+        }
+    })
+    .await
+    .expect("exact framing must permit idle reuse even when stream EOF is pending");
+}
+
+#[tokio::test]
+async fn exact_length_framing_rejects_short_tls_bodies() {
+    time::timeout(Duration::from_secs(10), async {
+        let peer = TlsPeer::start().await;
+        let client = peer.client(InternodeHttpProtocol::Http1).await;
+        let mut response = client
+            .get(format!("{}/short", peer.url))
+            .send()
+            .await
+            .expect("short response headers");
+        assert_eq!(response.version(), Version::HTTP_11);
+        assert_eq!(response.content_length(), Some(u64::try_from(PAYLOAD_SIZE).expect("test payload length")));
+        let first = response
+            .chunk()
+            .await
+            .expect("initial partial body")
+            .expect("partial body must arrive");
+        assert!(!first.is_empty());
+        peer.short_body_eof.notify_one();
+        assert!(
+            response.bytes().await.is_err(),
+            "a truncated fixed-length body must not become successful EOF"
+        );
+    })
+    .await
+    .expect("short fixed-length body must terminate with an error");
 }
