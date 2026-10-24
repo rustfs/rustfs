@@ -1256,7 +1256,7 @@ def release_batch_crash():
     """Observe real journals before SIGKILL without requiring test-only hooks."""
     import random
     rounds = []
-    for iteration in range(2):
+    for iteration, phase in enumerate(('prepared', 'receipts')):
         cluster = Cluster(f'release-batch-crash-{iteration}', drives=4)
         try:
             cluster.create()
@@ -1266,11 +1266,15 @@ def release_batch_crash():
             large = random.Random(2850).randbytes(1024 * 1024)
             payloads = {f'inline/object-{index:04d}': small for index in range(256)}
             payloads.update({f'external/object-{index:04d}': large for index in range(32)})
+            confirmed = {'confirmed/inline': small, 'confirmed/external': large}
             client.put_bucket(bucket)
             etags = {}
-            for key, payload in payloads.items():
+            for key, payload in {**payloads, **confirmed}.items():
                 client.put(bucket, key, payload)
                 etags[key] = client.last_headers['etag']
+            for key in confirmed:
+                client.delete(bucket, key)
+                wait_inventory(cluster, bucket, key, lambda inventory: all(not drive['exists'] for node in inventory for drive in node))
             request = {}
 
             def delete_batch():
@@ -1286,7 +1290,7 @@ def release_batch_crash():
                 except Exception as error:
                     request['exception'] = str(error)
 
-            inspect = (
+            counts = (
                 "from pathlib import Path\nimport json\n"
                 f"bucket={bucket!r}\n"
                 "print(json.dumps([{'prepared': len(list((d/bucket).rglob('delete-prepared'))), "
@@ -1297,64 +1301,77 @@ def release_batch_crash():
             thread.start()
             deadline = time.monotonic() + 30
             while True:
-                observation = cluster.inspect_data(inspect)
-                if any(drive['prepared'] for node in observation for drive in node):
+                observation = cluster.inspect_data(counts)
+                if any(drive[phase] for node in observation for drive in node):
                     break
                 if not thread.is_alive() or time.monotonic() >= deadline:
-                    raise AssertionError('a live batch with persisted preparation must be observed before the crash')
+                    raise AssertionError('the selected durable evidence must be observed in a live batch before the crash')
                 time.sleep(0.02)
             assert thread.is_alive(), 'the observed batch must still be active before SIGKILL'
             cluster.kill(0)
             thread.join(10)
             assert not thread.is_alive(), 'the interrupted client must finish'
-            acknowledged = set()
+            acknowledged = set(confirmed)
             if 'response' in request:
                 _, body = request['response']
                 for item in ET.fromstring(body):
                     if item.tag.rsplit('}', 1)[-1] == 'Deleted':
                         acknowledged.update(child.text for child in item if child.tag.rsplit('}', 1)[-1] == 'Key')
+            physical_probe = (
+                "from pathlib import Path\nimport json\n"
+                f"bucket={bucket!r};keys={list(payloads) + list(confirmed)!r}\n"
+                "result=[]\nfor d in Path('/data').glob('d*'):\n"
+                " root=d/bucket\n"
+                " result.append({'prepared':len(list(root.rglob('delete-prepared'))),"
+                "'receipts':len(list(root.rglob('delete-quorum-committed'))),"
+                "'live':[key for key in keys if (root/key/'xl.meta').is_file()],"
+                "'residue':[key for key in keys if (root/key).exists() and not (root/key/'xl.meta').is_file()]})\n"
+                "print(json.dumps(result))"
+            )
+
+            def wait_for_physical_settlement():
+                deadline = time.monotonic() + 90
+                while True:
+                    drives = [drive for node in cluster.inspect_data(physical_probe) for drive in node]
+                    if all(not drive['prepared'] and not drive['receipts'] and not drive['residue'] for drive in drives):
+                        live = set(drives[0]['live'])
+                        if all(set(drive['live']) == live for drive in drives):
+                            return live
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('automatic recovery must converge physically before any new S3 DELETE, LIST, GET, or admin request')
+                    time.sleep(0.05)
+
             cluster.restart()
-            deadline = time.monotonic() + 90
-            while True:
-                remaining = cluster.inspect_data(inspect)
-                if all(not drive['prepared'] and not drive['receipts'] for node in remaining for drive in node):
-                    break
-                if time.monotonic() >= deadline:
-                    raise TimeoutError('batch recovery must settle automatically without a new DELETE or admin request')
-                time.sleep(0.05)
-            present = set(client.list(bucket))
+            # Physical inspection precedes S3 listing, which can itself purge
+            # eligible residue and must not manufacture recovery evidence here.
+            present = wait_for_physical_settlement()
             assert present <= payloads.keys()
             assert not (present & acknowledged), 'acknowledged deletes cannot resurrect'
-            for key, payload in payloads.items():
+            assert set(client.list(bucket)) == present
+            for key, payload in {**payloads, **confirmed}.items():
                 status, body = client.request('GET', bucket + '/' + key, expected=(200, 404))
                 assert (status == 200) == (key in present)
                 if status == 200:
                     assert body == payload, 'every surviving key must preserve complete original bytes'
                     assert client.last_headers.get('etag') == etags[key], 'rollback must preserve the original ETag'
-            absent = sorted(payloads.keys() - present)
-            physical = cluster.inspect_data(
-                "from pathlib import Path\nimport json\n"
-                f"bucket={bucket!r};keys={absent!r}\n"
-                "print(json.dumps([str(d/bucket/key) for d in Path('/data').glob('d*') "
-                "for key in keys if (d/bucket/key).exists()]))"
-            )
-            assert all(not node for node in physical), 'automatic recovery cannot leave invisible object residue'
             cluster.stop_clean()
             cluster.restart()
-            assert set(client.list(bucket)) == present, 'a second recovery cannot change the settled key set'
+            assert wait_for_physical_settlement() == present, 'a second recovery cannot change the settled key set'
+            assert set(client.list(bucket)) == present
             for key in present:
                 assert client.get(bucket, key) == payloads[key], 'a second recovery must preserve complete bytes'
                 assert client.last_headers.get('etag') == etags[key], 'a second recovery must preserve the original ETag'
             client.batch_delete(bucket, list(payloads))
             assert client.list(bucket) == []
             client.delete_bucket(bucket)
-            rounds.append({'observed_before_kill': observation, 'acknowledged': len(acknowledged),
-                           'present': len(present), 'absent': len(payloads) - len(present),
-                           'complete_bytes_verified': len(present), 'second_restart_stable': True})
+            rounds.append({'observed_phase': phase, 'observed_before_kill': observation,
+                           'acknowledged': len(acknowledged), 'present': len(present),
+                           'absent': len(payloads) + len(confirmed) - len(present),
+                           'complete_bytes_and_etags_verified': len(present), 'second_restart_stable': True})
         finally:
             cluster.remove()
     return {'case': 'release-batch-crash', 'status': 'passed', 'rounds': rounds,
-            'fault_model': 'SIGKILL after observing persisted preparation; no deterministic stage barrier'}
+            'fault_model': 'SIGKILL after observing durable preparation or receipt; no deterministic instruction barrier'}
 
 def large_batch_delete():
     cluster = Cluster('batch-1000', nodes=4, drives=2)
