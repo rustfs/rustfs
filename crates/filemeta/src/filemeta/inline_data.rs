@@ -856,7 +856,7 @@ mod tests {
         assert!(invalid_request[8].validate_for_delete_operation().is_err());
         assert_indexed_matches_scalar(&original, &invalid_request);
 
-        let mut free_marker = original.clone();
+        let mut free_marker = original;
         let version = free_marker
             .versions
             .iter_mut()
