@@ -62,6 +62,20 @@ fn lifecycle_v2_reader_accepts_retained_unknown_generation_without_a_source_iden
 }
 
 #[test]
+fn lifecycle_reader_capability_matches_supported_formats() {
+    let mut payload = unknown_generation_payload();
+    payload["records"][0]["state"] = json!({"state": "active"});
+    for version in 0..=MRF_LIFECYCLE_READER_MAX_FORMAT_VERSION + 1 {
+        payload["format_version"] = json!(version);
+        assert_eq!(
+            decode_mrf_lifecycle_checkpoint(&lifecycle_reader_frame(&payload, version), 8192).is_ok(),
+            (1..=MRF_LIFECYCLE_READER_MAX_FORMAT_VERSION).contains(&version),
+            "advertised reader support must match the actual decoder for format {version}"
+        );
+    }
+}
+
+#[test]
 fn lifecycle_v2_reader_rejects_mislabeled_and_unsupported_formats() {
     let payload = unknown_generation_payload();
     for (payload_version, envelope_version) in [(1, 1), (1, 2), (2, 1), (3, 3)] {

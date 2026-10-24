@@ -217,6 +217,7 @@ pub const BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION: u32 = 2;
 pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v4\0";
 pub const REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-tier-remote-version-state-capability-v1\0";
 pub const CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-cross-pool-fence-capability-v1\0";
+pub const MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-mrf-lifecycle-reader-capability-v1\0";
 pub const ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-ilm-recovery-export-capability-v1\0";
 pub const TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX: &[u8] =
     b"rustfs-transition-transaction-compaction-capability-v1\0";
@@ -286,6 +287,30 @@ pub fn transition_transaction_compaction_capability_probe(nonce: &[u8; 16]) -> V
 pub fn is_transition_transaction_compaction_capability_probe(command: &[u8]) -> bool {
     command.len() == TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX.len() + 16
         && command.starts_with(TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn mrf_lifecycle_reader_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_mrf_lifecycle_reader_capability_probe(command: &[u8]) -> bool {
+    command.len() == MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn encode_mrf_lifecycle_reader_capability(
+    maximum_format_version: u8,
+    topology_member: &str,
+    process_epoch: &[u8; 16],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let identity = encode_remote_version_state_capability(topology_member, process_epoch)?;
+    let mut result = Vec::with_capacity(1 + identity.len());
+    result.push(maximum_format_version);
+    result.extend_from_slice(&identity);
+    Ok(result)
 }
 
 pub fn encode_remote_version_state_capability(
@@ -2477,6 +2502,39 @@ mod heal_control_tests {
     };
     use crate::heal_control;
     use std::time::Duration;
+
+    #[test]
+    fn mrf_lifecycle_reader_capability_probe_is_distinct_and_strict() {
+        let probe = super::mrf_lifecycle_reader_capability_probe(&[7; 16]);
+        let mut expected = b"rustfs-mrf-lifecycle-reader-capability-v1\0".to_vec();
+        expected.extend_from_slice(&[7; 16]);
+        assert_eq!(probe, expected);
+        assert!(super::is_mrf_lifecycle_reader_capability_probe(&probe));
+        assert!(!is_heal_control_capability_probe(&probe));
+        assert!(!is_cross_pool_fence_capability_probe(&probe));
+        assert!(!is_remote_version_state_capability_probe(&probe));
+        for length in 0..probe.len() {
+            assert!(!super::is_mrf_lifecycle_reader_capability_probe(&probe[..length]));
+        }
+        let mut trailing = probe.clone();
+        trailing.push(0);
+        assert!(!super::is_mrf_lifecycle_reader_capability_probe(&trailing));
+        let mut unknown = probe;
+        unknown[0] ^= 1;
+        assert!(!super::is_mrf_lifecycle_reader_capability_probe(&unknown));
+        assert!(!super::is_mrf_lifecycle_reader_capability_probe(&heal_control_capability_probe(&[7; 16])));
+    }
+
+    #[test]
+    fn mrf_lifecycle_reader_capability_carries_the_reported_format_and_identity() {
+        let epoch = [9; 16];
+        let result = super::encode_mrf_lifecycle_reader_capability(2, "node-a:9000", &epoch).expect("reader capability");
+        assert_eq!(result[0], 2);
+        assert_eq!(result.len(), 1 + 8 + "node-a:9000".len() + 16);
+        let (member, decoded_epoch) = decode_remote_version_state_capability(&result[1..]).expect("capability identity");
+        assert_eq!(member, "node-a:9000");
+        assert_eq!(decoded_epoch, &epoch);
+    }
 
     #[test]
     fn canonical_heal_control_body_binds_every_field_and_boundary() {
