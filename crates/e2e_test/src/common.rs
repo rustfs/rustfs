@@ -103,6 +103,18 @@ fn capture_log_path(log_dir: &Path, temp_dir: &str) -> Option<PathBuf> {
     Some(log_dir.join(format!("{temp_name}.log")))
 }
 
+#[cfg(test)]
+pub(crate) fn tls_diagnostic_log_directory(report: Option<&Path>, artifacts: Option<&Path>, cluster: &Path) -> PathBuf {
+    if let Some(report) = report {
+        return report.with_extension("logs");
+    }
+    if let Some(artifacts) = artifacts {
+        // Keep failed-run logs outside the cluster directory removed on drop.
+        return artifacts.join(format!("internode-tls-{}", uuid::Uuid::new_v4().simple()));
+    }
+    cluster.join("logs")
+}
+
 fn configured_capture_log_path(temp_dir: &str) -> Option<String> {
     let log_dir = std::env::var_os("RUSTFS_E2E_LOG_DIR")?;
     if stdfs::create_dir_all(&log_dir).is_err() {
@@ -2319,6 +2331,25 @@ mod tests {
             capture_log_path(Path::new("/tmp/e2e-logs"), "/tmp/rustfs_e2e_test_abc"),
             Some(PathBuf::from("/tmp/e2e-logs/rustfs_e2e_test_abc.log"))
         );
+
+        let cluster = tempfile::tempdir().expect("temporary cluster");
+        let artifacts = tempfile::tempdir().expect("CI artifact root");
+        let first = tls_diagnostic_log_directory(None, Some(artifacts.path()), cluster.path());
+        let second = tls_diagnostic_log_directory(None, Some(artifacts.path()), cluster.path());
+        assert!(first.starts_with(artifacts.path()), "CI must retain TLS node logs after cluster cleanup");
+        assert!(second.starts_with(artifacts.path()));
+        assert_ne!(first, second, "separate attempts must not append to another run's logs");
+        assert_eq!(
+            tls_diagnostic_log_directory(Some(Path::new("acceptance/report.json")), Some(artifacts.path()), cluster.path()),
+            Path::new("acceptance/report.logs"),
+            "an explicit acceptance report keeps its existing node-log location"
+        );
+        assert_eq!(tls_diagnostic_log_directory(None, None, cluster.path()), cluster.path().join("logs"));
+        std::fs::create_dir(&first).expect("run log directory");
+        let log = first.join("node-0.log");
+        std::fs::write(&log, "read failure").expect("captured node output");
+        cluster.close().expect("failed cluster cleanup");
+        assert_eq!(std::fs::read_to_string(log).expect("retained node log"), "read failure");
     }
 
     #[test]
