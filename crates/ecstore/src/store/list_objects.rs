@@ -52,7 +52,8 @@ use futures::future::join_all;
 use rand::seq::SliceRandom;
 use rustfs_filemeta::{
     FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry,
-    MetacacheReader, MetadataResolutionParams, is_io_eof,
+    MetaCacheEntryResolution as ListingEntryResolution, MetacacheReader, MetadataResolutionParams, is_io_eof,
+    resolve_agreed_entry as resolve_agreed_listing_entry,
 };
 use rustfs_io_metrics::{
     LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED, LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED, LIST_OBJECTS_SOURCE_WALKER,
@@ -2740,12 +2741,6 @@ fn resolve_listing_entries(
     }
 }
 
-enum ListingEntryResolution {
-    Resolved(MetaCacheEntry),
-    NeedsSupplement(MetaCacheEntry),
-    Rejected,
-}
-
 #[derive(Clone)]
 struct FallbackListingEntry {
     endpoint: String,
@@ -2800,7 +2795,7 @@ struct ListingSupplement {
     options: ListingSupplementOptions,
     fallback_disks: Arc<Vec<DiskStore>>,
     claim_tracker: FallbackClaimTracker,
-    entries: Option<Arc<OnceCell<FallbackListingEntries>>>,
+    entries: Option<OnceCell<FallbackListingEntries>>,
     reconciler: Option<ListingReconciler>,
 }
 
@@ -2836,8 +2831,8 @@ impl ListingSupplement {
         claim_tracker: FallbackClaimTracker,
         reconciler: Option<ListingReconciler>,
     ) -> Arc<Self> {
-        let entries: Option<Arc<OnceCell<FallbackListingEntries>>> = if options.per_disk_limit > 0 {
-            Some(Arc::new(OnceCell::new()))
+        let entries = if options.per_disk_limit > 0 && !fallback_disks.is_empty() {
+            Some(OnceCell::new())
         } else {
             None
         };
@@ -3072,43 +3067,6 @@ async fn read_fallback_object_disk(
     }
 }
 
-fn version_requires_supplement(
-    version_required_quorum: usize,
-    reader_disks: usize,
-    selected_object_versions: usize,
-    requested_versions: usize,
-) -> bool {
-    reader_disks < version_required_quorum && (requested_versions == 0 || selected_object_versions < requested_versions)
-}
-
-fn cached_entry_needs_supplement(
-    cached: &FileMeta,
-    reader_disks: usize,
-    resolver: &MetadataResolutionParams,
-    enforce_write_quorum: bool,
-) -> bool {
-    if !enforce_write_quorum {
-        return false;
-    }
-
-    let mut selected_object_versions = 0;
-    for version in cached.versions.iter() {
-        let required_quorum = version.listing_quorum(resolver.obj_quorum, resolver.write_quorum_slack);
-        if version_requires_supplement(required_quorum, reader_disks, selected_object_versions, resolver.requested_versions) {
-            return true;
-        }
-
-        if !version.header.free_version() {
-            selected_object_versions += 1;
-        }
-        if resolver.requested_versions > 0 && selected_object_versions == resolver.requested_versions {
-            break;
-        }
-    }
-
-    false
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum ListingSupplementTarget {
     Directory(String),
@@ -3167,20 +3125,22 @@ fn listing_entries_supplement_target(
                     .is_some_and(|candidate| candidate.name == entry.name && candidate.is_object())
             })
             .count();
-        let entries_disagree = entries.0.iter().flatten().any(|candidate| {
-            candidate.name == entry.name && candidate.is_object() && !entry.matches(Some(candidate), resolver.strict).1
-        });
+        let entries_disagree = !entry.headers_agree(
+            entries
+                .0
+                .iter()
+                .flatten()
+                .filter(|candidate| candidate.name == entry.name && candidate.is_object()),
+            resolver.strict,
+        );
         // A split primary sample can fall back to an older version even when a
         // newer version reaches write quorum only after the fallback disks join.
         if entries_disagree {
             return Some(ListingSupplementTarget::Object(entry.name.clone()));
         }
 
-        let mut entry = entry.clone();
-        if let Ok(cached) = entry.xl_meta()
-            && cached_entry_needs_supplement(&cached, reader_disks, resolver, enforce_write_quorum)
-        {
-            return Some(ListingSupplementTarget::Object(entry.name));
+        if entry.needs_quorum_supplement(reader_disks, resolver).unwrap_or(false) {
+            return Some(ListingSupplementTarget::Object(entry.name.clone()));
         }
     }
 
@@ -3214,120 +3174,19 @@ async fn resolve_agreed_listing_entry_with_supplement(
     entry: MetaCacheEntry,
     reader_disks: usize,
     resolver: MetadataResolutionParams,
-    enforce_write_quorum: bool,
     supplement: Arc<ListingSupplement>,
 ) -> std::result::Result<Option<MetaCacheEntry>, DiskError> {
-    let mut candidates = Vec::with_capacity(reader_disks);
-    candidates.resize(reader_disks, Some(entry.clone()));
-    candidates.extend(supplement.entries_for(&entry.name).await);
-    if let Some(resolved) = resolve_listing_entries(MetaCacheEntries(candidates), resolver.clone(), enforce_write_quorum) {
+    let fallback = supplement.entries_for(&entry.name).await;
+    let mut candidates = Vec::with_capacity(reader_disks + fallback.len());
+    candidates.resize(reader_disks, Some(&entry));
+    candidates.extend(fallback.iter().map(Option::as_ref));
+    if let Some(resolved) = MetaCacheEntries::resolve_borrowed_with_write_quorum(&candidates, resolver.clone()) {
         return Ok(Some(resolved));
     }
     if entry.is_dir() {
         return Ok(None);
     }
-    supplement.reconcile_object(&entry.name, resolver, enforce_write_quorum).await
-}
-
-fn listing_entry_with_selected_versions(
-    mut entry: MetaCacheEntry,
-    meta_ver: u8,
-    data: rustfs_filemeta::InlineData,
-    selected_versions: Vec<FileMetaShallowVersion>,
-) -> Option<MetaCacheEntry> {
-    let merged_cached = FileMeta {
-        meta_ver,
-        data,
-        versions: selected_versions,
-    };
-    let metadata = merged_cached.marshal_msg().ok()?;
-
-    entry.metadata = metadata;
-    entry.cached = Some(merged_cached);
-    Some(entry)
-}
-
-fn resolve_agreed_listing_entry(
-    mut entry: MetaCacheEntry,
-    reader_disks: usize,
-    resolver: MetadataResolutionParams,
-    enforce_write_quorum: bool,
-) -> ListingEntryResolution {
-    if !enforce_write_quorum {
-        return ListingEntryResolution::Resolved(entry);
-    }
-
-    if entry.is_dir() {
-        return if reader_disks >= resolver.dir_quorum {
-            ListingEntryResolution::Resolved(entry)
-        } else {
-            ListingEntryResolution::Rejected
-        };
-    }
-
-    if reader_disks < resolver.obj_quorum {
-        return ListingEntryResolution::Rejected;
-    }
-
-    let cached = match entry.xl_meta_ref() {
-        Ok(cached) => cached,
-        Err(_) if resolver.obj_quorum <= 1 => return ListingEntryResolution::Resolved(entry),
-        Err(_) => return ListingEntryResolution::Rejected,
-    };
-    if resolver.requested_versions == 1
-        && let Some(first) = cached.versions.first()
-        && !first.header.free_version()
-        && reader_disks >= first.listing_quorum(resolver.obj_quorum, resolver.write_quorum_slack)
-    {
-        return ListingEntryResolution::Resolved(entry);
-    }
-    let cached = cached.clone();
-    let mut selected_versions = Vec::new();
-    let mut selected_object_versions = 0;
-    let mut first_selected_idx = None;
-    let mut needs_supplement = false;
-
-    for (idx, version) in cached.versions.iter().enumerate() {
-        let required_quorum = version.listing_quorum(resolver.obj_quorum, resolver.write_quorum_slack);
-        if reader_disks < required_quorum {
-            needs_supplement |=
-                version_requires_supplement(required_quorum, reader_disks, selected_object_versions, resolver.requested_versions);
-            continue;
-        }
-
-        if first_selected_idx.is_none() {
-            first_selected_idx = Some(idx);
-        }
-        if !version.header.free_version() {
-            selected_object_versions += 1;
-        }
-        selected_versions.push(version.clone());
-
-        if resolver.requested_versions > 0 && selected_object_versions == resolver.requested_versions {
-            break;
-        }
-    }
-
-    if needs_supplement {
-        return ListingEntryResolution::NeedsSupplement(entry);
-    }
-
-    if selected_versions.is_empty() {
-        return ListingEntryResolution::Rejected;
-    }
-
-    let selected_latest = first_selected_idx == Some(0)
-        && resolver.requested_versions == 1
-        && selected_versions
-            .first()
-            .is_some_and(|version| !version.header.free_version());
-    if selected_latest || selected_versions.len() == cached.versions.len() {
-        return ListingEntryResolution::Resolved(entry);
-    }
-
-    listing_entry_with_selected_versions(entry, cached.meta_ver, cached.data, selected_versions)
-        .map(ListingEntryResolution::Resolved)
-        .unwrap_or(ListingEntryResolution::Rejected)
+    supplement.reconcile_object(&entry.name, resolver, true).await
 }
 
 /// The walk must discover every supported payload layout, including objects
@@ -4808,7 +4667,7 @@ impl ECStore {
                                         let entry = match resolve_agreed_listing_entry(
                                             entry,
                                             reader_disks,
-                                            resolver.clone(),
+                                            &resolver,
                                             enforce_write_quorum,
                                         ) {
                                             ListingEntryResolution::Resolved(entry) => entry,
@@ -4817,7 +4676,6 @@ impl ECStore {
                                                     entry,
                                                     reader_disks,
                                                     resolver,
-                                                    enforce_write_quorum,
                                                     supplement,
                                                 )
                                                 .await?
@@ -6248,7 +6106,7 @@ impl Sets {
                                     let entry = match resolve_agreed_listing_entry(
                                         entry,
                                         reader_disks,
-                                        resolver.clone(),
+                                        &resolver,
                                         enforce_write_quorum,
                                     ) {
                                         ListingEntryResolution::Resolved(entry) => entry,
@@ -6257,7 +6115,6 @@ impl Sets {
                                                 entry,
                                                 reader_disks,
                                                 resolver,
-                                                enforce_write_quorum,
                                                 supplement,
                                             )
                                             .await?
@@ -7190,29 +7047,23 @@ impl SetDisks {
                                 return Ok(());
                             }
 
-                            let entry =
-                                match resolve_agreed_listing_entry(entry, reader_disks, resolver.clone(), enforce_write_quorum) {
-                                    ListingEntryResolution::Resolved(entry) => entry,
-                                    ListingEntryResolution::NeedsSupplement(entry) => {
-                                        if cancel_token.is_cancelled() {
-                                            return Ok(());
-                                        }
-
-                                        let Some(entry) = resolve_agreed_listing_entry_with_supplement(
-                                            entry,
-                                            reader_disks,
-                                            resolver,
-                                            enforce_write_quorum,
-                                            supplement,
-                                        )
-                                        .await?
-                                        else {
-                                            return Ok(());
-                                        };
-                                        entry
+                            let entry = match resolve_agreed_listing_entry(entry, reader_disks, &resolver, enforce_write_quorum) {
+                                ListingEntryResolution::Resolved(entry) => entry,
+                                ListingEntryResolution::NeedsSupplement(entry) => {
+                                    if cancel_token.is_cancelled() {
+                                        return Ok(());
                                     }
-                                    ListingEntryResolution::Rejected => return Ok(()),
-                                };
+
+                                    let Some(entry) =
+                                        resolve_agreed_listing_entry_with_supplement(entry, reader_disks, resolver, supplement)
+                                            .await?
+                                    else {
+                                        return Ok(());
+                                    };
+                                    entry
+                                }
+                                ListingEntryResolution::Rejected => return Ok(()),
+                            };
 
                             if let Err(err) = send_or_cancel(&cancel_token, &value, entry).await
                                 && !cancel_token.is_cancelled()
@@ -7375,13 +7226,13 @@ mod test {
         PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER, PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER,
         PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION, PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER, PERSISTENT_KEY_ONLY_INDEX_HEADER,
         PersistentKeyOnlyIndex, PersistentListMetadataObject, RUSTFS_META_BUCKET, VerifiedIndexCandidateStats, VersionMarker,
-        cached_entry_needs_supplement, current_list_objects_mutation_sequence, encode_persistent_list_metadata_object,
-        enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results,
-        latest_listing_allow_agreed_objects, latest_listing_object_quorum, latest_listing_raw_min_disks,
-        latest_listing_write_quorum_slack, list_marker_key, list_merged_entry_channel, list_metadata_resolution_params,
-        list_objects_from_metadata_snapshot_candidates, list_objects_from_verified_index_candidates,
-        list_objects_from_verified_index_candidates_with_optional_stats, list_objects_from_verified_index_candidates_with_stats,
-        list_objects_index_mode_from_env, list_objects_index_provider_from_env, list_objects_index_provider_state_from_env,
+        current_list_objects_mutation_sequence, encode_persistent_list_metadata_object, enforce_latest_listing_write_quorum,
+        expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects,
+        latest_listing_object_quorum, latest_listing_raw_min_disks, latest_listing_write_quorum_slack, list_marker_key,
+        list_merged_entry_channel, list_metadata_resolution_params, list_objects_from_metadata_snapshot_candidates,
+        list_objects_from_verified_index_candidates, list_objects_from_verified_index_candidates_with_optional_stats,
+        list_objects_from_verified_index_candidates_with_stats, list_objects_index_mode_from_env,
+        list_objects_index_provider_from_env, list_objects_index_provider_state_from_env,
         list_objects_metadata_fast_guardrails_from_env, list_objects_paginate, list_objects_quorum_from_env,
         listing_entries_supplement_target, load_namespace_mutation_journal_state, load_persistent_key_only_index,
         max_keys_plus_one, merge_entry_channels, namespace_mutation_journal_chaos_bucket_from_env,
@@ -7687,8 +7538,10 @@ mod test {
         assert_eq!(candidates[0].as_ref().map(|entry| entry.name.as_str()), Some("object"));
     }
 
-    #[test]
-    fn listing_supplement_uses_page_cache_only_for_bounded_walks() {
+    #[tokio::test]
+    async fn listing_supplement_uses_page_cache_only_for_bounded_walks() {
+        let (_dirs, disks, _set) = hermetic_set_disks_isolated(4).await;
+        let fallback = Arc::new(vec![disks[0].clone()]);
         let bounded = ListingSupplement::new(
             ListingSupplementOptions {
                 bucket: "bucket".to_string(),
@@ -7703,7 +7556,7 @@ mod test {
                 walkdir_timeout: None,
                 walkdir_stall_timeout: None,
             },
-            Arc::new(Vec::new()),
+            fallback.clone(),
             FallbackClaimTracker::default(),
         );
         let unbounded = ListingSupplement::new(
@@ -7720,10 +7573,12 @@ mod test {
                 walkdir_timeout: None,
                 walkdir_stall_timeout: None,
             },
-            Arc::new(Vec::new()),
+            fallback.clone(),
             FallbackClaimTracker::default(),
         );
 
+        let empty = ListingSupplement::new(bounded.options.clone(), Arc::new(Vec::new()), FallbackClaimTracker::default());
+        assert!(empty.entries.is_none(), "no fallback readers need no page cache");
         assert!(bounded.entries.is_some());
         assert!(bounded.options.skip_total_timeout);
         assert!(unbounded.entries.is_none());
@@ -11279,6 +11134,46 @@ mod test {
     }
 
     #[test]
+    fn agreed_filtered_history_preserves_selected_bodies_and_inline_data() {
+        for warm in [false, true] {
+            let mut entry = test_transitioned_meta_entry("key", "remote-key", true);
+            let time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("older version");
+            let history = test_object_meta_entry_with_erasure_versions(
+                "key",
+                &[(time, "visible", 8, 8), (time - time::Duration::seconds(1), "older", 8, 8)],
+            );
+            let cached = entry.cached.as_mut().expect("free record fixture");
+            cached.versions.extend(history.cached.expect("user history").versions);
+            let mut inline = vec![1];
+            rmp::encode::write_map_len(&mut inline, 1).expect("inline map");
+            rmp::encode::write_str(&mut inline, &cached.versions[1].header.version_id.expect("visible id").to_string())
+                .expect("inline key");
+            rmp::encode::write_bin(&mut inline, b"inline-payload").expect("inline value");
+            cached.data.update(&inline);
+            let body = cached.versions[1].meta.as_ptr();
+            entry.metadata = cached.marshal_msg().expect("complete history");
+            if !warm {
+                entry.cached = None;
+            }
+            let resolver = list_metadata_resolution_params("bucket".to_owned(), 4, 8, false, 8);
+            let ListingEntryResolution::Resolved(entry) = resolve_agreed_listing_entry(entry, 8, &resolver, true) else {
+                panic!("readable free-headed history must resolve");
+            };
+            let info = entry.to_fileinfo("bucket").expect("filtered visible version");
+            assert_eq!(info.metadata.get("etag").map(String::as_str), Some("visible"));
+            let cached = entry.cached.expect("filtered cache");
+            assert_eq!(cached.versions.len(), 2, "one free record and latest user version");
+            if warm {
+                assert_eq!(cached.versions[1].meta.as_ptr(), body, "selected cached body must move");
+            }
+            assert_eq!(cached.data.as_slice(), inline.as_slice(), "inline payload is preserved");
+            let decoded = FileMeta::load(&entry.metadata).expect("filtered serialized history");
+            assert_eq!(decoded.versions, cached.versions);
+            assert_eq!(decoded.data.as_slice(), inline.as_slice());
+        }
+    }
+
+    #[test]
     fn latest_listing_primary_sizing_preserves_default_layout_and_sampling_modes() {
         assert_eq!(super::preferred_listing_quorum(9, 16, 4, true), 12);
         assert_eq!(super::preferred_listing_quorum(8, 16, 4, true), 12);
@@ -11370,13 +11265,13 @@ mod test {
         let mut resolver = list_metadata_resolution_params("bucket".to_string(), 2, 2, false, 1);
 
         assert!(matches!(
-            resolve_agreed_listing_entry(entry.clone(), 2, resolver.clone(), true),
+            resolve_agreed_listing_entry(entry.clone(), 2, &resolver, true),
             ListingEntryResolution::Resolved(_)
         ));
 
         resolver.write_quorum_slack = 0;
         assert!(matches!(
-            resolve_agreed_listing_entry(entry, 2, resolver, true),
+            resolve_agreed_listing_entry(entry, 2, &resolver, true),
             ListingEntryResolution::NeedsSupplement(_)
         ));
     }
@@ -11390,24 +11285,24 @@ mod test {
         // 1. enforce_write_quorum = false immediately resolves without inspecting quorum or metadata.
         let strict_resolver = list_metadata_resolution_params("bucket".to_string(), 4, 4, false, 0);
         assert!(matches!(
-            resolve_agreed_listing_entry(obj_entry.clone(), 1, strict_resolver.clone(), false),
+            resolve_agreed_listing_entry(obj_entry.clone(), 1, &strict_resolver, false),
             ListingEntryResolution::Resolved(_)
         ));
 
         // 2. Directory entry resolves when reader_disks >= dir_quorum and rejects below dir_quorum.
         let dir_entry = test_dir_meta_entry("prefix/");
         assert!(matches!(
-            resolve_agreed_listing_entry(dir_entry.clone(), 4, strict_resolver.clone(), true),
+            resolve_agreed_listing_entry(dir_entry.clone(), 4, &strict_resolver, true),
             ListingEntryResolution::Resolved(_)
         ));
         assert!(matches!(
-            resolve_agreed_listing_entry(dir_entry, 3, strict_resolver.clone(), true),
+            resolve_agreed_listing_entry(dir_entry, 3, &strict_resolver, true),
             ListingEntryResolution::Rejected
         ));
 
         // 3. reader_disks < obj_quorum rejects before decoding xl.meta.
         assert!(matches!(
-            resolve_agreed_listing_entry(obj_entry, 3, strict_resolver, true),
+            resolve_agreed_listing_entry(obj_entry, 3, &strict_resolver, true),
             ListingEntryResolution::Rejected
         ));
 
@@ -11420,12 +11315,12 @@ mod test {
         };
         let q1_resolver = list_metadata_resolution_params("bucket".to_string(), 1, 1, false, 0);
         assert!(matches!(
-            resolve_agreed_listing_entry(corrupt_entry.clone(), 1, q1_resolver, true),
+            resolve_agreed_listing_entry(corrupt_entry.clone(), 1, &q1_resolver, true),
             ListingEntryResolution::Resolved(_)
         ));
         let q2_resolver = list_metadata_resolution_params("bucket".to_string(), 2, 2, false, 0);
         assert!(matches!(
-            resolve_agreed_listing_entry(corrupt_entry, 2, q2_resolver.clone(), true),
+            resolve_agreed_listing_entry(corrupt_entry, 2, &q2_resolver, true),
             ListingEntryResolution::Rejected
         ));
 
@@ -11449,12 +11344,11 @@ mod test {
         // `!first.header.free_version()` guard the fast-path would falsely resolve; instead
         // the loop inspects the 2+2 object version (write quorum 3) and requests a supplement.
         assert!(matches!(
-            resolve_agreed_listing_entry(transitioned.clone(), 2, q2_resolver.clone(), true),
+            resolve_agreed_listing_entry(transitioned.clone(), 2, &q2_resolver, true),
             ListingEntryResolution::NeedsSupplement(_)
         ));
 
-        let ListingEntryResolution::Resolved(resolved) = resolve_agreed_listing_entry(transitioned, 3, q2_resolver.clone(), true)
-        else {
+        let ListingEntryResolution::Resolved(resolved) = resolve_agreed_listing_entry(transitioned, 3, &q2_resolver, true) else {
             panic!("expected Resolved for free-version + committed object");
         };
         let info = resolved.to_fileinfo("bucket").expect("decode resolved entry");
@@ -11465,7 +11359,7 @@ mod test {
         let mut free_only = test_transitioned_meta_entry("free-only-obj", "remote-key", true);
         free_only.cached = None;
         assert!(matches!(
-            resolve_agreed_listing_entry(free_only, 3, q2_resolver, true),
+            resolve_agreed_listing_entry(free_only, 3, &q2_resolver, true),
             ListingEntryResolution::Resolved(_)
         ));
     }
@@ -11474,13 +11368,13 @@ mod test {
     fn cached_entry_supplement_check_honors_write_quorum_slack() {
         let mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
         let mut entry = test_object_meta_entry_with_erasure_versions("object", &[(mod_time, "etag", 2, 2)]);
-        let cached = entry.xl_meta().expect("test entry should decode");
+        entry.xl_meta_ref().expect("test entry should decode");
         let mut resolver = list_metadata_resolution_params("bucket".to_string(), 2, 2, false, 1);
 
-        assert!(!cached_entry_needs_supplement(&cached, 2, &resolver, true));
+        assert!(!entry.needs_quorum_supplement(2, &resolver).expect("valid metadata"));
 
         resolver.write_quorum_slack = 0;
-        assert!(cached_entry_needs_supplement(&cached, 2, &resolver, true));
+        assert!(entry.needs_quorum_supplement(2, &resolver).expect("valid metadata"));
     }
 
     #[test]
@@ -11837,7 +11731,7 @@ mod test {
                     let resolver = resolver.clone();
                     let fallback_old_entry = fallback_old_entry.clone();
                     Box::pin(async move {
-                        let entry = match resolve_agreed_listing_entry(entry, 5, resolver.clone(), true) {
+                        let entry = match resolve_agreed_listing_entry(entry, 5, &resolver, true) {
                             ListingEntryResolution::Resolved(entry) => entry,
                             ListingEntryResolution::NeedsSupplement(entry) => {
                                 let mut candidates = vec![Some(entry); 5];
@@ -11892,7 +11786,7 @@ mod test {
                     let seen = seen_clone.clone();
                     let resolver = resolver.clone();
                     Box::pin(async move {
-                        let entry = match resolve_agreed_listing_entry(entry, 5, resolver.clone(), true) {
+                        let entry = match resolve_agreed_listing_entry(entry, 5, &resolver, true) {
                             ListingEntryResolution::Resolved(entry) => entry,
                             ListingEntryResolution::NeedsSupplement(entry) => {
                                 let supplement = ListingSupplement::new(
@@ -11912,7 +11806,7 @@ mod test {
                                     Arc::new(Vec::new()),
                                     FallbackClaimTracker::default(),
                                 );
-                                super::resolve_agreed_listing_entry_with_supplement(entry, 5, resolver, true, supplement)
+                                super::resolve_agreed_listing_entry_with_supplement(entry, 5, resolver, supplement)
                                     .await?
                                     .expect("the previous committed version must resolve without extra disks")
                             }
@@ -11960,7 +11854,7 @@ mod test {
                     let fallback_entry = fallback_entry.clone();
                     Box::pin(async move {
                         let ListingEntryResolution::NeedsSupplement(entry) =
-                            resolve_agreed_listing_entry(entry, 5, resolver.clone(), true)
+                            resolve_agreed_listing_entry(entry, 5, &resolver, true)
                         else {
                             return Ok(());
                         };
