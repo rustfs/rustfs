@@ -20,7 +20,7 @@ use crate::server::RemoteAddr;
 use crate::server::cors;
 use crate::server::hybrid::{HybridBody, is_grpc_request};
 use crate::server::{
-    ADMIN_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HealthProbe, MINIO_ADMIN_PREFIX,
+    ADMIN_PREFIX, ApiPathMatch, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HealthProbe, MINIO_ADMIN_PREFIX,
     MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_LIVE_PATH,
     MINIO_HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests,
     build_health_response_parts, collect_probe_readiness, console_prefix, has_path_prefix, is_admin_path, is_table_catalog_path,
@@ -30,7 +30,7 @@ use crate::shared_types::ReadinessDegradedReason;
 use crate::storage_api::server::layer::apply_cors_headers;
 use crate::storage_api::server::layer::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
 use bytes::{Bytes, BytesMut};
-use futures::future::Either;
+use futures::future::{Either, Ready, ready};
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode, Uri};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
@@ -2430,6 +2430,80 @@ fn rewrite_double_slash_root(uri: &Uri) -> Option<Uri> {
     Uri::from_parts(parts).ok()
 }
 
+/// Serves the API under `RUSTFS_API_PREFIX` while s3s verifies the path the client signed.
+///
+/// Install only when the prefix is configured. The original wire path goes into
+/// `SignedUriPath`, which only trusted server code may set, and the URI is rewritten to the
+/// remainder so routing, request context and authorization see the unprefixed path.
+#[derive(Clone)]
+pub struct ApiPrefixLayer;
+
+impl<S> Layer<S> for ApiPrefixLayer {
+    type Service = ApiPrefixService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ApiPrefixService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct ApiPrefixService<S> {
+    inner: S,
+}
+
+impl<S, ReqBody, ResBody> Service<HttpRequest<ReqBody>> for ApiPrefixService<S>
+where
+    S: Service<HttpRequest<ReqBody>, Response = Response<ResBody>>,
+    ResBody: Default,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Either<S::Future, Ready<Result<S::Response, S::Error>>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: HttpRequest<ReqBody>) -> Self::Future {
+        if !strip_api_prefix_from_request(&mut req, crate::server::strip_api_prefix) {
+            let response = Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(ResBody::default())
+                .expect("valid response");
+            return Either::Right(ready(Ok(response)));
+        }
+        Either::Left(self.inner.call(req))
+    }
+}
+
+/// Returns false when the request must be rejected (see `strip_api_prefix`).
+fn strip_api_prefix_from_request<B>(req: &mut HttpRequest<B>, strip: impl FnOnce(&str) -> ApiPathMatch<'_>) -> bool {
+    let rewritten = match strip(req.uri().path()) {
+        ApiPathMatch::Reject => return false,
+        ApiPathMatch::PassThrough => return true,
+        ApiPathMatch::Strip(remainder) => rewrite_api_prefixed_uri(req.uri(), remainder),
+    };
+    let Some(rewritten) = rewritten else {
+        return true;
+    };
+    let original_path = req.uri().path().to_owned();
+    *req.uri_mut() = rewritten;
+    req.extensions_mut().insert(s3s::auth::SignedUriPath::new(original_path));
+    true
+}
+
+/// Keeps scheme, authority and query. The bare prefix becomes `/`.
+fn rewrite_api_prefixed_uri(uri: &Uri, remainder: &str) -> Option<Uri> {
+    let remainder = if remainder.is_empty() { "/" } else { remainder };
+    let path_and_query = match uri.query() {
+        Some(query) => format!("{remainder}?{query}"),
+        None => remainder.to_string(),
+    };
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(path_and_query.parse().ok()?);
+    Uri::from_parts(parts).ok()
+}
+
 #[cfg(test)]
 mod tests {
     #[tokio::test]
@@ -2516,6 +2590,88 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temp_env::{async_with_vars, with_var};
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
+
+    fn strip_under_p(path: &str) -> ApiPathMatch<'_> {
+        let decoded = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+        if has_path_prefix(&decoded, "/p") && !has_path_prefix(path, "/p") && !has_path_prefix(&decoded, "/p/console") {
+            return ApiPathMatch::Reject;
+        }
+        if has_path_prefix(path, "/p/console") || !has_path_prefix(path, "/p") {
+            return ApiPathMatch::PassThrough;
+        }
+        path.strip_prefix("/p").map_or(ApiPathMatch::PassThrough, ApiPathMatch::Strip)
+    }
+
+    fn strip_request(uri: &str) -> (String, Option<String>) {
+        let mut request = Request::builder().uri(uri).body(()).expect("request");
+        assert!(strip_api_prefix_from_request(&mut request, strip_under_p), "{uri}");
+        let signed = request
+            .extensions()
+            .get::<s3s::auth::SignedUriPath>()
+            .map(|path| path.as_str().to_owned());
+        (request.uri().to_string(), signed)
+    }
+
+    #[test]
+    fn api_prefix_strips_path_and_records_signed_path() {
+        assert_eq!(strip_request("/p/b/k?x=1"), ("/b/k?x=1".to_string(), Some("/p/b/k".to_string())));
+        assert_eq!(strip_request("/p"), ("/".to_string(), Some("/p".to_string())));
+        assert_eq!(strip_request("/p/"), ("/".to_string(), Some("/p/".to_string())));
+        assert_eq!(strip_request("/p/?list-type=2"), ("/?list-type=2".to_string(), Some("/p/".to_string())));
+        assert_eq!(
+            strip_request("http://example.com:9000/p/b/k?x=1"),
+            ("http://example.com:9000/b/k?x=1".to_string(), Some("/p/b/k".to_string()))
+        );
+    }
+
+    #[test]
+    fn api_prefix_preserves_percent_encoded_signed_path() {
+        assert_eq!(
+            strip_request("/p/b/a%2Fb%20c%2B?x=%2F"),
+            ("/b/a%2Fb%20c%2B?x=%2F".to_string(), Some("/p/b/a%2Fb%20c%2B".to_string()))
+        );
+    }
+
+    #[test]
+    fn api_prefix_leaves_other_paths_untouched() {
+        for uri in [
+            "/px/b",
+            "/b/k?x=1",
+            "/",
+            "/p/console",
+            "/p/console/index.html?x=1",
+            "/b/a%2Fb",
+            "/%70x/b",
+        ] {
+            assert_eq!(strip_request(uri), (uri.to_string(), None), "{uri}");
+        }
+    }
+
+    #[test]
+    fn api_prefix_rejects_percent_encoded_prefix_variants() {
+        for uri in ["/%70/b/k", "/p%2Fb/k", "/%70", "/%70/?x=1"] {
+            let mut request = Request::builder().uri(uri).body(()).expect("request");
+            assert!(!strip_api_prefix_from_request(&mut request, strip_under_p), "{uri}");
+            assert_eq!(request.uri().to_string(), uri);
+            assert!(request.extensions().get::<s3s::auth::SignedUriPath>().is_none(), "{uri}");
+        }
+    }
+
+    #[test]
+    fn api_prefix_layer_absent_when_unset() {
+        // The prefix is process-wide and these unit tests never configure it.
+        assert!(crate::server::api_prefix().is_none());
+        let inner = tower::service_fn(|req: Request<()>| async move {
+            let signed = req.extensions().get::<s3s::auth::SignedUriPath>().is_some();
+            Ok::<_, Infallible>(Response::new(format!("{}|{signed}", req.uri())))
+        });
+        let mut service = tower::ServiceBuilder::new()
+            .option_layer(crate::server::api_prefix().map(|_| ApiPrefixLayer))
+            .service(inner);
+        let request = Request::builder().uri("/p/b/k").body(()).expect("request");
+        let result = futures::executor::block_on(service.call(request)).expect("response");
+        assert_eq!(result.into_body(), "/p/b/k|false");
+    }
 
     #[test]
     fn telemetry_adapter_accepts_only_the_frozen_s3_operations() {

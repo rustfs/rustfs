@@ -23,10 +23,11 @@ use crate::server::{
     compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
-        BodylessStatusFixLayer, ConditionalCorsLayer, DoubleSlashListBucketsCompatLayer, EmptyBodyContentLengthCompatLayer,
-        ExternalRequestContextLayer, HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer,
-        PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, RequestLoggingLayer, S3ErrorMessageCompatLayer,
-        SigV4HeaderGuardLayer, StsQueryApiCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
+        ApiPrefixLayer, BodylessStatusFixLayer, ConditionalCorsLayer, DoubleSlashListBucketsCompatLayer,
+        EmptyBodyContentLengthCompatLayer, ExternalRequestContextLayer, HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer,
+        ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, RequestLoggingLayer,
+        S3ErrorMessageCompatLayer, SigV4HeaderGuardLayer, StsQueryApiCompatLayer, VirtualHostStyleHintLayer,
+        redact_sensitive_uri_query,
     },
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env},
     ssec_transport::SsecTransportLayer,
@@ -1145,6 +1146,8 @@ macro_rules! external_service_stack {
                 }
                 request
             })
+            // Only present with RUSTFS_API_PREFIX; must precede every layer that reads the path.
+            .option_layer(crate::server::api_prefix().map(|_| ApiPrefixLayer))
             .layer(ExternalRequestContextLayer::new(is_console))
             .layer(StsQueryApiCompatLayer)
             .layer(EmptyBodyContentLengthCompatLayer)
@@ -2325,6 +2328,7 @@ fn process_connection(
         //  1. AddExtensionLayer<RemoteAddr>           — per-connection peer address
         //  2. AddExtensionLayer<SocketAddr>           — per-connection raw socket addr (TrustedProxy)
         //  3. TrustedProxyLayer                       — conditional, parses X-Forwarded-For
+        //  3b. ApiPrefixLayer                         — conditional, strips RUSTFS_API_PREFIX after recording the signed path
         //  4. ExternalRequestContextLayer            — S3 canonical ID / control-plane propagated ID
         //  5. StsQueryApiCompatLayer                 — route-scoped STS envelopes, including outer short-circuit errors
         //  6. EmptyBodyContentLengthCompatLayer       — adds Content-Length: 0 for known empty-body API routes
