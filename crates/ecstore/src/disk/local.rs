@@ -568,7 +568,7 @@ async fn write_delete_rollback_files(
     let sync = effective_durability(volume).syncs_commit_metadata();
     let staging_root = io_root.join(RUSTFS_META_TMP_BUCKET);
     let io_root = io_root.to_path_buf();
-    os::run_blocking_namespace_operation(first_lease, move || {
+    os::run_blocking_namespace_operation_with_sync(first_lease, sync, move || {
         for (_, path, _, _) in &entries {
             reject_local_disk_symlink_components(&io_root, path).map_err(std::io::Error::from)?;
         }
@@ -7736,7 +7736,7 @@ impl LocalDisk {
             let receipt_path = transaction_path.join(DELETE_QUORUM_COMMITTED_FILE);
             let lease = os::acquire_namespace_mutation_lease_with_owner(&receipt_path, namespace_owner.clone()).await;
             let sync = effective_durability(volume).syncs_commit_metadata();
-            os::run_blocking_namespace_operation(lease, move || {
+            os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
                 let receipt = match std::fs::OpenOptions::new().write(true).create_new(true).open(&receipt_path) {
                     Ok(receipt) => receipt,
                     Err(err) if err.kind() == ErrorKind::AlreadyExists => {
@@ -7838,7 +7838,7 @@ impl LocalDisk {
             let metadata_path = self.io_get_object_path(volume, &format!("{object}/{STORAGE_FORMAT_FILE}"))?;
             let lease = os::acquire_namespace_mutation_lease_with_owner(&file_path, Some(owner)).await;
             let sync = effective_durability(volume).syncs_commit_metadata();
-            let result = os::run_blocking_namespace_operation(lease, move || {
+            let result = os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
                 let bytes = std::fs::read(metadata_path)?;
                 let metadata = FileMeta::load(&bytes).map_err(|_| std::io::Error::from(ErrorKind::InvalidData))?;
                 if metadata
@@ -7896,7 +7896,7 @@ impl LocalDisk {
             let data_path = file_path.clone();
             let sync = effective_durability(volume).syncs_commit_metadata();
             let keep_rollback_witnesses = opt.recoverable_delete;
-            os::run_blocking_namespace_operation(lease, move || {
+            os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
                 let entries = match std::fs::read_dir(&data_path) {
                     Ok(entries) => entries,
                     Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
@@ -9172,34 +9172,37 @@ impl LocalDisk {
                 }
 
                 let root = self.publication_root.clone();
-                self.blocking_queue
-                    .run_cancellable(move |is_cancelled| {
-                        if is_cancelled() {
-                            return Err(std::io::Error::other("blocking namespace operation cancelled"));
-                        }
-                        #[cfg(test)]
-                        run_owned_file_write_before_open(&path);
+                let operation = move |is_cancelled: &dyn Fn() -> bool| {
+                    if is_cancelled() {
+                        return Err(std::io::Error::other("blocking namespace operation cancelled"));
+                    }
+                    #[cfg(test)]
+                    run_owned_file_write_before_open(&path);
 
-                        let (mut file, parent_handle) = if sync == SyncMode::FileAndDir {
-                            root.create_truncate_with_parent(&path)?
-                        } else {
-                            (root.create_truncate(&path)?, None)
-                        };
-                        std::io::Write::write_all(&mut file, buf.as_ref())?;
-                        if sync != SyncMode::None {
-                            file.sync_data()?;
-                            // FileOnly callers rename the file away, so the tmp
-                            // directory entry never needs to become durable.
-                            if sync == SyncMode::FileAndDir
-                                && let Some(parent) = path.parent()
-                            {
-                                os::fsync_directory_handle_std(parent, parent_handle.as_ref())?;
-                            }
+                    let (mut file, parent_handle) = if sync == SyncMode::FileAndDir {
+                        root.create_truncate_with_parent(&path)?
+                    } else {
+                        (root.create_truncate(&path)?, None)
+                    };
+                    std::io::Write::write_all(&mut file, buf.as_ref())?;
+                    if sync != SyncMode::None {
+                        file.sync_data()?;
+                        // FileOnly callers rename the file away, so the tmp
+                        // directory entry never needs to become durable.
+                        if sync == SyncMode::FileAndDir
+                            && let Some(parent) = path.parent()
+                        {
+                            os::fsync_directory_handle_std(parent, parent_handle.as_ref())?;
                         }
-                        Ok(())
-                    })
-                    .await
-                    .map_err(to_file_error)?;
+                    }
+                    Ok(())
+                };
+                let result = if sync == SyncMode::None {
+                    self.blocking_queue.run_cancellable(operation).await
+                } else {
+                    self.blocking_queue.run_fsync_cancellable(operation).await
+                };
+                result.map_err(to_file_error)?;
             }
         }
 
@@ -10511,7 +10514,9 @@ impl LocalDisk {
         if namespace_owner.is_some() {
             let lease = os::acquire_namespace_mutation_lease_with_owner(&marker_path, namespace_owner.clone()).await;
             let volume = volume.to_string();
-            let sync = os::run_blocking_namespace_operation(lease, move || {
+            // This operation resolves durability inside the worker, so reserve
+            // the sync lane even if the current bucket override is relaxed.
+            let sync = os::run_blocking_namespace_operation_with_sync(lease, true, move || {
                 #[cfg(test)]
                 run_owned_file_write_before_open(&marker_path);
                 let marker = std::fs::File::create(marker_path)?;
@@ -25852,6 +25857,61 @@ mod test {
                 disk.read_version("", "bucket", "symlink-leaf", "", &opts).await,
                 Err(DiskError::InvalidPath)
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_owned_write_leaves_metadata_reads_on_foreground_lane() {
+        let dir = tempfile::tempdir().expect("disk root");
+        let endpoint = Endpoint::try_from(dir.path().to_string_lossy().as_ref()).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let metadata = dir.path().join("existing-metadata");
+        fs::write(&metadata, b"existing").await.expect("metadata fixture");
+        for sync in [SyncMode::None, SyncMode::FileOnly, SyncMode::FileAndDir] {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let queue = Arc::clone(&disk.blocking_queue);
+            let blocker = tokio::spawn(async move {
+                queue
+                    .run_fsync_cancellable(move |_| {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.blocking_recv();
+                        Ok(())
+                    })
+                    .await
+            });
+            started_rx.await.expect("fsync lane blocked");
+            let path = dir.path().join("new-metadata");
+            let mut write =
+                std::pin::pin!(disk.write_all_internal(&path, InternalBuf::Owned(Bytes::from_static(b"new")), sync, dir.path(),));
+            assert!(futures::FutureExt::now_or_never(&mut write).is_none());
+            let read = tokio::time::timeout(
+                Duration::from_secs(5),
+                disk.run_metadata_read(None, metadata.clone(), |opened| {
+                    let mut file = opened?;
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+                    Ok::<_, std::io::Error>(bytes)
+                }),
+            )
+            .await;
+            let published_before_sync = path.exists();
+            release_tx.send(()).expect("release fsync lane");
+            blocker.await.expect("blocker joined").expect("blocker completed");
+            write.await.expect("write completed");
+            assert_eq!(
+                read.expect("metadata read must progress")
+                    .expect("queued read")
+                    .expect("read bytes"),
+                b"existing"
+            );
+            assert_eq!(
+                published_before_sync,
+                sync == SyncMode::None,
+                "durable writes wait on fsync, relaxed writes stay on foreground"
+            );
+            assert_eq!(fs::read(&path).await.expect("new metadata"), b"new");
+            fs::remove_file(&path).await.expect("remove fixture");
         }
     }
 

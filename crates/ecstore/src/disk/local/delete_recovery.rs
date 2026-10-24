@@ -1227,7 +1227,7 @@ impl LocalDisk {
         let record_destination = destination.clone();
         let staging_root = temporary.clone();
         let lease = os::acquire_namespace_mutation_lease_with_owner(&destination, owner.clone()).await;
-        let (staged, target) = os::run_blocking_namespace_operation(lease, move || {
+        let (staged, target) = os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
             std::fs::create_dir_all(&staging_root)?;
             let staged = Arc::new(
                 tempfile::Builder::new()
