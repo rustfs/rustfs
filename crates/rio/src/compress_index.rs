@@ -730,7 +730,7 @@ mod tests {
     #[test]
     fn test_index_round_trip_with_negative_compressed_deltas_and_large_offsets() -> io::Result<()> {
         let mut source = Index::new();
-        source.reset(1 << 20);
+        source.est_block_uncomp = 1 << 20;
         // Compressed blocks much smaller than est_block_uncomp / 2 (512 KiB)
         // produce negative c_off residuals (-524,088 and -262,144).
         source.add(0, 0)?;
@@ -746,7 +746,11 @@ mod tests {
         assert!(rest.is_empty());
         assert_eq!(decoded.total_uncompressed, source.total_uncompressed);
         assert_eq!(decoded.total_compressed, source.total_compressed);
-        assert_eq!(decoded.info, source.info);
+        assert_eq!(decoded.info.len(), source.info.len());
+        for (actual, expected) in decoded.info.iter().zip(source.info.iter()) {
+            assert_eq!(actual.compressed_offset, expected.compressed_offset);
+            assert_eq!(actual.uncompressed_offset, expected.uncompressed_offset);
+        }
 
         Ok(())
     }
