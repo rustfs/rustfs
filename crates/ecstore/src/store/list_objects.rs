@@ -7575,7 +7575,7 @@ mod test {
                 walkdir_timeout: None,
                 walkdir_stall_timeout: None,
             },
-            fallback.clone(),
+            fallback,
             FallbackClaimTracker::default(),
         );
 
