@@ -809,6 +809,8 @@ pub struct FolderScanner {
     pending_size_reconciliation_truncated: bool,
     #[cfg(test)]
     list_path_raw_options_observer: Option<mpsc::UnboundedSender<ListPathRawTimeoutSnapshot>>,
+    #[cfg(test)]
+    defer_abandoned_entries_until_finished: bool,
 }
 
 struct RawEnumerationProgress {
@@ -2818,19 +2820,23 @@ impl FolderScanner {
                 let mut seen_truncated_objects: HashSet<String> = HashSet::new();
 
                 loop {
-                    if agreed_closed && partial_closed && finished_closed {
+                    if child_ctx.is_cancelled() || (agreed_closed && partial_closed && finished_closed) {
                         break;
                     }
+                    #[cfg(test)]
+                    let defer_entries = self.defer_abandoned_entries_until_finished && !finished_closed;
+                    #[cfg(not(test))]
+                    let defer_entries = false;
 
                     select! {
-                        entry_name = agreed_rx.recv(), if !agreed_closed => {
+                        entry_name = agreed_rx.recv(), if !agreed_closed && !defer_entries => {
                             let Some(entry_name) = entry_name else {
                                 agreed_closed = true;
                                 continue;
                             };
                             (self.update_current_path)(&entry_name).await;
                         }
-                        entries = partial_rx.recv(), if !partial_closed => {
+                        entries = partial_rx.recv(), if !partial_closed && !defer_entries => {
                             let Some(entries) = entries else {
                                 partial_closed = true;
                                 continue;
@@ -2956,6 +2962,7 @@ impl FolderScanner {
                                 finished_closed = true;
                                 continue;
                             };
+                            finished_closed = true;
                             if disk_errors_are_only_missing_paths(&errs) {
                                 debug!(
                                     target: "rustfs::scanner::folder",
@@ -2977,7 +2984,9 @@ impl FolderScanner {
                                     "Scanner list_path_raw finished with disk errors"
                                 );
                             }
-                            child_ctx.cancel();
+                            // The producer awaited callback sends, not their
+                            // consumption. Drain the remaining candidate and
+                            // agreed frames before closing this child walk.
                         }
                         _ = child_ctx.cancelled() => {
                             break;
@@ -3257,6 +3266,8 @@ pub(crate) async fn scan_data_folder_scoped(
         pending_size_reconciliation_truncated: false,
         #[cfg(test)]
         list_path_raw_options_observer: None,
+        #[cfg(test)]
+        defer_abandoned_entries_until_finished: false,
     };
 
     let now = FolderScanner::now_secs();
