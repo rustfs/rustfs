@@ -168,6 +168,9 @@ setup_output() {
   mkdir -p "$OUT_DIR/status"
   mkdir -p "$OUT_DIR/heal"
   mkdir -p "$OUT_DIR/metrics"
+  rm -f "$OUT_DIR/pidstat.txt" "$OUT_DIR/iostat.txt" "$OUT_DIR/mpstat.txt" \
+    "$OUT_DIR/host-telemetry-status.tsv"
+  printf 'collector\texit_status\n' >"$OUT_DIR/host-telemetry-status.tsv"
   SUMMARY_CSV="$OUT_DIR/scanner-summary.csv"
   echo "timestamp,primary_pressure,current_cycle_objects_scanned,current_cycle_directories_scanned,last_cycle_result,last_cycle_partial_reason,last_cycle_partial_source,lifecycle_transition_scanner_missed,source_work_missed_total,current_cycle_usage_saves,last_cycle_usage_saves,usage_dirty_pending_buckets,usage_last_cycle_dirty_buckets,usage_last_cycle_cleared_dirty_buckets,usage_last_save_result,usage_last_save_unix_secs,life_time_scan_cycle,life_time_scan_bucket_drive,life_time_scan_object,life_time_save_usage,heal_queue_length,heal_active_tasks,heal_scanner_queued,heal_admin_queued,heal_auto_heal_queued" >"$SUMMARY_CSV"
 }
@@ -216,7 +219,6 @@ start_host_telemetry() {
     return
   fi
 
-  printf 'collector\texit_status\n' >"$OUT_DIR/host-telemetry-status.tsv"
   local pid
   pid="$(first_rustfs_pid)"
 
@@ -243,22 +245,34 @@ start_host_telemetry() {
   fi
 }
 
-wait_host_telemetry() {
-  local index status
+finalize_host_telemetry() {
+  local run_status="${1:-0}" index pid status write_status=0
 
   if [[ ${#TELEMETRY_PIDS[@]} -eq 0 ]]; then
     return
   fi
 
-  for index in "${!TELEMETRY_PIDS[@]}"; do
-    if wait "${TELEMETRY_PIDS[$index]}"; then
+  local collector_pids=("${TELEMETRY_PIDS[@]}")
+  local collector_names=("${TELEMETRY_NAMES[@]}")
+  TELEMETRY_PIDS=()
+  TELEMETRY_NAMES=()
+
+  if [[ "$run_status" != "0" ]]; then
+    for pid in "${collector_pids[@]}"; do
+      kill "$pid" 2>/dev/null || true
+    done
+  fi
+
+  for index in "${!collector_pids[@]}"; do
+    if wait "${collector_pids[$index]}"; then
       status=0
     else
       status=$?
-      printf 'WARN: host telemetry collector %s exited with status %s\n' "${TELEMETRY_NAMES[$index]}" "$status" >&2
+      printf 'WARN: host telemetry collector %s exited with status %s\n' "${collector_names[$index]}" "$status" >&2 || true
     fi
-    printf '%s\t%s\n' "${TELEMETRY_NAMES[$index]}" "$status" >>"$OUT_DIR/host-telemetry-status.tsv"
+    printf '%s\t%s\n' "${collector_names[$index]}" "$status" >>"$OUT_DIR/host-telemetry-status.tsv" || write_status=$?
   done
+  return "$write_status"
 }
 
 scanner_status_url() {
@@ -517,9 +531,10 @@ main() {
 
   write_metadata "$started_at"
   capture_config_snapshots
+  trap 'harness_exit_status=$?; finalize_host_telemetry "$harness_exit_status" || true; exit "$harness_exit_status"' EXIT
   start_host_telemetry
   capture_status_series
-  wait_host_telemetry
+  finalize_host_telemetry
   write_report
 
   echo "Scanner validation artifacts written to $OUT_DIR"
