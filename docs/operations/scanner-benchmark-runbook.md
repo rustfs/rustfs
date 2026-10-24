@@ -146,6 +146,19 @@ in the cell artifact directory; aggregate values alone do not establish their
 measurement provenance. Missing production instrumentation is a pending gate,
 not permission to report a fabricated zero.
 
+For usage-cache saves, `encode_bytes` uses the window delta of
+`rustfs_scanner_cache_serialized_bytes_total`. `save_bytes` uses the sum of
+`rustfs_scanner_cache_save_payload_bytes_total` deltas for `cache="main"` and
+`cache="backup"`.
+The latter counts each full encoded payload submitted to the save interface
+after publication admission, including retries, failed writes, and timeouts.
+A rejected admission, skipped backup, or read-after-error reconciliation adds
+no save bytes. These are submitted application bytes: a failed attempt may
+consume only part of its body, and lower-layer retries, erasure parity, metadata,
+and physical disk writes are outside this counter. Keep the same definition on
+both builds; retain disk counters separately. Neither counter measures cache
+clone allocations, and an absent series is not a measured zero.
+
 Each comparison records a `w22` section with clone, encode, and save bytes per
 walked object, clone/encode and save/encode byte ratios, and candidate changes.
 These are traffic amplification indicators, not allocation attribution or an
