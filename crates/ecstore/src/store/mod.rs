@@ -1430,7 +1430,7 @@ impl BucketOperations for ECStore {
 
     #[instrument(skip(self))]
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
-        Box::pin(self.handle_make_bucket(bucket, opts)).await
+        self.handle_make_bucket(bucket, opts).await
     }
 
     #[instrument(skip(self))]
@@ -1917,6 +1917,19 @@ mod tests {
         assert!(!rendered.contains("format.json"));
         assert!(!rendered.contains("TimedActionSlot"));
         assert!(!rendered.contains("DiskHealthTracker"));
+    }
+
+    #[test]
+    fn make_bucket_handler_future_remains_stack_bounded() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let opts = MakeBucketOptions::default();
+        let future = store.handle_make_bucket("stack-bounded-bucket", &opts);
+        let future_size = std::mem::size_of_val(&future);
+
+        assert!(
+            future_size <= 4 * 1024,
+            "make bucket handler future must remain stack-bounded; measured {future_size} bytes"
+        );
     }
 
     #[test]

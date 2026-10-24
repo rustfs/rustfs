@@ -848,277 +848,293 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
-        if opts.artifact_base_prefix.as_deref().is_some_and(|prefix| {
-            is_meta_bucketname(bucket)
-                || opts.no_lock
-                || !crate::storage_api_contracts::bucket::valid_artifact_base_prefix(prefix)
-        }) {
-            return Err(Error::other("invalid artifact bucket creation options"));
-        }
-        if !is_meta_bucketname(bucket)
-            && let Err(err) = check_valid_bucket_name_strict(bucket)
-        {
-            return Err(StorageError::BucketNameInvalid(err.to_string()));
-        }
+        self.handle_make_bucket_inner(bucket, opts).await
+    }
 
-        // Lock order: bucket lifecycle -> metadata transaction -> exact bucket namespace.
-        let bucket_lifecycle_guard = if !opts.no_lock {
-            Some(self.acquire_bucket_lifecycle_write_lock(bucket).await?)
-        } else {
-            None
-        };
-        let metadata_transaction_guard = if !opts.no_lock && !is_meta_bucketname(bucket) {
-            Some(metadata_sys::acquire_bucket_metadata_transaction_lock_in(&self.ctx, bucket).await?)
-        } else {
-            None
-        };
-        let ns_guard = if !opts.no_lock {
-            let ns_lock = self.new_ns_lock(bucket, bucket).await?;
-            Some(
-                await_bucket_namespace_operation(
-                    bucket_lifecycle_guard.as_ref(),
-                    bucket,
-                    "bucket namespace lock acquisition",
-                    async {
-                        ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| match e {
-                            rustfs_lock::error::LockError::QuorumNotReached { required, achieved } => {
-                                StorageError::NamespaceLockQuorumUnavailable {
-                                    mode: "write",
-                                    bucket: bucket.to_string(),
-                                    object: bucket.to_string(),
-                                    required,
-                                    achieved,
-                                }
-                            }
-                            other => StorageError::Lock(other),
-                        })
-                    },
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-
-        let existing_bucket_info = match self.get_bucket_info_from_sets(bucket, &BucketOptions::default()).await {
-            Ok(info) => Some(info),
-            Err(err) => {
-                if is_err_bucket_not_found(&err) {
-                    None
-                } else {
-                    return Err(to_object_err(err, vec![bucket]));
-                }
+    // Keep the large creation future out of the instrumented handler's poll
+    // frame. Guards remain owned by the same task.
+    fn handle_make_bucket_inner<'a>(
+        &'a self,
+        bucket: &'a str,
+        opts: &'a MakeBucketOptions,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if opts.artifact_base_prefix.as_deref().is_some_and(|prefix| {
+                is_meta_bucketname(bucket)
+                    || opts.no_lock
+                    || !crate::storage_api_contracts::bucket::valid_artifact_base_prefix(prefix)
+            }) {
+                return Err(Error::other("invalid artifact bucket creation options"));
             }
-        };
-        let confirmed_missing = existing_bucket_info.is_none();
-        let mut pending_creation_metadata = None;
-        if confirmed_missing
-            && !opts.no_lock
-            && !is_meta_bucketname(bucket)
-            && let Some(metadata_store) = metadata_sys::object_store_if_initialized_in(&self.ctx).await
-            && let Some(old_incarnation) = crate::bucket::metadata::load_bucket_incarnation(metadata_store, bucket).await?
-        {
-            // A quorum-level absence is not proof that every disk lost the old
-            // generation. Require the explicit recovery path to verify all disks
-            // and retire this incarnation before a same-name create can mutate
-            // any volume.
-            self.ensure_bucket_volume_absent_on_all_sets(bucket)
-                .await
-                .map_err(|error| match error {
-                    StorageError::BucketExists(_) => StorageError::InvalidArgument(
+            if !is_meta_bucketname(bucket)
+                && let Err(err) = check_valid_bucket_name_strict(bucket)
+            {
+                return Err(StorageError::BucketNameInvalid(err.to_string()));
+            }
+
+            // Lock order: bucket lifecycle -> metadata transaction -> exact bucket namespace.
+            let bucket_lifecycle_guard = if !opts.no_lock {
+                Some(self.acquire_bucket_lifecycle_write_lock(bucket).await?)
+            } else {
+                None
+            };
+            let metadata_transaction_guard = if !opts.no_lock && !is_meta_bucketname(bucket) {
+                Some(metadata_sys::acquire_bucket_metadata_transaction_lock_in(&self.ctx, bucket).await?)
+            } else {
+                None
+            };
+            let ns_guard = if !opts.no_lock {
+                let ns_lock = self.new_ns_lock(bucket, bucket).await?;
+                Some(
+                    await_bucket_namespace_operation(
+                        bucket_lifecycle_guard.as_ref(),
+                        bucket,
+                        "bucket namespace lock acquisition",
+                        async {
+                            ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| match e {
+                                rustfs_lock::error::LockError::QuorumNotReached { required, achieved } => {
+                                    StorageError::NamespaceLockQuorumUnavailable {
+                                        mode: "write",
+                                        bucket: bucket.to_string(),
+                                        object: bucket.to_string(),
+                                        required,
+                                        achieved,
+                                    }
+                                }
+                                other => StorageError::Lock(other),
+                            })
+                        },
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+
+            let existing_bucket_info = match self.get_bucket_info_from_sets(bucket, &BucketOptions::default()).await {
+                Ok(info) => Some(info),
+                Err(err) => {
+                    if is_err_bucket_not_found(&err) {
+                        None
+                    } else {
+                        return Err(to_object_err(err, vec![bucket]));
+                    }
+                }
+            };
+            let confirmed_missing = existing_bucket_info.is_none();
+            let mut pending_creation_metadata = None;
+            if confirmed_missing
+                && !opts.no_lock
+                && !is_meta_bucketname(bucket)
+                && let Some(metadata_store) = metadata_sys::object_store_if_initialized_in(&self.ctx).await
+                && let Some(old_incarnation) = crate::bucket::metadata::load_bucket_incarnation(metadata_store, bucket).await?
+            {
+                // A quorum-level absence is not proof that every disk lost the old
+                // generation. Require the explicit recovery path to verify all disks
+                // and retire this incarnation before a same-name create can mutate
+                // any volume.
+                self.ensure_bucket_volume_absent_on_all_sets(bucket)
+                    .await
+                    .map_err(|error| match error {
+                        StorageError::BucketExists(_) => StorageError::InvalidArgument(
+                            "CreateBucket".to_string(),
+                            "bucket".to_string(),
+                            "an old bucket volume remains on disk; administrator recovery refused".to_string(),
+                        ),
+                        other => other,
+                    })?;
+                let (metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
+                let metadata_store = metadata_sys::object_store_in(&self.ctx).await?;
+                let pending_intent = persisted
+                    && metadata.bucket_incarnation_id == old_incarnation
+                    && metadata.needs_bucket_creation_commit()
+                    && !crate::bucket::retirement::is_retired(metadata_store, bucket, old_incarnation).await?;
+                if pending_intent {
+                    pending_creation_metadata = Some(metadata);
+                } else {
+                    return Err(StorageError::InvalidArgument(
                         "CreateBucket".to_string(),
                         "bucket".to_string(),
-                        "an old bucket volume remains on disk; administrator recovery refused".to_string(),
-                    ),
-                    other => other,
-                })?;
-            let (metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
-            let metadata_store = metadata_sys::object_store_in(&self.ctx).await?;
-            let pending_intent = persisted
-                && metadata.bucket_incarnation_id == old_incarnation
-                && metadata.needs_bucket_creation_commit()
-                && !crate::bucket::retirement::is_retired(metadata_store, bucket, old_incarnation).await?;
-            if pending_intent {
-                pending_creation_metadata = Some(metadata);
-            } else {
-                return Err(StorageError::InvalidArgument(
-                    "CreateBucket".to_string(),
-                    "bucket".to_string(),
-                    format!("orphaned bucket generation {old_incarnation} requires administrator recovery before recreation"),
-                ));
-            }
-        }
-        let existing_metadata = if let Some(metadata) = pending_creation_metadata {
-            Some(metadata)
-        } else if (opts.force_create || opts.artifact_base_prefix.is_some()) && !confirmed_missing && !is_meta_bucketname(bucket)
-        {
-            let (mut metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
-            if !persisted {
-                metadata = BucketMetadata::new(bucket);
-                metadata.created = existing_bucket_info
-                    .as_ref()
-                    .and_then(|info| info.created)
-                    .unwrap_or(OffsetDateTime::UNIX_EPOCH);
-                // A sidecar left by an interrupted legacy migration is the
-                // bucket's published incarnation; keep it rather than minting
-                // one that would invalidate fences taken on the stored value.
-                // A retired incarnation is residue of a deleted bucket and
-                // must not come back.
-                let store = metadata_sys::object_store_in(&self.ctx).await?;
-                if let Some(stored) = crate::bucket::metadata::load_bucket_incarnation(store.clone(), bucket).await?
-                    && !crate::bucket::retirement::is_retired(store, bucket, stored).await?
-                {
-                    metadata.bucket_incarnation_id = stored;
+                        format!("orphaned bucket generation {old_incarnation} requires administrator recovery before recreation"),
+                    ));
                 }
-            } else if !metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() {
-                return Err(Error::other(format!(
-                    "bucket incarnation sidecar is missing for new-format metadata: {bucket}"
-                )));
-            } else if !metadata.bucket_incarnation_sidecar {
-                metadata.bucket_incarnation_id = Uuid::new_v4();
             }
-            Some(metadata)
-        } else {
-            None
-        };
-
-        let has_creation_identity = existing_metadata.is_some();
-        let mut meta = existing_metadata.unwrap_or_else(|| {
-            if confirmed_missing && !is_meta_bucketname(bucket) {
-                BucketMetadata::new_with_default_durability(bucket)
-            } else {
-                BucketMetadata::new(bucket)
-            }
-        });
-        if let Some(prefix) = &opts.artifact_base_prefix {
-            if has_creation_identity {
-                if meta.artifact_base_prefix.as_ref() != Some(prefix) {
-                    return Err(Error::other("artifact namespace is immutable"));
+            let existing_metadata = if let Some(metadata) = pending_creation_metadata {
+                Some(metadata)
+            } else if (opts.force_create || opts.artifact_base_prefix.is_some())
+                && !confirmed_missing
+                && !is_meta_bucketname(bucket)
+            {
+                let (mut metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
+                if !persisted {
+                    metadata = BucketMetadata::new(bucket);
+                    metadata.created = existing_bucket_info
+                        .as_ref()
+                        .and_then(|info| info.created)
+                        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+                    // A sidecar left by an interrupted legacy migration is the
+                    // bucket's published incarnation; keep it rather than minting
+                    // one that would invalidate fences taken on the stored value.
+                    // A retired incarnation is residue of a deleted bucket and
+                    // must not come back.
+                    let store = metadata_sys::object_store_in(&self.ctx).await?;
+                    if let Some(stored) = crate::bucket::metadata::load_bucket_incarnation(store.clone(), bucket).await?
+                        && !crate::bucket::retirement::is_retired(store, bucket, stored).await?
+                    {
+                        metadata.bucket_incarnation_id = stored;
+                    }
+                } else if !metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() {
+                    return Err(Error::other(format!(
+                        "bucket incarnation sidecar is missing for new-format metadata: {bucket}"
+                    )));
+                } else if !metadata.bucket_incarnation_sidecar {
+                    metadata.bucket_incarnation_id = Uuid::new_v4();
                 }
-            } else if confirmed_missing {
-                meta.artifact_base_prefix = Some(prefix.clone());
+                Some(metadata)
             } else {
-                return Err(Error::other("artifact namespace requires a new bucket"));
-            }
-        }
-        let existing_incarnation_is_authoritative = meta.bucket_incarnation_sidecar;
-        if confirmed_missing || is_meta_bucketname(bucket) {
-            meta.set_created(opts.created_at);
+                None
+            };
 
-            if opts.versioning_enabled || meta.artifact_base_prefix.is_some() {
+            let has_creation_identity = existing_metadata.is_some();
+            let mut meta = existing_metadata.unwrap_or_else(|| {
+                if confirmed_missing && !is_meta_bucketname(bucket) {
+                    BucketMetadata::new_with_default_durability(bucket)
+                } else {
+                    BucketMetadata::new(bucket)
+                }
+            });
+            if let Some(prefix) = &opts.artifact_base_prefix {
+                if has_creation_identity {
+                    if meta.artifact_base_prefix.as_ref() != Some(prefix) {
+                        return Err(Error::other("artifact namespace is immutable"));
+                    }
+                } else if confirmed_missing {
+                    meta.artifact_base_prefix = Some(prefix.clone());
+                } else {
+                    return Err(Error::other("artifact namespace requires a new bucket"));
+                }
+            }
+            let existing_incarnation_is_authoritative = meta.bucket_incarnation_sidecar;
+            if confirmed_missing || is_meta_bucketname(bucket) {
+                meta.set_created(opts.created_at);
+
+                if opts.versioning_enabled || meta.artifact_base_prefix.is_some() {
+                    meta.versioning_config_xml =
+                        crate::bucket::utils::serialize::<VersioningConfiguration>(&ENABLED_VERSIONING_CONFIG)?;
+                }
+            }
+
+            // Object Lock enable is one-way, and it must apply to an existing bucket
+            // too. Site replication replays make-with-versioning carrying the
+            // source's lockEnabled against a destination bucket that already exists;
+            // gating this on `confirmed_missing` returned success while leaving the
+            // replica unlocked, so replicated versions could be deleted without the
+            // retention the source enforces.
+            let lock_newly_enabled = opts.lock_enabled && !meta.lock_enabled;
+            if opts.lock_enabled {
+                meta.lock_enabled = true;
+                meta.object_lock_config_xml = crate::bucket::utils::serialize(&*crate::store::ENABLED_OBJECT_LOCK_CONFIG)?;
                 meta.versioning_config_xml =
                     crate::bucket::utils::serialize::<VersioningConfiguration>(&ENABLED_VERSIONING_CONFIG)?;
             }
-        }
 
-        // Object Lock enable is one-way, and it must apply to an existing bucket
-        // too. Site replication replays make-with-versioning carrying the
-        // source's lockEnabled against a destination bucket that already exists;
-        // gating this on `confirmed_missing` returned success while leaving the
-        // replica unlocked, so replicated versions could be deleted without the
-        // retention the source enforces.
-        let lock_newly_enabled = opts.lock_enabled && !meta.lock_enabled;
-        if opts.lock_enabled {
-            meta.lock_enabled = true;
-            meta.object_lock_config_xml = crate::bucket::utils::serialize(&*crate::store::ENABLED_OBJECT_LOCK_CONFIG)?;
-            meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&ENABLED_VERSIONING_CONFIG)?;
-        }
-
-        let metadata_persisted_before_physical =
-            confirmed_missing && !is_meta_bucketname(bucket) && (opts.lock_enabled || meta.artifact_base_prefix.is_some());
-        if metadata_persisted_before_physical {
-            metadata_sys::set_new_bucket_metadata_intent_in(&self.ctx, meta.clone()).await?;
-            if bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-                || metadata_transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-                || ns_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-            {
-                return Err(Error::other(format!("bucket metadata creation intent lock was lost: {bucket}")));
-            }
-        }
-
-        if confirmed_missing && !is_meta_bucketname(bucket) {
-            // Fence every scanner cycle that could have observed the namespace
-            // before physical creation. Creation may become visible even when a
-            // later metadata write or namespace-lock check fails.
-            crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
-            // Keep cleanup state out of the bucket-creation request future.
-            Box::pin(self.cleanup_bucket_usage(bucket, ns_guard.as_ref())).await?;
-        }
-
-        if let Err(err) = await_bucket_lifecycle_operation(
-            bucket_lifecycle_guard.as_ref(),
-            ns_guard.as_ref(),
-            bucket,
-            "physical bucket creation",
-            await_bucket_namespace_operation(
-                metadata_transaction_guard.as_ref(),
-                bucket,
-                "bucket creation metadata transaction",
-                async {
-                    self.make_bucket_on_sets(bucket, opts)
-                        .await
-                        .map_err(|err| to_object_err(err, vec![bucket]))
-                },
-            ),
-        )
-        .await
-        {
-            if is_err_bucket_exists(&err)
-                && let Err(heal_err) = self
-                    .handle_heal_bucket(
-                        bucket,
-                        &HealOpts {
-                            recreate: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-            {
-                warn!("best-effort bucket heal after BucketExists failed: {heal_err}");
-            }
-            if confirmed_missing && !is_err_bucket_exists(&err) && ns_guard.as_ref().is_none_or(|guard| !guard.is_lock_lost()) {
-                error!("make bucket failed: {err}");
-                self.rollback_failed_bucket_creation(bucket, bucket_lifecycle_guard.as_ref(), ns_guard.as_ref())
-                    .await;
-            }
-            return Err(err);
-        };
-
-        let metadata_result = async {
+            let metadata_persisted_before_physical =
+                confirmed_missing && !is_meta_bucketname(bucket) && (opts.lock_enabled || meta.artifact_base_prefix.is_some());
             if metadata_persisted_before_physical {
-                return metadata_sys::commit_bucket_metadata_in(&self.ctx, meta).await;
+                metadata_sys::set_new_bucket_metadata_intent_in(&self.ctx, meta.clone()).await?;
+                if bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                    || metadata_transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                    || ns_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                {
+                    return Err(Error::other(format!("bucket metadata creation intent lock was lost: {bucket}")));
+                }
             }
-            if is_meta_bucketname(bucket) {
-                metadata_sys::set_bucket_metadata_in(&self.ctx, meta).await
-            } else if existing_incarnation_is_authoritative && !lock_newly_enabled {
-                metadata_sys::commit_bucket_metadata_in(&self.ctx, meta).await
-            } else {
-                metadata_sys::set_new_bucket_metadata_in(&self.ctx, meta).await
-            }
-        }
-        .await;
-        let metadata_lock_lost = bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-            || metadata_transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-            || ns_guard.as_ref().is_some_and(|guard| guard.is_lock_lost());
-        if let Err(err) = metadata_result {
-            if !metadata_lock_lost {
-                self.rollback_failed_bucket_creation(bucket, bucket_lifecycle_guard.as_ref(), ns_guard.as_ref())
-                    .await;
-            }
-            return Err(err);
-        }
-        if metadata_lock_lost {
-            return Err(Error::other(format!("bucket metadata initialization lock was lost: {bucket}")));
-        }
 
-        if confirmed_missing && !is_meta_bucketname(bucket) {
-            // A scanner may have sampled the first fence before the bucket
-            // became visible. Fence again after metadata initialization so
-            // that snapshot cannot publish as complete.
-            crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
-        }
+            if confirmed_missing && !is_meta_bucketname(bucket) {
+                // Fence every scanner cycle that could have observed the namespace
+                // before physical creation. Creation may become visible even when a
+                // later metadata write or namespace-lock check fails.
+                crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
+                // Keep cleanup state out of the bucket-creation request future.
+                Box::pin(self.cleanup_bucket_usage(bucket, ns_guard.as_ref())).await?;
+            }
 
-        Ok(())
+            if let Err(err) = await_bucket_lifecycle_operation(
+                bucket_lifecycle_guard.as_ref(),
+                ns_guard.as_ref(),
+                bucket,
+                "physical bucket creation",
+                await_bucket_namespace_operation(
+                    metadata_transaction_guard.as_ref(),
+                    bucket,
+                    "bucket creation metadata transaction",
+                    async {
+                        self.make_bucket_on_sets(bucket, opts)
+                            .await
+                            .map_err(|err| to_object_err(err, vec![bucket]))
+                    },
+                ),
+            )
+            .await
+            {
+                if is_err_bucket_exists(&err)
+                    && let Err(heal_err) = self
+                        .handle_heal_bucket(
+                            bucket,
+                            &HealOpts {
+                                recreate: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                {
+                    warn!("best-effort bucket heal after BucketExists failed: {heal_err}");
+                }
+                if confirmed_missing && !is_err_bucket_exists(&err) && ns_guard.as_ref().is_none_or(|guard| !guard.is_lock_lost())
+                {
+                    error!("make bucket failed: {err}");
+                    self.rollback_failed_bucket_creation(bucket, bucket_lifecycle_guard.as_ref(), ns_guard.as_ref())
+                        .await;
+                }
+                return Err(err);
+            };
+
+            let metadata_result = async {
+                if metadata_persisted_before_physical {
+                    return metadata_sys::commit_bucket_metadata_in(&self.ctx, meta).await;
+                }
+                if is_meta_bucketname(bucket) {
+                    metadata_sys::set_bucket_metadata_in(&self.ctx, meta).await
+                } else if existing_incarnation_is_authoritative && !lock_newly_enabled {
+                    metadata_sys::commit_bucket_metadata_in(&self.ctx, meta).await
+                } else {
+                    metadata_sys::set_new_bucket_metadata_in(&self.ctx, meta).await
+                }
+            }
+            .await;
+            let metadata_lock_lost = bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                || metadata_transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                || ns_guard.as_ref().is_some_and(|guard| guard.is_lock_lost());
+            if let Err(err) = metadata_result {
+                if !metadata_lock_lost {
+                    self.rollback_failed_bucket_creation(bucket, bucket_lifecycle_guard.as_ref(), ns_guard.as_ref())
+                        .await;
+                }
+                return Err(err);
+            }
+            if metadata_lock_lost {
+                return Err(Error::other(format!("bucket metadata initialization lock was lost: {bucket}")));
+            }
+
+            if confirmed_missing && !is_meta_bucketname(bucket) {
+                // A scanner may have sampled the first fence before the bucket
+                // became visible. Fence again after metadata initialization so
+                // that snapshot cannot publish as complete.
+                crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
+            }
+
+            Ok(())
+        })
     }
 
     /// Prove a live bucket generation before repairing missing expansion volumes.
