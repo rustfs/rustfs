@@ -194,6 +194,7 @@ The adapter also reports the measurement-window delta of
 `rustfs_heal_mainline_throttle_total{source="admin",result="delayed"}` as
 `heal_mainline_throttle_delayed`; a cumulative process-lifetime value is not a
 valid input.
+
 The clone, encode, and save byte fields are also deltas from the same window.
 Requests, throughput, and p99 must be positive; errors must be zero. Repair
 counts must match the manifest when background work is on. Keep underlying
@@ -214,6 +215,26 @@ consume only part of its body, and lower-layer retries, erasure parity, metadata
 and physical disk writes are outside this counter. Keep the same definition on
 both builds; retain disk counters separately. Neither counter measures cache
 clone allocations, and an absent series is not a measured zero.
+
+`walk_objects` can use the aligned window delta of
+`rustfs_scanner_object_metadata_visits_total`, summed across the declared
+`bucket` and `disk` identities. Each visit starts after scanner I/O admission,
+immediately before reading an `xl.meta` entry. Failed or cancelled reads still
+count; payload entries, cached summaries, and paths skipped before admission do
+not. Re-reading an object counts again, including on another drive. This measures
+scanner metadata visits, not unique S3 objects, versions, successful repairs, or
+physical disk operations. The counter handle is registered once per bucket/drive
+walker and reused without per-object label allocation; recording still has a cost.
+
+For a workload with distinct hot and cold buckets, `cold_walk_objects` selects
+only the cold bucket identities declared in the independent workload manifest.
+Do not infer coldness from the observed counts or multiply bucket-walk counts by
+cached object totals. This metric cannot separate hot and cold prefixes within
+one bucket; that attribution remains unverified. Warm up the required series,
+retain node/drive identities, reject resets or missing window boundaries, and
+use the same visit definition on both builds. Bucket labels follow the existing
+bucket/drive scanner metrics and have bucket-scale cardinality; no key or version
+is a label. An absent or dropped series is not zero.
 
 Each comparison records a `w22` section with clone, encode, and save bytes per
 walked object, clone/encode and save/encode byte ratios, and candidate changes.
@@ -252,6 +273,24 @@ The nightly heal workflow clones **`rustfs/auto-testing`** separately and invoke
 entry point. If an adapter uses it, record and verify the external checkout's
 owner and full commit before use. The current workflow clones the default branch,
 so its contents must not be attributed to a RustFS source SHA.
+
+#### Histogram Window Evidence
+
+Use `scripts/scanner_otlp_window.py` to subtract two cumulative explicit-histogram or monotonic integer-counter snapshots before deriving window evidence. It reads OTLP JSON, or binary OTLP with `--format protobuf` when `opentelemetry-proto` is installed in the active Python environment. Pin and record that dependency in the adapter environment. Keep each original export and its source-node association; output includes the SHA-256 of both inputs.
+
+```bash
+python3 scripts/scanner_otlp_window.py \
+  --before before.json --after after.json \
+  --metric rustfs_heal_admission_start_duration_seconds \
+  --start-ns "$WINDOW_START_NS" --end-ns "$WINDOW_END_NS" \
+  --out histogram-window.json
+```
+
+The command requires matching resource, scope, unit, labels, bucket boundaries and cumulative start time at both boundaries. It rejects missing series, resets, decreasing bucket counters, no-recorded-value flags and duplicate series. Warm up every required label combination before taking the first snapshot; an absent series is not an implicit zero. The optional window arguments must both be present and match every selected point's collection timestamps exactly. Without them, `window_checked` is false and each series retains its actual interval; this is diagnostic output, not same-window release evidence. Independently timed exports from different nodes must not be presented as synchronized samples.
+
+The p95/p99 outputs are bucket intervals, in the metric's original unit, with an exclusive lower and inclusive upper bound. A null endpoint is unbounded; a null percentile means no observations. Historical maxima and minima cannot be subtracted to obtain window maxima or minima. The tool does not interpolate, average per-node percentiles, or turn interval endpoints into the scalar percentiles required by the ABBA gate. Obtain aligned observations with sufficient resolution before reporting those scalars. It also does not change the meaning of the underlying metric: `rustfs_heal_admission_lock_phase_seconds` includes lock acquisition waits and is not an exact lock-hold measurement.
+
+Integer counters use the same `--metric` selection and identity/window checks. Their rows have `kind: "sum"` and an exact integer `delta`; histogram rows have `kind: "histogram"`. Counters must be cumulative, monotonic, and nonnegative OTLP `asInt` values within signed int64 range. Floating-point sums, resets, decreases, type changes and absent values are rejected. A present unchanged counter produces a measured zero delta; missing observations never do. No summation across nodes or labels is implicit: retain those identities when aggregating a counter such as `rustfs_scanner_cache_serialized_bytes_total` across a proven common window.
 
 #### Heal Object Lock Wait
 

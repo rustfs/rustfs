@@ -27,6 +27,7 @@ use std::sync::Mutex as StdMutex;
 use tempfile::TempDir;
 
 pub(super) mod admin_overlap;
+mod admission_timing;
 mod root_recovery;
 use uuid::Uuid;
 mod auto_scan;
@@ -4177,7 +4178,7 @@ async fn admission_snapshot_tracks_start_duplicate_force_start_and_displacement(
     assert_eq!(admission.force_start, 1);
     assert!(
         admission.max_lock_phase_micros > 0,
-        "snapshot should expose a measurable queue/admission lock phase for p95-style external aggregation"
+        "snapshot should expose a measurable maximum queue/admission lock phase"
     );
 }
 

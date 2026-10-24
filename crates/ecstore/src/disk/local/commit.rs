@@ -21,10 +21,11 @@ use super::run_destination_commit_directory_preparation;
 use super::should_fail_local_inline_rollback_hardlink;
 use super::{
     EVENT_DISK_LOCAL_ACCESS_FAILED, EVENT_DISK_LOCAL_HEAL_PURGE_FAILED, EVENT_DISK_LOCAL_RENAME_REJECTED, LOG_COMPONENT_ECSTORE,
-    LOG_SUBSYSTEM_DISK_LOCAL, LocalDisk, SyncMode, effective_durability, inline_metadata_rollback_dir, observe_old_current,
-    remove_dir_all_if_exists, remove_dst_base_before_commit, remove_file_if_exists, rename_data_versions_signature,
-    run_inline_preparation_before_backup, should_fail_after_metadata_commit, should_fail_before_old_metadata_backup,
-    should_fail_commit_rename, should_remove_staged_meta_before_commit, skip_access_checks, tmp_staging_mutation_path,
+    LOG_SUBSYSTEM_DISK_LOCAL, LocalDisk, SyncMode, effective_durability, has_inline_commit_test_failpoints,
+    inline_metadata_rollback_dir, observe_old_current, remove_dir_all_if_exists, remove_dst_base_before_commit,
+    remove_file_if_exists, rename_data_versions_signature, run_inline_preparation_before_backup,
+    should_fail_after_metadata_commit, should_fail_before_old_metadata_backup, should_fail_commit_rename,
+    should_remove_staged_meta_before_commit, skip_access_checks, tmp_staging_mutation_path,
 };
 #[cfg(test)]
 use super::{run_inline_before_file_sync_admission, run_owned_file_write_before_open, run_rename_data_after_first_publication};
@@ -105,16 +106,7 @@ impl StagedRollbackBackup {
 
 impl RenameCommitContext<'_> {
     fn rollback_metadata_std(&self, rollback_data_dir: Option<Uuid>) -> std::io::Result<()> {
-        if let Some(old_data_dir) = rollback_data_dir {
-            let Some(dst_parent) = self.destination_metadata.parent() else {
-                return Err(std::io::Error::new(ErrorKind::InvalidInput, "missing object metadata parent"));
-            };
-            let backup_path = dst_parent.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
-            std::fs::rename(backup_path, self.destination_metadata)?;
-        } else {
-            remove_file_if_exists(self.destination_metadata)?;
-        }
-        Ok(())
+        rollback_metadata_std(self.destination_metadata, rollback_data_dir)
     }
 
     fn rollback_non_inline_std(&self, rollback_data_dir: Option<Uuid>) -> std::io::Result<()> {
@@ -130,16 +122,7 @@ impl RenameCommitContext<'_> {
         rollback_data_dir: Option<Uuid>,
         local_backup: Option<&StagedRollbackBackup>,
     ) -> std::io::Result<()> {
-        #[cfg(all(test, not(windows)))]
-        os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Rollback, self.destination_metadata);
-        if let Some(backup) = local_backup {
-            // The preceding commit used this staged directory on the same
-            // filesystem. Never unlink xl.meta before its atomic replacement.
-            std::fs::rename(backup.path(), self.destination_metadata)?;
-        } else {
-            self.rollback_metadata_std(rollback_data_dir)?;
-        }
-        Ok(())
+        rollback_inline_metadata_std(self.destination_metadata, rollback_data_dir, local_backup)
     }
 
     async fn restore_published_data_source(&self) -> Result<()> {
@@ -207,6 +190,106 @@ pub(super) fn create_local_inline_rollback_backup(
     Ok(backup_path)
 }
 
+fn rollback_metadata_std(destination_metadata: &Path, rollback_data_dir: Option<Uuid>) -> std::io::Result<()> {
+    if let Some(old_data_dir) = rollback_data_dir {
+        let Some(dst_parent) = destination_metadata.parent() else {
+            return Err(std::io::Error::new(ErrorKind::InvalidInput, "missing object metadata parent"));
+        };
+        let backup_path = dst_parent.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+        std::fs::rename(backup_path, destination_metadata)?;
+    } else {
+        remove_file_if_exists(destination_metadata)?;
+    }
+    Ok(())
+}
+
+fn rollback_inline_metadata_std(
+    destination_metadata: &Path,
+    rollback_data_dir: Option<Uuid>,
+    local_backup: Option<&StagedRollbackBackup>,
+) -> std::io::Result<()> {
+    #[cfg(all(test, not(windows)))]
+    os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Rollback, destination_metadata);
+    if let Some(backup) = local_backup {
+        // The preceding commit used this staged directory on the same
+        // filesystem. Never unlink xl.meta before its atomic replacement.
+        std::fs::rename(backup.path(), destination_metadata)?;
+        Ok(())
+    } else {
+        rollback_metadata_std(destination_metadata, rollback_data_dir)
+    }
+}
+
+fn fsync_inline_commit_std(
+    dst: &Path,
+    dst_volume_dir: &Path,
+    destination_was_absent: bool,
+    local_backup: Option<&StagedRollbackBackup>,
+    commit_guard: &os::RenameCommitGuard,
+) -> std::io::Result<()> {
+    if let Some(dst_parent) = dst.parent() {
+        let fsync_started = rustfs_io_metrics::put_stage_timer();
+        if let Err(err) = os::fsync_commit_directory_limited_std(dst_parent, commit_guard) {
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
+                fsync_started,
+            );
+            rollback_inline_metadata_std(dst, None, local_backup)?;
+            return Err(err);
+        }
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
+            fsync_started,
+        );
+    }
+
+    if destination_was_absent {
+        let mut ancestor = dst.parent().and_then(Path::parent);
+        while let Some(ancestor_dir) = ancestor {
+            if !ancestor_dir.starts_with(dst_volume_dir) {
+                break;
+            }
+            let fsync_started = rustfs_io_metrics::put_stage_timer();
+            if let Err(err) = os::fsync_dir_limited_std(ancestor_dir) {
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC,
+                    fsync_started,
+                );
+                rollback_inline_metadata_std(dst, None, local_backup)?;
+                return Err(err);
+            }
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC,
+                fsync_started,
+            );
+            if ancestor_dir == dst_volume_dir {
+                break;
+            }
+            ancestor = ancestor_dir.parent();
+        }
+    }
+    Ok(())
+}
+
+type PreparedInlineMetadata = (
+    Option<Uuid>,
+    Option<Uuid>,
+    Option<Vec<u8>>,
+    Option<crate::disk::OldCurrentSize>,
+    bool,
+    Option<FileInfo>,
+    Option<StagedRollbackBackup>,
+    bool,
+    os::PreparedRenameSource,
+);
+
+enum InlinePreparationOutcome {
+    Committed(RenameDataResp),
+    CommitErr(DiskError),
+    Prepared(PreparedInlineMetadata),
+}
+
+#[cfg(test)]
 pub(super) async fn lock_rename_commit_directories(
     source_parent: &Path,
     destination_parent: &Path,
@@ -244,33 +327,66 @@ pub(super) async fn lock_rename_commit_directories(
     result.map_err(to_file_error).map_err(DiskError::from)
 }
 
-async fn prepare_rename_destination_metadata(
-    file_path: &Path,
-    rename_commit_guard: &os::RenameCommitGuard,
+async fn prepare_rename_commit_and_destination_metadata(
+    create_source_parent: bool,
+    source_parent: &Path,
+    destination_parent: &Path,
+    destination_metadata: &Path,
+    base_dir: &Path,
+    publication_root: &os::PublicationRoot,
     mutation_lease: Arc<os::NamespaceMutationLease>,
-) -> Result<Option<Bytes>> {
+) -> Result<(os::RenameCommitGuard, Option<Bytes>)> {
     #[cfg(any(windows, target_os = "linux"))]
     let result = {
-        let file_path = file_path.to_path_buf();
-        let rename_commit_guard = rename_commit_guard.clone();
+        let source_parent = source_parent.to_path_buf();
+        let destination_parent = destination_parent.to_path_buf();
+        let destination_metadata = destination_metadata.to_path_buf();
+        let base_dir = base_dir.to_path_buf();
+        let publication_root = publication_root.clone();
         os::run_blocking_namespace_operation(mutation_lease, move || {
-            os::read_destination_file_with_commit_guard(&file_path, &rename_commit_guard)
+            if create_source_parent {
+                std::fs::create_dir_all(&source_parent)?;
+            }
+            let guard = match os::prepare_rename_commit_guard(&source_parent, &destination_parent, &base_dir, &publication_root) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    return Err(match std::fs::symlink_metadata(&base_dir) {
+                        Err(base_err) if base_err.kind() == ErrorKind::NotFound => base_err,
+                        _ => err,
+                    });
+                }
+            };
+            #[cfg(all(test, windows))]
+            run_destination_commit_directory_preparation(&destination_parent);
+            let data = os::read_destination_file_with_commit_guard(&destination_metadata, &guard)?;
+            Ok((guard, data.map(Bytes::from)))
         })
         .await
     };
     #[cfg(not(any(windows, target_os = "linux")))]
-    let _ = (rename_commit_guard, mutation_lease);
-    #[cfg(not(any(windows, target_os = "linux")))]
-    let result = match fs::read(file_path).await {
-        Ok(data) => Ok(Some(data)),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err),
+    let result = {
+        let _ = mutation_lease;
+        if create_source_parent {
+            fs::create_dir_all(source_parent).await.map_err(to_file_error)?;
+        }
+        let guard =
+            os::prepare_rename_commit_guard(source_parent, destination_parent, base_dir, publication_root).map_err(|err| {
+                match std::fs::symlink_metadata(base_dir) {
+                    Err(base_err) if base_err.kind() == ErrorKind::NotFound => base_err,
+                    _ => err,
+                }
+            });
+        match guard {
+            Ok(guard) => match fs::read(destination_metadata).await {
+                Ok(data) => Ok((guard, Some(Bytes::from(data)))),
+                Err(err) if err.kind() == ErrorKind::NotFound => Ok((guard, None)),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        }
     };
 
-    result
-        .map(|data| data.map(Bytes::from))
-        .map_err(to_file_error)
-        .map_err(DiskError::from)
+    result.map_err(to_file_error).map_err(DiskError::from)
 }
 
 /// Proof produced only when the local rename returns at an existing access
@@ -305,7 +421,7 @@ impl LocalDisk {
         // object commit is publishing into it. The peer's empty scan remains
         // optimistic; this lease establishes the local commit/delete order and
         // remains owned by any blocking syscall that outlives async cancellation.
-        let destination_object_path = self.io_get_object_path(dst_volume, dst_path)?;
+        let (dst_volume_dir, destination_object_path) = self.io_get_bucket_and_object_path(dst_volume, dst_path)?;
         let quota_fence_token =
             match rustfs_utils::http::metadata_compat::get_consistent_str(&fi.metadata, QUOTA_MUTATION_FENCE_METADATA_SUFFIX) {
                 Some(value) => {
@@ -334,8 +450,13 @@ impl LocalDisk {
         } else {
             None
         };
+        let root_destination_object_path = self.root.join(
+            destination_object_path
+                .strip_prefix(self.io_root())
+                .map_err(|_| DiskError::InvalidPath)?,
+        );
         let metadata_lease =
-            os::acquire_metadata_mutation_lease(&self.get_object_path(dst_volume, dst_path)?, state.namespace_owner.take()).await;
+            os::acquire_metadata_mutation_lease(&root_destination_object_path, state.namespace_owner.take()).await;
         let mutation_lease = os::acquire_rename_data_mutation_lease_with_owner(
             &self.root,
             dst_volume,
@@ -386,7 +507,6 @@ impl LocalDisk {
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
 
-        let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
         if !skip_access_checks(dst_volume)
             && let Err(e) = super::super::fs::access_std(&dst_volume_dir)
         {
@@ -408,18 +528,12 @@ impl LocalDisk {
         let src_file_path = self.io_get_object_path(src_volume, format!("{}/{}", src_path, STORAGE_FORMAT_FILE).as_str())?;
         let dst_file_path = self.io_get_object_open_path(dst_volume, format!("{}/{}", dst_path, STORAGE_FORMAT_FILE).as_str())?;
 
-        // data_dir path
-        let has_data_dir_path = {
-            let has_data_dir = {
-                if !fi.is_remote() {
-                    fi.data_dir
-                        .map(|dir| rustfs_utils::path::retain_slash(dir.to_string().as_str()))
-                } else {
-                    None
-                }
-            };
-
-            if let Some(data_dir) = has_data_dir {
+        // data_dir path (only used by the non-inline commit branch)
+        let has_data_dir_path = if no_inline && !fi.is_remote() {
+            if let Some(data_dir) = fi
+                .data_dir
+                .map(|dir| rustfs_utils::path::retain_slash(dir.to_string().as_str()))
+            {
                 let src_data_path = self.io_get_object_path(
                     src_volume,
                     rustfs_utils::path::retain_slash(format!("{}/{}", src_path, data_dir).as_str()).as_str(),
@@ -433,6 +547,8 @@ impl LocalDisk {
             } else {
                 None
             }
+        } else {
+            None
         };
 
         check_path_length(src_file_path.to_string_lossy().to_string().as_str())?;
@@ -452,14 +568,13 @@ impl LocalDisk {
         let dst_file_parent = dst_file_path
             .parent()
             .ok_or_else(|| DiskError::other("missing object metadata parent"))?;
-        if !no_inline {
-            fs::create_dir_all(src_file_parent).await.map_err(to_file_error)?;
-        }
         // Acquire the common trees before reading destination metadata. On
         // Windows this pins the object directory identity across publication.
-        let rename_commit_guard = lock_rename_commit_directories(
+        let (rename_commit_guard, has_dst_buf) = prepare_rename_commit_and_destination_metadata(
+            !no_inline,
             src_file_parent,
             dst_file_parent,
+            &dst_file_path,
             &dst_volume_dir,
             &self.publication_root,
             mutation_lease.clone(),
@@ -474,12 +589,6 @@ impl LocalDisk {
             source_volume_dir: &src_volume_dir,
             data_paths: has_data_dir_path.as_ref(),
         };
-        let has_dst_buf = prepare_rename_destination_metadata(
-            commit.destination_metadata,
-            &commit.directory_guard,
-            commit.mutation_lease.clone(),
-        )
-        .await?;
 
         if no_inline {
             // Non-inline: read xl.meta, parse, write, rename data dir, rename xl.meta
@@ -916,6 +1025,10 @@ impl LocalDisk {
             let dst_path_for_failpoint = dst_path.to_string();
             let dst_volume_for_source = dst_volume.to_string();
             let dst_path_for_source = dst_path.to_string();
+            let dst_volume_dir_for_commit = dst_volume_dir.clone();
+            let publication_root_for_commit = self.publication_root.clone();
+            #[cfg(not(windows))]
+            let cleanup_src_parent = cleanup_path.is_none();
             #[cfg(windows)]
             let source_parent = src_file_parent.to_path_buf();
             let rename_commit_guard_for_preparation = commit.directory_guard.clone();
@@ -932,7 +1045,7 @@ impl LocalDisk {
             } else {
                 None
             };
-            let prepare_inline_metadata = move || {
+            let prepare_inline_metadata = move |is_cancelled: &dyn Fn() -> bool| {
                 let mut prepared_metadata_source =
                     os::create_prepared_rename_source_with_commit_guard(&src, &dst, &rename_commit_guard_for_preparation)?;
                 #[cfg(windows)]
@@ -1012,7 +1125,71 @@ impl LocalDisk {
                     staged_rollback_path = Some(StagedRollbackBackup(backup_path));
                 }
 
-                Ok::<_, std::io::Error>((
+                let destination_was_absent = has_dst_buf.is_none();
+                if !is_cancelled()
+                    && rollback_data_dir.is_none()
+                    && !os::dst_dir_fsync_group_commit_enabled()
+                    && !has_inline_commit_test_failpoints(&dst_path_for_failpoint)
+                {
+                    let rename_res = if should_fail_commit_rename(&dst_path_for_failpoint) {
+                        drop(prepared_metadata_source);
+                        Err(DiskError::other("test fail during metadata commit rename"))
+                    } else {
+                        os::rename_prepared_source_on_thread(
+                            prepared_metadata_source,
+                            &src,
+                            &dst,
+                            &dst_volume_dir_for_commit,
+                            &publication_root_for_commit,
+                            &rename_commit_guard_for_preparation,
+                        )
+                    };
+                    if let Err(err) = rename_res {
+                        if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
+                            let _ = remove_file_if_exists(backup_path);
+                        }
+                        return Ok(InlinePreparationOutcome::CommitErr(err));
+                    }
+
+                    if should_fail_after_metadata_commit(&dst_path_for_failpoint) {
+                        let err = rollback_inline_metadata_std(&dst, None, staged_rollback_path.as_ref())
+                            .err()
+                            .unwrap_or_else(|| std::io::Error::other("test fail after metadata commit"));
+                        return Ok(InlinePreparationOutcome::CommitErr(DiskError::from(err)));
+                    }
+
+                    if sync
+                        && let Err(err) = fsync_inline_commit_std(
+                            &dst,
+                            &dst_volume_dir_for_commit,
+                            destination_was_absent,
+                            staged_rollback_path.as_ref(),
+                            &rename_commit_guard_for_preparation,
+                        )
+                    {
+                        return Ok(InlinePreparationOutcome::CommitErr(DiskError::from(err)));
+                    }
+
+                    if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
+                        let _ = remove_file_if_exists(backup_path);
+                    }
+                    #[cfg(not(windows))]
+                    if cleanup_src_parent && let Some(parent) = src.parent() {
+                        let _ = std::fs::remove_dir(parent);
+                    }
+
+                    return Ok::<_, std::io::Error>(InlinePreparationOutcome::Committed(RenameDataResp {
+                        old_data_dir,
+                        rollback_data_dir,
+                        cleanup_data_dir: old_data_dir,
+                        sign: version_signature,
+                        old_current_size,
+                        old_current_source_checked,
+                        old_current_source,
+                    }));
+                }
+
+                Ok::<_, std::io::Error>(InlinePreparationOutcome::Prepared((
                     rollback_data_dir,
                     old_data_dir,
                     version_signature,
@@ -1020,19 +1197,22 @@ impl LocalDisk {
                     old_current_source_checked,
                     old_current_source,
                     staged_rollback_path,
-                    has_dst_buf.is_none(),
+                    destination_was_absent,
                     prepared_metadata_source,
-                ))
+                )))
             };
             let inline_preparation = if let Some(admission) = file_sync_admission.as_ref() {
-                os::run_blocking_namespace_file_sync_operation(commit.mutation_lease.clone(), admission, prepare_inline_metadata)
-                    .await
+                os::run_cancellable_blocking_namespace_file_sync_operation(
+                    commit.mutation_lease.clone(),
+                    admission,
+                    prepare_inline_metadata,
+                )
+                .await
             } else {
-                os::run_blocking_namespace_operation(commit.mutation_lease.clone(), prepare_inline_metadata).await
+                os::run_cancellable_blocking_namespace_operation(commit.mutation_lease.clone(), prepare_inline_metadata).await
             }
             .map_err(to_file_error)
             .map_err(DiskError::from);
-
             let (
                 rollback_data_dir,
                 cleanup_data_dir,
@@ -1044,13 +1224,31 @@ impl LocalDisk {
                 destination_was_absent,
                 prepared_metadata_source,
             ) = match inline_preparation {
-                Ok(prepared) => prepared,
-                Err(err) => {
+                Ok(InlinePreparationOutcome::Committed(resp)) => {
+                    drop(file_sync_admission.take());
+                    #[cfg(windows)]
+                    drop(commit.directory_guard);
+                    if let Some(ref cleanup) = cleanup_path {
+                        let _ = self.delete_file(&dst_volume_dir, cleanup, true, false).await;
+                    } else {
+                        #[cfg(windows)]
+                        if let Some(parent) = src_file_path.parent() {
+                            let _ = std::fs::remove_dir(parent);
+                        }
+                    }
+                    for part_path in &invalidate_part_paths {
+                        self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                    }
+                    return Ok(resp);
+                }
+                Ok(InlinePreparationOutcome::CommitErr(err)) | Err(err) => {
+                    drop(file_sync_admission.take());
                     for part_path in &invalidate_part_paths {
                         self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
                     }
                     return Err(err);
                 }
+                Ok(InlinePreparationOutcome::Prepared(prepared)) => prepared,
             };
 
             commit.directory_guard = remove_dst_base_before_commit(

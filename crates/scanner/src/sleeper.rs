@@ -225,7 +225,7 @@ impl DynamicSleeper {
         self.admit_disk_io(1, 0).await;
     }
 
-    async fn sleep_folder_preset(&self) {
+    pub(crate) async fn sleep_folder_preset(&self) {
         if !Self::should_sleep() {
             return;
         }
