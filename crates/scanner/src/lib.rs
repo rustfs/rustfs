@@ -59,6 +59,7 @@ use uuid::Uuid;
 
 pub mod data_usage_define;
 pub mod error;
+mod heal_completion;
 pub mod prefix_usage;
 pub mod raw_page_index;
 mod remote_scanner;

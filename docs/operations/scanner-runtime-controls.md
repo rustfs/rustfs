@@ -325,6 +325,7 @@ RustFS uses a `global_pause` policy while pool decommission or rebalance can hid
 | `pause_backlog.persistence_state` | `degraded` when the `.scanner-pause-backlog.json` ledger cannot be claimed or updated; `error` carries the reason. Scanner cycles keep running untracked behind the data-movement fence, and the ledger claim is retried on each scheduler wake at most every five minutes. `unavailable` means no scanner runtime on this node has attempted a claim. |
 | `pause_backlog.phase` | `idle`, `paused`, `catching_up`, or `retry_exhausted`. The ledger returns to `idle` only after one successful full namespace scan and zero known dirty-usage, expiry, and transition queues. |
 | `membership_repair_pending` | A rejoining decommission source is being re-seeded from the last committed surviving-set ledger before a new full-membership commit is allowed. |
+| `rolled_forward_partial_commit` | Interleaved writers left no surviving commit and different stable fields; the next writer claim, or decommission retirement of the ledger, stabilizes the unique newest stable ledger. |
 | `pause_backlog.thresholds` | Exact pause-duration, deferred-cycle, backlog-size, rate, and failure limits used by the running binary. |
 | `pause_backlog.alert_reasons` | Exceeded thresholds, exhausted counters or retries, replica degradation, and persistence failures. |
 
@@ -501,6 +502,38 @@ Each execution has its own pacing latch, with no new global manager or cross-set
 The pacing gate holds neither namespace locks nor I/O/page permits while sleeping. At final page admission, each real permit acquisition gets a fresh, nonblocking pressure decision. Low-pressure work keeps that permit; only a unit that needs a pause releases capacity to wait. A unit that has completed one bounded pause may proceed despite persistent pressure, which supplies minimum maintenance progress without an endless acquire/pause loop. Existing object operations and commit tails are not interrupted because pressure rose. Cancellation and deadlines remain interruptible, and disabling pacing cannot bypass the global, per-set or page-concurrency hard caps. The existing `RUSTFS_HEAL_MAINLINE_THROTTLE_ENABLE=false` setting is the operational opt-out for newly created executions; no additional request override is introduced.
 
 A missing provider, zero pause, or both class thresholds set to zero preserves unpaced execution. Missing counts follow the existing shared pressure interpreter; they are observations, not health, quorum or resource-ownership proof. The current provider exposes node-level workload classes, so this does not claim independent per-set foreground measurements or a hard global resource budget. Runtime waits increment `rustfs_heal_mainline_throttle_total` with `source=admin`, `result=delayed`, and a foreground-pressure or `recovery_window` reason. Real p99/throughput protection requires the separate W20 fixed-load ABBA measurements.
+
+## Live Scanner Heal Completions
+
+Scanner admissions now retain the canonical heal task ID, including merged
+requests. Node-local metrics associate these live candidates with the executor's
+typed terminal result:
+
+| Metric | Meaning |
+|---|---|
+| `rustfs_scanner_heal_pending_tasks` | Canonical tasks awaiting a terminal observation. |
+| `rustfs_scanner_heal_pending_oldest_seconds` | Age of the oldest retained pending candidate; refreshed every five seconds. |
+| `rustfs_scanner_heal_candidate_terminal_total` | Associated candidates, labeled by object `disposition`, expected `scan_mode`, and unresolved `scope`. |
+| `rustfs_scanner_heal_task_terminal_observations_total` | Associated task observations, deduplicated within the bounded recent history. This is not an execution count. |
+| `rustfs_scanner_heal_candidate_unknown_total` | Candidates whose integrity remains unknown, labeled by reason. |
+| `rustfs_scanner_heal_completion_lost_total` | Terminal notifications skipped by a lagging observer. |
+
+These metrics use the configured metrics exporter. A task's `Completed` state
+can include a deferred object; the `disposition` label preserves that distinction.
+`MetadataHealthy`, `Repaired`, and authoritative absence never imply verified
+payload bytes. Even `VerifiedHealthy` cannot certify scanner coverage: the current
+contract does not bind the candidate's content identity and leader epoch. No
+verified-byte or full-bucket coverage counter is advanced here.
+
+The admission buffer, pending map, terminal channel, and recent history each hold
+at most 1,024 entries. Retained identities are capped at 4 KiB; terminal history
+expires after ten minutes and pending observations after one hour. Overflow,
+notification loss, missing identity, and expiry remain unknown. Queue cancellation
+or displacement paths without a terminal snapshot also age out as unknown.
+Process restart clears this diagnostic state; a restarted runtime reinstalls its
+observer. Counts and pending age are not a durable integrity ledger or a cold-range
+completion deadline. Existing periodic traversal and pending retry hints provide
+compensation independently.
 
 ## Pending Heal Hints
 

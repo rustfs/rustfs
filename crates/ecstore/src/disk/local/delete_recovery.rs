@@ -2781,7 +2781,7 @@ mod tests {
     // metadata yet. Rolling back that sub-quorum write removes the marker it
     // published, and must not report the backup it never wrote as missing:
     // that NotFound read as the first error of rustfs/backlog#2873 defect F.
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn delete_recovery_rollback_of_marker_on_missing_object_is_clean() {
         for applied in [true, false] {
             let (_temp, disk, _info, _original) = fixture().await;
@@ -2820,13 +2820,6 @@ mod tests {
             assert_eq!(observed.state, DeleteRecoveryState::NewPrepared);
             assert!(observed.journal.as_ref().unwrap().original_digest.is_none());
 
-            let logs = crate::disk::local::test::CapturedLogs::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(logs.clone())
-                .with_ansi(false)
-                .without_time()
-                .finish();
-            let guard = tracing::subscriber::set_default(subscriber);
             let restored = disk
                 .settle_delete_transaction(
                     "recovery",
@@ -2837,17 +2830,22 @@ mod tests {
                 )
                 .await
                 .expect("rollback of a marker published on a missing object");
-            drop(guard);
             assert_eq!(restored.state, DeleteRecoveryState::Absent);
             assert!(
                 !root.join(STORAGE_FORMAT_FILE).exists(),
                 "rollback removes the uncommitted marker (applied={applied})"
             );
             assert!(!root.join(transaction.to_string()).exists());
+            // The NotFound this rename logged read as the first error of the
+            // failed write. Assert the attempt rather than the log, which
+            // tracing's process-wide callsite cache can hide under cargo test.
+            let backup = root.join(transaction.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
             assert!(
-                !logs.contents().contains("reliable_rename failed"),
-                "a backup that was never written is not a rename failure (applied={applied}): {}",
-                logs.contents()
+                !crate::disk::local::DELETE_ROLLBACK_BACKUP_RESTORES
+                    .lock()
+                    .unwrap()
+                    .contains(&backup),
+                "a rollback must not restore a backup it never wrote (applied={applied})"
             );
         }
     }

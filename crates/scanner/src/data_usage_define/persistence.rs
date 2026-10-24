@@ -543,6 +543,10 @@ impl DataUsageCache {
                         cache_publication_admission_unavailable()
                     });
                 };
+                // Count each admitted submission, not encoding, reconciliation,
+                // or physical I/O performed below the save interface.
+                counter!(METRIC_CACHE_SAVE_PAYLOAD_BYTES_TOTAL, "cache" => path_type)
+                    .increment(u64::try_from(buf_clone.len()).unwrap_or(u64::MAX));
                 if let Some(revision) = revision {
                     crate::save_config_shared_with_preconditions_and_lease_fence_and_scope(
                         store_clone,
