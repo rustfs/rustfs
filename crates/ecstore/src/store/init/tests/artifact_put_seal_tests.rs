@@ -14,6 +14,7 @@ use crate::{
     store::ECStore,
 };
 use std::{sync::Arc, time::Duration};
+use tokio::io::AsyncReadExt as _;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -113,7 +114,7 @@ async fn tail_barrier_case(cancel_put_waiter: bool) {
         let handoff = PutObjectCommitBarrier::install(bucket, &object, PutObjectCommitPause::AfterRenameHandoff);
         let put_store = store.clone();
         let put_object = object.clone();
-        let put = tokio::spawn(async move {
+        let put_task = tokio::spawn(async move {
             put_store
                 .put_object(
                     bucket,
@@ -131,12 +132,12 @@ async fn tail_barrier_case(cancel_put_waiter: bool) {
             .expect("one real disk pauses before rename");
         quorum.wait_until_paused().await;
         if cancel_put_waiter {
-            put.abort();
+            put_task.abort();
         }
         quorum.release();
         handoff.wait_until_paused().await;
         handoff.release();
-        let result = tokio::time::timeout(DEADLINE, put)
+        let result = tokio::time::timeout(DEADLINE, put_task)
             .await
             .expect("PUT waiter returns while its tail remains paused");
         if cancel_put_waiter {
@@ -147,6 +148,34 @@ async fn tail_barrier_case(cancel_put_waiter: bool) {
                 .expect("PUT quorum ACK succeeds before tail completion");
         }
         assert!(tracker.running() > 0, "real rename tail must still be live");
+        let parallel_object = format!("{prefix}parallel.png");
+        let parallel = tokio::time::timeout(DEADLINE, put(&store, bucket, &parallel_object))
+            .await
+            .expect("ARTIFACT_PUT_SHARED_ADMISSION: another object in the same attempt completes while A is paused");
+        let mut reader = tokio::time::timeout(
+            DEADLINE,
+            store.get_object_reader(
+                bucket,
+                &parallel_object,
+                None,
+                Default::default(),
+                &ObjectOptions {
+                    version_id: Some(parallel.version_id.expect("parallel PUT has a real version").to_string()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("parallel object GET completes while A is paused")
+        .expect("parallel object is readable");
+        let mut bytes = Vec::new();
+        tokio::time::timeout(DEADLINE, reader.stream.read_to_end(&mut bytes))
+            .await
+            .expect("parallel object body completes while A is paused")
+            .expect("read parallel object body");
+        assert_eq!(bytes, vec![0xA5; 273], "ARTIFACT_PUT_SHARED_ADMISSION: B publishes exact bytes");
+        drop(reader);
+        assert!(tracker.running() > 0, "A's physical tail remains paused throughout B's PUT and GET");
         let record = artifact_put_seal_record_path(bucket, incarnation, &prefix);
         let attempt_lock = store
             .new_ns_lock(RUSTFS_META_BUCKET, &record)

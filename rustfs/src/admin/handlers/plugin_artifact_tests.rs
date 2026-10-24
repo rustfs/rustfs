@@ -265,58 +265,61 @@ async fn receipt(response: S3Result<S3Response<(StatusCode, Body)>>) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn artifact_handlers_persist_seal_and_exact_retirement_with_idempotent_retry() {
-    let fixture = Fixture::new(prefix()).await;
-    let object = format!("{}image.png", fixture.prefix);
-    let first = fixture.put(&object, 0xA5).await.expect("first real version");
-    let second = fixture.put(&object, 0xBB).await.expect("second real version");
-    assert_ne!(first, second);
-    let retirement = fixture.retire(&object, first);
-    let error = Retire
-        .call(fixture.request(&retirement, Some(USER)), Params::new())
-        .await
-        .expect_err("retirement requires a seal");
-    assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
-    fixture.absent(&fixture.retirement_path(&object, first)).await;
-
-    for _ in 0..2 {
-        let seal = receipt(Seal.call(fixture.request(&fixture.seal(), Some(USER)), Params::new()).await).await;
-        assert_eq!(seal["ordinary_put_sealed"], true);
-        assert_eq!(seal["target"], fixture.target());
-        assert!(seal.get("gc_safe").is_none());
-    }
-    let persisted_seal = fixture.record(&fixture.seal_path()).await;
-    assert_eq!(persisted_seal["incarnation_id"], json!(fixture.incarnation));
-    assert_eq!(persisted_seal["attempt_prefix"], fixture.prefix);
-    assert!(fixture.put(&object, 0xCC).await.is_err(), "handler seal fences genuine subsequent PUTs");
-    for _ in 0..2 {
-        let retired = receipt(Retire.call(fixture.request(&retirement, Some(USER)), Params::new()).await).await;
-        assert_eq!(retired["exact_version_repair_retired"], true);
-        assert_eq!(retired["version_id"], json!(first));
-        assert!(retired.get("gc_safe").is_none());
-    }
-    let persisted = fixture.record(&fixture.retirement_path(&object, first)).await;
-    assert_eq!(persisted["object"], object);
-    assert_eq!(persisted["version_id"], json!(first));
-    fixture.absent(&fixture.retirement_path(&object, second)).await;
-    for (version, byte) in [(first, 0xA5), (second, 0xBB)] {
-        let mut reader = fixture
-            .store
-            .get_object_reader(
-                BUCKET,
-                &object,
-                None,
-                Default::default(),
-                &StorageObjectOptions {
-                    version_id: Some(version.to_string()),
-                    ..Default::default()
-                },
-            )
+    Box::pin(async {
+        let fixture = Fixture::new(prefix()).await;
+        let object = format!("{}image.png", fixture.prefix);
+        let first = fixture.put(&object, 0xA5).await.expect("first real version");
+        let second = fixture.put(&object, 0xBB).await.expect("second real version");
+        assert_ne!(first, second);
+        let retirement = fixture.retire(&object, first);
+        let error = Retire
+            .call(fixture.request(&retirement, Some(USER)), Params::new())
             .await
-            .expect("retirement preserves real versioned GET");
-        let mut bytes = Vec::new();
-        reader.stream.read_to_end(&mut bytes).await.expect("exact payload");
-        assert_eq!(bytes, vec![byte; 273]);
-    }
+            .expect_err("retirement requires a seal");
+        assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
+        fixture.absent(&fixture.retirement_path(&object, first)).await;
+
+        for _ in 0..2 {
+            let seal = receipt(Seal.call(fixture.request(&fixture.seal(), Some(USER)), Params::new()).await).await;
+            assert_eq!(seal["ordinary_put_sealed"], true);
+            assert_eq!(seal["target"], fixture.target());
+            assert!(seal.get("gc_safe").is_none());
+        }
+        let persisted_seal = fixture.record(&fixture.seal_path()).await;
+        assert_eq!(persisted_seal["incarnation_id"], json!(fixture.incarnation));
+        assert_eq!(persisted_seal["attempt_prefix"], fixture.prefix);
+        assert!(fixture.put(&object, 0xCC).await.is_err(), "handler seal fences genuine subsequent PUTs");
+        for _ in 0..2 {
+            let retired = receipt(Retire.call(fixture.request(&retirement, Some(USER)), Params::new()).await).await;
+            assert_eq!(retired["exact_version_repair_retired"], true);
+            assert_eq!(retired["version_id"], json!(first));
+            assert!(retired.get("gc_safe").is_none());
+        }
+        let persisted = fixture.record(&fixture.retirement_path(&object, first)).await;
+        assert_eq!(persisted["object"], object);
+        assert_eq!(persisted["version_id"], json!(first));
+        fixture.absent(&fixture.retirement_path(&object, second)).await;
+        for (version, byte) in [(first, 0xA5), (second, 0xBB)] {
+            let mut reader = fixture
+                .store
+                .get_object_reader(
+                    BUCKET,
+                    &object,
+                    None,
+                    Default::default(),
+                    &StorageObjectOptions {
+                        version_id: Some(version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("retirement preserves real versioned GET");
+            let mut bytes = Vec::new();
+            reader.stream.read_to_end(&mut bytes).await.expect("exact payload");
+            assert_eq!(bytes, vec![byte; 273]);
+        }
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -491,60 +494,63 @@ async fn artifact_writes_artifact_handlers_reject_unauthorized_principals_and_wr
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn artifact_writes_artifact_handlers_bind_incarnation_and_request_instance() {
-    let prefix = prefix();
-    let first = Fixture::new(prefix.clone()).await;
-    let second = Fixture::new(prefix).await;
-    assert_ne!(first.incarnation, second.incarnation);
-    let object = format!("{}image.png", first.prefix);
-    let version = first.put(&object, 0xA5).await.expect("first store object");
-    second.put(&object, 0xBB).await.expect("second store object");
-    for (operation, mut body) in [
-        (&Seal as &dyn Operation, first.seal()),
-        (&SealRepairs as &dyn Operation, first.seal()),
-        (&SealWrites as &dyn Operation, first.seal()),
-        (&Retire as &dyn Operation, first.retire(&object, version)),
-    ] {
-        body["target"]["bucket_incarnation"] = json!(second.incarnation);
-        let req = first.request(&body, Some(USER));
-        let result = operation.call(req, Params::new()).await;
-        assert_eq!(
-            result.expect_err("other instance incarnation is rejected").code(),
-            &s3s::S3ErrorCode::ServiceUnavailable
-        );
-        first.absent(&first.seal_path()).await;
-        second.absent(&second.seal_path()).await;
+    Box::pin(async {
+        let prefix = prefix();
+        let first = Fixture::new(prefix.clone()).await;
+        let second = Fixture::new(prefix).await;
+        assert_ne!(first.incarnation, second.incarnation);
+        let object = format!("{}image.png", first.prefix);
+        let version = first.put(&object, 0xA5).await.expect("first store object");
+        second.put(&object, 0xBB).await.expect("second store object");
+        for (operation, mut body) in [
+            (&Seal as &dyn Operation, first.seal()),
+            (&SealRepairs as &dyn Operation, first.seal()),
+            (&SealWrites as &dyn Operation, first.seal()),
+            (&Retire as &dyn Operation, first.retire(&object, version)),
+        ] {
+            body["target"]["bucket_incarnation"] = json!(second.incarnation);
+            let req = first.request(&body, Some(USER));
+            let result = operation.call(req, Params::new()).await;
+            assert_eq!(
+                result.expect_err("other instance incarnation is rejected").code(),
+                &s3s::S3ErrorCode::ServiceUnavailable
+            );
+            first.absent(&first.seal_path()).await;
+            second.absent(&second.seal_path()).await;
+            first.absent(&first.repair_seal_path()).await;
+            second.absent(&second.repair_seal_path()).await;
+            first.absent(&first.retirement_path(&object, version)).await;
+            second.absent(&second.retirement_path(&object, version)).await;
+        }
+        receipt(Seal.call(first.request(&first.seal(), Some(USER)), Params::new()).await).await;
+        let mut wrong_incarnation = first.seal();
+        wrong_incarnation["target"]["bucket_incarnation"] = json!(second.incarnation);
+        let error = SealRepairs
+            .call(first.request(&wrong_incarnation, Some(USER)), Params::new())
+            .await
+            .expect_err("repair seal checks incarnation even after the PUT seal exists");
+        assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
         first.absent(&first.repair_seal_path()).await;
         second.absent(&second.repair_seal_path()).await;
-        first.absent(&first.retirement_path(&object, version)).await;
-        second.absent(&second.retirement_path(&object, version)).await;
-    }
-    receipt(Seal.call(first.request(&first.seal(), Some(USER)), Params::new()).await).await;
-    let mut wrong_incarnation = first.seal();
-    wrong_incarnation["target"]["bucket_incarnation"] = json!(second.incarnation);
-    let error = SealRepairs
-        .call(first.request(&wrong_incarnation, Some(USER)), Params::new())
-        .await
-        .expect_err("repair seal checks incarnation even after the PUT seal exists");
-    assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
-    first.absent(&first.repair_seal_path()).await;
-    second.absent(&second.repair_seal_path()).await;
-    assert!(first.put(&object, 0xCC).await.is_err());
-    second
-        .put(&object, 0xDD)
-        .await
-        .expect("first instance seal cannot affect second store");
-    second.absent(&second.seal_path()).await;
-    first.record(&first.seal_path()).await;
-    let repaired = receipt(
-        SealRepairs
-            .call(first.request(&first.seal(), Some(USER)), Params::new())
-            .await,
-    )
-    .await;
-    assert_eq!(repaired["target"], first.target());
-    assert_eq!(repaired["attempt_repairs_sealed"], true);
-    first.record(&first.repair_seal_path()).await;
-    second.absent(&second.repair_seal_path()).await;
+        assert!(first.put(&object, 0xCC).await.is_err());
+        second
+            .put(&object, 0xDD)
+            .await
+            .expect("first instance seal cannot affect second store");
+        second.absent(&second.seal_path()).await;
+        first.record(&first.seal_path()).await;
+        let repaired = receipt(
+            SealRepairs
+                .call(first.request(&first.seal(), Some(USER)), Params::new())
+                .await,
+        )
+        .await;
+        assert_eq!(repaired["target"], first.target());
+        assert_eq!(repaired["attempt_repairs_sealed"], true);
+        first.record(&first.repair_seal_path()).await;
+        second.absent(&second.repair_seal_path()).await;
+    })
+    .await
 }
 
 impl Fixture {
@@ -570,56 +576,59 @@ impl Fixture {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn artifact_bucket_create_persists_current_identity_and_recreation() {
-    use crate::admin::storage_api::AdminVersioningConfigExt as _;
-    use crate::storage::storage_api::ecstore_bucket::metadata::load_bucket_metadata;
-    let fixture = Fixture::new(prefix()).await;
-    let bucket = "new-handler-artifacts";
-    fixture.grant_creation(bucket).await;
-    let body = json!({"version":1,"bucket":bucket,"base_prefix":"outputs/"});
-    let first = receipt(Create.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
-    let first_id = Uuid::parse_str(first["bucket_incarnation"].as_str().expect("receipt UUID")).expect("UUID");
-    let metadata = load_bucket_metadata(fixture.store.clone(), bucket)
-        .await
-        .expect("read persistent metadata");
-    assert_eq!(first_id, metadata.bucket_incarnation_id, "ARTIFACT_CREATE_CURRENT_GENERATION");
-    assert!(!first_id.is_nil());
-    assert_eq!(metadata.artifact_base_prefix.as_deref(), Some("outputs/"));
-    let config = metadata.versioning_config.expect("persistent versioning");
-    assert!(config.enabled());
-    assert!(!config.exclude_folders.unwrap_or(false));
-    assert!(config.excluded_prefixes.as_ref().is_none_or(Vec::is_empty));
-    assert_eq!(first["versioning_enabled"], true);
-    assert_eq!(first["bucket"], bucket);
-    assert_eq!(first["base_prefix"], "outputs/");
-    assert!(first.get("gc_safe").is_none());
-    fixture
-        .store
-        .delete_bucket(bucket, &DeleteBucketOptions::default())
-        .await
-        .expect("delete first empty generation");
-    let second = receipt(Create.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
-    let second_id = Uuid::parse_str(second["bucket_incarnation"].as_str().expect("new UUID")).expect("UUID");
-    assert_ne!(first_id, second_id, "ARTIFACT_CREATE_CURRENT_GENERATION");
-    let current = load_bucket_metadata(fixture.store.clone(), bucket)
-        .await
-        .expect("read current metadata");
-    assert_eq!(second_id, current.bucket_incarnation_id, "ARTIFACT_CREATE_CURRENT_GENERATION");
-    assert_eq!(current.artifact_base_prefix.as_deref(), Some("outputs/"));
-    assert!(
+    Box::pin(async {
+        use crate::admin::storage_api::AdminVersioningConfigExt as _;
+        use crate::storage::storage_api::ecstore_bucket::metadata::load_bucket_metadata;
+        let fixture = Fixture::new(prefix()).await;
+        let bucket = "new-handler-artifacts";
+        fixture.grant_creation(bucket).await;
+        let body = json!({"version":1,"bucket":bucket,"base_prefix":"outputs/"});
+        let first = receipt(Create.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
+        let first_id = Uuid::parse_str(first["bucket_incarnation"].as_str().expect("receipt UUID")).expect("UUID");
+        let metadata = load_bucket_metadata(fixture.store.clone(), bucket)
+            .await
+            .expect("read persistent metadata");
+        assert_eq!(first_id, metadata.bucket_incarnation_id, "ARTIFACT_CREATE_CURRENT_GENERATION");
+        assert!(!first_id.is_nil());
+        assert_eq!(metadata.artifact_base_prefix.as_deref(), Some("outputs/"));
+        let config = metadata.versioning_config.expect("persistent versioning");
+        assert!(config.enabled());
+        assert!(!config.exclude_folders.unwrap_or(false));
+        assert!(config.excluded_prefixes.as_ref().is_none_or(Vec::is_empty));
+        assert_eq!(first["versioning_enabled"], true);
+        assert_eq!(first["bucket"], bucket);
+        assert_eq!(first["base_prefix"], "outputs/");
+        assert!(first.get("gc_safe").is_none());
+        fixture
+            .store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete first empty generation");
+        let second = receipt(Create.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
+        let second_id = Uuid::parse_str(second["bucket_incarnation"].as_str().expect("new UUID")).expect("UUID");
+        assert_ne!(first_id, second_id, "ARTIFACT_CREATE_CURRENT_GENERATION");
+        let current = load_bucket_metadata(fixture.store.clone(), bucket)
+            .await
+            .expect("read current metadata");
+        assert_eq!(second_id, current.bucket_incarnation_id, "ARTIFACT_CREATE_CURRENT_GENERATION");
+        assert_eq!(current.artifact_base_prefix.as_deref(), Some("outputs/"));
+        assert!(
+            fixture
+                .store
+                .clone()
+                .seal_artifact_attempt_puts(bucket, first_id, &fixture.prefix)
+                .await
+                .is_err(),
+            "old receipt cannot seal replacement"
+        );
         fixture
             .store
             .clone()
-            .seal_artifact_attempt_puts(bucket, first_id, &fixture.prefix)
+            .seal_artifact_attempt_puts(bucket, second_id, &fixture.prefix)
             .await
-            .is_err(),
-        "old receipt cannot seal replacement"
-    );
-    fixture
-        .store
-        .clone()
-        .seal_artifact_attempt_puts(bucket, second_id, &fixture.prefix)
-        .await
-        .expect("current incarnation with the same prefix seals successfully");
+            .expect("current incarnation with the same prefix seals successfully");
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -753,46 +762,49 @@ async fn artifact_bucket_create_topology_and_input_fail_closed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn artifact_bucket_inspect_current_identity_and_recreation() {
-    let fixture = Fixture::new(prefix()).await;
-    fixture.grant_bucket_action(BUCKET, "admin:GetPluginArtifactBucket").await;
-    let body = json!({"version":1,"bucket":BUCKET,"base_prefix":"outputs/"});
-    let observed = receipt(Inspect.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
-    assert_eq!(observed["bucket_incarnation"], json!(fixture.incarnation));
-    assert_eq!(observed["bucket"], BUCKET);
-    assert_eq!(observed["base_prefix"], "outputs/");
-    assert_eq!(observed["versioning_enabled"], true);
-    assert_eq!(observed["version"], 1);
-    for absent in ["gc_safe", "ordinary_put_sealed", "all_writes_sealed"] {
-        assert!(observed.get(absent).is_none());
-    }
-    fixture
-        .store
-        .delete_bucket(BUCKET, &DeleteBucketOptions::default())
-        .await
-        .expect("delete first generation");
-    let current = fixture
-        .store
-        .clone()
-        .make_artifact_bucket(BUCKET, "outputs/")
-        .await
-        .expect("same-prefix recreation");
-    assert_ne!(current, fixture.incarnation);
-    let observed = receipt(Inspect.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
-    assert_eq!(observed["bucket_incarnation"], json!(current));
-    assert!(
+    Box::pin(async {
+        let fixture = Fixture::new(prefix()).await;
+        fixture.grant_bucket_action(BUCKET, "admin:GetPluginArtifactBucket").await;
+        let body = json!({"version":1,"bucket":BUCKET,"base_prefix":"outputs/"});
+        let observed = receipt(Inspect.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
+        assert_eq!(observed["bucket_incarnation"], json!(fixture.incarnation));
+        assert_eq!(observed["bucket"], BUCKET);
+        assert_eq!(observed["base_prefix"], "outputs/");
+        assert_eq!(observed["versioning_enabled"], true);
+        assert_eq!(observed["version"], 1);
+        for absent in ["gc_safe", "ordinary_put_sealed", "all_writes_sealed"] {
+            assert!(observed.get(absent).is_none());
+        }
+        fixture
+            .store
+            .delete_bucket(BUCKET, &DeleteBucketOptions::default())
+            .await
+            .expect("delete first generation");
+        let current = fixture
+            .store
+            .clone()
+            .make_artifact_bucket(BUCKET, "outputs/")
+            .await
+            .expect("same-prefix recreation");
+        assert_ne!(current, fixture.incarnation);
+        let observed = receipt(Inspect.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
+        assert_eq!(observed["bucket_incarnation"], json!(current));
+        assert!(
+            fixture
+                .store
+                .clone()
+                .seal_artifact_attempt_puts(BUCKET, fixture.incarnation, &fixture.prefix)
+                .await
+                .is_err()
+        );
         fixture
             .store
             .clone()
-            .seal_artifact_attempt_puts(BUCKET, fixture.incarnation, &fixture.prefix)
+            .seal_artifact_attempt_puts(BUCKET, current, &fixture.prefix)
             .await
-            .is_err()
-    );
-    fixture
-        .store
-        .clone()
-        .seal_artifact_attempt_puts(BUCKET, current, &fixture.prefix)
-        .await
-        .expect("current generation accepted");
+            .expect("current generation accepted");
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1017,6 +1029,7 @@ async fn artifact_writes_handler_strict_requests_and_independent_action() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn artifact_writes_handler_confirms_both_records_on_first_and_exact_retry() {
+    Box::pin(async {
     let fixture = Fixture::new(prefix()).await;
     let policy = Policy::parse_config(
         &serde_json::to_vec(&json!({"Version":"2012-10-17", "Statement":[{
@@ -1048,214 +1061,219 @@ async fn artifact_writes_handler_confirms_both_records_on_first_and_exact_retry(
     }
     fixture.absent(&fixture.retirement_path(&key, version)).await;
     assert!(fixture.put(&key, 0xBB).await.is_err(), "combined seal must actually reject PUT");
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn artifact_writes_upload_part_copy_rejects_real_managed_staging_and_preserves_it() {
-    use crate::storage::storage_api::contract::{
-        bucket::BUCKET_LIFECYCLE_LOCK_OBJECT, multipart::MultipartOperations as _, namespace::NamespaceLocking as _,
-    };
-    use s3s::{
-        S3 as _,
-        dto::{CopySource, UploadPartCopyInput},
-    };
-    let fixture = Fixture::new(prefix()).await;
-    let ordinary = "artifact-copy-control";
-    fixture
-        .store
-        .make_bucket(
-            ordinary,
-            &MakeBucketOptions {
-                versioning_enabled: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("ordinary source bucket");
-    fixture
-        .store
-        .put_object(
-            ordinary,
-            "source.bin",
-            &mut StoragePutObjReader::from_vec(vec![0xBB; 273]),
-            &StorageObjectOptions {
-                versioned: true,
-                write_completion: WriteCompletion::TailDrained,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("actual copy source");
-    let key = format!("{}legacy-multipart.bin", fixture.prefix);
-    fixture.put(&key, 0xA5).await.expect("existing managed version");
-    // Model persisted staging predating the managed profile. Use the existing
-    // pool API under an actual lifecycle owner; no invented upload ID or
-    // bucket-authority override can stand in for a valid copy destination.
-    let namespace = fixture
-        .store
-        .new_ns_lock(BUCKET, BUCKET_LIFECYCLE_LOCK_OBJECT)
-        .await
-        .expect("managed lifecycle namespace");
-    let lifecycle = namespace
-        .get_read_lock(Duration::from_secs(30))
-        .await
-        .expect("managed lifecycle owner");
-    let mut options = StorageObjectOptions {
-        expected_bucket_incarnation_id: Some(fixture.incarnation),
-        versioned: true,
-        ..Default::default()
-    };
-    options.add_bucket_lifecycle_lock_guard(&lifecycle);
-    let upload = fixture.store.pools[0]
-        .new_multipart_upload(BUCKET, &key, &options)
-        .await
-        .expect("real historical managed upload");
-    let original = fixture.store.pools[0]
-        .put_object_part(
-            BUCKET,
-            &key,
-            &upload.upload_id,
-            1,
-            &mut StoragePutObjReader::from_vec(vec![0xAA; 273]),
-            &options,
-        )
-        .await
-        .expect("real historical staged part");
-    drop(options);
-    drop(lifecycle);
-    let parts = fixture
-        .store
-        .list_object_parts(BUCKET, &key, &upload.upload_id, None, 1000, &StorageObjectOptions::default())
-        .await
-        .expect("historical staging is readable before copy");
-    assert_eq!(parts.parts.len(), 1);
-    assert_eq!(parts.parts[0].etag, original.etag);
-    let slot = ServerContextSlot::new();
-    assert!(slot.install(fixture.context.clone()));
-    let fs = crate::storage::ecfs::FS::with_server_ctx(slot);
-    // S3Access::check authenticates this principal in a network request. Keep
-    // that same real context-bound identity when entering the access hook here.
-    let (credential, is_owner) = crate::auth::check_key_valid_with_context("", ROOT, Some(fixture.context.as_ref()))
-        .await
-        .expect("authenticate the fixture's actual root identity");
-    assert!(is_owner);
-    let source_incarnation = fixture
-        .store
-        .bucket_incarnation_id(ordinary)
-        .await
-        .expect("actual source incarnation");
-    let copy_request = |bucket: &str, key: &str, upload_id: &str| {
-        let input = UploadPartCopyInput::builder()
-            .bucket(bucket.to_owned())
-            .key(key.to_owned())
-            .upload_id(upload_id.to_owned())
-            .part_number(1)
-            .copy_source(CopySource::Bucket {
-                bucket: ordinary.to_owned().into(),
-                key: "source.bin".into(),
-                version_id: None,
-            })
-            .build()
-            .expect("valid UploadPartCopy request");
-        let mut req = fixture.request(&json!({}), Some(ROOT));
-        req.extensions.insert(crate::storage::storage_api::access_consumer::ReqInfo {
-            cred: Some(credential.clone()),
-            is_owner,
+    Box::pin(async {
+        use crate::storage::storage_api::contract::{
+            bucket::BUCKET_LIFECYCLE_LOCK_OBJECT, multipart::MultipartOperations as _, namespace::NamespaceLocking as _,
+        };
+        use s3s::{
+            S3 as _,
+            dto::{CopySource, UploadPartCopyInput},
+        };
+        let fixture = Fixture::new(prefix()).await;
+        let ordinary = "artifact-copy-control";
+        fixture
+            .store
+            .make_bucket(
+                ordinary,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("ordinary source bucket");
+        fixture
+            .store
+            .put_object(
+                ordinary,
+                "source.bin",
+                &mut StoragePutObjReader::from_vec(vec![0xBB; 273]),
+                &StorageObjectOptions {
+                    versioned: true,
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("actual copy source");
+        let key = format!("{}legacy-multipart.bin", fixture.prefix);
+        fixture.put(&key, 0xA5).await.expect("existing managed version");
+        // Model persisted staging predating the managed profile. Use the existing
+        // pool API under an actual lifecycle owner; no invented upload ID or
+        // bucket-authority override can stand in for a valid copy destination.
+        let namespace = fixture
+            .store
+            .new_ns_lock(BUCKET, BUCKET_LIFECYCLE_LOCK_OBJECT)
+            .await
+            .expect("managed lifecycle namespace");
+        let lifecycle = namespace
+            .get_read_lock(Duration::from_secs(30))
+            .await
+            .expect("managed lifecycle owner");
+        let mut options = StorageObjectOptions {
+            expected_bucket_incarnation_id: Some(fixture.incarnation),
+            versioned: true,
             ..Default::default()
-        });
-        S3Request {
-            input,
-            method: Method::PUT,
-            uri: req.uri,
-            headers: req.headers,
-            extensions: req.extensions,
-            credentials: req.credentials,
-            region: req.region,
-            service: req.service,
-            trailing_headers: None,
-        }
-    };
-    let disk_snapshot = || {
-        let mut pending = vec![fixture._root.path().to_owned()];
-        let mut snapshot = std::collections::BTreeMap::new();
-        while let Some(path) = pending.pop() {
-            if path.is_dir() {
-                for entry in std::fs::read_dir(&path).expect("fixture directory") {
-                    pending.push(entry.expect("fixture entry").path());
-                }
-                snapshot.insert(path, None);
-            } else {
-                let bytes = std::fs::read(&path).expect("fixture file");
-                snapshot.insert(path, Some(bytes));
+        };
+        options.add_bucket_lifecycle_lock_guard(&lifecycle);
+        let upload = fixture.store.pools[0]
+            .new_multipart_upload(BUCKET, &key, &options)
+            .await
+            .expect("real historical managed upload");
+        let original = fixture.store.pools[0]
+            .put_object_part(
+                BUCKET,
+                &key,
+                &upload.upload_id,
+                1,
+                &mut StoragePutObjReader::from_vec(vec![0xAA; 273]),
+                &options,
+            )
+            .await
+            .expect("real historical staged part");
+        drop(options);
+        drop(lifecycle);
+        let parts = fixture
+            .store
+            .list_object_parts(BUCKET, &key, &upload.upload_id, None, 1000, &StorageObjectOptions::default())
+            .await
+            .expect("historical staging is readable before copy");
+        assert_eq!(parts.parts.len(), 1);
+        assert_eq!(parts.parts[0].etag, original.etag);
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(fixture.context.clone()));
+        let fs = crate::storage::ecfs::FS::with_server_ctx(slot);
+        // S3Access::check authenticates this principal in a network request. Keep
+        // that same real context-bound identity when entering the access hook here.
+        let (credential, is_owner) = crate::auth::check_key_valid_with_context("", ROOT, Some(fixture.context.as_ref()))
+            .await
+            .expect("authenticate the fixture's actual root identity");
+        assert!(is_owner);
+        let source_incarnation = fixture
+            .store
+            .bucket_incarnation_id(ordinary)
+            .await
+            .expect("actual source incarnation");
+        let copy_request = |bucket: &str, key: &str, upload_id: &str| {
+            let input = UploadPartCopyInput::builder()
+                .bucket(bucket.to_owned())
+                .key(key.to_owned())
+                .upload_id(upload_id.to_owned())
+                .part_number(1)
+                .copy_source(CopySource::Bucket {
+                    bucket: ordinary.to_owned().into(),
+                    key: "source.bin".into(),
+                    version_id: None,
+                })
+                .build()
+                .expect("valid UploadPartCopy request");
+            let mut req = fixture.request(&json!({}), Some(ROOT));
+            req.extensions.insert(crate::storage::storage_api::access_consumer::ReqInfo {
+                cred: Some(credential.clone()),
+                is_owner,
+                ..Default::default()
+            });
+            S3Request {
+                input,
+                method: Method::PUT,
+                uri: req.uri,
+                headers: req.headers,
+                extensions: req.extensions,
+                credentials: req.credentials,
+                region: req.region,
+                service: req.service,
+                trailing_headers: None,
             }
-        }
-        snapshot
-    };
-    let mut managed_request = copy_request(BUCKET, &key, &upload.upload_id);
-    s3s::access::S3Access::upload_part_copy(&fs, &mut managed_request)
-        .await
-        .expect("real source/destination authorization captures both generation guards");
-    let mut source_options = StorageObjectOptions::default();
-    crate::storage::storage_api::access_consumer::apply_copy_source_bucket_generation_guard(
-        &managed_request,
-        ordinary,
-        &mut source_options,
-    )
-    .expect("source generation middleware contract");
-    assert_eq!(source_options.expected_bucket_incarnation_id, Some(source_incarnation));
-    let mut destination_options = StorageObjectOptions::default();
-    crate::storage::storage_api::access_consumer::apply_bucket_generation_guard(
-        &managed_request,
-        BUCKET,
-        &mut destination_options,
-    )
-    .expect("destination generation middleware contract");
-    assert_eq!(destination_options.expected_bucket_incarnation_id, Some(fixture.incarnation));
-    let before = disk_snapshot();
-    let error = Box::pin(fs.upload_part_copy(managed_request))
-        .await
-        .expect_err("managed copy must reject at its actual write entrance");
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InternalError);
-    assert_eq!(error.message(), Some("We encountered an internal error, please try again."));
-    assert!(
-        disk_snapshot() == before,
-        "rejected copy changed existing metadata, shards, or multipart staging"
-    );
-    let after = fixture
-        .store
-        .list_object_parts(BUCKET, &key, &upload.upload_id, None, 1000, &StorageObjectOptions::default())
-        .await
-        .expect("original staged part remains readable");
-    assert_eq!(after.parts.len(), 1);
-    assert_eq!(after.parts[0].etag, original.etag);
-    let control = fixture
-        .store
-        .new_multipart_upload(ordinary, "destination.bin", &StorageObjectOptions::default())
-        .await
-        .expect("ordinary MPU");
-    let mut control_request = copy_request(ordinary, "destination.bin", &control.upload_id);
-    s3s::access::S3Access::upload_part_copy(&fs, &mut control_request)
-        .await
-        .expect("ordinary copy uses the same real authorization/generation middleware");
-    let copied = Box::pin(fs.upload_part_copy(control_request))
-        .await
-        .expect("same S3 handler must copy into ordinary staging");
-    assert!(copied.output.copy_part_result.and_then(|part| part.e_tag).is_some());
-    let parts = fixture
-        .store
-        .list_object_parts(
+        };
+        let disk_snapshot = || {
+            let mut pending = vec![fixture._root.path().to_owned()];
+            let mut snapshot = std::collections::BTreeMap::new();
+            while let Some(path) = pending.pop() {
+                if path.is_dir() {
+                    for entry in std::fs::read_dir(&path).expect("fixture directory") {
+                        pending.push(entry.expect("fixture entry").path());
+                    }
+                    snapshot.insert(path, None);
+                } else {
+                    let bytes = std::fs::read(&path).expect("fixture file");
+                    snapshot.insert(path, Some(bytes));
+                }
+            }
+            snapshot
+        };
+        let mut managed_request = copy_request(BUCKET, &key, &upload.upload_id);
+        s3s::access::S3Access::upload_part_copy(&fs, &mut managed_request)
+            .await
+            .expect("real source/destination authorization captures both generation guards");
+        let mut source_options = StorageObjectOptions::default();
+        crate::storage::storage_api::access_consumer::apply_copy_source_bucket_generation_guard(
+            &managed_request,
             ordinary,
-            "destination.bin",
-            &control.upload_id,
-            None,
-            1000,
-            &StorageObjectOptions::default(),
+            &mut source_options,
         )
-        .await
-        .expect("copied ordinary part");
-    assert_eq!(parts.parts.len(), 1);
-    assert_eq!(parts.parts[0].size, 273);
+        .expect("source generation middleware contract");
+        assert_eq!(source_options.expected_bucket_incarnation_id, Some(source_incarnation));
+        let mut destination_options = StorageObjectOptions::default();
+        crate::storage::storage_api::access_consumer::apply_bucket_generation_guard(
+            &managed_request,
+            BUCKET,
+            &mut destination_options,
+        )
+        .expect("destination generation middleware contract");
+        assert_eq!(destination_options.expected_bucket_incarnation_id, Some(fixture.incarnation));
+        let before = disk_snapshot();
+        let error = Box::pin(fs.upload_part_copy(managed_request))
+            .await
+            .expect_err("managed copy must reject at its actual write entrance");
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InternalError);
+        assert_eq!(error.message(), Some("We encountered an internal error, please try again."));
+        assert!(
+            disk_snapshot() == before,
+            "rejected copy changed existing metadata, shards, or multipart staging"
+        );
+        let after = fixture
+            .store
+            .list_object_parts(BUCKET, &key, &upload.upload_id, None, 1000, &StorageObjectOptions::default())
+            .await
+            .expect("original staged part remains readable");
+        assert_eq!(after.parts.len(), 1);
+        assert_eq!(after.parts[0].etag, original.etag);
+        let control = fixture
+            .store
+            .new_multipart_upload(ordinary, "destination.bin", &StorageObjectOptions::default())
+            .await
+            .expect("ordinary MPU");
+        let mut control_request = copy_request(ordinary, "destination.bin", &control.upload_id);
+        s3s::access::S3Access::upload_part_copy(&fs, &mut control_request)
+            .await
+            .expect("ordinary copy uses the same real authorization/generation middleware");
+        let copied = Box::pin(fs.upload_part_copy(control_request))
+            .await
+            .expect("same S3 handler must copy into ordinary staging");
+        assert!(copied.output.copy_part_result.and_then(|part| part.e_tag).is_some());
+        let parts = fixture
+            .store
+            .list_object_parts(
+                ordinary,
+                "destination.bin",
+                &control.upload_id,
+                None,
+                1000,
+                &StorageObjectOptions::default(),
+            )
+            .await
+            .expect("copied ordinary part");
+        assert_eq!(parts.parts.len(), 1);
+        assert_eq!(parts.parts[0].size, 273);
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1313,127 +1331,130 @@ async fn artifact_inventory_handler_requires_request_context_and_independent_act
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn artifact_delete_handler_enforces_scope_seals_and_exact_version() {
-    let fixture = Fixture::new(prefix()).await;
-    let key = format!("{}image.bin", fixture.prefix);
-    let first = fixture.put(&key, 0xA5).await.expect("first real version");
-    let second = fixture.put(&key, 0xBB).await.expect("second real version");
-    let request = fixture.retire(&key, first);
-    for principal in [None, Some(USER), Some(ROOT)] {
-        assert_eq!(
-            DeleteVersion
-                .call(fixture.request(&request, principal), Params::new())
-                .await
-                .expect_err("A03GC2_INVARIANT old seal/retire authority cannot delete")
-                .code(),
-            &s3s::S3ErrorCode::AccessDenied,
-        );
-    }
-    let policy = Policy::parse_config(
-        &serde_json::to_vec(&json!({
-            "Version":"2012-10-17", "Statement":[{
-                "Effect":"Allow", "Action":"admin:DeletePluginArtifactVersion",
-                "Resource":format!("arn:aws:s3:::{BUCKET}/{key}")
-            }]
-        }))
-        .expect("delete policy bytes"),
-    )
-    .expect("independent delete policy");
-    const CLEANUP: &str = "artifact-cleanup";
-    fixture
-        .user(CLEANUP, Some(vec![format!("arn:aws:s3:::{BUCKET}/{key}")]))
-        .await;
-    fixture
-        .iam
-        .set_policy(CLEANUP, policy)
-        .await
-        .expect("grant exact key delete authority");
-    assert!(
-        DeleteVersion
-            .call(fixture.request(&request, Some(CLEANUP)), Params::new())
+    Box::pin(async {
+        let fixture = Fixture::new(prefix()).await;
+        let key = format!("{}image.bin", fixture.prefix);
+        let first = fixture.put(&key, 0xA5).await.expect("first real version");
+        let second = fixture.put(&key, 0xBB).await.expect("second real version");
+        let request = fixture.retire(&key, first);
+        for principal in [None, Some(USER), Some(ROOT)] {
+            assert_eq!(
+                DeleteVersion
+                    .call(fixture.request(&request, principal), Params::new())
+                    .await
+                    .expect_err("A03GC2_INVARIANT old seal/retire authority cannot delete")
+                    .code(),
+                &s3s::S3ErrorCode::AccessDenied,
+            );
+        }
+        let policy = Policy::parse_config(
+            &serde_json::to_vec(&json!({
+                "Version":"2012-10-17", "Statement":[{
+                    "Effect":"Allow", "Action":"admin:DeletePluginArtifactVersion",
+                    "Resource":format!("arn:aws:s3:::{BUCKET}/{key}")
+                }]
+            }))
+            .expect("delete policy bytes"),
+        )
+        .expect("independent delete policy");
+        const CLEANUP: &str = "artifact-cleanup";
+        fixture
+            .user(CLEANUP, Some(vec![format!("arn:aws:s3:::{BUCKET}/{key}")]))
+            .await;
+        fixture
+            .iam
+            .set_policy(CLEANUP, policy)
             .await
-            .is_err(),
-        "A03GC2_INVARIANT unsealed attempt is protected"
-    );
-    receipt(Seal.call(fixture.request(&fixture.seal(), Some(USER)), Params::new()).await).await;
-    assert!(
-        DeleteVersion
-            .call(fixture.request(&request, Some(CLEANUP)), Params::new())
-            .await
-            .is_err(),
-        "A03GC2_INVARIANT PUT seal alone cannot authorize deletion"
-    );
-    receipt(
-        SealWrites
-            .call(fixture.request(&fixture.seal(), Some(USER)), Params::new())
-            .await,
-    )
-    .await;
-    let mut wrong_identity = request.clone();
-    wrong_identity["target"]["bucket_incarnation"] = json!(Uuid::new_v4());
-    assert!(
-        DeleteVersion
-            .call(fixture.request(&wrong_identity, Some(CLEANUP)), Params::new())
-            .await
-            .is_err(),
-        "A03GC2_INVARIANT incarnation mismatch cannot delete"
-    );
-    let outside_scope = fixture.retire(&format!("{}other.bin", fixture.prefix), first);
-    assert_eq!(
-        DeleteVersion
-            .call(fixture.request(&outside_scope, Some(CLEANUP)), Params::new())
-            .await
-            .expect_err("A03GC2_INVARIANT exact object IAM scope")
-            .code(),
-        &s3s::S3ErrorCode::AccessDenied
-    );
-    for _ in 0..2 {
-        let deleted = receipt(
+            .expect("grant exact key delete authority");
+        assert!(
             DeleteVersion
                 .call(fixture.request(&request, Some(CLEANUP)), Params::new())
+                .await
+                .is_err(),
+            "A03GC2_INVARIANT unsealed attempt is protected"
+        );
+        receipt(Seal.call(fixture.request(&fixture.seal(), Some(USER)), Params::new()).await).await;
+        assert!(
+            DeleteVersion
+                .call(fixture.request(&request, Some(CLEANUP)), Params::new())
+                .await
+                .is_err(),
+            "A03GC2_INVARIANT PUT seal alone cannot authorize deletion"
+        );
+        receipt(
+            SealWrites
+                .call(fixture.request(&fixture.seal(), Some(USER)), Params::new())
                 .await,
         )
         .await;
-        assert_eq!(
-            deleted,
-            json!({"version":1,"target":fixture.target(),"object":key,
-            "version_id":first,"exact_version_deleted":true}),
-            "A03GC2_INVARIANT exact retry receipt"
+        let mut wrong_identity = request.clone();
+        wrong_identity["target"]["bucket_incarnation"] = json!(Uuid::new_v4());
+        assert!(
+            DeleteVersion
+                .call(fixture.request(&wrong_identity, Some(CLEANUP)), Params::new())
+                .await
+                .is_err(),
+            "A03GC2_INVARIANT incarnation mismatch cannot delete"
         );
-    }
-    let absent = fixture
-        .store
-        .get_object_reader(
-            BUCKET,
-            &key,
-            None,
-            Default::default(),
-            &StorageObjectOptions {
-                version_id: Some(first.to_string()),
-                ..Default::default()
-            },
-        )
-        .await;
-    assert!(
-        matches!(absent, Err(Error::VersionNotFound(_, _, _)) | Err(Error::FileVersionNotFound)),
-        "A03GC2_INVARIANT real exact version is absent"
-    );
-    let mut preserved = fixture
-        .store
-        .get_object_reader(
-            BUCKET,
-            &key,
-            None,
-            Default::default(),
-            &StorageObjectOptions {
-                version_id: Some(second.to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("A03GC2_INVARIANT other exact version survives");
-    let mut bytes = Vec::new();
-    preserved.stream.read_to_end(&mut bytes).await.expect("surviving bytes");
-    assert_eq!(bytes, vec![0xBB; 273]);
+        let outside_scope = fixture.retire(&format!("{}other.bin", fixture.prefix), first);
+        assert_eq!(
+            DeleteVersion
+                .call(fixture.request(&outside_scope, Some(CLEANUP)), Params::new())
+                .await
+                .expect_err("A03GC2_INVARIANT exact object IAM scope")
+                .code(),
+            &s3s::S3ErrorCode::AccessDenied
+        );
+        for _ in 0..2 {
+            let deleted = receipt(
+                DeleteVersion
+                    .call(fixture.request(&request, Some(CLEANUP)), Params::new())
+                    .await,
+            )
+            .await;
+            assert_eq!(
+                deleted,
+                json!({"version":1,"target":fixture.target(),"object":key,
+            "version_id":first,"exact_version_deleted":true}),
+                "A03GC2_INVARIANT exact retry receipt"
+            );
+        }
+        let absent = fixture
+            .store
+            .get_object_reader(
+                BUCKET,
+                &key,
+                None,
+                Default::default(),
+                &StorageObjectOptions {
+                    version_id: Some(first.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(absent, Err(Error::VersionNotFound(_, _, _)) | Err(Error::FileVersionNotFound)),
+            "A03GC2_INVARIANT real exact version is absent"
+        );
+        let mut preserved = fixture
+            .store
+            .get_object_reader(
+                BUCKET,
+                &key,
+                None,
+                Default::default(),
+                &StorageObjectOptions {
+                    version_id: Some(second.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("A03GC2_INVARIANT other exact version survives");
+        let mut bytes = Vec::new();
+        preserved.stream.read_to_end(&mut bytes).await.expect("surviving bytes");
+        assert_eq!(bytes, vec![0xBB; 273]);
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

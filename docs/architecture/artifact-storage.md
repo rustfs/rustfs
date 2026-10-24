@@ -201,13 +201,14 @@ rejects missing or mismatched identities, including on retries after the seal
 record already exists. Ordinary PUT retains its write quorum; successful sealing
 requires confirmation from every configured receiver.
 
-The PUT commit path takes locks in this order: bucket lifecycle, attempt record,
-then target object. Same-attempt commits are serialized; uploading a body does
-not hold the attempt lock. The actual commit and rename-tail owner retains the
-attempt guard after a quorum response or cancellation of the request waiter.
-The seal takes the same attempt lock and persists its record with all metadata
-writes drained before returning. Thus it waits for admitted ordinary PUTs and
-prevents later ordinary PUT publication, including after a restart.
+The PUT commit path takes locks in this order: bucket lifecycle READ, attempt
+record READ, then target object WRITE. Different objects in the same attempt can
+commit concurrently; uploading a body does not hold the attempt lock. The actual
+commit and rename-tail owner retains the attempt guard after a quorum response
+or cancellation of the request waiter. The seal takes the attempt lock in WRITE
+mode and persists its record with all metadata writes drained before returning.
+Thus it waits for admitted ordinary PUTs and prevents later ordinary PUT
+publication, including after a restart.
 
 The four-node scenarios in
 `crates/e2e_test/src/distributed/artifact_seal_test.rs` exercise cross-node
@@ -272,7 +273,7 @@ success controls. Rejected requests must preserve file bytes and filesystem
 identity/change times, so a local mutation followed by rollback is not treated
 as a successful rejection.
 
-Object repair takes the same attempt lock before capacity and object locks.
+Object repair takes the same attempt lock in WRITE mode before capacity and object locks.
 Local rename and metadata-replacement workers retain the lifecycle and attempt
 owners until the physical mutation completes, even if the async waiter is
 cancelled or times out. On distributed Unix URL topologies, dedicated

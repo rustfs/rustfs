@@ -23,7 +23,10 @@ pub use delete::ArtifactDeleteTarget;
 
 use super::versioning::VersioningApi as _;
 use super::{metadata::BucketMetadata, metadata_sys};
-use crate::config::com::{read_config_observation_no_lock, save_config_no_lock, with_config_object_write_lock};
+use crate::config::com::{
+    read_config_limited_preserve_empty_with_metadata_opts, read_config_observation_no_lock, save_config_no_lock,
+    with_config_object_write_lock,
+};
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::object_api::{NamespaceLockFence, ObjectLockConfigSnapshot, ObjectOptions, WriteCommitGuard};
@@ -115,7 +118,7 @@ impl ArtifactPutTarget {
         {
             return Err(Error::other("artifact PUT target identity mismatch"));
         }
-        // Lock order: lifecycle read -> attempt record write -> target object write.
+        // Lock order: lifecycle read -> attempt record read -> target object write.
         // A destructive PUT already owns the lifecycle and metadata guards in
         // its Object Lock snapshot. Retain that owner rather than queueing a
         // recursive read behind a writer that is waiting for this PUT.
@@ -141,9 +144,7 @@ impl ArtifactPutTarget {
                 None,
             )
         };
-        let path = self.record.path();
-        let lock = store.new_ns_lock(RUSTFS_META_BUCKET, &path).await?;
-        let attempt = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout()).await?;
+        let attempt = ArtifactPutReadOwner::acquire(&store, self.record.path()).await?;
         let guard = ArtifactPutGuard {
             identity: self.record.identity(),
             attempt,
@@ -154,7 +155,7 @@ impl ArtifactPutTarget {
         if guard.is_lock_lost() {
             return Err(Error::other("artifact PUT fence was lost"));
         }
-        if self.record.exists(store, &guard.attempt).await? {
+        if self.record.exists_under_read(store, &guard.attempt).await? {
             return Err(Error::other("artifact attempt PUTs are sealed"));
         }
         if guard.is_lock_lost() {
@@ -171,9 +172,35 @@ pub(crate) struct ArtifactPutIdentity {
     pub(crate) receiver_key: [u8; 32],
 }
 
+/// Ordinary PUTs only observe the seal record. Shared owners admit different
+/// objects concurrently while the sealer's write lock waits for their tails.
+struct ArtifactPutReadOwner {
+    path: String,
+    guard: rustfs_lock::NamespaceLockGuard,
+}
+
+impl ArtifactPutReadOwner {
+    async fn acquire(store: &ECStore, path: String) -> Result<Self> {
+        let lock = store.new_ns_lock(RUSTFS_META_BUCKET, &path).await?;
+        let guard = lock.get_read_lock(get_lock_acquire_timeout()).await?;
+        Ok(Self { path, guard })
+    }
+
+    fn is_lock_lost(&self) -> bool {
+        self.guard.is_lock_lost() || self.guard.is_released()
+    }
+
+    fn check(&self, path: &str) -> Result<()> {
+        if self.path != path || self.is_lock_lost() {
+            return Err(Error::other("artifact PUT attempt read fence was lost or mismatched"));
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct ArtifactPutGuard {
     pub(crate) identity: ArtifactPutIdentity,
-    attempt: WriteCommitGuard,
+    attempt: ArtifactPutReadOwner,
     lifecycle: Option<Arc<BucketIncarnationFenceGuard>>,
     _snapshot: Option<Arc<ObjectLockConfigSnapshot>>,
     lifecycle_fence: Option<NamespaceLockFence>,
@@ -689,6 +716,38 @@ impl PutSealRecord {
             return Err(Error::other("artifact PUT seal identity mismatch"));
         }
         Ok(true)
+    }
+
+    async fn exists_under_read(&self, store: Arc<ECStore>, owner: &ArtifactPutReadOwner) -> Result<bool> {
+        let path = self.path();
+        owner.check(&path)?;
+        // Reuse the held read owner instead of reacquiring a read lock behind
+        // a queued sealer. Observation must not repair or use a body cache.
+        let opts = ObjectOptions {
+            no_lock: true,
+            suppress_read_repair: true,
+            skip_verify_bitrot: false,
+            ..Default::default()
+        };
+        let observed = crate::object_api::without_get_object_body_cache_hook(
+            read_config_limited_preserve_empty_with_metadata_opts(store, &path, &opts, 16 * 1024),
+        )
+        .await;
+        // Lost ownership must not turn a missing observation into admission.
+        owner.check(&path)?;
+        let exists = match observed {
+            Ok((bytes, _)) => {
+                let record: Self = serde_json::from_slice(&bytes)?;
+                if record != *self {
+                    return Err(Error::other("artifact PUT seal identity mismatch"));
+                }
+                true
+            }
+            Err(Error::ConfigNotFound) => false,
+            Err(error) => return Err(error),
+        };
+        owner.check(&path)?;
+        Ok(exists)
     }
 }
 
