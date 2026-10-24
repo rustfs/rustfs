@@ -901,6 +901,102 @@ impl RemoteScanProgress {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScannerUsagePublicationClass {
+    #[default]
+    Unknown,
+    ProgressOnly,
+    Observational,
+    CompletePending,
+    CompleteConverged,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScannerUsagePublicationOutcome {
+    #[default]
+    Unknown,
+    Running,
+    NoUpdate,
+    Saved,
+    AlreadyDurable,
+    PriorCycleDurable,
+    Current,
+    Deferred,
+    Failed,
+    Interrupted,
+}
+
+/// One node-local publication attempt, independent of cycle completion and heal integrity.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScannerUsagePublicationStatus {
+    pub scanner_epoch: Option<u64>,
+    pub cycle: Option<u64>,
+    pub class: ScannerUsagePublicationClass,
+    pub outcome: ScannerUsagePublicationOutcome,
+    /// Count from the confirmed authoritative snapshot, never the live dirty map.
+    pub pending_bucket_count: Option<u64>,
+    pub snapshot_updated_at_unix_secs: Option<u64>,
+    pub observed_at_unix_secs: Option<u64>,
+}
+
+/// Replacing this handle fences late updates from an earlier attempt, including retries of the same cycle.
+#[derive(Default)]
+pub struct ScannerUsagePublicationObservation {
+    status: Mutex<ScannerUsagePublicationStatus>,
+}
+
+impl ScannerUsagePublicationObservation {
+    pub fn new(scanner_epoch: u64, cycle: u64) -> Self {
+        Self {
+            status: Mutex::new(ScannerUsagePublicationStatus {
+                scanner_epoch: Some(scanner_epoch),
+                cycle: Some(cycle),
+                outcome: ScannerUsagePublicationOutcome::Running,
+                observed_at_unix_secs: Some(unix_now_secs()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    pub fn record(&self, mut status: ScannerUsagePublicationStatus) {
+        let mut current = self.status.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if status.scanner_epoch != current.scanner_epoch || status.cycle != current.cycle {
+            status = ScannerUsagePublicationStatus {
+                scanner_epoch: current.scanner_epoch,
+                cycle: current.cycle,
+                ..Default::default()
+            };
+        }
+        status.observed_at_unix_secs = Some(unix_now_secs());
+        *current = status;
+    }
+
+    pub fn finish(&self) {
+        let mut status = self.status.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if status.outcome == ScannerUsagePublicationOutcome::Running {
+            status.outcome = ScannerUsagePublicationOutcome::Unknown;
+            status.observed_at_unix_secs = Some(unix_now_secs());
+        }
+    }
+
+    pub fn interrupt(&self) {
+        let mut status = self.status.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *status = ScannerUsagePublicationStatus {
+            scanner_epoch: status.scanner_epoch,
+            cycle: status.cycle,
+            outcome: ScannerUsagePublicationOutcome::Interrupted,
+            observed_at_unix_secs: Some(unix_now_secs()),
+            ..Default::default()
+        };
+    }
+
+    fn snapshot(&self) -> ScannerUsagePublicationStatus {
+        self.status.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+}
+
 pub struct Metrics {
     operations: Vec<AtomicU64>,
     latency: Vec<LockedLastMinuteLatency>,
@@ -908,6 +1004,8 @@ pub struct Metrics {
     actions_latency: Vec<LockedLastMinuteLatency>,
     current_paths: Arc<RwLock<HashMap<String, Arc<CurrentPathTracker>>>>,
     cycle_info: Arc<RwLock<Option<CurrentCycle>>>,
+    // Lock order: cycle_info, usage_publication, then the observation's status. No awaits under either mutex.
+    usage_publication: Mutex<Arc<ScannerUsagePublicationObservation>>,
     current_scan_mode: AtomicU8,
     current_scan_cycle_work_active: AtomicBool,
     // Cycle transitions and reports lock cycle_info before remote_scan_progress.
@@ -1417,6 +1515,8 @@ pub struct ScannerLastMinute {
 pub struct ScannerMetricsReport {
     pub collected_at: Timestamp,
     pub current_cycle: u64,
+    #[serde(default)]
+    pub usage_publication: ScannerUsagePublicationStatus,
     #[serde(default)]
     pub current_cycle_active: bool,
     pub current_started: Timestamp,
@@ -2054,6 +2154,7 @@ impl Metrics {
                 .collect(),
             current_paths: Arc::new(RwLock::new(HashMap::new())),
             cycle_info: Arc::new(RwLock::new(None)),
+            usage_publication: Mutex::new(Arc::new(ScannerUsagePublicationObservation::default())),
             current_scan_mode: AtomicU8::new(HealScanMode::Unknown as u8),
             current_scan_cycle_work_active: AtomicBool::new(false),
             remote_scan_progress: Mutex::new(Arc::new(RemoteScanProgress::default())),
@@ -2968,7 +3069,18 @@ impl Metrics {
 
     /// Replace the current cycle record.
     pub async fn set_cycle(&self, cycle: Option<CurrentCycle>) {
-        *self.cycle_info.write().await = cycle;
+        let mut current_cycle = self.cycle_info.write().await;
+        if cycle.is_none() {
+            self.invalidate_usage_publication();
+        }
+        *current_cycle = cycle;
+    }
+
+    /// Reset/recovery changed the persisted baseline; an old attempt cannot restore its observation.
+    /// This takes only the observation pointer lock, so storage ownership checks need no intervening await.
+    pub fn invalidate_usage_publication(&self) {
+        *self.usage_publication.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Arc::new(ScannerUsagePublicationObservation::default());
     }
 
     /// Publish a scanner cycle and its work-accounting baseline as one state transition.
@@ -2983,8 +3095,24 @@ impl Metrics {
         cycle: CurrentCycle,
         remote_progress: Arc<RemoteScanProgress>,
     ) -> ScanCycleWorkSnapshot {
+        self.start_scan_cycle_work_with_publication(
+            cycle,
+            remote_progress,
+            Arc::new(ScannerUsagePublicationObservation::default()),
+        )
+        .await
+    }
+
+    /// Install publication and work observations under the same cycle transition.
+    pub async fn start_scan_cycle_work_with_publication(
+        &self,
+        cycle: CurrentCycle,
+        remote_progress: Arc<RemoteScanProgress>,
+        publication: Arc<ScannerUsagePublicationObservation>,
+    ) -> ScanCycleWorkSnapshot {
         let mut current_cycle = self.cycle_info.write().await;
         let snapshot = self.begin_scan_cycle_work(remote_progress);
+        *self.usage_publication.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = publication;
         *current_cycle = Some(cycle);
         snapshot
     }
@@ -3598,6 +3726,11 @@ impl Metrics {
 
         let has_cycle = {
             let cycle = self.cycle_info.read().await;
+            m.usage_publication = self
+                .usage_publication
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .snapshot();
             let has_cycle = if let Some(cycle) = cycle.as_ref() {
                 m.current_cycle = cycle.current;
                 m.cycles_completed_at = cycle.cycle_completed.iter().copied().map(chrono_to_jiff_timestamp).collect();
@@ -5795,6 +5928,127 @@ mod tests {
         let roundtrip: ScannerMetricsReport =
             serde_json::from_slice(&serde_json::to_vec(&report).expect("encode report")).expect("decode report");
         assert_eq!(roundtrip.usage_candidates, report.usage_candidates);
+    }
+
+    #[tokio::test]
+    async fn usage_publication_keeps_snapshot_pending_and_fences_retried_attempts() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.report().await.usage_publication, ScannerUsagePublicationStatus::default());
+        let cycle = CurrentCycle {
+            current: 12,
+            next: 13,
+            ..Default::default()
+        };
+        let first = Arc::new(ScannerUsagePublicationObservation::new(8, 12));
+        let start = metrics
+            .start_scan_cycle_work_with_publication(cycle.clone(), Arc::new(RemoteScanProgress::default()), first.clone())
+            .await;
+        let running = metrics.report().await.usage_publication;
+        assert_eq!((running.scanner_epoch, running.cycle), (Some(8), Some(12)));
+        assert_eq!(running.outcome, ScannerUsagePublicationOutcome::Running);
+        assert_eq!(running.pending_bucket_count, None);
+
+        let saved = ScannerUsagePublicationStatus {
+            scanner_epoch: Some(8),
+            cycle: Some(12),
+            class: ScannerUsagePublicationClass::CompletePending,
+            outcome: ScannerUsagePublicationOutcome::Saved,
+            pending_bucket_count: Some(7),
+            snapshot_updated_at_unix_secs: Some(20),
+            ..Default::default()
+        };
+        first.record(saved.clone());
+        for live_pending in [0, 99] {
+            metrics.record_scanner_dirty_usage_pending(live_pending);
+            let report = metrics.report().await;
+            assert_eq!(report.usage_publication.pending_bucket_count, Some(7));
+        }
+        first.finish();
+        metrics
+            .finish_scan_cycle_work_with_cycle(
+                start,
+                CurrentCycle {
+                    current: 0,
+                    ..cycle.clone()
+                },
+            )
+            .await;
+        let idle = metrics.report().await;
+        assert_eq!(idle.current_cycle, 0);
+        assert_eq!(idle.usage_publication.cycle, Some(12));
+
+        let retry = Arc::new(ScannerUsagePublicationObservation::new(8, 12));
+        metrics
+            .start_scan_cycle_work_with_publication(cycle, Arc::new(RemoteScanProgress::default()), retry.clone())
+            .await;
+        first.record(saved.clone());
+        let current = metrics.report().await.usage_publication;
+        assert_eq!(current.outcome, ScannerUsagePublicationOutcome::Running);
+        assert_eq!(current.class, ScannerUsagePublicationClass::Unknown);
+        assert_eq!(current.pending_bucket_count, None);
+
+        metrics.invalidate_usage_publication();
+        retry.record(saved);
+        assert_eq!(metrics.report().await.usage_publication, ScannerUsagePublicationStatus::default());
+    }
+
+    #[tokio::test]
+    async fn usage_publication_loss_restart_and_legacy_reports_remain_unknown() {
+        let metrics = Metrics::new();
+        let observation = Arc::new(ScannerUsagePublicationObservation::new(8, 12));
+        metrics
+            .start_scan_cycle_work_with_publication(
+                CurrentCycle {
+                    current: 12,
+                    ..Default::default()
+                },
+                Arc::new(RemoteScanProgress::default()),
+                observation.clone(),
+            )
+            .await;
+        observation.record(ScannerUsagePublicationStatus {
+            scanner_epoch: Some(8),
+            cycle: Some(12),
+            class: ScannerUsagePublicationClass::CompleteConverged,
+            outcome: ScannerUsagePublicationOutcome::Saved,
+            pending_bucket_count: Some(0),
+            ..Default::default()
+        });
+        observation.interrupt();
+        let interrupted = metrics.report().await.usage_publication;
+        assert_eq!(interrupted.outcome, ScannerUsagePublicationOutcome::Interrupted);
+        assert_eq!(interrupted.class, ScannerUsagePublicationClass::Unknown);
+        assert_eq!(interrupted.pending_bucket_count, None);
+
+        metrics.set_cycle(None).await;
+        observation.finish();
+        assert_eq!(metrics.report().await.usage_publication, ScannerUsagePublicationStatus::default());
+        let report = Metrics::new().report().await;
+        assert_eq!(report.usage_publication.pending_bucket_count, None);
+        let mut legacy = serde_json::to_value(report).expect("serialize scanner report");
+        legacy.as_object_mut().expect("report object").remove("usage_publication");
+        let legacy: ScannerMetricsReport = serde_json::from_value(legacy).expect("decode legacy report");
+        assert_eq!(legacy.usage_publication, ScannerUsagePublicationStatus::default());
+    }
+
+    #[test]
+    fn usage_publication_rejects_snapshot_from_another_cycle() {
+        let observation = ScannerUsagePublicationObservation::new(8, 12);
+        observation.record(ScannerUsagePublicationStatus {
+            scanner_epoch: Some(8),
+            cycle: Some(13),
+            class: ScannerUsagePublicationClass::CompleteConverged,
+            outcome: ScannerUsagePublicationOutcome::Saved,
+            pending_bucket_count: Some(0),
+            ..Default::default()
+        });
+        let status = observation.snapshot();
+        assert_eq!((status.scanner_epoch, status.cycle), (Some(8), Some(12)));
+        assert_eq!(status.class, ScannerUsagePublicationClass::Unknown);
+        assert_eq!(status.pending_bucket_count, None);
+        let unfinished = ScannerUsagePublicationObservation::new(8, 13);
+        unfinished.finish();
+        assert_eq!(unfinished.snapshot().outcome, ScannerUsagePublicationOutcome::Unknown);
     }
 
     #[test]

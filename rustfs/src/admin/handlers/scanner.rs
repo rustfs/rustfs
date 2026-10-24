@@ -52,6 +52,7 @@ struct ScannerStatusResponse {
     data_movement_pause: ScannerDataMovementPauseStatus,
     pause_backlog: rustfs_scanner::ScannerPauseBacklogStatus,
     catch_up_estimate: ScannerCatchUpEstimate,
+    heal_observation: rustfs_scanner::ScannerHealObservationStatus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,6 +230,7 @@ fn scanner_status_response(
         data_movement_pause,
         pause_backlog,
         catch_up_estimate,
+        heal_observation: rustfs_scanner::scanner_heal_observation_status(),
     }
 }
 
@@ -857,6 +859,61 @@ mod tests {
         assert!(encoded["bitrot"]["bitrot_start_cycle"].is_u64());
         assert!(encoded["bitrot"]["bitrot_start_unix_secs"].is_u64());
         assert!(encoded["disk_io_budget"].is_array());
+        assert_eq!(encoded["metrics"]["usage_publication"]["class"], "unknown");
+        assert!(encoded["metrics"]["usage_publication"]["pending_bucket_count"].is_null());
+        assert_eq!(encoded["heal_observation"]["integrity_state"], "unknown");
+    }
+
+    #[test]
+    fn scanner_status_serializes_snapshot_pending_and_terminal_unknown_separately() {
+        use rustfs_scanner_metrics::metrics::{
+            ScannerUsagePublicationClass, ScannerUsagePublicationOutcome, ScannerUsagePublicationStatus,
+        };
+
+        let mut response = scanner_status_response(
+            true,
+            ScannerMetricsReport {
+                usage_publication: ScannerUsagePublicationStatus {
+                    scanner_epoch: Some(8),
+                    cycle: Some(12),
+                    class: ScannerUsagePublicationClass::CompletePending,
+                    outcome: ScannerUsagePublicationOutcome::PriorCycleDurable,
+                    pending_bucket_count: Some(7),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            rustfs_scanner::scanner_runtime_config_status(),
+            rustfs_scanner::ScannerCycleScheduleStatus::default(),
+            ScannerDataMovementPauseStatus::default(),
+            rustfs_scanner::ScannerPauseBacklogStatus::default(),
+        );
+        response.heal_observation = rustfs_scanner::ScannerHealObservationStatus {
+            state: "active",
+            retained_pending_tasks: Some(0),
+            terminal_task_observations_total: Some(1),
+            terminal_candidates: vec![rustfs_scanner::ScannerHealTerminalObservation {
+                execution: "completed",
+                disposition: "deferred",
+                scope: "content_and_leader_unknown",
+                scan_mode: "deep",
+                count: 1,
+            }],
+            unknown_candidates: vec![rustfs_scanner::ScannerHealUnknownObservation {
+                reason: "content_and_leader_unknown",
+                count: 1,
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(response).expect("serialize scanner status");
+        assert_eq!(json["metrics"]["usage_publication"]["cycle"], 12);
+        assert_eq!(json["metrics"]["usage_publication"]["pending_bucket_count"], 7);
+        assert_eq!(json["metrics"]["usage_publication"]["class"], "complete_pending");
+        assert_eq!(json["heal_observation"]["retained_pending_tasks"], 0);
+        assert_eq!(json["heal_observation"]["terminal_candidates"][0]["execution"], "completed");
+        assert_eq!(json["heal_observation"]["terminal_candidates"][0]["disposition"], "deferred");
+        assert_eq!(json["heal_observation"]["unknown_candidates"][0]["count"], 1);
+        assert_eq!(json["heal_observation"]["integrity_state"], "unknown");
     }
 
     #[test]

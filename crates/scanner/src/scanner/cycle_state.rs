@@ -2491,6 +2491,7 @@ async fn save_reset_config(
     if !owns_reset() {
         return Err(EcstoreError::other("scanner reset ownership was lost before write"));
     }
+    global_metrics().invalidate_usage_publication();
     save_config_with_preconditions(storeapi, path, data, preconditions).await
 }
 
@@ -2508,6 +2509,7 @@ async fn delete_reset_config(
     if !owns_reset() {
         return Err(EcstoreError::other("scanner reset ownership was lost before delete"));
     }
+    global_metrics().invalidate_usage_publication();
     storeapi.delete_config_object(bucket, path, options).await
 }
 

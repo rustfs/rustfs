@@ -29,6 +29,9 @@ use crate::{
     ScannerObjectOptions as ObjectOptions, ScannerPutObjReader as PutObjReader, init_bucket_metadata_sys_for_scanner_tests,
     init_ecstore_config_for_scanner_tests, init_local_disks_with_instance_ctx,
 };
+use rustfs_scanner_metrics::metrics::{
+    ScannerUsagePublicationClass, ScannerUsagePublicationOutcome, ScannerUsagePublicationStatus,
+};
 use serial_test::serial;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -727,7 +730,7 @@ async fn checkpoint_runtime_handoff(store: Arc<MemoryConfigStore>, expected_cycl
     assert_eq!((cycle.next, saved_epoch), (expected_cycle, epoch));
     cycle.current = cycle.next;
     let ctx = CancellationToken::new();
-    let mut metrics = ScannerCycleMetricsGuard::new(cycle.clone(), Arc::new(RemoteScanProgress::default())).await;
+    let mut metrics = ScannerCycleMetricsGuard::new(cycle.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
     tokio::time::pause();
     let budget = ScannerCycleBudget::new(
         &ctx,
@@ -1333,7 +1336,7 @@ async fn test_mark_scan_cycle_idle_clears_published_cycle_state() {
 
     global_metrics().set_current_scan_mode(HealScanMode::Deep);
     let mut cycle_metrics_guard =
-        ScannerCycleMetricsGuard::new(cycle_info.clone(), Arc::new(RemoteScanProgress::default())).await;
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
 
     mark_scan_cycle_idle(&mut cycle_info, &mut cycle_metrics_guard).await;
 
@@ -1356,7 +1359,7 @@ async fn test_mark_scan_cycle_idle_clears_published_cycle_state() {
 async fn scanner_cycle_metrics_guard_installs_budget_remote_progress() {
     let parent = CancellationToken::new();
     let old_budget = ScannerCycleBudget::new(&parent, ScannerCycleBudgetConfig::default());
-    let mut guard = ScannerCycleMetricsGuard::new(CurrentCycle::default(), old_budget.remote_scan_progress()).await;
+    let mut guard = ScannerCycleMetricsGuard::new(CurrentCycle::default(), 1, old_budget.remote_scan_progress()).await;
     old_budget.record_remote_progress(3, 2);
     guard.finish(CurrentCycle::default()).await;
     let previous = global_metrics().report().await;
@@ -1364,7 +1367,7 @@ async fn scanner_cycle_metrics_guard_installs_budget_remote_progress() {
     assert_eq!(previous.last_cycle_directories_scanned, 2);
 
     let budget = ScannerCycleBudget::new(&parent, ScannerCycleBudgetConfig::default());
-    let mut guard = ScannerCycleMetricsGuard::new(CurrentCycle::default(), budget.remote_scan_progress()).await;
+    let mut guard = ScannerCycleMetricsGuard::new(CurrentCycle::default(), 1, budget.remote_scan_progress()).await;
     budget.record_remote_progress(2, 1);
     old_budget.record_remote_progress(9, 7);
     let active = global_metrics().report().await;
@@ -1388,7 +1391,7 @@ async fn scanner_cycle_metrics_guard_covers_published_first_cycle_lifetime() {
         started: cycle_started,
         ..Default::default()
     };
-    let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone(), Arc::new(RemoteScanProgress::default())).await;
+    let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
     let setup_report = global_metrics().report().await;
     assert!(setup_report.current_cycle_active);
     assert_eq!(setup_report.current_cycle, 0);
@@ -1414,7 +1417,7 @@ async fn scanner_cycle_metrics_guard_keeps_active_cycle_published_during_finaliz
         started: Utc::now(),
         ..Default::default()
     };
-    let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone(), Arc::new(RemoteScanProgress::default())).await;
+    let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
 
     cycle_info.current = 0;
     tokio::task::yield_now().await;
@@ -1440,6 +1443,7 @@ async fn scanner_cycle_metrics_guard_drop_clears_activity() {
             started: Utc::now(),
             ..Default::default()
         },
+        1,
         Arc::new(RemoteScanProgress::default()),
     )
     .await;
@@ -1447,7 +1451,10 @@ async fn scanner_cycle_metrics_guard_drop_clears_activity() {
 
     drop(guard);
 
-    assert!(!global_metrics().report().await.current_cycle_active);
+    let report = global_metrics().report().await;
+    assert!(!report.current_cycle_active);
+    assert_eq!(report.usage_publication.outcome, ScannerUsagePublicationOutcome::Interrupted);
+    assert_eq!(report.usage_publication.pending_bucket_count, None);
     global_metrics().set_cycle(None).await;
 }
 
@@ -1809,7 +1816,7 @@ async fn test_finalize_partial_scan_cycle_advances_and_persists_counter() {
         started: Utc::now(),
     };
     let mut cycle_metrics_guard =
-        ScannerCycleMetricsGuard::new(cycle_info.clone(), Arc::new(RemoteScanProgress::default())).await;
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
 
     assert!(finalize_partial_scan_cycle(&ctx, store.clone(), &mut cycle_info, &mut revision, 1, &mut cycle_metrics_guard,).await);
 
@@ -1846,7 +1853,7 @@ async fn scanner_cycle_recovers_to_newer_durable_cache_floor() {
         started: Utc::now(),
     };
     let mut cycle_metrics_guard =
-        ScannerCycleMetricsGuard::new(cycle_info.clone(), Arc::new(RemoteScanProgress::default())).await;
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
 
     assert!(
         persist_required_scanner_cycle_floor(
@@ -1887,7 +1894,7 @@ async fn scanner_cycle_rejects_invalid_cache_floor() {
         started: Utc::now(),
     };
     let mut cycle_metrics_guard =
-        ScannerCycleMetricsGuard::new(cycle_info.clone(), Arc::new(RemoteScanProgress::default())).await;
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
 
     assert!(
         !persist_required_scanner_cycle_floor(
@@ -1909,7 +1916,7 @@ async fn scanner_cycle_rejects_invalid_cache_floor() {
         ..Default::default()
     };
     let mut max_cycle_metrics_guard =
-        ScannerCycleMetricsGuard::new(max_cycle_info.clone(), Arc::new(RemoteScanProgress::default())).await;
+        ScannerCycleMetricsGuard::new(max_cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
     assert!(
         !persist_required_scanner_cycle_floor(
             &ctx,
@@ -4945,7 +4952,7 @@ async fn test_finalize_partial_scan_cycle_reports_persist_failure() {
         started: Utc::now(),
     };
     let mut cycle_metrics_guard =
-        ScannerCycleMetricsGuard::new(cycle_info.clone(), Arc::new(RemoteScanProgress::default())).await;
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
 
     assert!(!finalize_partial_scan_cycle(&ctx, store, &mut cycle_info, &mut revision, 1, &mut cycle_metrics_guard,).await);
     assert_eq!(cycle_info.next, 13);
@@ -5617,9 +5624,30 @@ async fn scanner_usage_state_reset_publishes_fenced_bootstrap_marker() {
             .expect("usage slot should persist");
     }
 
+    let metrics_guard = ScannerCycleMetricsGuard::new(cycle.clone(), 7, Arc::new(RemoteScanProgress::default())).await;
+    let old_publication = ScannerUsagePublicationStatus {
+        scanner_epoch: Some(7),
+        cycle: Some(41),
+        class: ScannerUsagePublicationClass::CompleteConverged,
+        outcome: ScannerUsagePublicationOutcome::Saved,
+        pending_bucket_count: Some(0),
+        ..Default::default()
+    };
+    metrics_guard.publication.record(old_publication.clone());
     let result = reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store.clone())
         .await
         .expect("usage state reset should publish a fenced bootstrap marker");
+    assert_eq!(
+        global_metrics().report().await.usage_publication,
+        ScannerUsagePublicationStatus::default()
+    );
+    metrics_guard.publication.record(old_publication);
+    assert_eq!(
+        global_metrics().report().await.usage_publication,
+        ScannerUsagePublicationStatus::default()
+    );
+    drop(metrics_guard);
+    global_metrics().set_cycle(None).await;
 
     assert_eq!(result.status, "reset");
     assert_eq!(result.mode, "full-rebuild");
@@ -7413,6 +7441,9 @@ async fn test_store_data_usage_in_backend_advances_past_changed_same_epoch_cycle
         last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
         scanner_epoch: Some(8),
         scanner_cycle: Some(12),
+        usage_snapshot_converged: Some(false),
+        usage_snapshot_pending_buckets: (0..7).map(|index| format!("pending-{index}")).collect(),
+        usage_snapshot_pending_bucket_count: 7,
         ..complete_usage_with_bucket_count(None, 2)
     };
     store
@@ -7427,16 +7458,42 @@ async fn test_store_data_usage_in_backend_advances_past_changed_same_epoch_cycle
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(30)),
             scanner_epoch: Some(8),
             scanner_cycle: Some(12),
+            usage_snapshot_converged: Some(true),
             ..complete_usage_with_bucket_count(None, 3)
         })
         .await
         .expect("changed retry snapshot should enqueue");
     drop(sender);
 
-    let outcome =
-        store_data_usage_in_backend_with_outcome_for_epoch(CancellationToken::new(), store.clone(), receiver, Some(8)).await;
+    let publication =
+        store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch_and_lease_fence(
+            CancellationToken::new(),
+            store.clone(),
+            receiver,
+            Some(8),
+            None,
+            ScannerPublicationFence::new(None, None, None),
+            || async { None },
+        )
+        .await;
 
-    assert_eq!(outcome, DataUsagePersistOutcome::PriorCycleDurable);
+    assert_eq!(publication.outcome(), DataUsagePersistOutcome::PriorCycleDurable);
+    let status = publication.observation_for_attempt(8, 12, false, publication.outcome());
+    assert_eq!(status.class, ScannerUsagePublicationClass::CompletePending);
+    assert_eq!(
+        status.pending_bucket_count,
+        Some(7),
+        "read the existing snapshot, not the converged retry"
+    );
+    assert_eq!(status.snapshot_updated_at_unix_secs, Some(20));
+    let fenced = publication.observation_for_attempt(
+        8,
+        12,
+        false,
+        DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseReleaseFailed),
+    );
+    assert_eq!(fenced.outcome, ScannerUsagePublicationOutcome::Deferred);
+    assert_eq!(fenced.pending_bucket_count, None);
     assert_eq!(store.put_counts.lock().await.get(&key), None);
     let saved = store
         .objects
