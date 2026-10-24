@@ -354,7 +354,6 @@ impl From<EcstoreReplicationHealQueueResult> for ScannerReplicationHealResult {
 }
 
 pub(crate) mod scan {
-    #[cfg(test)]
     pub(crate) use super::storage_contracts::BucketOperations;
     pub(crate) use super::storage_contracts::{
         BucketOptions, NamespaceLocking, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
@@ -375,7 +374,8 @@ pub(crate) mod scanner_io {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::{
         bucket::{
-            lifecycle::bucket_lifecycle_ops::init_background_expiry, metadata::BUCKET_LIFECYCLE_CONFIG,
+            lifecycle::bucket_lifecycle_ops::init_background_expiry,
+            metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG},
             metadata_sys::update as update_bucket_metadata,
         },
         data_usage::{

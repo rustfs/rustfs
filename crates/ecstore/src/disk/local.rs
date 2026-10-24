@@ -116,6 +116,31 @@ use uuid::Uuid;
 // Bound outstanding filesystem jobs and metadata buffers per disk request.
 const PART_METADATA_READ_CONCURRENCY: usize = 8;
 
+// Keep independent forward transactions bounded without reordering aliases,
+// parent/child keys, rollback, or legacy operations.
+const DELETE_VERSION_PREPARE_CONCURRENCY: usize = 8;
+
+fn delete_version_batch_concurrency(versions: &[FileInfoVersions], opts: &DeleteOptions) -> usize {
+    if !cfg!(target_os = "linux") || !opts.recoverable_delete || opts.undo_write || opts.undo_delete || versions.len() < 2 {
+        return 1;
+    }
+    let mut names = HashSet::with_capacity(versions.len());
+    for version in versions {
+        let name = version.name.as_str();
+        if name.split('/').any(|segment| matches!(segment, "" | "." | "..")) || !names.insert(name) {
+            return 1;
+        }
+    }
+    for name in &names {
+        for (separator, _) in name.match_indices('/') {
+            if names.contains(&name[..separator]) {
+                return 1;
+            }
+        }
+    }
+    DELETE_VERSION_PREPARE_CONCURRENCY
+}
+
 /// The fresh health path uses a synchronous capacity syscall. Keep the permit
 /// inside the blocking closure so cancelling its async caller cannot admit a
 /// second probe while the first syscall is still running.
@@ -7117,23 +7142,29 @@ impl LocalDisk {
         opts: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Vec<Option<Error>> {
-        let mut errs = Vec::with_capacity(versions.len());
-        for _ in 0..versions.len() {
-            errs.push(None);
+        let concurrency = delete_version_batch_concurrency(&versions, &opts);
+        let mut errors = vec![None; versions.len()];
+        let mut pending = stream::iter(
+            versions
+                .into_iter()
+                .enumerate()
+                .map(|(index, version): (usize, FileInfoVersions)| {
+                    let owner = namespace_owner.clone();
+                    let options = &opts;
+                    async move {
+                        let error = self
+                            .delete_versions_internal(volume, &version.name, &version.versions, options, owner)
+                            .await
+                            .err();
+                        (index, error)
+                    }
+                }),
+        )
+        .buffer_unordered(concurrency);
+        while let Some((index, error)) = pending.next().await {
+            errors[index] = error;
         }
-
-        for (i, ver) in versions.iter().enumerate() {
-            if let Err(e) = self
-                .delete_versions_internal(volume, ver.name.as_str(), &ver.versions, &opts, namespace_owner.clone())
-                .await
-            {
-                errs[i] = Some(e);
-            } else {
-                errs[i] = None;
-            }
-        }
-
-        errs
+        errors
     }
 
     pub(crate) async fn delete_versions_guarded_with_namespace_owner(
@@ -12394,7 +12425,11 @@ impl DiskAPI for LocalDisk {
             .await?;
 
         if let Some(flag) = opts.producer_limit_reached.as_ref() {
-            flag.store(limit_reached, std::sync::atomic::Ordering::Release);
+            // Every disk of every set in a page shares this flag, and the
+            // collector reads it as "did ANY bounded walk stop at its limit".
+            // A walk that reached EOF must not clear what another producer
+            // reported, whatever order they finish in.
+            flag.fetch_or(limit_reached, std::sync::atomic::Ordering::AcqRel);
         }
         out.close().await?;
         Ok(())
@@ -15940,6 +15975,65 @@ mod test {
         assert!(
             elapsed > stall,
             "test is only meaningful if the walk outlives the stall budget, elapsed {elapsed:?} vs stall {stall:?}"
+        );
+    }
+
+    // The collector decides "truncated or exhausted" from one flag shared by every
+    // producer of the page. It must stay set once any bounded walk stopped early,
+    // however the remaining producers finish.
+    #[tokio::test]
+    async fn walk_dir_keeps_shared_limit_flag_set_by_another_producer() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let bucket = "test-bucket";
+        for idx in 0..3 {
+            let object_dir = dir.path().join(bucket).join(format!("prefix/object-{idx}"));
+            fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta")
+                .await
+                .expect("object metadata should be written");
+        }
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        disk.wait_for_startup_cleanup().await;
+
+        let walk = |limit: i32, flag: Arc<AtomicBool>| {
+            let disk = &disk;
+            async move {
+                let mut sink = Vec::new();
+                disk.walk_dir(
+                    WalkDirOptions {
+                        bucket: bucket.to_string(),
+                        base_dir: "prefix/".to_string(),
+                        recursive: true,
+                        limit,
+                        producer_limit_reached: Some(flag),
+                        ..Default::default()
+                    },
+                    &mut sink,
+                )
+                .await
+                .expect("walk should succeed");
+            }
+        };
+
+        let bounded = Arc::new(AtomicBool::new(false));
+        walk(1, bounded.clone()).await;
+        assert!(
+            bounded.load(Ordering::Acquire),
+            "a walk that stopped at its limit must report it through the shared flag"
+        );
+
+        // A sibling producer already stopped at its limit; this walk reaches EOF after it.
+        let shared = Arc::new(AtomicBool::new(true));
+        walk(0, shared.clone()).await;
+        assert!(
+            shared.load(Ordering::Acquire),
+            "a walk that reached EOF must not clear a limit another producer reported"
         );
     }
 

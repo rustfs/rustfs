@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::harness::{TestResult, assert_object_bytes, cluster_admin_ok, configure_node_logs, payload_for, unique_bucket};
+use super::harness::{
+    TestResult, assert_object_bytes, cluster_admin_ok, configure_node_logs, payload_for, retrying_put, unique_bucket, wait_until,
+};
 use crate::common::{ClusterTopology, RustFSTestClusterEnvironment};
 use crate::rpc_fault_proxy::{RpcFaultProxy, RpcPause};
 use aws_sdk_s3::{
@@ -110,14 +112,39 @@ fn assert_unavailable<E: std::fmt::Debug + ProvideErrorMetadata>(error: &SdkErro
     eprintln!("MPU acceptance: cause={cause}, retry={retry:?}, request_id={request_id}");
 }
 
-async fn abort(client: &Client, bucket: &str, key: &str, upload: &str) -> TestResult {
-    client
-        .abort_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .upload_id(upload)
-        .send()
-        .await?;
+async fn abort(client: &Client, bucket: &str, key: &str, upload: &str, allow_missing: bool) -> TestResult {
+    // Fault retirement resets outstanding RPC streams. Probe recovery within
+    // the shared deadline while channels and late lock cleanup converge.
+    wait_until(
+        DEADLINE,
+        || async {
+            match client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload)
+                .send()
+                .await
+            {
+                Ok(_) => Ok(true),
+                Err(error) if allow_missing && error.as_service_error().and_then(|e| e.meta().code()) == Some("NoSuchUpload") => {
+                    Ok(true)
+                }
+                Err(error)
+                    if error.as_service_error().and_then(|e| e.meta().code()) == Some("ServiceUnavailable")
+                        && error.raw_response().is_some_and(|response| {
+                            response.status().as_u16() == 503
+                                && response.headers().get("x-rustfs-error-cause") == Some("namespace_lock_timeout")
+                        }) =>
+                {
+                    Ok(false)
+                }
+                Err(error) => Err(error.into()),
+            }
+        },
+        "multipart abort after RPC fault retirement",
+    )
+    .await?;
     let missing = client
         .list_parts()
         .bucket(bucket)
@@ -234,6 +261,29 @@ fn quorum_outcome<T: std::fmt::Debug, E: std::fmt::Debug + ProvideErrorMetadata>
     }
 }
 
+async fn wait_for_lock_peer_recovery(proxies: &[RpcFaultProxy], client: &Client, bucket: &str) -> TestResult {
+    let key = unique_bucket("peer-recovery");
+    let observers = proxies[1..]
+        .iter()
+        .map(|proxy| proxy.pause(&["Lock", "LockBatch"], usize::MAX, Some(&key)))
+        .collect::<Result<Vec<_>, _>>()?;
+    for observer in &observers {
+        observer.release();
+    }
+    wait_until(
+        DEADLINE,
+        || async {
+            retrying_put(client, bucket, &key, vec![0x42; 1024], DEADLINE).await?;
+            // Quorum success alone can leave one peer's request breaker open.
+            // Two replies require a half-open peer to finish its first probe
+            // before admitting another RPC; every peer must rejoin the matrix.
+            Ok(observers.iter().all(|observer| observer.forwarded() >= 2))
+        },
+        "all lock peers recover after fault retirement",
+    )
+    .await
+}
+
 async fn phase_quorum_matrix(
     proxies: &[RpcFaultProxy],
     clients: &[Client],
@@ -274,7 +324,7 @@ async fn phase_quorum_matrix(
                 let request = clients[0].create_multipart_upload().bucket(bucket).key(&key);
                 let result = with_paused_peers(proxies, methods, &limits, bucket, async move { request.send().await }).await?;
                 if let Some(upload) = quorum_outcome(result, unavailable == unavailable_at_quorum, locks)? {
-                    abort(&clients[0], bucket, &key, upload.upload_id().ok_or("missing upload ID")?).await?;
+                    abort(&clients[0], bucket, &key, upload.upload_id().ok_or("missing upload ID")?, false).await?;
                 }
             } else {
                 let upload = clients[0].create_multipart_upload().bucket(bucket).key(&key).send().await?;
@@ -367,36 +417,17 @@ async fn phase_quorum_matrix(
                     }
                     _ => unreachable!(),
                 }
-                // A failed completion can be ambiguous to an S3 client. Cleanup
-                // accepts an already completed/aborted session, never another error.
-                match clients[0]
-                    .abort_multipart_upload()
-                    .bucket(bucket)
-                    .key(&key)
-                    .upload_id(upload_id)
-                    .send()
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(error) if error.as_service_error().and_then(|e| e.meta().code()) == Some("NoSuchUpload") => {}
-                    Err(error) => return Err(error.into()),
-                }
-                let missing = clients[0]
-                    .list_parts()
-                    .bucket(bucket)
-                    .key(&key)
-                    .upload_id(upload_id)
-                    .send()
-                    .await
-                    .expect_err("cleanup must remove the upload");
-                assert_eq!(missing.as_service_error().and_then(|e| e.meta().code()), Some("NoSuchUpload"));
+                // A failed completion can be ambiguous to an S3 client.
+                // Cleanup also accepts an already completed/aborted session.
+                abort(&clients[0], bucket, &key, upload_id, true).await?;
                 clients[0].delete_object().bucket(bucket).key(&key).send().await?;
             }
+            wait_for_lock_peer_recovery(proxies, &clients[0], bucket).await?;
+            round_trip(clients, bucket, "recovered", 9 * 1024 * 1024).await?;
             assert_no_uploads(clients, bucket).await?;
         }
     }
-    round_trip(clients, bucket, "recovered", 9 * 1024 * 1024).await?;
-    assert_no_uploads(clients, bucket).await
+    Ok(())
 }
 
 #[tokio::test]
@@ -516,7 +547,7 @@ async fn eight_node_eight_drive_multipart_load_leaves_no_residual_uploads() -> T
             .body(ByteStream::from(vec![0xa5; 8 * 1024 * 1024]))
             .send()
             .await?;
-        abort(&clients[(round + 2) % clients.len()], &bucket, "aborted", upload_id).await?;
+        abort(&clients[(round + 2) % clients.len()], &bucket, "aborted", upload_id, false).await?;
         assert_no_uploads(&clients, &bucket).await?;
         eprintln!(
             "MPU 8x8 acceptance: round={}/{rounds}, completed={}, aborted={}, elapsed={:?}",

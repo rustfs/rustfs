@@ -714,7 +714,7 @@ fn read_file_body_stream<R>(
     reader: R,
     length: usize,
     operation: &'static str,
-) -> Pin<Box<dyn futures::Stream<Item = io::Result<Bytes>> + Send + Sync>>
+) -> impl futures::Stream<Item = io::Result<Bytes>> + Send + Sync
 where
     R: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
 {
@@ -725,11 +725,10 @@ where
     } else {
         u64::try_from(length).unwrap_or(u64::MAX)
     };
-    let stream = ReaderStream::with_capacity(reader.take(read_limit), read_buffer_size).map_ok(move |bytes| {
+    ReaderStream::with_capacity(reader.take(read_limit), read_buffer_size).map_ok(move |bytes| {
         metrics.record_sent_bytes_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, bytes.len());
         bytes
-    });
-    Box::pin(stream)
+    })
 }
 
 fn read_file_stream_buffer_size(length: usize) -> usize {

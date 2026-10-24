@@ -19,7 +19,7 @@ Logical disks share the Docker host filesystem; this tests process/RPC failure
 and namespace safety, not independent hardware failure or power-loss durability.
 """
 from pathlib import Path
-import base64, hashlib, ipaddress, json, os, subprocess, tempfile, threading, time, uuid, xml.etree.ElementTree as ET
+import base64, hashlib, inspect, ipaddress, json, os, subprocess, tempfile, threading, time, uuid, xml.etree.ElementTree as ET
 from urllib.parse import quote
 ROOT = None
 PREFIX = None
@@ -35,6 +35,12 @@ def run(*args, check=True, **kwargs):
 
 def docker(*args, check=True):
     return run('docker', *args, check=check)
+
+def has_retained_content(root):
+    """Empty directory trees are pruned by non-force bucket removal."""
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        return True
+    return any(path.is_symlink() or not path.is_dir() for path in root.rglob('*'))
 
 class S3:
 
@@ -222,6 +228,12 @@ class Cluster:
 
     def kill(self, index=0):
         docker('kill', '--signal', 'KILL', self.names[index])
+
+    def stop_clean(self, index=0, timeout=60):
+        docker('stop', '--time', str(timeout), self.names[index])
+        state = json.loads(docker('inspect', '--format', '{{json .State}}', self.names[index]).stdout)
+        assert state['ExitCode'] == 0 and not state['OOMKilled'], state
+        return state
 
     def restart(self, index=None):
         for i in range(self.nodes) if index is None else [index]:
@@ -1035,9 +1047,7 @@ def automatic_clean_restart():
         clear_barriers(cluster)
         before = residue_inventory(cluster, bucket, key)
         assert all(any(path.endswith('delete-quorum-committed') for path in drive['files']) for node in before for drive in node)
-        docker('stop', '--time', '60', cluster.names[0])
-        state = json.loads(docker('inspect', '--format', '{{json .State}}', cluster.names[0]).stdout)
-        assert state['ExitCode'] == 0 and not state['OOMKilled'], state
+        state = cluster.stop_clean()
         repair = "from pathlib import Path; import json,os; roots=list(Path('/data').glob('d*/%s/%s')); dirs=[p for root in roots for p in root.iterdir() if p.is_dir() and (p/'part.1').is_file()]; assert len(dirs)==4; [os.chmod(p,0o755) for p in dirs]; print(json.dumps({'restored_payload_dirs':len(dirs)}))" % (bucket, key)
         cluster.inspect_data(repair)
         cluster.restart()
@@ -1248,6 +1258,135 @@ def admin_smoke():
     finally:
         cluster.remove()
 
+def release_batch_crash():
+    """Observe real journals before SIGKILL without requiring test-only hooks."""
+    import random
+    rounds = []
+    for iteration, phase in enumerate(('prepared', 'receipts')):
+        cluster = Cluster(f'release-batch-crash-{iteration}', drives=4)
+        try:
+            cluster.create()
+            client = cluster.clients[0]
+            bucket = 'release-batch-crash'
+            small = random.Random(2849).randbytes(4096)
+            large = random.Random(2850).randbytes(1024 * 1024)
+            payloads = {f'inline/object-{index:04d}': small for index in range(256)}
+            payloads.update({f'external/object-{index:04d}': large for index in range(32)})
+            confirmed = {'confirmed/inline': small, 'confirmed/external': large}
+            client.put_bucket(bucket)
+            etags = {}
+            for key, payload in {**payloads, **confirmed}.items():
+                client.put(bucket, key, payload)
+                etags[key] = client.last_headers['etag']
+            for key in confirmed:
+                client.delete(bucket, key)
+                wait_inventory(cluster, bucket, key, lambda inventory: all(not drive['exists'] for node in inventory for drive in node))
+            request = {}
+
+            def delete_batch():
+                try:
+                    xml = ET.Element('Delete')
+                    for key in payloads:
+                        ET.SubElement(ET.SubElement(xml, 'Object'), 'Key').text = key
+                    body = ET.tostring(xml)
+                    request['response'] = client.request('POST', bucket + '?delete', body, {
+                        'Content-Type': 'application/xml',
+                        'Content-MD5': base64.b64encode(hashlib.md5(body).digest()).decode(),
+                    }, expected=200)
+                except Exception as error:
+                    request['exception'] = str(error)
+
+            counts = (
+                "from pathlib import Path\nimport json\n"
+                f"bucket={bucket!r}\n"
+                "print(json.dumps([{'prepared': len(list((d/bucket).rglob('delete-prepared'))), "
+                "'receipts': len(list((d/bucket).rglob('delete-quorum-committed')))} "
+                "for d in Path('/data').glob('d*')]))"
+            )
+            thread = threading.Thread(target=delete_batch, daemon=True)
+            thread.start()
+            deadline = time.monotonic() + 30
+            while True:
+                observation = cluster.inspect_data(counts)
+                if any(drive[phase] for node in observation for drive in node):
+                    break
+                if not thread.is_alive() or time.monotonic() >= deadline:
+                    raise AssertionError('the selected durable evidence must be observed in a live batch before the crash')
+                time.sleep(0.02)
+            assert thread.is_alive(), 'the observed batch must still be active before SIGKILL'
+            (ROOT / f'release-batch-crash-{iteration}-observation.json').write_text(json.dumps({
+                'observed_phase': phase, 'observed_before_kill': observation,
+                'request_active_before_kill': True,
+            }, indent=2))
+            cluster.kill(0)
+            thread.join(10)
+            assert not thread.is_alive(), 'the interrupted client must finish'
+            acknowledged = set(confirmed)
+            if 'response' in request:
+                _, body = request['response']
+                for item in ET.fromstring(body):
+                    if item.tag.rsplit('}', 1)[-1] == 'Deleted':
+                        acknowledged.update(child.text for child in item if child.tag.rsplit('}', 1)[-1] == 'Key')
+            physical_probe = (
+                "from pathlib import Path\nimport json\n" + inspect.getsource(has_retained_content) +
+                f"bucket={bucket!r};keys={list(payloads) + list(confirmed)!r}\n"
+                "record_names={'xl.meta.bkp','delete-prepared','delete-target','delete-quorum-committed','delete-commit-finished','xl.meta.delete-marker.rollback'}\n"
+                "result=[]\nfor d in Path('/data').glob('d*'):\n"
+                " root=d/bucket\n"
+                " result.append({'prepared':len(list(root.rglob('delete-prepared'))),"
+                "'receipts':len(list(root.rglob('delete-quorum-committed'))),"
+                "'records':sum(p.name in record_names or p.name.startswith(('reserve-delete-data.','recovery-delete-data.','delete-data.')) for p in root.rglob('*')),"
+                "'live':[key for key in keys if (root/key/'xl.meta').is_file()],"
+                "'residue':[key for key in keys if not (root/key/'xl.meta').is_file() and has_retained_content(root/key)]})\n"
+                "print(json.dumps(result))"
+            )
+
+            def wait_for_physical_settlement():
+                deadline = time.monotonic() + 90
+                while True:
+                    drives = [drive for node in cluster.inspect_data(physical_probe) for drive in node]
+                    if all(not drive['records'] and not drive['residue'] for drive in drives):
+                        live = set(drives[0]['live'])
+                        if all(set(drive['live']) == live for drive in drives):
+                            return live
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('automatic recovery must converge physically before any new S3 DELETE, LIST, GET, or admin request')
+                    time.sleep(0.05)
+
+            cluster.restart()
+            # Physical inspection precedes S3 listing, which can itself purge
+            # eligible residue and must not manufacture recovery evidence here.
+            present = wait_for_physical_settlement()
+            assert present <= payloads.keys()
+            assert not (present & acknowledged), 'acknowledged deletes cannot resurrect'
+            assert set(client.list(bucket)) == present
+            for key, payload in {**payloads, **confirmed}.items():
+                status, body = client.request('GET', bucket + '/' + key, expected=(200, 404))
+                assert (status == 200) == (key in present)
+                if status == 200:
+                    assert body == payload, 'every surviving key must preserve complete original bytes'
+                    assert client.last_headers.get('etag') == etags[key], 'rollback must preserve the original ETag'
+            cluster.stop_clean()
+            cluster.restart()
+            assert wait_for_physical_settlement() == present, 'a second recovery cannot change the settled key set'
+            assert set(client.list(bucket)) == present
+            for key in present:
+                assert client.get(bucket, key) == payloads[key], 'a second recovery must preserve complete bytes'
+                assert client.last_headers.get('etag') == etags[key], 'a second recovery must preserve the original ETag'
+            if present:
+                client.batch_delete(bucket, sorted(present))
+            assert client.list(bucket) == []
+            client.delete_bucket(bucket)
+            rounds.append({'observed_phase': phase, 'observed_before_kill': observation,
+                           'acknowledged': len(acknowledged), 'present': len(present),
+                           'absent': len(payloads) + len(confirmed) - len(present),
+                           'complete_bytes_and_etags_verified': len(present), 'second_restart_stable': True})
+            (ROOT / 'release-batch-crash-progress.json').write_text(json.dumps(rounds, indent=2))
+        finally:
+            cluster.remove()
+    return {'case': 'release-batch-crash', 'status': 'passed', 'rounds': rounds,
+            'fault_model': 'SIGKILL after observing durable preparation or receipt; no deterministic instruction barrier'}
+
 def large_batch_delete():
     cluster = Cluster('batch-1000', nodes=4, drives=2)
     try:
@@ -1358,7 +1497,7 @@ def main():
     global ROOT, PREFIX, IMAGE, PORT, CANDIDATE, BASELINE
     import argparse, re, sys
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--binary', required=True, type=Path, help='Linux candidate binary built with e2e-test-hooks')
+    parser.add_argument('--binary', required=True, type=Path, help='Linux candidate; deterministic barrier cases require e2e-test-hooks')
     parser.add_argument('--baseline-binary', type=Path, help='Older Linux binary, required by mixed case')
     parser.add_argument('--image', required=True, help='Local Linux image with Python 3 and the binary runtime libraries')
     parser.add_argument('--artifact-dir', required=True, type=Path, help='New directory for logs and stage handshakes')
@@ -1385,7 +1524,7 @@ def main():
         existing = docker(resource, 'ls', '-q', '--filter', 'label=rustfs.delete-recovery-test=' + PREFIX).stdout.strip()
         if existing:
             parser.error('namespace already owns Docker resources; choose a new namespace')
-    cases = {'automatic-clean-restart': automatic_clean_restart, 'unknown-fresh': unknown_predecessor_fresh_delete, 'batch1000': large_batch_delete, 'versions3000': large_version_history, 'admin-smoke': admin_smoke, 'legacy-alias': legacy_transaction_data_dir_alias, 'missing-offline': ordinary_missing_with_offline_peer, 'inverse': retained_decision_newer_undecided, 'deep': deep_key_crash, 'deep-large-stack': lambda : deep_key_crash(True), 'admin-prefix': admin_prefix_scoped, 'response-loss': receipt_response_loss, 'admin-object': lambda : admin_legacy_dry_run(True), 'smoke': smoke, 'legacy1': lambda : legacy_retry(1), 'legacy4': lambda : legacy_retry(4), 'restore': rollback_crash, 'retention': protected_version, 'version-applied': lambda : versioned_crash('APPLIED'), 'version-decision': lambda : versioned_crash('DECISION'), 'returning': returning_drive_new_generation, 'untouched': untouched_returning_peer, 'missing-version': missing_version_returning_peer, 'mixed': mixed_versions, 'admin': admin_legacy_dry_run, 'prefix': uuid_prefix_crash, 'corruption': corruption_repair, 'permission': permission_fault, 'error-prepared': lambda : injected_error('PREPARED'), 'error-applied': lambda : injected_error('APPLIED'), 'error-decision': lambda : injected_error('DECISION')}
+    cases = {'release-batch-crash': release_batch_crash, 'automatic-clean-restart': automatic_clean_restart, 'unknown-fresh': unknown_predecessor_fresh_delete, 'batch1000': large_batch_delete, 'versions3000': large_version_history, 'admin-smoke': admin_smoke, 'legacy-alias': legacy_transaction_data_dir_alias, 'missing-offline': ordinary_missing_with_offline_peer, 'inverse': retained_decision_newer_undecided, 'deep': deep_key_crash, 'deep-large-stack': lambda : deep_key_crash(True), 'admin-prefix': admin_prefix_scoped, 'response-loss': receipt_response_loss, 'admin-object': lambda : admin_legacy_dry_run(True), 'smoke': smoke, 'legacy1': lambda : legacy_retry(1), 'legacy4': lambda : legacy_retry(4), 'restore': rollback_crash, 'retention': protected_version, 'version-applied': lambda : versioned_crash('APPLIED'), 'version-decision': lambda : versioned_crash('DECISION'), 'returning': returning_drive_new_generation, 'untouched': untouched_returning_peer, 'missing-version': missing_version_returning_peer, 'mixed': mixed_versions, 'admin': admin_legacy_dry_run, 'prefix': uuid_prefix_crash, 'corruption': corruption_repair, 'permission': permission_fault, 'error-prepared': lambda : injected_error('PREPARED'), 'error-applied': lambda : injected_error('APPLIED'), 'error-decision': lambda : injected_error('DECISION')}
     cases.update({'multipart-sidecars': completed_multipart_sidecars, 'multipart-integrity': lambda: completed_multipart_sidecars(True), 'multipart-sidecars-applied': lambda: completed_multipart_sidecars(False, True), 'multipart-integrity-applied': lambda: completed_multipart_sidecars(True, True)})
     for stage in ('PREPARED', 'APPLIED', 'DECISION'):
         cases['marker-batch-' + stage.lower()] = lambda stage=stage: marker_batch_crash(stage)

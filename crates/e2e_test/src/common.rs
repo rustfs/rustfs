@@ -1272,6 +1272,7 @@ pub struct RustFSTestClusterEnvironment {
     /// Optional socket proxies used for the corresponding node's volume
     /// endpoints. Proxies must be installed before [`Self::start`].
     volume_proxy_addresses: Vec<Option<SocketAddr>>,
+    tls_ca_pem: Option<Vec<u8>>,
 }
 
 impl RustFSTestClusterEnvironment {
@@ -1377,7 +1378,33 @@ impl RustFSTestClusterEnvironment {
             node_capture_log_paths: vec![None; topology.node_count],
             topology,
             volume_proxy_addresses: vec![None; node_count],
+            tls_ca_pem: None,
         })
+    }
+
+    /// Configure verified HTTPS for both volume endpoints and S3 clients.
+    /// The bundle must be generated before any node starts.
+    pub async fn enable_tls(&mut self, directory: &Path) -> std::io::Result<()> {
+        if self.nodes.iter().any(|node| node.process.is_some()) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "configure cluster TLS before starting nodes",
+            ));
+        }
+        let directory = fs::canonicalize(directory).await?;
+        let ca_pem = fs::read(directory.join("ca.crt")).await?;
+        reqwest::Certificate::from_pem(&ca_pem).map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+        self.set_env(
+            "RUSTFS_TLS_PATH",
+            directory
+                .to_str()
+                .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "TLS directory is not UTF-8"))?,
+        );
+        for node in &mut self.nodes {
+            node.url = format!("https://{}", node.address);
+        }
+        self.tls_ca_pem = Some(ca_pem);
+        Ok(())
     }
 
     /// Add an extra environment variable applied to every cluster node process.
@@ -1501,6 +1528,7 @@ impl RustFSTestClusterEnvironment {
 
     fn build_volumes_arg(&self) -> String {
         let pools = self.topology.normalized_pools();
+        let scheme = if self.tls_ca_pem.is_some() { "https" } else { "http" };
 
         if pools.len() <= 1 {
             // Single pool: explicit enumeration of every drive on every node.
@@ -1510,7 +1538,7 @@ impl RustFSTestClusterEnvironment {
                 .enumerate()
                 .flat_map(|(node_idx, n)| {
                     let address = self.volume_address(node_idx);
-                    n.data_dirs.iter().map(move |dir| format!("http://{}{}", address, dir))
+                    n.data_dirs.iter().map(move |dir| format!("{scheme}://{address}{dir}"))
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -1530,7 +1558,7 @@ impl RustFSTestClusterEnvironment {
                     .and_then(|d| d.rsplit_once('/').map(|(parent, _)| parent))
                     .unwrap_or(&node.data_dir);
                 format!(
-                    "http://{}{}/drive{{0...{}}}",
+                    "{scheme}://{}{}/drive{{0...{}}}",
                     self.volume_address(node_idx),
                     base,
                     self.topology.drives_per_node - 1
@@ -1719,13 +1747,20 @@ impl RustFSTestClusterEnvironment {
         if node_idx >= self.nodes.len() {
             return Err("node_idx is invalid".into());
         }
-        Ok(Client::from_conf(build_test_s3_config(
-            &self.nodes[node_idx].url,
-            &self.access_key,
-            &self.secret_key,
-            None,
-            "cluster-test",
-        )))
+        let mut config =
+            build_test_s3_config(&self.nodes[node_idx].url, &self.access_key, &self.secret_key, None, "cluster-test");
+        if let Some(ca_pem) = &self.tls_ca_pem {
+            use aws_smithy_http_client::tls::{Provider, TlsContext, TrustStore, rustls_provider::CryptoMode};
+            let tls = TlsContext::builder()
+                .with_trust_store(TrustStore::empty().with_pem_certificate(ca_pem.clone()))
+                .build()?;
+            let client = SmithyHttpClientBuilder::new()
+                .tls_provider(Provider::Rustls(CryptoMode::AwsLc))
+                .tls_context(tls)
+                .build_https();
+            config = config.to_builder().http_client(client).build();
+        }
+        Ok(Client::from_conf(config))
     }
 
     /// Create S3 clients for all nodes in the RustFS cluster and collect them into a vector.
@@ -1850,7 +1885,7 @@ impl RustFSTestClusterEnvironment {
         }
 
         self.nodes.push(ClusterNode {
-            url: format!("http://{address}"),
+            url: format!("{}://{address}", if self.tls_ca_pem.is_some() { "https" } else { "http" }),
             address,
             data_dir: data_dirs[0].clone(),
             data_dirs,
@@ -2464,6 +2499,7 @@ mod tests {
             node_capture_log_paths: vec![None; topology.node_count],
             topology,
             volume_proxy_addresses: vec![None; node_count],
+            tls_ca_pem: None,
         }
     }
 
@@ -2481,8 +2517,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn volumes_single_pool_multidrive_enumerates_every_drive() {
+    #[tokio::test]
+    async fn volumes_single_pool_multidrive_enumerates_every_drive() {
         // 4 nodes x 2 drives -> 8 explicit endpoints, one legacy pool. No
         // ellipses, so the server parser keeps this as a single DistErasure pool.
         let env = fake_cluster(ClusterTopology::single_pool_multidrive(4, 2));
@@ -2494,6 +2530,25 @@ mod tests {
             .join(" ");
         assert_eq!(env.build_volumes_arg(), expected);
         assert_eq!(env.build_volumes_arg().split(' ').count(), 8);
+
+        let directory = tempfile::tempdir().expect("TLS fixture directory");
+        crate::tls_gen::run(crate::tls_gen::Args {
+            out_dir: directory.path().to_owned(),
+            days: 1,
+            force: false,
+        })
+        .expect("generate TLS bundle");
+        for topology in [
+            ClusterTopology::single_pool_multidrive(4, 4),
+            ClusterTopology::per_node_pools(4, vec![vec![0], vec![1]]),
+        ] {
+            let mut cluster = fake_cluster(topology);
+            let plaintext_volumes = cluster.build_volumes_arg();
+            cluster.enable_tls(directory.path()).await.expect("configure TLS");
+            assert_eq!(cluster.build_volumes_arg(), plaintext_volumes.replace("http://", "https://"));
+            assert!(cluster.nodes.iter().all(|node| node.url.starts_with("https://")));
+            assert!(cluster.create_s3_client(0).is_ok(), "trusted SDK client should build");
+        }
     }
 
     #[test]
