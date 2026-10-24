@@ -25829,6 +25829,15 @@ mod delete_objects_lock_gating_tests {
             .as_fast_lock_manager()
             .expect("isolated fixture should use the local lock manager");
         assert_eq!(lock_manager.current_lock_counts(), (1, 0));
+        let canonical_key = ObjectKey::new(bucket, "a/b");
+        let raw_alias_key = ObjectKey::new(bucket, "a\\b");
+        // Bypass new_ns_lock's normalization deliberately. Keep this sentinel
+        // through completion so a batch using the raw alias cannot slip past
+        // merely because metadata admission used the initial 300 ms.
+        let raw_alias_guard = lock_manager
+            .acquire_read_lock(raw_alias_key.clone(), "raw-alias-sentinel")
+            .await
+            .expect("raw alias sentinel read lock should be acquired");
 
         let objects = vec![ObjectToDelete {
             object_name: "a\\b".to_string(),
@@ -25850,11 +25859,22 @@ mod delete_objects_lock_gating_tests {
             Duration::from_millis(300),
             futures::future::poll_fn(|cx| {
                 let result = std::future::Future::poll(delete.as_mut(), cx);
-                // Holders only: the queued batch shows up as a waiter.
+                // Admission can hold unrelated bucket metadata READ locks.
+                // Only the two object spellings belong to this assertion.
+                let mut holders = (0_u64, 0_u64);
+                for (info, count) in lock_manager.list_locks_with_holder_counts() {
+                    if info.key == canonical_key {
+                        assert_eq!(info.mode, rustfs_lock::LockMode::Exclusive);
+                        holders.0 += u64::from(count);
+                    } else if info.key == raw_alias_key {
+                        assert_eq!(info.mode, rustfs_lock::LockMode::Shared);
+                        holders.1 += u64::from(count);
+                    }
+                }
                 assert_eq!(
-                    lock_manager.current_lock_counts().0,
-                    1,
-                    "batch delete through `a\\b` must not lock beside the `a/b` holder"
+                    holders,
+                    (1, 1),
+                    "only the canonical holder and raw alias sentinel may own these object keys"
                 );
                 result
             }),
@@ -25872,6 +25892,7 @@ mod delete_objects_lock_gating_tests {
             .get_object_info(bucket, "a/b", &ObjectOptions::default())
             .await
             .expect_err("`a/b` must be gone after deleting `a\\b`");
+        drop(raw_alias_guard);
     }
 }
 
