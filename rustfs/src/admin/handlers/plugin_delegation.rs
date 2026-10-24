@@ -228,9 +228,11 @@ impl Operation for Submit {
             &signer,
             id,
             &deployment,
-            &input.object.bucket,
-            &input.object.key,
-            &input.object.version_id,
+            ObjectReference {
+                bucket: &input.object.bucket,
+                key: &input.object.key,
+                version_id: &input.object.version_id,
+            },
             now,
         ) {
             return Err(s3::error(S3ErrorCode::AccessDenied, "submit restriction rejected"));
@@ -532,9 +534,11 @@ mod tests {
             "owner",
             &record.id,
             "prod",
-            &input.object.bucket,
-            &input.object.key,
-            &input.object.version_id,
+            ObjectReference {
+                bucket: &input.object.bucket,
+                key: &input.object.key,
+                version_id: &input.object.version_id,
+            },
             2,
         ));
     }

@@ -208,8 +208,7 @@ async fn scan(
     tokio::join!(
         remote.inventory_artifact_attempt(
             fixture.expected,
-            BUCKET,
-            fixture.incarnation,
+            (BUCKET, fixture.incarnation),
             &fixture.prefix,
             phase,
             tokio::time::Instant::now() + duration,
@@ -355,8 +354,7 @@ async fn artifact_inventory_remote_cancel_retains_physical_owner() {
         remote
             .inventory_artifact_attempt(
                 expected,
-                BUCKET,
-                incarnation,
+                (BUCKET, incarnation),
                 &prefix,
                 ArtifactInventoryPhase::ArtifactInventoryScan,
                 tokio::time::Instant::now() + Duration::from_secs(30),

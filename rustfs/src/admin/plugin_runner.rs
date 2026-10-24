@@ -559,11 +559,10 @@ pub(crate) fn validate_delegation_scope(
     signer: &str,
     delegation_id: &str,
     deployment: &str,
-    bucket: &str,
-    key: &str,
-    version_id: &str,
+    object: ObjectReference<'_>,
     now: u64,
 ) -> bool {
+    let ObjectReference { bucket, key, version_id } = object;
     record.owner_access_key == signer
         && record.id == delegation_id
         && record.revision == delegation_id
@@ -874,7 +873,18 @@ mod tests {
             },
         };
         let valid = |signer, id, deployment, now| {
-            validate_delegation_scope(&record, signer, id, deployment, "images", "source/a.png", "v1", now)
+            validate_delegation_scope(
+                &record,
+                signer,
+                id,
+                deployment,
+                ObjectReference {
+                    bucket: "images",
+                    key: "source/a.png",
+                    version_id: "v1",
+                },
+                now,
+            )
         };
         assert!(valid("owner", &record.id, "prod", 2));
         assert!(!valid("other", &record.id, "prod", 2));
