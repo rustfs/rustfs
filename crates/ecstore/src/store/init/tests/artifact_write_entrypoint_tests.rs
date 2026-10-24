@@ -294,19 +294,15 @@ async fn object_mutations_case() {
         .await
         .expect("ordinary transition stays supported");
     assert_eq!(backend.object_count().await, 1);
+    let mut restore_transition = crate::bucket::lifecycle::lifecycle::TransitionOptions::default();
+    restore_transition.restore_request.days = Some(1);
     store
         .clone()
         .restore_transitioned_object(
             ordinary,
             &object,
             &ObjectOptions {
-                transition: crate::bucket::lifecycle::lifecycle::TransitionOptions {
-                    restore_request: s3s::dto::RestoreRequest {
-                        days: Some(1),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
+                transition: restore_transition,
                 ..exact
             },
         )

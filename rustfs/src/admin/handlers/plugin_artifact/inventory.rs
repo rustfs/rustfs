@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{AttemptIdentity, owner_for_resource, request_body, request_store, require_builtin_authorization};
+use crate::admin::storage_api::s3::{self, Body, ByteStream, DynByteStream, S3Request, S3Response, S3Result, StdError};
 use crate::admin::{
     auth::AdminResourceScope,
     router::Operation,
@@ -12,10 +13,6 @@ use futures::{Stream, StreamExt as _};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use matchit::Params;
 use rustfs_policy::policy::action::AdminAction;
-use s3s::{
-    Body, S3Request, S3Response, S3Result, StdError, s3_error,
-    stream::{ByteStream, DynByteStream},
-};
 use serde::{Deserialize, Serialize};
 use std::{
     io,
@@ -49,7 +46,7 @@ impl InventoryRequest {
                 .split('/')
                 .any(|part| part.is_empty() || part == "." || part == "..")
         {
-            return Err(s3_error!(InvalidRequest, "invalid artifact inventory request"));
+            return Err(s3::error(s3::S3ErrorCode::InvalidRequest, "invalid artifact inventory request"));
         }
         Ok(())
     }
@@ -104,10 +101,10 @@ impl Operation for Inventory {
                 AdminResourceScope::bucket_object(&input.target.bucket, &input.target.attempt_prefix),
             )
             .await?;
-            Ok::<_, s3s::S3Error>((store, input))
+            Ok::<_, s3::S3Error>((store, input))
         })
         .await
-        .map_err(|_| s3_error!(ServiceUnavailable, "artifact inventory unavailable"))??;
+        .map_err(|_| s3::error(s3::S3ErrorCode::ServiceUnavailable, "artifact inventory unavailable"))??;
         let (output, receiver) = mpsc::channel(2);
         let stream: DynByteStream = Box::pin(InventoryStream(ReceiverStream::new(receiver)));
         spawn_traced(produce(store, input, deadline, output));

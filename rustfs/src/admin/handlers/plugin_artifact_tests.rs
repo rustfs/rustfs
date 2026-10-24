@@ -3,6 +3,7 @@
 
 //! Internal handler calls with real request IAM and four-disk storage; no HTTP signing is simulated.
 use super::*;
+use crate::admin::storage_api::s3;
 use crate::admin::{
     runtime_sources::{AppContext, IamInterface, KmsInterface},
     storage_api::{
@@ -176,9 +177,9 @@ impl Fixture {
             trailing_headers: None,
         };
         req.extensions.insert(slot);
-        req.credentials = user.map(|access_key| s3s::auth::Credentials {
+        req.credentials = user.map(|access_key| s3::auth::Credentials {
             access_key: access_key.to_owned(),
-            secret_key: s3s::auth::SecretKey::from(if access_key == ROOT { ROOT_SECRET } else { SECRET }.to_owned()),
+            secret_key: s3::auth::SecretKey::from(if access_key == ROOT { ROOT_SECRET } else { SECRET }.to_owned()),
         });
         req
     }
@@ -275,7 +276,7 @@ async fn artifact_handlers_persist_seal_and_exact_retirement_with_idempotent_ret
         .call(fixture.request(&retirement, Some(USER)), Params::new())
         .await
         .expect_err("retirement requires a seal");
-    assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
+    assert_eq!(error.code(), &s3::S3ErrorCode::ServiceUnavailable);
     fixture.absent(&fixture.retirement_path(&object, first)).await;
 
     for _ in 0..2 {
@@ -337,7 +338,7 @@ async fn artifact_repair_seal_handler_requires_put_seal_and_confirms_only_attemp
                 .await
                 .expect_err("repair seal request is strict")
                 .code(),
-            &s3s::S3ErrorCode::InvalidRequest
+            &s3::S3ErrorCode::InvalidRequest
         );
     }
     for unready_slot in [false, true] {
@@ -352,14 +353,14 @@ async fn artifact_repair_seal_handler_requires_put_seal_and_confirms_only_attemp
                 .await
                 .expect_err("repair seal requires a ready request instance")
                 .code(),
-            &s3s::S3ErrorCode::ServiceUnavailable
+            &s3::S3ErrorCode::ServiceUnavailable
         );
     }
     let error = SealRepairs
         .call(fixture.request(&body, Some(USER)), Params::new())
         .await
         .expect_err("ordinary PUT seal is a prerequisite");
-    assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
+    assert_eq!(error.code(), &s3::S3ErrorCode::ServiceUnavailable);
     assert_eq!(error.message(), Some("artifact operation unconfirmed; retry the same identity"));
     fixture.absent(&fixture.repair_seal_path()).await;
     fixture.absent(&fixture.seal_path()).await;
@@ -408,7 +409,7 @@ async fn artifact_writes_artifact_handlers_reject_unauthorized_principals_and_wr
             .await
             .expect_err("old controls do not authorize repair sealing")
             .code(),
-        &s3s::S3ErrorCode::AccessDenied
+        &s3::S3ErrorCode::AccessDenied
     );
     fixture.absent(&fixture.repair_seal_path()).await;
     let (service, _) = fixture
@@ -475,7 +476,7 @@ async fn artifact_writes_artifact_handlers_reject_unauthorized_principals_and_wr
                 result
                     .expect_err("original user and exact resource policy are required")
                     .code(),
-                &s3s::S3ErrorCode::AccessDenied
+                &s3::S3ErrorCode::AccessDenied
             );
             fixture.absent(&fixture.seal_path()).await;
             fixture.absent(&fixture.repair_seal_path()).await;
@@ -509,7 +510,7 @@ async fn artifact_writes_artifact_handlers_bind_incarnation_and_request_instance
         let result = operation.call(req, Params::new()).await;
         assert_eq!(
             result.expect_err("other instance incarnation is rejected").code(),
-            &s3s::S3ErrorCode::ServiceUnavailable
+            &s3::S3ErrorCode::ServiceUnavailable
         );
         first.absent(&first.seal_path()).await;
         second.absent(&second.seal_path()).await;
@@ -525,7 +526,7 @@ async fn artifact_writes_artifact_handlers_bind_incarnation_and_request_instance
         .call(first.request(&wrong_incarnation, Some(USER)), Params::new())
         .await
         .expect_err("repair seal checks incarnation even after the PUT seal exists");
-    assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
+    assert_eq!(error.code(), &s3::S3ErrorCode::ServiceUnavailable);
     first.absent(&first.repair_seal_path()).await;
     second.absent(&second.repair_seal_path()).await;
     assert!(first.put(&object, 0xCC).await.is_err());
@@ -669,7 +670,7 @@ async fn artifact_bucket_create_resource_and_instance_isolation() {
             .await
             .expect_err("ARTIFACT_CREATE_RESOURCE")
             .code(),
-        &s3s::S3ErrorCode::AccessDenied
+        &s3::S3ErrorCode::AccessDenied
     );
     assert!(
         first
@@ -725,7 +726,7 @@ async fn artifact_bucket_create_topology_and_input_fail_closed() {
                 .await
                 .expect_err("invalid request")
                 .code(),
-            &s3s::S3ErrorCode::InvalidRequest
+            &s3::S3ErrorCode::InvalidRequest
         );
     }
     fixture
@@ -738,7 +739,7 @@ async fn artifact_bucket_create_topology_and_input_fail_closed() {
             .await
             .expect_err("remote capability unsupported")
             .code(),
-        &s3s::S3ErrorCode::ServiceUnavailable
+        &s3::S3ErrorCode::ServiceUnavailable
     );
     assert!(
         fixture
@@ -808,7 +809,7 @@ async fn artifact_bucket_inspect_resource_and_instance_isolation() {
             .await
             .expect_err("create cannot inspect")
             .code(),
-        &s3s::S3ErrorCode::AccessDenied
+        &s3::S3ErrorCode::AccessDenied
     );
     first.grant_bucket_action(BUCKET, "admin:GetPluginArtifactBucket").await;
     second.grant_bucket_action(BUCKET, "admin:GetPluginArtifactBucket").await;
@@ -828,7 +829,7 @@ async fn artifact_bucket_inspect_resource_and_instance_isolation() {
             true
         }
         Err(error) => {
-            assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
+            assert_eq!(error.code(), &s3::S3ErrorCode::AccessDenied);
             false
         }
     };
@@ -847,7 +848,7 @@ async fn artifact_bucket_inspect_resource_and_instance_isolation() {
                 .await
                 .expect_err("original IAM required")
                 .code(),
-            &s3s::S3ErrorCode::AccessDenied
+            &s3::S3ErrorCode::AccessDenied
         );
     }
     let mut unready = first.request(&body, Some(USER));
@@ -858,7 +859,7 @@ async fn artifact_bucket_inspect_resource_and_instance_isolation() {
             .await
             .expect_err("no ambient fallback")
             .code(),
-        &s3s::S3ErrorCode::ServiceUnavailable
+        &s3::S3ErrorCode::ServiceUnavailable
     );
 }
 
@@ -882,7 +883,7 @@ async fn artifact_bucket_inspect_rejections_leave_storage_unchanged() {
                 .await
                 .expect_err("not a matching managed bucket")
                 .code(),
-            &s3s::S3ErrorCode::ServiceUnavailable
+            &s3::S3ErrorCode::ServiceUnavailable
         );
     }
     let ordinary_metadata = load_bucket_metadata(fixture.store.clone(), ordinary)
@@ -914,7 +915,7 @@ async fn artifact_bucket_inspect_rejections_leave_storage_unchanged() {
                 .await
                 .expect_err("strict input")
                 .code(),
-            &s3s::S3ErrorCode::InvalidRequest
+            &s3::S3ErrorCode::InvalidRequest
         );
     }
     fixture
@@ -927,7 +928,7 @@ async fn artifact_bucket_inspect_rejections_leave_storage_unchanged() {
             .await
             .expect_err("unsupported topology")
             .code(),
-        &s3s::S3ErrorCode::ServiceUnavailable
+        &s3::S3ErrorCode::ServiceUnavailable
     );
 }
 
@@ -952,7 +953,7 @@ async fn artifact_writes_handler_strict_requests_and_independent_action() {
                 .await
                 .expect_err("old narrow action cannot authorize all writes")
                 .code(),
-            &s3s::S3ErrorCode::AccessDenied
+            &s3::S3ErrorCode::AccessDenied
         );
     }
     for mutate in ["version", "unknown", "target", "nil"] {
@@ -969,7 +970,7 @@ async fn artifact_writes_handler_strict_requests_and_independent_action() {
                 .await
                 .expect_err("writes request must be strict")
                 .code(),
-            &s3s::S3ErrorCode::InvalidRequest
+            &s3::S3ErrorCode::InvalidRequest
         );
     }
     for raw in [
@@ -984,7 +985,7 @@ async fn artifact_writes_handler_strict_requests_and_independent_action() {
                 .await
                 .expect_err("malformed and duplicate JSON must fail")
                 .code(),
-            &s3s::S3ErrorCode::InvalidRequest
+            &s3::S3ErrorCode::InvalidRequest
         );
     }
     for slot in [None, Some(Arc::new(ServerContextSlot::default()))] {
@@ -999,7 +1000,7 @@ async fn artifact_writes_handler_strict_requests_and_independent_action() {
                 .await
                 .expect_err("writes seal requires ready instance")
                 .code(),
-            &s3s::S3ErrorCode::ServiceUnavailable
+            &s3::S3ErrorCode::ServiceUnavailable
         );
     }
     let mut wrong = fixture.seal();
@@ -1008,7 +1009,7 @@ async fn artifact_writes_handler_strict_requests_and_independent_action() {
         .call(fixture.request(&wrong, Some(USER)), Params::new())
         .await
         .expect_err("unconfirmed incarnation");
-    assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
+    assert_eq!(error.code(), &s3::S3ErrorCode::ServiceUnavailable);
     assert_eq!(error.message(), Some("artifact operation unconfirmed; retry the same identity"));
     fixture.absent(&fixture.seal_path()).await;
     fixture.absent(&fixture.repair_seal_path()).await;
@@ -1053,12 +1054,9 @@ async fn artifact_writes_handler_confirms_both_records_on_first_and_exact_retry(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn artifact_writes_upload_part_copy_rejects_real_managed_staging_and_preserves_it() {
+    use crate::admin::storage_api::s3::{CopySource, S3 as _, S3Access, UploadPartCopyInput};
     use crate::storage::storage_api::contract::{
         bucket::BUCKET_LIFECYCLE_LOCK_OBJECT, multipart::MultipartOperations as _, namespace::NamespaceLocking as _,
-    };
-    use s3s::{
-        S3 as _,
-        dto::{CopySource, UploadPartCopyInput},
     };
     let fixture = Fixture::new(prefix()).await;
     let ordinary = "artifact-copy-control";
@@ -1193,7 +1191,7 @@ async fn artifact_writes_upload_part_copy_rejects_real_managed_staging_and_prese
         snapshot
     };
     let mut managed_request = copy_request(BUCKET, &key, &upload.upload_id);
-    s3s::access::S3Access::upload_part_copy(&fs, &mut managed_request)
+    S3Access::upload_part_copy(&fs, &mut managed_request)
         .await
         .expect("real source/destination authorization captures both generation guards");
     let mut source_options = StorageObjectOptions::default();
@@ -1216,7 +1214,7 @@ async fn artifact_writes_upload_part_copy_rejects_real_managed_staging_and_prese
     let error = Box::pin(fs.upload_part_copy(managed_request))
         .await
         .expect_err("managed copy must reject at its actual write entrance");
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InternalError);
+    assert_eq!(error.code(), &s3::S3ErrorCode::InternalError);
     assert_eq!(error.message(), Some("We encountered an internal error, please try again."));
     assert!(
         disk_snapshot() == before,
@@ -1235,7 +1233,7 @@ async fn artifact_writes_upload_part_copy_rejects_real_managed_staging_and_prese
         .await
         .expect("ordinary MPU");
     let mut control_request = copy_request(ordinary, "destination.bin", &control.upload_id);
-    s3s::access::S3Access::upload_part_copy(&fs, &mut control_request)
+    S3Access::upload_part_copy(&fs, &mut control_request)
         .await
         .expect("ordinary copy uses the same real authorization/generation middleware");
     let copied = Box::pin(fs.upload_part_copy(control_request))
@@ -1270,7 +1268,7 @@ async fn artifact_inventory_handler_requires_request_context_and_independent_act
             .await
             .expect_err("seal grants cannot inventory")
             .code(),
-        &s3s::S3ErrorCode::AccessDenied
+        &s3::S3ErrorCode::AccessDenied
     );
     for slot in [None, Some(Arc::new(ServerContextSlot::default()))] {
         let mut req = fixture.request(&request, Some(USER));
@@ -1284,7 +1282,7 @@ async fn artifact_inventory_handler_requires_request_context_and_independent_act
                 .await
                 .expect_err("inventory needs owning context")
                 .code(),
-            &s3s::S3ErrorCode::ServiceUnavailable
+            &s3::S3ErrorCode::ServiceUnavailable
         );
     }
     for mutation in ["version", "invocation_id", "unknown", "target", "nil", "prefix"] {
@@ -1303,7 +1301,7 @@ async fn artifact_inventory_handler_requires_request_context_and_independent_act
                 .await
                 .expect_err("strict inventory identity")
                 .code(),
-            &s3s::S3ErrorCode::InvalidRequest
+            &s3::S3ErrorCode::InvalidRequest
         );
     }
     fixture.absent(&fixture.seal_path()).await;
@@ -1325,7 +1323,7 @@ async fn artifact_delete_handler_enforces_scope_seals_and_exact_version() {
                 .await
                 .expect_err("A03GC2_INVARIANT old seal/retire authority cannot delete")
                 .code(),
-            &s3s::S3ErrorCode::AccessDenied,
+            &s3::S3ErrorCode::AccessDenied,
         );
     }
     let policy = Policy::parse_config(
@@ -1384,7 +1382,7 @@ async fn artifact_delete_handler_enforces_scope_seals_and_exact_version() {
             .await
             .expect_err("A03GC2_INVARIANT exact object IAM scope")
             .code(),
-        &s3s::S3ErrorCode::AccessDenied
+        &s3::S3ErrorCode::AccessDenied
     );
     for _ in 0..2 {
         let deleted = receipt(
@@ -1472,7 +1470,7 @@ async fn artifact_delete_inspect_negotiates_without_changing_v1() {
                 .await
                 .expect_err("unsupported version")
                 .code(),
-            &s3s::S3ErrorCode::InvalidRequest
+            &s3::S3ErrorCode::InvalidRequest
         );
     }
     let request = json!({"version":2,"bucket":BUCKET,"base_prefix":"outputs/"});
@@ -1482,7 +1480,7 @@ async fn artifact_delete_inspect_negotiates_without_changing_v1() {
             .await
             .expect_err("create remains version 1")
             .code(),
-        &s3s::S3ErrorCode::InvalidRequest
+        &s3::S3ErrorCode::InvalidRequest
     );
 }
 
@@ -1503,7 +1501,7 @@ async fn artifact_backup_retention_requires_independent_scoped_authority() {
                 .await
                 .expect_err("unrelated action denied")
                 .code(),
-            &s3s::S3ErrorCode::AccessDenied,
+            &s3::S3ErrorCode::AccessDenied,
             "O02P3_SEPARATE_BACKUP_AUTHORITY"
         );
     }
@@ -1516,7 +1514,7 @@ async fn artifact_backup_retention_requires_independent_scoped_authority() {
             .await
             .expect_err("wrong resource denied")
             .code(),
-        &s3s::S3ErrorCode::AccessDenied,
+        &s3::S3ErrorCode::AccessDenied,
         "O02P3_BACKUP_BUCKET_SCOPE"
     );
     fixture.grant_bucket_action(BUCKET, "admin:RetainPluginArtifactBackups").await;

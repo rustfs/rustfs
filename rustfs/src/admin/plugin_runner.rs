@@ -4,9 +4,9 @@
 //! Authenticated RustFS-to-Runner ingress transport.
 
 use crate::admin::runtime_sources;
+use crate::admin::storage_api::s3::{self, S3Error, S3ErrorCode, S3Result};
 use reqwest::{Client, StatusCode, Url};
 use rustfs_iam::delegation::Delegation;
-use s3s::{S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -180,7 +180,7 @@ pub(crate) fn configured_deployment() -> S3Result<String> {
     std::env::var("RUSTFS_PLUGIN_RUNNER_DEPLOYMENT")
         .ok()
         .filter(|value| literal(value))
-        .ok_or_else(|| s3_error!(ServiceUnavailable, "plugin runner is not configured"))
+        .ok_or_else(|| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner is not configured"))
 }
 
 pub(crate) async fn submit(request: &SubmitRequest<'_>) -> S3Result<Receipt> {
@@ -191,24 +191,26 @@ pub(crate) async fn submit(request: &SubmitRequest<'_>) -> S3Result<Receipt> {
         .json(request)
         .send()
         .await
-        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner unavailable"))?;
+        .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner unavailable"))?;
 
     match response.status() {
         StatusCode::OK => {
             let body = bounded_body(response, MAX_RECEIPT_BYTES).await?;
-            let receipt: Receipt =
-                serde_json::from_slice(&body).map_err(|_| s3_error!(ServiceUnavailable, "plugin runner receipt invalid"))?;
+            let receipt: Receipt = serde_json::from_slice(&body)
+                .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner receipt invalid"))?;
             if receipt.version != 1 || receipt.run_id.is_nil() || !literal(&receipt.pool) || receipt.deadline_unix_micros <= 0 {
-                return Err(s3_error!(ServiceUnavailable, "plugin runner receipt invalid"));
+                return Err(s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner receipt invalid"));
             }
             Ok(receipt)
         }
-        StatusCode::CONFLICT => Err(s3_error!(InvalidRequest, "idempotency key conflicts with existing job")),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(s3_error!(AccessDenied, "plugin runner rejected request")),
-        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
-            Err(s3_error!(InvalidRequest, "plugin runner rejected request"))
+        StatusCode::CONFLICT => Err(s3::error(S3ErrorCode::InvalidRequest, "idempotency key conflicts with existing job")),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            Err(s3::error(S3ErrorCode::AccessDenied, "plugin runner rejected request"))
         }
-        _ => Err(s3_error!(ServiceUnavailable, "plugin runner unavailable")),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            Err(s3::error(S3ErrorCode::InvalidRequest, "plugin runner rejected request"))
+        }
+        _ => Err(s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner unavailable")),
     }
 }
 
@@ -221,34 +223,37 @@ pub(crate) async fn query(request: &QueryRequest<'_>) -> S3Result<QueryResponse>
         .json(request)
         .send()
         .await
-        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner unavailable"))?;
+        .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner unavailable"))?;
 
     match response.status() {
         StatusCode::OK => {
             let body = bounded_body(response, MAX_QUERY_RESPONSE_BYTES).await?;
             let result: QueryResponse = serde_json::from_slice(&body)
-                .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner query response invalid"))?;
+                .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner query response invalid"))?;
             if !valid_query_response(&result, request.run_id) {
-                return Err(s3_error!(ServiceUnavailable, "plugin runner query response invalid"));
+                return Err(s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner query response invalid"));
             }
             Ok(result)
         }
-        StatusCode::NOT_FOUND => Err(s3_error!(NoSuchKey, "plugin run not found")),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(s3_error!(AccessDenied, "plugin runner rejected request")),
-        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
-            Err(s3_error!(InvalidRequest, "plugin runner rejected request"))
+        StatusCode::NOT_FOUND => Err(s3::error(S3ErrorCode::NoSuchKey, "plugin run not found")),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            Err(s3::error(S3ErrorCode::AccessDenied, "plugin runner rejected request"))
         }
-        _ => Err(s3_error!(ServiceUnavailable, "plugin runner unavailable")),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            Err(s3::error(S3ErrorCode::InvalidRequest, "plugin runner rejected request"))
+        }
+        _ => Err(s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner unavailable")),
     }
 }
 
 pub(crate) async fn history(request: &HistoryRequest<'_>) -> S3Result<HistoryResponse> {
     if request.version != 1 || request.run_id.is_nil() {
-        return Err(s3_error!(InvalidRequest, "invalid plugin run history request"));
+        return Err(s3::error(S3ErrorCode::InvalidRequest, "invalid plugin run history request"));
     }
-    let body = serde_json::to_vec(request).map_err(|_| s3_error!(InvalidRequest, "invalid plugin run history request"))?;
+    let body =
+        serde_json::to_vec(request).map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "invalid plugin run history request"))?;
     if body.len() > MAX_HISTORY_REQUEST_BYTES {
-        return Err(s3_error!(InvalidRequest, "plugin run history request too large"));
+        return Err(s3::error(S3ErrorCode::InvalidRequest, "plugin run history request too large"));
     }
     let mut url = configured_url()?;
     url.set_path(HISTORY_ENDPOINT_PATH);
@@ -259,24 +264,26 @@ pub(crate) async fn history(request: &HistoryRequest<'_>) -> S3Result<HistoryRes
         .body(body)
         .send()
         .await
-        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner unavailable"))?;
+        .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner unavailable"))?;
 
     match response.status() {
         StatusCode::OK => {
             let body = bounded_body(response, MAX_HISTORY_RESPONSE_BYTES).await?;
             let result: HistoryResponse = serde_json::from_slice(&body)
-                .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner history response invalid"))?;
+                .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner history response invalid"))?;
             if !valid_history_response(&result, request.run_id) {
-                return Err(s3_error!(ServiceUnavailable, "plugin runner history response invalid"));
+                return Err(s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner history response invalid"));
             }
             Ok(result)
         }
-        StatusCode::NOT_FOUND => Err(s3_error!(NoSuchKey, "plugin run not found")),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(s3_error!(AccessDenied, "plugin runner rejected request")),
-        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
-            Err(s3_error!(InvalidRequest, "plugin runner rejected request"))
+        StatusCode::NOT_FOUND => Err(s3::error(S3ErrorCode::NoSuchKey, "plugin run not found")),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            Err(s3::error(S3ErrorCode::AccessDenied, "plugin runner rejected request"))
         }
-        _ => Err(s3_error!(ServiceUnavailable, "plugin runner unavailable")),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            Err(s3::error(S3ErrorCode::InvalidRequest, "plugin runner rejected request"))
+        }
+        _ => Err(s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner unavailable")),
     }
 }
 
@@ -289,15 +296,15 @@ pub(crate) async fn cancel(request: &CancelRequest<'_>) -> S3Result<CancelRespon
         .json(request)
         .send()
         .await
-        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner unavailable"))?;
+        .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner unavailable"))?;
 
     match response.status() {
         StatusCode::OK => {
             let body = bounded_body(response, MAX_RECEIPT_BYTES).await?;
             let result: CancelResponse = serde_json::from_slice(&body)
-                .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner cancel response invalid"))?;
+                .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner cancel response invalid"))?;
             if !valid_cancel_response(&result, request.run_id) {
-                return Err(s3_error!(ServiceUnavailable, "plugin runner cancel response invalid"));
+                return Err(s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner cancel response invalid"));
             }
             Ok(result)
         }
@@ -307,11 +314,12 @@ pub(crate) async fn cancel(request: &CancelRequest<'_>) -> S3Result<CancelRespon
 
 pub(crate) async fn page(request: &PageRequest<'_>) -> S3Result<PageResponse> {
     if !(1..=100).contains(&request.limit) || request.cursor.is_some_and(|cursor| cursor.run_id.is_nil()) {
-        return Err(s3_error!(InvalidRequest, "invalid plugin run page request"));
+        return Err(s3::error(S3ErrorCode::InvalidRequest, "invalid plugin run page request"));
     }
-    let body = serde_json::to_vec(request).map_err(|_| s3_error!(InvalidRequest, "invalid plugin run page request"))?;
+    let body =
+        serde_json::to_vec(request).map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "invalid plugin run page request"))?;
     if body.len() > MAX_PAGE_REQUEST_BYTES {
-        return Err(s3_error!(InvalidRequest, "plugin run page request too large"));
+        return Err(s3::error(S3ErrorCode::InvalidRequest, "plugin run page request too large"));
     }
     let mut url = configured_url()?;
     url.set_path(PAGE_ENDPOINT_PATH);
@@ -322,23 +330,25 @@ pub(crate) async fn page(request: &PageRequest<'_>) -> S3Result<PageResponse> {
         .body(body)
         .send()
         .await
-        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner unavailable"))?;
+        .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner unavailable"))?;
 
     match response.status() {
         StatusCode::OK => {
             let body = bounded_body(response, MAX_PAGE_RESPONSE_BYTES).await?;
             let result: PageResponse = serde_json::from_slice(&body)
-                .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner page response invalid"))?;
+                .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner page response invalid"))?;
             if !valid_page_response(&result, request.limit) {
-                return Err(s3_error!(ServiceUnavailable, "plugin runner page response invalid"));
+                return Err(s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner page response invalid"));
             }
             Ok(result)
         }
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(s3_error!(AccessDenied, "plugin runner rejected request")),
-        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
-            Err(s3_error!(InvalidRequest, "plugin runner rejected request"))
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            Err(s3::error(S3ErrorCode::AccessDenied, "plugin runner rejected request"))
         }
-        _ => Err(s3_error!(ServiceUnavailable, "plugin runner unavailable")),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            Err(s3::error(S3ErrorCode::InvalidRequest, "plugin runner rejected request"))
+        }
+        _ => Err(s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner unavailable")),
     }
 }
 
@@ -348,11 +358,12 @@ pub(crate) async fn replay(request: &ReplayRequest<'_>) -> S3Result<ReplayReceip
         || !valid_idempotency_key(request.idempotency_key)
         || request.deadline_unix_micros <= 0
     {
-        return Err(s3_error!(InvalidRequest, "invalid plugin run replay request"));
+        return Err(s3::error(S3ErrorCode::InvalidRequest, "invalid plugin run replay request"));
     }
-    let body = serde_json::to_vec(request).map_err(|_| s3_error!(InvalidRequest, "invalid plugin run replay request"))?;
+    let body =
+        serde_json::to_vec(request).map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "invalid plugin run replay request"))?;
     if body.len() > MAX_REPLAY_REQUEST_BYTES {
-        return Err(s3_error!(InvalidRequest, "plugin run replay request too large"));
+        return Err(s3::error(S3ErrorCode::InvalidRequest, "plugin run replay request too large"));
     }
     let mut url = configured_url()?;
     url.set_path(REPLAY_ENDPOINT_PATH);
@@ -363,15 +374,15 @@ pub(crate) async fn replay(request: &ReplayRequest<'_>) -> S3Result<ReplayReceip
         .body(body)
         .send()
         .await
-        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner unavailable"))?;
+        .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner unavailable"))?;
 
     match response.status() {
         StatusCode::OK => {
             let body = bounded_body(response, MAX_RECEIPT_BYTES).await?;
             let result: ReplayReceipt = serde_json::from_slice(&body)
-                .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner replay receipt invalid"))?;
+                .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner replay receipt invalid"))?;
             if !valid_replay_receipt(&result, request.deadline_unix_micros) {
-                return Err(s3_error!(ServiceUnavailable, "plugin runner replay receipt invalid"));
+                return Err(s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner replay receipt invalid"));
             }
             Ok(result)
         }
@@ -379,15 +390,17 @@ pub(crate) async fn replay(request: &ReplayRequest<'_>) -> S3Result<ReplayReceip
     }
 }
 
-fn cancel_status_error(status: StatusCode) -> s3s::S3Error {
+fn cancel_status_error(status: StatusCode) -> S3Error {
     match status {
-        StatusCode::NOT_FOUND => s3_error!(NoSuchKey, "plugin run not found"),
-        StatusCode::CONFLICT => s3_error!(OperationAborted, "plugin run cannot be cancelled"),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => s3_error!(AccessDenied, "plugin runner rejected request"),
-        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
-            s3_error!(InvalidRequest, "plugin runner rejected request")
+        StatusCode::NOT_FOUND => s3::error(S3ErrorCode::NoSuchKey, "plugin run not found"),
+        StatusCode::CONFLICT => s3::error(S3ErrorCode::OperationAborted, "plugin run cannot be cancelled"),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            s3::error(S3ErrorCode::AccessDenied, "plugin runner rejected request")
         }
-        _ => s3_error!(ServiceUnavailable, "plugin runner unavailable"),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            s3::error(S3ErrorCode::InvalidRequest, "plugin runner rejected request")
+        }
+        _ => s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner unavailable"),
     }
 }
 
@@ -457,15 +470,17 @@ fn valid_replay_receipt(receipt: &ReplayReceipt, requested_deadline: i64) -> boo
         && receipt.deadline_unix_micros == requested_deadline
 }
 
-fn replay_status_error(status: StatusCode) -> s3s::S3Error {
+fn replay_status_error(status: StatusCode) -> S3Error {
     match status {
-        StatusCode::NOT_FOUND => s3_error!(NoSuchKey, "plugin run not found"),
-        StatusCode::CONFLICT => s3_error!(OperationAborted, "plugin run cannot be replayed"),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => s3_error!(AccessDenied, "plugin runner rejected request"),
-        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
-            s3_error!(InvalidRequest, "plugin runner rejected request")
+        StatusCode::NOT_FOUND => s3::error(S3ErrorCode::NoSuchKey, "plugin run not found"),
+        StatusCode::CONFLICT => s3::error(S3ErrorCode::OperationAborted, "plugin run cannot be replayed"),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            s3::error(S3ErrorCode::AccessDenied, "plugin runner rejected request")
         }
-        _ => s3_error!(ServiceUnavailable, "plugin runner unavailable"),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            s3::error(S3ErrorCode::InvalidRequest, "plugin runner rejected request")
+        }
+        _ => s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner unavailable"),
     }
 }
 
@@ -473,13 +488,13 @@ async fn configured_client() -> S3Result<Client> {
     let tls = runtime_sources::current_outbound_tls_state().await;
     let identity = tls
         .mtls_identity
-        .ok_or_else(|| s3_error!(ServiceUnavailable, "plugin runner client identity unavailable"))?;
+        .ok_or_else(|| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner client identity unavailable"))?;
     let mut identity_pem = Vec::with_capacity(identity.cert_pem.len() + identity.key_pem.len() + 1);
     identity_pem.extend_from_slice(&identity.cert_pem);
     identity_pem.push(b'\n');
     identity_pem.extend_from_slice(&identity.key_pem);
     let identity = reqwest::Identity::from_pem(&identity_pem)
-        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner client identity invalid"))?;
+        .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner client identity invalid"))?;
 
     let mut builder = Client::builder()
         .no_proxy()
@@ -489,20 +504,20 @@ async fn configured_client() -> S3Result<Client> {
         .identity(identity);
     if let Some(root_pem) = tls.root_ca_pem.filter(|pem| !pem.is_empty()) {
         let roots = reqwest::Certificate::from_pem_bundle(&root_pem)
-            .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner trust roots invalid"))?;
+            .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner trust roots invalid"))?;
         for root in roots {
             builder = builder.add_root_certificate(root);
         }
     }
     builder
         .build()
-        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner transport unavailable"))
+        .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner transport unavailable"))
 }
 
 fn configured_url() -> S3Result<Url> {
     let raw = std::env::var("RUSTFS_PLUGIN_RUNNER_URL")
-        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner is not configured"))?;
-    parse_endpoint(&raw).ok_or_else(|| s3_error!(ServiceUnavailable, "plugin runner URL invalid"))
+        .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner is not configured"))?;
+    parse_endpoint(&raw).ok_or_else(|| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner URL invalid"))
 }
 
 fn parse_endpoint(raw: &str) -> Option<Url> {
@@ -525,10 +540,10 @@ async fn bounded_body(mut response: reqwest::Response, limit: usize) -> S3Result
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|_| s3_error!(ServiceUnavailable, "plugin runner response unavailable"))?
+        .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner response unavailable"))?
     {
         if !bounded_len_allowed(body.len(), chunk.len(), limit) {
-            return Err(s3_error!(ServiceUnavailable, "plugin runner response too large"));
+            return Err(s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner response too large"));
         }
         body.extend_from_slice(&chunk);
     }
@@ -720,13 +735,13 @@ mod tests {
 
     #[test]
     fn cancel_status_codes_preserve_runner_contract() {
-        assert_eq!(cancel_status_error(StatusCode::NOT_FOUND).code(), &s3s::S3ErrorCode::NoSuchKey);
-        assert_eq!(cancel_status_error(StatusCode::CONFLICT).code(), &s3s::S3ErrorCode::OperationAborted);
-        assert_eq!(cancel_status_error(StatusCode::FORBIDDEN).code(), &s3s::S3ErrorCode::AccessDenied);
-        assert_eq!(cancel_status_error(StatusCode::BAD_REQUEST).code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(cancel_status_error(StatusCode::NOT_FOUND).code(), &S3ErrorCode::NoSuchKey);
+        assert_eq!(cancel_status_error(StatusCode::CONFLICT).code(), &S3ErrorCode::OperationAborted);
+        assert_eq!(cancel_status_error(StatusCode::FORBIDDEN).code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(cancel_status_error(StatusCode::BAD_REQUEST).code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(
             cancel_status_error(StatusCode::SERVICE_UNAVAILABLE).code(),
-            &s3s::S3ErrorCode::ServiceUnavailable
+            &S3ErrorCode::ServiceUnavailable
         );
     }
 
@@ -813,13 +828,13 @@ mod tests {
         let body = serde_json::to_vec(&request).unwrap();
         assert!(body.len() <= MAX_REPLAY_REQUEST_BYTES);
         assert!(body.len() > 4096, "test exercises JSON escaping of a maximum-length accepted key");
-        assert_eq!(replay_status_error(StatusCode::NOT_FOUND).code(), &s3s::S3ErrorCode::NoSuchKey);
-        assert_eq!(replay_status_error(StatusCode::CONFLICT).code(), &s3s::S3ErrorCode::OperationAborted);
-        assert_eq!(replay_status_error(StatusCode::FORBIDDEN).code(), &s3s::S3ErrorCode::AccessDenied);
-        assert_eq!(replay_status_error(StatusCode::BAD_REQUEST).code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(replay_status_error(StatusCode::NOT_FOUND).code(), &S3ErrorCode::NoSuchKey);
+        assert_eq!(replay_status_error(StatusCode::CONFLICT).code(), &S3ErrorCode::OperationAborted);
+        assert_eq!(replay_status_error(StatusCode::FORBIDDEN).code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(replay_status_error(StatusCode::BAD_REQUEST).code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(
             replay_status_error(StatusCode::SERVICE_UNAVAILABLE).code(),
-            &s3s::S3ErrorCode::ServiceUnavailable
+            &S3ErrorCode::ServiceUnavailable
         );
     }
 

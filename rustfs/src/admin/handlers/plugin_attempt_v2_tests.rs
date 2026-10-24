@@ -168,9 +168,9 @@ impl Fixture {
         };
         req.extensions.insert(slot);
         req.method = Method::POST;
-        req.credentials = Some(s3s::auth::Credentials {
+        req.credentials = Some(s3::auth::Credentials {
             access_key: BROKER.into(),
-            secret_key: s3s::auth::SecretKey::from(SECRET.to_owned()),
+            secret_key: s3::auth::SecretKey::from(SECRET.to_owned()),
         });
         req
     }
@@ -285,7 +285,7 @@ async fn delegation_v2_persists_and_vends_with_real_parent_intersection() {
             let mut wrong = body.clone();
             wrong["output_bucket"] = json!("third");
             match fixture.issue(&record, &wrong).await {
-                Err(error) => assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied),
+                Err(error) => assert_eq!(error.code(), &S3ErrorCode::AccessDenied),
                 Ok(_) => panic!("A03_CROSS_BUCKET_OUTPUT_BOUND"),
             }
             let response = fixture.issue(&record, &body).await.expect("actual v2 issuance");

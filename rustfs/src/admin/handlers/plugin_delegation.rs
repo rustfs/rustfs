@@ -7,6 +7,7 @@ use crate::admin::{
     plugin_runner::{self, ObjectReference, SubmitRequest},
     router::{AdminOperation, Operation, S3Router},
     runtime_sources,
+    storage_api::s3::{self, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result},
 };
 use crate::{
     auth::{check_key_valid_with_context, get_session_token},
@@ -16,7 +17,6 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use matchit::Params;
 use rustfs_iam::delegation::{DelegationError, Restrictions};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::Deserialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -61,12 +61,12 @@ pub fn register_plugin_delegation_route(router: &mut S3Router<AdminOperation>) -
     Ok(())
 }
 
-pub(super) fn storage_error(error: DelegationError) -> s3s::S3Error {
+pub(super) fn storage_error(error: DelegationError) -> S3Error {
     match error {
-        DelegationError::Invalid => s3_error!(InvalidRequest, "invalid delegation restriction"),
-        DelegationError::NotFound | DelegationError::OwnerRejected => s3_error!(NoSuchKey, "delegation not found"),
-        DelegationError::Unavailable => s3_error!(InternalError, "delegation unavailable"),
-        _ => s3_error!(AccessDenied, "delegation rejected"),
+        DelegationError::Invalid => s3::error(S3ErrorCode::InvalidRequest, "invalid delegation restriction"),
+        DelegationError::NotFound | DelegationError::OwnerRejected => s3::error(S3ErrorCode::NoSuchKey, "delegation not found"),
+        DelegationError::Unavailable => s3::error(S3ErrorCode::InternalError, "delegation unavailable"),
+        _ => s3::error(S3ErrorCode::AccessDenied, "delegation rejected"),
     }
 }
 
@@ -85,18 +85,18 @@ pub(super) async fn owner_for_resource(
     let signed = req
         .credentials
         .as_ref()
-        .ok_or_else(|| s3_error!(AccessDenied, "authentication required"))?;
+        .ok_or_else(|| s3::error(S3ErrorCode::AccessDenied, "authentication required"))?;
     if get_session_token(&req.uri, &req.headers).is_some() {
-        return Err(s3_error!(AccessDenied, "original user required"));
+        return Err(s3::error(S3ErrorCode::AccessDenied, "original user required"));
     }
-    let context =
-        runtime_sources::app_context_from_req(req).ok_or_else(|| s3_error!(InternalError, "application context unavailable"))?;
+    let context = runtime_sources::app_context_from_req(req)
+        .ok_or_else(|| s3::error(S3ErrorCode::InternalError, "application context unavailable"))?;
     let (credentials, root) = check_key_valid_with_context("", &signed.access_key, Some(context.as_ref())).await?;
     if root || credentials.is_temp() || credentials.is_service_account() {
-        return Err(s3_error!(AccessDenied, "original user required"));
+        return Err(s3::error(S3ErrorCode::AccessDenied, "original user required"));
     }
     if !context.iam().is_ready() {
-        return Err(s3_error!(InternalError, "iam unavailable"));
+        return Err(s3::error(S3ErrorCode::InternalError, "iam unavailable"));
     }
     let iam = context.iam().handle();
     validate_admin_action_with_bucket_object_for_iam(
@@ -113,7 +113,8 @@ pub(super) async fn owner_for_resource(
 }
 
 pub(super) fn response<T: serde::Serialize>(value: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let bytes = serde_json::to_vec(value).map_err(|_| s3_error!(InternalError, "delegation response unavailable"))?;
+    let bytes =
+        serde_json::to_vec(value).map_err(|_| s3::error(S3ErrorCode::InternalError, "delegation response unavailable"))?;
     let mut headers = HeaderMap::new();
     headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -127,13 +128,13 @@ impl Operation for Create {
         let (iam, owner) = owner(&req, AdminAction::CreatePluginDelegationAction).await?;
         let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
             .await
-            .map_err(|_| s3_error!(InvalidRequest, "delegation body unavailable"))?
-            .map_err(|_| s3_error!(InvalidRequest, "delegation body unavailable"))?;
-        let restriction: Restrictions =
-            serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid delegation restriction"))?;
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "delegation body unavailable"))?
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "delegation body unavailable"))?;
+        let restriction: Restrictions = serde_json::from_slice(&bytes)
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "invalid delegation restriction"))?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|_| s3_error!(InternalError, "clock unavailable"))?
+            .map_err(|_| s3::error(S3ErrorCode::InternalError, "clock unavailable"))?
             .as_secs();
         let record = iam
             .create_plugin_delegation(&owner, restriction, now)
@@ -150,10 +151,10 @@ impl Operation for Get {
         let (iam, owner) = owner(&req, AdminAction::GetPluginDelegationAction).await?;
         let id = params
             .get("id")
-            .ok_or_else(|| s3_error!(InvalidRequest, "delegation id required"))?;
+            .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "delegation id required"))?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|_| s3_error!(InternalError, "clock unavailable"))?
+            .map_err(|_| s3::error(S3ErrorCode::InternalError, "clock unavailable"))?
             .as_secs();
         let record = iam
             .read_active_plugin_delegation(&owner, id, now)
@@ -170,7 +171,7 @@ impl Operation for Revoke {
         let (iam, owner) = owner(&req, AdminAction::RevokePluginDelegationAction).await?;
         let id = params
             .get("id")
-            .ok_or_else(|| s3_error!(InvalidRequest, "delegation id required"))?;
+            .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "delegation id required"))?;
         iam.revoke_plugin_delegation(&owner, id).await.map_err(storage_error)?;
         response(&serde_json::json!({"revoked":true,"id":id}))
     }
@@ -200,22 +201,22 @@ impl Operation for Submit {
         let (iam, signer) = owner(&req, AdminAction::SubmitPluginJobAction).await?;
         let id = params
             .get("id")
-            .ok_or_else(|| s3_error!(InvalidRequest, "delegation id required"))?;
+            .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "delegation id required"))?;
         let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
             .await
-            .map_err(|_| s3_error!(InvalidRequest, "submit body unavailable"))?
-            .map_err(|_| s3_error!(InvalidRequest, "submit body unavailable"))?;
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "submit body unavailable"))?
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "submit body unavailable"))?;
         let input: SubmitInput =
-            serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid submit request"))?;
+            serde_json::from_slice(&bytes).map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "invalid submit request"))?;
         if input.version != 1
             || !plugin_runner::literal(&input.instance_id)
             || !plugin_runner::valid_idempotency_key(&input.idempotency_key)
         {
-            return Err(s3_error!(InvalidRequest, "invalid submit request"));
+            return Err(s3::error(S3ErrorCode::InvalidRequest, "invalid submit request"));
         }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|_| s3_error!(InternalError, "clock unavailable"))?
+            .map_err(|_| s3::error(S3ErrorCode::InternalError, "clock unavailable"))?
             .as_secs();
         let record = iam
             .read_active_plugin_delegation(&signer, id, now)
@@ -232,7 +233,7 @@ impl Operation for Submit {
             &input.object.version_id,
             now,
         ) {
-            return Err(s3_error!(AccessDenied, "submit restriction rejected"));
+            return Err(s3::error(S3ErrorCode::AccessDenied, "submit restriction rejected"));
         }
         let receipt = plugin_runner::submit(&SubmitRequest {
             version: input.version,
@@ -266,15 +267,15 @@ impl Operation for QueryRun {
         let (iam, signer) = owner(&req, AdminAction::GetPluginRunAction).await?;
         let id = params
             .get("id")
-            .ok_or_else(|| s3_error!(InvalidRequest, "delegation id required"))?;
+            .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "delegation id required"))?;
         let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
             .await
-            .map_err(|_| s3_error!(InvalidRequest, "query body unavailable"))?
-            .map_err(|_| s3_error!(InvalidRequest, "query body unavailable"))?;
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "query body unavailable"))?
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "query body unavailable"))?;
         let input: QueryRunInput =
-            serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid query request"))?;
+            serde_json::from_slice(&bytes).map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "invalid query request"))?;
         if input.version != 1 || input.run_id.is_nil() {
-            return Err(s3_error!(InvalidRequest, "invalid query request"));
+            return Err(s3::error(S3ErrorCode::InvalidRequest, "invalid query request"));
         }
         let record = iam.read_owned_plugin_delegation(&signer, id).await.map_err(storage_error)?;
         let result = plugin_runner::query(&plugin_runner::QueryRequest {
@@ -307,15 +308,15 @@ impl Operation for HistoryRun {
         let (iam, signer) = owner(&req, AdminAction::ListPluginRunsAction).await?;
         let id = params
             .get("id")
-            .ok_or_else(|| s3_error!(InvalidRequest, "delegation id required"))?;
+            .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "delegation id required"))?;
         let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
             .await
-            .map_err(|_| s3_error!(InvalidRequest, "history body unavailable"))?
-            .map_err(|_| s3_error!(InvalidRequest, "history body unavailable"))?;
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "history body unavailable"))?
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "history body unavailable"))?;
         let input: HistoryRunInput =
-            serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid history request"))?;
+            serde_json::from_slice(&bytes).map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "invalid history request"))?;
         if !valid_history_run_input(&input) {
-            return Err(s3_error!(InvalidRequest, "invalid history request"));
+            return Err(s3::error(S3ErrorCode::InvalidRequest, "invalid history request"));
         }
         let record = iam.read_owned_plugin_delegation(&signer, id).await.map_err(storage_error)?;
         let result = plugin_runner::history(&plugin_runner::HistoryRequest {
@@ -337,15 +338,15 @@ impl Operation for CancelRun {
         let (iam, signer) = owner(&req, AdminAction::CancelPluginRunAction).await?;
         let id = params
             .get("id")
-            .ok_or_else(|| s3_error!(InvalidRequest, "delegation id required"))?;
+            .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "delegation id required"))?;
         let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
             .await
-            .map_err(|_| s3_error!(InvalidRequest, "cancel body unavailable"))?
-            .map_err(|_| s3_error!(InvalidRequest, "cancel body unavailable"))?;
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "cancel body unavailable"))?
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "cancel body unavailable"))?;
         let input: QueryRunInput =
-            serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid cancel request"))?;
+            serde_json::from_slice(&bytes).map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "invalid cancel request"))?;
         if input.version != 1 || input.run_id.is_nil() {
-            return Err(s3_error!(InvalidRequest, "invalid cancel request"));
+            return Err(s3::error(S3ErrorCode::InvalidRequest, "invalid cancel request"));
         }
         let record = iam.read_owned_plugin_delegation(&signer, id).await.map_err(storage_error)?;
         let result = plugin_runner::cancel(&plugin_runner::CancelRequest {
@@ -380,15 +381,15 @@ impl Operation for PageRuns {
         let (iam, signer) = owner(&req, AdminAction::ListPluginRunsAction).await?;
         let id = params
             .get("id")
-            .ok_or_else(|| s3_error!(InvalidRequest, "delegation id required"))?;
+            .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "delegation id required"))?;
         let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
             .await
-            .map_err(|_| s3_error!(InvalidRequest, "page body unavailable"))?
-            .map_err(|_| s3_error!(InvalidRequest, "page body unavailable"))?;
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "page body unavailable"))?
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "page body unavailable"))?;
         let input: PageRunsInput =
-            serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid page request"))?;
+            serde_json::from_slice(&bytes).map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "invalid page request"))?;
         if !valid_page_runs_input(&input) {
-            return Err(s3_error!(InvalidRequest, "invalid page request"));
+            return Err(s3::error(S3ErrorCode::InvalidRequest, "invalid page request"));
         }
         let record = iam.read_owned_plugin_delegation(&signer, id).await.map_err(storage_error)?;
         let result = plugin_runner::page(&plugin_runner::PageRequest {
@@ -427,19 +428,19 @@ impl Operation for ReplayRun {
         let (iam, signer) = owner(&req, AdminAction::ReplayPluginRunAction).await?;
         let id = params
             .get("id")
-            .ok_or_else(|| s3_error!(InvalidRequest, "delegation id required"))?;
+            .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "delegation id required"))?;
         let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
             .await
-            .map_err(|_| s3_error!(InvalidRequest, "replay body unavailable"))?
-            .map_err(|_| s3_error!(InvalidRequest, "replay body unavailable"))?;
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "replay body unavailable"))?
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "replay body unavailable"))?;
         let input: ReplayRunInput =
-            serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid replay request"))?;
+            serde_json::from_slice(&bytes).map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "invalid replay request"))?;
         if !valid_replay_run_input(&input) {
-            return Err(s3_error!(InvalidRequest, "invalid replay request"));
+            return Err(s3::error(S3ErrorCode::InvalidRequest, "invalid replay request"));
         }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|_| s3_error!(InternalError, "clock unavailable"))?
+            .map_err(|_| s3::error(S3ErrorCode::InternalError, "clock unavailable"))?
             .as_secs();
         let record = iam
             .read_active_plugin_delegation(&signer, id, now)
@@ -496,7 +497,7 @@ mod tests {
                 Create.call(req, Params::new()).await
             };
             let error = result.expect_err("unsigned mutations must not reach persistence");
-            assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
         }
     }
 

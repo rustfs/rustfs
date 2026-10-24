@@ -7,6 +7,7 @@ use self::inventory::Inventory;
 use super::plugin_delegation::{owner_for_resource, response};
 use crate::admin::storage_api::error::Error;
 use crate::admin::storage_api::runtime::ECStore;
+use crate::admin::storage_api::s3::{self, Body, S3Request, S3Response, S3Result};
 use crate::{
     admin::{
         auth::AdminResourceScope,
@@ -18,7 +19,6 @@ use crate::{
 use http::{Method, StatusCode};
 use matchit::Params;
 use rustfs_policy::policy::action::AdminAction;
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
@@ -38,7 +38,7 @@ impl BucketIdentityRequest {
             || crate::storage::ecstore_bucket::utils::check_valid_bucket_name_strict(&self.bucket).is_err()
             || !crate::admin::storage_api::contract::bucket::valid_artifact_base_prefix(&self.base_prefix)
         {
-            return Err(s3_error!(InvalidRequest, "invalid artifact bucket identity request"));
+            return Err(s3::error(s3::S3ErrorCode::InvalidRequest, "invalid artifact bucket identity request"));
         }
         Ok(())
     }
@@ -77,7 +77,7 @@ impl AttemptIdentity {
             || !self.attempt_prefix.ends_with('/')
             || self.attempt_prefix.chars().any(char::is_control)
         {
-            return Err(s3_error!(InvalidRequest, "invalid artifact attempt identity"));
+            return Err(s3::error(s3::S3ErrorCode::InvalidRequest, "invalid artifact attempt identity"));
         }
         Ok(())
     }
@@ -109,7 +109,7 @@ impl ExactVersionRequest {
             || self.object.len() == self.target.attempt_prefix.len()
             || self.object.chars().any(char::is_control)
         {
-            return Err(s3_error!(InvalidRequest, "invalid artifact version identity"));
+            return Err(s3::error(s3::S3ErrorCode::InvalidRequest, "invalid artifact version identity"));
         }
         Ok(())
     }
@@ -161,29 +161,33 @@ async fn require_builtin_authorization() -> S3Result<()> {
     // cannot establish the explicit Resource contract of these controls.
     rustfs_iam::sys::IamSys::<rustfs_iam::store::object::ObjectStore>::ensure_restricted_credential_vending()
         .await
-        .map_err(|_| s3_error!(AccessDenied, "external policy plugin unsupported for artifact controls"))
+        .map_err(|_| s3::error(s3::S3ErrorCode::AccessDenied, "external policy plugin unsupported for artifact controls"))
 }
 
 async fn request_body<T: DeserializeOwned>(req: &mut S3Request<Body>) -> S3Result<T> {
     let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16 * 1024))
         .await
-        .map_err(|_| s3_error!(InvalidRequest, "artifact body unavailable"))?
-        .map_err(|_| s3_error!(InvalidRequest, "artifact body unavailable"))?;
-    serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid artifact request"))
+        .map_err(|_| s3::error(s3::S3ErrorCode::InvalidRequest, "artifact body unavailable"))?
+        .map_err(|_| s3::error(s3::S3ErrorCode::InvalidRequest, "artifact body unavailable"))?;
+    serde_json::from_slice(&bytes).map_err(|_| s3::error(s3::S3ErrorCode::InvalidRequest, "invalid artifact request"))
 }
 
 fn request_store(req: &S3Request<Body>) -> S3Result<Arc<ECStore>> {
     // These new controls require the owning server slot, never an ambient store.
     if req.extensions.get::<Arc<ServerContextSlot>>().is_none() {
-        return Err(s3_error!(ServiceUnavailable, "artifact application context unavailable"));
+        return Err(s3::error(s3::S3ErrorCode::ServiceUnavailable, "artifact application context unavailable"));
     }
-    runtime_sources::object_store_from_req(req).ok_or_else(|| s3_error!(ServiceUnavailable, "artifact storage unavailable"))
+    runtime_sources::object_store_from_req(req)
+        .ok_or_else(|| s3::error(s3::S3ErrorCode::ServiceUnavailable, "artifact storage unavailable"))
 }
 
-fn unconfirmed() -> s3s::S3Error {
+fn unconfirmed() -> s3::S3Error {
     // Storage may finish after a timeout or caller cancellation. Only an exact
     // successful retry confirms the durable fact; never expose internal paths.
-    s3_error!(ServiceUnavailable, "artifact operation unconfirmed; retry the same identity")
+    s3::error(
+        s3::S3ErrorCode::ServiceUnavailable,
+        "artifact operation unconfirmed; retry the same identity",
+    )
 }
 
 pub fn register_plugin_artifact_routes(router: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -254,9 +258,7 @@ impl Operation for Create {
                 .await
                 .map_err(|_| unconfirmed())?
                 .map_err(|error| match error {
-                    Error::BucketExists(_) => {
-                        s3_error!(BucketAlreadyExists, "artifact bucket already exists")
-                    }
+                    Error::BucketExists(_) => s3::error(s3::S3ErrorCode::BucketAlreadyExists, "artifact bucket already exists"),
                     _ => unconfirmed(),
                 })?;
         response(&BucketIdentityReceipt {
@@ -351,7 +353,10 @@ impl Operation for RetainBackups {
         }
         .validate(1)?;
         if input.bucket_incarnation.is_nil() {
-            return Err(s3_error!(InvalidRequest, "invalid artifact backup retention incarnation"));
+            return Err(s3::error(
+                s3::S3ErrorCode::InvalidRequest,
+                "invalid artifact backup retention incarnation",
+            ));
         }
         let store = request_store(&req)?;
         owner_for_resource(
@@ -385,7 +390,7 @@ impl Operation for Seal {
         let input: SealRequest = request_body(&mut req).await?;
         input.target.validate()?;
         if input.version != 1 {
-            return Err(s3_error!(InvalidRequest, "unsupported artifact protocol version"));
+            return Err(s3::error(s3::S3ErrorCode::InvalidRequest, "unsupported artifact protocol version"));
         }
         let store = request_store(&req)?;
         owner_for_resource(
@@ -417,7 +422,7 @@ impl Operation for SealRepairs {
         let input: SealRequest = request_body(&mut req).await?;
         input.target.validate()?;
         if input.version != 1 {
-            return Err(s3_error!(InvalidRequest, "unsupported artifact protocol version"));
+            return Err(s3::error(s3::S3ErrorCode::InvalidRequest, "unsupported artifact protocol version"));
         }
         let store = request_store(&req)?;
         owner_for_resource(
@@ -453,7 +458,7 @@ impl Operation for SealWrites {
         let input: SealRequest = request_body(&mut req).await?;
         input.target.validate()?;
         if input.version != 1 {
-            return Err(s3_error!(InvalidRequest, "unsupported artifact protocol version"));
+            return Err(s3::error(s3::S3ErrorCode::InvalidRequest, "unsupported artifact protocol version"));
         }
         let store = request_store(&req)?;
         owner_for_resource(

@@ -1077,7 +1077,10 @@ pub(crate) mod s3 {
     // not widen the repository's direct s3s import footprint.
     #[allow(unused_imports)]
     pub(crate) use s3s::auth;
-    pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header};
+    pub(crate) use s3s::stream::{ByteStream, DynByteStream};
+    pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, StdError, header};
+    #[cfg(test)]
+    pub(crate) use s3s::{S3, access::S3Access, dto::CopySource, dto::UploadPartCopyInput};
 
     /// Build an `S3Error` without reaching for the `s3s` error macro.
     ///

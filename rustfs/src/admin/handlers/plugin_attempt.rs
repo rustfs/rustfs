@@ -6,6 +6,7 @@ use crate::{
     admin::{
         router::{AdminOperation, Operation, S3Router},
         runtime_sources,
+        storage_api::s3::{self, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result},
     },
     auth::check_key_valid_with_context,
     server::ADMIN_PREFIX,
@@ -23,7 +24,6 @@ use rustfs_policy::{
         action::{Action, AdminAction, S3Action},
     },
 };
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -93,7 +93,7 @@ fn now() -> S3Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .map_err(|_| s3_error!(InternalError, "clock unavailable"))
+        .map_err(|_| s3::error(S3ErrorCode::InternalError, "clock unavailable"))
 }
 fn literal(value: &str) -> bool {
     !value.is_empty()
@@ -131,15 +131,15 @@ fn session_policy(record: &Delegation, attempt: &Attempt) -> S3Result<Policy> {
         || !attempt.output_prefix.ends_with('/')
         || !(1..=900).contains(&attempt.ttl_seconds)
     {
-        return Err(s3_error!(AccessDenied, "attempt restriction rejected"));
+        return Err(s3::error(S3ErrorCode::AccessDenied, "attempt restriction rejected"));
     }
     let value = serde_json::json!({"Version":"2012-10-17","Statement":[
         {"Effect":"Allow","Action":["s3:GetObjectVersion"],"Resource":[format!("arn:aws:s3:::{}/{}",attempt.input_bucket,attempt.input_key)],"Condition":{"StringEquals":{"s3:VersionId":attempt.input_version}}},
         {"Effect":"Allow","Action":["s3:PutObject"],"Resource":[format!("arn:aws:s3:::{}/{}*",attempt.output_bucket,attempt.output_prefix)]}
     ]});
     // Condition operators borrow their keys while the policy is decoded.
-    let bytes = serde_json::to_vec(&value).map_err(|_| s3_error!(InternalError, "attempt policy unavailable"))?;
-    serde_json::from_slice(&bytes).map_err(|_| s3_error!(InternalError, "attempt policy unavailable"))
+    let bytes = serde_json::to_vec(&value).map_err(|_| s3::error(S3ErrorCode::InternalError, "attempt policy unavailable"))?;
+    serde_json::from_slice(&bytes).map_err(|_| s3::error(S3ErrorCode::InternalError, "attempt policy unavailable"))
 }
 
 fn issuance_error(code: &'static str, issued: bool, unknown: bool) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -174,7 +174,7 @@ fn same_parent_authority(before_names: &[String], before_policy: &Policy, after_
 async fn require_builtin_authorization() -> S3Result<()> {
     rustfs_iam::sys::IamSys::<rustfs_iam::store::object::ObjectStore>::ensure_restricted_credential_vending()
         .await
-        .map_err(|_| s3_error!(AccessDenied, "external policy plugin unsupported for attempt credentials"))
+        .map_err(|_| s3::error(S3ErrorCode::AccessDenied, "external policy plugin unsupported for attempt credentials"))
 }
 
 struct Issue;
@@ -183,21 +183,22 @@ impl Operation for Issue {
     async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         require_builtin_authorization().await?;
         let (iam, broker) = owner(&req, AdminAction::IssuePluginAttemptAction).await?;
-        let deployment = configured_deployment(&broker).ok_or_else(|| s3_error!(AccessDenied, "broker deployment rejected"))?;
+        let deployment =
+            configured_deployment(&broker).ok_or_else(|| s3::error(S3ErrorCode::AccessDenied, "broker deployment rejected"))?;
         let context = runtime_sources::app_context_from_req(&req)
-            .ok_or_else(|| s3_error!(InternalError, "application context unavailable"))?;
+            .ok_or_else(|| s3::error(S3ErrorCode::InternalError, "application context unavailable"))?;
         let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
             .await
-            .map_err(|_| s3_error!(InvalidRequest, "attempt body unavailable"))?
-            .map_err(|_| s3_error!(InvalidRequest, "attempt body unavailable"))?;
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "attempt body unavailable"))?
+            .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "attempt body unavailable"))?;
         let attempt: Attempt =
-            serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid attempt request"))?;
+            serde_json::from_slice(&bytes).map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "invalid attempt request"))?;
         if attempt.deployment != deployment {
-            return Err(s3_error!(AccessDenied, "broker deployment rejected"));
+            return Err(s3::error(S3ErrorCode::AccessDenied, "broker deployment rejected"));
         }
         let id = params
             .get("id")
-            .ok_or_else(|| s3_error!(InvalidRequest, "delegation id required"))?;
+            .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "delegation id required"))?;
         let record = iam
             .read_active_plugin_delegation_for_broker(id, now()?)
             .await
@@ -205,17 +206,17 @@ impl Operation for Issue {
         let policy = session_policy(&record, &attempt)?;
         let (principal, root) = check_key_valid_with_context("", &record.owner_access_key, Some(context.as_ref())).await?;
         if root || principal.is_temp() || principal.is_service_account() {
-            return Err(s3_error!(AccessDenied, "original user required"));
+            return Err(s3::error(S3ErrorCode::AccessDenied, "original user required"));
         }
         // A broker request cannot reconstruct the original user's IP/MFA/tag
         // conditions. This first profile rejects conditional parent policies.
         let policies = iam
             .policy_db_get(&principal.access_key, &principal.groups)
             .await
-            .map_err(|_| s3_error!(InternalError, "parent policy unavailable"))?;
+            .map_err(|_| s3::error(S3ErrorCode::InternalError, "parent policy unavailable"))?;
         let parent_policy = iam.get_combined_policy(&policies).await;
         if policies.is_empty() || parent_policy.statements.iter().any(|s| !s.conditions.is_empty()) {
-            return Err(s3_error!(AccessDenied, "parent condition context unsupported"));
+            return Err(s3::error(S3ErrorCode::AccessDenied, "parent condition context unsupported"));
         }
         let mut conditions = HashMap::new();
         conditions.insert("s3:VersionId".to_owned(), vec![attempt.input_version.clone()]);
@@ -233,21 +234,22 @@ impl Operation for Issue {
             })
             .await
         {
-            return Err(s3_error!(AccessDenied, "parent input rejected"));
+            return Err(s3::error(S3ErrorCode::AccessDenied, "parent input rejected"));
         }
         let expiration = now()?
             .checked_add(attempt.ttl_seconds)
-            .ok_or_else(|| s3_error!(InvalidRequest, "invalid expiration"))?
+            .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "invalid expiration"))?
             .min(record.restrictions.expires_at_unix_seconds);
         let expires_at = OffsetDateTime::from_unix_timestamp(
-            i64::try_from(expiration).map_err(|_| s3_error!(InvalidRequest, "invalid expiration"))?,
+            i64::try_from(expiration).map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "invalid expiration"))?,
         )
-        .map_err(|_| s3_error!(InvalidRequest, "invalid expiration"))?;
+        .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "invalid expiration"))?;
         let mut claims = principal.claims.clone().unwrap_or_default();
         claims.insert(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM.into(), serde_json::Value::Bool(true));
         claims.insert("exp".into(), serde_json::json!(expires_at.unix_timestamp()));
         claims.insert("parent".into(), serde_json::json!(principal.access_key));
-        let bytes = serde_json::to_vec(&policy).map_err(|_| s3_error!(InternalError, "attempt policy unavailable"))?;
+        let bytes =
+            serde_json::to_vec(&policy).map_err(|_| s3::error(S3ErrorCode::InternalError, "attempt policy unavailable"))?;
         claims.insert(
             SESSION_POLICY_NAME.into(),
             serde_json::json!(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&bytes)),
@@ -257,18 +259,18 @@ impl Operation for Issue {
             .await
             .map_err(storage_error)?;
         if fresh != record {
-            return Err(s3_error!(AccessDenied, "attempt authority changed"));
+            return Err(s3::error(S3ErrorCode::AccessDenied, "attempt authority changed"));
         }
         owner(&req, AdminAction::IssuePluginAttemptAction).await?;
         require_builtin_authorization().await?;
         let signing = context
             .action_credentials()
             .get()
-            .ok_or_else(|| s3_error!(InternalError, "token signer unavailable"))?;
+            .ok_or_else(|| s3::error(S3ErrorCode::InternalError, "token signer unavailable"))?;
         // The server key seals the token only. Authorization above uses the
         // original user's current IAM, and S3 continues its parent intersection.
         let mut credential = get_new_credentials_with_metadata(&claims, &signing.secret_key)
-            .map_err(|_| s3_error!(InternalError, "attempt credential unavailable"))?;
+            .map_err(|_| s3::error(S3ErrorCode::InternalError, "attempt credential unavailable"))?;
         credential.parent_user = principal.access_key.clone();
         if iam.set_temp_user(&credential.access_key, &credential, None).await.is_err() {
             return issuance_error("PLUGIN_ATTEMPT_ISSUANCE_UNKNOWN", false, true);
@@ -286,7 +288,7 @@ impl Operation for Issue {
             let names = iam
                 .policy_db_get(&current.access_key, &current.groups)
                 .await
-                .map_err(|_| s3_error!(InternalError, "parent policy unavailable"))?;
+                .map_err(|_| s3::error(S3ErrorCode::InternalError, "parent policy unavailable"))?;
             let current_policy = iam.get_combined_policy(&names).await;
             if after != record
                 || current_root
@@ -295,11 +297,11 @@ impl Operation for Issue {
                 || current.secret_key != principal.secret_key
                 || !same_parent_authority(&policies, &parent_policy, &names, &current_policy)
             {
-                return Err(s3_error!(AccessDenied, "attempt authority changed"));
+                return Err(s3::error(S3ErrorCode::AccessDenied, "attempt authority changed"));
             }
             // Re-evaluate the broker against its real signed request context.
             owner(&req, AdminAction::IssuePluginAttemptAction).await?;
-            Ok::<(), s3s::S3Error>(())
+            Ok::<(), S3Error>(())
         }
         .await;
         if valid.is_err() {
