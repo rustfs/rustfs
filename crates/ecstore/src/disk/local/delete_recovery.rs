@@ -2278,6 +2278,131 @@ mod tests {
         (temp, disk, info, bytes)
     }
 
+    #[test]
+    fn delete_recovery_batch_parallelism_preserves_overlapping_key_order() {
+        let opts = DeleteOptions {
+            recoverable_delete: true,
+            ..Default::default()
+        };
+        for names in [
+            vec!["a", "a"],
+            vec!["a", "a-0", "a/child"],
+            vec!["a//b", "a/b"],
+            vec!["a/./b", "a/b"],
+            vec!["a/../b", "b"],
+        ] {
+            let groups: Vec<_> = names
+                .into_iter()
+                .map(|name| super::super::FileInfoVersions {
+                    name: name.to_owned(),
+                    ..Default::default()
+                })
+                .collect();
+            assert_eq!(
+                super::super::delete_version_batch_concurrency(&groups, &opts),
+                1,
+                "overlapping or noncanonical keys retain serial execution"
+            );
+        }
+        let groups: Vec<_> = ["a/one", "a/two"]
+            .into_iter()
+            .map(|name| super::super::FileInfoVersions {
+                name: name.to_owned(),
+                ..Default::default()
+            })
+            .collect();
+        let expected = if cfg!(target_os = "linux") {
+            super::super::DELETE_VERSION_PREPARE_CONCURRENCY
+        } else {
+            1
+        };
+        assert_eq!(super::super::delete_version_batch_concurrency(&groups, &opts), expected);
+        for options in [
+            DeleteOptions::default(),
+            DeleteOptions {
+                undo_write: true,
+                ..opts.clone()
+            },
+            DeleteOptions {
+                undo_delete: true,
+                ..opts.clone()
+            },
+        ] {
+            assert_eq!(
+                super::super::delete_version_batch_concurrency(&groups, &options),
+                1,
+                "legacy and rollback ordering is unchanged"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn delete_recovery_batch_prepares_independent_keys_while_one_metadata_lease_is_held() {
+        let (temp, disk, info, _) = fixture().await;
+        let disk = Arc::new(disk);
+        let mut healthy = info.clone();
+        healthy.name = "healthy".to_owned();
+        let healthy_root = temp.path().join("recovery/healthy");
+        fs::create_dir_all(&healthy_root).await.expect("healthy object directory");
+        fs::write(healthy_root.join(STORAGE_FORMAT_FILE), test_meta(healthy))
+            .await
+            .expect("healthy source");
+        let corrupt_root = temp.path().join("recovery/corrupt");
+        fs::create_dir_all(&corrupt_root).await.expect("corrupt object directory");
+        fs::write(corrupt_root.join(STORAGE_FORMAT_FILE), b"invalid xl.meta")
+            .await
+            .expect("corrupt source");
+        let held = os::acquire_metadata_mutation_lease(&temp.path().join("recovery/object"), None).await;
+        let groups = ["object", "corrupt", "healthy"]
+            .into_iter()
+            .map(|name| super::super::FileInfoVersions {
+                name: name.to_owned(),
+                versions: vec![FileInfo {
+                    name: name.to_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .collect();
+        let worker_disk = disk.clone();
+        let worker = tokio::spawn(async move {
+            worker_disk
+                .delete_versions_with_namespace_owner(
+                    "recovery",
+                    groups,
+                    DeleteOptions {
+                        recoverable_delete: true,
+                        old_data_dir: Some(Uuid::new_v4()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+        });
+        let prepared = tokio::time::timeout(Duration::from_secs(5), async {
+            while fs::try_exists(healthy_root.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("inspect healthy metadata")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(temp.path().join("recovery/object/xl.meta").exists(), "the locked source must stay intact");
+        drop(held);
+        let results = worker.await.expect("complete every disk result");
+        assert_eq!(
+            results,
+            vec![None, Some(DiskError::FileCorrupt), None],
+            "completion order cannot change per-key error positions"
+        );
+        assert!(
+            prepared.is_ok(),
+            "one key's metadata lease cannot serialize unrelated transaction preparation"
+        );
+    }
+
     #[tokio::test]
     async fn delete_recovery_absent_publish_refreshes_prepared_witness() {
         let (_temp, disk, _info, _original) = fixture().await;

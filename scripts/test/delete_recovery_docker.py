@@ -1248,6 +1248,106 @@ def admin_smoke():
     finally:
         cluster.remove()
 
+def release_batch_crash():
+    """Observe real journals before SIGKILL without requiring test-only hooks."""
+    import random
+    rounds = []
+    for iteration in range(2):
+        cluster = Cluster(f'release-batch-crash-{iteration}', drives=4)
+        try:
+            cluster.create()
+            client = cluster.clients[0]
+            bucket = 'release-batch-crash'
+            small = random.Random(2849).randbytes(4096)
+            large = random.Random(2850).randbytes(1024 * 1024)
+            payloads = {f'inline/object-{index:04d}': small for index in range(256)}
+            payloads.update({f'external/object-{index:04d}': large for index in range(32)})
+            client.put_bucket(bucket)
+            for key, payload in payloads.items():
+                client.put(bucket, key, payload)
+            request = {}
+
+            def delete_batch():
+                try:
+                    xml = ET.Element('Delete')
+                    for key in payloads:
+                        ET.SubElement(ET.SubElement(xml, 'Object'), 'Key').text = key
+                    body = ET.tostring(xml)
+                    request['response'] = client.request('POST', bucket + '?delete', body, {
+                        'Content-Type': 'application/xml',
+                        'Content-MD5': base64.b64encode(hashlib.md5(body).digest()).decode(),
+                    }, expected=200)
+                except Exception as error:
+                    request['exception'] = str(error)
+
+            inspect = (
+                "from pathlib import Path\nimport json\n"
+                f"bucket={bucket!r}\n"
+                "print(json.dumps([{'prepared': len(list((d/bucket).rglob('delete-prepared'))), "
+                "'receipts': len(list((d/bucket).rglob('delete-quorum-committed')))} "
+                "for d in Path('/data').glob('d*')]))"
+            )
+            thread = threading.Thread(target=delete_batch, daemon=True)
+            thread.start()
+            deadline = time.monotonic() + 30
+            while True:
+                observation = cluster.inspect_data(inspect)
+                if any(drive['prepared'] for node in observation for drive in node):
+                    break
+                if not thread.is_alive() or time.monotonic() >= deadline:
+                    raise AssertionError('a live batch with persisted preparation must be observed before the crash')
+                time.sleep(0.02)
+            assert thread.is_alive(), 'the observed batch must still be active before SIGKILL'
+            cluster.kill(0)
+            thread.join(10)
+            assert not thread.is_alive(), 'the interrupted client must finish'
+            acknowledged = set()
+            if 'response' in request:
+                _, body = request['response']
+                for item in ET.fromstring(body):
+                    if item.tag.rsplit('}', 1)[-1] == 'Deleted':
+                        acknowledged.update(child.text for child in item if child.tag.rsplit('}', 1)[-1] == 'Key')
+            cluster.restart()
+            deadline = time.monotonic() + 90
+            while True:
+                remaining = cluster.inspect_data(inspect)
+                if all(not drive['prepared'] and not drive['receipts'] for node in remaining for drive in node):
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('batch recovery must settle automatically without a new DELETE or admin request')
+                time.sleep(0.05)
+            present = set(client.list(bucket))
+            assert present <= payloads.keys()
+            assert not (present & acknowledged), 'acknowledged deletes cannot resurrect'
+            for key, payload in payloads.items():
+                status, body = client.request('GET', bucket + '/' + key, expected=(200, 404))
+                assert (status == 200) == (key in present)
+                if status == 200:
+                    assert body == payload, 'every surviving key must preserve complete original bytes'
+            absent = sorted(payloads.keys() - present)
+            physical = cluster.inspect_data(
+                "from pathlib import Path\nimport json\n"
+                f"bucket={bucket!r};keys={absent!r}\n"
+                "print(json.dumps([str(d/bucket/key) for d in Path('/data').glob('d*') "
+                "for key in keys if (d/bucket/key).exists()]))"
+            )
+            assert all(not node for node in physical), 'automatic recovery cannot leave invisible object residue'
+            docker('stop', '--time', '60', cluster.names[0])
+            cluster.restart()
+            assert set(client.list(bucket)) == present, 'a second recovery cannot change the settled key set'
+            for key in present:
+                assert client.get(bucket, key) == payloads[key], 'a second recovery must preserve complete bytes'
+            client.batch_delete(bucket, list(payloads))
+            assert client.list(bucket) == []
+            client.delete_bucket(bucket)
+            rounds.append({'observed_before_kill': observation, 'acknowledged': len(acknowledged),
+                           'present': len(present), 'absent': len(payloads) - len(present),
+                           'complete_bytes_verified': len(present), 'second_restart_stable': True})
+        finally:
+            cluster.remove()
+    return {'case': 'release-batch-crash', 'status': 'passed', 'rounds': rounds,
+            'fault_model': 'SIGKILL after observing persisted preparation; no deterministic stage barrier'}
+
 def large_batch_delete():
     cluster = Cluster('batch-1000', nodes=4, drives=2)
     try:
@@ -1358,7 +1458,7 @@ def main():
     global ROOT, PREFIX, IMAGE, PORT, CANDIDATE, BASELINE
     import argparse, re, sys
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--binary', required=True, type=Path, help='Linux candidate binary built with e2e-test-hooks')
+    parser.add_argument('--binary', required=True, type=Path, help='Linux candidate; deterministic barrier cases require e2e-test-hooks')
     parser.add_argument('--baseline-binary', type=Path, help='Older Linux binary, required by mixed case')
     parser.add_argument('--image', required=True, help='Local Linux image with Python 3 and the binary runtime libraries')
     parser.add_argument('--artifact-dir', required=True, type=Path, help='New directory for logs and stage handshakes')
@@ -1385,7 +1485,7 @@ def main():
         existing = docker(resource, 'ls', '-q', '--filter', 'label=rustfs.delete-recovery-test=' + PREFIX).stdout.strip()
         if existing:
             parser.error('namespace already owns Docker resources; choose a new namespace')
-    cases = {'automatic-clean-restart': automatic_clean_restart, 'unknown-fresh': unknown_predecessor_fresh_delete, 'batch1000': large_batch_delete, 'versions3000': large_version_history, 'admin-smoke': admin_smoke, 'legacy-alias': legacy_transaction_data_dir_alias, 'missing-offline': ordinary_missing_with_offline_peer, 'inverse': retained_decision_newer_undecided, 'deep': deep_key_crash, 'deep-large-stack': lambda : deep_key_crash(True), 'admin-prefix': admin_prefix_scoped, 'response-loss': receipt_response_loss, 'admin-object': lambda : admin_legacy_dry_run(True), 'smoke': smoke, 'legacy1': lambda : legacy_retry(1), 'legacy4': lambda : legacy_retry(4), 'restore': rollback_crash, 'retention': protected_version, 'version-applied': lambda : versioned_crash('APPLIED'), 'version-decision': lambda : versioned_crash('DECISION'), 'returning': returning_drive_new_generation, 'untouched': untouched_returning_peer, 'missing-version': missing_version_returning_peer, 'mixed': mixed_versions, 'admin': admin_legacy_dry_run, 'prefix': uuid_prefix_crash, 'corruption': corruption_repair, 'permission': permission_fault, 'error-prepared': lambda : injected_error('PREPARED'), 'error-applied': lambda : injected_error('APPLIED'), 'error-decision': lambda : injected_error('DECISION')}
+    cases = {'release-batch-crash': release_batch_crash, 'automatic-clean-restart': automatic_clean_restart, 'unknown-fresh': unknown_predecessor_fresh_delete, 'batch1000': large_batch_delete, 'versions3000': large_version_history, 'admin-smoke': admin_smoke, 'legacy-alias': legacy_transaction_data_dir_alias, 'missing-offline': ordinary_missing_with_offline_peer, 'inverse': retained_decision_newer_undecided, 'deep': deep_key_crash, 'deep-large-stack': lambda : deep_key_crash(True), 'admin-prefix': admin_prefix_scoped, 'response-loss': receipt_response_loss, 'admin-object': lambda : admin_legacy_dry_run(True), 'smoke': smoke, 'legacy1': lambda : legacy_retry(1), 'legacy4': lambda : legacy_retry(4), 'restore': rollback_crash, 'retention': protected_version, 'version-applied': lambda : versioned_crash('APPLIED'), 'version-decision': lambda : versioned_crash('DECISION'), 'returning': returning_drive_new_generation, 'untouched': untouched_returning_peer, 'missing-version': missing_version_returning_peer, 'mixed': mixed_versions, 'admin': admin_legacy_dry_run, 'prefix': uuid_prefix_crash, 'corruption': corruption_repair, 'permission': permission_fault, 'error-prepared': lambda : injected_error('PREPARED'), 'error-applied': lambda : injected_error('APPLIED'), 'error-decision': lambda : injected_error('DECISION')}
     cases.update({'multipart-sidecars': completed_multipart_sidecars, 'multipart-integrity': lambda: completed_multipart_sidecars(True), 'multipart-sidecars-applied': lambda: completed_multipart_sidecars(False, True), 'multipart-integrity-applied': lambda: completed_multipart_sidecars(True, True)})
     for stage in ('PREPARED', 'APPLIED', 'DECISION'):
         cases['marker-batch-' + stage.lower()] = lambda stage=stage: marker_batch_crash(stage)
