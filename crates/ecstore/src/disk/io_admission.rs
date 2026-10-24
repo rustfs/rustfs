@@ -493,6 +493,18 @@ where
     })
 }
 
+/// Run native filesystem work with the current resource ownership. Cancelling
+/// the async waiter cannot refund a unit while the native operation still runs.
+/// This does not acquire capacity or change foreground/background policy.
+#[doc(hidden)]
+pub fn spawn_blocking_with_resource_ownership<T, F>(operation: F) -> tokio::task::JoinHandle<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    spawn_blocking_with_disk_io_permit(None, operation)
+}
+
 type AdmissionWait = Pin<Box<dyn Future<Output = io::Result<DiskIoPermit>> + Send>>;
 
 impl Drop for DiskIoPermitLease {

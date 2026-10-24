@@ -55,7 +55,9 @@ mod set_disk;
 mod storage_api_contracts;
 mod store;
 
-pub use disk::{with_background_disk_io, with_background_resource_set, with_background_resource_unit};
+pub use disk::{
+    spawn_blocking_with_resource_ownership, with_background_disk_io, with_background_resource_set, with_background_resource_unit,
+};
 pub use store::PoolMetaWriteGateStatus;
 
 // pub mod checksum;

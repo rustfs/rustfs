@@ -945,7 +945,7 @@ async fn wait_for_scanner_io<T>(ctx: &CancellationToken, wait: impl std::future:
 }
 
 struct ScannerDirectory {
-    reader: tokio::fs::ReadDir,
+    reader: native_io::ReadDir,
     batch_entries: usize,
     #[cfg(test)]
     ordered: Option<tests::erasure_probe::OrderedEntries>,
@@ -953,7 +953,7 @@ struct ScannerDirectory {
 
 impl ScannerDirectory {
     async fn open(path: &str) -> std::io::Result<Self> {
-        let reader = tokio::fs::read_dir(path).await?;
+        let reader = native_io::ReadDir::open(path).await?;
         #[cfg(test)]
         let (reader, ordered) = {
             let mut reader = reader;
@@ -968,7 +968,7 @@ impl ScannerDirectory {
         })
     }
 
-    async fn next_entry(&mut self) -> std::io::Result<Option<tokio::fs::DirEntry>> {
+    async fn next_entry(&mut self) -> std::io::Result<Option<native_io::DirEntry>> {
         #[cfg(test)]
         if let Some(entries) = &mut self.ordered {
             return entries.pop_front().transpose();
@@ -982,7 +982,7 @@ async fn next_scanner_dir_entry(
     sleeper: &DynamicSleeper,
     entries: &mut ScannerDirectory,
     admission: Option<&Arc<rustfs_concurrency::adaptive::NodeAdmission>>,
-) -> Result<Option<tokio::fs::DirEntry>, ScannerError> {
+) -> Result<Option<native_io::DirEntry>, ScannerError> {
     if entries.batch_entries == SCANNER_DIRECTORY_BATCH_ENTRIES {
         wait_for_scanner_io(ctx, tokio::task::yield_now()).await?;
         entries.batch_entries = 0;
@@ -2078,7 +2078,7 @@ impl FolderScanner {
                     wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, 0)).await?;
                     let metadata = match wait_for_scanner_io(
                         &ctx,
-                        run_scanner_node_operation(self.node_admission.as_ref(), &ctx, tokio::fs::metadata(&file_path)),
+                        run_scanner_node_operation(self.node_admission.as_ref(), &ctx, native_io::metadata(&file_path)),
                     )
                     .await??
                     {
@@ -2225,7 +2225,7 @@ impl FolderScanner {
                         wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, 0)).await?;
                         wait_for_scanner_io(
                             &ctx,
-                            run_scanner_node_operation(self.node_admission.as_ref(), &ctx, tokio::fs::metadata(&item.path)),
+                            run_scanner_node_operation(self.node_admission.as_ref(), &ctx, native_io::metadata(&item.path)),
                         )
                         .await??
                         .map(|metadata| metadata.len())
@@ -3455,6 +3455,7 @@ pub(crate) async fn scan_data_folder_scoped(
 
 mod item_actions;
 mod ledger;
+mod native_io;
 
 use item_actions::*;
 pub use item_actions::{GetSizeFn, ScannerItem};

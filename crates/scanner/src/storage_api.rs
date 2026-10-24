@@ -21,7 +21,13 @@ use rustfs_lock::NamespaceLockWrapper;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
+pub(crate) use rustfs_ecstore::spawn_blocking_with_resource_ownership as ecstore_spawn_blocking_with_resource_ownership;
 pub(crate) use rustfs_ecstore::with_background_disk_io as ecstore_with_background_disk_io;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::{
+    with_background_resource_set as ecstore_with_background_resource_set,
+    with_background_resource_unit as ecstore_with_background_resource_unit,
+};
 
 pub(crate) use s3s::dto::{
     BucketLifecycleConfiguration as EcstoreBucketLifecycleConfiguration, LifecycleRuleFilter as EcstoreLifecycleRuleFilter,
