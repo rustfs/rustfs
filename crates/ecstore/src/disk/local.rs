@@ -12389,7 +12389,11 @@ impl DiskAPI for LocalDisk {
             .await?;
 
         if let Some(flag) = opts.producer_limit_reached.as_ref() {
-            flag.store(limit_reached, std::sync::atomic::Ordering::Release);
+            // Every disk of every set in a page shares this flag, and the
+            // collector reads it as "did ANY bounded walk stop at its limit".
+            // A walk that reached EOF must not clear what another producer
+            // reported, whatever order they finish in.
+            flag.fetch_or(limit_reached, std::sync::atomic::Ordering::AcqRel);
         }
         out.close().await?;
         Ok(())
@@ -15931,6 +15935,65 @@ mod test {
         assert!(
             elapsed > stall,
             "test is only meaningful if the walk outlives the stall budget, elapsed {elapsed:?} vs stall {stall:?}"
+        );
+    }
+
+    // The collector decides "truncated or exhausted" from one flag shared by every
+    // producer of the page. It must stay set once any bounded walk stopped early,
+    // however the remaining producers finish.
+    #[tokio::test]
+    async fn walk_dir_keeps_shared_limit_flag_set_by_another_producer() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let bucket = "test-bucket";
+        for idx in 0..3 {
+            let object_dir = dir.path().join(bucket).join(format!("prefix/object-{idx}"));
+            fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta")
+                .await
+                .expect("object metadata should be written");
+        }
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        disk.wait_for_startup_cleanup().await;
+
+        let walk = |limit: i32, flag: Arc<AtomicBool>| {
+            let disk = &disk;
+            async move {
+                let mut sink = Vec::new();
+                disk.walk_dir(
+                    WalkDirOptions {
+                        bucket: bucket.to_string(),
+                        base_dir: "prefix/".to_string(),
+                        recursive: true,
+                        limit,
+                        producer_limit_reached: Some(flag),
+                        ..Default::default()
+                    },
+                    &mut sink,
+                )
+                .await
+                .expect("walk should succeed");
+            }
+        };
+
+        let bounded = Arc::new(AtomicBool::new(false));
+        walk(1, bounded.clone()).await;
+        assert!(
+            bounded.load(Ordering::Acquire),
+            "a walk that stopped at its limit must report it through the shared flag"
+        );
+
+        // A sibling producer already stopped at its limit; this walk reaches EOF after it.
+        let shared = Arc::new(AtomicBool::new(true));
+        walk(0, shared.clone()).await;
+        assert!(
+            shared.load(Ordering::Acquire),
+            "a walk that reached EOF must not clear a limit another producer reported"
         );
     }
 
