@@ -1041,7 +1041,8 @@ impl ECStore {
             // before physical creation. Creation may become visible even when a
             // later metadata write or namespace-lock check fails.
             crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
-            self.cleanup_bucket_usage(bucket, ns_guard.as_ref()).await?;
+            // Keep cleanup state out of the bucket-creation request future.
+            Box::pin(self.cleanup_bucket_usage(bucket, ns_guard.as_ref())).await?;
         }
 
         if let Err(err) = await_bucket_lifecycle_operation(

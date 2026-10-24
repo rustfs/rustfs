@@ -1865,8 +1865,8 @@ impl DefaultMultipartUsecase {
                 ));
             }
         };
-        let (src_reader, _source_cancellation) = prepared_source
-            .into_reader_for_copy()
+        // Keep the reader setup state out of the instrumented request future.
+        let (src_reader, _source_cancellation) = Box::pin(prepared_source.into_reader_for_copy())
             .await
             .map_err(map_get_object_reader_error)?;
         let src_stream = src_reader.stream;

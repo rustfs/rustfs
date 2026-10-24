@@ -5488,156 +5488,167 @@ impl ECStore {
         }
 
         if opts.data_movement {
-            let existing_pool_info = self.get_pool_info_existing_with_opts(bucket, object, &gopts).await;
-            let existing_pool_idx = existing_pool_info
-                .as_ref()
-                .map(|(pinfo, _)| pinfo.index)
-                .map_err(Clone::clone);
-            let selected_target_pool_idx =
-                match select_data_movement_target_pool(existing_pool_idx, opts.src_pool_idx, opts.delete_marker)? {
-                    Some(pool_idx) => pool_idx,
-                    None => {
-                        if let Some(owner) = DecommissionCapacityOwner::from_options(&opts) {
-                            self.select_decommission_capacity_target_pool(owner, 0).await?
-                        } else {
-                            self.get_available_pool_idx_excluding(bucket, object, 0, opts.src_pool_idx)
-                                .await
-                                .ok_or(Error::DiskFull)?
+            // Keep migration-only state out of the ordinary delete poll frame.
+            return Box::pin(async move {
+                let existing_pool_info = self.get_pool_info_existing_with_opts(bucket, object, &gopts).await;
+                let existing_pool_idx = existing_pool_info
+                    .as_ref()
+                    .map(|(pinfo, _)| pinfo.index)
+                    .map_err(Clone::clone);
+                let selected_target_pool_idx =
+                    match select_data_movement_target_pool(existing_pool_idx, opts.src_pool_idx, opts.delete_marker)? {
+                        Some(pool_idx) => pool_idx,
+                        None => {
+                            if let Some(owner) = DecommissionCapacityOwner::from_options(&opts) {
+                                self.select_decommission_capacity_target_pool(owner, 0).await?
+                            } else {
+                                self.get_available_pool_idx_excluding(bucket, object, 0, opts.src_pool_idx)
+                                    .await
+                                    .ok_or(Error::DiskFull)?
+                            }
                         }
+                    };
+                let resume_target_pool_idx = if selected_target_pool_idx == opts.src_pool_idx {
+                    if let Some(owner) = DecommissionCapacityOwner::from_options(&opts) {
+                        Some(self.select_decommission_capacity_target_pool(owner, 0).await?)
+                    } else {
+                        self.get_available_pool_idx_excluding(bucket, object, 0, opts.src_pool_idx)
+                            .await
                     }
-                };
-            let resume_target_pool_idx = if selected_target_pool_idx == opts.src_pool_idx {
-                if let Some(owner) = DecommissionCapacityOwner::from_options(&opts) {
-                    Some(self.select_decommission_capacity_target_pool(owner, 0).await?)
                 } else {
-                    self.get_available_pool_idx_excluding(bucket, object, 0, opts.src_pool_idx)
-                        .await
-                }
-            } else {
-                None
-            };
-            let target_pool_idx =
-                resolve_data_movement_resume_target_pool(selected_target_pool_idx, resume_target_pool_idx, opts.src_pool_idx);
-            let mut delete_marker_target_opts = None;
+                    None
+                };
+                let target_pool_idx =
+                    resolve_data_movement_resume_target_pool(selected_target_pool_idx, resume_target_pool_idx, opts.src_pool_idx);
+                let mut delete_marker_target_opts = None;
 
-            if opts.delete_marker && should_check_data_movement_resume_target(opts.src_pool_idx, target_pool_idx) {
-                let source = self
-                    .find_data_movement_target_info(bucket, object, opts.src_pool_idx, &opts)
-                    .await;
-                #[cfg(test)]
-                let source =
-                    crate::core::pools::decommission_test_wrap_result("delete_marker_source_recheck", bucket, object, 0, source);
-                let source = source.map_err(|err| crate::data_movement::data_movement_source_read_error(bucket, object, err))?;
-                let Some(source) = source else {
-                    return Err(StorageError::DataMovementOverwriteErr(
-                        bucket.to_owned(),
-                        object.to_owned(),
-                        opts.version_id.unwrap_or_default(),
-                    ));
-                };
-                if !is_expected_data_movement_delete_marker_source(&source, opts.mod_time) {
-                    return Err(StorageError::DataMovementOverwriteErr(
-                        bucket.to_owned(),
-                        object.to_owned(),
-                        opts.version_id.unwrap_or_default(),
-                    ));
-                }
-                let Some(target_opts) = current_data_movement_delete_marker_opts(&source, &opts) else {
-                    return Err(StorageError::DataMovementOverwriteErr(
-                        bucket.to_owned(),
-                        object.to_owned(),
-                        opts.version_id.unwrap_or_default(),
-                    ));
-                };
-                let target = self
-                    .find_data_movement_target_info(bucket, object, target_pool_idx, &target_opts)
-                    .await?;
-                if let Some(target) = target {
-                    if !is_equivalent_data_movement_delete_marker(&source, &target) {
+                if opts.delete_marker && should_check_data_movement_resume_target(opts.src_pool_idx, target_pool_idx) {
+                    let source = self
+                        .find_data_movement_target_info(bucket, object, opts.src_pool_idx, &opts)
+                        .await;
+                    #[cfg(test)]
+                    let source = crate::core::pools::decommission_test_wrap_result(
+                        "delete_marker_source_recheck",
+                        bucket,
+                        object,
+                        0,
+                        source,
+                    );
+                    let source =
+                        source.map_err(|err| crate::data_movement::data_movement_source_read_error(bucket, object, err))?;
+                    let Some(source) = source else {
+                        return Err(StorageError::DataMovementOverwriteErr(
+                            bucket.to_owned(),
+                            object.to_owned(),
+                            opts.version_id.unwrap_or_default(),
+                        ));
+                    };
+                    if !is_expected_data_movement_delete_marker_source(&source, opts.mod_time) {
                         return Err(StorageError::DataMovementOverwriteErr(
                             bucket.to_owned(),
                             object.to_owned(),
                             opts.version_id.unwrap_or_default(),
                         ));
                     }
-                    let marker_version_id = target_opts
-                        .version_id
-                        .as_deref()
-                        .ok_or_else(|| StorageError::other("data movement marker verification requires an exact version id"))?;
-                    let confirmation = self.pools[target_pool_idx]
-                        .get_disks_by_key(object)
-                        .verify_data_movement_delete_marker_write_quorum(bucket, object, marker_version_id)
-                        .await;
-                    match confirmation {
-                        Ok(()) => {
-                            if let Some(owner) = DecommissionCapacityOwner::from_options(&target_opts) {
-                                self.reconcile_decommission_capacity_after_equivalent_target(owner, target_pool_idx, 0)
-                                    .await?;
+                    let Some(target_opts) = current_data_movement_delete_marker_opts(&source, &opts) else {
+                        return Err(StorageError::DataMovementOverwriteErr(
+                            bucket.to_owned(),
+                            object.to_owned(),
+                            opts.version_id.unwrap_or_default(),
+                        ));
+                    };
+                    let target = self
+                        .find_data_movement_target_info(bucket, object, target_pool_idx, &target_opts)
+                        .await?;
+                    if let Some(target) = target {
+                        if !is_equivalent_data_movement_delete_marker(&source, &target) {
+                            return Err(StorageError::DataMovementOverwriteErr(
+                                bucket.to_owned(),
+                                object.to_owned(),
+                                opts.version_id.unwrap_or_default(),
+                            ));
+                        }
+                        let marker_version_id = target_opts.version_id.as_deref().ok_or_else(|| {
+                            StorageError::other("data movement marker verification requires an exact version id")
+                        })?;
+                        let confirmation = self.pools[target_pool_idx]
+                            .get_disks_by_key(object)
+                            .verify_data_movement_delete_marker_write_quorum(bucket, object, marker_version_id)
+                            .await;
+                        match confirmation {
+                            Ok(()) => {
+                                if let Some(owner) = DecommissionCapacityOwner::from_options(&target_opts) {
+                                    self.reconcile_decommission_capacity_after_equivalent_target(owner, target_pool_idx, 0)
+                                        .await?;
+                                }
+                                let mut target = target;
+                                target.name = decode_dir_object(object);
+                                return Ok(target);
                             }
-                            let mut target = target;
-                            target.name = decode_dir_object(object);
-                            return Ok(target);
+                            Err(error)
+                                if matches!(
+                                    error,
+                                    StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _)
+                                ) && target_opts.version_purge_status().is_empty()
+                                    && target.version_purge_status.is_empty() => {}
+                            Err(error) => return Err(error),
                         }
-                        Err(error)
-                            if matches!(error, StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _))
-                                && target_opts.version_purge_status().is_empty()
-                                && target.version_purge_status.is_empty() => {}
-                        Err(error) => return Err(error),
+                        if let Some(owner) = DecommissionCapacityOwner::from_options(&target_opts) {
+                            self.reconcile_decommission_capacity_after_equivalent_target(owner, target_pool_idx, 0)
+                                .await?;
+                        }
+                        // An exact-version read proves only read quorum. Republish
+                        // the same marker so retries restore its write quorum before
+                        // a later latest-version lookup or source cleanup can proceed.
                     }
-                    if let Some(owner) = DecommissionCapacityOwner::from_options(&target_opts) {
-                        self.reconcile_decommission_capacity_after_equivalent_target(owner, target_pool_idx, 0)
-                            .await?;
-                    }
-                    // An exact-version read proves only read quorum. Republish
-                    // the same marker so retries restore its write quorum before
-                    // a later latest-version lookup or source cleanup can proceed.
-                }
-                delete_marker_target_opts = Some(target_opts);
-            }
-
-            if !should_check_data_movement_resume_target(opts.src_pool_idx, target_pool_idx) {
-                if let Ok((source_pool_info, _)) = existing_pool_info
-                    && opts.delete_marker
-                    && is_data_movement_delete_marker(&source_pool_info.object_info)
-                    && self
-                        .has_equivalent_data_movement_delete_marker(
-                            bucket,
-                            object,
-                            &source_pool_info.object_info,
-                            &opts,
-                            target_pool_idx,
-                        )
-                        .await?
-                {
-                    let mut obj = source_pool_info.object_info;
-                    obj.name = decode_dir_object(object);
-                    return Ok(obj);
+                    delete_marker_target_opts = Some(target_opts);
                 }
 
-                return Err(StorageError::DataMovementOverwriteErr(
-                    bucket.to_owned(),
-                    object.to_owned(),
-                    opts.version_id.unwrap_or_default(),
-                ));
-            }
+                if !should_check_data_movement_resume_target(opts.src_pool_idx, target_pool_idx) {
+                    if let Ok((source_pool_info, _)) = existing_pool_info
+                        && opts.delete_marker
+                        && is_data_movement_delete_marker(&source_pool_info.object_info)
+                        && self
+                            .has_equivalent_data_movement_delete_marker(
+                                bucket,
+                                object,
+                                &source_pool_info.object_info,
+                                &opts,
+                                target_pool_idx,
+                            )
+                            .await?
+                    {
+                        let mut obj = source_pool_info.object_info;
+                        obj.name = decode_dir_object(object);
+                        return Ok(obj);
+                    }
 
-            let target_opts = delete_marker_target_opts.unwrap_or(opts);
-            let mut obj = self
-                .run_decommission_capacity_admitted_mutation_with_capacity_lease(
-                    target_pool_idx,
-                    DecommissionCapacityOwner::from_options(&target_opts),
-                    None,
-                    |capacity_lease| async move {
-                        let mut target_opts = target_opts;
-                        if let Some(capacity_lease) = capacity_lease {
-                            target_opts.add_namespace_lock_lost_signal(capacity_lease);
-                        }
-                        self.pools[target_pool_idx].delete_object(bucket, object, target_opts).await
-                    },
-                )
-                .await?;
-            obj.name = decode_dir_object(obj.name.as_str());
-            return Ok(obj);
+                    return Err(StorageError::DataMovementOverwriteErr(
+                        bucket.to_owned(),
+                        object.to_owned(),
+                        opts.version_id.unwrap_or_default(),
+                    ));
+                }
+
+                let target_opts = delete_marker_target_opts.unwrap_or(opts);
+                let mut obj = self
+                    .run_decommission_capacity_admitted_mutation_with_capacity_lease(
+                        target_pool_idx,
+                        DecommissionCapacityOwner::from_options(&target_opts),
+                        None,
+                        |capacity_lease| async move {
+                            let mut target_opts = target_opts;
+                            if let Some(capacity_lease) = capacity_lease {
+                                target_opts.add_namespace_lock_lost_signal(capacity_lease);
+                            }
+                            self.pools[target_pool_idx].delete_object(bucket, object, target_opts).await
+                        },
+                    )
+                    .await?;
+                obj.name = decode_dir_object(obj.name.as_str());
+                Ok(obj)
+            })
+            .await;
         }
 
         // Determine which pool contains it

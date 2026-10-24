@@ -5268,528 +5268,203 @@ impl SetDisks {
                 namespace_lock_acquired_to_commit_ready_started,
             );
 
+            // Construct the boxed state in the factory so its temporary does
+            // not remain in the request's poll frame while commit runs.
             let commit = move |commit_submit_to_closure_enter_started: Option<Instant>,
-                               cancellation: Option<CancellationToken>| async move {
-                let write_context = write_context;
-                let commit_closure_total_started = rustfs_io_metrics::put_stage_timer();
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_SUBMIT_TO_CLOSURE_ENTER,
-                    commit_submit_to_closure_enter_started,
-                );
-                let commit_closure_enter_to_first_await_started = rustfs_io_metrics::put_stage_timer();
-                let mut _object_lock_guard = commit_object_lock_guard;
-                let mut _decommission_object_lock_guard = commit_decommission_object_lock_guard;
-                let mut _publication_guard = commit_publication_guard;
-                let mut _bucket_lifecycle_guard = commit_bucket_lifecycle_guard;
-                let mut _artifact_put_guard = commit_artifact_put_guard;
-                let mut _lifecycle_snapshot = commit_lifecycle_snapshot;
-                let mut _decommission_capacity_guard = commit_decommission_capacity_guard;
-                let mut quota_reservation = quota_reservation;
-                let rename_stage_start = Instant::now();
-                let commit_before_rename_started = rustfs_io_metrics::put_stage_timer();
-                let lock_held_pre_rename_prepare_started = rustfs_io_metrics::put_stage_timer();
-                let pre_rename = async {
-                    #[cfg(any(test, feature = "test-util"))]
-                    pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::AfterQuotaReservation).await;
-                    let quota_mark_commit_started = rustfs_io_metrics::put_stage_timer();
-                    quota_reservation.mark_commit_started().await?;
+                               cancellation: Option<CancellationToken>| {
+                Box::pin(async move {
+                    let write_context = write_context;
+                    let commit_closure_total_started = rustfs_io_metrics::put_stage_timer();
                     rustfs_io_metrics::record_put_object_stage_duration_from(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_QUOTA_MARK_COMMIT_STARTED,
-                        quota_mark_commit_started,
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_SUBMIT_TO_CLOSURE_ENTER,
+                        commit_submit_to_closure_enter_started,
                     );
-                    #[cfg(any(test, feature = "test-util"))]
-                    pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::BeforeQuotaRename).await;
-                    let first_fence_check_started = rustfs_io_metrics::put_stage_timer();
-                    if quota_reservation.is_lock_lost()
-                        || write_context.is_lock_lost()
-                        || _artifact_put_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-                        || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-                        || _decommission_object_lock_guard
-                            .as_ref()
-                            .is_some_and(|guard| guard.is_lock_lost())
-                        || _publication_guard
-                            .as_ref()
-                            .is_some_and(RemoteTuplePublicationCommitGuard::is_lock_lost)
-                        || commit_namespace_lock_fence
-                            .as_ref()
-                            .is_some_and(NamespaceLockFence::is_lock_lost)
-                        || commit_bucket_lifecycle_lock_fence
-                            .as_ref()
-                            .is_some_and(NamespaceLockFence::is_lock_lost)
-                        || _bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-                        || _decommission_capacity_guard
-                            .as_ref()
-                            .is_some_and(|guard| guard.is_lock_lost())
-                    {
-                        return Err(StorageError::NamespaceLockQuorumUnavailable {
-                            mode: "quota_reservation",
-                            bucket: commit_bucket.clone(),
-                            object: commit_object.clone(),
-                            required: 1,
-                            achieved: 0,
-                        });
-                    }
-                    rustfs_io_metrics::record_put_object_stage_duration_from(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_FIRST_FENCE_CHECK,
-                        first_fence_check_started,
-                    );
-                    let restore_opts = ObjectOptions {
-                        version_id: commit_version_id.clone(),
-                        versioned: commit_versioned,
-                        version_suspended: commit_version_suspended,
-                        no_lock: true,
-                        ..Default::default()
-                    };
-                    let restore_verify_started = rustfs_io_metrics::put_stage_timer();
-                    commit_set
-                        .require_current_restore_operation_id(
-                            &commit_bucket,
-                            &commit_object,
-                            &restore_opts,
-                            expected_restore_operation_id,
-                            "put_object_quota_reservation",
-                        )
-                        .await?;
-                    rustfs_io_metrics::record_put_object_stage_duration_from(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_RESTORE_VERIFY,
-                        restore_verify_started,
-                    );
-                    if let Some(proof) = transaction_fencing_proof.as_ref()
-                        && !object_transaction_fencing_fleet_proof_matches(proof)
-                    {
-                        return Err(Error::other("object transaction fencing fleet capability changed during put_object"));
-                    }
-                    if let Some(expected) = transaction_epoch_fence {
+                    let commit_closure_enter_to_first_await_started = rustfs_io_metrics::put_stage_timer();
+                    let mut _object_lock_guard = commit_object_lock_guard;
+                    let mut _decommission_object_lock_guard = commit_decommission_object_lock_guard;
+                    let mut _publication_guard = commit_publication_guard;
+                    let mut _bucket_lifecycle_guard = commit_bucket_lifecycle_guard;
+                    let mut _artifact_put_guard = commit_artifact_put_guard;
+                    let mut _lifecycle_snapshot = commit_lifecycle_snapshot;
+                    let mut _decommission_capacity_guard = commit_decommission_capacity_guard;
+                    let mut quota_reservation = quota_reservation;
+                    let rename_stage_start = Instant::now();
+                    let commit_before_rename_started = rustfs_io_metrics::put_stage_timer();
+                    let lock_held_pre_rename_prepare_started = rustfs_io_metrics::put_stage_timer();
+                    let pre_rename = async {
                         #[cfg(any(test, feature = "test-util"))]
-                        pause_put_object_commit(
+                        pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::AfterQuotaReservation)
+                            .await;
+                        let quota_mark_commit_started = rustfs_io_metrics::put_stage_timer();
+                        quota_reservation.mark_commit_started().await?;
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_QUOTA_MARK_COMMIT_STARTED,
+                            quota_mark_commit_started,
+                        );
+                        #[cfg(any(test, feature = "test-util"))]
+                        pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::BeforeQuotaRename).await;
+                        let first_fence_check_started = rustfs_io_metrics::put_stage_timer();
+                        if quota_reservation.is_lock_lost()
+                            || write_context.is_lock_lost()
+                            || _artifact_put_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                            || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                            || _decommission_object_lock_guard
+                                .as_ref()
+                                .is_some_and(|guard| guard.is_lock_lost())
+                            || _publication_guard
+                                .as_ref()
+                                .is_some_and(RemoteTuplePublicationCommitGuard::is_lock_lost)
+                            || commit_namespace_lock_fence
+                                .as_ref()
+                                .is_some_and(NamespaceLockFence::is_lock_lost)
+                            || commit_bucket_lifecycle_lock_fence
+                                .as_ref()
+                                .is_some_and(NamespaceLockFence::is_lock_lost)
+                            || _bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                            || _decommission_capacity_guard
+                                .as_ref()
+                                .is_some_and(|guard| guard.is_lock_lost())
+                        {
+                            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                                mode: "quota_reservation",
+                                bucket: commit_bucket.clone(),
+                                object: commit_object.clone(),
+                                required: 1,
+                                achieved: 0,
+                            });
+                        }
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_FIRST_FENCE_CHECK,
+                            first_fence_check_started,
+                        );
+                        let restore_opts = ObjectOptions {
+                            version_id: commit_version_id.clone(),
+                            versioned: commit_versioned,
+                            version_suspended: commit_version_suspended,
+                            no_lock: true,
+                            ..Default::default()
+                        };
+                        let restore_verify_started = rustfs_io_metrics::put_stage_timer();
+                        commit_set
+                            .require_current_restore_operation_id(
+                                &commit_bucket,
+                                &commit_object,
+                                &restore_opts,
+                                expected_restore_operation_id,
+                                "put_object_quota_reservation",
+                            )
+                            .await?;
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_RESTORE_VERIFY,
+                            restore_verify_started,
+                        );
+                        if let Some(proof) = transaction_fencing_proof.as_ref()
+                            && !object_transaction_fencing_fleet_proof_matches(proof)
+                        {
+                            return Err(Error::other("object transaction fencing fleet capability changed during put_object"));
+                        }
+                        if let Some(expected) = transaction_epoch_fence {
+                            #[cfg(any(test, feature = "test-util"))]
+                            pause_put_object_commit(
+                                &commit_bucket,
+                                &commit_object,
+                                PutObjectCommitPause::BeforeTransactionEpochVerify,
+                            )
+                            .await;
+                            let transaction_fence_verify_started = rustfs_io_metrics::put_stage_timer();
+                            verify_object_transaction_epoch_fence(&commit_set, &commit_bucket, &commit_object, expected).await?;
+                            rustfs_io_metrics::record_put_object_stage_duration_from(
+                                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_TRANSACTION_FENCE_VERIFY,
+                                transaction_fence_verify_started,
+                            );
+                        }
+                        let second_fence_check_started = rustfs_io_metrics::put_stage_timer();
+                        if quota_reservation.is_lock_lost()
+                            || write_context.is_lock_lost()
+                            || _artifact_put_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                            || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                            || _decommission_object_lock_guard
+                                .as_ref()
+                                .is_some_and(|guard| guard.is_lock_lost())
+                            || _publication_guard
+                                .as_ref()
+                                .is_some_and(RemoteTuplePublicationCommitGuard::is_lock_lost)
+                            || commit_namespace_lock_fence
+                                .as_ref()
+                                .is_some_and(NamespaceLockFence::is_lock_lost)
+                            || commit_bucket_lifecycle_lock_fence
+                                .as_ref()
+                                .is_some_and(NamespaceLockFence::is_lock_lost)
+                            || _bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                            || _decommission_capacity_guard
+                                .as_ref()
+                                .is_some_and(|guard| guard.is_lock_lost())
+                        {
+                            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                                mode: "quota_reservation",
+                                bucket: commit_bucket.clone(),
+                                object: commit_object.clone(),
+                                required: 1,
+                                achieved: 0,
+                            });
+                        }
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_SECOND_FENCE_CHECK,
+                            second_fence_check_started,
+                        );
+                        Ok(())
+                    };
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_ENTER_TO_FIRST_AWAIT,
+                        commit_closure_enter_to_first_await_started,
+                    );
+                    let pre_rename_await_total_started = rustfs_io_metrics::put_stage_timer();
+                    let mut pre_rename_result = if cancellation.is_some() || request_cancellation.is_some() {
+                        tokio::select! {
+                                biased;
+                            _ = wait_for_put_object_commit_cancellation(cancellation.as_ref(), request_cancellation.as_ref()) => {
+                                Err(StorageError::OperationCanceled)
+                            },
+                            result = pre_rename => result,
+                        }
+                    } else {
+                        pre_rename.await
+                    };
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_AWAIT_TOTAL,
+                        pre_rename_await_total_started,
+                    );
+                    let pre_rename_post_await_to_rename_started = rustfs_io_metrics::put_stage_timer();
+                    let scanner_scope_check_started = rustfs_io_metrics::put_stage_timer();
+                    if pre_rename_result.is_ok()
+                        && let Some(scope) = commit_scanner_publication_scope.as_ref()
+                        && let Err(err) = scope.try_begin()
+                    {
+                        let _ = scope.mark_aborted_before_commit();
+                        pre_rename_result = Err(Error::other(format!("scanner publication commit scope cannot start: {err:?}")));
+                    }
+                    if pre_rename_result.is_ok()
+                        && let Some(scope) = commit_scanner_publication_scope.as_ref()
+                        && !scope.can_commit()
+                    {
+                        let _ = scope.mark_indeterminate();
+                        pre_rename_result = Err(StorageError::OperationCanceled);
+                    }
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_SCANNER_SCOPE_CHECK,
+                        scanner_scope_check_started,
+                    );
+                    if let Err(err) = pre_rename_result {
+                        SetDisks::abort_quota_reservation_after_fence(
+                            quota_reservation,
+                            &commit_disks,
+                            &quota_fence_tokens,
                             &commit_bucket,
                             &commit_object,
-                            PutObjectCommitPause::BeforeTransactionEpochVerify,
+                            write_quorum,
+                            quota_mutation_fence,
                         )
                         .await;
-                        let transaction_fence_verify_started = rustfs_io_metrics::put_stage_timer();
-                        verify_object_transaction_epoch_fence(&commit_set, &commit_bucket, &commit_object, expected).await?;
-                        rustfs_io_metrics::record_put_object_stage_duration_from(
-                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_TRANSACTION_FENCE_VERIFY,
-                            transaction_fence_verify_started,
-                        );
-                    }
-                    let second_fence_check_started = rustfs_io_metrics::put_stage_timer();
-                    if quota_reservation.is_lock_lost()
-                        || write_context.is_lock_lost()
-                        || _artifact_put_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-                        || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-                        || _decommission_object_lock_guard
-                            .as_ref()
-                            .is_some_and(|guard| guard.is_lock_lost())
-                        || _publication_guard
-                            .as_ref()
-                            .is_some_and(RemoteTuplePublicationCommitGuard::is_lock_lost)
-                        || commit_namespace_lock_fence
-                            .as_ref()
-                            .is_some_and(NamespaceLockFence::is_lock_lost)
-                        || commit_bucket_lifecycle_lock_fence
-                            .as_ref()
-                            .is_some_and(NamespaceLockFence::is_lock_lost)
-                        || _bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-                        || _decommission_capacity_guard
-                            .as_ref()
-                            .is_some_and(|guard| guard.is_lock_lost())
-                    {
-                        return Err(StorageError::NamespaceLockQuorumUnavailable {
-                            mode: "quota_reservation",
-                            bucket: commit_bucket.clone(),
-                            object: commit_object.clone(),
-                            required: 1,
-                            achieved: 0,
-                        });
-                    }
-                    rustfs_io_metrics::record_put_object_stage_duration_from(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_SECOND_FENCE_CHECK,
-                        second_fence_check_started,
-                    );
-                    Ok(())
-                };
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_ENTER_TO_FIRST_AWAIT,
-                    commit_closure_enter_to_first_await_started,
-                );
-                let pre_rename_await_total_started = rustfs_io_metrics::put_stage_timer();
-                let mut pre_rename_result = if cancellation.is_some() || request_cancellation.is_some() {
-                    tokio::select! {
-                            biased;
-                        _ = wait_for_put_object_commit_cancellation(cancellation.as_ref(), request_cancellation.as_ref()) => {
-                            Err(StorageError::OperationCanceled)
-                        },
-                        result = pre_rename => result,
-                    }
-                } else {
-                    pre_rename.await
-                };
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_AWAIT_TOTAL,
-                    pre_rename_await_total_started,
-                );
-                let pre_rename_post_await_to_rename_started = rustfs_io_metrics::put_stage_timer();
-                let scanner_scope_check_started = rustfs_io_metrics::put_stage_timer();
-                if pre_rename_result.is_ok()
-                    && let Some(scope) = commit_scanner_publication_scope.as_ref()
-                    && let Err(err) = scope.try_begin()
-                {
-                    let _ = scope.mark_aborted_before_commit();
-                    pre_rename_result = Err(Error::other(format!("scanner publication commit scope cannot start: {err:?}")));
-                }
-                if pre_rename_result.is_ok()
-                    && let Some(scope) = commit_scanner_publication_scope.as_ref()
-                    && !scope.can_commit()
-                {
-                    let _ = scope.mark_indeterminate();
-                    pre_rename_result = Err(StorageError::OperationCanceled);
-                }
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_SCANNER_SCOPE_CHECK,
-                    scanner_scope_check_started,
-                );
-                if let Err(err) = pre_rename_result {
-                    SetDisks::abort_quota_reservation_after_fence(
-                        quota_reservation,
-                        &commit_disks,
-                        &quota_fence_tokens,
-                        &commit_bucket,
-                        &commit_object,
-                        write_quorum,
-                        quota_mutation_fence,
-                    )
-                    .await;
-                    if let Err(cleanup_err) = commit_set
-                        .delete_put_tmp_with_budget(&commit_tmp_dir, &commit_cleanup_reservation)
-                        .await
-                    {
-                        warn!(tmp_dir = %commit_tmp_dir, error = ?cleanup_err, "failed to cleanup put_object temporary data");
-                    } else if issue3031_diag_enabled() {
-                        warn!(
-                            target: "rustfs_ecstore::set_disk",
-                            bucket = %commit_bucket,
-                            object = %commit_object,
-                            tmp_dir = %commit_tmp_dir,
-                            "issue3031_put_object_tmp_cleanup_done"
-                        );
-                    }
-                    return Err(err);
-                }
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_PRE_RENAME_PREPARE,
-                    lock_held_pre_rename_prepare_started,
-                );
-
-                let tier_free_version_source_lookup_started = rustfs_io_metrics::put_stage_timer();
-                let reuse_rename_data_source_for_tier_free_version = tier_free_version_source_reuse_rename_data_enabled()
-                    && (commit_set.tier_free_version_rename_data_source_capable()
-                        || tier_free_version_source_reuse_rename_data_assume_homogeneous_enabled());
-                let mut put_tier_free_version_source = if commit_put_tier_free_version_id.is_some()
-                    && commit_tier_free_version_receipt_sink.is_some()
-                    && !tier_free_version_source_lookup_counterfactual_skip_enabled()
-                    && !reuse_rename_data_source_for_tier_free_version
-                {
-                    #[cfg(feature = "diagnostic-read-version-caller")]
-                    crate::cluster::rpc::runtime_sources::observe_read_version_context_boundary(
-                        rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::TierFreeVersionSourceLookup,
-                    );
-                    match commit_set
-                        .get_object_info(
-                            &commit_bucket,
-                            &commit_object,
-                            &ObjectOptions {
-                                no_lock: true,
-                                metadata_cache_safe: false,
-                                versioned: commit_versioned,
-                                version_suspended: commit_version_suspended,
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                    {
-                        Ok(source) => Some(source),
-                        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => None,
-                        Err(err) => {
-                            debug!(
-                                event = EVENT_LIFECYCLE_TRANSITIONED_DELETE_CLEANUP_OWNER,
-                                component = LOG_COMPONENT_ECSTORE,
-                                subsystem = LOG_SUBSYSTEM_SET_DISK,
-                                bucket = %commit_bucket,
-                                object = %commit_object,
-                                error = ?err,
-                                "Skipped opportunistic tier free-version receipt source capture"
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_TIER_FREE_VERSION_SOURCE_LOOKUP,
-                    tier_free_version_source_lookup_started,
-                );
-
-                let assign_rename_indexes_started = rustfs_io_metrics::put_stage_timer();
-                Self::assign_rename_data_indexes(&mut parts_metadatas);
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_ASSIGN_RENAME_INDEXES,
-                    assign_rename_indexes_started,
-                );
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_POST_AWAIT_TO_RENAME,
-                    pre_rename_post_await_to_rename_started,
-                );
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_BEFORE_RENAME,
-                    commit_before_rename_started,
-                );
-                let lock_held_rename_started = rustfs_io_metrics::put_stage_timer();
-                let mut rename_result = SetDisks::rename_data_owned_with_fence(
-                    &commit_disks,
-                    (RUSTFS_META_TMP_BUCKET, commit_tmp_dir.as_str()),
-                    parts_metadatas,
-                    (&commit_bucket, &commit_object),
-                    commit_allows_early_ack,
-                    crate::set_disk::core::io_primitives::RenameDataFenceOptions::new(
-                        write_quorum,
-                        commit_scanner_publication_lease_tokens.as_ref(),
-                    )
-                    .with_artifact_put(_artifact_put_guard.as_ref().map(|guard| guard.identity))
-                    .with_publication_scope(commit_scanner_publication_scope.clone())
-                    .with_rollback_receipt(commit_rollback_receipt.clone())
-                    .with_namespace_commit_guard((!is_meta_bucketname(&commit_bucket)).then(|| {
-                        // Disk workers and rollback retain this owner even if
-                        // the rename coordinator itself fails or is cancelled.
-                        let namespace_owner = commit_set.ctx.begin_namespace_commit();
-                        Arc::new((
-                            namespace_owner,
-                            _artifact_put_guard.clone(),
-                            _bucket_lifecycle_guard.clone(),
-                            _lifecycle_snapshot.clone(),
-                        )) as Arc<dyn Send + Sync>
-                    })),
-                )
-                .await;
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_RENAME,
-                    lock_held_rename_started,
-                );
-                let commit_after_rename_to_return_started = rustfs_io_metrics::put_stage_timer();
-                let lock_held_rename_result_to_tail_handoff_started = rustfs_io_metrics::put_stage_timer();
-                if let Some(scope) = commit_scanner_publication_scope.as_ref() {
-                    if rename_result.is_ok() {
-                        let _ = scope.mark_committed();
-                    } else {
-                        let _ = scope.mark_indeterminate();
-                    }
-                }
-                #[cfg(any(test, feature = "test-util"))]
-                if rename_result.is_ok() {
-                    pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::AfterRenameQuorum).await;
-                }
-                let mut rename_guard_release = None;
-                let mut needs_immediate_heal = false;
-                let mut tail_owns_tmp_cleanup = false;
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_RENAME_RESULT_TO_TAIL_HANDOFF,
-                    lock_held_rename_result_to_tail_handoff_started,
-                );
-                let lock_held_tail_handoff_started = rustfs_io_metrics::put_stage_timer();
-                if let Ok(rename_commit) = rename_result.as_mut() {
-                    commit_set.observe_tier_free_version_rename_data_source_capability(
-                        rename_commit.tail_drain.is_none() && rename_commit.old_current_source_all_successful_checked,
-                    );
-                    commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &rename_commit.capacity_disks);
-                    // Install the tail watcher before any post-commit await. The
-                    // latch keeps namespace guards through their prior handoff point.
-                    needs_immediate_heal = rename_commit.needs_immediate_heal();
-                    if let Some(rename_tail_drain) = rename_commit.tail_drain.take() {
-                        tail_owns_tmp_cleanup = true;
-                        let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
-                            commit_bucket.clone(),
-                            Some(commit_object.clone()),
-                            false,
-                            Some(HealChannelPriority::Normal),
-                            Some(commit_set.pool_index),
-                            Some(commit_set.set_index),
-                        );
-                        request.object_version_id = committed_version_id
-                            .or_else(|| commit_version_suspended.then(Uuid::nil))
-                            .map(|version_id| version_id.to_string());
-                        request.expected_bucket_incarnation_id = source_bucket_incarnation_id;
-                        let object_lock_guard = _object_lock_guard.take();
-                        let publication_guard = _publication_guard.take();
-                        let bucket_lifecycle_guard = _bucket_lifecycle_guard.take();
-                        let artifact_put_guard = _artifact_put_guard.take();
-                        let lifecycle_snapshot = _lifecycle_snapshot.take();
-                        let decommission_object_lock_guard = _decommission_object_lock_guard.take();
-                        let decommission_capacity_guard = _decommission_capacity_guard.take();
-                        let cleanup_bucket = commit_bucket.clone();
-                        let cleanup_object = commit_object.clone();
-                        let heal_set = commit_set.clone();
-                        let cleanup_set = commit_set.clone();
-                        let cleanup_tmp_dir = commit_tmp_dir.clone();
-                        let fence_disks = commit_disks.clone();
-                        let fence_tokens = quota_fence_tokens.clone();
-                        let fence_bucket = commit_bucket.clone();
-                        let fence_object = commit_object.clone();
-                        let (guard_release_tx, guard_release_rx) = tokio::sync::oneshot::channel();
-                        rename_guard_release = Some(guard_release_tx);
-                        let cleanup_reservation = commit_cleanup_reservation.clone();
-                        tokio::spawn(finish_rename_tail_heal(
-                            rename_tail_drain,
-                            guard_release_rx,
-                            (
-                                object_lock_guard,
-                                write_context,
-                                publication_guard,
-                                bucket_lifecycle_guard,
-                                artifact_put_guard,
-                                lifecycle_snapshot,
-                                decommission_object_lock_guard,
-                                decommission_capacity_guard,
-                            ),
-                            request,
-                            move || async move {
-                                if quota_mutation_fence {
-                                    let _ = SetDisks::release_quota_mutation_fences(
-                                        &fence_disks,
-                                        &fence_tokens,
-                                        &fence_bucket,
-                                        &fence_object,
-                                        write_quorum,
-                                    )
-                                    .await;
-                                }
-                            },
-                            move |(
-                                object_lock_guard,
-                                write_context,
-                                publication_guard,
-                                bucket_lifecycle_guard,
-                                artifact_put_guard,
-                                lifecycle_snapshot,
-                                decommission_object_lock_guard,
-                                decommission_capacity_guard,
-                            ),
-                                  targets| {
-                                drop(object_lock_guard);
-                                drop(write_context);
-                                drop(publication_guard);
-                                cleanup_runtime::run(cleanup_reservation, async move {
-                                    let zero_target_cleanup = targets.is_empty();
-                                    rustfs_io_metrics::record_put_object_stage_duration(
-                                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_COUNT,
-                                        targets.len() as f64,
-                                    );
-                                    if zero_target_cleanup {
-                                        rustfs_io_metrics::record_put_object_stage_duration(
-                                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_ZERO_TARGET,
-                                            1.0,
-                                        );
-                                    }
-                                    cleanup_set
-                                        .cleanup_rename_tail(
-                                            targets,
-                                            &cleanup_bucket,
-                                            &cleanup_object,
-                                            committed_data_dir,
-                                            transaction_epoch,
-                                        )
-                                        .await;
-                                    let tmp_delete_started = rustfs_io_metrics::put_stage_timer();
-                                    if zero_target_cleanup && rename_tail_cleanup_zero_target_tmp_delete_skip_enabled() {
-                                        rustfs_io_metrics::record_put_object_stage_duration(
-                                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE_COUNTERFACTUAL_SKIP,
-                                            1.0,
-                                        );
-                                    } else if let Err(err) =
-                                        cleanup_set.delete_all(RUSTFS_META_TMP_BUCKET, &cleanup_tmp_dir).await
-                                    {
-                                        warn!(tmp_dir = %cleanup_tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
-                                    } else if issue3031_diag_enabled() {
-                                        warn!(
-                                            target: "rustfs_ecstore::set_disk",
-                                            tmp_dir = %cleanup_tmp_dir,
-                                            "issue3031_put_object_tmp_cleanup_done"
-                                        );
-                                    }
-                                    rustfs_io_metrics::record_put_object_stage_duration_from(
-                                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE,
-                                        tmp_delete_started,
-                                    );
-                                    let guard_drop_started = rustfs_io_metrics::put_stage_timer();
-                                    drop(decommission_object_lock_guard);
-                                    drop(decommission_capacity_guard);
-                                    drop(artifact_put_guard);
-                                    drop(bucket_lifecycle_guard);
-                                    drop(lifecycle_snapshot);
-                                    rustfs_io_metrics::record_put_object_stage_duration_from(
-                                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DECOMMISSION_GUARD_DROP,
-                                        guard_drop_started,
-                                    );
-                                })
-                            },
-                            move |request| async move {
-                                let _ = heal_set.submit_rename_tail_heal(request, commit_write_completion).await;
-                            },
-                        ));
-                    }
-                }
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_TAIL_HANDOFF,
-                    lock_held_tail_handoff_started,
-                );
-                if !tail_owns_tmp_cleanup {
-                    drop(_decommission_capacity_guard.take());
-                }
-                #[cfg(any(test, feature = "test-util"))]
-                if rename_result.is_ok() {
-                    pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::AfterRenameHandoff).await;
-                }
-                if quota_mutation_fence && !tail_owns_tmp_cleanup {
-                    rustfs_io_metrics::record_put_object_stage_duration(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_QUOTA_FENCE_RELEASE_TRIGGERED,
-                        1.0,
-                    );
-                    let quota_fence_release_started = rustfs_io_metrics::put_stage_timer();
-                    let _ = SetDisks::release_quota_mutation_fences(
-                        &commit_disks,
-                        &quota_fence_tokens,
-                        &commit_bucket,
-                        &commit_object,
-                        write_quorum,
-                    )
-                    .await;
-                    rustfs_io_metrics::record_put_object_stage_duration_from(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_QUOTA_FENCE_RELEASE,
-                        quota_fence_release_started,
-                    );
-                } else {
-                    rustfs_io_metrics::record_put_object_stage_duration(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_QUOTA_FENCE_RELEASE_SKIPPED,
-                        1.0,
-                    );
-                }
-                if rename_result.is_ok() {
-                    let quota_commit_started = rustfs_io_metrics::put_stage_timer();
-                    quota_reservation.commit().await;
-                    rustfs_io_metrics::record_put_object_stage_duration_from(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_QUOTA_COMMIT,
-                        quota_commit_started,
-                    );
-                }
-                let rename_commit = match rename_result {
-                    Ok(commit) => commit,
-                    Err(err) => {
-                        if commit_rollback_receipt.is_incomplete() {
-                            // Incomplete undo retains the staging source and
-                            // rollback backup for recovery; cleanup is unsafe.
-                            return Err(err.into());
-                        }
                         if let Err(cleanup_err) = commit_set
                             .delete_put_tmp_with_budget(&commit_tmp_dir, &commit_cleanup_reservation)
                             .await
@@ -5804,332 +5479,665 @@ impl SetDisks {
                                 "issue3031_put_object_tmp_cleanup_done"
                             );
                         }
-                        return Err(err.into());
+                        return Err(err);
                     }
-                };
-                let online_disks = rename_commit.online_disks;
-                let op_old_dir = rename_commit.data_dir;
-                let cleanup_disks = rename_commit.cleanup_disks;
-                let old_current_size = rename_commit.old_current_size;
-                if put_tier_free_version_source.is_none()
-                    && reuse_rename_data_source_for_tier_free_version
-                    && rename_commit.old_current_source_checked
-                {
-                    put_tier_free_version_source = rename_commit
-                        .old_current_source
-                        .as_ref()
-                        .map(|source| build_get_object_info(source, &commit_bucket, &commit_object, commit_versioned));
-                }
-                let mut fi = rename_commit.committed_file_info;
-                let lock_held_post_rename_started = rustfs_io_metrics::put_stage_timer();
-                if let (Some(source), Some(free_version_id)) =
-                    (put_tier_free_version_source.as_ref(), commit_put_tier_free_version_id)
-                    && transitioned_delete_publishes_free_version(source, &fi, commit_skip_free_version)
-                {
-                    record_committed_tier_free_version_receipt_to_sink(
-                        commit_tier_free_version_receipt_sink.as_ref(),
-                        &commit_bucket,
-                        &commit_object,
-                        source,
-                        free_version_id,
-                        false,
-                    );
-                }
-
-                let repair_result = if needs_immediate_heal {
-                    rustfs_io_metrics::record_put_object_stage_duration(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_HEAL_SUBMIT_TRIGGERED,
-                        1.0,
-                    );
-                    let heal_submit_started = rustfs_io_metrics::put_stage_timer();
-                    let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
-                        commit_bucket.clone(),
-                        Some(commit_object.clone()),
-                        false,
-                        Some(HealChannelPriority::Normal),
-                        Some(commit_set.pool_index),
-                        Some(commit_set.set_index),
-                    );
-                    request.object_version_id = committed_version_id
-                        .or_else(|| commit_version_suspended.then(Uuid::nil))
-                        .map(|version_id| version_id.to_string());
-                    request.expected_bucket_incarnation_id = source_bucket_incarnation_id;
-                    let result = commit_set.submit_rename_tail_heal(request, commit_write_completion).await;
                     rustfs_io_metrics::record_put_object_stage_duration_from(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_HEAL_SUBMIT,
-                        heal_submit_started,
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_PRE_RENAME_PREPARE,
+                        lock_held_pre_rename_prepare_started,
                     );
-                    result
-                } else {
-                    rustfs_io_metrics::record_put_object_stage_duration(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_HEAL_SUBMIT_SKIPPED,
-                        1.0,
-                    );
-                    Ok(())
-                };
 
-                let rename_stage_elapsed = rename_stage_start.elapsed();
-                let rename_stage_ms = rename_stage_elapsed.as_millis() as u64;
-
-                if let Some(old_dir) = op_old_dir
-                    && Self::needs_old_data_cleanup_receipt(old_dir, committed_data_dir, transaction_epoch)
-                {
-                    rustfs_io_metrics::record_put_object_stage_duration(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_CLEANUP_RECEIPT_TRIGGERED,
-                        1.0,
-                    );
-                    let cleanup_receipt_started = rustfs_io_metrics::put_stage_timer();
-                    if commit_cleanup_reservation.is_none() {
-                        commit_set
-                            .persist_old_data_cleanup_receipts(
-                                &cleanup_disks,
+                    let tier_free_version_source_lookup_started = rustfs_io_metrics::put_stage_timer();
+                    let reuse_rename_data_source_for_tier_free_version = tier_free_version_source_reuse_rename_data_enabled()
+                        && (commit_set.tier_free_version_rename_data_source_capable()
+                            || tier_free_version_source_reuse_rename_data_assume_homogeneous_enabled());
+                    let mut put_tier_free_version_source = if commit_put_tier_free_version_id.is_some()
+                        && commit_tier_free_version_receipt_sink.is_some()
+                        && !tier_free_version_source_lookup_counterfactual_skip_enabled()
+                        && !reuse_rename_data_source_for_tier_free_version
+                    {
+                        #[cfg(feature = "diagnostic-read-version-caller")]
+                        crate::cluster::rpc::runtime_sources::observe_read_version_context_boundary(
+                            rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::TierFreeVersionSourceLookup,
+                        );
+                        match commit_set
+                            .get_object_info(
                                 &commit_bucket,
                                 &commit_object,
-                                old_dir,
-                                committed_data_dir,
-                                transaction_epoch,
+                                &ObjectOptions {
+                                    no_lock: true,
+                                    metadata_cache_safe: false,
+                                    versioned: commit_versioned,
+                                    version_suspended: commit_version_suspended,
+                                    ..Default::default()
+                                },
                             )
-                            .await;
+                            .await
+                        {
+                            Ok(source) => Some(source),
+                            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => None,
+                            Err(err) => {
+                                debug!(
+                                    event = EVENT_LIFECYCLE_TRANSITIONED_DELETE_CLEANUP_OWNER,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                                    bucket = %commit_bucket,
+                                    object = %commit_object,
+                                    error = ?err,
+                                    "Skipped opportunistic tier free-version receipt source capture"
+                                );
+                                None
+                            }
+                        }
                     } else {
-                        let cleanup_set = commit_set.clone();
-                        let receipt_disks = cleanup_disks.clone();
-                        let receipt_bucket = commit_bucket.clone();
-                        let receipt_object = commit_object.clone();
-                        cleanup_runtime::run(commit_cleanup_reservation.clone(), async move {
-                            cleanup_set
+                        None
+                    };
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_TIER_FREE_VERSION_SOURCE_LOOKUP,
+                        tier_free_version_source_lookup_started,
+                    );
+
+                    let assign_rename_indexes_started = rustfs_io_metrics::put_stage_timer();
+                    Self::assign_rename_data_indexes(&mut parts_metadatas);
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_ASSIGN_RENAME_INDEXES,
+                        assign_rename_indexes_started,
+                    );
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_POST_AWAIT_TO_RENAME,
+                        pre_rename_post_await_to_rename_started,
+                    );
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_BEFORE_RENAME,
+                        commit_before_rename_started,
+                    );
+                    let lock_held_rename_started = rustfs_io_metrics::put_stage_timer();
+                    let mut rename_result = SetDisks::rename_data_owned_with_fence(
+                        &commit_disks,
+                        (RUSTFS_META_TMP_BUCKET, commit_tmp_dir.as_str()),
+                        parts_metadatas,
+                        (&commit_bucket, &commit_object),
+                        commit_allows_early_ack,
+                        crate::set_disk::core::io_primitives::RenameDataFenceOptions::new(
+                            write_quorum,
+                            commit_scanner_publication_lease_tokens.as_ref(),
+                        )
+                        .with_artifact_put(_artifact_put_guard.as_ref().map(|guard| guard.identity))
+                        .with_publication_scope(commit_scanner_publication_scope.clone())
+                        .with_rollback_receipt(commit_rollback_receipt.clone())
+                        .with_namespace_commit_guard((!is_meta_bucketname(&commit_bucket)).then(|| {
+                            // Disk workers and rollback retain this owner even if
+                            // the rename coordinator itself fails or is cancelled.
+                            let namespace_owner = commit_set.ctx.begin_namespace_commit();
+                            Arc::new((
+                                namespace_owner,
+                                _artifact_put_guard.clone(),
+                                _bucket_lifecycle_guard.clone(),
+                                _lifecycle_snapshot.clone(),
+                            )) as Arc<dyn Send + Sync>
+                        })),
+                    )
+                    .await;
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_RENAME,
+                        lock_held_rename_started,
+                    );
+                    let commit_after_rename_to_return_started = rustfs_io_metrics::put_stage_timer();
+                    let lock_held_rename_result_to_tail_handoff_started = rustfs_io_metrics::put_stage_timer();
+                    if let Some(scope) = commit_scanner_publication_scope.as_ref() {
+                        if rename_result.is_ok() {
+                            let _ = scope.mark_committed();
+                        } else {
+                            let _ = scope.mark_indeterminate();
+                        }
+                    }
+                    #[cfg(any(test, feature = "test-util"))]
+                    if rename_result.is_ok() {
+                        pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::AfterRenameQuorum).await;
+                    }
+                    let mut rename_guard_release = None;
+                    let mut needs_immediate_heal = false;
+                    let mut tail_owns_tmp_cleanup = false;
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_RENAME_RESULT_TO_TAIL_HANDOFF,
+                        lock_held_rename_result_to_tail_handoff_started,
+                    );
+                    let lock_held_tail_handoff_started = rustfs_io_metrics::put_stage_timer();
+                    if let Ok(rename_commit) = rename_result.as_mut() {
+                        commit_set.observe_tier_free_version_rename_data_source_capability(
+                            rename_commit.tail_drain.is_none() && rename_commit.old_current_source_all_successful_checked,
+                        );
+                        commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &rename_commit.capacity_disks);
+                        // Install the tail watcher before any post-commit await. The
+                        // latch keeps namespace guards through their prior handoff point.
+                        needs_immediate_heal = rename_commit.needs_immediate_heal();
+                        if let Some(rename_tail_drain) = rename_commit.tail_drain.take() {
+                            tail_owns_tmp_cleanup = true;
+                            let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
+                                commit_bucket.clone(),
+                                Some(commit_object.clone()),
+                                false,
+                                Some(HealChannelPriority::Normal),
+                                Some(commit_set.pool_index),
+                                Some(commit_set.set_index),
+                            );
+                            request.object_version_id = committed_version_id
+                                .or_else(|| commit_version_suspended.then(Uuid::nil))
+                                .map(|version_id| version_id.to_string());
+                            request.expected_bucket_incarnation_id = source_bucket_incarnation_id;
+                            let object_lock_guard = _object_lock_guard.take();
+                            let publication_guard = _publication_guard.take();
+                            let bucket_lifecycle_guard = _bucket_lifecycle_guard.take();
+                            let artifact_put_guard = _artifact_put_guard.take();
+                            let lifecycle_snapshot = _lifecycle_snapshot.take();
+                            let decommission_object_lock_guard = _decommission_object_lock_guard.take();
+                            let decommission_capacity_guard = _decommission_capacity_guard.take();
+                            let cleanup_bucket = commit_bucket.clone();
+                            let cleanup_object = commit_object.clone();
+                            let heal_set = commit_set.clone();
+                            let cleanup_set = commit_set.clone();
+                            let cleanup_tmp_dir = commit_tmp_dir.clone();
+                            let fence_disks = commit_disks.clone();
+                            let fence_tokens = quota_fence_tokens.clone();
+                            let fence_bucket = commit_bucket.clone();
+                            let fence_object = commit_object.clone();
+                            let (guard_release_tx, guard_release_rx) = tokio::sync::oneshot::channel();
+                            rename_guard_release = Some(guard_release_tx);
+                            let cleanup_reservation = commit_cleanup_reservation.clone();
+                            tokio::spawn(finish_rename_tail_heal(
+                                rename_tail_drain,
+                                guard_release_rx,
+                                (
+                                    object_lock_guard,
+                                    write_context,
+                                    publication_guard,
+                                    bucket_lifecycle_guard,
+                                    artifact_put_guard,
+                                    lifecycle_snapshot,
+                                    decommission_object_lock_guard,
+                                    decommission_capacity_guard,
+                                ),
+                                request,
+                                move || async move {
+                                    if quota_mutation_fence {
+                                        let _ = SetDisks::release_quota_mutation_fences(
+                                            &fence_disks,
+                                            &fence_tokens,
+                                            &fence_bucket,
+                                            &fence_object,
+                                            write_quorum,
+                                        )
+                                        .await;
+                                    }
+                                },
+                                move |(
+                                    object_lock_guard,
+                                    write_context,
+                                    publication_guard,
+                                    bucket_lifecycle_guard,
+                                    artifact_put_guard,
+                                    lifecycle_snapshot,
+                                    decommission_object_lock_guard,
+                                    decommission_capacity_guard,
+                                ),
+                                      targets| {
+                                    drop(object_lock_guard);
+                                    drop(write_context);
+                                    drop(publication_guard);
+                                    cleanup_runtime::run(cleanup_reservation, async move {
+                                        let zero_target_cleanup = targets.is_empty();
+                                        rustfs_io_metrics::record_put_object_stage_duration(
+                                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_COUNT,
+                                            targets.len() as f64,
+                                        );
+                                        if zero_target_cleanup {
+                                            rustfs_io_metrics::record_put_object_stage_duration(
+                                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_ZERO_TARGET,
+                                                1.0,
+                                            );
+                                        }
+                                        cleanup_set
+                                            .cleanup_rename_tail(
+                                                targets,
+                                                &cleanup_bucket,
+                                                &cleanup_object,
+                                                committed_data_dir,
+                                                transaction_epoch,
+                                            )
+                                            .await;
+                                        let tmp_delete_started = rustfs_io_metrics::put_stage_timer();
+                                        if zero_target_cleanup && rename_tail_cleanup_zero_target_tmp_delete_skip_enabled() {
+                                            rustfs_io_metrics::record_put_object_stage_duration(
+                                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE_COUNTERFACTUAL_SKIP,
+                                            1.0,
+                                        );
+                                        } else if let Err(err) =
+                                            cleanup_set.delete_all(RUSTFS_META_TMP_BUCKET, &cleanup_tmp_dir).await
+                                        {
+                                            warn!(tmp_dir = %cleanup_tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
+                                        } else if issue3031_diag_enabled() {
+                                            warn!(
+                                                target: "rustfs_ecstore::set_disk",
+                                                tmp_dir = %cleanup_tmp_dir,
+                                                "issue3031_put_object_tmp_cleanup_done"
+                                            );
+                                        }
+                                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE,
+                                            tmp_delete_started,
+                                        );
+                                        let guard_drop_started = rustfs_io_metrics::put_stage_timer();
+                                        drop(decommission_object_lock_guard);
+                                        drop(decommission_capacity_guard);
+                                        drop(artifact_put_guard);
+                                        drop(bucket_lifecycle_guard);
+                                        drop(lifecycle_snapshot);
+                                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DECOMMISSION_GUARD_DROP,
+                                            guard_drop_started,
+                                        );
+                                    })
+                                },
+                                move |request| async move {
+                                    let _ = heal_set.submit_rename_tail_heal(request, commit_write_completion).await;
+                                },
+                            ));
+                        }
+                    }
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_TAIL_HANDOFF,
+                        lock_held_tail_handoff_started,
+                    );
+                    if !tail_owns_tmp_cleanup {
+                        drop(_decommission_capacity_guard.take());
+                    }
+                    #[cfg(any(test, feature = "test-util"))]
+                    if rename_result.is_ok() {
+                        pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::AfterRenameHandoff).await;
+                    }
+                    if quota_mutation_fence && !tail_owns_tmp_cleanup {
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_QUOTA_FENCE_RELEASE_TRIGGERED,
+                            1.0,
+                        );
+                        let quota_fence_release_started = rustfs_io_metrics::put_stage_timer();
+                        let _ = SetDisks::release_quota_mutation_fences(
+                            &commit_disks,
+                            &quota_fence_tokens,
+                            &commit_bucket,
+                            &commit_object,
+                            write_quorum,
+                        )
+                        .await;
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_QUOTA_FENCE_RELEASE,
+                            quota_fence_release_started,
+                        );
+                    } else {
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_QUOTA_FENCE_RELEASE_SKIPPED,
+                            1.0,
+                        );
+                    }
+                    if rename_result.is_ok() {
+                        let quota_commit_started = rustfs_io_metrics::put_stage_timer();
+                        quota_reservation.commit().await;
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_QUOTA_COMMIT,
+                            quota_commit_started,
+                        );
+                    }
+                    let rename_commit = match rename_result {
+                        Ok(commit) => commit,
+                        Err(err) => {
+                            if commit_rollback_receipt.is_incomplete() {
+                                // Incomplete undo retains the staging source and
+                                // rollback backup for recovery; cleanup is unsafe.
+                                return Err(err.into());
+                            }
+                            if let Err(cleanup_err) = commit_set
+                                .delete_put_tmp_with_budget(&commit_tmp_dir, &commit_cleanup_reservation)
+                                .await
+                            {
+                                warn!(tmp_dir = %commit_tmp_dir, error = ?cleanup_err, "failed to cleanup put_object temporary data");
+                            } else if issue3031_diag_enabled() {
+                                warn!(
+                                    target: "rustfs_ecstore::set_disk",
+                                    bucket = %commit_bucket,
+                                    object = %commit_object,
+                                    tmp_dir = %commit_tmp_dir,
+                                    "issue3031_put_object_tmp_cleanup_done"
+                                );
+                            }
+                            return Err(err.into());
+                        }
+                    };
+                    let online_disks = rename_commit.online_disks;
+                    let op_old_dir = rename_commit.data_dir;
+                    let cleanup_disks = rename_commit.cleanup_disks;
+                    let old_current_size = rename_commit.old_current_size;
+                    if put_tier_free_version_source.is_none()
+                        && reuse_rename_data_source_for_tier_free_version
+                        && rename_commit.old_current_source_checked
+                    {
+                        put_tier_free_version_source = rename_commit
+                            .old_current_source
+                            .as_ref()
+                            .map(|source| build_get_object_info(source, &commit_bucket, &commit_object, commit_versioned));
+                    }
+                    let mut fi = rename_commit.committed_file_info;
+                    let lock_held_post_rename_started = rustfs_io_metrics::put_stage_timer();
+                    if let (Some(source), Some(free_version_id)) =
+                        (put_tier_free_version_source.as_ref(), commit_put_tier_free_version_id)
+                        && transitioned_delete_publishes_free_version(source, &fi, commit_skip_free_version)
+                    {
+                        record_committed_tier_free_version_receipt_to_sink(
+                            commit_tier_free_version_receipt_sink.as_ref(),
+                            &commit_bucket,
+                            &commit_object,
+                            source,
+                            free_version_id,
+                            false,
+                        );
+                    }
+
+                    let repair_result = if needs_immediate_heal {
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_HEAL_SUBMIT_TRIGGERED,
+                            1.0,
+                        );
+                        let heal_submit_started = rustfs_io_metrics::put_stage_timer();
+                        let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
+                            commit_bucket.clone(),
+                            Some(commit_object.clone()),
+                            false,
+                            Some(HealChannelPriority::Normal),
+                            Some(commit_set.pool_index),
+                            Some(commit_set.set_index),
+                        );
+                        request.object_version_id = committed_version_id
+                            .or_else(|| commit_version_suspended.then(Uuid::nil))
+                            .map(|version_id| version_id.to_string());
+                        request.expected_bucket_incarnation_id = source_bucket_incarnation_id;
+                        let result = commit_set.submit_rename_tail_heal(request, commit_write_completion).await;
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_HEAL_SUBMIT,
+                            heal_submit_started,
+                        );
+                        result
+                    } else {
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_HEAL_SUBMIT_SKIPPED,
+                            1.0,
+                        );
+                        Ok(())
+                    };
+
+                    let rename_stage_elapsed = rename_stage_start.elapsed();
+                    let rename_stage_ms = rename_stage_elapsed.as_millis() as u64;
+
+                    if let Some(old_dir) = op_old_dir
+                        && Self::needs_old_data_cleanup_receipt(old_dir, committed_data_dir, transaction_epoch)
+                    {
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_CLEANUP_RECEIPT_TRIGGERED,
+                            1.0,
+                        );
+                        let cleanup_receipt_started = rustfs_io_metrics::put_stage_timer();
+                        if commit_cleanup_reservation.is_none() {
+                            commit_set
                                 .persist_old_data_cleanup_receipts(
-                                    &receipt_disks,
-                                    &receipt_bucket,
-                                    &receipt_object,
+                                    &cleanup_disks,
+                                    &commit_bucket,
+                                    &commit_object,
                                     old_dir,
                                     committed_data_dir,
                                     transaction_epoch,
                                 )
                                 .await;
-                        })
-                        .await;
-                    }
-                    rustfs_io_metrics::record_put_object_stage_duration_from(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_CLEANUP_RECEIPT,
-                        cleanup_receipt_started,
-                    );
-                } else {
-                    rustfs_io_metrics::record_put_object_stage_duration(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_CLEANUP_RECEIPT_SKIPPED,
-                        1.0,
-                    );
-                }
-
-                let metadata_invalidate_started = rustfs_io_metrics::put_stage_timer();
-                commit_set
-                    .invalidate_get_object_metadata_cache(&commit_bucket, &commit_object)
-                    .await;
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_METADATA_INVALIDATE,
-                    metadata_invalidate_started,
-                );
-
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_POST_RENAME,
-                    lock_held_post_rename_started,
-                );
-                let lock_held_guard_release_started = rustfs_io_metrics::put_stage_timer();
-                if let Some(release) = rename_guard_release.take() {
-                    let _ = release.send(true);
-                }
-                // The exact old-data-dir reclamation below is best-effort space
-                // cleanup; it must not serialize the next operation on this object.
-                drop(_object_lock_guard.take());
-                drop(_publication_guard.take());
-                drop(_bucket_lifecycle_guard.take());
-                rustfs_io_metrics::record_put_object_stage_duration_from(
-                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_GUARD_RELEASE,
-                    lock_held_guard_release_started,
-                );
-
-                rustfs_io_metrics::record_put_object_stage_duration("set_disk_rename", duration_millis_f64(rename_stage_elapsed));
-                if (rename_stage_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
-                    warn!(
-                        event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_SET_DISK,
-                        stage = "rename_data",
-                        bucket = %commit_bucket,
-                        object = %commit_object,
-                        tmp_dir = %commit_tmp_dir,
-                        duration_ms = { rename_stage_ms },
-                        write_quorum,
-                        state = "slow",
-                        "SetDisk commit tail stage is slow"
-                    );
-                }
-
-                let mut cleanup_stage_ms: Option<u64> = None;
-                if let Some(old_dir) = op_old_dir {
-                    let committed_dir = committed_data_dir.unwrap_or_default().to_string();
-                    let cleanup_stage_start = Instant::now();
-                    // backlog#898: reclaiming the dereferenced old data dir is
-                    // best-effort and returns a receipt (never `Err`). A failed GC
-                    // here must not negate an already-committed, durable write, so we
-                    // deliberately do NOT `?`-propagate it into a 503. On residue the
-                    // report path emits the leak metric and enqueues a heal.
-                    if commit_cleanup_reservation.is_none() {
-                        let cleanup = commit_set
-                            .commit_rename_data_dir_and_mark_capacity(
-                                &cleanup_disks,
-                                &commit_bucket,
-                                &commit_object,
-                                &old_dir.to_string(),
-                                &committed_dir,
-                                write_quorum,
-                            )
+                        } else {
+                            let cleanup_set = commit_set.clone();
+                            let receipt_disks = cleanup_disks.clone();
+                            let receipt_bucket = commit_bucket.clone();
+                            let receipt_object = commit_object.clone();
+                            cleanup_runtime::run(commit_cleanup_reservation.clone(), async move {
+                                cleanup_set
+                                    .persist_old_data_cleanup_receipts(
+                                        &receipt_disks,
+                                        &receipt_bucket,
+                                        &receipt_object,
+                                        old_dir,
+                                        committed_data_dir,
+                                        transaction_epoch,
+                                    )
+                                    .await;
+                            })
                             .await;
-                        commit_set
-                            .report_old_data_dir_cleanup(&commit_bucket, &commit_object, &old_dir.to_string(), &cleanup)
-                            .await;
+                        }
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_CLEANUP_RECEIPT,
+                            cleanup_receipt_started,
+                        );
                     } else {
-                        let cleanup_set = commit_set.clone();
-                        let cleanup_bucket = commit_bucket.clone();
-                        let cleanup_object = commit_object.clone();
-                        cleanup_runtime::run(commit_cleanup_reservation.clone(), async move {
-                            let cleanup = cleanup_set
-                                .commit_rename_data_dir_and_mark_capacity(
-                                    &cleanup_disks,
-                                    &cleanup_bucket,
-                                    &cleanup_object,
-                                    &old_dir.to_string(),
-                                    &committed_dir,
-                                    write_quorum,
-                                )
-                                .await;
-                            cleanup_set
-                                .report_old_data_dir_cleanup(&cleanup_bucket, &cleanup_object, &old_dir.to_string(), &cleanup)
-                                .await;
-                        })
-                        .await;
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_CLEANUP_RECEIPT_SKIPPED,
+                            1.0,
+                        );
                     }
-                    let cleanup_elapsed = cleanup_stage_start.elapsed();
-                    let cleanup_ms = cleanup_elapsed.as_millis() as u64;
-                    cleanup_stage_ms = Some(cleanup_ms);
-                    rustfs_io_metrics::record_put_object_stage_duration(
-                        "set_disk_old_data_cleanup",
-                        duration_millis_f64(cleanup_elapsed),
+
+                    let metadata_invalidate_started = rustfs_io_metrics::put_stage_timer();
+                    commit_set
+                        .invalidate_get_object_metadata_cache(&commit_bucket, &commit_object)
+                        .await;
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_METADATA_INVALIDATE,
+                        metadata_invalidate_started,
                     );
-                    if (cleanup_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
+
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_POST_RENAME,
+                        lock_held_post_rename_started,
+                    );
+                    let lock_held_guard_release_started = rustfs_io_metrics::put_stage_timer();
+                    if let Some(release) = rename_guard_release.take() {
+                        let _ = release.send(true);
+                    }
+                    // The exact old-data-dir reclamation below is best-effort space
+                    // cleanup; it must not serialize the next operation on this object.
+                    drop(_object_lock_guard.take());
+                    drop(_publication_guard.take());
+                    drop(_bucket_lifecycle_guard.take());
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_GUARD_RELEASE,
+                        lock_held_guard_release_started,
+                    );
+
+                    rustfs_io_metrics::record_put_object_stage_duration(
+                        "set_disk_rename",
+                        duration_millis_f64(rename_stage_elapsed),
+                    );
+                    if (rename_stage_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
                         warn!(
                             event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
                             component = LOG_COMPONENT_ECSTORE,
                             subsystem = LOG_SUBSYSTEM_SET_DISK,
-                            stage = "commit_rename_data_dir",
+                            stage = "rename_data",
                             bucket = %commit_bucket,
                             object = %commit_object,
                             tmp_dir = %commit_tmp_dir,
-                            old_dir = %old_dir,
-                            duration_ms = cleanup_ms,
+                            duration_ms = { rename_stage_ms },
                             write_quorum,
                             state = "slow",
                             "SetDisk commit tail stage is slow"
                         );
                     }
-                }
-                if is_compressed {
-                    record_compression_total_memory(actual_size as u64, w_size as u64).await;
-                }
-                fi.replication_state_internal = Some(commit_replication_state);
 
-                fi.is_latest = true;
-
-                if issue3031_diag_enabled() {
-                    let online_success_count = online_disks.iter().filter(|disk| disk.is_some()).count();
-                    warn!(
-                        target: "rustfs_ecstore::set_disk",
-                        bucket = %commit_bucket,
-                        object = %commit_object,
-                        tmp_dir = %commit_tmp_dir,
-                        data_dir = ?fi.data_dir,
-                        write_quorum,
-                        online_success_count,
-                        op_old_dir = ?op_old_dir,
-                        "issue3031_put_object_commit_succeeded"
-                    );
-                }
-
-                let total_commit_tail_ms = rename_stage_start.elapsed().as_millis();
-                if total_commit_tail_ms >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
-                    warn!(
-                        event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_SET_DISK,
-                        stage = "put_object_commit_tail",
-                        bucket = %commit_bucket,
-                        object = %commit_object,
-                        tmp_dir = %commit_tmp_dir,
-                        duration_ms = total_commit_tail_ms as u64,
-                        write_quorum,
-                        state = "slow",
-                        "SetDisk commit tail is slow"
-                    );
-                }
-
-                if issue3031_diag_enabled() {
-                    warn!(
-                        event = EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_SET_DISK,
-                        result = if repair_result.is_ok() { "success" } else { "repair_required" },
-                        bucket = %commit_bucket,
-                        object = %commit_object,
-                        write_quorum,
-                        write_path = commit_write_path_label,
-                        writer_setup_ms,
-                        encode_ms,
-                        rename_ms = rename_stage_ms,
-                        cleanup_ms = cleanup_stage_ms.unwrap_or_default(),
-                        cleanup_present = cleanup_stage_ms.is_some(),
-                        commit_tail_ms = total_commit_tail_ms as u64,
-                        "SetDisk put_object stage summary"
-                    );
-                }
-
-                if !tail_owns_tmp_cleanup {
-                    let cleanup_set = commit_set.clone();
-                    let cleanup_tmp_dir = commit_tmp_dir.clone();
-                    cleanup_runtime::spawn(commit_cleanup_reservation.clone(), async move {
-                        if let Err(err) = cleanup_set.delete_all(RUSTFS_META_TMP_BUCKET, &cleanup_tmp_dir).await {
-                            warn!(tmp_dir = %cleanup_tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
-                        } else if issue3031_diag_enabled() {
+                    let mut cleanup_stage_ms: Option<u64> = None;
+                    if let Some(old_dir) = op_old_dir {
+                        let committed_dir = committed_data_dir.unwrap_or_default().to_string();
+                        let cleanup_stage_start = Instant::now();
+                        // backlog#898: reclaiming the dereferenced old data dir is
+                        // best-effort and returns a receipt (never `Err`). A failed GC
+                        // here must not negate an already-committed, durable write, so we
+                        // deliberately do NOT `?`-propagate it into a 503. On residue the
+                        // report path emits the leak metric and enqueues a heal.
+                        if commit_cleanup_reservation.is_none() {
+                            let cleanup = commit_set
+                                .commit_rename_data_dir_and_mark_capacity(
+                                    &cleanup_disks,
+                                    &commit_bucket,
+                                    &commit_object,
+                                    &old_dir.to_string(),
+                                    &committed_dir,
+                                    write_quorum,
+                                )
+                                .await;
+                            commit_set
+                                .report_old_data_dir_cleanup(&commit_bucket, &commit_object, &old_dir.to_string(), &cleanup)
+                                .await;
+                        } else {
+                            let cleanup_set = commit_set.clone();
+                            let cleanup_bucket = commit_bucket.clone();
+                            let cleanup_object = commit_object.clone();
+                            cleanup_runtime::run(commit_cleanup_reservation.clone(), async move {
+                                let cleanup = cleanup_set
+                                    .commit_rename_data_dir_and_mark_capacity(
+                                        &cleanup_disks,
+                                        &cleanup_bucket,
+                                        &cleanup_object,
+                                        &old_dir.to_string(),
+                                        &committed_dir,
+                                        write_quorum,
+                                    )
+                                    .await;
+                                cleanup_set
+                                    .report_old_data_dir_cleanup(&cleanup_bucket, &cleanup_object, &old_dir.to_string(), &cleanup)
+                                    .await;
+                            })
+                            .await;
+                        }
+                        let cleanup_elapsed = cleanup_stage_start.elapsed();
+                        let cleanup_ms = cleanup_elapsed.as_millis() as u64;
+                        cleanup_stage_ms = Some(cleanup_ms);
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            "set_disk_old_data_cleanup",
+                            duration_millis_f64(cleanup_elapsed),
+                        );
+                        if (cleanup_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
                             warn!(
-                                target: "rustfs_ecstore::set_disk",
-                                tmp_dir = %cleanup_tmp_dir,
-                                "issue3031_put_object_tmp_cleanup_done"
+                                event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                                stage = "commit_rename_data_dir",
+                                bucket = %commit_bucket,
+                                object = %commit_object,
+                                tmp_dir = %commit_tmp_dir,
+                                old_dir = %old_dir,
+                                duration_ms = cleanup_ms,
+                                write_quorum,
+                                state = "slow",
+                                "SetDisk commit tail stage is slow"
                             );
                         }
-                    });
-                }
+                    }
+                    if is_compressed {
+                        record_compression_total_memory(actual_size as u64, w_size as u64).await;
+                    }
+                    fi.replication_state_internal = Some(commit_replication_state);
 
-                let completion = repair_result.map(|()| {
-                    let object_info_build_started = rustfs_io_metrics::put_stage_timer();
-                    let object_info = ObjectInfo::from_file_info(&fi, &commit_bucket, &commit_object, commit_is_versioned);
-                    rustfs_io_metrics::record_put_object_stage_duration_from(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_OBJECT_INFO_BUILD,
-                        object_info_build_started,
-                    );
-                    let post_object_info_to_return_started = rustfs_io_metrics::put_stage_timer();
-                    rustfs_io_metrics::record_put_object_stage_duration_from(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_POST_OBJECT_INFO_TO_RETURN,
-                        post_object_info_to_return_started,
-                    );
-                    rustfs_io_metrics::record_put_object_stage_duration_from(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_AFTER_RENAME_TO_RETURN,
-                        commit_after_rename_to_return_started,
-                    );
-                    rustfs_io_metrics::record_put_object_stage_duration_from(
-                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL,
-                        commit_closure_total_started,
-                    );
-                    (object_info, old_current_size)
-                });
-                Ok(CommittedPutOutcome { completion })
+                    fi.is_latest = true;
+
+                    if issue3031_diag_enabled() {
+                        let online_success_count = online_disks.iter().filter(|disk| disk.is_some()).count();
+                        warn!(
+                            target: "rustfs_ecstore::set_disk",
+                            bucket = %commit_bucket,
+                            object = %commit_object,
+                            tmp_dir = %commit_tmp_dir,
+                            data_dir = ?fi.data_dir,
+                            write_quorum,
+                            online_success_count,
+                            op_old_dir = ?op_old_dir,
+                            "issue3031_put_object_commit_succeeded"
+                        );
+                    }
+
+                    let total_commit_tail_ms = rename_stage_start.elapsed().as_millis();
+                    if total_commit_tail_ms >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
+                        warn!(
+                            event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_SET_DISK,
+                            stage = "put_object_commit_tail",
+                            bucket = %commit_bucket,
+                            object = %commit_object,
+                            tmp_dir = %commit_tmp_dir,
+                            duration_ms = total_commit_tail_ms as u64,
+                            write_quorum,
+                            state = "slow",
+                            "SetDisk commit tail is slow"
+                        );
+                    }
+
+                    if issue3031_diag_enabled() {
+                        warn!(
+                            event = EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_SET_DISK,
+                            result = if repair_result.is_ok() { "success" } else { "repair_required" },
+                            bucket = %commit_bucket,
+                            object = %commit_object,
+                            write_quorum,
+                            write_path = commit_write_path_label,
+                            writer_setup_ms,
+                            encode_ms,
+                            rename_ms = rename_stage_ms,
+                            cleanup_ms = cleanup_stage_ms.unwrap_or_default(),
+                            cleanup_present = cleanup_stage_ms.is_some(),
+                            commit_tail_ms = total_commit_tail_ms as u64,
+                            "SetDisk put_object stage summary"
+                        );
+                    }
+
+                    if !tail_owns_tmp_cleanup {
+                        let cleanup_set = commit_set.clone();
+                        let cleanup_tmp_dir = commit_tmp_dir.clone();
+                        cleanup_runtime::spawn(commit_cleanup_reservation.clone(), async move {
+                            if let Err(err) = cleanup_set.delete_all(RUSTFS_META_TMP_BUCKET, &cleanup_tmp_dir).await {
+                                warn!(tmp_dir = %cleanup_tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
+                            } else if issue3031_diag_enabled() {
+                                warn!(
+                                    target: "rustfs_ecstore::set_disk",
+                                    tmp_dir = %cleanup_tmp_dir,
+                                    "issue3031_put_object_tmp_cleanup_done"
+                                );
+                            }
+                        });
+                    }
+
+                    let completion = repair_result.map(|()| {
+                        let object_info_build_started = rustfs_io_metrics::put_stage_timer();
+                        let object_info = ObjectInfo::from_file_info(&fi, &commit_bucket, &commit_object, commit_is_versioned);
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_OBJECT_INFO_BUILD,
+                            object_info_build_started,
+                        );
+                        let post_object_info_to_return_started = rustfs_io_metrics::put_stage_timer();
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_POST_OBJECT_INFO_TO_RETURN,
+                            post_object_info_to_return_started,
+                        );
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_AFTER_RENAME_TO_RETURN,
+                            commit_after_rename_to_return_started,
+                        );
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL,
+                            commit_closure_total_started,
+                        );
+                        (object_info, old_current_size)
+                    });
+                    Ok(CommittedPutOutcome { completion })
+                })
             };
 
             if let Some(handoff) = commit_cancellation_handoff_tx.take() {
@@ -6154,7 +6162,7 @@ impl SetDisks {
                     rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::PutCommitOwner,
                 );
                 let result = tokio::spawn(async move {
-                    let commit = Box::pin(commit(commit_submit_to_closure_enter_started, Some(child_token)));
+                    let commit = commit(commit_submit_to_closure_enter_started, Some(child_token));
                     #[cfg(feature = "diagnostic-read-version-caller")]
                     return crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
                         diagnostic_context,
@@ -6180,7 +6188,7 @@ impl SetDisks {
             } else {
                 let commit_task_wait_started = rustfs_io_metrics::put_stage_timer();
                 let commit_submit_to_closure_enter_started = rustfs_io_metrics::put_stage_timer();
-                let result = Box::pin(commit(commit_submit_to_closure_enter_started, None)).await;
+                let result = commit(commit_submit_to_closure_enter_started, None).await;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_TASK_WAIT,
                     commit_task_wait_started,
