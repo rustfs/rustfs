@@ -17,7 +17,8 @@
 //! when PublicAccessBlock configuration is missing or explicitly set.
 
 use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
-use aws_sdk_s3::types::PublicAccessBlockConfiguration;
+use crate::sts_query_compat_test::{OPA_AUTH_TOKEN, OpaMock};
+use aws_sdk_s3::types::{PublicAccessBlockConfiguration, Tag, Tagging};
 use tracing::info;
 
 async fn setup_public_bucket(
@@ -67,6 +68,98 @@ async fn anonymous_get_object(
 ) -> Result<reqwest::Response, reqwest::Error> {
     let url = format!("{}/{}/{}", env.url, bucket_name, key);
     local_http_client().get(&url).send().await
+}
+
+#[tokio::test]
+async fn test_plain_http_matches_secure_transport_false_bucket_policy() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    assert!(env.url.starts_with("http://"), "fixture must exercise plaintext HTTP: {}", env.url);
+
+    let bucket = "secure-transport-policy";
+    let key = "plain-http.txt";
+    let admin = env.create_s3_client();
+    admin.create_bucket().bucket(bucket).send().await?;
+    admin
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"plain http"))
+        .send()
+        .await?;
+    admin
+        .put_bucket_policy()
+        .bucket(bucket)
+        .policy(
+            serde_json::json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:GetObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                    "Condition": {"Bool": {"aws:SecureTransport": "false"}}
+                }]
+            })
+            .to_string(),
+        )
+        .send()
+        .await?;
+
+    let response = anonymous_get_object(&env, bucket, key).await?;
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.bytes().await?.as_ref(), b"plain http");
+    Ok(())
+}
+
+/// Root credentials have no attached IAM policy, so these requests depend on
+/// the owner flag reaching policy evaluation unchanged.
+#[tokio::test]
+async fn test_root_requests_keep_policy_owner_flag() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let opa = OpaMock::start().await?;
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(
+        vec![],
+        &[
+            ("RUSTFS_POLICY_PLUGIN_URL", opa.url.as_str()),
+            ("RUSTFS_POLICY_PLUGIN_AUTH_TOKEN", OPA_AUTH_TOKEN),
+        ],
+    )
+    .await?;
+
+    let bucket = "root-owner-flag";
+    let key = "owner.txt";
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"owner access"))
+        .send()
+        .await?;
+
+    // Duplicate stored tags are ambiguous. An owner request must not enter the
+    // OPA tag-loading path, which rejects this metadata before evaluation.
+    client
+        .put_bucket_tagging()
+        .bucket(bucket)
+        .tagging(
+            Tagging::builder()
+                .tag_set(Tag::builder().key("department").value("finance").build()?)
+                .tag_set(Tag::builder().key("department").value("engineering").build()?)
+                .build()?,
+        )
+        .send()
+        .await?;
+    let object = client.get_object().bucket(bucket).key(key).send().await?;
+
+    assert_eq!(object.body.collect().await?.into_bytes().as_ref(), b"owner access");
+    Ok(())
 }
 
 /// Issue #2036: Anonymous GetObject should succeed when bucket policy allows it

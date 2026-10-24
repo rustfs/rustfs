@@ -15,12 +15,15 @@
 use super::ObjectOptions;
 use super::ecfs::FS;
 use super::{ECStore, PolicySys, ReplicationStatusType, StorageError, get_lock_acquire_timeout, is_err_bucket_not_found};
+use crate::auth::facts::{
+    AuthzFacts, AuthzPrincipal, AuthzTarget, base_conditions, build_args, build_conditions, forward_secret_headers,
+};
 use crate::auth::{
     AuthType, OBJECT_CREATION_OPERATION_CONDITION, OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION,
     RUSTFS_MAX_CONTENT_LENGTH_QUERY, RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY, VerifiedPresignedRequest, VerifiedSigV4Request,
-    check_key_valid_with_context, get_condition_values_with_client_info, get_condition_values_with_query_and_client_info,
-    get_request_auth_type_with_query, get_session_token, parse_presigned_multipart_max_total_object_size,
-    parse_presigned_put_max_content_length, reject_unsigned_amz_headers_on_sigv4_request,
+    check_key_valid_with_context, get_condition_values_with_client_info, get_request_auth_type_with_query, get_session_token,
+    parse_presigned_multipart_max_total_object_size, parse_presigned_put_max_content_length,
+    reject_unsigned_amz_headers_on_sigv4_request,
 };
 use crate::error::{ApiError, normalize_put_read_quorum_error};
 use crate::license::license_check;
@@ -62,7 +65,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::OnceLock;
 use time::OffsetDateTime;
-use url::{Url, form_urlencoded};
+use url::Url;
 
 const EVENT_OBJECT_TAG_AUTHORIZATION: &str = "object_tag_authorization";
 const LOG_COMPONENT_ACCESS: &str = "storage_access";
@@ -886,30 +889,6 @@ fn action_tag_metric_label(action: &Action) -> &'static str {
     }
 }
 
-fn merge_list_bucket_query_conditions(action: Action, query: Option<&str>, conditions: &mut HashMap<String, Vec<String>>) {
-    if !matches!(
-        action,
-        Action::S3Action(
-            S3Action::ListBucketAction | S3Action::ListBucketVersionsAction | S3Action::ListBucketMultipartUploadsAction
-        )
-    ) {
-        return;
-    }
-
-    let Some(query) = query else {
-        return;
-    };
-
-    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
-        match key.as_ref() {
-            "prefix" | "delimiter" | "max-keys" => {
-                conditions.entry(key.into_owned()).or_default().push(value.into_owned());
-            }
-            _ => {}
-        }
-    }
-}
-
 fn merge_request_object_tag_conditions(
     action: Action,
     headers: &HeaderMap,
@@ -938,42 +917,53 @@ fn merge_request_object_tag_conditions(
     Ok(())
 }
 
+/// The request facts of `req` for an authorization decision about `target`, read now.
+fn request_authz_facts<T>(req: &S3Request<T>, mut target: AuthzTarget<'_>) -> AuthzFacts {
+    if target.action != Action::S3Action(S3Action::CreateBucketAction) {
+        target.location_constraint = None;
+    }
+    AuthzFacts::from_request_parts(
+        &req.headers,
+        req.uri.query(),
+        req.extensions
+            .get::<Option<RemoteAddr>>()
+            .and_then(|addr| addr.as_ref().map(|addr| addr.0)),
+        req.extensions.get::<rustfs_trusted_proxies::ClientInfo>(),
+        target,
+        OffsetDateTime::now_utc(),
+    )
+}
+
+/// The root access key a principal is compared against to be the `Account`.
+fn root_access_key() -> String {
+    runtime_sources::current_action_credentials()
+        .map(|root| root.access_key)
+        .unwrap_or_default()
+}
+
 fn authorization_conditions<T>(
     req: &S3Request<T>,
-    cred: &rustfs_credentials::Credentials,
-    version_id: Option<&str>,
-    location_constraint: Option<String>,
-    remote_addr: Option<std::net::SocketAddr>,
-    client_info: Option<&ClientInfo>,
-    action: Action,
+    principal: &AuthzPrincipal<'_>,
+    facts: &AuthzFacts,
 ) -> S3Result<HashMap<String, Vec<String>>> {
-    let mut conditions = get_condition_values_with_query_and_client_info(
-        &req.headers,
-        cred,
-        version_id,
-        None,
-        remote_addr,
-        req.uri.query(),
-        client_info,
-    );
     let internal_object_authorization = req.extensions.get::<InternalObjectAuthorization>().is_some();
+    let mut conditions = if internal_object_authorization {
+        base_conditions(principal, facts)
+    } else {
+        build_conditions(principal, facts)
+    };
+    forward_secret_headers(&req.headers, &mut conditions);
     if internal_object_authorization {
-        retain_internal_object_authorization_conditions(&mut conditions, cred);
+        retain_internal_object_authorization_conditions(&mut conditions, principal.claims());
     }
-    if action == Action::S3Action(S3Action::PutObjectAction) {
+    if facts.action() == Action::S3Action(S3Action::PutObjectAction) {
         let creates_object = internal_object_authorization || req.extensions.get::<MultipartStagingOperation>().is_none();
-        conditions.insert(OBJECT_CREATION_OPERATION_CONDITION.to_string(), vec![creates_object.to_string()]);
+        conditions.insert(OBJECT_CREATION_OPERATION_CONDITION.to_owned(), vec![creates_object.to_string()]);
     }
     if internal_object_authorization {
         return Ok(conditions);
     }
-    if action == Action::S3Action(S3Action::CreateBucketAction)
-        && let Some(location) = location_constraint
-    {
-        conditions.insert("LocationConstraint".to_string(), vec![location]);
-    }
-    merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
-    merge_request_object_tag_conditions(action, &req.headers, &mut conditions)?;
+    merge_request_object_tag_conditions(facts.action(), &req.headers, &mut conditions)?;
     if let Some(RequestedObjectLockRetention(retention)) = req.extensions.get::<RequestedObjectLockRetention>() {
         // Standalone retention writes apply the XML body, so headers must not
         // supply a different value to the policy decision.
@@ -1060,7 +1050,7 @@ fn remaining_retention_days(retain_until: OffsetDateTime, now: OffsetDateTime) -
 
 fn retain_internal_object_authorization_conditions(
     conditions: &mut HashMap<String, Vec<String>>,
-    cred: &rustfs_credentials::Credentials,
+    claims: Option<&HashMap<String, serde_json::Value>>,
 ) {
     conditions.retain(|key, _| {
         matches!(
@@ -1080,7 +1070,7 @@ fn retain_internal_object_authorization_conditions(
                 | "LocationConstraint"
                 | "groups"
                 | "roles"
-        ) || cred.claims.as_ref().is_some_and(|claims| {
+        ) || claims.is_some_and(|claims| {
             claims
                 .keys()
                 .any(|claim| claim.trim_start_matches("ldap").to_lowercase() == *key)
@@ -1179,10 +1169,20 @@ pub(crate) async fn prepare_list_buckets_iam_authorization<T>(req: &S3Request<T>
     let account = cred.access_key.clone();
     let groups = cred.groups.clone();
     let claims = cred.claims.clone().unwrap_or_default();
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-    let client_info = req.extensions.get::<ClientInfo>();
     let action = Action::S3Action(S3Action::ListAllMyBucketsAction);
-    let base_conditions = authorization_conditions(req, cred, None, None, remote_addr, client_info, action)?;
+    let root_access_key = root_access_key();
+    let principal = AuthzPrincipal::new(cred, &root_access_key);
+    let facts = request_authz_facts(
+        req,
+        AuthzTarget {
+            action,
+            bucket: "",
+            object: "",
+            version_id: None,
+            location_constraint: None,
+        },
+    );
+    let base_conditions = authorization_conditions(req, &principal, &facts)?;
     let mut bucket_conditions = base_conditions.clone();
     bucket_conditions.insert("prefix".to_string(), vec![String::new()]);
     bucket_conditions.insert("delimiter".to_string(), vec!["/".to_string()]);
@@ -1388,7 +1388,6 @@ async fn authorize_request_with_location_constraint<T>(
     location_constraint: Option<String>,
 ) -> S3Result<()> {
     let internal_object_authorization = req.extensions.get::<InternalObjectAuthorization>().is_some();
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
     let req_info = req_info_ref(req)?;
     let cred = req_info.cred.clone();
     let is_owner = req_info.is_owner;
@@ -1409,23 +1408,21 @@ async fn authorize_request_with_location_constraint<T>(
     if let Some(cred) = &cred {
         let iam_store = request_iam_store(req)?;
 
-        let default_claims = HashMap::new();
-        let claims = cred.claims.as_ref().unwrap_or(&default_claims);
-        let client_info = req.extensions.get::<ClientInfo>();
-        let mut conditions =
-            authorization_conditions(req, cred, version_id.as_deref(), location_constraint, remote_addr, client_info, action)?;
+        let root_access_key = root_access_key();
+        let principal = AuthzPrincipal::new(cred, &root_access_key).with_owner(is_owner);
+        let facts = request_authz_facts(
+            req,
+            AuthzTarget {
+                action,
+                bucket: bucket.as_str(),
+                object: object.as_str(),
+                version_id: version_id.as_deref(),
+                location_constraint: location_constraint.as_deref(),
+            },
+        );
+        let mut conditions = authorization_conditions(req, &principal, &facts)?;
 
-        let action_args = Args {
-            account: &cred.access_key,
-            groups: &cred.groups,
-            action,
-            bucket: bucket.as_str(),
-            conditions: &conditions,
-            is_owner,
-            object: object.as_str(),
-            claims,
-            deny_only: false,
-        };
+        let action_args = build_args(&principal, &facts, &conditions);
         let prepared = iam_store.prepare_auth(&action_args).await;
         let needs_tag_from_iam = prepared.needs_existing_object_tag;
 
@@ -1503,17 +1500,7 @@ async fn authorize_request_with_location_constraint<T>(
         }
 
         let iam_allowed = {
-            let mut final_args = Args {
-                account: &cred.access_key,
-                groups: &cred.groups,
-                action,
-                bucket: bucket.as_str(),
-                conditions: &conditions,
-                is_owner,
-                object: object.as_str(),
-                claims,
-                deny_only: false,
-            };
+            let mut final_args = build_args(&principal, &facts, &conditions);
             let allowed = iam_store
                 .try_eval_prepared(&prepared, &final_args)
                 .await
@@ -1584,16 +1571,19 @@ async fn authorize_request_with_location_constraint<T>(
         }
     } else {
         let default_cred = rustfs_credentials::Credentials::default();
-        let client_info = req.extensions.get::<ClientInfo>();
-        let mut conditions = authorization_conditions(
+        let root_access_key = root_access_key();
+        let principal = AuthzPrincipal::new(&default_cred, &root_access_key);
+        let facts = request_authz_facts(
             req,
-            &default_cred,
-            version_id.as_deref(),
-            location_constraint,
-            remote_addr,
-            client_info,
-            action,
-        )?;
+            AuthzTarget {
+                action,
+                bucket: bucket.as_str(),
+                object: object.as_str(),
+                version_id: version_id.as_deref(),
+                location_constraint: location_constraint.as_deref(),
+            },
+        );
+        let mut conditions = authorization_conditions(req, &principal, &facts)?;
 
         let no_groups: Option<Vec<String>> = None;
         let bucket_tag_hint = if !bucket.is_empty() && !object.is_empty() {
@@ -2006,15 +1996,21 @@ async fn prepare_table_data_plane_list_access<T>(req: &mut S3Request<T>, bucket:
         let req_info = req_info_ref(req)?;
         (req_info.cred.clone(), req_info.is_owner)
     };
-    let remote_addr = req
-        .extensions
-        .get::<Option<RemoteAddr>>()
-        .and_then(|value| value.map(|address| address.0));
-    let client_info = req.extensions.get::<ClientInfo>();
     let default_cred = rustfs_credentials::Credentials::default();
     let condition_cred = cred.as_ref().unwrap_or(&default_cred);
-    let conditions =
-        authorization_conditions(req, condition_cred, None, None, remote_addr, client_info, Action::S3Action(action))?;
+    let root_access_key = root_access_key();
+    let principal = AuthzPrincipal::new(condition_cred, &root_access_key);
+    let facts = request_authz_facts(
+        req,
+        AuthzTarget {
+            action: Action::S3Action(action),
+            bucket,
+            object: "",
+            version_id: None,
+            location_constraint: None,
+        },
+    );
+    let conditions = authorization_conditions(req, &principal, &facts)?;
     let iam_store = cred.as_ref().map(|_| request_iam_store(req)).transpose()?;
     let store = table_catalog_store_for_data_plane(req)?;
     let tables = crate::table_catalog::TableCatalogStore::list_all_tables(&store, bucket)
@@ -3626,8 +3622,8 @@ mod tests {
         classify_bucket_policy_raw_load_error, complete_multipart_upload_authorize_action, delete_object_authorize_action,
         get_bucket_policy_authorize_action, has_write_offset_bytes_header, install_object_generation_test_hook,
         legal_hold_write_requested, list_parts_authorize_action, load_bucket_policy_existing_object_tag_hint,
-        maybe_merge_object_tag_conditions, merge_list_bucket_query_conditions, merge_request_object_tag_conditions,
-        owner_can_bypass_policy_deny, post_object_authorize_action, put_bucket_policy_authorize_action, request_context_from_req,
+        maybe_merge_object_tag_conditions, merge_request_object_tag_conditions, owner_can_bypass_policy_deny,
+        post_object_authorize_action, put_bucket_policy_authorize_action, request_authz_facts, request_context_from_req,
         request_object_store, require_owned_reserved_table_object, retention_write_requested, table_data_plane_admin_action,
         table_data_plane_content_mutation, table_data_plane_resource_for_request, table_publication_guard_error,
         validate_post_object_success_controls, versioned_read_action, versioned_tagging_action,
@@ -3637,6 +3633,7 @@ mod tests {
         set_requested_object_lock_retention,
     };
     use crate::auth::OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION;
+    use crate::auth::facts::{AuthzPrincipal, AuthzTarget, list_query_pairs, merge_list_query_conditions};
     use crate::error::ApiError;
     use crate::storage::storage_api::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::storage::storage_api::contract::multipart::MultipartOperations as _;
@@ -4414,9 +4411,9 @@ mod tests {
     #[test]
     fn test_merge_list_bucket_query_conditions_extracts_supported_keys() {
         let mut conditions = HashMap::new();
-        merge_list_bucket_query_conditions(
+        merge_list_query_conditions(
             Action::S3Action(S3Action::ListBucketAction),
-            Some("prefix=photos%2F2024%2F&delimiter=%2F&max-keys=10&encoding-type=url"),
+            &list_query_pairs(Some("prefix=photos%2F2024%2F&delimiter=%2F&max-keys=10&encoding-type=url")),
             &mut conditions,
         );
 
@@ -4429,9 +4426,9 @@ mod tests {
     #[test]
     fn test_merge_list_bucket_query_conditions_preserves_empty_prefix_signal() {
         let mut conditions = HashMap::new();
-        merge_list_bucket_query_conditions(
+        merge_list_query_conditions(
             Action::S3Action(S3Action::ListBucketVersionsAction),
-            Some("prefix=&delimiter=%2F"),
+            &list_query_pairs(Some("prefix=&delimiter=%2F")),
             &mut conditions,
         );
 
@@ -4442,9 +4439,9 @@ mod tests {
     #[test]
     fn test_merge_list_bucket_query_conditions_ignores_non_list_actions() {
         let mut conditions = HashMap::new();
-        merge_list_bucket_query_conditions(
+        merge_list_query_conditions(
             Action::S3Action(S3Action::GetObjectAction),
-            Some("prefix=photos%2F2024%2F&delimiter=%2F&max-keys=10"),
+            &list_query_pairs(Some("prefix=photos%2F2024%2F&delimiter=%2F&max-keys=10")),
             &mut conditions,
         );
 
@@ -4476,6 +4473,38 @@ mod tests {
             destination_conditions.get("RequestObjectTagKeys"),
             Some(&vec!["classification".to_string(), "label".to_string()])
         );
+    }
+
+    #[test]
+    fn access_facts_preserve_verified_client_context() {
+        use crate::shared_types::RemoteAddr;
+        use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
+
+        let trusted = ClientInfo::from_trusted_proxy(
+            "203.0.113.9".parse().expect("client IP"),
+            None,
+            Some("https".to_owned()),
+            "10.0.0.2".parse().expect("proxy IP"),
+            1,
+            ValidationMode::Lenient,
+            Vec::new(),
+        );
+        for (client_info, expected_ip, expected_secure) in [(None, "192.0.2.10", "false"), (Some(trusted), "203.0.113.9", "true")]
+        {
+            let mut req = build_request((), Method::GET);
+            req.headers
+                .insert("x-forwarded-for", HeaderValue::from_static("198.51.100.1"));
+            req.headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+            req.extensions
+                .insert(Some(RemoteAddr("192.0.2.10:443".parse().expect("peer address"))));
+            if let Some(client_info) = client_info {
+                req.extensions.insert(client_info);
+            }
+            let conditions = remaining_retention_days_conditions(&req, Action::S3Action(S3Action::GetObjectAction));
+            assert_eq!(conditions.get("SourceIp"), Some(&vec![expected_ip.to_owned()]));
+            assert_eq!(conditions.get("SecureTransport"), Some(&vec![expected_secure.to_owned()]));
+            assert!(req.extensions.get::<Option<RemoteAddr>>().is_some(), "facts must only borrow extensions");
+        }
     }
 
     #[tokio::test]
@@ -4574,9 +4603,18 @@ mod tests {
                             S3Action::GetObjectAction,
                             S3Action::GetObjectVersionAction,
                         ] {
-                            let conditions =
-                                authorization_conditions(&req, &credentials, None, None, None, None, Action::S3Action(action))
-                                    .expect("conditions should build");
+                            let principal = AuthzPrincipal::new(&credentials, "");
+                            let facts = request_authz_facts(
+                                &req,
+                                AuthzTarget {
+                                    action: Action::S3Action(action),
+                                    bucket: "",
+                                    object: "",
+                                    version_id: None,
+                                    location_constraint: None,
+                                },
+                            );
+                            let conditions = authorization_conditions(&req, &principal, &facts).expect("conditions should build");
                             let values = conditions
                                 .iter()
                                 .filter(|(key, _)| key.eq_ignore_ascii_case(OBJECT_CREATION_OPERATION_CONDITION))
@@ -4713,16 +4751,18 @@ mod tests {
                 ..Default::default()
             };
             let location = requested_bucket_location_constraint(&req.input);
-            let conditions = authorization_conditions(
+            let principal = AuthzPrincipal::new(&credentials, "");
+            let facts = request_authz_facts(
                 &req,
-                &credentials,
-                None,
-                location,
-                None,
-                None,
-                Action::S3Action(S3Action::CreateBucketAction),
-            )
-            .expect("CreateBucket conditions");
+                AuthzTarget {
+                    action: Action::S3Action(S3Action::CreateBucketAction),
+                    bucket: "",
+                    object: "",
+                    version_id: None,
+                    location_constraint: location.as_deref(),
+                },
+            );
+            let conditions = authorization_conditions(&req, &principal, &facts).expect("CreateBucket conditions");
             assert_eq!(
                 conditions
                     .get("LocationConstraint")
@@ -4735,16 +4775,17 @@ mod tests {
                 S3Action::PutBucketVersioningAction,
                 S3Action::GetObjectAction,
             ] {
-                let conditions = authorization_conditions(
+                let facts = request_authz_facts(
                     &req,
-                    &credentials,
-                    None,
-                    expected.map(str::to_owned),
-                    None,
-                    None,
-                    Action::S3Action(action),
-                )
-                .expect("non-CreateBucket conditions");
+                    AuthzTarget {
+                        action: Action::S3Action(action),
+                        bucket: "",
+                        object: "",
+                        version_id: None,
+                        location_constraint: expected,
+                    },
+                );
+                let conditions = authorization_conditions(&req, &principal, &facts).expect("non-CreateBucket conditions");
                 assert!(!conditions.contains_key("LocationConstraint"), "{action:?}");
             }
         }
@@ -4752,7 +4793,18 @@ mod tests {
 
     fn remaining_retention_days_conditions<T>(req: &S3Request<T>, action: Action) -> HashMap<String, Vec<String>> {
         let credentials = rustfs_credentials::Credentials::default();
-        authorization_conditions(req, &credentials, None, None, None, None, action).expect("conditions should build")
+        let principal = AuthzPrincipal::new(&credentials, "");
+        let facts = request_authz_facts(
+            req,
+            AuthzTarget {
+                action,
+                bucket: "",
+                object: "",
+                version_id: None,
+                location_constraint: None,
+            },
+        );
+        authorization_conditions(req, &principal, &facts).expect("conditions should build")
     }
 
     #[tokio::test]
@@ -4987,9 +5039,19 @@ mod tests {
         req.extensions.insert(InternalObjectAuthorization);
 
         let credentials = rustfs_credentials::Credentials::default();
+        let principal = AuthzPrincipal::new(&credentials, "");
+        let facts = request_authz_facts(
+            &req,
+            AuthzTarget {
+                action: Action::S3Action(S3Action::PutObjectAction),
+                bucket: "",
+                object: "",
+                version_id: None,
+                location_constraint: None,
+            },
+        );
         let conditions =
-            authorization_conditions(&req, &credentials, None, None, None, None, Action::S3Action(S3Action::PutObjectAction))
-                .expect("internal object authorization conditions should build");
+            authorization_conditions(&req, &principal, &facts).expect("internal object authorization conditions should build");
 
         assert_eq!(conditions.get("authType"), Some(&vec!["REST-HEADER".to_string()]));
         assert_eq!(conditions.get("signatureversion"), Some(&vec!["AWS4-HMAC-SHA256".to_string()]));

@@ -12,6 +12,7 @@
 ## Open Items
 
 - `8565` historical rebalance replacement recovery: older schema-seven intents can exhaust their retry budget before format repair when retained rebalance metadata describes removed pools. After validating blank targets, terminal historical topology, and ownership, grant one durable handoff and one rebuild attempt. Remove after supported direct upgrades no longer admit snapshots lacking replacement_preformat_handoff_retry_done and all retained affected intents have been resolved.
+- `authz-secret-header-conditions` legacy policy input: credential and SSE-C customer-key headers still reach the condition map consumed by OPA, while AuthzFacts excludes them. Preserve that input during the authorization-facts refactor. Remove the forwarding after a reviewed policy-input change stops sending those headers and defines migration for existing OPA policies.
 
 - `backlog-2253-metadata-observation-adapter` metadata observations: preserve aligned metadata/error slices for existing layout, shard and exact-version PUT, MPU and delete consumers while read/heal scheduling uses typed disk observations. Pending slots acquire empty placeholders only in this adapter. Remove after those remaining consumers use typed observations; delete the adapter and old facade in a separate cleanup.
 
