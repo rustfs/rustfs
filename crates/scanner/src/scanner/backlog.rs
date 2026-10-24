@@ -1289,24 +1289,29 @@ fn scanner_pause_backlog_ledger_key(ledger: &ScannerPauseBacklogLedger) -> (u64,
 /// superseded rollback point, and a newer unstabilized commit was never proven.
 ///
 /// Everything else stays fail-closed: an invalid or unreadable replica, two
-/// different stable ledgers at the newest key, and a missing replica that a
-/// stored commit names as a member, because its lost record may have held a
-/// newer stable ledger.
+/// different stable ledgers at the newest key, and a stored commit that names
+/// a member which is missing or outside this read, because that member's
+/// record may hold a newer stable ledger. Missing replicas that no stored
+/// commit names are new members and hold no ledger.
 fn select_scanner_pause_backlog_roll_forward(replicas: &[ScannerPauseBacklogReplica]) -> Option<ScannerPauseBacklogLedger> {
     let missing = replicas
         .iter()
         .filter(|replica| matches!(replica.state, ScannerPauseBacklogReplicaState::Missing))
         .map(|replica| replica.id)
         .collect::<BTreeSet<_>>();
+    let read = replicas.iter().map(|replica| replica.id).collect::<BTreeSet<_>>();
     let mut stables = Vec::with_capacity(replicas.len());
     for replica in replicas {
         match &replica.state {
             ScannerPauseBacklogReplicaState::Missing => {}
             ScannerPauseBacklogReplicaState::Valid(record) => {
+                // A named member that this selection could not read, such as a
+                // retiring source outside the writable set, may hold the newest
+                // stable ledger. Retirement reads those members and decides.
                 if record
                     .committed
                     .as_ref()
-                    .is_some_and(|committed| committed.replicas.iter().any(|id| missing.contains(id)))
+                    .is_some_and(|committed| committed.replicas.iter().any(|id| missing.contains(id) || !read.contains(id)))
                 {
                     return None;
                 }
@@ -1637,6 +1642,28 @@ fn plan_scanner_pause_backlog_retirement(
                 .map_err(scanner_pause_backlog_retirement_invalid_record)?,
         }));
     }
+    if full_commit.is_none()
+        && let Ok(all) = &full_selection
+        && all.persistence_state == SCANNER_PAUSE_BACKLOG_ROLLED_FORWARD
+    {
+        // Interleaved writers left no surviving commit. The same native
+        // selector, over every read member including the retiring source and
+        // queued pools, proves the newest stable ledger. Retirement holds the
+        // writers' object fence, so it stabilizes that ledger on the survivors
+        // itself instead of waiting for a scanner writer that may not run.
+        // The commit names every survivor: if a missing survivor rejects the
+        // create because it did hold a record, the next read sees that record
+        // and no surviving commit can omit it.
+        let committed = commit_scanner_pause_backlog_record(Some(&all.ledger), &all.ledger, &surviving_ids);
+        let stable = stable_scanner_pause_backlog_record(&all.ledger, committed.committed.as_ref(), &surviving_ids);
+        return Ok(Some(ScannerPauseBacklogRetirementPlan {
+            seed_record: None,
+            commit_record: encode_scanner_pause_backlog_record(&committed)
+                .map_err(scanner_pause_backlog_retirement_invalid_record)?,
+            stable_record: encode_scanner_pause_backlog_record(&stable)
+                .map_err(scanner_pause_backlog_retirement_invalid_record)?,
+        }));
+    }
     let ledger = if let Some(committed) = &full_commit {
         if surviving_commit
             .as_ref()
@@ -1680,13 +1707,6 @@ fn plan_scanner_pause_backlog_retirement(
         if !current.durable {
             return Err(scanner_pause_backlog_retirement_authority_conflict(
                 "scanner pause backlog retirement has no proven native authority",
-            ));
-        }
-        if current.persistence_state == SCANNER_PAUSE_BACKLOG_ROLLED_FORWARD {
-            // The scanner writer stabilizes a rolled-forward ledger on its
-            // next claim. Retirement never adopts it before that commit exists.
-            return Err(scanner_pause_backlog_retirement_handoff_conflict(
-                "scanner pause backlog retirement waits for the writer to stabilize a rolled-forward ledger",
             ));
         }
         if decoded
@@ -1806,6 +1826,20 @@ async fn write_scanner_pause_backlog_record<S>(
 where
     S: ScannerStorage,
 {
+    write_scanner_pause_backlog_record_to(storeapi, loaded, record, None).await
+}
+
+/// Publish `record` to the loaded cohort, or only to `only` when given. A
+/// subset publication stops at its first failure so no later member is written.
+async fn write_scanner_pause_backlog_record_to<S>(
+    storeapi: Arc<S>,
+    loaded: &LoadedScannerPauseBacklog,
+    record: ScannerPauseBacklogReplicaRecord,
+    only: Option<BTreeSet<ScannerPauseBacklogReplicaId>>,
+) -> Result<(), String>
+where
+    S: ScannerStorage,
+{
     let data = encode_scanner_pause_backlog_record(&record)?;
 
     let writable = storeapi.scanner_pause_backlog_writable_set_disks().await;
@@ -1846,6 +1880,9 @@ where
                 pool_index: set.pool_index,
                 set_index: set.set_index,
             };
+            if only.as_ref().is_some_and(|only| !only.contains(&id)) {
+                continue;
+            }
             let result = match revisions.get(&id) {
                 Some(revision) => storeapi
                     .clone()
@@ -1860,7 +1897,11 @@ where
                     .map_err(|err| err.to_string()),
                 None => Err("replica revision is unavailable".to_string()),
             };
+            let failed = result.is_err();
             results.push((id, result));
+            if failed && only.is_some() {
+                break;
+            }
         }
         results
     })
@@ -1892,19 +1933,32 @@ async fn stabilize_scanner_pause_backlog<S>(
 where
     S: ScannerStorage,
 {
-    // A new rollback proof names only members that already store a record. A
-    // missing member that fails this write must not become a named member
-    // whose absence later reads as a lost record; once every member holds this
-    // proof, the next commit adopts the complete membership.
+    // A new rollback proof names only members that already store a record, so
+    // a missing member that fails this write never becomes a named member whose
+    // absence reads as a lost record. Missing members are written first and the
+    // first failure stops the publication: a member that only read as missing
+    // rejects the create, and no surviving proof can then omit its record. Once
+    // every member holds this proof, the next commit adopts the full membership.
+    let missing = loaded
+        .replicas
+        .iter()
+        .filter(|replica| matches!(replica.state, ScannerPauseBacklogReplicaState::Missing))
+        .map(|replica| replica.id)
+        .collect::<BTreeSet<_>>();
     let mut members = loaded
         .replicas
         .iter()
-        .filter(|replica| !matches!(replica.state, ScannerPauseBacklogReplicaState::Missing))
         .map(|replica| replica.id)
+        .filter(|id| !missing.contains(id))
         .collect::<Vec<_>>();
     members.sort_unstable();
     let record = stable_scanner_pause_backlog_record(&loaded.ledger, loaded.authoritative_commit.as_ref(), &members);
-    write_scanner_pause_backlog_record(storeapi.clone(), loaded, record).await?;
+    if loaded.authoritative_commit.is_none() && !missing.is_empty() {
+        write_scanner_pause_backlog_record_to(storeapi.clone(), loaded, record.clone(), Some(missing)).await?;
+        write_scanner_pause_backlog_record_to(storeapi.clone(), loaded, record, Some(members.iter().copied().collect())).await?;
+    } else {
+        write_scanner_pause_backlog_record(storeapi.clone(), loaded, record).await?;
+    }
     let stabilized = load_scanner_pause_backlog(storeapi).await?;
     if stabilized.ledger != loaded.ledger || !stabilized.all_current_replicas_stable() {
         return Err("scanner pause backlog failed to stabilize its last committed generation".to_string());
@@ -3310,6 +3364,21 @@ mod tests {
         }
     }
 
+    /// Bytes and CAS revisions of every member that stores a record.
+    async fn native_replica_snapshot_present(store: &ECStore) -> Vec<(ScannerPauseBacklogReplicaId, Vec<u8>, String)> {
+        let mut snapshot = Vec::new();
+        for pool in &store.pools {
+            for set in &pool.disk_set {
+                let replica = read_scanner_pause_backlog_replica(Arc::clone(set)).await;
+                if !matches!(replica.state, ScannerPauseBacklogReplicaState::Missing) {
+                    let (bytes, revision) = native_replica_bytes(set).await;
+                    snapshot.push((replica.id, bytes, revision));
+                }
+            }
+        }
+        snapshot
+    }
+
     async fn native_replica_snapshot(store: &ECStore) -> Vec<(Vec<u8>, String)> {
         let mut snapshot = Vec::new();
         for pool in &store.pools {
@@ -3322,7 +3391,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn native_writer_interleaved_expansion_claims_roll_forward_and_retire() {
+    fn native_retirement_rolls_forward_interleaved_wedge_without_a_writer() {
         run_native_retirement_test(async || {
             set_runtime_error(None);
             let (_root, store, original) = native_expanded_backlog_store(1, false).await;
@@ -3336,43 +3405,170 @@ mod tests {
             assert_eq!(loaded.persistence_state, SCANNER_PAUSE_BACKLOG_ROLLED_FORWARD);
             assert!(loaded.durable && !loaded.stable_matches_ledger && loaded.authoritative_commit.is_none());
 
-            // Retirement never adopts the rolled-forward ledger before a writer
-            // commits it, and it retries instead of failing the decommission.
+            // A decommission reaches the ledger before any scanner writer runs
+            // again. Retirement holds the writers' fence and stabilizes the
+            // proven ledger itself; it neither waits for nor needs a writer.
             let (source_bytes, _) = native_replica_bytes(&store.pools[0].disk_set[0]).await;
             store
                 .prepare_scanner_pause_backlog_retirement_for_test(0, source_bytes.len() * 2)
                 .await
                 .expect("activate the source retirement");
-            let before = native_replica_snapshot(&store).await;
-            let handoff = store
-                .retire_scanner_pause_backlog_for_test(0, 0)
-                .await
-                .expect_err("retirement must wait for the writer to stabilize the rolled-forward ledger");
-            assert!(handoff.to_string().contains("retryable handoff conflict"), "{handoff}");
-            assert_eq!(native_replica_snapshot(&store).await, before, "a refused retirement keeps every record");
-
-            // The next claim converges the surviving membership on its own.
-            let expected = claim_scanner_pause_backlog_writer(&wedge.acknowledged, now + 1).expect("recovery generation");
-            let recovered = ScannerPauseBacklogController::claim(Arc::clone(&store), now + 1)
-                .await
-                .expect("a later claim must converge the interleaved publication");
-            assert_current_native_writer_ledger(&store, &expected).await;
-            assert_eq!(expected.dirty_usage_buckets, original.dirty_usage_buckets);
-            assert_eq!(expected.current_attempt_serial, original.current_attempt_serial);
-            drop(recovered);
-
             for set in 0..2 {
                 store
                     .retire_scanner_pause_backlog_for_test(0, set)
                     .await
-                    .expect("retire the source after the ledger converged");
+                    .expect("retirement must converge the interleaved publication on its first attempt");
                 assert_native_source_missing(&store, set).await;
             }
             let surviving = load_scanner_pause_backlog(Arc::clone(&store))
                 .await
                 .expect("surviving ledger");
-            assert_eq!(surviving.ledger, expected);
+            assert_eq!(surviving.ledger, wedge.acknowledged, "retirement keeps the proven ledger");
             assert!(surviving.all_current_replicas_stable());
+
+            // A later writer claim advances from the retired, stable ledger.
+            let expected = claim_scanner_pause_backlog_writer(&wedge.acknowledged, now + 1).expect("writer generation");
+            let recovered = ScannerPauseBacklogController::claim(Arc::clone(&store), now + 1)
+                .await
+                .expect("the surviving ledger accepts a writer");
+            assert_current_native_writer_ledger(&store, &expected).await;
+            assert_eq!(expected.dirty_usage_buckets, original.dirty_usage_buckets);
+            assert_eq!(expected.current_attempt_serial, original.current_attempt_serial);
+            drop(recovered);
+            shutdown_native_retirement_store(store).await;
+            set_runtime_error(None);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_writer_roll_forward_refuses_commit_members_outside_its_read() {
+        run_native_retirement_test(async || {
+            set_runtime_error(None);
+            let (_root, store, original) = native_expanded_backlog_store(1, false).await;
+            let now = unix_now().saturating_add(60);
+            let wedge = native_interleaved_expansion_wedge(&store, &original, now).await;
+            let ids = (0..3)
+                .flat_map(|pool_index| (0..2).map(move |set_index| replica_id(pool_index, set_index)))
+                .collect::<Vec<_>>();
+            // The retiring source holds the newest stable ledger.
+            let newest = claim_scanner_pause_backlog_writer(&wedge.acknowledged, now + 1).expect("newest generation");
+            replace_native_pause_backlog_replica(
+                &store,
+                replica_id(0, 0),
+                ScannerPauseBacklogReplicaRecord::new(
+                    Some(newest.clone()),
+                    Some(ScannerPauseBacklogCommitRecord::new(newest.clone(), ids)),
+                ),
+            )
+            .await;
+            let (source_bytes, _) = native_replica_bytes(&store.pools[0].disk_set[0]).await;
+            store
+                .prepare_scanner_pause_backlog_retirement_for_test(0, source_bytes.len() * 2)
+                .await
+                .expect("activate the source retirement");
+
+            // The writer reads only the survivors. Their newest stable ledger is
+            // older than the source's, so the writer must not roll forward.
+            let before = native_replica_snapshot(&store).await;
+            let error = ScannerPauseBacklogController::claim(Arc::clone(&store), now + 2)
+                .await
+                .err()
+                .expect("a writer must not roll forward past members it cannot read");
+            assert!(
+                error.contains("neither a surviving membership commit nor a stable rollback point"),
+                "{error}"
+            );
+            assert_eq!(native_replica_snapshot(&store).await, before, "a refused claim keeps every record");
+
+            // Retirement reads the source too and keeps its newest ledger.
+            for set in 0..2 {
+                store
+                    .retire_scanner_pause_backlog_for_test(0, set)
+                    .await
+                    .expect("retirement converges with the source's newest ledger");
+                assert_native_source_missing(&store, set).await;
+            }
+            let surviving = load_scanner_pause_backlog(Arc::clone(&store))
+                .await
+                .expect("surviving ledger");
+            assert_eq!(surviving.ledger, newest);
+            assert!(surviving.all_current_replicas_stable());
+            shutdown_native_retirement_store(store).await;
+            set_runtime_error(None);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_writer_spurious_missing_read_cannot_omit_a_newer_member() {
+        run_native_retirement_test(async || {
+            set_runtime_error(None);
+            let (_root, store, original) = native_expanded_backlog_store(1, false).await;
+            let now = unix_now().saturating_add(60);
+            let ids = (0..3)
+                .flat_map(|pool_index| (0..2).map(move |set_index| replica_id(pool_index, set_index)))
+                .collect::<Vec<_>>();
+            let newer_member = replica_id(2, 1);
+            let others = ids.iter().copied().filter(|id| *id != newer_member).collect::<Vec<_>>();
+            let middle = claim_scanner_pause_backlog_writer(&original, now).expect("middle generation");
+            let newest = claim_scanner_pause_backlog_writer(&middle, now + 1).expect("newest generation");
+            for (index, id) in others.iter().enumerate() {
+                let ledger = if index < 3 { &original } else { &middle };
+                replace_native_pause_backlog_replica(
+                    &store,
+                    *id,
+                    ScannerPauseBacklogReplicaRecord::new(
+                        Some(ledger.clone()),
+                        Some(ScannerPauseBacklogCommitRecord::new(ledger.clone(), others.clone())),
+                    ),
+                )
+                .await;
+            }
+            replace_native_pause_backlog_replica(
+                &store,
+                newer_member,
+                ScannerPauseBacklogReplicaRecord::new(
+                    Some(newest.clone()),
+                    Some(ScannerPauseBacklogCommitRecord::new(newest.clone(), ids.clone())),
+                ),
+            )
+            .await;
+            let actual = load_scanner_pause_backlog(Arc::clone(&store))
+                .await
+                .expect("a complete read rolls forward to the newest member");
+            assert_eq!(actual.ledger, newest);
+
+            // A startup read reports the newest member as missing. The selector
+            // rolls forward to the older ledger it can see, and the writer
+            // stabilizes that view.
+            let mut spurious = actual.replicas.clone();
+            for replica in &mut spurious {
+                if replica.id == newer_member {
+                    replica.revision = Some(DataUsageCacheRevision::Missing);
+                    replica.state = ScannerPauseBacklogReplicaState::Missing;
+                }
+            }
+            let misread = select_scanner_pause_backlog_replicas(spurious).expect("the misread view is selectable");
+            assert_eq!(misread.ledger, middle);
+            let before = native_replica_snapshot(&store).await;
+            let error = stabilize_scanner_pause_backlog(Arc::clone(&store), &misread)
+                .await
+                .err()
+                .expect("the member that read as missing rejects the create");
+            assert!(error.contains("commit did not reach every surviving set"), "{error}");
+            assert_eq!(
+                native_replica_snapshot(&store).await,
+                before,
+                "no surviving proof may omit the member that read as missing"
+            );
+
+            let expected = claim_scanner_pause_backlog_writer(&newest, now + 2).expect("recovery generation");
+            let recovered = ScannerPauseBacklogController::claim(Arc::clone(&store), now + 2)
+                .await
+                .expect("the next complete read converges on the newest ledger");
+            assert_current_native_writer_ledger(&store, &expected).await;
+            drop(recovered);
             shutdown_native_retirement_store(store).await;
             set_runtime_error(None);
         });
@@ -3411,8 +3607,9 @@ mod tests {
             assert_eq!(loaded.persistence_state, SCANNER_PAUSE_BACKLOG_ROLLED_FORWARD);
             assert_eq!(loaded.replica_count, 8);
 
-            // The first publication to a new member fails transiently. The
-            // rollback proof written to every other member must not name it.
+            // The first publication to a new member fails transiently. Missing
+            // members are written first, so no other record changes.
+            let before = native_replica_snapshot_present(&expanded).await;
             let fault =
                 NativeScannerPauseBacklogWriteFault::fail_before_write(Arc::clone(&expanded.pools[3].disk_set[0]), "publish", 1);
             let error = ScannerPauseBacklogController::claim(Arc::clone(&expanded), now + 1)
@@ -3421,17 +3618,16 @@ mod tests {
                 .expect("the injected new-member failure stops this claim");
             assert!(error.contains("injected native scanner backlog publish"), "{error}");
             drop(fault);
+            assert_eq!(
+                native_replica_snapshot_present(&expanded).await,
+                before,
+                "a failed first write to a new member changes no stored record"
+            );
             let partial = load_scanner_pause_backlog(Arc::clone(&expanded))
                 .await
-                .expect("the partial rollback proof survives on every member that stores it");
+                .expect("the wedge stays selectable after the failed write");
             assert_eq!(partial.ledger, wedge.acknowledged);
-            assert!(partial.authoritative_commit.is_some());
-            assert!(
-                partial
-                    .replicas
-                    .iter()
-                    .any(|replica| matches!(replica.state, ScannerPauseBacklogReplicaState::Missing))
-            );
+            assert_eq!(partial.persistence_state, SCANNER_PAUSE_BACKLOG_ROLLED_FORWARD);
 
             let expected = claim_scanner_pause_backlog_writer(&wedge.acknowledged, now + 2).expect("recovery generation");
             let recovered = ScannerPauseBacklogController::claim(Arc::clone(&expanded), now + 2)
@@ -3541,19 +3737,18 @@ mod tests {
             replace_native_pause_backlog_replica(&store, replica_id(1, 1), wedge.rollback.clone()).await;
 
             // The same records without the conflict converge and retire.
-            let expected = claim_scanner_pause_backlog_writer(&wedge.acknowledged, now + 10).expect("recovery generation");
-            let recovered = ScannerPauseBacklogController::claim(Arc::clone(&store), now + 10)
-                .await
-                .expect("the unconflicted wedge converges");
-            assert_current_native_writer_ledger(&store, &expected).await;
-            drop(recovered);
             for set in 0..2 {
                 store
                     .retire_scanner_pause_backlog_for_test(0, set)
                     .await
-                    .expect("retire the source after the ledger converged");
+                    .expect("the unconflicted wedge converges and retires");
                 assert_native_source_missing(&store, set).await;
             }
+            let surviving = load_scanner_pause_backlog(Arc::clone(&store))
+                .await
+                .expect("surviving ledger");
+            assert_eq!(surviving.ledger, wedge.acknowledged);
+            assert!(surviving.all_current_replicas_stable());
             shutdown_native_retirement_store(store).await;
             set_runtime_error(None);
         });
