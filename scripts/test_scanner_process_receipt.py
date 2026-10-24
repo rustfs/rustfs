@@ -89,6 +89,20 @@ class ProcessReceiptTest(unittest.TestCase):
         self.assertEqual(receipt.environment_digest(changed, self.public),
                          receipt.environment_digest(self.environment, self.public))
 
+    def test_scanner_schedule_is_bound_to_actual_process_environment(self):
+        schedule = {"RUSTFS_SCANNER_START_DELAY_SECS": "1", "RUSTFS_SCANNER_CYCLE": "5"}
+        self.public.update(schedule)
+        raw = self.environment + b"RUSTFS_SCANNER_START_DELAY_SECS=1\0RUSTFS_SCANNER_CYCLE=5\0"
+        (self.pid / "environ").write_bytes(raw)
+        result = self.attest()
+        self.assertEqual(result["environment_sha256"], receipt.fingerprint(self.public))
+        self.assertTrue(set(schedule) <= set(result["environment_keys"]))
+        for key in schedule:
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "mismatch"):
+                receipt.environment_digest(raw, {**self.public, key: "60"})
+        with self.assertRaises(ValueError):
+            receipt.environment_digest(raw + b"RUSTFS_SCANNER_UNKNOWN=1\0", self.public)
+
     def test_inactive_service_is_rejected_before_process_access(self):
         self.observation.update(active="inactive", pid=0)
         with self.assertRaisesRegex(ValueError, "not active"):
