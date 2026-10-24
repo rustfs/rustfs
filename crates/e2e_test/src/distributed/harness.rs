@@ -34,7 +34,7 @@ use crate::common::{
 };
 use crate::replication_extension_test::LOOPBACK_REPLICATION_TARGET_ENV;
 use aws_sdk_s3::Client;
-use aws_sdk_s3::config::retry::RetryConfig;
+use aws_sdk_s3::config::{Credentials, retry::RetryConfig};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::{get_object::GetObjectError, put_object::PutObjectError};
 use aws_sdk_s3::primitives::ByteStream;
@@ -185,13 +185,12 @@ impl DistCluster {
         if node_idx >= self.cluster.nodes.len() {
             return Err("node_idx is invalid".into());
         }
-        Ok(Client::from_conf(build_test_s3_config(
-            &self.cluster.nodes[node_idx].url,
-            access_key,
-            secret_key,
-            None,
-            "cluster-iam-test",
-        )))
+        let config = self.cluster.create_s3_client(node_idx)?.config().to_builder();
+        Ok(Client::from_conf(
+            config
+                .credentials_provider(Credentials::new(access_key, secret_key, None, None, "cluster-iam-test"))
+                .build(),
+        ))
     }
 
     /// Stop the fleet, drop retired pools from the command line, and restart

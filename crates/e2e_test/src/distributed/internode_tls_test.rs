@@ -198,6 +198,19 @@ async fn four_node_tls_large_and_range_gets_preserve_bytes() -> TestResult {
         results.push(
             serde_json::json!({"operation": "put", "bytes": length, "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0}),
         );
+        if length == 32 * 1024 {
+            let alternate = dist.client_with_credentials(0, &dist.cluster.access_key, &dist.cluster.secret_key)?;
+            let alternate = Client::from_conf(alternate.config().to_builder().retry_config(RetryConfig::disabled()).build());
+            results.push(verified_get(&alternate, 0, &bucket, &object, &object.reads[0], false).await?);
+            let invalid = dist.client_with_credentials(0, "invalid-tls-user", "invalid-tls-secret-password")?;
+            let invalid = Client::from_conf(invalid.config().to_builder().retry_config(RetryConfig::disabled()).build());
+            let denied = invalid
+                .list_buckets()
+                .send()
+                .await
+                .expect_err("alternate credentials must not inherit the root identity");
+            assert_eq!(denied.raw_response().map(|response| response.status().as_u16()), Some(403));
+        }
         for expected in &object.reads {
             for (node, client) in clients.iter().enumerate() {
                 results.push(verified_get(client, node, &bucket, &object, expected, false).await?);
