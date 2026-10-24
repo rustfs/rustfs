@@ -162,7 +162,8 @@ class ProcessReceiptTest(unittest.TestCase):
     def test_missing_duplicate_or_aliased_data_roots_are_rejected(self):
         link = self.root / "alias"
         link.symlink_to(self.data)
-        for paths in ([], [str(self.data)] * 2, [str(link)], [str(self.binary)], [str(self.root / "missing")]):
+        for paths in ([], [str(self.data)] * 2, [str(self.data), str(self.data) + "/."],
+                      [str(link)], [str(self.binary)], [str(self.root / "missing")]):
             with self.subTest(paths=paths), self.assertRaises((ValueError, OSError)):
                 receipt.attest(self.service, self.public, paths)
 

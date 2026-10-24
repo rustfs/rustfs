@@ -99,6 +99,8 @@ def attest(service, expected_environment, data_roots):
         directories.append({"path": str(path), "device": info.st_dev, "inode": info.st_ino,
                             "total_bytes": usage.f_blocks * usage.f_frsize,
                             "available_bytes": usage.f_bavail * usage.f_frsize})
+    require(len({(directory["device"], directory["inode"]) for directory in directories}) == len(directories),
+            "duplicate data directory identity")
     require(process_state(pid) == state and service.observe() == before, "process or resource limits changed during observation")
     current = (PROC / str(pid) / "exe").stat()
     require((current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino), "running executable changed")
