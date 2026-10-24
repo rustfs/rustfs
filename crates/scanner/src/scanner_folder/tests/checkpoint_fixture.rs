@@ -1447,3 +1447,39 @@ where
     }
     panic!("finite stable fixture must converge using the same four-object budget without an unbounded final sweep");
 }
+
+fn emit_first_registration_capture_event() {
+    tracing::debug!(
+        target: "rustfs::scanner::folder",
+        event = EVENT_SCANNER_FOLDER_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_FOLDER,
+        state = "first_registration_capture",
+        "Scanner test capture exercised first callsite registration"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn checkpoint_log_capture_survives_first_registration_on_unsubscribed_thread() {
+    let logs = CapturedLogs::default();
+    // Construct the capture before polling it: its subscriber must be live
+    // when the other thread first registers this otherwise unused callsite.
+    let captured = logs.capture(tracing::Level::DEBUG, async {
+        emit_first_registration_capture_event();
+    });
+    std::thread::spawn(emit_first_registration_capture_event)
+        .join()
+        .expect("unsubscribed first-registration thread");
+    captured.await;
+    let events = logs
+        .contents()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("scanner JSON event"))
+        .filter(|event| event["fields"]["state"] == "first_registration_capture")
+        .count();
+    assert_eq!(
+        events, 1,
+        "first registration without a subscriber must not disable the captured callsite"
+    );
+}
