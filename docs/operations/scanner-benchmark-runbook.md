@@ -215,6 +215,26 @@ and physical disk writes are outside this counter. Keep the same definition on
 both builds; retain disk counters separately. Neither counter measures cache
 clone allocations, and an absent series is not a measured zero.
 
+`walk_objects` can use the aligned window delta of
+`rustfs_scanner_object_metadata_visits_total`, summed across the declared
+`bucket` and `disk` identities. Each visit starts after scanner I/O admission,
+immediately before reading an `xl.meta` entry. Failed or cancelled reads still
+count; payload entries, cached summaries, and paths skipped before admission do
+not. Re-reading an object counts again, including on another drive. This measures
+scanner metadata visits, not unique S3 objects, versions, successful repairs, or
+physical disk operations. The counter handle is registered once per bucket/drive
+walker and reused without per-object label allocation; recording still has a cost.
+
+For a workload with distinct hot and cold buckets, `cold_walk_objects` selects
+only the cold bucket identities declared in the independent workload manifest.
+Do not infer coldness from the observed counts or multiply bucket-walk counts by
+cached object totals. This metric cannot separate hot and cold prefixes within
+one bucket; that attribution remains unverified. Warm up the required series,
+retain node/drive identities, reject resets or missing window boundaries, and
+use the same visit definition on both builds. Bucket labels follow the existing
+bucket/drive scanner metrics and have bucket-scale cardinality; no key or version
+is a label. An absent or dropped series is not zero.
+
 Each comparison records a `w22` section with clone, encode, and save bytes per
 walked object, clone/encode and save/encode byte ratios, and candidate changes.
 These are traffic amplification indicators, not allocation attribution or an
