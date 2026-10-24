@@ -310,6 +310,8 @@ fi
 
 grep -q -- 'missing value for --alias' "$missing_value_log"
 
+"$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_version_oracle.py"
+
 secret_arg_log="$TMP_DIR/secret-arg.log"
 if PATH="$BIN_DIR:$PATH" "$SCRIPT" --secret-key rustfsadmin >"$secret_arg_log" 2>&1; then
   echo "Expected --secret-key argv to be rejected" >&2
