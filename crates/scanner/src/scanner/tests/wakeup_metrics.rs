@@ -219,9 +219,8 @@ async fn scanner_trigger_metrics_record_recovery_and_config_without_rate_limited
         .expect("rate-limited scanner must reach its normal scheduler wait");
         notify_scanner_cycle_recovery_wake();
         recorder.wait_for(WAKEUPS, "recovery").await;
-        let mut config = rustfs_config::server_config::Config::new();
-        config.set_defaults();
-        crate::runtime_config::apply_scanner_runtime_config(&config).expect("runtime config must still apply");
+        let config = super::startup_gate::startup_config(&[("alert_excess_versions", "1001")]);
+        crate::runtime_config::apply_scanner_runtime_config(&config).expect("changed runtime config must apply");
         recorder.wait_for(WAKEUPS, "runtime_config").await;
         ctx.cancel();
         tokio::time::timeout(Duration::from_secs(5), scanner_task)

@@ -35,7 +35,7 @@ Bitrot cycle resolution differs because the canonical persistent key belongs to 
 | `scanner.delay` | `RUSTFS_SCANNER_DELAY` | factor | preset-derived | Overrides the sleep multiplier. Valid range is `0` through `10000` (`MAX_SCANNER_DELAY_FACTOR`). |
 | `scanner.max_wait` | `RUSTFS_SCANNER_MAX_WAIT_SECS` | seconds | preset-derived | Caps one scanner sleep. |
 | `scanner.cycle` | `RUSTFS_SCANNER_CYCLE` | seconds | preset-derived | Sets the interval between scanner cycles. |
-| `scanner.start_delay` | `RUSTFS_SCANNER_START_DELAY_SECS` (deprecated alias `RUSTFS_DATA_SCANNER_START_DELAY_SECS`) | seconds | unset | Sets startup delay and, for compatibility, the cycle interval when `scanner.cycle` is unset. |
+| `scanner.start_delay` | `RUSTFS_SCANNER_START_DELAY_SECS` (deprecated alias `RUSTFS_DATA_SCANNER_START_DELAY_SECS`) | seconds | unset | Sets an explicit startup delay and, for compatibility, the cycle interval when `scanner.cycle` is unset. When absent, startup uses the smaller of the cycle interval and 60 seconds, with jitter; see [Startup and cycle budgets](#startup-and-cycle-budgets). |
 | `scanner.cycle_max_duration` | `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` | seconds | `1800` (`DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS`) | Caps one cycle's runtime. An explicit `0` disables this budget. |
 | `scanner.cycle_max_objects` | `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` | objects | `0` (`DEFAULT_SCANNER_CYCLE_MAX_OBJECTS`) | Caps objects processed by one cycle. `0` disables this budget. |
 | `scanner.cycle_max_directories` | `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` | directories | `0` (`DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES`) | Caps directories entered by one cycle. `0` disables this budget. |
@@ -64,6 +64,22 @@ Speed presets (`crates/config/src/constants/scanner.rs`) set the base sleep mult
 | `slowest` | 100x | 15s | 30m |
 
 Use `scanner.delay`, `scanner.max_wait`, and `scanner.cycle` when the preset is close but one axis needs a precise override. With `idle_mode=true`, directory-level sleep is `1ms x factor` and object-level sleep is `time spent on the object x factor`, both capped at `max_wait`; a foreground-read floor of `FOREGROUND_READ_BACKOFF_PER_REQUEST_MS` (10ms) per concurrent GetObject/streaming read, capped at `FOREGROUND_READ_BACKOFF_MAX_MS` (250ms), is applied on top and can exceed the preset's `max_wait` (`crates/scanner/src/sleeper.rs`). The per-disk foreground-priority gate is independent of `idle_mode` and remains active when sleeps are disabled.
+
+### Startup and cycle budgets
+
+Startup and the recurring cycle interval are separate. With a warm, complete usage cache and no active replication, the implicit startup delay uses `min(scanner.cycle, 60s)`, with the existing ±10% jitter. An explicit `scanner.start_delay` retains its configured delay and jitter. A cold usage cache, a valid newer observation requiring refresh, or active replication with existing buckets can skip the startup delay. Starting an attempt promptly does not bypass leader election, recovery, data-movement pauses, or disk admission.
+
+Before this startup cap, a warm cache inherited the whole cycle interval. For example, `scanner.cycle=21600` could wait 5 hours 24 minutes to 6 hours 36 minutes after every process restart. For an explicit prompt start while retaining a six-hour recurring interval, set both `RUSTFS_SCANNER_CYCLE=21600` and `RUSTFS_SCANNER_START_DELAY_SECS=1`. Removing the cycle setting would allow the startup setting to supply the recurring interval through the compatibility fallback.
+
+The startup usage preflight is read-only and has a 30-second deadline. If it cannot finish, the scanner proceeds to its normal fenced attempt; the timeout does not certify usage or bypass recovery checks. Cancellation interrupts both preflight and startup delay. Runtime timing changes use elapsed startup time rather than starting a fresh wait. Updates with the same effective startup delay retain the original jitter sample and deadline, including cycle changes masked by an explicit startup delay or the implicit 60-second cap. Maintenance changes wake the delay so the existing scanner path can inspect the new rules. Pre-leadership retry waits also wake on runtime and maintenance changes.
+
+Cold-cache startup and startup without active replication avoid an extra bucket listing. Maintenance discovery keeps looking for replication after finding lifecycle rules in an earlier bucket. Once replication is found, both scheduling decisions are settled and remaining buckets need no startup inspection. Reapplying an unchanged resolved configuration does not reconfigure per-disk budgets or emit another configuration wakeup.
+
+The `cycle_max_duration`, `cycle_max_objects`, and `cycle_max_directories` controls bound a cycle's work; they do not guarantee that every budget can complete a sweep in bounded chunks. A partial scan preserves useful checkpoints and coverage, but reopening ancestors and revalidating directory entries costs work again. A budget below the minimum replay or traversal cost can repeatedly stop at the same directory. Cross-bucket fairness also needs to be distinguished from progress within one bucket. Use pacing controls to limit background I/O, and choose cycle budgets large enough for the namespace to advance.
+
+Budget cancellation alone does not publish complete usage or acknowledge dirty buckets. A partial cycle must retain that uncertainty; a growing directories-scanned counter is not proof of new coverage or published totals. Inspect checkpoint/frontier changes and publication status across attempts before changing budgets. A budget cancellation does not persist a disabled scheduler flag and does not justify deleting scanner state.
+
+When runtime configuration is applied, `metrics.cycle_interval_seconds`, `metrics.bitrot_cycle_enabled`, and the cycle-budget fields describe that configuration even before the first scan. They do not establish that a cycle is running; use `metrics.current_cycle_active`, `cycle_schedule`, `cycle_recovery`, leadership, and `data_movement_pause` to interpret inactivity. A running cycle retains its existing budget; a configuration update applies to later budget creation. Configuration refreshes retain timeout/no-progress diagnostics until a new cycle starts. If the first refresh fails validation, the retained effective configuration still initializes its metrics while the validation error remains reported; a failed refresh cannot replace a newer accepted configuration. Older releases initialized these configuration metrics only on the first cycle, so zero values during startup did not prove that scheduling was disabled.
 
 ### Walkers per disk
 
@@ -792,7 +808,7 @@ For a mostly idle single-node, single-disk deployment with sustained CPU usage w
 6. If `primary_pressure` is `throttle_pause` and pause ratios are low, raise `scanner.delay` first.
 7. If individual sleeps are too short, raise `scanner.max_wait`.
 8. If each scan cycle finishes but starts too often, raise `scanner.cycle`.
-9. If scans must be broken into bounded chunks, set one of `scanner.cycle_max_duration`, `scanner.cycle_max_objects`, or `scanner.cycle_max_directories`.
+9. To bound one cycle, set `scanner.cycle_max_duration`, `scanner.cycle_max_objects`, or `scanner.cycle_max_directories`; confirm that checkpoints advance under that budget. These controls do not guarantee resumable bounded chunks for every directory shape; see [Startup and cycle budgets](#startup-and-cycle-budgets).
 10. Recheck `pacing_pressure`, `maintenance_control`, source work, and lifecycle transition status after one or more scanner cycles.
 
 Do not rely only on a longer cycle interval if lifecycle, replication, heal, or bitrot work must keep moving; use source work and transition status to confirm that background maintenance still progresses.
