@@ -41,7 +41,9 @@ async fn startup_preflight_timeout_drops_read_only_inspection() {
         std::future::pending::<(bool, bool)>().await
     };
     let started = Instant::now();
-    assert!(wait_for_scanner_startup(&ctx, inspection, false, scanner_maintenance_generation()).await);
+    assert!(
+        wait_for_scanner_startup(&ctx, inspection, false, scanner_maintenance_generation(), randomized_cycle_delay_for).await
+    );
     assert_eq!(started.elapsed(), SCANNER_STARTUP_USAGE_INSPECTION_TIMEOUT);
     assert!(dropped.await.is_err(), "timeout should drop the pending read-only inspection");
 }
@@ -60,7 +62,13 @@ async fn startup_cancellation_interrupts_preflight_and_long_delay() {
             (false, true)
         };
         let started = Instant::now();
-        let mut gate = Box::pin(wait_for_scanner_startup(&ctx, inspection, false, scanner_maintenance_generation()));
+        let mut gate = Box::pin(wait_for_scanner_startup(
+            &ctx,
+            inspection,
+            false,
+            scanner_maintenance_generation(),
+            randomized_cycle_delay_for,
+        ));
         assert!(matches!(futures::poll!(&mut gate), Poll::Pending));
         ctx.cancel();
         assert!(!gate.await);
@@ -80,6 +88,7 @@ async fn startup_shorter_config_uses_elapsed_wait_instead_of_restarting() {
         std::future::ready((false, true)),
         false,
         scanner_maintenance_generation(),
+        randomized_cycle_delay_for,
     ));
     assert!(matches!(futures::poll!(&mut gate), Poll::Pending));
     advance(Duration::from_secs(30)).await;
@@ -102,6 +111,7 @@ async fn startup_unrelated_config_keeps_original_deadline() {
         std::future::ready((false, true)),
         false,
         scanner_maintenance_generation(),
+        randomized_cycle_delay_for,
     ));
     assert!(matches!(futures::poll!(&mut gate), Poll::Pending));
     advance(Duration::from_secs(60)).await;
@@ -211,7 +221,7 @@ async fn startup_discovers_replication_after_lifecycle_in_another_bucket() {
     let state = initial_scanner_startup_usage_state(&store, features.replication).await;
     assert!(state.1, "warm replication startup should observe existing buckets");
     assert_eq!(
-        initial_scanner_delay_for_startup(
+        scanner_startup_delay_policy(
             &ScannerRuntimeConfig {
                 start_delay: Some(Duration::from_secs(21600)),
                 ..Default::default()
@@ -220,7 +230,7 @@ async fn startup_discovers_replication_after_lifecycle_in_another_bucket() {
             state.1,
             features.replication,
         ),
-        Duration::ZERO
+        None
     );
 }
 
@@ -249,4 +259,43 @@ async fn startup_replication_discovery_does_not_inspect_irrelevant_lifecycle_tai
         "replication already resolves scheduling; the later lifecycle bucket should remain uninspected"
     );
     assert!(!features.inspection_failed);
+}
+
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn startup_equivalent_policies_preserve_the_sampled_deadline() {
+    for explicit in [true, false] {
+        let mut initial = vec![("cycle", "21600")];
+        let mut updated = vec![("cycle", "43200")];
+        if explicit {
+            initial.push(("start_delay", "120"));
+            updated.push(("start_delay", "120"));
+        }
+        crate::runtime_config::apply_scanner_runtime_config(&startup_config(&initial)).expect("initial timing config");
+        let ctx = CancellationToken::new();
+        let samples = std::cell::Cell::new(0);
+        let mut gate = Box::pin(wait_for_scanner_startup(
+            &ctx,
+            std::future::ready((false, true)),
+            false,
+            scanner_maintenance_generation(),
+            |base| {
+                let count = samples.get() + 1;
+                samples.set(count);
+                if count == 1 { base.mul_f64(0.9) } else { base.mul_f64(1.1) }
+            },
+        ));
+        assert!(matches!(futures::poll!(&mut gate), Poll::Pending));
+        assert_eq!(samples.get(), 1);
+        advance(Duration::from_secs(10)).await;
+        crate::runtime_config::apply_scanner_runtime_config(&startup_config(&updated)).expect("cycle-only update");
+        assert!(matches!(futures::poll!(&mut gate), Poll::Pending));
+        assert_eq!(samples.get(), 1, "equivalent startup policy must retain its jitter sample");
+        advance(Duration::from_secs(if explicit { 98 } else { 44 })).await;
+        assert!(
+            matches!(futures::poll!(&mut gate), Poll::Ready(true)),
+            "original sampled deadline must remain effective"
+        );
+    }
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }

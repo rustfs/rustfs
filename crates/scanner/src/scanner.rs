@@ -516,20 +516,22 @@ fn cap_clean_idle_cycle_delay(delay: Duration, max_interval: Duration, enabled: 
         .max(Duration::from_secs(1))
 }
 
-fn initial_scanner_delay_for_startup(
+// None starts promptly; Some is the normalized interval to jitter once.
+fn scanner_startup_delay_policy(
     config: &ScannerRuntimeConfig,
     usage_cache_is_cold: bool,
     has_buckets: bool,
     has_active_replication: bool,
-) -> Duration {
+) -> Option<Duration> {
     if usage_cache_is_cold || (has_active_replication && has_buckets) {
-        return Duration::ZERO;
+        return None;
     }
-    // A long recurring cadence must not postpone the first attempt for hours.
-    randomized_cycle_delay_for(
+    Some(
         config
             .start_delay
-            .unwrap_or_else(|| config.cycle_interval.min(Duration::from_secs(60))),
+            .unwrap_or_else(|| config.cycle_interval.min(Duration::from_secs(60)))
+            .max(Duration::from_secs(1))
+            .min(MAX_SCANNER_SCHEDULE_DELAY),
     )
 }
 
@@ -562,14 +564,16 @@ async fn wait_for_scanner_runtime_wake(
     }
 }
 
-async fn wait_for_scanner_startup<F>(
+async fn wait_for_scanner_startup<F, J>(
     ctx: &CancellationToken,
     inspection: F,
     replication_active: bool,
     maintenance_generation: u64,
+    mut sample_delay: J,
 ) -> bool
 where
     F: Future<Output = (bool, bool)>,
+    J: FnMut(Duration) -> Duration,
 {
     let started = Instant::now();
     if ctx.is_cancelled() {
@@ -597,9 +601,14 @@ where
         },
     };
     let mut runtime_generation = scanner_runtime_config_generation();
-    let mut config = crate::runtime_config::current_scanner_runtime_config();
-    let delay = initial_scanner_delay_for_startup(&config, usage_cache_is_cold, has_buckets, replication_active);
-    if delay.is_zero() {
+    let mut policy = scanner_startup_delay_policy(
+        &crate::runtime_config::current_scanner_runtime_config(),
+        usage_cache_is_cold,
+        has_buckets,
+        replication_active,
+    );
+    let delay = policy.map(&mut sample_delay).unwrap_or_default();
+    if policy.is_none() {
         info!(
             target: "rustfs::scanner",
             event = EVENT_SCANNER_CYCLE_STATE,
@@ -617,13 +626,17 @@ where
             return wake != ScannerCycleWakeReason::Cancelled;
         }
         runtime_generation = scanner_runtime_config_generation();
-        let updated = crate::runtime_config::current_scanner_runtime_config();
-        if (updated.start_delay, updated.cycle_interval) != (config.start_delay, config.cycle_interval) {
-            // Reconfiguration cannot restart an already elapsed startup wait.
-            deadline =
-                started + initial_scanner_delay_for_startup(&updated, usage_cache_is_cold, has_buckets, replication_active);
+        let updated = scanner_startup_delay_policy(
+            &crate::runtime_config::current_scanner_runtime_config(),
+            usage_cache_is_cold,
+            has_buckets,
+            replication_active,
+        );
+        if updated != policy {
+            // Equivalent policies retain their deadline and jitter sample.
+            policy = updated;
+            deadline = started + policy.map(&mut sample_delay).unwrap_or_default();
         }
-        config = updated;
     }
 }
 
@@ -1139,6 +1152,7 @@ where
             initial_scanner_startup_usage_state(&storeapi_clone, replication_active),
             replication_active,
             startup_maintenance_generation.unwrap_or_else(scanner_maintenance_generation),
+            randomized_cycle_delay_for,
         )
         .await
         {

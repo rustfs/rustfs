@@ -857,10 +857,13 @@ pub(crate) fn lookup_scanner_runtime_config(
     })
 }
 
-fn apply_resolved_runtime_config(config: ScannerRuntimeConfig) -> bool {
+fn apply_resolved_runtime_config(config: Option<ScannerRuntimeConfig>) -> bool {
     let Ok(mut state) = SCANNER_RUNTIME_CONFIG.write() else {
         return false;
     };
+    // Failed resolution can initialize the retained startup snapshot, but
+    // must not replace a newer configuration accepted by another caller.
+    let config = config.unwrap_or_else(|| state.config.clone());
     if state.applied && state.config == config {
         return false;
     }
@@ -914,7 +917,7 @@ pub fn validate_scanner_runtime_config(config: &ServerConfig) -> Result<(), Scan
 pub fn apply_scanner_runtime_config(config: &ServerConfig) -> Result<(), ScannerRuntimeConfigError> {
     validate_scanner_runtime_config(config)?;
     let resolved = lookup_scanner_runtime_config(Some(config))?;
-    if apply_resolved_runtime_config(resolved) {
+    if apply_resolved_runtime_config(Some(resolved)) {
         SCANNER_RUNTIME_CONFIG_GENERATION.fetch_add(1, Ordering::AcqRel);
         SCANNER_RUNTIME_CONFIG_NOTIFY.notify_one();
     }
@@ -931,15 +934,22 @@ pub(crate) async fn scanner_runtime_config_changed() {
 
 pub(crate) fn refresh_scanner_runtime_config_from_global() -> Result<(), ScannerRuntimeConfigError> {
     let config = current_server_config();
-    let resolved = lookup_scanner_runtime_config(config.as_ref())?;
-    apply_resolved_runtime_config(resolved);
-    Ok(())
+    match lookup_scanner_runtime_config(config.as_ref()) {
+        Ok(resolved) => {
+            apply_resolved_runtime_config(Some(resolved));
+            Ok(())
+        }
+        Err(error) => {
+            apply_resolved_runtime_config(None);
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]
 pub(crate) fn refresh_scanner_runtime_config_for_tests() {
     if let Ok(resolved) = lookup_scanner_runtime_config(None) {
-        apply_resolved_runtime_config(resolved);
+        apply_resolved_runtime_config(Some(resolved));
     }
 }
 
@@ -1164,7 +1174,7 @@ mod tests {
             },
             ..Default::default()
         };
-        super::apply_resolved_runtime_config(config.clone());
+        super::apply_resolved_runtime_config(Some(config.clone()));
         let report = metrics.report().await;
         assert_eq!(report.cycle_interval_seconds, 21600.0);
         assert!(report.bitrot_cycle_enabled);
@@ -1178,13 +1188,64 @@ mod tests {
 
         config.bitrot_cycle = None;
         config.cycle_budget = Default::default();
-        super::apply_resolved_runtime_config(config);
+        super::apply_resolved_runtime_config(Some(config));
         let report = metrics.report().await;
         assert!(!report.bitrot_cycle_enabled);
         assert_eq!(report.bitrot_cycle_seconds, 0.0);
         assert_eq!(report.cycle_max_duration_seconds, 0.0);
         assert_eq!(report.cycle_max_objects, 0);
         assert_eq!(report.cycle_max_directories, 0);
+        super::refresh_scanner_runtime_config_for_tests();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn invalid_first_refresh_publishes_retained_config_without_reverting_newer_state() {
+        temp_env::async_with_vars([(ENV_SCANNER_WALKERS_PER_DISK, Some("0"))], async {
+            let retained = super::ScannerRuntimeConfig::default();
+            {
+                let mut state = super::SCANNER_RUNTIME_CONFIG.write().expect("runtime config state");
+                state.config = retained.clone();
+                state.applied = false;
+            }
+            let metrics = rustfs_scanner_metrics::metrics::global_metrics();
+            metrics.record_scanner_cycle_config(Duration::ZERO, None, None, None, None);
+            assert!(matches!(
+                super::refresh_scanner_runtime_config_from_global(),
+                Err(super::ScannerRuntimeConfigError::InvalidValue {
+                    key: ENV_SCANNER_WALKERS_PER_DISK,
+                    ..
+                })
+            ));
+            let report = metrics.report().await;
+            assert_eq!(report.cycle_interval_seconds, retained.cycle_interval.as_secs_f64());
+            assert_eq!(report.bitrot_cycle_enabled, retained.bitrot_cycle.is_some());
+            assert_eq!(
+                report.cycle_max_duration_seconds,
+                retained.cycle_budget.max_duration.unwrap_or_default().as_secs_f64()
+            );
+            assert!(super::SCANNER_RUNTIME_CONFIG.read().expect("runtime config state").applied);
+
+            let newer = super::ScannerRuntimeConfig {
+                cycle_interval: Duration::from_secs(120),
+                ..retained
+            };
+            super::apply_resolved_runtime_config(Some(newer.clone()));
+            metrics.record_scanner_cycle_timeout(true, Duration::from_secs(17));
+            assert!(matches!(
+                super::refresh_scanner_runtime_config_from_global(),
+                Err(super::ScannerRuntimeConfigError::InvalidValue {
+                    key: ENV_SCANNER_WALKERS_PER_DISK,
+                    ..
+                })
+            ));
+            assert_eq!(super::current_scanner_runtime_config(), newer);
+            let report = metrics.report().await;
+            assert_eq!(report.cycle_interval_seconds, 120.0);
+            assert_eq!(report.cycle_last_progress_age, 17);
+            assert!(report.leader_lease_without_progress);
+        })
+        .await;
         super::refresh_scanner_runtime_config_for_tests();
     }
 
@@ -1199,10 +1260,10 @@ mod tests {
         }
         let metrics = rustfs_scanner_metrics::metrics::global_metrics();
         metrics.record_scanner_cycle_config(Duration::ZERO, None, None, None, None);
-        assert!(super::apply_resolved_runtime_config(config.clone()));
+        assert!(super::apply_resolved_runtime_config(Some(config.clone())));
         assert_eq!(metrics.report().await.cycle_interval_seconds, config.cycle_interval.as_secs_f64());
         metrics.record_scanner_cycle_timeout(true, Duration::from_secs(17));
-        assert!(!super::apply_resolved_runtime_config(config));
+        assert!(!super::apply_resolved_runtime_config(Some(config)));
         let unchanged = metrics.report().await;
         assert_eq!(unchanged.cycle_last_progress_age, 17);
         assert!(unchanged.leader_lease_without_progress);
@@ -1216,7 +1277,7 @@ mod tests {
         let generation = super::scanner_runtime_config_generation();
         let resolved = super::current_scanner_runtime_config();
         for _ in 0..1000 {
-            assert!(!super::apply_resolved_runtime_config(resolved.clone()));
+            assert!(!super::apply_resolved_runtime_config(Some(resolved.clone())));
         }
         super::apply_scanner_runtime_config(&config).expect("unchanged configuration should be accepted");
         assert_eq!(super::scanner_runtime_config_generation(), generation);
@@ -1430,7 +1491,7 @@ mod tests {
 
         with_var_unset(ENV_SCANNER_BITROT_CYCLE_SECS, || {
             let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
-            super::apply_resolved_runtime_config(resolved);
+            super::apply_resolved_runtime_config(Some(resolved));
 
             let encoded = serde_json::to_value(super::scanner_runtime_config_status()).expect("scanner status should serialize");
 
@@ -1563,7 +1624,7 @@ mod tests {
                 assert_eq!(resolved.disk_io_budget_bytes_per_sec, ScannerIoBudgetLimit::Auto);
                 assert_eq!(resolved.disk_io_budget_bytes_per_sec_source, ScannerRuntimeConfigSource::Env);
 
-                super::apply_resolved_runtime_config(resolved);
+                super::apply_resolved_runtime_config(Some(resolved));
                 let status = super::scanner_runtime_config_status();
                 assert_eq!(status.disk_io_budget_iops.value, "0");
                 assert_eq!(status.disk_io_budget_iops.source, ScannerRuntimeConfigSource::Env);
@@ -1639,7 +1700,7 @@ mod tests {
         with_var_unset(ENV_SCANNER_CYCLE_MAX_OBJECTS, || {
             with_var_unset(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, || {
                 let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
-                super::apply_resolved_runtime_config(resolved);
+                super::apply_resolved_runtime_config(Some(resolved));
 
                 let status = super::scanner_runtime_config_status();
 
@@ -1677,7 +1738,7 @@ mod tests {
         with_var_unset("RUSTFS_SCANNER_DELAY", || {
             with_var_unset("RUSTFS_SCANNER_MAX_WAIT_SECS", || {
                 let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
-                super::apply_resolved_runtime_config(resolved);
+                super::apply_resolved_runtime_config(Some(resolved));
 
                 let encoded =
                     serde_json::to_value(super::scanner_runtime_config_status()).expect("scanner status should serialize");
@@ -1699,7 +1760,7 @@ mod tests {
         with_var("RUSTFS_SCANNER_DELAY", Some("1.25"), || {
             with_var("RUSTFS_SCANNER_MAX_WAIT_SECS", Some("2"), || {
                 let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
-                super::apply_resolved_runtime_config(resolved);
+                super::apply_resolved_runtime_config(Some(resolved));
 
                 let encoded =
                     serde_json::to_value(super::scanner_runtime_config_status()).expect("scanner status should serialize");
@@ -1721,7 +1782,7 @@ mod tests {
         with_var_unset(ENV_SCANNER_SPEED, || {
             with_var_unset(ENV_SCANNER_MAX_WAIT_SECS, || {
                 let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
-                super::apply_resolved_runtime_config(resolved);
+                super::apply_resolved_runtime_config(Some(resolved));
 
                 let status = super::scanner_runtime_config_status();
 

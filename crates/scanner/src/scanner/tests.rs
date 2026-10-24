@@ -1176,7 +1176,7 @@ fn test_randomized_cycle_delay_bounds_extreme_interval() {
 
 #[test]
 fn test_initial_scanner_delay_uses_configured_start_delay() {
-    let delay = initial_scanner_delay_for_startup(
+    let delay = scanner_startup_delay_policy(
         &ScannerRuntimeConfig {
             start_delay: Some(Duration::from_secs(120)),
             ..Default::default()
@@ -1185,8 +1185,7 @@ fn test_initial_scanner_delay_uses_configured_start_delay() {
         true,
         false,
     );
-    assert!(delay >= Duration::from_secs(108));
-    assert!(delay <= Duration::from_secs(132));
+    assert_eq!(delay, Some(Duration::from_secs(120)));
 }
 
 #[test]
@@ -1196,10 +1195,9 @@ fn test_initial_scanner_delay_bounds_warm_startup_without_changing_cycle() {
         for (cycle, startup) in [(1, 1), (30, 30), (60, 60), (21600, 60)] {
             with_var(ENV_SCANNER_CYCLE, Some(cycle.to_string().as_str()), || {
                 crate::runtime_config::refresh_scanner_runtime_config_for_tests();
-                let delay = initial_scanner_delay_for_startup(&resolve_scanner_runtime_config(), false, true, false);
+                let delay = scanner_startup_delay_policy(&resolve_scanner_runtime_config(), false, true, false);
                 let expected = Duration::from_secs(startup);
-                assert!(delay >= expected.mul_f64(0.9), "cycle {cycle}: {delay:?}");
-                assert!(delay <= expected.mul_f64(1.1), "cycle {cycle}: {delay:?}");
+                assert_eq!(delay, Some(expected), "cycle {cycle}");
                 assert_eq!(scanner_cycle_interval(), Duration::from_secs(cycle));
             });
         }
@@ -1209,7 +1207,7 @@ fn test_initial_scanner_delay_bounds_warm_startup_without_changing_cycle() {
 
 #[test]
 fn test_initial_scanner_delay_skips_for_cold_usage_cache_with_buckets() {
-    let delay = initial_scanner_delay_for_startup(
+    let delay = scanner_startup_delay_policy(
         &ScannerRuntimeConfig {
             start_delay: Some(Duration::from_secs(120)),
             ..Default::default()
@@ -1218,12 +1216,12 @@ fn test_initial_scanner_delay_skips_for_cold_usage_cache_with_buckets() {
         true,
         false,
     );
-    assert_eq!(delay, Duration::ZERO);
+    assert_eq!(delay, None);
 }
 
 #[test]
 fn test_initial_scanner_delay_keeps_configured_delay_for_warm_usage_cache_no_replication() {
-    let delay = initial_scanner_delay_for_startup(
+    let delay = scanner_startup_delay_policy(
         &ScannerRuntimeConfig {
             start_delay: Some(Duration::from_secs(120)),
             ..Default::default()
@@ -1232,13 +1230,12 @@ fn test_initial_scanner_delay_keeps_configured_delay_for_warm_usage_cache_no_rep
         true,
         false,
     );
-    assert!(delay >= Duration::from_secs(108));
-    assert!(delay <= Duration::from_secs(132));
+    assert_eq!(delay, Some(Duration::from_secs(120)));
 }
 
 #[test]
 fn test_initial_scanner_delay_skips_for_cold_usage_cache_without_buckets() {
-    let delay = initial_scanner_delay_for_startup(
+    let delay = scanner_startup_delay_policy(
         &ScannerRuntimeConfig {
             start_delay: Some(Duration::from_secs(120)),
             ..Default::default()
@@ -1247,14 +1244,14 @@ fn test_initial_scanner_delay_skips_for_cold_usage_cache_without_buckets() {
         false,
         false,
     );
-    assert_eq!(delay, Duration::ZERO);
+    assert_eq!(delay, None);
 }
 
 #[test]
 fn test_initial_scanner_delay_skips_for_active_replication_warm_cache() {
     // Warm cache + active replication rules → skip startup delay so that FAILED-status objects
     // from a crash are healed on the first cycle, not after a 27-33 min sleep.
-    let delay = initial_scanner_delay_for_startup(
+    let delay = scanner_startup_delay_policy(
         &ScannerRuntimeConfig {
             start_delay: Some(Duration::from_secs(120)),
             ..Default::default()
@@ -1263,13 +1260,13 @@ fn test_initial_scanner_delay_skips_for_active_replication_warm_cache() {
         true,
         true,
     );
-    assert_eq!(delay, Duration::ZERO);
+    assert_eq!(delay, None);
 }
 
 #[test]
 fn test_initial_scanner_delay_keeps_delay_for_replication_without_buckets() {
     // Active replication but no buckets → no objects to scan, keep normal delay.
-    let delay = initial_scanner_delay_for_startup(
+    let delay = scanner_startup_delay_policy(
         &ScannerRuntimeConfig {
             start_delay: Some(Duration::from_secs(120)),
             ..Default::default()
@@ -1278,8 +1275,7 @@ fn test_initial_scanner_delay_keeps_delay_for_replication_without_buckets() {
         false,
         true,
     );
-    assert!(delay >= Duration::from_secs(108));
-    assert!(delay <= Duration::from_secs(132));
+    assert_eq!(delay, Some(Duration::from_secs(120)));
 }
 
 #[test]
