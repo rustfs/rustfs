@@ -108,7 +108,7 @@ def measure(cluster, case, count, size, batch, repeat):
         for drive in node:
             external = any(path.rsplit("/", 1)[-1] == "part.1" for path in drive["files"])
             assert external == (size > 128 * 1024), "the fixture must exercise its declared physical layout"
-    harness.docker("stop", "--time", "30", cluster.names[0])
+    clean_stop = cluster.stop_clean(timeout=30)
     restart_started = time.perf_counter()
     cluster.restart()
     ready_seconds = time.perf_counter() - restart_started
@@ -124,6 +124,7 @@ def measure(cluster, case, count, size, batch, repeat):
     # so its complete initial sweep uses one bounded page on each disk.
     assert completed == [1] * 4, "unexpected discovery scopes invalidate startup attribution"
     startup = {
+        "clean_exit_code": clean_stop["ExitCode"],
         "ready_seconds": ready_seconds,
         "initial_discovery_complete_seconds": time.perf_counter() - restart_started,
         "discovery_within_30_seconds": time.perf_counter() - restart_started <= 30,

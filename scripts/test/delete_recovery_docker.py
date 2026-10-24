@@ -223,6 +223,12 @@ class Cluster:
     def kill(self, index=0):
         docker('kill', '--signal', 'KILL', self.names[index])
 
+    def stop_clean(self, index=0, timeout=60):
+        docker('stop', '--time', str(timeout), self.names[index])
+        state = json.loads(docker('inspect', '--format', '{{json .State}}', self.names[index]).stdout)
+        assert state['ExitCode'] == 0 and not state['OOMKilled'], state
+        return state
+
     def restart(self, index=None):
         for i in range(self.nodes) if index is None else [index]:
             docker('start', self.names[i])
@@ -1035,9 +1041,7 @@ def automatic_clean_restart():
         clear_barriers(cluster)
         before = residue_inventory(cluster, bucket, key)
         assert all(any(path.endswith('delete-quorum-committed') for path in drive['files']) for node in before for drive in node)
-        docker('stop', '--time', '60', cluster.names[0])
-        state = json.loads(docker('inspect', '--format', '{{json .State}}', cluster.names[0]).stdout)
-        assert state['ExitCode'] == 0 and not state['OOMKilled'], state
+        state = cluster.stop_clean()
         repair = "from pathlib import Path; import json,os; roots=list(Path('/data').glob('d*/%s/%s')); dirs=[p for root in roots for p in root.iterdir() if p.is_dir() and (p/'part.1').is_file()]; assert len(dirs)==4; [os.chmod(p,0o755) for p in dirs]; print(json.dumps({'restored_payload_dirs':len(dirs)}))" % (bucket, key)
         cluster.inspect_data(repair)
         cluster.restart()
@@ -1263,8 +1267,10 @@ def release_batch_crash():
             payloads = {f'inline/object-{index:04d}': small for index in range(256)}
             payloads.update({f'external/object-{index:04d}': large for index in range(32)})
             client.put_bucket(bucket)
+            etags = {}
             for key, payload in payloads.items():
                 client.put(bucket, key, payload)
+                etags[key] = client.last_headers['etag']
             request = {}
 
             def delete_batch():
@@ -1324,6 +1330,7 @@ def release_batch_crash():
                 assert (status == 200) == (key in present)
                 if status == 200:
                     assert body == payload, 'every surviving key must preserve complete original bytes'
+                    assert client.last_headers.get('etag') == etags[key], 'rollback must preserve the original ETag'
             absent = sorted(payloads.keys() - present)
             physical = cluster.inspect_data(
                 "from pathlib import Path\nimport json\n"
@@ -1332,11 +1339,12 @@ def release_batch_crash():
                 "for key in keys if (d/bucket/key).exists()]))"
             )
             assert all(not node for node in physical), 'automatic recovery cannot leave invisible object residue'
-            docker('stop', '--time', '60', cluster.names[0])
+            cluster.stop_clean()
             cluster.restart()
             assert set(client.list(bucket)) == present, 'a second recovery cannot change the settled key set'
             for key in present:
                 assert client.get(bucket, key) == payloads[key], 'a second recovery must preserve complete bytes'
+                assert client.last_headers.get('etag') == etags[key], 'a second recovery must preserve the original ETag'
             client.batch_delete(bucket, list(payloads))
             assert client.list(bucket) == []
             client.delete_bucket(bucket)

@@ -4,11 +4,21 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 
 import delete_recovery_perf as perf
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_clean_restart_rejects_forced_exit_or_oom(self):
+        for state in ({"ExitCode": 137, "OOMKilled": False}, {"ExitCode": 0, "OOMKilled": True}):
+            cluster = perf.harness.Cluster.__new__(perf.harness.Cluster)
+            cluster.names = ["owned-test-server"]
+            with patch.object(perf.harness, "docker", side_effect=[SimpleNamespace(), SimpleNamespace(stdout=json.dumps(state).encode())]):
+                with self.assertRaises(AssertionError):
+                    cluster.stop_clean()
+
     def test_expired_operation_window_cannot_be_attributed_to_the_candidate(self):
         with self.assertRaisesRegex(ValueError, "expired"):
             perf.stage_delta({"prepare": {"count": 4, "ns": 100}}, {"prepare": {"count": 3, "ns": 90}})
