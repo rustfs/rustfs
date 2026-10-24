@@ -248,7 +248,7 @@ impl ForegroundRecorder {
     }
 }
 
-/// Non-clonable request ownership, moved from the service future to its body.
+/// Non-cloneable request ownership, moved from the service future to its body.
 pub struct ForegroundObservation<'a> {
     recorder: &'a ForegroundRecorder,
     started_at: Option<Instant>,
