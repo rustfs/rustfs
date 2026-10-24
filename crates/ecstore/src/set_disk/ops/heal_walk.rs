@@ -358,6 +358,7 @@ impl SetDisks {
                 let collector = agreed_collector.clone();
                 Box::pin(async move {
                     collector.ingest(entry);
+                    Ok(())
                 })
             })),
             partial: Some(Box::new(move |entries: MetaCacheEntries, _errs: &[Option<DiskError>]| {

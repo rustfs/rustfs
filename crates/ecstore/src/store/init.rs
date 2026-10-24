@@ -12389,6 +12389,90 @@ mod tests {
             .len()
     }
 
+    // Recovery removes metadata replicas disk by disk. An unreadable prefix
+    // is incomplete evidence and must reset, never advance, the empty streak.
+    #[cfg(feature = "test-util")]
+    fn tier_delete_recovery_listing_is_empty(prefix: &str, count: crate::error::Result<usize>) -> bool {
+        match count {
+            Ok(count) => count == 0,
+            Err(StorageError::InsufficientReadQuorum(bucket, object)) if bucket == RUSTFS_META_BUCKET && object == prefix => {
+                false
+            }
+            Err(error) => panic!("{prefix} recovery inventory should be listable: {error:?}"),
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn tier_delete_recovery_prefix_is_empty(store: Arc<crate::store::ECStore>, prefix: &str) -> bool {
+        let store_id = store.id;
+        let started = std::time::Instant::now();
+        let count = store
+            .list_objects_v2(RUSTFS_META_BUCKET, prefix, None, None, 100, false, None, false)
+            .await
+            .map(|listing| listing.objects.len());
+        if let Err(error) = &count {
+            eprintln!(
+                "tier-delete recovery inventory unavailable: store={store_id} prefix={prefix} elapsed={:?} error={error:?}",
+                started.elapsed()
+            );
+        }
+        tier_delete_recovery_listing_is_empty(prefix, count)
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn tier_delete_recovery_observations_require_readable_empty_prefixes() {
+        for prefix in [TIER_DELETE_JOURNAL_PREFIX, TIER_DELETE_DISPATCH_MANIFEST_PREFIX] {
+            let observations = [
+                Ok(0),
+                Err(StorageError::InsufficientReadQuorum(RUSTFS_META_BUCKET.to_string(), prefix.to_string())),
+                Ok(0),
+                Ok(1),
+                Ok(0),
+            ];
+            let mut stable_empty = 0;
+            let streaks = observations
+                .into_iter()
+                .map(|count| {
+                    if tier_delete_recovery_listing_is_empty(prefix, count) {
+                        stable_empty += 1;
+                    } else {
+                        stable_empty = 0;
+                    }
+                    stable_empty
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(streaks, [1, 0, 1, 0, 1], "unreadable or nonempty {prefix} cannot certify convergence");
+            for _ in 0..10 {
+                assert!(!tier_delete_recovery_listing_is_empty(
+                    prefix,
+                    Err(StorageError::InsufficientReadQuorum(RUSTFS_META_BUCKET.to_string(), prefix.to_string())),
+                ));
+            }
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn tier_delete_recovery_observations_reject_unrelated_errors() {
+        for prefix in [TIER_DELETE_JOURNAL_PREFIX, TIER_DELETE_DISPATCH_MANIFEST_PREFIX] {
+            for error in [
+                StorageError::InsufficientReadQuorum("other-bucket".to_string(), prefix.to_string()),
+                StorageError::InsufficientReadQuorum(RUSTFS_META_BUCKET.to_string(), "other-prefix".to_string()),
+                StorageError::FileNotFound,
+                StorageError::ErasureReadQuorum,
+            ] {
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        tier_delete_recovery_listing_is_empty(prefix, Err(error))
+                    }))
+                    .is_err(),
+                    "only the exact recovery prefix's InsufficientReadQuorum may defer an observation"
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "test-util")]
     async fn install_committed_tier_delete_journals(
         store: Arc<crate::store::ECStore>,
@@ -12496,8 +12580,8 @@ mod tests {
                 recover_tier_delete_journal_entries(store.clone(), 100, None)
                     .await
                     .expect("restarted journal recovery pass should finish");
-                if tier_delete_journal_count(store.clone()).await == 0
-                    && tier_delete_dispatch_manifest_count(store.clone()).await == 0
+                if tier_delete_recovery_prefix_is_empty(store.clone(), TIER_DELETE_JOURNAL_PREFIX).await
+                    && tier_delete_recovery_prefix_is_empty(store.clone(), TIER_DELETE_DISPATCH_MANIFEST_PREFIX).await
                     && tier_delete_dispatch_manifest_recovery_count_for_test(&store) == 0
                 {
                     stable_empty_observations += 1;
@@ -13925,8 +14009,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(30), async {
             let mut stable_empty_observations = 0;
             loop {
-                if tier_delete_journal_count(restarted_store.clone()).await == 0
-                    && tier_delete_dispatch_manifest_count(restarted_store.clone()).await == 0
+                if tier_delete_recovery_prefix_is_empty(restarted_store.clone(), TIER_DELETE_JOURNAL_PREFIX).await
+                    && tier_delete_recovery_prefix_is_empty(restarted_store.clone(), TIER_DELETE_DISPATCH_MANIFEST_PREFIX).await
                     && tier_delete_dispatch_manifest_recovery_count_for_test(&restarted_store) == 0
                 {
                     stable_empty_observations += 1;
@@ -14050,8 +14134,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(30), async {
             let mut stable_empty_observations = 0;
             loop {
-                if tier_delete_journal_count(restarted_store.clone()).await == 0
-                    && tier_delete_dispatch_manifest_count(restarted_store.clone()).await == 0
+                if tier_delete_recovery_prefix_is_empty(restarted_store.clone(), TIER_DELETE_JOURNAL_PREFIX).await
+                    && tier_delete_recovery_prefix_is_empty(restarted_store.clone(), TIER_DELETE_DISPATCH_MANIFEST_PREFIX).await
                     && tier_delete_dispatch_manifest_recovery_count_for_test(&restarted_store) == 0
                 {
                     stable_empty_observations += 1;

@@ -22,6 +22,8 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto,
 };
+use prost::Message as _;
+use rustfs_protos::proto_gen::node_service::DeleteRequest;
 use std::{
     io,
     net::SocketAddr,
@@ -195,6 +197,30 @@ impl RpcFaultProxy {
     }
 }
 
+fn scope_matches(method: &str, body: &[u8], scope: &[u8]) -> io::Result<bool> {
+    if method != "Delete" {
+        return Ok(body.windows(scope.len()).any(|window| window == scope));
+    }
+    // Abort's recursive root delete must not be confused with transaction or
+    // part cleanup below that root. This is a unary, uncompressed gRPC frame.
+    if body.len() < 5 || body[0] != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "scoped Delete needs an uncompressed unary frame",
+        ));
+    }
+    let mut encoded_length = [0; 4];
+    encoded_length.copy_from_slice(&body[1..5]);
+    if u32::try_from(body.len() - 5).ok() != Some(u32::from_be_bytes(encoded_length)) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "scoped Delete frame length mismatch"));
+    }
+    let request = DeleteRequest::decode(&body[5..]).map_err(io::Error::other)?;
+    let options: serde_json::Value = serde_json::from_str(&request.options).map_err(io::Error::other)?;
+    Ok(request.volume == ".rustfs.sys/multipart"
+        && request.path.trim_end_matches('/').as_bytes() == scope
+        && options.get("recursive").and_then(serde_json::Value::as_bool) == Some(true))
+}
+
 async fn forward_request(
     request: Request<Incoming>,
     client: ProxyClient,
@@ -206,14 +232,14 @@ async fn forward_request(
     let mut observed = None;
     if let Some(pause) = pause {
         let method = parts.uri.path().strip_prefix("/node_service.NodeService/");
-        if method.is_some_and(|name| pause.methods.contains(&name)) {
+        if let Some(method) = method.filter(|name| pause.methods.contains(name)) {
             let matches = if let Some(scope) = pause.scope.as_deref() {
-                // Scope the control packet to this bucket or upload without
-                // decoding or changing bytes covered by the RPC signature.
+                // Inspect bounded routing data while retaining the exact
+                // original bytes covered by the RPC signature.
                 let collected = Limited::new(body, 1024 * 1024).collect().await.map_err(io::Error::other)?;
                 let trailers = collected.trailers().cloned();
                 let bytes = collected.to_bytes();
-                let matches = bytes.windows(scope.len()).any(|window| window == scope);
+                let matches = scope_matches(method, &bytes, scope)?;
                 body = Full::new(bytes)
                     .map_err(|never| match never {})
                     .with_trailers(async move { trailers.map(Ok::<_, io::Error>) })
@@ -503,5 +529,44 @@ mod tests {
         })
         .await
         .expect("scoped discard deadline");
+    }
+    #[test]
+    fn delete_scope_matches_only_the_upload_root() {
+        let frame = |volume: &str, path: &str| {
+            let message = DeleteRequest {
+                volume: volume.to_owned(),
+                path: path.to_owned(),
+                options: r#"{"recursive":true}"#.to_owned(),
+                ..Default::default()
+            };
+            let payload = message.encode_to_vec();
+            let length = u32::try_from(payload.len()).expect("small control packet");
+            let mut bytes = vec![0];
+            bytes.extend_from_slice(&length.to_be_bytes());
+            bytes.extend_from_slice(&payload);
+            bytes
+        };
+        let root = b"hash/upload";
+        assert!(scope_matches("Delete", &frame(".rustfs.sys/multipart", "hash/upload"), root).expect("root frame"));
+        assert!(scope_matches("Delete", &frame(".rustfs.sys/multipart", "hash/upload/"), root).expect("directory frame"));
+        for path in ["hash/upload/part.1", "hash/upload-other"] {
+            assert!(!scope_matches("Delete", &frame(".rustfs.sys/multipart", path), root).expect("other path"));
+        }
+        assert!(!scope_matches("Delete", &frame(".rustfs.sys/tmp", "hash/upload"), root).expect("other volume"));
+        let non_recursive = DeleteRequest {
+            volume: ".rustfs.sys/multipart".to_owned(),
+            path: "hash/upload".to_owned(),
+            options: r#"{"recursive":false}"#.to_owned(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mut non_recursive_frame = vec![0];
+        non_recursive_frame.extend_from_slice(&u32::try_from(non_recursive.len()).expect("small frame").to_be_bytes());
+        non_recursive_frame.extend_from_slice(&non_recursive);
+        assert!(!scope_matches("Delete", &non_recursive_frame, root).expect("non-recursive frame"));
+        assert!(
+            scope_matches("Delete", &[0, 0, 0, 0, 1], root).is_err(),
+            "truncation must not become a match"
+        );
     }
 }
