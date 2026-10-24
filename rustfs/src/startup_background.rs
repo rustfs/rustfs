@@ -57,7 +57,7 @@ pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Resu
     // (rustfs/backlog#1873).
     run_startup_bitrot_self_test(bitrot_selftest_enabled_from_env(), bitrot_selftest_strict_from_env()).await?;
 
-    let _ = create_ahm_services_cancel_token();
+    let background_cancel = create_ahm_services_cancel_token();
 
     let plan = resolve_background_service_plan(scanner_enabled_from_env(), heal_enabled_from_env());
 
@@ -94,6 +94,10 @@ pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Resu
     );
 
     init_on_demand_migration_backfill_runtime(store).await;
+
+    if plan.heal_manager_enabled {
+        let _ = crate::foreground_observation::start_sampler(background_cancel);
+    }
 
     Ok(plan.scanner_enabled)
 }

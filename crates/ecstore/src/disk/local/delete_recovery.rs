@@ -2336,7 +2336,7 @@ mod tests {
             },
             DeleteOptions {
                 undo_delete: true,
-                ..opts.clone()
+                ..opts
             },
         ] {
             assert_eq!(
