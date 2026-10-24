@@ -1180,12 +1180,18 @@ fn test_initial_scanner_delay_uses_configured_start_delay() {
 
 #[test]
 #[serial]
-fn test_initial_scanner_delay_uses_cycle_without_explicit_start_delay() {
-    with_var(ENV_SCANNER_CYCLE, Some("120"), || {
-        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
-        let delay = initial_scanner_delay_for(None);
-        assert!(delay >= Duration::from_secs(108));
-        assert!(delay <= Duration::from_secs(132));
+fn test_initial_scanner_delay_bounds_warm_startup_without_changing_cycle() {
+    with_unset_scanner_timing_env(|| {
+        for (cycle, startup) in [(1, 1), (30, 30), (60, 60), (21600, 60)] {
+            with_var(ENV_SCANNER_CYCLE, Some(cycle.to_string().as_str()), || {
+                crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+                let delay = initial_scanner_delay_for_startup(None, false, true, false);
+                let expected = Duration::from_secs(startup);
+                assert!(delay >= expected.mul_f64(0.9), "cycle {cycle}: {delay:?}");
+                assert!(delay <= expected.mul_f64(1.1), "cycle {cycle}: {delay:?}");
+                assert_eq!(scanner_cycle_interval(), Duration::from_secs(cycle));
+            });
+        }
     });
     crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }

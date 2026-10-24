@@ -517,9 +517,11 @@ fn cap_clean_idle_cycle_delay(delay: Duration, max_interval: Duration, enabled: 
 }
 
 fn initial_scanner_delay_for(start_delay_secs: Option<u64>) -> Duration {
-    start_delay_secs
-        .map(|secs| randomized_cycle_delay_for(Duration::from_secs(secs)))
-        .unwrap_or_else(randomized_cycle_delay)
+    // A long recurring cadence must not postpone the first attempt for hours.
+    let delay = start_delay_secs
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| scanner_cycle_interval().min(Duration::from_secs(60)));
+    randomized_cycle_delay_for(delay)
 }
 
 fn initial_scanner_delay_for_startup(
@@ -1774,21 +1776,8 @@ where
             "Scanner runtime config refresh failed"
         );
     }
-    let configured_cycle_interval = scanner_cycle_interval();
     let configured_bitrot_cycle = scanner_bitrot_cycle();
-    let cycle_budget_config = ScannerCycleBudgetConfig {
-        max_duration: cycle_budget.max_duration(),
-        max_objects: cycle_budget.max_objects(),
-        max_directories: cycle_budget.max_directories(),
-    };
     let usage_persist_timeout = data_usage_persist_timeout();
-    global_metrics().record_scanner_cycle_config(
-        configured_cycle_interval,
-        configured_bitrot_cycle,
-        cycle_budget_config.max_duration,
-        cycle_budget_config.max_objects,
-        cycle_budget_config.max_directories,
-    );
     cycle_info.current = cycle_info.next;
     let now = Instant::now();
     cycle_info.started = Utc::now();

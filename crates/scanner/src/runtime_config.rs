@@ -856,6 +856,13 @@ fn apply_resolved_runtime_config(config: ScannerRuntimeConfig) {
         speed: config.speed,
     });
     if let Ok(mut guard) = SCANNER_RUNTIME_CONFIG.write() {
+        rustfs_scanner_metrics::metrics::global_metrics().record_scanner_cycle_config(
+            config.cycle_interval,
+            config.bitrot_cycle,
+            config.cycle_budget.max_duration,
+            config.cycle_budget.max_objects,
+            config.cycle_budget.max_directories,
+        );
         *guard = config;
     }
 }
@@ -1123,6 +1130,46 @@ mod tests {
             .insert(target.to_string(), kvs);
         config.set_defaults();
         config
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn applying_runtime_config_publishes_cycle_metrics_before_first_cycle() {
+        let metrics = rustfs_scanner_metrics::metrics::global_metrics();
+        metrics.record_scanner_cycle_config(Duration::ZERO, None, None, None, None);
+        let before = metrics.report().await;
+        let mut config = super::ScannerRuntimeConfig {
+            cycle_interval: Duration::from_secs(21600),
+            bitrot_cycle: Some(Duration::from_secs(2592000)),
+            cycle_budget: crate::scanner_budget::ScannerCycleBudgetConfig {
+                max_duration: Some(Duration::from_secs(1800)),
+                max_objects: Some(1000),
+                max_directories: Some(8000),
+            },
+            ..Default::default()
+        };
+        super::apply_resolved_runtime_config(config.clone());
+        let report = metrics.report().await;
+        assert_eq!(report.cycle_interval_seconds, 21600.0);
+        assert!(report.bitrot_cycle_enabled);
+        assert_eq!(report.bitrot_cycle_seconds, 2592000.0);
+        assert_eq!(report.cycle_max_duration_seconds, 1800.0);
+        assert_eq!(report.cycle_max_objects, 1000);
+        assert_eq!(report.cycle_max_directories, 8000);
+        assert_eq!(report.current_cycle, before.current_cycle);
+        assert_eq!(report.current_cycle_active, before.current_cycle_active);
+        assert_eq!(report.cycles_completed_at, before.cycles_completed_at);
+
+        config.bitrot_cycle = None;
+        config.cycle_budget = Default::default();
+        super::apply_resolved_runtime_config(config);
+        let report = metrics.report().await;
+        assert!(!report.bitrot_cycle_enabled);
+        assert_eq!(report.bitrot_cycle_seconds, 0.0);
+        assert_eq!(report.cycle_max_duration_seconds, 0.0);
+        assert_eq!(report.cycle_max_objects, 0);
+        assert_eq!(report.cycle_max_directories, 0);
+        super::refresh_scanner_runtime_config_for_tests();
     }
 
     #[test]
