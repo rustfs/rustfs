@@ -188,7 +188,13 @@ impl FileMeta {
         if !buf.is_empty() {
             InlineData::validate_slice(buf).map_err(|e| {
                 error!("data validation failed: {}", e);
-                e
+                // Validation only examines bytes already read. Classify damage
+                // as repairable corruption only for formats we understand.
+                if InlineData::version_ok_slice(buf) && Self::decode_xl_headers(meta).is_ok() {
+                    Error::FileCorrupt
+                } else {
+                    e
+                }
             })?;
         }
 

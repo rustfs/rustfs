@@ -1435,7 +1435,10 @@ impl DefaultObjectUsecase {
 
         let output = PutObjectOutput {
             e_tag,
-            server_side_encryption: committed.effective_sse.clone(),
+            server_side_encryption: committed
+                .effective_sse
+                .clone()
+                .filter(|_| committed.sse_customer_algorithm.is_none()),
             sse_customer_algorithm: committed.sse_customer_algorithm.clone(),
             sse_customer_key_md5: committed.sse_customer_key_md5.clone(),
             ssekms_key_id: committed.effective_kms_key_id.clone(),
@@ -3964,6 +3967,12 @@ mod tests {
     async fn sse_c_put_is_accepted_on_a_bucket_with_default_encryption() {
         use md5::{Digest as _, Md5};
 
+        let context = crate::storage::storage_api::bootstrap_instance_ctx();
+        assert!(
+            context.object_encryption_resolver().is_some(),
+            "real SSE-C reads need the production encryption resolver"
+        );
+
         for (algorithm, kms_key_id, prefix) in [
             (ServerSideEncryption::AES256, None, "ssec-over-aes256-default"),
             (ServerSideEncryption::AWS_KMS, Some("bucket-key"), "ssec-over-kms-default"),
@@ -3985,14 +3994,69 @@ mod tests {
                 .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
                 .sse_customer_algorithm(Some("AES256".to_string()))
                 .sse_customer_key(Some(base64_simd::STANDARD.encode_to_string(customer_key)))
-                .sse_customer_key_md5(Some(key_md5))
+                .sse_customer_key_md5(Some(key_md5.clone()))
                 .build()
                 .expect("SSE-C PUT input must build");
 
-            DefaultObjectUsecase::from_global()
+            let usecase = DefaultObjectUsecase::from_global();
+            let response = usecase
                 .execute_put_object(&FS::new(), build_request(input, Method::PUT))
                 .await
                 .unwrap_or_else(|err| panic!("a {algorithm} default bucket must accept an SSE-C PUT: {err:?}"));
+            assert_eq!(response.output.server_side_encryption, None);
+            assert_eq!(response.output.sse_customer_algorithm.as_deref(), Some("AES256"));
+            assert_eq!(response.output.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
+
+            let encoded_key = base64_simd::STANDARD.encode_to_string(customer_key);
+            let mut read_headers = HeaderMap::new();
+            read_headers.insert("x-amz-server-side-encryption-customer-algorithm", HeaderValue::from_static("AES256"));
+            read_headers.insert(
+                "x-amz-server-side-encryption-customer-key",
+                HeaderValue::from_str(&encoded_key).expect("encoded customer key is a valid header"),
+            );
+            read_headers.insert(
+                "x-amz-server-side-encryption-customer-key-md5",
+                HeaderValue::from_str(&key_md5).expect("customer key MD5 is a valid header"),
+            );
+            let head_input = HeadObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("ledger.csv".to_string())
+                .sse_customer_algorithm(Some("AES256".to_string()))
+                .sse_customer_key(Some(encoded_key.clone()))
+                .sse_customer_key_md5(Some(key_md5.clone()))
+                .build()
+                .expect("SSE-C HEAD input must build");
+            let mut head_request = build_request(head_input, Method::HEAD);
+            head_request.headers = read_headers.clone();
+            let head = Box::pin(usecase.execute_head_object(head_request))
+                .await
+                .expect("matching SSE-C key must authorize HEAD");
+            assert_eq!(head.output.server_side_encryption, None);
+            assert_eq!(head.output.sse_customer_algorithm.as_deref(), Some("AES256"));
+            assert_eq!(head.output.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
+
+            let get_input = GetObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("ledger.csv".to_string())
+                .sse_customer_algorithm(Some("AES256".to_string()))
+                .sse_customer_key(Some(encoded_key))
+                .sse_customer_key_md5(Some(key_md5.clone()))
+                .build()
+                .expect("SSE-C GET input must build");
+            let mut get_request = build_request(get_input, Method::GET);
+            get_request.headers = read_headers;
+            let get = Box::pin(usecase.execute_get_object(get_request))
+                .await
+                .expect("matching SSE-C key must authorize GET");
+            assert_eq!(get.output.server_side_encryption, None);
+            assert_eq!(get.output.sse_customer_algorithm.as_deref(), Some("AES256"));
+            assert_eq!(get.output.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
+            let mut body = get.output.body.expect("SSE-C GET must include the decrypted body");
+            let mut plaintext = Vec::new();
+            while let Some(chunk) = body.next().await {
+                plaintext.extend_from_slice(&chunk.expect("SSE-C body must decrypt completely"));
+            }
+            assert_eq!(plaintext, payload, "header classification must preserve the complete decrypted payload");
 
             let stored = store
                 .get_object_info(&bucket, "ledger.csv", &ObjectOptions::default())

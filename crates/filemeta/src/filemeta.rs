@@ -2427,6 +2427,52 @@ mod test {
     }
 
     #[test]
+    fn truncated_inline_xlmeta_is_file_corrupt_only_for_supported_formats() {
+        let mut meta = FileMeta::new();
+        meta.data
+            .replace("fixture", vec![0x5a; 4095])
+            .expect("seed real inline framing");
+        let inline_len = meta.data.as_slice().len();
+        let original = meta.marshal_msg().expect("serialize valid inline metadata");
+        let inline_start = original.len() - inline_len;
+        let parsed = FileMeta::load(&original).expect("complete inline metadata must decode");
+        assert_eq!(parsed.data, meta.data);
+        for cut in inline_start + 1..original.len() {
+            assert_eq!(
+                FileMeta::load(&original[..cut]).expect_err("incomplete inline framing must fail"),
+                Error::FileCorrupt,
+                "inline truncation at byte {cut} must remain repairable"
+            );
+        }
+
+        for inline_version in [0, 2] {
+            let mut unsupported = original[..original.len() / 2].to_vec();
+            unsupported[inline_start] = inline_version;
+            assert_ne!(
+                FileMeta::load(&unsupported).expect_err("malformed unsupported inline format must fail"),
+                Error::FileCorrupt,
+                "unknown inline version must not authorize repair"
+            );
+        }
+        for (header_ver, meta_ver) in [
+            (XL_HEADER_VERSION + 1, XL_META_VERSION),
+            (XL_HEADER_VERSION, XL_META_VERSION + 1),
+        ] {
+            let mut headers = Vec::new();
+            rmp::encode::write_uint(&mut headers, u64::from(header_ver)).expect("write future header");
+            rmp::encode::write_uint(&mut headers, u64::from(meta_ver)).expect("write future metadata version");
+            rmp::encode::write_uint(&mut headers, 0).expect("write empty version count");
+            let mut unsupported = build_xl_buffer(&headers);
+            unsupported.extend_from_slice(&meta.data.as_slice()[..inline_len / 2]);
+            assert_ne!(
+                FileMeta::load(&unsupported).expect_err("unsupported metadata with truncated inline data must fail"),
+                Error::FileCorrupt,
+                "future metadata schema must not authorize repair"
+            );
+        }
+    }
+
+    #[test]
     fn truncated_xlmeta_index_and_format_reads_are_file_corrupt() {
         let buf = FileMeta::default()
             .marshal_msg()

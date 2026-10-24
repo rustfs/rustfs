@@ -5379,8 +5379,8 @@ async fn scanner_legacy_usage_backup_survives_fencing_and_restart_after_real_met
         .await
         .expect_err("truncated primary must fail in the real object reader");
     assert!(
-        error.to_string().contains("InlineData value out of range"),
-        "unexpected truncated-primary error: {error}"
+        matches!(error, EcstoreError::FileCorrupt),
+        "unexpected truncated-primary error: {error:?}"
     );
     assert_eq!(
         read_config_with_revision(store.clone(), &backup_path)

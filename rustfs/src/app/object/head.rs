@@ -462,12 +462,13 @@ impl DefaultObjectUsecase {
         })?;
 
         let metadata_map = info.user_defined.clone();
-        let server_side_encryption = metadata_map
-            .get("x-amz-server-side-encryption")
-            .map(|v| ServerSideEncryption::from(v.clone()));
         let sse_customer_algorithm = metadata_map
             .get("x-amz-server-side-encryption-customer-algorithm")
             .map(|v| SSECustomerAlgorithm::from(v.clone()));
+        let server_side_encryption = metadata_map
+            .get("x-amz-server-side-encryption")
+            .filter(|_| sse_customer_algorithm.is_none())
+            .map(|v| ServerSideEncryption::from(v.clone()));
         let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
         let sse_kms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
         let storage_class = response_storage_class(&info, &metadata_map);
