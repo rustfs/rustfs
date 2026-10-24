@@ -55,6 +55,7 @@ struct PauseState {
     limit: usize,
     matched: AtomicUsize,
     blocked: AtomicUsize,
+    forwarded: AtomicUsize,
     reached: Notify,
     release: watch::Sender<Disposition>,
 }
@@ -69,6 +70,11 @@ pub(crate) struct RpcPause {
 impl RpcPause {
     pub(crate) fn hits(&self) -> usize {
         self.state.blocked.load(Ordering::SeqCst)
+    }
+
+    /// Selected RPCs whose backend returned a response, excluding discarded packets.
+    pub(crate) fn forwarded(&self) -> usize {
+        self.state.forwarded.load(Ordering::SeqCst)
     }
 
     pub(crate) async fn wait_for_hits(&self, count: usize) -> io::Result<()> {
@@ -179,6 +185,7 @@ impl RpcFaultProxy {
             limit,
             matched: AtomicUsize::new(0),
             blocked: AtomicUsize::new(0),
+            forwarded: AtomicUsize::new(0),
             reached: Notify::new(),
             release,
         });
@@ -222,6 +229,7 @@ async fn forward_request(
 ) -> io::Result<hyper::Response<Incoming>> {
     let (mut parts, body) = request.into_parts();
     let mut body = body.map_err(io::Error::other).boxed();
+    let mut observed = None;
     if let Some(pause) = pause {
         let method = parts.uri.path().strip_prefix("/node_service.NodeService/");
         if let Some(method) = method.filter(|name| pause.methods.contains(name)) {
@@ -256,6 +264,7 @@ async fn forward_request(
                 if disposition == Disposition::Discard {
                     return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "injected RPC packet loss"));
                 }
+                observed = Some(pause);
             }
         }
     }
@@ -273,10 +282,17 @@ async fn forward_request(
         .path_and_query(parts.uri.path_and_query().map_or("/", |value| value.as_str()))
         .build()
         .map_err(io::Error::other)?;
-    client
+    let response = client
         .request(Request::from_parts(parts, body))
         .await
-        .map_err(io::Error::other)
+        .map_err(io::Error::other)?;
+    if let Some(pause) = observed
+        && response.status().is_success()
+        && response.headers().get("grpc-status").is_none_or(|status| status == "0")
+    {
+        pause.forwarded.fetch_add(1, Ordering::SeqCst);
+    }
+    Ok(response)
 }
 
 impl Drop for RpcFaultProxy {
@@ -430,6 +446,52 @@ mod tests {
         .await
         .expect("selective fault deadline");
     }
+    #[tokio::test]
+    async fn released_observer_requires_a_selected_backend_response() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let backend = backend().await.expect("backend listener");
+            let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback"), backend.address)
+                .await
+                .expect("proxy listener");
+            let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(true).build_http();
+            let observer = proxy
+                .pause(&["Lock"], usize::MAX, Some("recovery-bucket"))
+                .expect("RPC observer");
+            let unrelated = call_body(&client, proxy.local_addr(), "Lock", Bytes::from_static(b"other-bucket"))
+                .await
+                .expect("unrelated request");
+            unrelated.into_body().collect().await.expect("unrelated body");
+            assert_eq!(observer.forwarded(), 0, "unrelated traffic cannot prove recovery");
+            let task_client = client.clone();
+            let address = proxy.local_addr();
+            let request =
+                tokio::spawn(
+                    async move { call_body(&task_client, address, "Lock", Bytes::from_static(b"recovery-bucket")).await },
+                );
+            observer.wait_for_hits(1).await.expect("selected request arrived");
+            assert_eq!(observer.forwarded(), 0, "an intercepted request has not reached its backend");
+            observer.release();
+            let body = request
+                .await
+                .expect("request task")
+                .expect("forwarded request")
+                .into_body()
+                .collect()
+                .await
+                .expect("forwarded body");
+            assert_eq!(body.trailers().expect("preserved trailers")["x-proof"], "unchanged-proof");
+            assert_eq!(body.to_bytes(), Bytes::from_static(b"recovery-bucket"));
+            assert_eq!(observer.forwarded(), 1);
+            let another = call_body(&client, address, "Lock", Bytes::from_static(b"recovery-bucket"))
+                .await
+                .expect("observer forwards without pausing");
+            another.into_body().collect().await.expect("second body");
+            assert_eq!(observer.forwarded(), 2);
+        })
+        .await
+        .expect("passive observer deadline");
+    }
+
     #[tokio::test]
     async fn scoped_fault_discards_expired_packets_without_replaying_them() {
         tokio::time::timeout(Duration::from_secs(10), async {

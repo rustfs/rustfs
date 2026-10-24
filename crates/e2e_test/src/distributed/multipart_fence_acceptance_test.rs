@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use super::harness::{
-    TestResult, assert_object_bytes, cluster_admin_ok, configure_node_logs, payload_for, sha256_hex, unique_bucket,
+    TestResult, assert_object_bytes, cluster_admin_ok, configure_node_logs, payload_for, retrying_put, sha256_hex, unique_bucket,
+    wait_until,
 };
 use crate::common::{ClusterTopology, RustFSTestClusterEnvironment};
 use crate::rpc_fault_proxy::{RpcFaultProxy, RpcPause};
@@ -192,8 +193,8 @@ where
     outcome.map_err(|_| format!("{operation} did not recover within {DEADLINE:?}: {last_failure}").into())
 }
 
-async fn abort_after_fault(client: &Client, bucket: &str, key: &str, upload: &str) -> TestResult {
-    recover_after_fault(&format!("Abort {key}"), || {
+async fn abort_after_fault(client: &Client, bucket: &str, key: &str, upload: &str, allow_missing: bool) -> TestResult {
+    match recover_after_fault(&format!("Abort {key}"), || {
         client
             .abort_multipart_upload()
             .bucket(bucket)
@@ -201,7 +202,12 @@ async fn abort_after_fault(client: &Client, bucket: &str, key: &str, upload: &st
             .upload_id(upload)
             .send()
     })
-    .await??;
+    .await?
+    {
+        Ok(_) => {}
+        Err(error) if allow_missing && error.as_service_error().and_then(|e| e.meta().code()) == Some("NoSuchUpload") => {}
+        Err(error) => return Err(error.into()),
+    }
     let missing = recover_after_fault(&format!("ListParts {key}"), || {
         client.list_parts().bucket(bucket).key(key).upload_id(upload).send()
     })
@@ -348,33 +354,27 @@ fn quorum_outcome<T: std::fmt::Debug, E: std::fmt::Debug + ProvideErrorMetadata>
     }
 }
 
-async fn assert_partial_mutation_outcome(clients: &[Client], bucket: &str, key: &str, upload_id: &str) -> TestResult {
-    let result = clients[0]
-        .abort_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .upload_id(upload_id)
-        .send()
-        .await;
-    match result {
-        Ok(_) => {}
-        Err(error) if error.as_service_error().and_then(|e| e.meta().code()) == Some("NoSuchUpload") => {}
-        Err(error) => {
-            // Failed mutations may leave partial staging. An unresolved
-            // staging identity must fail closed rather than weaken metadata
-            // authority. Improving ordinary Abort recovery is tracked separately.
-            assert_unavailable(&error, "storage_write_quorum", None);
-            eprintln!("MPU partial-mutation staging requires repair before ordinary Abort");
-            return Ok(());
-        }
+async fn wait_for_lock_peer_recovery(proxies: &[RpcFaultProxy], client: &Client, bucket: &str) -> TestResult {
+    let key = unique_bucket("peer-recovery");
+    let observers = proxies[1..]
+        .iter()
+        .map(|proxy| proxy.pause(&["Lock", "LockBatch"], usize::MAX, Some(&key)))
+        .collect::<Result<Vec<_>, _>>()?;
+    for observer in &observers {
+        observer.release();
     }
-    let missing = recover_after_fault("ListParts after partial mutation", || {
-        clients[0].list_parts().bucket(bucket).key(key).upload_id(upload_id).send()
-    })
-    .await?
-    .expect_err("successful Abort or NoSuchUpload must retire the session");
-    assert_eq!(missing.as_service_error().and_then(|e| e.meta().code()), Some("NoSuchUpload"));
-    assert_no_uploads_after_fault(clients, bucket).await
+    wait_until(
+        DEADLINE,
+        || async {
+            retrying_put(client, bucket, &key, vec![0x42; 1024], DEADLINE).await?;
+            // Quorum success alone can leave one peer's request breaker open.
+            // Two replies require a half-open peer to finish its first probe
+            // before admitting another RPC; every peer must rejoin the matrix.
+            Ok(observers.iter().all(|observer| observer.forwarded() >= 2))
+        },
+        "all lock peers recover after fault retirement",
+    )
+    .await
 }
 
 async fn phase_quorum_matrix(
@@ -389,9 +389,6 @@ async fn phase_quorum_matrix(
         // Four-node read quorum is two; commit/write quorum is three.
         let unavailable_at_quorum = if locks && phase == "create" { 2 } else { 1 };
         for unavailable in [unavailable_at_quorum, unavailable_at_quorum + 1] {
-            let case_bucket = unique_bucket("mpu-quorum-case");
-            clients[0].create_bucket().bucket(&case_bucket).send().await?;
-            let bucket = case_bucket.as_str();
             let key = format!("{locks}-{phase}-{unavailable}");
             let mut limits = vec![usize::MAX; unavailable];
             // EC12+4: one peer contributes four shards; one packet on the
@@ -420,7 +417,7 @@ async fn phase_quorum_matrix(
                 let request = clients[0].create_multipart_upload().bucket(bucket).key(&key);
                 let result = with_paused_peers(proxies, methods, &limits, bucket, async move { request.send().await }).await?;
                 if let Some(upload) = quorum_outcome(result, unavailable == unavailable_at_quorum, locks)? {
-                    abort_after_fault(&clients[0], bucket, &key, upload.upload_id().ok_or("missing upload ID")?).await?;
+                    abort_after_fault(&clients[0], bucket, &key, upload.upload_id().ok_or("missing upload ID")?, false).await?;
                 }
             } else {
                 let upload = clients[0]
@@ -523,42 +520,20 @@ async fn phase_quorum_matrix(
                     }
                     _ => unreachable!(),
                 }
-                if !locks && matches!(phase, "complete" | "abort") && unavailable != unavailable_at_quorum {
-                    assert_partial_mutation_outcome(clients, bucket, &key, upload_id).await?;
-                    continue;
-                }
-                // A failed completion can be ambiguous to an S3 client. Cleanup
-                // accepts an already completed/aborted session, never another error.
-                match recover_after_fault(&format!("Abort {key} after {phase}"), || {
-                    clients[0]
-                        .abort_multipart_upload()
-                        .bucket(bucket)
-                        .key(&key)
-                        .upload_id(upload_id)
-                        .send()
-                })
-                .await?
-                {
-                    Ok(_) => {}
-                    Err(error) if error.as_service_error().and_then(|e| e.meta().code()) == Some("NoSuchUpload") => {}
-                    Err(error) => return Err(error.into()),
-                }
-                let missing = recover_after_fault(&format!("ListParts {key} after {phase}"), || {
-                    clients[0].list_parts().bucket(bucket).key(&key).upload_id(upload_id).send()
-                })
-                .await?
-                .expect_err("cleanup must remove the upload");
-                assert_eq!(missing.as_service_error().and_then(|e| e.meta().code()), Some("NoSuchUpload"));
+                // Cleanup must recover even after a below-quorum mutation;
+                // only an already retired session may return NoSuchUpload.
+                abort_after_fault(&clients[0], bucket, &key, upload_id, true).await?;
                 recover_after_fault(&format!("DeleteObject {key} after {phase}"), || {
                     clients[0].delete_object().bucket(bucket).key(&key).send()
                 })
                 .await??;
             }
+            wait_for_lock_peer_recovery(proxies, &clients[0], bucket).await?;
+            round_trip(clients, bucket, "recovered", 9 * 1024 * 1024).await?;
             assert_no_uploads_after_fault(clients, bucket).await?;
         }
     }
-    round_trip(clients, bucket, "recovered", 9 * 1024 * 1024).await?;
-    assert_no_uploads(clients, bucket).await
+    Ok(())
 }
 
 #[tokio::test]
