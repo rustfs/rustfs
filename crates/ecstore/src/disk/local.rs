@@ -4481,6 +4481,7 @@ impl LocalIoBackend for StdBackend {
     }
 
     async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter> {
+        self.invalidate_cached_fd(volume, path).await;
         match mode {
             WriteMode::Truncate { size_hint } => {
                 let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
@@ -5699,6 +5700,7 @@ impl LocalIoBackend for UringBackend {
     }
 
     async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter> {
+        self.invalidate_cached_fd(volume, path).await;
         self.inner.open_write(volume, path, mode).await
     }
 
@@ -5706,24 +5708,28 @@ impl LocalIoBackend for UringBackend {
         if let Some(cache) = self.fd_cache.as_ref() {
             cache.invalidate_exact(volume, path).await;
         }
+        self.inner.invalidate_cached_fd(volume, path).await;
     }
 
     fn invalidate_cached_fds_under(&self, volume: &str, path: &str) {
         if let Some(cache) = self.fd_cache.as_ref() {
             cache.invalidate_under(volume, path);
         }
+        self.inner.invalidate_cached_fds_under(volume, path);
     }
 
     fn invalidate_cached_fds_for_volume(&self, volume: &str) {
         if let Some(cache) = self.fd_cache.as_ref() {
             cache.invalidate_volume(volume);
         }
+        self.inner.invalidate_cached_fds_for_volume(volume);
     }
 
     async fn clear_cached_fds(&self) {
         if let Some(cache) = self.fd_cache.as_ref() {
             cache.clear();
         }
+        self.inner.clear_cached_fds().await;
     }
 }
 
@@ -9232,10 +9238,12 @@ impl LocalDisk {
         let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
-        self.write_all_internal(&file_path, InternalBuf::Owned(buf), sync, skip_parent)
-            .await?;
-
-        Ok(())
+        self.io_backend.invalidate_cached_fd(volume, path).await;
+        let res = self
+            .write_all_internal(&file_path, InternalBuf::Owned(buf), sync, skip_parent)
+            .await;
+        self.io_backend.invalidate_cached_fd(volume, path).await;
+        res
     }
     // write_all_internal do write file.
     // Executes the given SyncMode verbatim: durability policy (tier gating,
@@ -12040,6 +12048,17 @@ impl DiskAPI for LocalDisk {
             self.write_all(dst_volume, format!("{dst_path}.meta").as_str(), meta).await?;
         }
 
+        if src_is_dir {
+            self.io_backend.invalidate_cached_fds_under(src_volume, src_path);
+            self.io_backend.invalidate_cached_fds_under(dst_volume, dst_path);
+        } else {
+            self.io_backend.invalidate_cached_fd(src_volume, src_path).await;
+            self.io_backend.invalidate_cached_fd(dst_volume, dst_path).await;
+            self.io_backend
+                .invalidate_cached_fd(dst_volume, &format!("{dst_path}.meta"))
+                .await;
+        }
+
         if let Some(parent) = src_file_path.parent() {
             self.delete_file(&src_volume_dir, &parent.to_path_buf(), false, false).await?;
         }
@@ -12111,8 +12130,13 @@ impl DiskAPI for LocalDisk {
 
         // Both ends changed identity: the source path no longer exists and the
         // destination now resolves to a different inode (backlog#1145).
-        self.io_backend.invalidate_cached_fd(src_volume, src_path).await;
-        self.io_backend.invalidate_cached_fd(dst_volume, dst_path).await;
+        if src_is_dir {
+            self.io_backend.invalidate_cached_fds_under(src_volume, src_path);
+            self.io_backend.invalidate_cached_fds_under(dst_volume, dst_path);
+        } else {
+            self.io_backend.invalidate_cached_fd(src_volume, src_path).await;
+            self.io_backend.invalidate_cached_fd(dst_volume, dst_path).await;
+        }
 
         if let Some(parent) = src_file_path.parent() {
             let _ = self.delete_file(&src_volume_dir, &parent.to_path_buf(), false, false).await;
@@ -31033,5 +31057,112 @@ mod test {
         assert_eq!(generation, before + 1);
         assert_eq!(ctx.namespace_commit_generation(), before + 2);
         assert!(!ctx.namespace_commits_pending());
+    }
+
+    #[tokio::test]
+    async fn fd_cache_invalidated_on_write_all_open_write_rename_part_and_dir_rename_file() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("utf8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let volume = "fd-cache-invalidation-test";
+        disk.make_volume(volume).await.expect("make_volume");
+
+        // 1. Seed FdCache via pread_bytes on an 8192-byte file, then overwrite in-place via write_all
+        // with a smaller 128-byte payload (truncating across a page boundary) and then a larger 12288-byte payload.
+        let initial = vec![b'A'; 8192];
+        disk.write_all(volume, "obj/data.bin", Bytes::from(initial.clone()))
+            .await
+            .expect("write initial");
+        let read_initial = disk
+            .io_backend
+            .pread_bytes(volume, "obj/data.bin", 0, 8192, None)
+            .await
+            .expect("pread initial");
+        assert_eq!(read_initial.as_ref(), initial.as_slice());
+
+        let shrunk = vec![b'B'; 128];
+        disk.write_all(volume, "obj/data.bin", Bytes::from(shrunk.clone()))
+            .await
+            .expect("write shrunk");
+        // Reading past the new 128-byte EOF must return FileCorrupt rather than mapping stale 8192 len (SIGBUS).
+        let oob = disk.io_backend.pread_bytes(volume, "obj/data.bin", 0, 8192, None).await;
+        assert!(matches!(oob, Err(DiskError::FileCorrupt)));
+        let read_shrunk = disk
+            .io_backend
+            .pread_bytes(volume, "obj/data.bin", 0, 128, None)
+            .await
+            .expect("pread shrunk");
+        assert_eq!(read_shrunk.as_ref(), shrunk.as_slice());
+
+        // Growing via append_file / open_write must also invalidate the cached 128-byte length.
+        let mut writer = disk.append_file(volume, "obj/data.bin").await.expect("append_file");
+        writer.write_all(&vec![b'C'; 256]).await.expect("append write");
+        writer.flush().await.expect("append flush");
+        drop(writer);
+        let read_grown = disk
+            .io_backend
+            .pread_bytes(volume, "obj/data.bin", 0, 384, None)
+            .await
+            .expect("pread grown");
+        assert_eq!(&read_grown[..128], shrunk.as_slice());
+        assert_eq!(&read_grown[128..], vec![b'C'; 256].as_slice());
+
+        // 2. rename_part must invalidate cached destination and source descriptors.
+        disk.write_all(volume, "mp/part.1", Bytes::from_static(b"old-part"))
+            .await
+            .expect("write old part");
+        let old_part = disk
+            .io_backend
+            .pread_bytes(volume, "mp/part.1", 0, 8, None)
+            .await
+            .expect("pread old part");
+        assert_eq!(old_part.as_ref(), b"old-part");
+
+        disk.write_all(volume, "tmp/staged-part", Bytes::from_static(b"new-part"))
+            .await
+            .expect("write staged part");
+        disk.rename_part(volume, "tmp/staged-part", volume, "mp/part.1", Bytes::from_static(b"meta"))
+            .await
+            .expect("rename_part");
+        let new_part = disk
+            .io_backend
+            .pread_bytes(volume, "mp/part.1", 0, 8, None)
+            .await
+            .expect("pread new part");
+        assert_eq!(new_part.as_ref(), b"new-part");
+
+        // 3. Directory rename_file ("src_dir/" -> "dst_dir/") must invalidate cached children under dst_dir/.
+        disk.write_all(volume, "dst_dir/child.bin", Bytes::from_static(b"old-child"))
+            .await
+            .expect("write old child");
+        let _ = disk
+            .io_backend
+            .pread_bytes(volume, "dst_dir/child.bin", 0, 9, None)
+            .await
+            .expect("cache old child");
+        disk.delete(volume, "dst_dir/child.bin", DeleteOptions::default())
+            .await
+            .expect("delete old child");
+        // Re-populate cache before directory rename
+        disk.write_all(volume, "src_dir/child.bin", Bytes::from_static(b"new-child"))
+            .await
+            .expect("write src child");
+        let _ = disk
+            .io_backend
+            .pread_bytes(volume, "src_dir/child.bin", 0, 9, None)
+            .await
+            .expect("cache src child");
+        disk.rename_file(volume, "src_dir/", volume, "dst_dir/")
+            .await
+            .expect("rename_file dir");
+        assert!(
+            disk.io_backend
+                .pread_bytes(volume, "src_dir/child.bin", 0, 9, None)
+                .await
+                .is_err(),
+            "cached child under renamed-from directory must be invalidated"
+        );
     }
 }
