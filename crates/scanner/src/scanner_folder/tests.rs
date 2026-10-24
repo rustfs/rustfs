@@ -30,6 +30,7 @@ use std::sync::Mutex;
 pub(super) mod checkpoint_fixture;
 pub(super) mod enumeration_restart;
 mod incremental_enumeration;
+mod listing_completion;
 mod metadata_visits;
 mod node_admission;
 
@@ -400,6 +401,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,
         list_path_raw_options_observer: None,
+        defer_abandoned_entries_until_finished: false,
     };
 
     (scanner, temp_dir)
