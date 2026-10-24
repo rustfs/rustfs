@@ -2656,8 +2656,11 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let _upload_guard = self
             .acquire_multipart_upload_write_lock("abort_multipart_upload", bucket, object, upload_id, opts)
             .await?;
+        // A failed completion can consume staging metadata on some disks.
+        // Identify the upload with read quorum; deletion below still requires
+        // its full write quorum and the upload's incarnation/lifecycle fences.
         let (fi, _) = self
-            .check_upload_id_exists_with_opts(bucket, object, upload_id, true, opts)
+            .check_upload_id_exists_with_opts(bucket, object, upload_id, false, opts)
             .await?;
         ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
@@ -7583,6 +7586,64 @@ mod tests {
             assert_abort_first_linearizes("multipart-abort-first-legacy", "object", encrypted_opts).await;
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn abort_recovers_read_quorum_staging_metadata() {
+        for remaining in [2, 1] {
+            let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "multipart-abort-partial-commit";
+            let object = "object";
+            make_bucket_on_all(&disk_stores, bucket).await;
+            let upload = set_disks
+                .new_multipart_upload(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("create upload before partial commit");
+            put_test_part(&set_disks, bucket, object, &upload.upload_id, 1, &[0x42; 4096], 4096).await;
+            let upload_path = SetDisks::get_upload_id_dir(bucket, object, &upload.upload_id);
+            // A failed completion can consume staging metadata on the disks
+            // whose rename succeeded while the remaining disks retain it.
+            for directory in &temp_dirs[remaining..] {
+                tokio::fs::remove_file(
+                    directory
+                        .path()
+                        .join(RUSTFS_META_MULTIPART_BUCKET)
+                        .join(&upload_path)
+                        .join("xl.meta"),
+                )
+                .await
+                .expect("consume staging metadata without deleting residual parts");
+            }
+
+            let result = set_disks
+                .abort_multipart_upload(bucket, object, &upload.upload_id, &ObjectOptions::default())
+                .await;
+            if remaining == 2 {
+                result.expect("read quorum identifies the upload; delete still requires write quorum");
+                for directory in &temp_dirs {
+                    assert!(
+                        !directory
+                            .path()
+                            .join(RUSTFS_META_MULTIPART_BUCKET)
+                            .join(&upload_path)
+                            .exists(),
+                        "abort must reclaim staging on every available disk"
+                    );
+                }
+            } else {
+                assert!(matches!(result, Err(StorageError::InvalidUploadID(..))), "{result:?}");
+                for directory in &temp_dirs {
+                    assert!(
+                        directory
+                            .path()
+                            .join(RUSTFS_META_MULTIPART_BUCKET)
+                            .join(&upload_path)
+                            .exists(),
+                        "metadata below read quorum must not authorize deletion"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
