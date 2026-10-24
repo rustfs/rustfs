@@ -261,16 +261,41 @@ fn quorum_outcome<T: std::fmt::Debug, E: std::fmt::Debug + ProvideErrorMetadata>
     }
 }
 
-async fn phase_quorum_matrix(locks: bool, drives_per_node: usize, storage_class: &str) -> TestResult {
+async fn wait_for_lock_peer_recovery(proxies: &[RpcFaultProxy], client: &Client, bucket: &str) -> TestResult {
+    let key = unique_bucket("peer-recovery");
+    let observers = proxies[1..]
+        .iter()
+        .map(|proxy| proxy.pause(&["Lock", "LockBatch"], usize::MAX, Some(&key)))
+        .collect::<Result<Vec<_>, _>>()?;
+    for observer in &observers {
+        observer.release();
+    }
+    wait_until(
+        DEADLINE,
+        || async {
+            retrying_put(client, bucket, &key, vec![0x42; 1024], DEADLINE).await?;
+            // Quorum success alone can leave one peer's request breaker open.
+            // Two replies require a half-open peer to finish its first probe
+            // before admitting another RPC; every peer must rejoin the matrix.
+            Ok(observers.iter().all(|observer| observer.forwarded() >= 2))
+        },
+        "all lock peers recover after fault retirement",
+    )
+    .await
+}
+
+async fn phase_quorum_matrix(
+    proxies: &[RpcFaultProxy],
+    clients: &[Client],
+    bucket: &str,
+    locks: bool,
+    drives_per_node: usize,
+) -> TestResult {
     for phase in ["create", "part", "complete", "abort"] {
         // Ordinary Create holds only the shared bucket lifecycle fence.
         // Four-node read quorum is two; commit/write quorum is three.
         let unavailable_at_quorum = if locks && phase == "create" { 2 } else { 1 };
         for unavailable in [unavailable_at_quorum, unavailable_at_quorum + 1] {
-            // Each row owns its peer health history: an earlier timeout must
-            // not open the request breaker and bypass this row's injected RPC.
-            let (_cluster, proxies, clients, bucket) = fixture(drives_per_node, storage_class).await?;
-            let (proxies, clients, bucket) = (proxies.as_slice(), clients.as_slice(), bucket.as_str());
             let key = format!("{locks}-{phase}-{unavailable}");
             let mut limits = vec![usize::MAX; unavailable];
             // EC12+4: one peer contributes four shards; one packet on the
@@ -397,7 +422,7 @@ async fn phase_quorum_matrix(locks: bool, drives_per_node: usize, storage_class:
                 abort(&clients[0], bucket, &key, upload_id, true).await?;
                 clients[0].delete_object().bucket(bucket).key(&key).send().await?;
             }
-            retrying_put(&clients[0], bucket, "recovery-probe", vec![0x42; 1024], DEADLINE).await?;
+            wait_for_lock_peer_recovery(proxies, &clients[0], bucket).await?;
             round_trip(clients, bucket, "recovered", 9 * 1024 * 1024).await?;
             assert_no_uploads(clients, bucket).await?;
         }
@@ -407,27 +432,27 @@ async fn phase_quorum_matrix(locks: bool, drives_per_node: usize, storage_class:
 
 #[tokio::test]
 async fn metadata_delay_preserves_write_quorum_and_rejects_quorum_minus_one() -> TestResult {
-    phase_quorum_matrix(false, 1, "EC:2").await
+    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+    phase_quorum_matrix(&proxies, &clients, &bucket, false, 1).await
 }
 
 #[tokio::test]
 async fn lock_delay_preserves_admission_quorum_and_reports_timeout() -> TestResult {
-    phase_quorum_matrix(true, 1, "EC:2").await
+    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+    phase_quorum_matrix(&proxies, &clients, &bucket, true, 1).await
 }
 
 #[tokio::test]
 async fn sixteen_shard_multipart_metadata_requires_twelve_votes() -> TestResult {
-    {
-        let (cluster, _proxies, _clients, _bucket) = fixture(4, "EC:4").await?;
-        let storage = cluster_admin_ok(&cluster, http::Method::GET, "/rustfs/admin/v3/storageinfo", None).await?;
-        let storage: serde_json::Value = serde_json::from_str(&storage)?;
-        let storage: rustfs_madmin::StorageInfo = serde_json::from_value(storage["info"].clone())?;
-        assert_eq!(storage.disks.len(), 16);
-        assert_eq!(storage.backend.total_sets, vec![1]);
-        assert_eq!(storage.backend.drives_per_set, vec![16]);
-        assert_eq!(storage.backend.standard_sc_parity, Some(4));
-    }
-    phase_quorum_matrix(false, 4, "EC:4").await
+    let (cluster, proxies, clients, bucket) = fixture(4, "EC:4").await?;
+    let storage = cluster_admin_ok(&cluster, http::Method::GET, "/rustfs/admin/v3/storageinfo", None).await?;
+    let storage: serde_json::Value = serde_json::from_str(&storage)?;
+    let storage: rustfs_madmin::StorageInfo = serde_json::from_value(storage["info"].clone())?;
+    assert_eq!(storage.disks.len(), 16);
+    assert_eq!(storage.backend.total_sets, vec![1]);
+    assert_eq!(storage.backend.drives_per_set, vec![16]);
+    assert_eq!(storage.backend.standard_sc_parity, Some(4));
+    phase_quorum_matrix(&proxies, &clients, &bucket, false, 4).await
 }
 
 #[tokio::test]

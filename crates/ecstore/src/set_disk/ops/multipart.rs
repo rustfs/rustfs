@@ -1264,9 +1264,8 @@ impl SetDisks {
         upload_id_path: &str,
         write: bool,
     ) -> Result<(FileInfo, Vec<FileInfo>)> {
-        let disks = self.disks.read().await;
-
-        let disks = disks.clone();
+        // Slow metadata I/O must not hold the topology registry's read lock.
+        let disks = self.get_disks_internal().await;
 
         let (parts_metadata, errs) =
             Self::read_all_fileinfo(&disks, bucket, RUSTFS_META_MULTIPART_BUCKET, upload_id_path, "", false, false, false)
@@ -7586,6 +7585,43 @@ mod tests {
             assert_abort_first_linearizes("multipart-abort-first-legacy", "object", encrypted_opts).await;
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn multipart_metadata_io_does_not_block_disk_registry_updates() {
+        use crate::set_disk::core::io_primitives::rename_fanout_barrier::{self, PHASE_READ_VERSION};
+
+        let (_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-metadata-registry";
+        let object = "object";
+        make_bucket_on_all(&disks, bucket).await;
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create upload for metadata lookup");
+        let path = SetDisks::get_upload_id_dir(bucket, object, &upload.upload_id);
+        for write in [false, true] {
+            let barrier = rename_fanout_barrier::arm(&path, 0, PHASE_READ_VERSION);
+            let lookup_set = set_disks.clone();
+            let upload_id = upload.upload_id.clone();
+            let lookup = tokio::spawn(async move { lookup_set.check_upload_id_exists(bucket, object, &upload_id, write).await });
+            tokio::time::timeout(Duration::from_secs(5), barrier.wait_until_paused())
+                .await
+                .expect("metadata I/O reaches its deterministic barrier");
+            assert!(!lookup.is_finished(), "metadata lookup must still be waiting on disk I/O");
+            let registry_writable = tokio::time::timeout(Duration::from_secs(2), set_disks.disks.write())
+                .await
+                .is_ok();
+            barrier.release();
+            lookup
+                .await
+                .expect("metadata lookup task")
+                .expect("metadata quorum remains valid");
+            assert!(
+                registry_writable,
+                "disk registry writes must proceed while metadata I/O is paused, write={write}"
+            );
+        }
     }
 
     #[tokio::test]
