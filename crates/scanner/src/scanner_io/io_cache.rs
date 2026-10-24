@@ -787,7 +787,11 @@ impl ScannerIOCache for SetDisks {
                 NamespaceScannerWorkerMode::RemoteV4(server_epoch) => Some(server_epoch),
                 NamespaceScannerWorkerMode::Coordinator => None,
             };
+            #[cfg(test)]
+            let worker_index = futs.len();
             futs.push(AbortOnDropHandle::new(tokio::spawn(async move {
+                #[cfg(test)]
+                super::tests::observe_coordinator_bucket_worker_started(worker_index).await;
                 let remote_session_id = uuid::Uuid::new_v4();
                 let mut remote_session_sequence = 0_u64;
                 loop {
@@ -1056,7 +1060,7 @@ impl ScannerIOCache for SetDisks {
                         None
                     };
                     #[cfg(test)]
-                    super::tests::observe_coordinator_bucket_scan_admitted(&bucket.name).await;
+                    super::tests::observe_coordinator_bucket_scan_admitted(worker_index, &bucket.name).await;
 
                     // Lock order: scanner leader fence -> set-scoped per-bucket cache lock ->
                     // cache object read/write.
