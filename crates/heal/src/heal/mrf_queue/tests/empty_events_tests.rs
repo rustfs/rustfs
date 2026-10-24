@@ -52,6 +52,7 @@ fn runtime() -> MrfRuntime {
         dirty: false,
         journal_on_disk: false,
         retain_replay_journal: false,
+        replay_readable: true,
         durable_replay_anchors: Vec::new(),
         replay_cleanup: None,
         runtime_checkpoint: None,
@@ -425,7 +426,8 @@ fn empty_events_real_consumer_stop_retains_unresolved_journal() {
             let listing = tokio::time::timeout(Duration::from_secs(10), listed)
                 .await
                 .expect("consumer startup finishes")
-                .expect("listing receipt");
+                .expect("listing receipt")
+                .expect("readable lifecycle snapshot");
             assert!(
                 listing
                     .responsibilities

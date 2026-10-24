@@ -1733,6 +1733,10 @@ struct MrfLegacyResponsibilityActionResponse {
 fn map_mrf_lifecycle_control_error(error: rustfs_heal::heal::mrf_queue::MrfLifecycleControlError) -> s3s::S3Error {
     use rustfs_heal::heal::mrf_queue::MrfLifecycleControlError;
     match error {
+        MrfLifecycleControlError::CheckpointUnreadable => admin_error(
+            S3ErrorCode::ServiceUnavailable,
+            "MRF checkpoint is unreadable; retain its files and restore a compatible reader",
+        ),
         MrfLifecycleControlError::Unavailable | MrfLifecycleControlError::Persistence => {
             admin_error(S3ErrorCode::ServiceUnavailable, "MRF lifecycle operation could not be completed")
         }
@@ -1745,6 +1749,14 @@ fn map_mrf_lifecycle_control_error(error: rustfs_heal::heal::mrf_queue::MrfLifec
         MrfLifecycleControlError::IncarnationChanged => admin_error(
             S3ErrorCode::InvalidRequest,
             "bucket incarnation changed; refresh the MRF responsibility listing",
+        ),
+        MrfLifecycleControlError::BucketIdentityUnresolved => admin_error(
+            S3ErrorCode::InvalidRequest,
+            "current bucket identity is unresolved; the MRF responsibility remains held",
+        ),
+        MrfLifecycleControlError::BucketIdentityUnavailable(_) => admin_error(
+            S3ErrorCode::ServiceUnavailable,
+            "current bucket identity is unavailable; retry after storage recovers",
         ),
         MrfLifecycleControlError::InvalidAction(reason) => admin_error(S3ErrorCode::InvalidRequest, reason),
     }
@@ -1960,9 +1972,9 @@ mod tests {
         build_replacement_recovery_status_response, encode_background_heal_status, encode_heal_control_path,
         encode_heal_start_success, encode_heal_task_status, execute_after_heal_start_preflight, heal_channel_response_items,
         heal_channel_response_progress, heal_channel_response_summary, heal_control_response_id, json_response,
-        map_heal_response, merge_peer_heal_statuses, parse_mrf_legacy_responsibility_query, peer_topology_complete,
-        query_peer_heal_status, query_peer_replacement_recovery_status, read_cluster_heal_status, reject_heal_admission,
-        validate_heal_request_mode, validate_heal_target, validate_mrf_legacy_responsibility_action,
+        map_heal_response, map_mrf_lifecycle_control_error, merge_peer_heal_statuses, parse_mrf_legacy_responsibility_query,
+        peer_topology_complete, query_peer_heal_status, query_peer_replacement_recovery_status, read_cluster_heal_status,
+        reject_heal_admission, validate_heal_request_mode, validate_heal_target, validate_mrf_legacy_responsibility_action,
     };
     use crate::storage::rpc::node_service::heal::{
         NodeHealProgress, NodeHealStatusSnapshot, NodeReplacementRecoveryStatusSnapshot, encode_node_replacement_recovery_status,
@@ -2086,6 +2098,21 @@ mod tests {
             let uri = Uri::try_from(format!("/rustfs/admin/v4/heal/mrf/responsibilities?{query}")).expect("well-formed URI");
             assert!(parse_mrf_legacy_responsibility_query(&uri).is_err(), "accepted invalid query {query}");
         }
+    }
+
+    #[test]
+    fn mrf_lifecycle_errors_distinguish_unresolved_identity_and_storage_failure() {
+        use rustfs_heal::heal::mrf_queue::MrfLifecycleControlError;
+
+        let unresolved = map_mrf_lifecycle_control_error(MrfLifecycleControlError::BucketIdentityUnresolved);
+        assert_eq!(unresolved.code(), &S3ErrorCode::InvalidRequest);
+        let unavailable = map_mrf_lifecycle_control_error(MrfLifecycleControlError::BucketIdentityUnavailable(Box::new(
+            rustfs_heal::Error::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "private storage detail")),
+        )));
+        assert_eq!(unavailable.code(), &S3ErrorCode::ServiceUnavailable);
+        assert!(!unavailable.to_string().contains("private storage detail"));
+        let unreadable = map_mrf_lifecycle_control_error(MrfLifecycleControlError::CheckpointUnreadable);
+        assert_eq!(unreadable.code(), &S3ErrorCode::ServiceUnavailable);
     }
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::sync::mpsc;
