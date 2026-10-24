@@ -184,6 +184,14 @@ entry point. If an adapter uses it, record and verify the external checkout's
 owner and full commit before use. The current workflow clones the default branch,
 so its contents must not be attributed to a RustFS source SHA.
 
+#### Heal Object Lock Wait
+
+`rustfs_heal_object_lock_wait_seconds` measures namespace acquisition in the set-local heal paths. Timing starts when the acquisition future is first polled, after namespace construction and existing diagnostic setup, and stops when acquisition returns or the pending future is dropped. It excludes repair work and lock hold time. Observation returns the original guard and error; it does not change release points, timeouts or retries.
+
+The fixed labels are `op` (`heal_object`, `read_repair_data`, `read_repair_commit`, `heal_object_dir`, `check_abandoned_parts`), `mode` (`read`, `write`) and `result` (`acquired`, `failed`, `cancelled`, `disabled`). The ordinary outer heal lock and explicit-version helper both use `heal_object`; these count actual acquisitions, not logical repair tasks. `no_lock` and errors constructing a namespace produce no acquisition sample. No bucket, key, version or owner is a label, and the metric does not require object-lock diagnostic logging.
+
+Keep acquired and failed completed-attempt distributions, cancellation counts, and disabled-lock observations distinguishable in W11 evidence. A cancelled sample is elapsed wait before cancellation, not a completed acquisition; a disabled guard does not establish real contention. Do not discard failed waits to improve a percentile, infer task-attempt counts from acquisitions, or substitute admission mutex timing for this metric. Window differences and histogram resolution still need independent verification; this instrument alone does not supply exact scalar percentiles or complete SSD acceptance.
+
 #### Evidence Gates
 
 `report.json` records each group's verdict and the raw responses remain in their
