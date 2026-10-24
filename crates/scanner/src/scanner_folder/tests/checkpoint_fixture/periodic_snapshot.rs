@@ -999,14 +999,11 @@ async fn periodic_resume_uses_traversal_order_for_punctuation_siblings() {
 #[serial]
 async fn periodic_failed_nested_entries_cannot_certify_a_bucket_with_diagnostics_disabled() {
     let logs = CapturedLogs::default();
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_writer(logs.clone())
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    logs.capture(tracing::Level::DEBUG, periodic_failed_entries_with_captured_logs(&logs))
+        .await;
+}
+
+async fn periodic_failed_entries_with_captured_logs(logs: &CapturedLogs) {
     let (loaded, _, original, _guard) = nested_periodic_snapshot(true, (0, 0)).await;
     let result = temp_env::async_with_vars([(ENV_FAILED_OBJECT_TTL_SECS, Some("0"))], async {
         let mut cache = loaded;

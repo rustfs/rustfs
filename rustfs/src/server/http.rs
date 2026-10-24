@@ -28,7 +28,7 @@ use crate::server::{
         PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, RequestLoggingLayer, S3ErrorMessageCompatLayer,
         SigV4HeaderGuardLayer, StsQueryApiCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
     },
-    rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env},
+    rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env, rate_limit_vh_domain_hosts},
     ssec_transport::SsecTransportLayer,
     strip_valid_port_suffix,
     tls_material::{
@@ -1107,7 +1107,7 @@ fn make_http_trace_span<ReqBody>(request: &HttpRequest<ReqBody>) -> Span {
 macro_rules! external_service_stack {
     ($service:expr, $remote_addr:expr, $trusted_proxy_layer:expr, $is_console:expr,
      $rate_limit_layer:expr, $connection_is_tls:expr, $readiness:expr, $keystone_auth:expr,
-     $compression_config:expr, $server_ctx:expr, $server_domains_configured:expr) => {{
+     $compression_config:expr, $server_ctx:expr, $server_domains_configured:expr, $vh_domain_hosts:expr) => {{
         let remote_addr = $remote_addr;
         let trusted_proxy_layer = $trusted_proxy_layer;
         let is_console = $is_console;
@@ -1118,6 +1118,7 @@ macro_rules! external_service_stack {
         let compression_config = $compression_config;
         let server_ctx = $server_ctx;
         let server_domains_configured = $server_domains_configured;
+        let vh_domain_hosts = $vh_domain_hosts;
         ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
             // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
@@ -1237,7 +1238,7 @@ macro_rules! external_service_stack {
             .layer(S3ErrorMessageCompatLayer)
             .layer(IcebergRestErrorCompatLayer)
             .layer(ObjectAttributesEtagFixLayer)
-            .layer(ConditionalCorsLayer::new())
+            .layer(ConditionalCorsLayer::new().with_vh_domain_hosts(vh_domain_hosts))
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .layer(BodylessStatusFixLayer)
             .layer(HeadRequestBodyFixLayer)
@@ -1558,6 +1559,8 @@ pub async fn start_http_server(
     // overlap with the bare domains they were generated from.
     let host_domain_sets = s3_host_domains(config)?;
     let rate_limit_vh_domains: Vec<String> = host_domain_sets.iter().flatten().cloned().collect();
+    // Same domain set for resolving the bucket of virtual-hosted-style CORS requests.
+    let vh_domain_hosts = rate_limit_vh_domain_hosts(rate_limit_vh_domains.clone());
 
     // Setup S3 service
     // This project uses the S3S library to implement S3 services
@@ -1711,6 +1714,7 @@ pub async fn start_http_server(
         let h3_compression = compression_config.clone();
         let h3_trusted_proxy = rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone());
         let h3_domains_configured = !config.server_domains.is_empty();
+        let h3_vh_domain_hosts = vh_domain_hosts.clone();
 
         let make_service = move |peer_addr: SocketAddr| -> Http3ExternalService {
             let remote_addr = RemoteAddr(peer_addr);
@@ -1741,7 +1745,8 @@ pub async fn start_http_server(
                 h3_keystone.clone(),
                 h3_compression.clone(),
                 h3_server_ctx.clone(),
-                h3_domains_configured
+                h3_domains_configured,
+                h3_vh_domain_hosts.clone()
             ))
         };
 
@@ -2004,6 +2009,7 @@ pub async fn start_http_server(
                 compression_config: compression_config.clone(),
                 is_console,
                 server_domains_configured,
+                vh_domain_hosts: vh_domain_hosts.clone(),
                 readiness: readiness.clone(),
                 keystone_auth: auth_keystone::get_keystone_auth(),
                 trusted_proxy_layer: rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone()),
@@ -2081,6 +2087,8 @@ struct ConnectionContext {
     is_console: bool,
     /// Whether `RUSTFS_SERVER_DOMAINS` is configured (i.e. s3s virtual-hosted-style routing is active).
     server_domains_configured: bool,
+    /// Port-stripped virtual-hosted-style domains, for bucket-level CORS resolution.
+    vh_domain_hosts: Arc<[String]>,
     readiness: Arc<GlobalReadiness>,
     /// Pre-computed Keystone auth provider (avoids per-connection OnceLock read).
     keystone_auth: Option<Arc<rustfs_keystone::KeystoneAuthProvider>>,
@@ -2241,6 +2249,7 @@ fn process_connection(
             compression_config,
             is_console,
             server_domains_configured,
+            vh_domain_hosts,
             readiness,
             keystone_auth,
             trusted_proxy_layer,
@@ -2362,7 +2371,8 @@ fn process_connection(
                 keystone_auth.clone(),
                 compression_config.clone(),
                 server_ctx.clone(),
-                server_domains_configured
+                server_domains_configured,
+                vh_domain_hosts.clone()
             )
         };
         let build_internode_stack = |service| {
@@ -2875,7 +2885,8 @@ mod tests {
             None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
             HttpCompressionConfig::default(),
             ServerContextSlot::new(),
-            false
+            false,
+            Arc::default()
         ))
     }
 
@@ -5130,7 +5141,7 @@ mod tests {
                 let inner = Http3CoreService::new(inner);
                 Http3ExternalService::new(external_service_stack!(inner, Some(RemoteAddr(peer)), None::<rustfs_trusted_proxies::TrustedProxyLayer>, false,
                     Some(rate.clone()), true, server_readiness.clone(), Some(provider.clone()),
-                    HttpCompressionConfig::default(), ServerContextSlot::new(), false))
+                    HttpCompressionConfig::default(), ServerContextSlot::new(), false, Arc::default()))
             }, 0, Duration::from_secs(1), receiver)?;
             let client_endpoint = client_endpoint(vec![cert])?;
             let (quic, mut client, driver) = connect(&client_endpoint, endpoint.local_addr()?).await?;
@@ -5188,7 +5199,8 @@ mod tests {
                     None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
                     HttpCompressionConfig::default(),
                     ServerContextSlot::new(),
-                    false
+                    false,
+                    Arc::default()
                 ))
             },
             0,
