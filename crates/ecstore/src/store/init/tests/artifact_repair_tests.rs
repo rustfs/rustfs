@@ -475,9 +475,8 @@ fn artifact_attempt_repair_seal_covers_all_versions_and_survives_reopen() {
             .await
             .expect("another ordinary-sealed attempt remains repairable");
         assert!(repaired.error.is_none(), "other-attempt repair failed: {:?}", repaired.error);
-        assert_eq!(
+        assert!(
             other_part.exists(),
-            true,
             "ARTIFACT_ATTEMPT_REPAIR_SEAL: another attempt restores its physical shard"
         );
         assert_exact_payload(&store, bucket, &other_object, other).await;
@@ -617,9 +616,8 @@ fn artifact_attempt_repair_seal_corrupt_or_wrong_identity_records_fail_closed() 
             );
             assert_repair_seal_denied(&store, bucket, &object, &version.to_string()).await;
             assert_repair_seal_denied(&store, bucket, &object, "").await;
-            assert_eq!(
-                missing.exists(),
-                false,
+            assert!(
+                !missing.exists(),
                 "ARTIFACT_ATTEMPT_REPAIR_SEAL: invalid seal never admits shard publication"
             );
             assert_eq!(
@@ -1019,9 +1017,8 @@ async fn assert_closed_attempt_cannot_repair(store: &ECStore, bucket: &str, obje
             "ARTIFACT_ATTEMPT_REPAIR_SEAL: closed repair cannot publish after the old physical tail drains"
         );
         if let Some(part) = &missing {
-            assert_eq!(
-                part.exists(),
-                false,
+            assert!(
+                !part.exists(),
                 "ARTIFACT_ATTEMPT_REPAIR_SEAL: closed repair cannot restore a shard after the old physical tail drains"
             );
         }

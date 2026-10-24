@@ -5850,11 +5850,13 @@ mod tests {
         assert_eq!(store.write_calls.load(Ordering::SeqCst), 0);
     }
 
+    type ObservationEofGate = (Option<tokio::sync::oneshot::Sender<()>>, tokio::sync::oneshot::Receiver<()>);
+
     struct ObservationStream {
         inner: Cursor<Vec<u8>>,
         consumed: Arc<AtomicUsize>,
         fail: bool,
-        eof_gate: Option<(Option<tokio::sync::oneshot::Sender<()>>, tokio::sync::oneshot::Receiver<()>)>,
+        eof_gate: Option<ObservationEofGate>,
     }
 
     impl AsyncRead for ObservationStream {
@@ -5887,7 +5889,7 @@ mod tests {
         error: Option<Error>,
         stream_error: bool,
         gets: AtomicUsize,
-        eof_gate: std::sync::Mutex<Option<(Option<tokio::sync::oneshot::Sender<()>>, tokio::sync::oneshot::Receiver<()>)>>,
+        eof_gate: std::sync::Mutex<Option<ObservationEofGate>>,
         consumed: Arc<AtomicUsize>,
         options: std::sync::Mutex<Option<(bool, bool, bool)>>,
         writes: AtomicUsize,
@@ -5985,12 +5987,8 @@ mod tests {
             .expect("matching real owner");
         let store = Arc::new(ObservationStore::new(b"raw".to_vec(), 3));
         let result = super::read_config_observation_no_lock(store.clone(), object, 3, &guard).await;
-        assert_eq!(result.is_ok(), true, "I06L_READ_FLAGS: {result:?}");
-        assert_eq!(
-            *store.options.lock().expect("options") == Some((true, true, false)),
-            true,
-            "I06L_READ_FLAGS"
-        );
+        assert!(result.is_ok(), "I06L_READ_FLAGS: {result:?}");
+        assert!(*store.options.lock().expect("options") == Some((true, true, false)), "I06L_READ_FLAGS");
         assert_eq!(result.expect("raw observation").0, b"raw");
         assert_eq!(store.writes.load(Ordering::SeqCst), 0);
         for (bucket, key) in [(RUSTFS_META_BUCKET, "config/other.bin"), ("wrong-bucket", object)] {
@@ -6004,8 +6002,8 @@ mod tests {
                 .expect("wrong-target real owner");
             let store = Arc::new(ObservationStore::new(Vec::new(), 0));
             let result = super::read_config_observation_no_lock(store.clone(), object, 8, &wrong).await;
-            assert_eq!(matches!(result, Err(Error::InvalidArgument(..))), true, "I06L_TARGET_REJECTED");
-            assert_eq!(store.gets.load(Ordering::SeqCst) == 0, true, "I06L_TARGET_REJECTED");
+            assert!(matches!(result, Err(Error::InvalidArgument(..))), "I06L_TARGET_REJECTED");
+            assert!(store.gets.load(Ordering::SeqCst) == 0, "I06L_TARGET_REJECTED");
         }
         for error in [
             Error::FileNotFound,
@@ -6034,12 +6032,12 @@ mod tests {
         let err = super::read_config_observation_no_lock(store.clone(), object, 8, &guard)
             .await
             .expect_err("stream failure");
-        assert_eq!(err.to_string().contains("observation stream failed"), true, "I06L_TYPED_STREAM_ERROR");
+        assert!(err.to_string().contains("observation stream failed"), "I06L_TYPED_STREAM_ERROR");
         assert_eq!(store.writes.load(Ordering::SeqCst), 0);
         let store = Arc::new(ObservationStore::new(vec![7; 64], 0));
         let result = super::read_config_observation_no_lock(store.clone(), object, 8, &guard).await;
-        assert_eq!(matches!(result, Err(Error::CorruptedFormat)), true, "I06L_STREAM_BOUND");
-        assert_eq!(store.consumed.load(Ordering::SeqCst) == 9, true, "I06L_STREAM_BOUND");
+        assert!(matches!(result, Err(Error::CorruptedFormat)), "I06L_STREAM_BOUND");
+        assert!(store.consumed.load(Ordering::SeqCst) == 9, "I06L_STREAM_BOUND");
         assert_eq!(store.writes.load(Ordering::SeqCst), 0);
     }
 
@@ -6074,12 +6072,12 @@ mod tests {
                 tokio::time::timeout(std::time::Duration::from_secs(60), signal.notified())
                     .await
                     .expect("actual owner loss watchdog");
-                assert_eq!(guard.is_lock_lost(), true, "I06L_LOSS_AFTER_READ");
+                assert!(guard.is_lock_lost(), "I06L_LOSS_AFTER_READ");
                 release_tx.send(()).expect("release EOF");
                 let result = tokio::time::timeout(std::time::Duration::from_secs(60), read)
                     .await
                     .expect("read watchdog");
-                assert_eq!(
+                assert!(
                     matches!(
                         result,
                         Err(Error::NamespaceLockQuorumUnavailable {
@@ -6087,7 +6085,6 @@ mod tests {
                             ..
                         })
                     ),
-                    true,
                     "I06L_LOSS_AFTER_READ"
                 );
                 assert_eq!(store.gets.load(Ordering::SeqCst), 1);
@@ -6096,9 +6093,9 @@ mod tests {
                 tokio::time::timeout(std::time::Duration::from_secs(60), signal.notified())
                     .await
                     .expect("actual owner loss watchdog");
-                assert_eq!(guard.is_lock_lost(), true, "I06L_LOSS_BEFORE_GET");
+                assert!(guard.is_lock_lost(), "I06L_LOSS_BEFORE_GET");
                 let result = super::read_config_observation_no_lock(store.clone(), object, 3, &guard).await;
-                assert_eq!(
+                assert!(
                     matches!(
                         result,
                         Err(Error::NamespaceLockQuorumUnavailable {
@@ -6106,10 +6103,9 @@ mod tests {
                             ..
                         })
                     ),
-                    true,
                     "I06L_LOSS_BEFORE_GET"
                 );
-                assert_eq!(store.gets.load(Ordering::SeqCst) == 0, true, "I06L_LOSS_BEFORE_GET");
+                assert!(store.gets.load(Ordering::SeqCst) == 0, "I06L_LOSS_BEFORE_GET");
             }
             assert_eq!(store.writes.load(Ordering::SeqCst), 0);
         }
@@ -6159,7 +6155,7 @@ mod tests {
     async fn observation_enforces_byte_limit() {
         let store = Arc::new(ObservationStore::new(vec![7; 64], 0));
         let result = super::read_config_observation(store.clone(), "config/observation.bin", 8).await;
-        assert_eq!(result.is_err(), true, "I05_BOUND_ENFORCED");
+        assert!(result.is_err(), "I05_BOUND_ENFORCED");
         assert_eq!(
             result.expect_err("bounded observation error"),
             Error::CorruptedFormat,

@@ -741,8 +741,7 @@ async fn write_delete_rollback_file(
 ) -> Result<()> {
     write_delete_rollback_file_with_prepared_publication(
         io_root,
-        volume,
-        object_dir,
+        (volume, object_dir),
         rollback_dir,
         name,
         data,
@@ -754,14 +753,14 @@ async fn write_delete_rollback_file(
 
 async fn write_delete_rollback_file_with_prepared_publication(
     io_root: &Path,
-    volume: &str,
-    object_dir: &Path,
+    target: (&str, &Path),
     rollback_dir: Uuid,
     name: &str,
     data: &[u8],
     namespace_owner: Option<Arc<dyn Send + Sync>>,
     prepared: Option<Arc<os::NamespaceMutationLease>>,
 ) -> Result<()> {
+    let (volume, object_dir) = target;
     let backup_dir = object_dir.join(rollback_dir.to_string());
     let path = backup_dir.join(name);
     let lease = if let Some(prepared) = prepared {
@@ -6931,7 +6930,7 @@ impl LocalDisk {
             let file_path = self.io_get_object_path(volume, path)?;
             let path = path.to_string();
             let sync_metadata = effective_durability(volume).syncs_commit_metadata();
-            return Ok(tokio::task::spawn_blocking(move || {
+            Ok(tokio::task::spawn_blocking(move || {
                 let _owner = owner;
                 #[cfg(test)]
                 run_owned_file_write_before_open(&file_path);
@@ -7043,7 +7042,7 @@ impl LocalDisk {
                 result
             })
             .await
-            .map_err(DiskError::from)??);
+            .map_err(DiskError::from)??)
         }
 
         #[cfg(windows)]
@@ -7051,7 +7050,7 @@ impl LocalDisk {
             let file_path = self.io_get_object_path(volume, path)?;
             let sync_metadata = effective_durability(volume).syncs_commit_metadata();
             let publication_root = self.publication_root.clone();
-            return Ok(tokio::task::spawn_blocking(move || {
+            Ok(tokio::task::spawn_blocking(move || {
                 let _owner = owner;
                 #[cfg(test)]
                 run_owned_file_write_before_open(&file_path);
@@ -7064,7 +7063,7 @@ impl LocalDisk {
                 )
             })
             .await
-            .map_err(DiskError::from)??);
+            .map_err(DiskError::from)??)
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -7802,8 +7801,7 @@ impl LocalDisk {
         if let Some(parent) = src_file_path.parent() {
             let _ = self
                 .delete_file_with_prepared_publication(
-                    &src_volume_dir,
-                    &parent.to_path_buf(),
+                    (&src_volume_dir, &parent.to_path_buf()),
                     false,
                     false,
                     prepared.as_ref().map(|lease| lease.clone() as Arc<dyn Send + Sync>),
@@ -9253,7 +9251,7 @@ impl LocalDisk {
         let result = if let Some(prepared) = prepared {
             self.delete_unleased_prepared(volume, path, &opts, prepared).await
         } else {
-            self.delete_unleased_with_prepared_metadata(volume, path, &opts, namespace_owner, None, metadata_owner, None)
+            self.delete_unleased_with_prepared_metadata((volume, path), &opts, namespace_owner, None, metadata_owner, None)
                 .await
         };
         claim.finish(result.is_ok());
@@ -9291,8 +9289,7 @@ impl LocalDisk {
                     async move {
                         let error = self
                             .delete_versions_guarded_internal(
-                                volume,
-                                &version.name,
+                                (volume, &version.name),
                                 &version.versions,
                                 options,
                                 owner,
@@ -9329,8 +9326,7 @@ impl LocalDisk {
         for version in &versions {
             errors.push(
                 self.delete_versions_guarded_internal(
-                    volume,
-                    &version.group.name,
+                    (volume, &version.group.name),
                     &version.group.versions,
                     &opts,
                     namespace_owner.clone(),
@@ -9381,8 +9377,7 @@ impl LocalDisk {
                 let file_path = self.io_get_object_path(volume, path)?;
                 check_path_length(file_path.to_string_lossy().as_ref())?;
                 self.delete_file_with_prepared_publication(
-                    &volume_dir,
-                    &file_path,
+                    (&volume_dir, &file_path),
                     false,
                     false,
                     Some(publication.clone()),
@@ -9445,8 +9440,7 @@ impl LocalDisk {
             }
             return self
                 .undo_write(
-                    volume,
-                    file_path.as_path(),
+                    (volume, file_path.as_path()),
                     &fi,
                     &opts,
                     namespace_owner,
@@ -9565,8 +9559,7 @@ impl LocalDisk {
             } else {
                 write_delete_rollback_file_with_prepared_publication(
                     self.io_root(),
-                    volume,
-                    file_path.as_path(),
+                    (volume, file_path.as_path()),
                     rollback_dir,
                     STORAGE_FORMAT_FILE_BACKUP,
                     &buf,
@@ -9816,8 +9809,7 @@ impl LocalDisk {
             .await
         } else {
             self.delete_file_with_prepared_publication(
-                &volume_dir,
-                &xl_path,
+                (&volume_dir, &xl_path),
                 true,
                 false,
                 namespace_owner.clone(),
@@ -9952,14 +9944,14 @@ impl LocalDisk {
 
     async fn undo_write(
         &self,
-        volume: &str,
-        file_path: &Path,
+        target: (&str, &Path),
         fi: &FileInfo,
         opts: &DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         prepared_publication: Option<Arc<os::NamespaceMutationLease>>,
         prepared_trash: Option<(PathBuf, Arc<os::NamespaceMutationLease>)>,
     ) -> Result<()> {
+        let (volume, file_path) = target;
         let old_data_dir = opts.old_data_dir.ok_or(DiskError::FileCorrupt)?;
         let xl_path = path_join(&[file_path, Path::new(STORAGE_FORMAT_FILE)]);
         if opts.undo_delete {
@@ -10280,8 +10272,7 @@ impl LocalDisk {
         if opts.recursive && opts.old_data_dir.is_some() {
             return self
                 .delete_unleased_with_prepared_metadata(
-                    volume,
-                    path,
+                    (volume, path),
                     opts,
                     Some(plan.lease.clone()),
                     None,
@@ -10294,14 +10285,11 @@ impl LocalDisk {
         let file_path = self.io_get_object_path(volume, path)?;
         let lease = plan.lease.clone();
         self.delete_file_with_prepared_entry(
-            &volume_dir,
-            &file_path,
+            (&volume_dir, &file_path),
             opts.recursive,
             opts.immediate,
             Some(lease.clone()),
-            Some(lease),
-            None,
-            Some(plan),
+            (Some(lease), None, Some(plan)),
             None,
         )
         .await?;
@@ -10530,8 +10518,7 @@ impl LocalDisk {
         };
         match self
             .delete_unleased_with_prepared_metadata(
-                volume,
-                path,
+                (volume, path),
                 &opt,
                 namespace_owner,
                 staging_cleanup.as_ref(),
@@ -10681,20 +10668,20 @@ impl LocalDisk {
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         staging_cleanup: Option<&StagingCleanupLease>,
     ) -> Result<()> {
-        self.delete_unleased_with_prepared_metadata(volume, path, opt, namespace_owner, staging_cleanup, None, None)
+        self.delete_unleased_with_prepared_metadata((volume, path), opt, namespace_owner, staging_cleanup, None, None)
             .await
     }
 
     async fn delete_unleased_with_prepared_metadata(
         &self,
-        volume: &str,
-        path: &str,
+        target: (&str, &str),
         opt: &DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         staging_cleanup: Option<&StagingCleanupLease>,
         metadata_owner: Option<Arc<os::MetadataMutationLease>>,
         publication: Option<Arc<os::NamespaceMutationLease>>,
     ) -> Result<()> {
+        let (volume, path) = target;
         let volume_dir = self.io_get_bucket_path(volume)?;
         if !skip_access_checks(volume)
             && let Err(e) = cached_access(&volume_dir).await
@@ -10870,18 +10857,19 @@ impl LocalDisk {
             recursive = false;
         }
         self.delete_file_with_prepared_entry(
-            &volume_dir,
-            &file_path,
+            (&volume_dir, &file_path),
             recursive,
             opt.immediate,
             namespace_owner,
-            publication.clone(),
-            None,
-            publication.map(|lease| PreparedPathDelete {
-                lease,
-                trash: None,
-                encoded_trash: None,
-            }),
+            (
+                publication.clone(),
+                None,
+                publication.map(|lease| PreparedPathDelete {
+                    lease,
+                    trash: None,
+                    encoded_trash: None,
+                }),
+            ),
             staging_cleanup,
         )
         .await?;
@@ -10912,22 +10900,18 @@ impl LocalDisk {
         staging_cleanup: Option<&'a StagingCleanupLease>,
     ) -> BoxFuture<'a, Result<()>> {
         self.delete_file_with_prepared_entry(
-            base_path,
-            delete_path,
+            (base_path, delete_path),
             recursive,
             immediate_purge,
             namespace_owner,
-            None,
-            None,
-            None,
+            (None, None, None),
             staging_cleanup,
         )
     }
 
     fn delete_file_with_prepared_publication<'a>(
         &'a self,
-        base_path: &'a PathBuf,
-        delete_path: &'a PathBuf,
+        target: (&'a PathBuf, &'a PathBuf),
         recursive: bool,
         immediate_purge: bool,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
@@ -10935,31 +10919,31 @@ impl LocalDisk {
         prepared_trash: Option<(PathBuf, Arc<os::NamespaceMutationLease>)>,
     ) -> BoxFuture<'a, Result<()>> {
         self.delete_file_with_prepared_entry(
-            base_path,
-            delete_path,
+            target,
             recursive,
             immediate_purge,
             namespace_owner,
-            prepared_publication,
-            prepared_trash,
-            None,
+            (prepared_publication, prepared_trash, None),
             None,
         )
     }
 
     fn delete_file_with_prepared_entry<'a>(
         &'a self,
-        base_path: &'a PathBuf,
-        delete_path: &'a PathBuf,
+        target: (&'a PathBuf, &'a PathBuf),
         recursive: bool,
         immediate_purge: bool,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
-        prepared_publication: Option<Arc<os::NamespaceMutationLease>>,
-        prepared_trash: Option<(PathBuf, Arc<os::NamespaceMutationLease>)>,
-        prepared_entry: Option<PreparedPathDelete>,
+        prepared: (
+            Option<Arc<os::NamespaceMutationLease>>,
+            Option<(PathBuf, Arc<os::NamespaceMutationLease>)>,
+            Option<PreparedPathDelete>,
+        ),
         staging_cleanup: Option<&'a StagingCleanupLease>,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            let (base_path, delete_path) = target;
+            let (prepared_publication, prepared_trash, prepared_entry) = prepared;
             // debug!("delete_file {:?}\n base_path:{:?}", &delete_path, &base_path);
 
             if is_root_path(base_path) || is_root_path(delete_path) {
@@ -11088,14 +11072,11 @@ impl LocalDisk {
             {
                 let result = self
                     .delete_file_with_prepared_entry(
-                        base_path,
-                        &PathBuf::from(dir_path),
+                        (base_path, &PathBuf::from(dir_path)),
                         false,
                         false,
                         namespace_owner.clone(),
-                        prepared_publication.clone(),
-                        None,
-                        None,
+                        (prepared_publication.clone(), None, None),
                         staging_cleanup,
                     )
                     .await;
@@ -11416,8 +11397,7 @@ impl LocalDisk {
             } else {
                 write_delete_rollback_file_with_prepared_publication(
                     self.io_root(),
-                    volume,
-                    &object_dir,
+                    (volume, &object_dir),
                     rollback_dir,
                     DELETE_MARKER_ROLLBACK_FILE,
                     &[],
@@ -11568,8 +11548,7 @@ impl LocalDisk {
             let result = async {
                 let publication = self.prepare_bulk_delete_group(volume, &version.group.name, owner.clone())?;
                 self.delete_versions_guarded_internal(
-                    volume,
-                    &version.group.name,
+                    (volume, &version.group.name),
                     &version.group.versions,
                     &opts,
                     None,
@@ -11593,7 +11572,7 @@ impl LocalDisk {
         opts: &DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
-        self.delete_versions_guarded_internal(volume, path, fis, opts, namespace_owner, None, None)
+        self.delete_versions_guarded_internal((volume, path), fis, opts, namespace_owner, None, None)
             .await
     }
 
@@ -11605,20 +11584,20 @@ impl LocalDisk {
         opts: &DeleteOptions,
         prepared_publication: Option<Arc<os::NamespaceMutationLease>>,
     ) -> Result<()> {
-        self.delete_versions_guarded_internal(volume, path, fis, opts, None, None, prepared_publication)
+        self.delete_versions_guarded_internal((volume, path), fis, opts, None, None, prepared_publication)
             .await
     }
 
     async fn delete_versions_guarded_internal(
         &self,
-        volume: &str,
-        path: &str,
+        target: (&str, &str),
         fis: &[FileInfo],
         opts: &DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         expected_current: Option<&CurrentDeleteGeneration>,
         prepared_publication: Option<Arc<os::NamespaceMutationLease>>,
     ) -> Result<()> {
+        let (volume, path) = target;
         let volume_dir = self.io_get_bucket_path(volume)?;
         let object_path = self.get_object_path(volume, path)?;
         let mut namespace_owner: Option<Arc<dyn Send + Sync>> = if let Some(publication) = &prepared_publication {
@@ -11778,8 +11757,7 @@ impl LocalDisk {
             } else {
                 write_delete_rollback_file_with_prepared_publication(
                     self.io_root(),
-                    volume,
-                    object_dir,
+                    (volume, object_dir),
                     rollback_dir,
                     STORAGE_FORMAT_FILE_BACKUP,
                     &data,
@@ -12003,8 +11981,7 @@ impl LocalDisk {
         if fm.versions.is_empty() {
             if let Err(err) = self
                 .delete_file_with_prepared_publication(
-                    &volume_dir,
-                    &xlpath,
+                    (&volume_dir, &xlpath),
                     true,
                     false,
                     namespace_owner.clone(),
@@ -13960,7 +13937,7 @@ impl LocalDisk {
             fs::try_exists(self.io_get_object_path(volume, &format!("{object}/{rollback_dir}/{}", delete_recovery::PREPARED))?)
                 .await
                 .map_err(to_file_error)?;
-        for paths in paths.chunks_exact(3) {
+        for paths in paths.as_chunks::<3>().0 {
             let reserved_path = &paths[0];
             let committed_path = &paths[if recovery_owned { 2 } else { 1 }];
             let data_path = reserved_path.parent().ok_or(DiskError::InvalidPath)?;
@@ -22456,10 +22433,9 @@ mod test {
             let dst = disk.io_get_object_path("destination", "target").expect("destination");
             fs::write(&src, b"payload").await.expect("source bytes");
             fs::write(&dst, b"old destination").await.expect("old bytes");
-            let _hook;
-            if stage == "parent-sync" {
+            let _hook = if stage == "parent-sync" {
                 os::fsync_dir_recorder::set_failure(dst.parent().expect("parent"), ErrorKind::PermissionDenied);
-                _hook = None;
+                None
             } else {
                 let remove = src.clone();
                 let hook_stage = if stage == "source-sync" {
@@ -22467,10 +22443,10 @@ mod test {
                 } else {
                     hooks::Stage::Rename
                 };
-                _hook = Some(hooks::install_at(hook_stage, &src, move || {
+                Some(hooks::install_at(hook_stage, &src, move || {
                     std::fs::remove_file(remove).expect("cause actual syscall failure");
-                }));
-            }
+                }))
+            };
             let result = wrapper
                 .begin_legacy_rename_file(("source", "entry"), ("destination", "target"), true, None)
                 .await

@@ -471,16 +471,16 @@ impl ECStore {
     /// from the captured disk, and closure from the existing two-domain owners.
     pub async fn inventory_local_artifact_attempt(
         &self,
-        disk_ref: &str,
-        expected_disk: Uuid,
-        bucket: &str,
-        incarnation: Uuid,
+        disk: (&str, Uuid),
+        bucket: (&str, Uuid),
         attempt_prefix: &str,
         phase: rustfs_protos::proto_gen::node_service::ArtifactInventoryPhase,
         deadline: tokio::time::Instant,
         output: tokio::sync::mpsc::Sender<crate::disk::ArtifactInventoryFrame>,
     ) -> DiskResult<()> {
         use rustfs_protos::proto_gen::node_service::ArtifactInventoryPhase;
+        let (disk_ref, expected_disk) = disk;
+        let (bucket, incarnation) = bucket;
         if expected_disk.is_nil()
             || incarnation.is_nil()
             || self.ctx.lock_manager().is_disabled()
@@ -1308,6 +1308,108 @@ pub async fn get_disk_infos(disks: &[Option<DiskStore>]) -> Vec<Option<DiskInfo>
     }
 
     res
+}
+
+async fn begin_legacy_local_rename_file_with_ctx(
+    ctx: &Arc<InstanceContext>,
+    disk_ref: &str,
+    source: (&str, &str),
+    destination: (&str, &str),
+    durable: bool,
+) -> DiskResult<LegacyRenameFile> {
+    let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
+    let owner =
+        admit_local_disk(ctx, &disk, disk_id, !is_meta_bucketname(source.0) || !is_meta_bucketname(destination.0)).await?;
+    disk.begin_legacy_rename_file(source, destination, durable, owner.map(|owner| owner as Arc<dyn Send + Sync>))
+        .await
+}
+
+async fn begin_legacy_local_part_mutation_with_ctx(
+    ctx: &Arc<InstanceContext>,
+    disk_ref: &str,
+    source: Option<(&str, &str)>,
+    destination: (&str, &str),
+    operation: LegacyPartOperation,
+) -> DiskResult<LegacyPartMutation> {
+    let started = std::time::Instant::now();
+    let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
+    let result = async {
+        let ordinary = source.is_some_and(|s| !is_meta_bucketname(s.0)) || !is_meta_bucketname(destination.0);
+        let owner = admit_local_disk(ctx, &disk, disk_id, ordinary).await?;
+        disk.begin_legacy_part_mutation(source, destination, owner.map(|owner| owner as Arc<dyn Send + Sync>), operation)
+            .await
+    }
+    .await;
+    if let Err(error) = &result {
+        disk.record_legacy_admission_failure(operation.name(), error, started);
+    }
+    result
+}
+
+async fn begin_legacy_local_path_delete_with_ctx(
+    ctx: &Arc<InstanceContext>,
+    disk_ref: &str,
+    volume: &str,
+    operation: LegacyPathDeleteOperation,
+    external_guard: Option<Arc<dyn Send + Sync>>,
+) -> DiskResult<LegacyPathDelete> {
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + crate::disk::disk_store::get_max_timeout_duration();
+    let (disk, disk_id) = tokio::time::timeout_at(deadline, local_disk_candidate(ctx, disk_ref))
+        .await
+        .map_err(|_| DiskError::Timeout)?
+        .map_err(|_| DiskError::other("cannot find disk"))?;
+    let result = tokio::time::timeout_at(deadline, async {
+        let instance = admit_local_disk(ctx, &disk, disk_id, !is_meta_bucketname(volume))
+            .await
+            .map_err(|_| DiskError::other("cannot find disk"))?;
+        let owner: Arc<dyn Send + Sync> = Arc::new((instance, external_guard));
+        disk.begin_legacy_path_delete(volume, operation, Some(owner), deadline).await
+    })
+    .await
+    .map_err(|_| DiskError::Timeout)
+    .and_then(|result| result);
+    if let Err(error) = &result {
+        disk.record_legacy_admission_failure(operation.name(), error, started);
+    }
+    result
+}
+
+async fn begin_legacy_local_residual_version_delete_with_ctx(
+    ctx: &Arc<InstanceContext>,
+    disk_ref: &str,
+    volume: &str,
+    path: &str,
+    undo_write: bool,
+) -> DiskResult<LegacyMetadataWrite> {
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + crate::disk::disk_store::get_max_timeout_duration();
+    let compatible_lookup_error = |error| {
+        if undo_write {
+            error
+        } else {
+            DiskError::other("cannot find disk")
+        }
+    };
+    let (disk, disk_id) = tokio::time::timeout_at(deadline, local_disk_candidate(ctx, disk_ref))
+        .await
+        .map_err(|_| DiskError::Timeout)?
+        .map_err(compatible_lookup_error)?;
+    let result = tokio::time::timeout_at(deadline, async {
+        let owner = admit_local_disk(ctx, &disk, disk_id, !is_meta_bucketname(volume))
+            .await
+            .map_err(compatible_lookup_error)?;
+        disk.begin_legacy_metadata_write_with_namespace_owner(volume, path, owner.map(|owner| owner as Arc<dyn Send + Sync>))
+            .await
+            .map(|token| token.with_deadline(deadline))
+    })
+    .await
+    .map_err(|_| DiskError::Timeout)
+    .and_then(|result| result);
+    if let Err(error) = &result {
+        disk.record_legacy_admission_failure("delete_version", error, started);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -2952,106 +3054,4 @@ mod tests {
         assert!(record_local_disk_id_if_active(&instance_ctx, &replacement, disk_id).await);
         assert_eq!(instance_ctx.local_disk_id_map().read().await.get(&disk_id), Some(&endpoint));
     }
-}
-
-async fn begin_legacy_local_rename_file_with_ctx(
-    ctx: &Arc<InstanceContext>,
-    disk_ref: &str,
-    source: (&str, &str),
-    destination: (&str, &str),
-    durable: bool,
-) -> DiskResult<LegacyRenameFile> {
-    let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
-    let owner =
-        admit_local_disk(ctx, &disk, disk_id, !is_meta_bucketname(source.0) || !is_meta_bucketname(destination.0)).await?;
-    disk.begin_legacy_rename_file(source, destination, durable, owner.map(|owner| owner as Arc<dyn Send + Sync>))
-        .await
-}
-
-async fn begin_legacy_local_part_mutation_with_ctx(
-    ctx: &Arc<InstanceContext>,
-    disk_ref: &str,
-    source: Option<(&str, &str)>,
-    destination: (&str, &str),
-    operation: LegacyPartOperation,
-) -> DiskResult<LegacyPartMutation> {
-    let started = std::time::Instant::now();
-    let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
-    let result = async {
-        let ordinary = source.is_some_and(|s| !is_meta_bucketname(s.0)) || !is_meta_bucketname(destination.0);
-        let owner = admit_local_disk(ctx, &disk, disk_id, ordinary).await?;
-        disk.begin_legacy_part_mutation(source, destination, owner.map(|owner| owner as Arc<dyn Send + Sync>), operation)
-            .await
-    }
-    .await;
-    if let Err(error) = &result {
-        disk.record_legacy_admission_failure(operation.name(), error, started);
-    }
-    result
-}
-
-async fn begin_legacy_local_path_delete_with_ctx(
-    ctx: &Arc<InstanceContext>,
-    disk_ref: &str,
-    volume: &str,
-    operation: LegacyPathDeleteOperation,
-    external_guard: Option<Arc<dyn Send + Sync>>,
-) -> DiskResult<LegacyPathDelete> {
-    let started = std::time::Instant::now();
-    let deadline = tokio::time::Instant::now() + crate::disk::disk_store::get_max_timeout_duration();
-    let (disk, disk_id) = tokio::time::timeout_at(deadline, local_disk_candidate(ctx, disk_ref))
-        .await
-        .map_err(|_| DiskError::Timeout)?
-        .map_err(|_| DiskError::other("cannot find disk"))?;
-    let result = tokio::time::timeout_at(deadline, async {
-        let instance = admit_local_disk(ctx, &disk, disk_id, !is_meta_bucketname(volume))
-            .await
-            .map_err(|_| DiskError::other("cannot find disk"))?;
-        let owner: Arc<dyn Send + Sync> = Arc::new((instance, external_guard));
-        disk.begin_legacy_path_delete(volume, operation, Some(owner), deadline).await
-    })
-    .await
-    .map_err(|_| DiskError::Timeout)
-    .and_then(|result| result);
-    if let Err(error) = &result {
-        disk.record_legacy_admission_failure(operation.name(), error, started);
-    }
-    result
-}
-
-async fn begin_legacy_local_residual_version_delete_with_ctx(
-    ctx: &Arc<InstanceContext>,
-    disk_ref: &str,
-    volume: &str,
-    path: &str,
-    undo_write: bool,
-) -> DiskResult<LegacyMetadataWrite> {
-    let started = std::time::Instant::now();
-    let deadline = tokio::time::Instant::now() + crate::disk::disk_store::get_max_timeout_duration();
-    let compatible_lookup_error = |error| {
-        if undo_write {
-            error
-        } else {
-            DiskError::other("cannot find disk")
-        }
-    };
-    let (disk, disk_id) = tokio::time::timeout_at(deadline, local_disk_candidate(ctx, disk_ref))
-        .await
-        .map_err(|_| DiskError::Timeout)?
-        .map_err(compatible_lookup_error)?;
-    let result = tokio::time::timeout_at(deadline, async {
-        let owner = admit_local_disk(ctx, &disk, disk_id, !is_meta_bucketname(volume))
-            .await
-            .map_err(compatible_lookup_error)?;
-        disk.begin_legacy_metadata_write_with_namespace_owner(volume, path, owner.map(|owner| owner as Arc<dyn Send + Sync>))
-            .await
-            .map(|token| token.with_deadline(deadline))
-    })
-    .await
-    .map_err(|_| DiskError::Timeout)
-    .and_then(|result| result);
-    if let Err(error) = &result {
-        disk.record_legacy_admission_failure("delete_version", error, started);
-    }
-    result
 }

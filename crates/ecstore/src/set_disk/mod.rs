@@ -1221,22 +1221,22 @@ mod prepared_get_object_metadata_tests {
             &namespace,
             std::time::Duration::from_secs(30),
         ));
-        assert_eq!(futures::poll!(contender.as_mut()).is_pending(), true, "I06L_OWNER_RETAINED");
+        assert!(futures::poll!(contender.as_mut()).is_pending(), "I06L_OWNER_RETAINED");
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             crate::config::com::read_config_observation_no_lock(set.clone(), object, payload.len(), &guard),
         )
         .await
         .expect("locked observation hang watchdog");
-        assert_eq!(result.is_ok(), true, "I06L_NO_NESTED_LOCK: {result:?}");
+        assert!(result.is_ok(), "I06L_NO_NESTED_LOCK: {result:?}");
         let (bytes, info) = result.expect("locked observation");
-        assert_eq!(bytes == payload, true, "I06L_HOOK_BYPASS");
-        assert_eq!(calls.load(Ordering::SeqCst) == 0, true, "I06L_HOOK_BYPASS");
+        assert!(bytes == payload, "I06L_HOOK_BYPASS");
+        assert!(calls.load(Ordering::SeqCst) == 0, "I06L_HOOK_BYPASS");
         assert_eq!(info.size, written.size);
         assert_eq!(info.etag, written.etag);
         assert_eq!(info.data_dir, written.data_dir);
         assert_eq!(info.name, object);
-        assert_eq!(futures::poll!(contender.as_mut()).is_pending(), true, "I06L_OWNER_RETAINED");
+        assert!(futures::poll!(contender.as_mut()).is_pending(), "I06L_OWNER_RETAINED");
         drop(guard);
         let next = tokio::time::timeout(std::time::Duration::from_secs(10), contender)
             .await
@@ -1268,14 +1268,14 @@ mod prepared_get_object_metadata_tests {
                 .await
                 .expect("matching boundary owner");
             let result = crate::config::com::read_config_observation_no_lock(set.clone(), object, body.len(), &guard).await;
-            assert_eq!(result.is_ok(), true, "I06L_EMPTY_DISTINCT: {result:?}");
+            assert!(result.is_ok(), "I06L_EMPTY_DISTINCT: {result:?}");
             let (bytes, info) = result.expect("boundary observation");
             assert_eq!(bytes, body);
             assert_eq!(info.size, written.size);
             if !body.is_empty() {
                 let result =
                     crate::config::com::read_config_observation_no_lock(set.clone(), object, body.len() - 1, &guard).await;
-                assert_eq!(matches!(result, Err(Error::CorruptedFormat)), true, "I06L_BOUND_ENFORCED");
+                assert!(matches!(result, Err(Error::CorruptedFormat)), "I06L_BOUND_ENFORCED");
             }
         }
         let object = "config/locked-absent.bin";
@@ -1287,7 +1287,7 @@ mod prepared_get_object_metadata_tests {
             .await
             .expect("matching missing owner");
         let result = crate::config::com::read_config_observation_no_lock(set, object, 0, &guard).await;
-        assert_eq!(matches!(result, Err(Error::ConfigNotFound)), true, "I06L_EMPTY_DISTINCT");
+        assert!(matches!(result, Err(Error::ConfigNotFound)), "I06L_EMPTY_DISTINCT");
     }
 
     #[tokio::test]
@@ -1302,7 +1302,7 @@ mod prepared_get_object_metadata_tests {
             .await
             .expect("persist real config fixture");
         let result = crate::config::com::read_config_observation(set.clone(), object, payload.len()).await;
-        assert_eq!(result.is_ok(), true, "I05_OBSERVATION_SUCCESS: {result:?}");
+        assert!(result.is_ok(), "I05_OBSERVATION_SUCCESS: {result:?}");
         let (bytes, info) = result.expect("real observation success");
         assert_eq!(bytes, payload);
         assert_eq!(info.size, written.size);
@@ -1310,7 +1310,7 @@ mod prepared_get_object_metadata_tests {
         assert_eq!(info.data_dir, written.data_dir);
         assert_eq!(info.name, object);
         let over = crate::config::com::read_config_observation(set.clone(), object, payload.len() - 1).await;
-        assert_eq!(over.is_err(), true, "I05_BOUND_ENFORCED");
+        assert!(over.is_err(), "I05_BOUND_ENFORCED");
         assert_eq!(over.expect_err("over limit must fail"), Error::CorruptedFormat, "I05_BOUND_ENFORCED");
         let absent = crate::config::com::read_config_observation(set.clone(), "config/observation-absent.bin", 32).await;
         assert_eq!(absent.expect_err("absent config"), Error::ConfigNotFound);
@@ -1339,7 +1339,7 @@ mod prepared_get_object_metadata_tests {
         assert_eq!(ordinary_observation_get(&set, object).await, vec![b'x'; OBSERVATION_HOOK_BODY_LEN]);
         assert_eq!(calls.swap(0, Ordering::SeqCst), 1);
         let result = crate::config::com::read_config_observation(set, object, OBSERVATION_HOOK_BODY_LEN).await;
-        assert_eq!(result.is_ok(), true, "I05_HOOK_BYPASS: {result:?}");
+        assert!(result.is_ok(), "I05_HOOK_BYPASS: {result:?}");
         assert_eq!(
             result.expect("observed persisted body").0,
             vec![b'p'; OBSERVATION_HOOK_BODY_LEN],
@@ -1419,8 +1419,7 @@ mod prepared_get_object_metadata_tests {
             _data: &mut PutObjReader,
             _opts: &ObjectOptions,
         ) -> Result<ObjectInfo> {
-            assert!(false, "observation must not PUT");
-            Err(Error::other("unexpected observation PUT"))
+            panic!("observation must not PUT");
         }
     }
 
@@ -1444,7 +1443,7 @@ mod prepared_get_object_metadata_tests {
         let mut scope = Box::pin(crate::config::com::read_config_observation(adapter, object, OBSERVATION_HOOK_BODY_LEN));
         tokio::select! {
             result = ready_rx => { result.expect("producer reached pending GET"); }
-            result = &mut scope => { assert!(false, "producer must remain pending until cancelled: {result:?}"); }
+            result = &mut scope => { panic!("producer must remain pending until cancelled: {result:?}"); }
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         drop(scope);

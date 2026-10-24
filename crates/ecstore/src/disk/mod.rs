@@ -1228,11 +1228,9 @@ impl Disk {
             Disk::Remote(remote_disk) => RenameDataObservation::unknown(
                 remote_disk
                     .rename_data_borrowed_with_fence(
-                        src_volume,
-                        src_path,
+                        (src_volume, src_path),
                         fi,
-                        dst_volume,
-                        dst_path,
+                        (dst_volume, dst_path),
                         guards.scanner_publication_lease_token,
                         guards.artifact_put.map(|identity| identity.incarnation),
                     )
@@ -1261,11 +1259,9 @@ impl Disk {
             Disk::Remote(remote_disk) => {
                 remote_disk
                     .rename_data_borrowed_with_fence(
-                        src_volume,
-                        src_path,
+                        (src_volume, src_path),
                         fi,
-                        dst_volume,
-                        dst_path,
+                        (dst_volume, dst_path),
                         scanner_publication_lease_token,
                         None,
                     )

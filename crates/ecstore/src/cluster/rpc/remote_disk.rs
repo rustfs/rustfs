@@ -2492,8 +2492,7 @@ impl RemoteDisk {
     pub async fn inventory_artifact_attempt(
         &self,
         expected_disk: Uuid,
-        bucket: &str,
-        incarnation: Uuid,
+        target: (&str, Uuid),
         prefix: &str,
         phase: rustfs_protos::proto_gen::node_service::ArtifactInventoryPhase,
         deadline: tokio::time::Instant,
@@ -2504,6 +2503,7 @@ impl RemoteDisk {
             artifact_inventory as protocol,
             proto_gen::node_service::{ArtifactInventoryRequest, artifact_inventory_frame::Payload},
         };
+        let (bucket, incarnation) = target;
         let duration = deadline
             .checked_duration_since(tokio::time::Instant::now())
             .ok_or(Error::Timeout)?;
@@ -2678,21 +2678,21 @@ impl RemoteDisk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        self.rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None, None)
+        self.rename_data_borrowed_with_fence((src_volume, src_path), fi, (dst_volume, dst_path), None, None)
             .await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) async fn rename_data_borrowed_with_fence(
         &self,
-        src_volume: &str,
-        src_path: &str,
+        source: (&str, &str),
         fi: &FileInfo,
-        dst_volume: &str,
-        dst_path: &str,
+        target: (&str, &str),
         scanner_publication_lease_token: Option<Uuid>,
         artifact_incarnation: Option<Uuid>,
     ) -> Result<RenameDataResp> {
+        let (src_volume, src_path) = source;
+        let (dst_volume, dst_path) = target;
         if let Some(scope) = crate::bucket::artifact::artifact_repair_scope(dst_volume, dst_path)
             && let Some(identity) = scope.receiver_identity()
         {

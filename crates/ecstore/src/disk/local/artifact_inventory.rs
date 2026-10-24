@@ -101,20 +101,27 @@ impl LocalDisk {
         deadline: Instant,
         output: mpsc::Sender<ArtifactInventoryFrame>,
     ) -> Result<()> {
-        self.inventory_artifact_attempt_with_limits(expected_disk_id, bucket, attempt_prefix, identity, deadline, output, LIMITS)
-            .await
+        self.inventory_artifact_attempt_with_limits(
+            expected_disk_id,
+            (bucket, attempt_prefix),
+            identity,
+            deadline,
+            output,
+            LIMITS,
+        )
+        .await
     }
 
     async fn inventory_artifact_attempt_with_limits(
         &self,
         expected_disk_id: Uuid,
-        bucket: &str,
-        attempt_prefix: &str,
+        target: (&str, &str),
         identity: ArtifactPutIdentity,
         deadline: Instant,
         output: mpsc::Sender<ArtifactInventoryFrame>,
         limits: Limits,
     ) -> Result<()> {
+        let (bucket, attempt_prefix) = target;
         if expected_disk_id.is_nil()
             || identity.incarnation.is_nil()
             || !component(bucket)
@@ -498,9 +505,8 @@ mod unix {
                     let parts = current
                         .data_dirs
                         .remove(name)
-                        .map(|parts| {
+                        .inspect(|_| {
                             references -= 1;
-                            parts
                         })
                         .unwrap_or_default();
                     let key = format!("{}/{name}", current.key);
@@ -1010,8 +1016,7 @@ mod tests {
             let result = disk
                 .inventory_artifact_attempt_with_limits(
                     id,
-                    BUCKET,
-                    PREFIX,
+                    (BUCKET, PREFIX),
                     identity,
                     Instant::now() + Duration::from_secs(5),
                     output,

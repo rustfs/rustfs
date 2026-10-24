@@ -1424,7 +1424,7 @@ impl LocalDisk {
         let metadata_owner = os::acquire_metadata_mutation_lease(&object_path, namespace_owner).await;
         let volume_guard = os::disk_volume_mutation_lock(&self.root, volume).read_owned().await;
         let owner: Option<Arc<dyn Send + Sync>> = Some(Arc::new((metadata_owner, volume_guard)));
-        self.delete_recovery_settle_owned(volume, object, transaction, expected_fingerprint, action, owner, None)
+        self.delete_recovery_settle_owned((volume, object), transaction, expected_fingerprint, action, owner, None)
             .await
     }
 
@@ -1441,7 +1441,7 @@ impl LocalDisk {
             return Err(DiskError::InvalidPath);
         }
         let owner: Option<Arc<dyn Send + Sync>> = Some(publication.clone());
-        self.delete_recovery_settle_owned(volume, object, transaction, expected_fingerprint, action, owner, Some(publication))
+        self.delete_recovery_settle_owned((volume, object), transaction, expected_fingerprint, action, owner, Some(publication))
             .await
     }
 
@@ -1461,8 +1461,7 @@ impl LocalDisk {
             .delete_recovery_inspect_owned(volume, object, transaction, owner.clone())
             .await?;
         self.delete_recovery_settle_owned(
-            volume,
-            object,
+            (volume, object),
             transaction,
             state.fingerprint,
             DeleteRecoveryAction::Rollback,
@@ -1475,14 +1474,14 @@ impl LocalDisk {
 
     async fn delete_recovery_settle_owned(
         &self,
-        volume: &str,
-        object: &str,
+        target: (&str, &str),
         transaction: Uuid,
         expected_fingerprint: DeleteRecoveryDigest,
         action: DeleteRecoveryAction,
         owner: Option<Arc<dyn Send + Sync>>,
         prepared_publication: Option<Arc<os::NamespaceMutationLease>>,
     ) -> Result<DeleteRecoveryInspection> {
+        let (volume, object) = target;
         let mut observed = self
             .delete_recovery_inspect_owned(volume, object, transaction, owner.clone())
             .await?;
@@ -1512,8 +1511,7 @@ impl LocalDisk {
                 };
                 write_delete_rollback_file_with_prepared_publication(
                     self.io_root(),
-                    volume,
-                    &root,
+                    (volume, &root),
                     transaction,
                     DELETE_QUORUM_COMMITTED_FILE,
                     &serde_json::to_vec(&receipt)?,
@@ -1544,8 +1542,7 @@ impl LocalDisk {
                 };
                 write_delete_rollback_file_with_prepared_publication(
                     self.io_root(),
-                    volume,
-                    &root,
+                    (volume, &root),
                     transaction,
                     DELETE_QUORUM_COMMITTED_FILE,
                     &serde_json::to_vec(&receipt)?,
@@ -1586,8 +1583,7 @@ impl LocalDisk {
             };
             write_delete_rollback_file_with_prepared_publication(
                 self.io_root(),
-                volume,
-                &root,
+                (volume, &root),
                 transaction,
                 DELETE_QUORUM_COMMITTED_FILE,
                 &serde_json::to_vec(&receipt)?,
@@ -1750,8 +1746,7 @@ impl LocalDisk {
                 };
                 write_delete_rollback_file_with_prepared_publication(
                     self.io_root(),
-                    volume,
-                    &root,
+                    (volume, &root),
                     transaction,
                     DELETE_QUORUM_COMMITTED_FILE,
                     &serde_json::to_vec(&receipt)?,
@@ -1795,18 +1790,19 @@ impl LocalDisk {
                         .await?;
                     } else {
                         self.delete_file_with_prepared_entry(
-                            &self.io_get_bucket_path(volume)?,
-                            &root.join(STORAGE_FORMAT_FILE),
+                            (&self.io_get_bucket_path(volume)?, &root.join(STORAGE_FORMAT_FILE)),
                             false,
                             false,
                             owner.clone(),
-                            prepared_publication.clone(),
-                            None,
-                            prepared_publication.as_ref().map(|publication| PreparedPathDelete {
-                                lease: publication.clone(),
-                                trash: None,
-                                encoded_trash: None,
-                            }),
+                            (
+                                prepared_publication.clone(),
+                                None,
+                                prepared_publication.as_ref().map(|publication| PreparedPathDelete {
+                                    lease: publication.clone(),
+                                    trash: None,
+                                    encoded_trash: None,
+                                }),
+                            ),
                             None,
                         )
                         .await?;
@@ -1914,8 +1910,7 @@ impl LocalDisk {
                 }
                 write_delete_rollback_file_with_prepared_publication(
                     self.io_root(),
-                    volume,
-                    &root,
+                    (volume, &root),
                     transaction,
                     FINISHED,
                     &[],
@@ -1929,8 +1924,7 @@ impl LocalDisk {
                 };
                 write_delete_rollback_file_with_prepared_publication(
                     self.io_root(),
-                    volume,
-                    &root,
+                    (volume, &root),
                     transaction,
                     DELETE_QUORUM_COMMITTED_FILE,
                     &serde_json::to_vec(&receipt)?,

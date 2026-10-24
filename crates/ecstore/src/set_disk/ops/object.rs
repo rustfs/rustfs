@@ -15165,7 +15165,7 @@ mod metadata_mutation_generation_tests {
                 object,
                 &mut reader,
                 &hermetic_set_disks_support::lifecycle_owned_put_options(
-                    &set_disks,
+                    set_disks,
                     bucket,
                     ObjectOptions {
                         no_lock: true,
@@ -19296,7 +19296,7 @@ mod transition_upload_integrity_tests {
                 object,
                 &mut reader,
                 &hermetic_set_disks_support::lifecycle_owned_put_options(
-                    &set_disks,
+                    set_disks,
                     bucket,
                     ObjectOptions {
                         no_lock: true,
@@ -26137,7 +26137,7 @@ mod body_cache_hook_e2e_tests {
                 bucket,
                 object,
                 &mut reader,
-                &hermetic_set_disks_support::lifecycle_owned_put_options(&set_disks, bucket, opts.clone()).await,
+                &hermetic_set_disks_support::lifecycle_owned_put_options(set_disks, bucket, opts.clone()).await,
             )
             .await
             .expect("compressed object should be written");
@@ -26179,7 +26179,7 @@ mod body_cache_hook_e2e_tests {
                 bucket,
                 object,
                 &mut reader,
-                &hermetic_set_disks_support::lifecycle_owned_put_options(&set_disks, bucket, opts.clone()).await,
+                &hermetic_set_disks_support::lifecycle_owned_put_options(set_disks, bucket, opts.clone()).await,
             )
             .await
             .expect("plain object should be written");

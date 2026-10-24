@@ -1660,7 +1660,7 @@ impl LegacyFileStream {
         #[cfg(all(test, not(windows)))]
         {
             let mut waiting = std::pin::pin!(tokio::task::unconstrained(self.writers.clone().write_owned()));
-            return std::future::poll_fn(|cx| {
+            std::future::poll_fn(|cx| {
                 let state = std::future::Future::poll(waiting.as_mut(), cx);
                 if state.is_pending()
                     && let Ok(path) = self
@@ -1676,7 +1676,7 @@ impl LegacyFileStream {
                 }
                 state
             })
-            .await;
+            .await
         }
         #[cfg(not(all(test, not(windows))))]
         self.writers.clone().write_owned().await

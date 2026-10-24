@@ -59,7 +59,7 @@ impl ECStore {
                         let scan = async {
                             match disk.as_ref() {
                                 Disk::Local(local) => local.get_disk().inventory_artifact_attempt(*expected, &bucket, &prefix, put.identity(), deadline, sender).await,
-                                Disk::Remote(remote) => remote.inventory_artifact_attempt(*expected, &bucket, incarnation, &prefix, ArtifactInventoryPhase::ArtifactInventoryScan, deadline, sender).await,
+                                Disk::Remote(remote) => remote.inventory_artifact_attempt(*expected, (&bucket, incarnation), &prefix, ArtifactInventoryPhase::ArtifactInventoryScan, deadline, sender).await,
                             }
                         };
                         tokio::pin!(scan);
@@ -190,8 +190,7 @@ impl ECStore {
                         remote
                             .inventory_artifact_attempt(
                                 *expected,
-                                &record.bucket,
-                                record.incarnation_id,
+                                (&record.bucket, record.incarnation_id),
                                 &record.attempt_prefix,
                                 ArtifactInventoryPhase::ArtifactInventoryVerify,
                                 deadline,

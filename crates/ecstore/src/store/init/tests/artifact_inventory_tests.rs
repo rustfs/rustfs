@@ -314,10 +314,8 @@ fn artifact_inventory_readonly_authority_cold_cache_and_queued_writer() {
         let drain = async { while frames.recv().await.is_some() {} };
         let endpoint = member.endpoint().to_string();
         let receive = store.inventory_local_artifact_attempt(
-            &endpoint,
-            expected,
-            "inventory-aggregate",
-            incarnation,
+            (&endpoint, expected),
+            ("inventory-aggregate", incarnation),
             &prefix,
             rustfs_protos::proto_gen::node_service::ArtifactInventoryPhase::ArtifactInventoryScan,
             tokio::time::Instant::now() + Duration::from_secs(2),

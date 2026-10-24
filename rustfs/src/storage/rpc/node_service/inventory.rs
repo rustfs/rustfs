@@ -54,10 +54,8 @@ impl NodeService {
             let run = async {
                 let (output, mut frames) = mpsc::channel(1);
                 let operation = store.inventory_local_artifact_attempt(
-                    &body.disk,
-                    expected,
-                    &body.bucket,
-                    incarnation,
+                    (&body.disk, expected),
+                    (&body.bucket, incarnation),
                     &body.attempt_prefix,
                     phase,
                     deadline,
