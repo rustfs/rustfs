@@ -50,7 +50,7 @@ use std::{
     convert::Infallible,
     env, fs as stdfs,
     path::PathBuf,
-    sync::{Arc, Once, OnceLock},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 use tokio::fs;
@@ -60,7 +60,6 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
-static INIT: Once = Once::new();
 const TRANSITION_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const RESTORE_SUSPENDED_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const ENV_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_ENABLE";
@@ -71,7 +70,7 @@ const ENV_GET_CODEC_STREAMING_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_MIN_S
 const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
 
 fn init_tracing() {
-    INIT.call_once(|| {});
+    rustfs_test_utils::init_tracing();
 }
 
 async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
@@ -346,22 +345,60 @@ async fn register_mock_tier(tier_name: &str) -> MockWarmBackend {
     register_mock_tier_util(&current_tier_config_handle(), tier_name).await
 }
 
-async fn wait_for_transition(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> Option<ObjectInfo> {
+async fn wait_for_transition(
+    ecstore: &Arc<ECStore>,
+    bucket: &str,
+    object: &str,
+    timeout: Duration,
+) -> Result<ObjectInfo, String> {
     let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
-        if let Ok(info) = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await
-            && info.transitioned_object.status == "complete"
-        {
-            return Some(info);
-        }
+        let observed = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await;
+        let observed = match observed {
+            Ok(info) if info.transitioned_object.status == "complete" => return Ok(info),
+            other => other,
+        };
 
         if tokio::time::Instant::now() >= deadline {
-            return None;
+            let last_observation = match observed {
+                Ok(info) => format!("transitioned_status={:?}", info.transitioned_object.status),
+                Err(error) => format!("metadata_error={:?}", error.code()),
+            };
+            let state = get_global_transition_state();
+            return Err(format!(
+                "transition did not complete within {timeout:?}; {last_observation}; pending={}, active={}, compensation_pending={}, compensation_running={}",
+                state.pending_tasks(),
+                state.active_tasks(),
+                state.compensation_pending_tasks(),
+                state.compensation_running_tasks(),
+            ));
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+async fn transition_wait_timeout_reports_metadata_state_and_read_failure() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let bucket = format!("test-transition-wait-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    create_test_bucket(&ecstore, &bucket).await;
+    upload_test_object(&ecstore, &bucket, "plain.txt", b"not transitioned").await;
+
+    let pending = wait_for_transition(&ecstore, &bucket, "plain.txt", Duration::ZERO)
+        .await
+        .expect_err("an untransitioned object must still fail the observation deadline");
+    assert!(pending.contains("transitioned_status=\"\""), "{pending}");
+    assert!(pending.contains("compensation_pending="), "{pending}");
+    assert!(pending.contains("compensation_running="), "{pending}");
+
+    let missing = wait_for_transition(&ecstore, &bucket, "missing.txt", Duration::ZERO)
+        .await
+        .expect_err("metadata read failures must not become a completed transition");
+    assert!(missing.contains("metadata_error=ObjectNotFound"), "{missing}");
 }
 
 async fn wait_for_restore_completion(

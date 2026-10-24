@@ -322,3 +322,4 @@ grep -q -- 'unknown arg: --secret-key' "$secret_arg_log"
 
 "$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_service.py"
 "$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_abba.py"
+"$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_otlp_window.py"

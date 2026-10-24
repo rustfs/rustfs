@@ -87,16 +87,34 @@ class S3:
         xml = f'<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>{state}</Status></VersioningConfiguration>'.encode()
         return self.request('PUT', bucket + '?versioning', xml, {'Content-Type': 'application/xml'}, 200)
 
-    def batch_delete(self, bucket, keys):
+    def batch_delete(self, bucket, keys, version_ids=None):
+        if version_ids is not None:
+            assert len(keys) == len(version_ids)
         xml = ET.Element('Delete')
-        for key in keys:
-            ET.SubElement(ET.SubElement(xml, 'Object'), 'Key').text = key
+        for index, key in enumerate(keys):
+            item = ET.SubElement(xml, 'Object')
+            ET.SubElement(item, 'Key').text = key
+            if version_ids is not None:
+                ET.SubElement(item, 'VersionId').text = version_ids[index]
         data = ET.tostring(xml)
         (status, body) = self.request('POST', bucket + '?delete', data, {'Content-Type': 'application/xml', 'Content-MD5': base64.b64encode(hashlib.md5(data).digest()).decode()}, 200)
         response = ET.fromstring(body)
         errors = [node for node in response.iter() if node.tag.rsplit('}', 1)[-1] == 'Error']
         assert not errors, f'DeleteObjects returned per-key errors: {body!r}'
         return (status, body)
+
+    def versions(self, bucket, key):
+        (_, body) = self.request('GET', bucket + '?versions&prefix=' + quote(key, safe=''), expected=200)
+        entries = []
+        for item in ET.fromstring(body):
+            kind = item.tag.rsplit('}', 1)[-1]
+            if kind not in ('Version', 'DeleteMarker'):
+                continue
+            fields = {child.tag.rsplit('}', 1)[-1]: child.text for child in item}
+            if fields.get('Key') == key:
+                assert fields.get('VersionId'), body
+                entries.append((fields['VersionId'], kind == 'DeleteMarker'))
+        return sorted(entries)
 
     def complete_multipart(self, bucket, key, parts):
         path = bucket + '/' + key
@@ -324,6 +342,25 @@ def reached_barrier(cluster, index, nonce, timeout=45):
     cluster.logs()
     raise TimeoutError('crash stage not reached: ' + nonce)
 
+def reached_all_drive_barriers(cluster, index, nonce, drives=4, timeout=45):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        observations = {}
+        for path in cluster.barriers[index].glob('reached.' + nonce + '.*.json'):
+            try:
+                observation = json.loads(path.read_text())
+                observations[observation['drive']] = observation
+            except (json.JSONDecodeError, OSError):
+                continue
+        if len(observations) == drives:
+            values = list(observations.values())
+            assert len({item['transaction'] for item in values}) == 1, values
+            assert len({item['pid'] for item in values}) == 1, values
+            return values
+        time.sleep(0.02)
+    cluster.logs()
+    raise TimeoutError('not every logical drive reached the crash stage: ' + nonce)
+
 def clear_barriers(cluster):
     for directory in cluster.barriers:
         (directory / 'arm.json').unlink(missing_ok=True)
@@ -381,6 +418,81 @@ def process_crash(stage, nodes=1, size=2 * 1024 * 1024):
             client.delete(bucket, key)
             client.delete_bucket(bucket)
         return {'case': case, 'status': 'passed', 'observation': observation, 'request': {key: str(value) for (key, value) in request.items()}}
+    finally:
+        cluster.remove()
+
+def marker_batch_crash(stage):
+    from collections import Counter
+    cluster = Cluster('marker-batch-' + stage.lower(), nodes=1, drives=4)
+    try:
+        cluster.create()
+        client = cluster.clients[0]
+        bucket, key = 'marker-batch-crash', 'history'
+        client.put_bucket(bucket)
+        client.versioning(bucket)
+        payload = bytes(range(256)) * 4096
+        client.put(bucket, key, payload)
+        data_version = client.last_headers['x-amz-version-id']
+        markers = []
+        for _ in range(16):
+            client.delete(bucket, key)
+            markers.append(client.last_headers['x-amz-version-id'])
+        original_versions = client.versions(bucket, key)
+        assert original_versions == sorted([(data_version, False), *[(version, True) for version in markers]])
+        original_inventory = residue_inventory(cluster, bucket, key)
+        requested = [*markers, markers[0], markers[-1]]
+        nonce = arm_barrier(cluster, 0, bucket, key, stage)
+        request = {}
+
+        def delete_batch():
+            try:
+                request['response'] = client.batch_delete(bucket, [key] * len(requested), version_ids=requested)
+            except Exception as error:
+                request['exception'] = str(error)
+
+        thread = threading.Thread(target=delete_batch, daemon=True)
+        thread.start()
+        observations = reached_all_drive_barriers(cluster, 0, nonce)
+        cluster.kill(0)
+        thread.join(5)
+        assert not thread.is_alive(), 'interrupted client must stop before recovery observations'
+        clear_barriers(cluster)
+        cluster.restart()
+        if stage in ('PREPARED', 'APPLIED'):
+            wait_inventory(cluster, bucket, key, lambda inventory: inventory == original_inventory)
+            assert client.versions(bucket, key) == original_versions
+        else:
+            assert stage == 'DECISION'
+            assert client.versions(bucket, key) == [(data_version, False)]
+        (_, response) = client.batch_delete(bucket, [key] * len(requested), version_ids=requested)
+        deleted = [
+            {child.tag.rsplit('}', 1)[-1]: child.text for child in item}
+            for item in ET.fromstring(response)
+            if item.tag.rsplit('}', 1)[-1] == 'Deleted'
+        ]
+        assert Counter((item.get('Key'), item.get('VersionId')) for item in deleted) == Counter((key, version) for version in requested)
+        if stage != 'DECISION':
+            assert all(item.get('DeleteMarker') == 'true' and item.get('DeleteMarkerVersionId') == item['VersionId'] for item in deleted)
+        assert client.versions(bucket, key) == [(data_version, False)]
+        assert client.get(bucket, key) == payload
+        client.delete(bucket, key)
+        fresh_marker = client.last_headers['x-amz-version-id']
+        assert fresh_marker not in markers
+        client.batch_delete(bucket, [key] * len(requested), version_ids=requested)
+        cluster.kill(0)
+        cluster.restart()
+        assert client.versions(bucket, key) == sorted([(data_version, False), (fresh_marker, True)])
+        assert client.get(bucket, key + '?versionId=' + quote(data_version, safe='')) == payload
+        client.batch_delete(bucket, [key, key], version_ids=[fresh_marker, data_version])
+        assert client.versions(bucket, key) == []
+        client.delete_bucket(bucket)
+        return {
+            'case': 'marker-batch-' + stage.lower(), 'status': 'passed',
+            'observations': observations, 'old_markers': len(markers),
+            'duplicate_requests': len(requested) - len(markers),
+            'retained_data_bytes': len(payload), 'fresh_marker_preserved_after_restart': True,
+            'logical_topology': '1 process / 4 logical drives',
+        }
     finally:
         cluster.remove()
 
@@ -1275,6 +1387,8 @@ def main():
             parser.error('namespace already owns Docker resources; choose a new namespace')
     cases = {'automatic-clean-restart': automatic_clean_restart, 'unknown-fresh': unknown_predecessor_fresh_delete, 'batch1000': large_batch_delete, 'versions3000': large_version_history, 'admin-smoke': admin_smoke, 'legacy-alias': legacy_transaction_data_dir_alias, 'missing-offline': ordinary_missing_with_offline_peer, 'inverse': retained_decision_newer_undecided, 'deep': deep_key_crash, 'deep-large-stack': lambda : deep_key_crash(True), 'admin-prefix': admin_prefix_scoped, 'response-loss': receipt_response_loss, 'admin-object': lambda : admin_legacy_dry_run(True), 'smoke': smoke, 'legacy1': lambda : legacy_retry(1), 'legacy4': lambda : legacy_retry(4), 'restore': rollback_crash, 'retention': protected_version, 'version-applied': lambda : versioned_crash('APPLIED'), 'version-decision': lambda : versioned_crash('DECISION'), 'returning': returning_drive_new_generation, 'untouched': untouched_returning_peer, 'missing-version': missing_version_returning_peer, 'mixed': mixed_versions, 'admin': admin_legacy_dry_run, 'prefix': uuid_prefix_crash, 'corruption': corruption_repair, 'permission': permission_fault, 'error-prepared': lambda : injected_error('PREPARED'), 'error-applied': lambda : injected_error('APPLIED'), 'error-decision': lambda : injected_error('DECISION')}
     cases.update({'multipart-sidecars': completed_multipart_sidecars, 'multipart-integrity': lambda: completed_multipart_sidecars(True), 'multipart-sidecars-applied': lambda: completed_multipart_sidecars(False, True), 'multipart-integrity-applied': lambda: completed_multipart_sidecars(True, True)})
+    for stage in ('PREPARED', 'APPLIED', 'DECISION'):
+        cases['marker-batch-' + stage.lower()] = lambda stage=stage: marker_batch_crash(stage)
     for stage in ('PREACTIVATION', 'PREPARED', 'APPLIED', 'DECISION'):
         for nodes in (1, 4):
             cases[f'{stage.lower()}{nodes}'] = lambda stage=stage, nodes=nodes: process_crash(stage, nodes)
