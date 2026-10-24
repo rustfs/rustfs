@@ -3,6 +3,7 @@
 
 use super::harness::{DistCluster, DistLayout, TestResult, unique_bucket};
 use crate::tls_gen;
+use anyhow::Context;
 use aws_sdk_s3::{Client, config::retry::RetryConfig, primitives::ByteStream};
 use futures::future::try_join_all;
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -13,6 +14,17 @@ use std::time::{Duration, Instant};
 
 const MIB: u64 = 1024 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn diagnostic_log_directory(report: Option<&Path>, artifacts: Option<&Path>, cluster: &Path) -> PathBuf {
+    if let Some(report) = report {
+        return report.with_extension("logs");
+    }
+    if let Some(artifacts) = artifacts {
+        // Keep failed-run logs outside the cluster directory removed on drop.
+        return artifacts.join(format!("internode-tls-{}", uuid::Uuid::new_v4().simple()));
+    }
+    cluster.join("logs")
+}
 
 struct ExpectedRead {
     range: Option<(u64, u64)>,
@@ -85,6 +97,8 @@ async fn verified_get(
     expected: &ExpectedRead,
     concurrent: bool,
 ) -> TestResult<serde_json::Value> {
+    let mut stage = "response headers";
+    let mut count = 0u64;
     tokio::time::timeout(READ_TIMEOUT, async {
         let started = Instant::now();
         let mut request = client.get_object().bucket(bucket).key(&object.key);
@@ -92,13 +106,13 @@ async fn verified_get(
             request = request.range(format!("bytes={start}-{end}"));
         }
         let mut output = request.send().await?;
+        stage = "response body";
         assert_eq!(output.content_length(), Some(i64::try_from(expected.length)?));
         if let Some((start, end)) = expected.range {
             assert_eq!(output.content_range(), Some(format!("bytes {start}-{end}/{}", object.length).as_str()));
         } else {
             assert_eq!(output.content_range(), None);
         }
-        let mut count = 0u64;
         let mut digest = Sha256::new();
         while let Some(chunk) = output.body.next().await {
             let chunk = chunk?;
@@ -115,7 +129,16 @@ async fn verified_get(
             "concurrent": concurrent, "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
         }))
     })
-    .await?
+    .await
+    .with_context(|| {
+        format!(
+            "TLS GET timed out after {}s: node={node}, key={}, range={:?}, concurrent={concurrent}, stage={stage}, received={count}, expected={}",
+            READ_TIMEOUT.as_secs(),
+            object.key,
+            expected.range,
+            expected.length
+        )
+    })?
 }
 
 /// This case always exercises the full acceptance sizes; do not substitute
@@ -157,9 +180,8 @@ async fn four_node_tls_large_and_range_gets_preserve_bytes() -> TestResult {
     {
         return Err("acceptance report paths must be unused".into());
     }
-    let log_directory = report_path
-        .as_ref()
-        .map_or_else(|| directory.join("logs"), |path| path.with_extension("logs"));
+    let artifacts = std::env::var_os("RUSTFS_E2E_LOG_DIR").map(PathBuf::from);
+    let log_directory = diagnostic_log_directory(report_path.as_deref(), artifacts.as_deref(), &directory);
     std::fs::create_dir(&log_directory)?;
     dist.capture_logs_under(&log_directory)?;
     dist.cluster.start().await?;
@@ -194,7 +216,14 @@ async fn four_node_tls_large_and_range_gets_preserve_bytes() -> TestResult {
                 .body(ByteStream::from_path(&object.path).await?)
                 .send(),
         )
-        .await??;
+        .await
+        .with_context(|| {
+            format!(
+                "TLS PUT timed out after {}s: node=0, key={}, bytes={length}",
+                READ_TIMEOUT.as_secs(),
+                object.key
+            )
+        })??;
         results.push(
             serde_json::json!({"operation": "put", "bytes": length, "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0}),
         );
@@ -247,4 +276,26 @@ async fn four_node_tls_large_and_range_gets_preserve_bytes() -> TestResult {
     }
     eprintln!("internode_tls_acceptance={report}");
     Ok(())
+}
+
+#[test]
+fn tls_diagnostics_follow_ci_artifact_root_without_sharing_run_logs() {
+    let cluster = tempfile::tempdir().expect("temporary cluster");
+    let artifacts = tempfile::tempdir().expect("CI artifact root");
+    let first = diagnostic_log_directory(None, Some(artifacts.path()), cluster.path());
+    let second = diagnostic_log_directory(None, Some(artifacts.path()), cluster.path());
+    assert!(first.starts_with(artifacts.path()), "CI must retain TLS node logs after cluster cleanup");
+    assert!(second.starts_with(artifacts.path()));
+    assert_ne!(first, second, "separate attempts must not append to another run's logs");
+    assert_eq!(
+        diagnostic_log_directory(Some(Path::new("acceptance/report.json")), Some(artifacts.path()), cluster.path()),
+        Path::new("acceptance/report.logs"),
+        "an explicit acceptance report keeps its existing node-log location"
+    );
+    assert_eq!(diagnostic_log_directory(None, None, cluster.path()), cluster.path().join("logs"));
+    std::fs::create_dir(&first).expect("run log directory");
+    let log = first.join("node-0.log");
+    std::fs::write(&log, "read failure").expect("captured node output");
+    cluster.close().expect("failed cluster cleanup");
+    assert_eq!(std::fs::read_to_string(log).expect("retained node log"), "read failure");
 }
