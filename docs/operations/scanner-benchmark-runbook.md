@@ -397,6 +397,14 @@ GETs are bounded (`--workers`, default 8, maximum 64); each body is read in 1 Mi
 chunks. This checks S3-visible content and versions, not every on-disk erasure
 fragment, and does not replace the seeded repair or performance gates.
 
+#### In-Process Foreground Windows
+
+When scanner or heal is enabled, a one-second process-local sampler tracks external S3 requests from the outer service call through response-body completion, stream failure or cancellation. It runs independently of the metrics export switch and stops with background services. Requests and their existing body buffers are not copied or moved to another task. The start boundary is `Service::call`; connection establishment and Tower readiness waits before that call are outside this window. A successful body observation means the server produced its final frame, not that the client received or acknowledged it. HEAD and bodyless HTTP statuses finish at response headers. Admin, health, console, STS and internal RPC traffic are excluded by the existing external S3 route classifier.
+
+Windows preserve request starts, in-flight requests and completed, failed and cancelled counts in four fixed classes: `read`, `write`, `metadata` and `other`. Cancellation is a censored observation and contributes no completed-latency sample. P99 is an inclusive nanosecond interval over non-cancelled completions, including errors, and is unavailable below 100 samples; 100 samples permit rank calculation but do not establish statistical confidence. The overflow bucket has no upper bound. The sampler brackets each atomic window cut with two monotonic clock readings. A writer delayed across a cut delays publication without changing those readings. Consumers must check validity, age and cut uncertainty; a missing or low-sample window does not prove that foreground work is idle.
+
+With metrics export enabled, `rustfs_background_foreground_window_*` gauges expose validity, cut uncertainty, duration, starts, in-flight work and per-class counts and percentile bounds. Check the class and percentile availability gauges before reading retained numeric values. Exported floating-point gauges are diagnostic; the in-process counters retain integer precision. These local windows neither align different nodes nor provide the exact client-side percentile required by the SSD ABBA gate. They supply observations, without enabling an adaptive admission policy or completing performance acceptance.
+
 #### Histogram Window Evidence
 
 Use `scripts/scanner_otlp_window.py` to subtract two cumulative explicit-histogram or monotonic integer-counter snapshots before deriving window evidence. It reads OTLP JSON, or binary OTLP with `--format protobuf` when `opentelemetry-proto` is installed in the active Python environment. Pin and record that dependency in the adapter environment. Keep each original export and its source-node association; output includes the SHA-256 of both inputs.
