@@ -18,6 +18,14 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
 
 #[tokio::test]
+async fn four_node_explicit_delete_marker_batch_is_immediately_visible() -> TestResult {
+    init_logging();
+    let dist = DistCluster::start(DistLayout::FourByFour).await?;
+    let bucket = unique_bucket("explicit-marker-batch");
+    crate::delete_objects_versioning_test::assert_explicit_marker_batch_cleanup(&dist.clients()?, &bucket).await
+}
+
+#[tokio::test]
 async fn four_node_four_drive_versioning_put_list_get_delete_marker() -> TestResult {
     init_logging();
     let dist = DistCluster::start(DistLayout::FourByFour).await?;
