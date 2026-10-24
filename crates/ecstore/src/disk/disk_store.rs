@@ -2917,6 +2917,63 @@ impl DiskAPI for LocalDiskWrapper {
             .await
     }
 
+    async fn rename_data_with_pool_meta_cas(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp> {
+        if dst_volume != super::RUSTFS_META_BUCKET
+            || dst_path != "pool.bin"
+            || !rustfs_utils::http::metadata_compat::contains_key_str(&fi.metadata, super::POOL_META_NATIVE_CAS_METADATA_SUFFIX)
+        {
+            return Err(DiskError::UnsupportedDisk);
+        }
+        self.rename_data_borrowed(src_volume, src_path, &fi, dst_volume, dst_path)
+            .await
+    }
+
+    async fn undo_pool_meta_write(&self, volume: &str, path: &str, fi: FileInfo, opts: DeleteOptions) -> Result<()> {
+        if volume != super::RUSTFS_META_BUCKET
+            || path != "pool.bin"
+            || !opts.undo_write
+            || !rustfs_utils::http::metadata_compat::contains_key_str(&fi.metadata, super::POOL_META_NATIVE_CAS_METADATA_SUFFIX)
+        {
+            return Err(DiskError::UnsupportedDisk);
+        }
+        self.undo_write_with_namespace_owner(volume, path, fi, opts, None).await
+    }
+
+    async fn pool_meta_native_recovery(
+        &self,
+        request: super::PoolMetaNativeRecoveryRequest,
+    ) -> Result<super::PoolMetaNativeRecoveryResponse> {
+        let mutation = matches!(&request, super::PoolMetaNativeRecoveryRequest::Apply { .. });
+        let operation = self.clone();
+        let owner = mutation.then(|| Arc::new(()) as Arc<dyn Send + Sync>);
+        run_owned_mutation(owner, move || async move {
+            operation
+                .track_disk_health_mutation(
+                    "pool_meta_native_recovery",
+                    if mutation {
+                        DiskMetricMutation::Write
+                    } else {
+                        DiskMetricMutation::None
+                    },
+                    || async { operation.disk.pool_meta_native_recovery(request).await },
+                    if mutation {
+                        Duration::ZERO
+                    } else {
+                        get_max_timeout_duration()
+                    },
+                )
+                .await
+        })
+        .await
+    }
+
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         self.track_disk_health_with_op_and_timeout_action(
             "list_dir",

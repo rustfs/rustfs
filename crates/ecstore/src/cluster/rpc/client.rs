@@ -105,7 +105,7 @@ pub async fn tier_mutation_control_time_out_client(
 
 /// Build a `NodeServiceClient` bound to the [`ChannelClass`]-appropriate channel for `addr`.
 ///
-/// Bulk `bytes`-carrying RPCs (ReadAll/WriteAll/CompareAndUpdateFile/ReadMultiple/BatchReadVersion) pass
+/// Bulk `bytes`-carrying RPCs, including native pool metadata recovery inventories, pass
 /// [`ChannelClass::Bulk`] so, when channel isolation is enabled, they are physically isolated
 /// from lock/health RPCs; everything else uses [`ChannelClass::Control`]. When isolation is
 /// disabled the two classes resolve to the same cached channel, i.e. legacy behavior.

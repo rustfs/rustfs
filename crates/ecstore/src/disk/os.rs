@@ -2469,6 +2469,31 @@ pub async fn rename_all(
     Ok(())
 }
 
+/// Retain mutation ownership through both metadata publication and its directory
+/// barriers, even when the async caller stops waiting after the rename starts.
+pub(crate) async fn rename_metadata_and_sync_with_lease(
+    source: PathBuf,
+    destination: PathBuf,
+    base: PathBuf,
+    publication_root: PublicationRoot,
+    lease: Arc<NamespaceMutationLease>,
+) -> crate::disk::error::Result<()> {
+    run_blocking_namespace_operation(lease, move || {
+        let preparation = prepare_rename_with_retry(&source, &destination, &base, &publication_root)?;
+        rename_prepared(&source, &destination, &preparation)?;
+        if let Some(parent) = destination.parent() {
+            fsync_dir_std(parent)?;
+            if parent != base {
+                fsync_dir_std(&base)?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(to_file_error)?;
+    Ok(())
+}
+
 pub(crate) async fn fsync_dir_with_owner(path: &Path, namespace_owner: Option<Arc<dyn Send + Sync>>) -> io::Result<()> {
     #[cfg(unix)]
     {

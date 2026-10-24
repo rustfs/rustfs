@@ -495,7 +495,8 @@ pub(crate) mod ecstore_disk {
         DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest,
         DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo,
         DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload,
-        GuardedFileInfoVersions, OldCurrentSize, PartTransactionAction, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
+        GuardedFileInfoVersions, OldCurrentSize, POOL_META_NATIVE_CAS_METADATA_SUFFIX, PartTransactionAction,
+        PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
         ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo,
         WalkDirOptions, get_object_disk_read_timeout, is_quota_mutation_fence_path, validate_batch_read_version_item_count,
     };

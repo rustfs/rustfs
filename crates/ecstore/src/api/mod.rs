@@ -438,9 +438,11 @@ pub mod disk {
         DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DeleteRecoveryState,
         Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, DiskStore, FileInfoVersions, FileReader, FileWriter,
         GuardedDeleteVersionsPayload, GuardedFileInfoVersions, HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize,
-        PartTransactionAction, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp,
-        ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-        is_quota_mutation_fence_path, new_disk, validate_batch_read_version_item_count,
+        POOL_META_NATIVE_CAS_METADATA_SUFFIX, PartTransactionAction, PoolMetaNativeBackup, PoolMetaNativeInspection,
+        PoolMetaNativeObject, PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse,
+        QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
+        STORAGE_FORMAT_FILE, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, is_quota_mutation_fence_path,
+        new_disk, validate_batch_read_version_item_count,
     };
     pub use bytes::Bytes;
     pub use endpoint::Endpoint;

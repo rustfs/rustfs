@@ -562,6 +562,25 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn rename_data_with_pool_meta_cas(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::RenameDataRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::RenameDataResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+    async fn undo_pool_meta_write(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::DeleteVersionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::DeleteVersionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+    async fn pool_meta_native_recovery(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::PoolMetaNativeRecoveryRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::PoolMetaNativeRecoveryResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn make_volumes(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::MakeVolumesRequest>,

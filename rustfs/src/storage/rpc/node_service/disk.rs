@@ -14,6 +14,7 @@
 
 use super::{LocalMutationTarget, NodeService};
 use crate::storage::storage_api::ecstore_disk::{
+    POOL_META_NATIVE_CAS_METADATA_SUFFIX, PoolMetaNativeRecoveryRequest as NativeRecoveryRequest,
     QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, is_quota_mutation_fence_path,
 };
 use crate::storage::storage_api::rpc_consumer::node_service::{
@@ -905,6 +906,7 @@ impl NodeService {
         &self,
         request: Request<DeleteVersionRequest>,
         require_marker_condition: bool,
+        pool_meta_undo: bool,
     ) -> Result<Response<DeleteVersionResponse>, Status> {
         if !request.get_ref().bucket_incarnation_id.is_empty()
             && !request
@@ -915,11 +917,18 @@ impl NodeService {
         {
             return Err(Status::permission_denied("incarnation-bound delete requires a body-bound digest"));
         }
-        verify_disk_mutation_digest(
-            &request,
-            rustfs_protos::canonical_delete_version_request_body(request.get_ref()),
-            "delete_version",
-        )?;
+        if pool_meta_undo {
+            let body = rustfs_protos::canonical_delete_version_request_body(request.get_ref())
+                .map_err(|_| Status::invalid_argument("invalid pool metadata undo body length"))?;
+            verify_tonic_canonical_body_digest(&request, &body)
+                .map_err(|_| Status::permission_denied("pool metadata undo requires body-bound v2 authentication"))?;
+        } else {
+            verify_disk_mutation_digest(
+                &request,
+                rustfs_protos::canonical_delete_version_request_body(request.get_ref()),
+                "delete_version",
+            )?;
+        }
         if require_marker_condition
             && Uuid::from_slice(&request.get_ref().bucket_incarnation_id)
                 .ok()
@@ -949,6 +958,24 @@ impl NodeService {
                 }));
             }
         };
+        let has_pool_meta_cas =
+            rustfs_utils::http::metadata_compat::contains_key_str(&file_info.metadata, POOL_META_NATIVE_CAS_METADATA_SUFFIX);
+        if has_pool_meta_cas != pool_meta_undo {
+            return Err(Status::invalid_argument("protected pool metadata undo requires UndoPoolMetaWrite"));
+        }
+        if pool_meta_undo
+            && (request.volume != RUSTFS_META_BUCKET
+                || request.path != "pool.bin"
+                || !opts.undo_write
+                || opts.undo_delete
+                || request.force_del_marker
+                || require_marker_condition
+                || !request.bucket_incarnation_id.is_empty()
+                || request.file_info_bin.is_empty()
+                || request.opts_bin.is_empty())
+        {
+            return Err(Status::invalid_argument("invalid native pool metadata undo scope"));
+        }
         if rejects_legacy_delete_transaction(&request.volume, &opts) {
             return Ok(Response::new(DeleteVersionResponse {
                 success: false,
@@ -1315,6 +1342,44 @@ impl NodeService {
         }
     }
 
+    pub(super) async fn handle_pool_meta_native_recovery(
+        &self,
+        request: Request<PoolMetaNativeRecoveryRequest>,
+    ) -> Result<Response<PoolMetaNativeRecoveryResponse>, Status> {
+        let body = rustfs_protos::canonical_pool_meta_native_recovery_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("invalid pool metadata recovery body length"))?;
+        verify_tonic_canonical_body_digest(&request, &body)
+            .map_err(|_| Status::permission_denied("pool metadata recovery requires body-bound v2 authentication"))?;
+        let request = request.into_inner();
+        let operation: NativeRecoveryRequest = rustfs_protos::decode_pool_meta_native_recovery_payload(&request.payload)
+            .map_err(|_| Status::invalid_argument("invalid native pool metadata recovery payload"))?;
+        let result = match self.find_disk(&request.disk).await {
+            Some(disk) => {
+                crate::storage::storage_api::ecstore_disk::DiskAPI::pool_meta_native_recovery(disk.as_ref(), operation).await
+            }
+            None => Err(DiskError::DiskNotFound),
+        };
+        match result {
+            Ok(response) => {
+                let payload = rmp_serde::to_vec_named(&response)
+                    .map_err(|_| Status::internal("cannot encode native pool metadata recovery response"))?;
+                if payload.len() > rustfs_protos::POOL_META_NATIVE_RECOVERY_MAX_PAYLOAD_BYTES {
+                    return Err(Status::resource_exhausted("native pool metadata recovery response exceeds limit"));
+                }
+                Ok(Response::new(PoolMetaNativeRecoveryResponse {
+                    success: true,
+                    error: None,
+                    payload: payload.into(),
+                }))
+            }
+            Err(error) => Ok(Response::new(PoolMetaNativeRecoveryResponse {
+                success: false,
+                error: Some(error.into()),
+                payload: Bytes::new(),
+            })),
+        }
+    }
+
     pub(super) async fn handle_read_metadata(
         &self,
         request: Request<ReadMetadataRequest>,
@@ -1511,6 +1576,7 @@ impl NodeService {
         &self,
         request: Request<RenameDataRequest>,
         quota_fence: bool,
+        pool_meta_cas: bool,
     ) -> Result<Response<RenameDataResponse>, Status> {
         let service_return_started = rustfs_io_metrics::put_stage_timer();
         let service_entry_started = rustfs_io_metrics::put_stage_timer();
@@ -1534,7 +1600,11 @@ impl NodeService {
         }
         let body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
         let mut quota_topology = None;
-        let authenticated = if quota_fence {
+        let authenticated = if pool_meta_cas {
+            let body = body.map_err(|_| Status::invalid_argument("invalid pool metadata CAS body length"))?;
+            verify_tonic_canonical_body_digest(&request, &body)
+                .map_err(|_| Status::permission_denied("pool metadata CAS requires body-bound v2 authentication"))
+        } else if quota_fence {
             verify_quota_mutation_digest(&request, body).map(|topology| quota_topology = Some(topology))
         } else {
             verify_disk_mutation_digest(&request, body, "rename_data")
@@ -1639,6 +1709,26 @@ impl NodeService {
         }
         if let Some(topology) = quota_topology {
             self.quota_store_for_topology(&target, &topology)?;
+        }
+        let has_pool_meta_cas = rustfs_utils::http::metadata_compat::contains_key_str(
+            &decoded_file_info.value.metadata,
+            POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+        );
+        if has_pool_meta_cas != pool_meta_cas {
+            return Err(Status::invalid_argument(
+                "protected pool metadata rename requires RenameDataWithPoolMetaCas",
+            ));
+        }
+        if pool_meta_cas
+            && (request.dst_volume != RUSTFS_META_BUCKET
+                || request.dst_path != "pool.bin"
+                || request.src_volume != ".rustfs.sys/tmp"
+                || !decoded_file_info.from_msgpack
+                || scanner_publication_lease_token.is_some()
+                || bucket_incarnation.is_some()
+                || quota_fence)
+        {
+            return Err(Status::invalid_argument("invalid native pool metadata CAS scope"));
         }
         let request_decoded_from_msgpack = decoded_file_info.from_msgpack;
         #[cfg(feature = "e2e-test-hooks")]

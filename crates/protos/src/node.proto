@@ -339,6 +339,19 @@ message RenameDataResponse {
   bytes rename_data_resp_bin = 4;
 }
 
+// Fixed-scope native pool.bin recovery. The typed MessagePack payload never
+// accepts an arbitrary volume or object path.
+message PoolMetaNativeRecoveryRequest {
+  string disk = 1;
+  bytes payload = 2;
+}
+
+message PoolMetaNativeRecoveryResponse {
+  bool success = 1;
+  optional Error error = 2;
+  bytes payload = 3;
+}
+
 message MakeVolumesRequest {
   string disk = 1;  // indicate which one in the disks
   repeated string volumes = 2;
@@ -1287,6 +1300,9 @@ service NodeService {
   rpc RenameData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc RenameDataAtIncarnation(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc RenameDataWithQuotaFence(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
+  rpc RenameDataWithPoolMetaCas(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
+  rpc UndoPoolMetaWrite(DeleteVersionRequest) returns (DeleteVersionResponse) {}; // auth-policy: body-bound
+  rpc PoolMetaNativeRecovery(PoolMetaNativeRecoveryRequest) returns (PoolMetaNativeRecoveryResponse) {}; // auth-policy: body-bound
   rpc MakeVolumes(MakeVolumesRequest) returns (MakeVolumesResponse) {}; // auth-policy: body-bound
   rpc MakeVolume(MakeVolumeRequest) returns (MakeVolumeResponse) {}; // auth-policy: body-bound
   rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse) {}; // auth-policy: read-only

@@ -1722,7 +1722,7 @@ impl Node for NodeService {
         if !request.get_ref().bucket_incarnation_id.is_empty() {
             return Err(Status::invalid_argument("incarnation-bound rename requires RenameDataAtIncarnation"));
         }
-        self.handle_rename_data(request, false).await
+        self.handle_rename_data(request, false, false).await
     }
 
     async fn rename_data_at_incarnation(
@@ -1737,14 +1737,35 @@ impl Node for NodeService {
         {
             return Err(Status::invalid_argument("bucket incarnation must be a non-nil UUID"));
         }
-        self.handle_rename_data(request, false).await
+        self.handle_rename_data(request, false, false).await
     }
 
     async fn rename_data_with_quota_fence(
         &self,
         request: Request<RenameDataRequest>,
     ) -> Result<Response<RenameDataResponse>, Status> {
-        self.handle_rename_data(request, true).await
+        self.handle_rename_data(request, true, false).await
+    }
+
+    async fn rename_data_with_pool_meta_cas(
+        &self,
+        request: Request<RenameDataRequest>,
+    ) -> Result<Response<RenameDataResponse>, Status> {
+        self.handle_rename_data(request, false, true).await
+    }
+
+    async fn undo_pool_meta_write(
+        &self,
+        request: Request<DeleteVersionRequest>,
+    ) -> Result<Response<DeleteVersionResponse>, Status> {
+        self.handle_delete_version(request, false, true).await
+    }
+
+    async fn pool_meta_native_recovery(
+        &self,
+        request: Request<PoolMetaNativeRecoveryRequest>,
+    ) -> Result<Response<PoolMetaNativeRecoveryResponse>, Status> {
+        self.handle_pool_meta_native_recovery(request).await
     }
 
     async fn make_volumes(&self, request: Request<MakeVolumesRequest>) -> Result<Response<MakeVolumesResponse>, Status> {
@@ -1845,7 +1866,7 @@ impl Node for NodeService {
         if !request.get_ref().bucket_incarnation_id.is_empty() {
             return Err(Status::invalid_argument("incarnation-bound delete requires DeleteVersionAtIncarnation"));
         }
-        self.handle_delete_version(request, false).await
+        self.handle_delete_version(request, false, false).await
     }
 
     async fn delete_version_at_incarnation(
@@ -1860,7 +1881,7 @@ impl Node for NodeService {
         {
             return Err(Status::invalid_argument("bucket incarnation must be a non-nil UUID"));
         }
-        self.handle_delete_version(request, false).await
+        self.handle_delete_version(request, false, false).await
     }
 
     async fn delete_retired_marker(
@@ -1875,7 +1896,7 @@ impl Node for NodeService {
         {
             return Err(Status::invalid_argument("bucket incarnation must be a non-nil UUID"));
         }
-        self.handle_delete_version(request, true).await
+        self.handle_delete_version(request, true, false).await
     }
 
     async fn guarded_delete_versions(
@@ -3149,15 +3170,15 @@ mod tests {
         HealControlRequest, HealControlResponse, ListBucketRequest, ListDirRequest, ListVolumesRequest,
         LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest,
         LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest,
-        MakeVolumeRequest, MakeVolumesRequest, Mss, PingRequest, PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest,
-        ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RecoverDeleteTransactionRequest, ReloadPoolMetaRequest,
-        ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest, ScannerActivityRequest,
-        ScannerDirtyUsageSnapshotRequest, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
-        ServerInfoRequest, SettlePartTransactionRequest, SignalServiceRequest, SnapshotLeaseReleaseRequest,
-        SnapshotLeaseRenewRequest, SnapshotLeaseRequest, StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest,
-        StopRebalanceRequest, TierMutationAbortRequest, TierMutationFailureClass, TierMutationPeerState,
-        TierMutationPrepareRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
-        WriteMetadataRequest, WriteRequest,
+        MakeVolumeRequest, MakeVolumesRequest, Mss, PingRequest, PoolMetaNativeRecoveryRequest, PreparePartTransactionRequest,
+        ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RecoverDeleteTransactionRequest,
+        ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest,
+        ScannerActivityRequest, ScannerDirtyUsageSnapshotRequest, ScannerPublicationLeaseReleaseRequest,
+        ScannerPublicationLeaseRequest, ServerInfoRequest, SettlePartTransactionRequest, SignalServiceRequest,
+        SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest, StartDecommissionRequest,
+        StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationFailureClass,
+        TierMutationPeerState, TierMutationPrepareRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest,
+        VerifyFileRequest, WriteAllRequest, WriteMetadataRequest, WriteRequest,
         heal_control_service_client::HealControlServiceClient,
         heal_control_service_server::{HealControlService as _, HealControlServiceServer},
         node_service_client::NodeServiceClient,
@@ -3175,10 +3196,13 @@ mod tests {
     use tonic::{Request, Response, Status};
     use uuid::Uuid;
 
-    const DISK_MUTATION_RPC_METHODS: [&str; 29] = [
+    const DISK_MUTATION_RPC_METHODS: [&str; 32] = [
         "renamedata",
         "renamedataatincarnation",
         "renamedatawithquotafence",
+        "renamedatawithpoolmetacas",
+        "undopoolmetawrite",
+        "poolmetanativerecovery",
         "writemetadataatincarnation",
         "deleteatincarnation",
         "deleteversionatincarnation",
@@ -4871,6 +4895,21 @@ mod tests {
             rustfs_protos::canonical_rename_data_request_body
         );
         assert_gated!(
+            rename_data_with_pool_meta_cas,
+            RenameDataRequest::default(),
+            rustfs_protos::canonical_rename_data_request_body
+        );
+        assert_gated!(
+            undo_pool_meta_write,
+            DeleteVersionRequest::default(),
+            rustfs_protos::canonical_delete_version_request_body
+        );
+        assert_gated!(
+            pool_meta_native_recovery,
+            PoolMetaNativeRecoveryRequest::default(),
+            rustfs_protos::canonical_pool_meta_native_recovery_request_body
+        );
+        assert_gated!(
             delete_version,
             DeleteVersionRequest {
                 bucket_incarnation_id: Default::default(),
@@ -5159,6 +5198,112 @@ mod tests {
             covered_methods, expected_methods,
             "the disk mutation exclusion set must exactly match handlers exercised by the independent digest test",
         );
+    }
+
+    #[tokio::test]
+    async fn pool_meta_native_handlers_reject_unsigned_requests_and_legacy_guard_dispatch() {
+        let service = make_server();
+        assert_eq!(
+            service
+                .rename_data_with_pool_meta_cas(Request::new(RenameDataRequest::default()))
+                .await
+                .expect_err("native CAS requires body authentication")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            service
+                .undo_pool_meta_write(Request::new(DeleteVersionRequest::default()))
+                .await
+                .expect_err("native undo requires body authentication")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            service
+                .pool_meta_native_recovery(Request::new(PoolMetaNativeRecoveryRequest::default()))
+                .await
+                .expect_err("native recovery requires body authentication")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut info = rustfs_filemeta::FileInfo::default();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut info.metadata,
+            crate::storage::storage_api::ecstore_disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+            format!("{{\"attempt_id\":\"{}\",\"parent\":null}}", Uuid::new_v4()),
+        );
+        let encoded = rmp_serde::to_vec_named(&info).expect("FileInfo fixture must encode");
+        macro_rules! signed {
+            ($message:expr, $canonical:path) => {{
+                let mut request = Request::new($message);
+                let body = $canonical(request.get_ref()).expect("canonical body must encode");
+                set_tonic_canonical_body_digest(&mut request, &body).expect("body digest must encode");
+                mark_v2_authenticated(&mut request);
+                request
+            }};
+        }
+        let rename = RenameDataRequest {
+            disk: "unknown-disk".to_owned(),
+            src_volume: ".rustfs.sys/tmp".to_owned(),
+            src_path: "staged".to_owned(),
+            dst_volume: ".rustfs.sys".to_owned(),
+            dst_path: "pool.bin".to_owned(),
+            file_info_bin: encoded.clone().into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            service
+                .rename_data(signed!(rename, rustfs_protos::canonical_rename_data_request_body))
+                .await
+                .expect_err("a guarded rename must use the explicit enforcing method")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let opts = crate::storage::storage_api::DeleteOptions {
+            undo_write: true,
+            old_data_dir: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let undo = DeleteVersionRequest {
+            disk: "unknown-disk".to_owned(),
+            volume: ".rustfs.sys".to_owned(),
+            path: "pool.bin".to_owned(),
+            file_info_bin: encoded.into(),
+            opts_bin: rmp_serde::to_vec_named(&opts).expect("undo fixture must encode").into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            service
+                .delete_version(signed!(undo, rustfs_protos::canonical_delete_version_request_body))
+                .await
+                .expect_err("a guarded undo must use the explicit enforcing method")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let mut invalid_payloads = vec![vec![], vec![0xc1], vec![0x90, 0xc0]];
+        for operation in ["probe", "inspect_identity"] {
+            for field in ["object", "path"] {
+                let mut value = serde_json::json!({"operation":operation});
+                value[field] = serde_json::json!("pool.bin");
+                invalid_payloads.push(rmp_serde::to_vec_named(&value).expect("unknown-field request fixture must encode"));
+            }
+        }
+        for payload in invalid_payloads {
+            let request = PoolMetaNativeRecoveryRequest {
+                disk: "unknown-disk".to_owned(),
+                payload: payload.clone().into(),
+            };
+            assert_eq!(
+                service
+                    .pool_meta_native_recovery(signed!(request, rustfs_protos::canonical_pool_meta_native_recovery_request_body))
+                    .await
+                    .expect_err("malformed recovery must stop before disk lookup")
+                    .code(),
+                tonic::Code::InvalidArgument,
+                "invalid native recovery payload: {payload:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1059,6 +1059,82 @@ pub fn canonical_rename_data_request_body(
     Ok(body.finish())
 }
 
+pub fn canonical_pool_meta_native_recovery_request_body(
+    request: &proto_gen::node_service::PoolMetaNativeRecoveryRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-pool-meta-native-recovery-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_bytes(&request.payload)?;
+    Ok(body.finish())
+}
+
+/// The native recovery RPC accepts exactly one bounded MessagePack value.
+pub const POOL_META_NATIVE_RECOVERY_MAX_PAYLOAD_BYTES: usize = DEFAULT_GRPC_SERVER_MESSAGE_LEN;
+
+pub fn decode_pool_meta_native_recovery_payload<T: serde::de::DeserializeOwned>(payload: &[u8]) -> std::io::Result<T> {
+    if payload.is_empty() || payload.len() > POOL_META_NATIVE_RECOVERY_MAX_PAYLOAD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid pool metadata recovery payload length",
+        ));
+    }
+    let mut cursor = std::io::Cursor::new(payload);
+    let value = rmp_serde::from_read(&mut cursor)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid pool metadata recovery payload"))?;
+    if cursor.position() != u64::try_from(payload.len()).map_err(std::io::Error::other)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "trailing pool metadata recovery payload",
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod pool_meta_native_rpc_tests {
+    use super::*;
+
+    #[test]
+    fn pool_meta_native_recovery_body_binds_disk_and_payload_without_field_aliasing() {
+        use proto_gen::node_service::PoolMetaNativeRecoveryRequest;
+        let baseline = PoolMetaNativeRecoveryRequest {
+            disk: "disk-a".to_owned(),
+            payload: vec![1, 2].into(),
+        };
+        let body = canonical_pool_meta_native_recovery_request_body(&baseline).expect("body must encode");
+        for changed in [
+            PoolMetaNativeRecoveryRequest {
+                disk: "disk-b".to_owned(),
+                ..baseline.clone()
+            },
+            PoolMetaNativeRecoveryRequest {
+                payload: vec![1, 3].into(),
+                ..baseline.clone()
+            },
+            PoolMetaNativeRecoveryRequest {
+                disk: "disk-a\u{1}".to_owned(),
+                payload: vec![2].into(),
+            },
+        ] {
+            assert_ne!(
+                body,
+                canonical_pool_meta_native_recovery_request_body(&changed).expect("changed body must encode")
+            );
+        }
+    }
+
+    #[test]
+    fn pool_meta_native_recovery_codec_rejects_empty_malformed_and_trailing_values() {
+        for payload in [vec![], vec![0xc1], vec![0x90, 0xc0]] {
+            assert!(decode_pool_meta_native_recovery_payload::<Vec<u8>>(&payload).is_err());
+        }
+        assert_eq!(
+            decode_pool_meta_native_recovery_payload::<Vec<u8>>(&[0x90]).expect("one empty array is valid"),
+            Vec::<u8>::new()
+        );
+    }
+}
+
 pub const QUOTA_MUTATION_TOPOLOGY_HEADER: &str = "x-rustfs-quota-topology";
 
 /// Binds a quota mutation to the coordinator's complete, ordered storage layout.

@@ -18,7 +18,7 @@
 
 | Dependency | Ready signal | Blocks `FullReady` | Notes |
 |---|---|---|---|
-| StorageReady | Storage/global config readiness publication plus runtime storage checks. | Yes. | Startup can mark the stage before later runtime readiness rechecks storage. |
+| StorageReady | Storage/global config readiness publication plus runtime storage checks. | Yes. | Startup can mark the stage before later runtime readiness rechecks storage. Initial pool metadata reads must complete before object-store publication; see [pool metadata recovery](../operations/pool-metadata-recovery.md). |
 | IamReady | Inline IAM bootstrap or deferred IAM recovery publication. | Yes. | Deferred recovery can publish IAM readiness after HTTP has already started. |
 | Lock quorum | Per-set write quorum readiness. | Yes. | Do not replace the distributed lock quorum check with node count or endpoint count. |
 | Peer health | `peer_health_ready` runtime status. | Only when `RUSTFS_HEALTH_PEER_READY_CHECK_ENABLE` is enabled. | The gate is disabled by default; unknown peer health degrades readiness only when enabled. |

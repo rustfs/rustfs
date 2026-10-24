@@ -27,8 +27,9 @@ use crate::disk::{
     DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest, DeleteRecoveryInspection,
     DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation,
     DiskOption, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload, GuardedFileInfoVersions,
-    PartTransactionAction, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken,
-    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, batch_read_version_one_by_one,
+    PartTransactionAction, PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse, ReadMultipleReq, ReadMultipleResp,
+    ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    batch_read_version_one_by_one,
     disk_store::{
         DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
         get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
@@ -62,11 +63,12 @@ use rustfs_protos::proto_gen::node_service::{
     BatchReadVersionRequest, BatchReadVersionResponse, CheckPartsRequest, CompareAndUpdateFileOutcome,
     CompareAndUpdateFileRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest,
     DeleteVersionsResponse, DeleteVolumeRequest, DiskInfoRequest, GuardedDeleteVersionsRequest, ListDirRequest,
-    ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, ReadAllRequest,
-    ReadMetadataRequest, ReadMultipleRequest, ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest,
-    RecoverDeleteTransactionRequest, RenameDataRequest, RenameFileRequest, SettlePartTransactionRequest,
-    SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest, SnapshotLeaseResponse, StatVolumeRequest,
-    UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest, node_service_client::NodeServiceClient,
+    ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, PoolMetaNativeRecoveryRequest as PoolMetaNativeRecoveryRpcRequest,
+    PreparePartTransactionRequest, ReadAllRequest, ReadMetadataRequest, ReadMultipleRequest, ReadMultipleResponse,
+    ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RecoverDeleteTransactionRequest, RenameDataRequest, RenameFileRequest,
+    SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
+    SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+    node_service_client::NodeServiceClient,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -2128,7 +2130,7 @@ impl RemoteDisk {
             .map_err(|err| Error::RemoteClientUnavailable(err.to_string()))
     }
 
-    /// Client for large `bytes`-carrying RPCs (ReadAll/WriteAll/CompareAndUpdateFile/ReadMultiple/BatchReadVersion).
+    /// Client for large `bytes`-carrying RPCs, including native pool metadata recovery inventories.
     /// Routes onto the isolated bulk channel pool so large transfers cannot head-of-line block
     /// lock/health RPCs (grpc-optimization P1). Falls back to the control channel when isolation
     /// is disabled.
@@ -2399,6 +2401,17 @@ impl RemoteDisk {
         dst_path: &str,
         scanner_publication_lease_token: Option<Uuid>,
     ) -> Result<RenameDataResp> {
+        let pool_meta_cas = rustfs_utils::http::metadata_compat::contains_key_str(
+            &fi.metadata,
+            crate::disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+        );
+        if pool_meta_cas
+            && (dst_volume != crate::disk::RUSTFS_META_BUCKET
+                || dst_path != "pool.bin"
+                || scanner_publication_lease_token.is_some())
+        {
+            return Err(DiskError::UnsupportedDisk);
+        }
         trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
@@ -2441,7 +2454,10 @@ impl RemoteDisk {
                     &fi.metadata,
                     crate::disk::QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
                 );
-                if quota_fenced {
+                if pool_meta_cas {
+                    let body = canonical_body.map_err(|_| Error::other("pool metadata CAS body length cannot be represented"))?;
+                    crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &body).map_err(Error::other)?;
+                } else if quota_fenced {
                     attach_quota_mutation_body_digest(&mut request, canonical_body)?;
                 } else if scanner_publication_lease_token.is_some() || incarnation_bound {
                     let canonical_body =
@@ -2458,7 +2474,9 @@ impl RemoteDisk {
                 let rpc_started = rustfs_io_metrics::put_stage_timer();
                 let response = rustfs_io_metrics::observe_put_stage_future(
                     async {
-                        if quota_fenced {
+                        if pool_meta_cas {
+                            client.rename_data_with_pool_meta_cas(request).await
+                        } else if quota_fenced {
                             // The method itself proves quota-token enforcement; an old peer must fail closed.
                             client.rename_data_with_quota_fence(request).await
                         } else if incarnation_bound {
@@ -2472,7 +2490,14 @@ impl RemoteDisk {
                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_POLL_PENDING_COUNT,
                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_FIRST_PENDING_TO_READY,
                 )
-                .await?;
+                .await
+                .map_err(|status| {
+                    if pool_meta_cas && status.code() == Code::Unimplemented {
+                        DiskError::UnsupportedDisk
+                    } else {
+                        status.into()
+                    }
+                })?;
                 let response_process_started = rustfs_io_metrics::put_stage_timer();
                 let response_headers_started = rustfs_io_metrics::put_stage_timer();
                 let _ = response.metadata().len();
@@ -2907,6 +2932,20 @@ impl DiskAPI for RemoteDisk {
                 let file_info_bin = encode_file_info_msgpack(&fi)?;
                 let opts_bin = encode_delete_options_msgpack(&opts)?;
                 let conditional_marker = opts.expected_delete_marker.is_some();
+                let pool_meta_undo = rustfs_utils::http::metadata_compat::contains_key_str(
+                    &fi.metadata,
+                    crate::disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+                );
+                if pool_meta_undo
+                    && (volume != crate::disk::RUSTFS_META_BUCKET
+                        || path != "pool.bin"
+                        || !opts.undo_write
+                        || opts.undo_delete
+                        || force_del_marker
+                        || conditional_marker)
+                {
+                    return Err(DiskError::UnsupportedDisk);
+                }
                 let file_info = serde_json::to_string(&fi)?;
                 let opts = serde_json::to_string(&opts)?;
 
@@ -2926,7 +2965,7 @@ impl DiskAPI for RemoteDisk {
                 });
                 let canonical_body = rustfs_protos::canonical_delete_version_request_body(request.get_ref());
                 let incarnation_bound = !request.get_ref().bucket_incarnation_id.is_empty();
-                if incarnation_bound {
+                if incarnation_bound || pool_meta_undo {
                     let body = canonical_body.map_err(|_| Error::other("delete-version body length cannot be represented"))?;
                     crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &body).map_err(Error::other)?;
                 } else {
@@ -2935,7 +2974,15 @@ impl DiskAPI for RemoteDisk {
 
                 // The marker-specific method rejects older peers; its body digest
                 // also binds any incarnation, so neither precondition can be lost.
-                let response = if conditional_marker {
+                let response = if pool_meta_undo {
+                    client.undo_pool_meta_write(request).await.map_err(|status| {
+                        if status.code() == Code::Unimplemented {
+                            DiskError::UnsupportedDisk
+                        } else {
+                            status.into()
+                        }
+                    })?
+                } else if conditional_marker {
                     client.delete_retired_marker(request).await?
                 } else if incarnation_bound {
                     client.delete_version_at_incarnation(request).await?
@@ -3615,6 +3662,70 @@ impl DiskAPI for RemoteDisk {
     ) -> Result<RenameDataResp> {
         self.rename_data_borrowed(src_volume, src_path, &fi, dst_volume, dst_path)
             .await
+    }
+
+    async fn rename_data_with_pool_meta_cas(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp> {
+        if !rustfs_utils::http::metadata_compat::contains_key_str(&fi.metadata, crate::disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX)
+        {
+            return Err(DiskError::UnsupportedDisk);
+        }
+        self.rename_data_borrowed(src_volume, src_path, &fi, dst_volume, dst_path)
+            .await
+    }
+
+    async fn undo_pool_meta_write(&self, volume: &str, path: &str, fi: FileInfo, opts: DeleteOptions) -> Result<()> {
+        if !rustfs_utils::http::metadata_compat::contains_key_str(&fi.metadata, crate::disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX)
+        {
+            return Err(DiskError::UnsupportedDisk);
+        }
+        self.delete_version(volume, path, fi, false, opts).await
+    }
+
+    async fn pool_meta_native_recovery(
+        &self,
+        operation: PoolMetaNativeRecoveryRequest,
+    ) -> Result<PoolMetaNativeRecoveryResponse> {
+        self.execute_with_timeout_for_op(
+            "pool_meta_native_recovery",
+            || async {
+                let payload = rmp_serde::to_vec_named(&operation).map_err(Error::other)?;
+                if payload.len() > rustfs_protos::POOL_META_NATIVE_RECOVERY_MAX_PAYLOAD_BYTES {
+                    return Err(DiskError::FileCorrupt);
+                }
+                let mut client = self.get_bulk_client().await?;
+                let mut request = Request::new(PoolMetaNativeRecoveryRpcRequest {
+                    disk: self.endpoint.to_string(),
+                    payload: payload.into(),
+                });
+                let body = rustfs_protos::canonical_pool_meta_native_recovery_request_body(request.get_ref())
+                    .map_err(|_| Error::other("pool metadata recovery body length cannot be represented"))?;
+                crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &body).map_err(Error::other)?;
+                let response = client
+                    .pool_meta_native_recovery(request)
+                    .await
+                    .map_err(|status| {
+                        if status.code() == Code::Unimplemented {
+                            DiskError::UnsupportedDisk
+                        } else {
+                            status.into()
+                        }
+                    })?
+                    .into_inner();
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+                rustfs_protos::decode_pool_meta_native_recovery_payload(&response.payload).map_err(Error::other)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -4603,6 +4714,120 @@ mod tests {
                 "/node_service.NodeService/RenameDataWithQuotaFence",
             ],
             "quota operations must never fall back to snapshot or unfenced rename methods"
+        );
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    async fn pool_meta_native_recovery_uses_bulk_channel_without_replacing_control() {
+        runtime_sources::ensure_test_rpc_secret();
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_INTERNODE_CHANNEL_ISOLATION, Some("true")),
+                (rustfs_config::ENV_INTERNODE_BULK_CHANNELS, Some("1")),
+            ],
+            async {
+                let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+                    .await
+                    .expect("route test peer must bind");
+                let remote = remote_disk_for_addr(&peer.addr).await;
+                let bulk_key = format!("{}\u{0}bulk\u{0}0", peer.addr);
+                drop(remote.get_client().await.expect("control channel must connect"));
+                assert!(rustfs_common::has_cached_connection(&peer.addr).await, "control channel must be warm");
+                assert!(
+                    !rustfs_common::has_cached_connection(&bulk_key).await,
+                    "the unique peer must have no bulk channel yet"
+                );
+
+                assert_eq!(
+                    remote
+                        .pool_meta_native_recovery(PoolMetaNativeRecoveryRequest::Probe {})
+                        .await,
+                    Err(DiskError::UnsupportedDisk),
+                    "the old-peer response must still traverse the real recovery RPC route",
+                );
+                assert!(
+                    rustfs_common::has_cached_connection(&peer.addr).await,
+                    "recovery must retain the control cache"
+                );
+                assert!(
+                    rustfs_common::has_cached_connection(&bulk_key).await,
+                    "recovery must establish its isolated bulk channel"
+                );
+                assert_eq!(
+                    *peer.peer.unsupported_methods.lock().expect("observed methods lock"),
+                    vec!["/node_service.NodeService/PoolMetaNativeRecovery"],
+                );
+
+                remote.cancel_token.cancel();
+                drop(remote);
+                rustfs_common::evict_connection(&peer.addr).await;
+                rustfs_common::evict_connection(&bulk_key).await;
+                peer.stop().await;
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pool_meta_native_old_peer_rejects_without_legacy_fallback() {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("old peer must bind");
+        let remote = remote_disk_for_addr(&peer.addr).await;
+        let mut file_info = sample_rename_data_file_info();
+        crate::disk::PoolMetaNativeCasCondition {
+            attempt_id: Uuid::new_v4(),
+            parent: None,
+            parent_raw_sha256: None,
+        }
+        .insert_into(&mut file_info.metadata)
+        .expect("native condition must encode");
+        assert_eq!(
+            remote
+                .rename_data_borrowed_with_fence(
+                    crate::disk::RUSTFS_META_TMP_BUCKET,
+                    "staged",
+                    &file_info,
+                    crate::disk::RUSTFS_META_BUCKET,
+                    "pool.bin",
+                    None
+                )
+                .await
+                .expect_err("old peer must reject native CAS"),
+            DiskError::UnsupportedDisk,
+        );
+        assert_eq!(
+            remote
+                .delete_version(
+                    crate::disk::RUSTFS_META_BUCKET,
+                    "pool.bin",
+                    file_info,
+                    false,
+                    DeleteOptions {
+                        undo_write: true,
+                        old_data_dir: Some(Uuid::new_v4()),
+                        ..Default::default()
+                    }
+                )
+                .await,
+            Err(DiskError::UnsupportedDisk),
+        );
+        assert_eq!(
+            remote
+                .pool_meta_native_recovery(PoolMetaNativeRecoveryRequest::Probe {})
+                .await,
+            Err(DiskError::UnsupportedDisk),
+        );
+        assert_eq!(
+            *peer.peer.unsupported_methods.lock().expect("observed methods lock"),
+            vec![
+                "/node_service.NodeService/RenameDataWithPoolMetaCas",
+                "/node_service.NodeService/UndoPoolMetaWrite",
+                "/node_service.NodeService/PoolMetaNativeRecovery"
+            ],
+            "protected mutations and capability probes must never fall back to legacy RPCs",
         );
         peer.stop().await;
     }

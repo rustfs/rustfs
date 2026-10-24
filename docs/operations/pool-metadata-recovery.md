@@ -32,9 +32,23 @@ A V3 update first conditionally writes a pending generation containing the last 
 
 Do not hand-edit a pending record or select a replica only because it is in pool zero. Preserve all copies when escalating recovery.
 
+## Interrupted native metadata publication
+
+A process kill can leave a pool with two PREPARE heads and two COMMIT heads for the same V3 transaction. Repeating the ordinary read cannot repair that split: the latest-head selection still requires its original quorum. Startup reconciliation holds the same distributed `pool.bin` writer fence as runtime recovery.
+
+Conditional native recovery is limited to modern, single-part inline metadata. It requires an ordinary readable COMMIT in another pool, one matching cluster identity and epoch on every disk, and complete readable current and rollback evidence. Every shard must match that COMMIT, its exact PREPARE, or a fully verified older-generation backup. Reconstruction verifies bitrot and erasure integrity; two reconstructable shards do not establish commit authority. Missing, conflicting, unsupported, or higher-generation evidence remains an operator recovery case.
+
+Recovery checks each disk ID, current SHA and complete backup inventory inside the native metadata and publication leases. Identity shards are validated on every member of their own hashed erasure set before Apply and after normal CAS/readback, under the same global writer fence. Co-located identity bytes are additionally pinned and bound into that disk's inventory SHA; co-location is not required. It publishes the proven COMMIT with a fresh physical file identity, retains rollback evidence, then performs normal conditional V3 writes and ordinary quorum readback. Partial repair or fence loss keeps writes blocked. A verified identity or transaction conflict retains `RecoveryRequired` in the original write state even if partial repair made the head readable; a later ordinary quorum cannot clear that known conflict. Transport failures, unsupported recovery layouts and missing evidence do not acquire a permanent validation latch merely because recovery could not verify them.
+
+Normal `pool.bin` CAS also compares the exact per-disk predecessor under the native mutation lease. Each physical PREPARE and COMMIT uses a separate rollback directory. Undo must match both its own new head and its exact parent backup; late writes, undo and cleanup cannot replace a later acknowledged head. Ordinary object writes retain their existing behavior.
+
+The native CAS, undo and recovery RPC methods require all participating storage nodes to support them. They never fall back to legacy mutators on `Unimplemented`. Pause pool metadata mutations during a mixed-version rollout and finish upgrading the storage nodes before resuming decommission or rebalance. V3 payloads remain unchanged; downgrading the entire fleet to binaries without native CAS requires a stopped cluster and offline reconciliation.
+
 ## Runtime write recovery
 
 A runtime metadata or identity read failure before any write is dispatched rejects that operation but does not permanently block subsequent retries. Errors retain their typed cause; pool metadata unavailability reaches S3 as `503 ServiceUnavailable`, without exposing internal error details. Cancellation during preflight or a rejected first conditional write is also retryable. After any identity, prepare, or commit write may have started, cancellation, an uncertain write result, or abandoned runtime publication blocks further metadata-dependent mutations.
+
+During startup, an unreadable identity or `pool.bin` replica returns typed `ReadUnavailable` before a partial metadata view is installed or the object store is published. Initialization retries from the complete identity and metadata read at the existing five-second retry interval, within the existing startup attempt budget. A later readable result must still pass the original identity, generation, topology, conditional-write and readback checks. Read-only unavailability does not create a permanent startup block; an existing validation or uncertain-write block is never cleared by a clean retry.
 
 The node checks for interrupted pool metadata transactions every five seconds. Failed recovery attempts back off to at most sixty seconds; each attempt has a thirty-second budget and stops on shutdown. Healthy nodes do not read metadata for this worker. Recovery:
 

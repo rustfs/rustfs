@@ -4822,6 +4822,63 @@ impl SetDisks {
                 return Err(err);
             }
 
+            if bucket == RUSTFS_META_BUCKET
+                && object == "pool.bin"
+                && rustfs_utils::http::metadata_compat::contains_key_str(
+                    &opts.user_defined,
+                    crate::disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+                )
+            {
+                // The logical If-Match above remains authoritative. Bind each
+                // disk mutation to its actual physical predecessor as well, so
+                // a lagging replica can converge without admitting late tails.
+                let condition = rustfs_utils::http::metadata_compat::get_consistent_str(
+                    &opts.user_defined,
+                    crate::disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+                )
+                .ok_or(DiskError::FileCorrupt)?;
+                let condition: crate::disk::PoolMetaNativeCasCondition =
+                    serde_json::from_str(condition).map_err(|_| DiskError::FileCorrupt)?;
+                let (parents, errors) =
+                    Self::read_all_fileinfo(&shuffle_disks, bucket, bucket, object, "", false, false, false).await?;
+                for (index, ((metadata, parent), error)) in parts_metadatas.iter_mut().zip(&parents).zip(&errors).enumerate() {
+                    let mut parent_raw_sha256 = None;
+                    let parent = match error {
+                        None => Some(crate::disk::PoolMetaNativeFileIdentity::from_file_info(parent)?),
+                        Some(DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound) => None,
+                        // An unavailable disk keeps the exact logical parent;
+                        // reconnecting cannot turn an unknown head into absence.
+                        Some(
+                            DiskError::DiskNotFound | DiskError::FaultyDisk | DiskError::DiskAccessDenied | DiskError::Timeout,
+                        ) => condition.parent.clone(),
+                        Some(DiskError::FileCorrupt) => {
+                            use sha2::Digest as _;
+                            let disk = shuffle_disks[index].as_ref().ok_or(DiskError::DiskNotFound)?;
+                            match disk
+                                .pool_meta_native_recovery(crate::disk::PoolMetaNativeRecoveryRequest::Inspect {
+                                    object: crate::disk::PoolMetaNativeObject::PoolBin,
+                                })
+                                .await?
+                            {
+                                crate::disk::PoolMetaNativeRecoveryResponse::Inspected(snapshot) => {
+                                    let raw = snapshot.current.ok_or(DiskError::ConditionalDeleteConflict)?;
+                                    parent_raw_sha256 = Some(sha2::Sha256::digest(&raw).into());
+                                    None
+                                }
+                                _ => return Err(DiskError::FileCorrupt.into()),
+                            }
+                        }
+                        Some(err) => return Err(err.clone().into()),
+                    };
+                    crate::disk::PoolMetaNativeCasCondition {
+                        attempt_id: condition.attempt_id,
+                        parent,
+                        parent_raw_sha256,
+                    }
+                    .insert_into(&mut metadata.metadata)?;
+                }
+            }
+
             // Generate ordinary PUT timestamps under the commit lock so version
             // ordering follows durable commit ordering when writers queued on
             // the same object. Internal callers with an explicit timestamp keep

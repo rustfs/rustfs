@@ -21,6 +21,7 @@ pub(super) mod delete_recovery;
 #[cfg(all(unix, test))]
 #[path = "fd_cache_tests.rs"]
 mod fd_cache_tests;
+pub(crate) mod pool_meta_native;
 mod replacement_lease;
 #[cfg(any(target_os = "linux", test))]
 #[path = "uring_driver_budget.rs"]
@@ -6978,6 +6979,7 @@ impl LocalDisk {
         fi: FileInfo,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
+        pool_meta_native::reject_raw_path(volume, path)?;
         crate::hp_guard!("LocalDisk::write_metadata");
         fi.validate_for_metadata_read()?;
         let p = self.io_get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
@@ -7047,6 +7049,7 @@ impl LocalDisk {
         opts: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<DataDirDeleteStatus> {
+        let namespace_owner = self.pool_meta_cleanup_owner(volume, path, &opts, namespace_owner).await?;
         let key = SnapshotLeaseKey {
             volume: volume.to_string(),
             path: path.to_string(),
@@ -7153,7 +7156,13 @@ impl LocalDisk {
         errors
     }
 
-    async fn delete_version_inner(&self, volume: &str, path: &str, fi: FileInfo, mutation: DeleteVersionMutation) -> Result<()> {
+    async fn delete_version_inner(
+        &self,
+        volume: &str,
+        path: &str,
+        mut fi: FileInfo,
+        mutation: DeleteVersionMutation,
+    ) -> Result<()> {
         let DeleteVersionMutation {
             force_del_marker,
             opts,
@@ -7205,6 +7214,9 @@ impl LocalDisk {
         if opts.recoverable_delete || (opts.undo_write && opts.undo_delete) {
             let volume_guard = os::disk_volume_mutation_lock(&self.root, volume).read_owned().await;
             namespace_owner = Some(Arc::new((namespace_owner, volume_guard)));
+        }
+        if pool_meta_native::is_object(volume, path) {
+            self.check_pool_meta_undo(&mut fi, &opts, &file_path).await?;
         }
         if opts.old_data_dir.is_some() && opts.undo_write {
             if opts.undo_delete
@@ -7728,6 +7740,12 @@ impl LocalDisk {
         opt: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
+        if pool_meta_native::reject_raw_path(volume, path).is_err() {
+            let owner = self.pool_meta_cleanup_owner(volume, path, &opt, namespace_owner).await?;
+            return self
+                .delete_unleased_with_namespace_owner(volume, path, &opt, owner, None)
+                .await;
+        }
         crate::hp_guard!("LocalDisk::delete");
         if opt.orphan_data_dir {
             return self
@@ -8565,6 +8583,13 @@ impl LocalDisk {
             .parent()
             .ok_or_else(|| DiskError::other("missing object metadata parent"))?;
 
+        if pool_meta_native::is_object(volume, path) {
+            let [fi] = fis else {
+                return Err(DiskError::ConditionalDeleteConflict);
+            };
+            self.check_pool_meta_undo(&mut fi.clone(), opts, object_dir).await?;
+        }
+
         if let Some(rollback_dir) = opts.old_data_dir
             && opts.undo_write
         {
@@ -9172,6 +9197,7 @@ impl LocalDisk {
 
     // write_all_public for trail
     async fn write_all_public(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
+        pool_meta_native::reject_raw_path(volume, path)?;
         if volume == RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
             let mut format_info = self.format_info.write().await;
             format_info.data.clone_from(&data);
@@ -11290,6 +11316,7 @@ impl DiskAPI for LocalDisk {
         expected: Option<Bytes>,
         replacement: Option<Bytes>,
     ) -> Result<ConditionalFileUpdate> {
+        pool_meta_native::reject_raw_path(volume, path)?;
         #[cfg(unix)]
         {
             use rustix::fs::{FlockOperation, flock};
@@ -12015,6 +12042,8 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        pool_meta_native::reject_raw_path(src_volume, src_path)?;
+        pool_meta_native::reject_raw_path(dst_volume, dst_path)?;
         crate::hp_guard!("LocalDisk::rename_file");
         let src_volume_dir = self.io_get_bucket_path(src_volume)?;
         let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
@@ -12087,6 +12116,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, _file_size: i64) -> Result<FileWriter> {
+        pool_meta_native::reject_raw_path(volume, path)?;
         crate::hp_guard!("LocalDisk::create_file");
         if !origvolume.is_empty() {
             let origvolume_dir = self.io_get_bucket_path(origvolume)?;
@@ -12130,6 +12160,7 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     // async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<File> {
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
+        pool_meta_native::reject_raw_path(volume, path)?;
         self.io_backend.open_write(volume, path, WriteMode::Append).await
     }
 
@@ -12448,6 +12479,9 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
+        for path in paths {
+            pool_meta_native::reject_raw_path(volume, path)?;
+        }
         let volume_dir = self.io_get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             cached_access(&volume_dir)
@@ -12615,6 +12649,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
+        pool_meta_native::reject_raw_path(volume, path)?;
         let object_path = self.get_object_path(volume, path)?;
         if let Some(condition) = &opts.transition_reconcile {
             if !fi.metadata.is_empty() || opts.no_persistence || opts.replace_user_metadata {

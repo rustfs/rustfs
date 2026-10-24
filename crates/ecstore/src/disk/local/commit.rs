@@ -417,6 +417,32 @@ impl LocalDisk {
             wait_for_heal_commit_test_barrier(&self.root, dst_volume, dst_path).await?;
         }
         let mut fi = fi;
+        let pool_meta_condition = if super::pool_meta_native::is_object(dst_volume, dst_path) {
+            Some(super::pool_meta_native::PoolMetaNativeCasCondition::take(&mut fi).map_err(|err| {
+                state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
+                err
+            })?)
+        } else {
+            None
+        };
+        if pool_meta_condition
+            .as_ref()
+            .is_some_and(|condition| fi.data_dir == Some(condition.attempt_id))
+        {
+            state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
+            return Err(DiskError::FileCorrupt);
+        }
+        if let Some(condition) = &pool_meta_condition {
+            let new_identity = super::pool_meta_native::PoolMetaNativeFileIdentity::from_file_info(&fi)?;
+            if condition
+                .parent
+                .as_ref()
+                .is_some_and(|parent| new_identity.mod_time_unix_nanos <= parent.mod_time_unix_nanos)
+            {
+                state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
+                return Err(DiskError::ConditionalDeleteConflict);
+            }
+        }
         // A non-force DeleteBucket must not remove a directory while a local
         // object commit is publishing into it. The peer's empty scan remains
         // optimistic; this lease establishes the local commit/delete order and
@@ -467,6 +493,12 @@ impl LocalDisk {
         .await;
         if let Some(claim) = quota_fence_claim {
             mutation_lease.attach_external_guard(claim);
+        }
+        if let Some(condition) = &pool_meta_condition {
+            if let Err(err) = self.check_pool_meta_parent(condition, &destination_object_path).await {
+                state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
+                return Err(err);
+            }
         }
         if fi.is_legacy_indexed_delete_marker() {
             fi.erasure.index = 0;
@@ -619,13 +651,17 @@ impl LocalDisk {
             let (old_current_size, old_current_source_checked, old_current_source) =
                 observe_old_current(has_dst_buf.is_some(), dst_meta_unparsable, &xlmeta, dst_volume, dst_path, version_id);
             let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
-            let rollback_data_dir = has_old_data_dir.or_else(|| {
-                if has_dst_buf.is_some() && xlmeta.find_version(Some(version_id)).is_ok() {
-                    Some(inline_metadata_rollback_dir(version_id, &xlmeta))
-                } else {
-                    None
-                }
-            });
+            let rollback_data_dir = if let Some(condition) = &pool_meta_condition {
+                condition.has_parent().then_some(condition.attempt_id)
+            } else {
+                has_old_data_dir.or_else(|| {
+                    if has_dst_buf.is_some() && xlmeta.find_version(Some(version_id)).is_ok() {
+                        Some(inline_metadata_rollback_dir(version_id, &xlmeta))
+                    } else {
+                        None
+                    }
+                })
+            };
             if let Some(old_data_dir) = has_old_data_dir.as_ref() {
                 let _ = xlmeta.data.remove_two(version_id, *old_data_dir);
             }
@@ -1079,7 +1115,9 @@ impl LocalDisk {
                 // Healing commits never run set-level post-return rollback; keep
                 // their intra-commit rollback backup in the staging directory so
                 // `<object>/<rollback_data_dir>/xl.meta.bkp` is never stranded.
-                let rollback_data_dir = if fi_healing {
+                let rollback_data_dir = if let Some(condition) = &pool_meta_condition {
+                    condition.has_parent().then_some(condition.attempt_id)
+                } else if fi_healing {
                     None
                 } else {
                     old_data_dir.or_else(|| {

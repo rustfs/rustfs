@@ -1282,14 +1282,19 @@ impl ECStore {
         let results = if is_pool_meta_object(bucket, &object) && !opts.no_lock && !heal_pools.is_empty() {
             let target_pool_indices = heal_pools.iter().map(|pool| pool.pool_idx).collect::<Vec<_>>();
             match self.acquire_pool_meta_object_heal_fence(&target_pool_indices).await {
-                Ok((pool_meta_guard, admissions)) => {
+                Ok((pool_meta_guard, admissions, mut save_guard)) => {
                     let fixed_set = self.pools.first().and_then(|pool| pool.disk_set.first()).cloned();
-                    let futures = heal_pools.iter().zip(admissions).map(|(pool, admission)| {
+                    let mut results = Vec::with_capacity(heal_pools.len());
+                    // The metadata writer is shared across these repairs. Keep
+                    // its mutable write state in the original lock order; each
+                    // target still fans out to its disks concurrently.
+                    for (pool, admission) in heal_pools.iter().zip(admissions) {
                         let pool = Arc::clone(pool);
                         let pool_object = object.clone();
                         let fixed_set = fixed_set.clone();
+                        let pool_meta_guard = Arc::clone(&pool_meta_guard);
                         let mut opts = *opts;
-                        async move {
+                        let result = async {
                             admission?;
                             let fixed_set = fixed_set.ok_or_else(|| Error::other("pool metadata heal requires a fixed set"))?;
                             let target_set = pool.get_disks_for_heal_object(&pool_object, &opts)?;
@@ -1300,12 +1305,14 @@ impl ECStore {
                             }
                             #[cfg(test)]
                             crate::core::pools::notify_decommission_external_heal_operation_started(store_id);
-                            pool.heal_object_with_absence(bucket, &pool_object, version_id, &opts, proof)
+                            self.heal_pool_meta_object_with_cas(&pool, version_id, &opts, proof, pool_meta_guard, &mut save_guard)
                                 .await
                         }
-                    });
-                    let results = join_all(futures).await;
+                        .await;
+                        results.push(result);
+                    }
                     drop(pool_meta_guard);
+                    drop(save_guard);
                     results
                 }
                 Err(err) => (0..heal_pools.len()).map(|_| Err(err.clone())).collect(),
@@ -1390,6 +1397,54 @@ impl ECStore {
         }
 
         Ok((HealResultItem::default(), Some(Error::FileNotFound)))
+    }
+
+    async fn heal_pool_meta_object_with_cas(
+        &self,
+        pool: &Arc<Sets>,
+        version_id: &str,
+        opts: &HealOpts,
+        proof: crate::set_disk::AbsenceProofRequest<'_>,
+        guard: Arc<NamespaceLockGuard>,
+        state: &mut crate::core::pools::PoolMetaWriteState,
+    ) -> Result<(HealResultItem, Option<Error>, Option<crate::set_disk::HealedObjectAbsence>)> {
+        // Observe through the ordinary healer, but let only the owning pool
+        // metadata CAS publish replacements. Its native conditions also cover
+        // missing members without admitting an unconditional heal overwrite.
+        let mut inspect_opts = *opts;
+        inspect_opts.dry_run = true;
+        let version = if Uuid::parse_str(version_id).is_ok_and(|version| version.is_nil()) {
+            ""
+        } else {
+            version_id
+        };
+        let (before, error, absence) = pool
+            .heal_object_with_absence(RUSTFS_META_BUCKET, POOL_META_NAME, version, &inspect_opts, proof)
+            .await?;
+        let target = pool.get_disks_for_heal_object(POOL_META_NAME, opts)?;
+        let owns_replica = Arc::ptr_eq(&target, &pool.get_disks_by_key(POOL_META_NAME));
+        let needs_repair = !before.after.drives.is_empty() && before.after.drives.iter().any(|drive| drive.state != "ok");
+        if opts.dry_run || error.is_some() || !owns_replica || !needs_repair {
+            return Ok((before, error, absence));
+        }
+        if let Err(error) = self
+            .heal_pool_meta_replica_under_fence(pool.pool_idx, Arc::clone(&guard), state)
+            .await
+        {
+            return Ok((before, Some(error), None));
+        }
+        let (mut after, error, _) = pool
+            .heal_object_with_absence(RUSTFS_META_BUCKET, POOL_META_NAME, version, &inspect_opts, proof)
+            .await?;
+        after.before = before.before;
+        if guard.is_lock_lost() {
+            return Ok((after, Some(Error::SlowDown), None));
+        }
+        if error.is_none() && !after.after.drives.is_empty() && after.after.drives.iter().all(|drive| drive.state == "ok") {
+            after.metadata_verified = true;
+            after.metadata_repair_verified = true;
+        }
+        Ok((after, error, None))
     }
 
     #[instrument(skip(self))]
@@ -2033,18 +2088,14 @@ mod tests {
         let missing_disk = target_set.disks.read().await[0]
             .clone()
             .expect("pool metadata fixture disk should be online");
-        missing_disk
-            .delete(
-                RUSTFS_META_BUCKET,
-                POOL_META_NAME,
-                DeleteOptions {
-                    recursive: true,
-                    immediate: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("one pool metadata shard should be removable");
+        assert!(missing_disk.is_local(), "pool metadata fault fixture requires a local disk");
+        tokio::fs::remove_dir_all(
+            std::path::Path::new(&missing_disk.endpoint().get_file_path())
+                .join(RUSTFS_META_BUCKET)
+                .join(POOL_META_NAME),
+        )
+        .await
+        .expect("remove one physical metadata shard without relaxing the native mutation guard");
         assert!(
             missing_disk.read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false).await.is_err(),
             "pool metadata fixture must start with one missing shard"
@@ -3069,6 +3120,106 @@ mod tests {
             missing_disk.read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false).await.is_ok(),
             "pool metadata read repair should restore the missing shard"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_heal_dry_run_preserves_missing_shard() {
+        let (_temp_dirs, store, _other_store) = test_two_pool_stores(None).await;
+        let missing_disk = remove_pool_meta_shard(&store, 0).await;
+        let (result, error) = store
+            .handle_heal_object(
+                RUSTFS_META_BUCKET,
+                POOL_META_NAME,
+                "",
+                &HealOpts {
+                    dry_run: true,
+                    pool: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("pool metadata dry-run inspection");
+        assert!(
+            error.is_none(),
+            "readable canonical metadata should support a dry-run inspection: {error:?}"
+        );
+        assert_eq!(result.object, POOL_META_NAME);
+        assert!(
+            result
+                .before
+                .drives
+                .iter()
+                .any(|drive| drive.state == DriveState::Missing.to_string())
+        );
+        assert!(
+            missing_disk.read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false).await.is_err(),
+            "dry-run must not perform the controlled CAS"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_heal_cas_repairs_only_the_requested_pool() {
+        let (_temp_dirs, store, _other_store) = test_two_pool_stores(None).await;
+        let selected_missing = remove_pool_meta_shard(&store, 0).await;
+        let unselected_missing = remove_pool_meta_shard(&store, 1).await;
+        let (result, error) = store
+            .handle_heal_object(
+                RUSTFS_META_BUCKET,
+                POOL_META_NAME,
+                "",
+                &HealOpts {
+                    pool: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("targeted pool metadata heal");
+        assert!(error.is_none(), "the selected pool metadata replica should heal: {error:?}");
+        assert_eq!(result.object, POOL_META_NAME);
+        assert!(
+            selected_missing
+                .read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false)
+                .await
+                .is_ok()
+        );
+        assert!(
+            unselected_missing
+                .read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false)
+                .await
+                .is_err(),
+            "targeted metadata heal must not rewrite an unselected pool"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_heal_retains_save_gate_before_writer_through_native_cas() {
+        let (_directories, store, _other_store) = test_two_pool_stores(None).await;
+        let missing = remove_pool_meta_shard(&store, 0).await;
+        let (guard, admissions, mut state) = store.acquire_pool_meta_object_heal_fence(&[0]).await.expect("heal authority");
+        assert!(admissions.into_iter().all(|admission| admission.is_ok()));
+        assert!(store.pool_meta_save_gate.try_lock().is_err(), "heal must retain the earlier save gate");
+        let writer_store = Arc::clone(&store);
+        let writer = tokio::spawn(async move { writer_store.save_current_pool_meta_for_test(&[0]).await });
+        tokio::task::yield_now().await;
+        assert!(!writer.is_finished(), "ordinary writer must queue before taking its namespace writer");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            store.heal_pool_meta_replica_under_fence(0, Arc::clone(&guard), &mut state),
+        )
+        .await
+        .expect("heal cannot wait for a gate held by the queued writer")
+        .expect("native heal");
+        drop(guard);
+        drop(state);
+        tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+            .await
+            .expect("queued writer must progress after heal")
+            .expect("writer task")
+            .expect("writer result");
+        assert!(missing.read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false).await.is_ok());
     }
 
     #[tokio::test]
