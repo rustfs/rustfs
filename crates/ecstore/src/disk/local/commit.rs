@@ -1027,6 +1027,7 @@ impl LocalDisk {
             let dst_path_for_source = dst_path.to_string();
             let dst_volume_dir_for_commit = dst_volume_dir.clone();
             let publication_root_for_commit = self.publication_root.clone();
+            #[cfg(not(windows))]
             let cleanup_src_parent = cleanup_path.is_none();
             #[cfg(windows)]
             let source_parent = src_file_parent.to_path_buf();
@@ -1131,10 +1132,11 @@ impl LocalDisk {
                     && !has_inline_commit_test_failpoints(&dst_path_for_failpoint)
                 {
                     let rename_res = if should_fail_commit_rename(&dst_path_for_failpoint) {
+                        drop(prepared_metadata_source);
                         Err(DiskError::other("test fail during metadata commit rename"))
                     } else {
                         os::rename_prepared_source_on_thread(
-                            &prepared_metadata_source,
+                            prepared_metadata_source,
                             &src,
                             &dst,
                             &dst_volume_dir_for_commit,

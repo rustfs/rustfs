@@ -2833,14 +2833,14 @@ fn rename_prepared_source_std(
 }
 
 pub(crate) fn rename_prepared_source_on_thread(
-    prepared_source: &PreparedRenameSource,
+    prepared_source: PreparedRenameSource,
     src_file_path: &Path,
     dst_file_path: &Path,
     base_dir: &Path,
     publication_root: &PublicationRoot,
     commit_guard: &RenameCommitGuard,
 ) -> Result<()> {
-    rename_prepared_source_std(prepared_source, src_file_path, dst_file_path, base_dir, publication_root, commit_guard)
+    rename_prepared_source_std(&prepared_source, src_file_path, dst_file_path, base_dir, publication_root, commit_guard)
         .map_err(to_file_error)?;
     Ok(())
 }
