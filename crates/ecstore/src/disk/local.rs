@@ -10286,10 +10286,10 @@ impl LocalDisk {
         let lease = plan.lease.clone();
         self.delete_file_with_prepared_entry(
             (&volume_dir, &file_path),
-            opts.recursive,
-            opts.immediate,
+            (opts.recursive, opts.immediate),
             Some(lease.clone()),
-            (Some(lease), None, Some(plan)),
+            Some(lease),
+            (None, Some(plan)),
             None,
         )
         .await?;
@@ -10858,11 +10858,10 @@ impl LocalDisk {
         }
         self.delete_file_with_prepared_entry(
             (&volume_dir, &file_path),
-            recursive,
-            opt.immediate,
+            (recursive, opt.immediate),
             namespace_owner,
+            publication.clone(),
             (
-                publication.clone(),
                 None,
                 publication.map(|lease| PreparedPathDelete {
                     lease,
@@ -10901,10 +10900,10 @@ impl LocalDisk {
     ) -> BoxFuture<'a, Result<()>> {
         self.delete_file_with_prepared_entry(
             (base_path, delete_path),
-            recursive,
-            immediate_purge,
+            (recursive, immediate_purge),
             namespace_owner,
-            (None, None, None),
+            None,
+            (None, None),
             staging_cleanup,
         )
     }
@@ -10920,10 +10919,10 @@ impl LocalDisk {
     ) -> BoxFuture<'a, Result<()>> {
         self.delete_file_with_prepared_entry(
             target,
-            recursive,
-            immediate_purge,
+            (recursive, immediate_purge),
             namespace_owner,
-            (prepared_publication, prepared_trash, None),
+            prepared_publication,
+            (prepared_trash, None),
             None,
         )
     }
@@ -10931,19 +10930,16 @@ impl LocalDisk {
     fn delete_file_with_prepared_entry<'a>(
         &'a self,
         target: (&'a PathBuf, &'a PathBuf),
-        recursive: bool,
-        immediate_purge: bool,
+        mode: (bool, bool),
         namespace_owner: Option<Arc<dyn Send + Sync>>,
-        prepared: (
-            Option<Arc<os::NamespaceMutationLease>>,
-            Option<(PathBuf, Arc<os::NamespaceMutationLease>)>,
-            Option<PreparedPathDelete>,
-        ),
+        prepared_publication: Option<Arc<os::NamespaceMutationLease>>,
+        prepared_paths: (Option<(PathBuf, Arc<os::NamespaceMutationLease>)>, Option<PreparedPathDelete>),
         staging_cleanup: Option<&'a StagingCleanupLease>,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let (base_path, delete_path) = target;
-            let (prepared_publication, prepared_trash, prepared_entry) = prepared;
+            let (recursive, immediate_purge) = mode;
+            let (prepared_trash, prepared_entry) = prepared_paths;
             // debug!("delete_file {:?}\n base_path:{:?}", &delete_path, &base_path);
 
             if is_root_path(base_path) || is_root_path(delete_path) {
@@ -11073,10 +11069,10 @@ impl LocalDisk {
                 let result = self
                     .delete_file_with_prepared_entry(
                         (base_path, &PathBuf::from(dir_path)),
-                        false,
-                        false,
+                        (false, false),
                         namespace_owner.clone(),
-                        (prepared_publication.clone(), None, None),
+                        prepared_publication.clone(),
+                        (None, None),
                         staging_cleanup,
                     )
                     .await;

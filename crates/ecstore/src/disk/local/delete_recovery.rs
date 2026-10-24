@@ -1791,11 +1791,10 @@ impl LocalDisk {
                     } else {
                         self.delete_file_with_prepared_entry(
                             (&self.io_get_bucket_path(volume)?, &root.join(STORAGE_FORMAT_FILE)),
-                            false,
-                            false,
+                            (false, false),
                             owner.clone(),
+                            prepared_publication.clone(),
                             (
-                                prepared_publication.clone(),
                                 None,
                                 prepared_publication.as_ref().map(|publication| PreparedPathDelete {
                                     lease: publication.clone(),
