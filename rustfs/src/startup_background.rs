@@ -67,8 +67,24 @@ pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Resu
     rustfs_scanner::set_scanner_workload_admission_snapshot_provider(workload_provider.clone());
 
     if plan.heal_manager_enabled {
-        let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
-        init_heal_manager_with_workload_provider(heal_storage, None, Some(workload_provider)).await?;
+        let adaptive = rustfs_utils::get_env_bool("RUSTFS_HEAL_ADAPTIVE_ADMISSION", false);
+        #[cfg(not(any(target_os = "linux", all(test, unix))))]
+        if adaptive {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "adaptive heal admission requires Linux cgroup v2",
+            ));
+        }
+        #[cfg(any(target_os = "linux", all(test, unix)))]
+        let admission = adaptive.then(|| rustfs_concurrency::adaptive::NodeAdmission::new(crate::background_admission::MAXIMUM));
+        #[cfg(not(any(target_os = "linux", all(test, unix))))]
+        let admission = None;
+        let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()).with_admission(admission.clone()));
+        init_heal_manager_with_workload_provider(heal_storage, None, Some(workload_provider.clone())).await?;
+        #[cfg(any(target_os = "linux", all(test, unix)))]
+        if let Some(admission) = admission {
+            crate::background_admission::start(admission, background_cancel.clone(), workload_provider);
+        }
     }
 
     let heal_manager_reason = if plan.heal_enabled {
