@@ -537,6 +537,7 @@ const GET_MID_SIZE_STREAMING_MAX_SIZE: usize = 512 * 1024;
 const EVENT_LIFECYCLE_TRANSITION_CLEANUP: &str = "lifecycle_transition_cleanup";
 const EVENT_LIFECYCLE_TRANSITIONED_DELETE_CLEANUP_OWNER: &str = "lifecycle_transitioned_delete_cleanup_owner";
 const EVENT_LIFECYCLE_RESTORE_CLEANUP: &str = "lifecycle_restore_cleanup";
+const EVENT_DELETE_VERSION_QUORUM: &str = "delete_version_quorum";
 
 fn replication_status_writeback_is_current(object_info: &ObjectInfo, condition: &ReplicationStatusWritebackCondition) -> bool {
     let current = object_info.replication_generation_snapshot();
@@ -8921,6 +8922,23 @@ impl SetDisks {
             quorum_result = Err(DiskError::UnsupportedDisk.into());
         }
         let should_rollback = quorum_result.is_err();
+        if should_rollback {
+            // Each drive's own error is the only record of why the write lost
+            // quorum; the rollback that follows logs symptoms, not this cause.
+            warn!(
+                event = EVENT_DELETE_VERSION_QUORUM,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                result = "rollback",
+                bucket,
+                object,
+                pool_index = self.pool_index,
+                set_index = self.set_index,
+                write_quorum,
+                drive_errors = ?errs,
+                "Delete version lost write quorum; rolling back"
+            );
+        }
         let structured_cleanup = !is_meta_bucketname(bucket) && !should_rollback;
         if structured_cleanup {
             self.publish_delete_commit(

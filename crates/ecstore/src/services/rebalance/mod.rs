@@ -147,6 +147,19 @@ pub(crate) async fn test_three_pool_stores_with_isolated_node_contexts(
     test_pool_stores_with_contexts(rebalance_meta, true, 3, 2).await
 }
 
+/// Four drives per set, so a set can hold metadata on fewer than its read
+/// quorum of drives while each drive stays online.
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) async fn test_three_pool_stores_with_four_disk_sets_with_isolated_node_contexts(
+    rebalance_meta: Option<RebalanceMeta>,
+) -> (
+    Vec<tempfile::TempDir>,
+    std::sync::Arc<crate::store::ECStore>,
+    std::sync::Arc<crate::store::ECStore>,
+) {
+    test_pool_stores_with_contexts(rebalance_meta, true, 3, 4).await
+}
+
 #[cfg(all(test, feature = "test-util"))]
 pub(crate) async fn test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(
     rebalance_meta: Option<RebalanceMeta>,
