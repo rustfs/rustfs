@@ -174,25 +174,25 @@ fn validate_copy_source_range_not_exceeds(range_spec: &HTTPRangeSpec, object_siz
     Ok(())
 }
 
-fn validate_complete_multipart_parts(parts: &[CompletePart]) -> S3Result<()> {
+fn validate_complete_multipart_parts(parts: &[CompletePart]) -> rustfs_s3_types::S3Result<()> {
     if let Some(part) = parts
         .iter()
         .find(|part| !(1..=MAX_MULTIPART_PART_NUMBER as usize).contains(&part.part_num))
     {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidPart,
+        return Err(rustfs_s3_types::S3Error::with_message(
+            rustfs_s3_types::S3ErrorCode::InvalidPart,
             format!("Part number {} must be between 1 and {MAX_MULTIPART_PART_NUMBER}", part.part_num),
         ));
     }
 
     if parts.windows(2).any(|window| window[0].part_num >= window[1].part_num) {
-        return Err(s3_error!(InvalidPartOrder, "Part numbers must be strictly increasing"));
+        return Err(rustfs_s3_types::s3_error!(InvalidPartOrder, "Part numbers must be strictly increasing"));
     }
 
     Ok(())
 }
 
-fn normalize_complete_multipart_parts(parts: Vec<CompletePart>) -> S3Result<Vec<CompletePart>> {
+fn normalize_complete_multipart_parts(parts: Vec<CompletePart>) -> rustfs_s3_types::S3Result<Vec<CompletePart>> {
     // For duplicate part numbers, keep the last occurrence from the request.
     // This matches retry/resend semantics where later uploads override earlier ones.
     let mut seen = HashSet::with_capacity(parts.len());
@@ -383,22 +383,22 @@ fn extract_request_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
         .or_else(|| uri.authority().map(|authority| authority.as_str().to_string()))
 }
 
-fn resolve_upload_part_size(content_length: Option<i64>, body: Option<&StreamingBlob>) -> S3Result<Option<i64>> {
+fn resolve_upload_part_size(content_length: Option<i64>, body: Option<&StreamingBlob>) -> rustfs_s3_types::S3Result<Option<i64>> {
     if let Some(length) = content_length {
         return Ok(Some(length));
     }
     body.and_then(|body| body.remaining_length().exact())
         .map(i64::try_from)
         .transpose()
-        .map_err(|_| s3_error!(UnexpectedContent))
+        .map_err(|_| rustfs_s3_types::s3_error!(UnexpectedContent))
 }
 
-fn require_upload_part_size(size: Option<i64>, capped: bool) -> S3Result<i64> {
+fn require_upload_part_size(size: Option<i64>, capped: bool) -> rustfs_s3_types::S3Result<i64> {
     match size {
         Some(size) if size >= 0 => Ok(size),
-        Some(_) => Err(s3_error!(UnexpectedContent)),
-        None if capped => Err(s3_error!(UnexpectedContent)),
-        None => Err(S3Error::new(S3ErrorCode::MissingContentLength)),
+        Some(_) => Err(rustfs_s3_types::s3_error!(UnexpectedContent)),
+        None if capped => Err(rustfs_s3_types::s3_error!(UnexpectedContent)),
+        None => Err(rustfs_s3_types::S3Error::new(rustfs_s3_types::S3ErrorCode::MissingContentLength)),
     }
 }
 
@@ -2374,7 +2374,8 @@ mod tests {
 
     #[test]
     fn resolve_upload_part_size_uses_normalized_logical_length() {
-        assert_eq!(resolve_upload_part_size(Some(5242880), None).expect("DTO length"), Some(5242880));
+        let result: rustfs_s3_types::S3Result<Option<i64>> = resolve_upload_part_size(Some(5242880), None);
+        assert_eq!(result.expect("DTO length"), Some(5242880));
         assert_eq!(resolve_upload_part_size(None, None).expect("unknown length"), None);
         let body = StreamingBlob::from(Bytes::from_static(b"abc"));
         assert_eq!(resolve_upload_part_size(None, Some(&body)).expect("exact bytes"), Some(3));
@@ -2386,19 +2387,20 @@ mod tests {
 
     #[test]
     fn upload_part_length_contract_rejects_unknown_and_all_negative_lengths() {
+        let result: rustfs_s3_types::S3Result<i64> = require_upload_part_size(None, false);
         assert_eq!(
-            require_upload_part_size(None, false).expect_err("ordinary unknown").code(),
-            &S3ErrorCode::MissingContentLength
+            result.expect_err("ordinary unknown").code(),
+            &rustfs_s3_types::S3ErrorCode::MissingContentLength
         );
         assert_eq!(
             require_upload_part_size(None, true).expect_err("capped unknown").code(),
-            &S3ErrorCode::UnexpectedContent
+            &rustfs_s3_types::S3ErrorCode::UnexpectedContent
         );
         for capped in [false, true] {
             for size in [-1, -2, i64::MIN] {
                 assert_eq!(
                     require_upload_part_size(Some(size), capped).expect_err("negative").code(),
-                    &S3ErrorCode::UnexpectedContent
+                    &rustfs_s3_types::S3ErrorCode::UnexpectedContent
                 );
             }
             assert_eq!(require_upload_part_size(Some(0), capped).expect("zero is valid"), 0);
@@ -3213,11 +3215,11 @@ mod tests {
 
     #[test]
     fn validate_complete_multipart_parts_enforces_part_number_range() {
-        validate_complete_multipart_parts(&[CompletePart {
+        let result: rustfs_s3_types::S3Result<()> = validate_complete_multipart_parts(&[CompletePart {
             part_num: MAX_MULTIPART_PART_NUMBER as usize,
             ..Default::default()
-        }])
-        .expect("part number 10000 must remain valid");
+        }]);
+        result.expect("part number 10000 must remain valid");
 
         for part_num in [0, MAX_MULTIPART_PART_NUMBER as usize + 1] {
             let err = validate_complete_multipart_parts(&[CompletePart {
@@ -3225,7 +3227,7 @@ mod tests {
                 ..Default::default()
             }])
             .expect_err("out-of-range complete part number must be rejected");
-            assert_eq!(err.code(), &S3ErrorCode::InvalidPart);
+            assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidPart);
             let expected = format!("Part number {part_num} must be between 1 and {MAX_MULTIPART_PART_NUMBER}");
             assert_eq!(err.message(), Some(expected.as_str()));
         }
@@ -3246,7 +3248,8 @@ mod tests {
             },
         ];
 
-        let normalized = normalize_complete_multipart_parts(input).expect("normalization should succeed");
+        let result: rustfs_s3_types::S3Result<Vec<CompletePart>> = normalize_complete_multipart_parts(input);
+        let normalized = result.expect("normalization should succeed");
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized[0].part_num, 1);
         assert_eq!(normalized[0].etag.as_deref(), Some("new"));
