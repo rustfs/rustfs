@@ -59,6 +59,47 @@ impl PoolMetaNativeFileIdentity {
     }
 }
 
+/// One-shot data-durability evidence; never namespace or metadata authority.
+#[cfg(unix)]
+pub(super) struct DurableHeadReceipt {
+    pub(super) physical: os::DurableFileReceipt,
+    pub(super) identity: PoolMetaNativeFileIdentity,
+}
+
+#[cfg(not(unix))]
+pub(super) type DurableHeadReceipt = ();
+
+#[cfg(unix)]
+pub(super) struct ReceiptMutationGuard<'a> {
+    slot: &'a ParkingLotMutex<Option<DurableHeadReceipt>>,
+    complete: bool,
+    _metadata_owner: Arc<dyn Send + Sync>,
+}
+
+#[cfg(unix)]
+impl<'a> ReceiptMutationGuard<'a> {
+    pub(super) fn new(slot: &'a ParkingLotMutex<Option<DurableHeadReceipt>>, owner: Arc<dyn Send + Sync>) -> Self {
+        Self {
+            slot,
+            complete: false,
+            _metadata_owner: owner,
+        }
+    }
+
+    pub(super) fn complete(&mut self) {
+        self.complete = true;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReceiptMutationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.slot.lock().take();
+        }
+    }
+}
+
 /// One physical CAS attempt and the complete parent identity it may replace.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -231,6 +272,26 @@ fn check_repair_request(
 }
 
 impl LocalDisk {
+    #[cfg(unix)]
+    pub(super) async fn publish_pool_meta_durable_head(
+        &self,
+        candidate: Option<DurableHeadReceipt>,
+        head: PathBuf,
+        owner: Arc<os::NamespaceMutationLease>,
+    ) {
+        let Some(candidate) = candidate else { return };
+        let root = self.publication_root.clone();
+        let verified = os::run_blocking_namespace_operation(owner, move || {
+            Ok(candidate.physical.matches_current(&root, &head).then_some(candidate))
+        })
+        .await;
+        // Only the live waiter may publish the proof after every barrier. A
+        // cancelled waiter leaves it cold even if its owned syscall finishes.
+        if let Ok(Some(candidate)) = verified {
+            *self.pool_meta_durable_head.lock() = Some(candidate);
+        }
+    }
+
     pub(super) async fn pool_meta_cleanup_owner(
         &self,
         volume: &str,
@@ -291,6 +352,8 @@ impl LocalDisk {
     }
 
     pub(super) async fn check_pool_meta_undo(&self, fi: &mut FileInfo, opts: &DeleteOptions, object_dir: &Path) -> Result<()> {
+        #[cfg(unix)]
+        self.pool_meta_durable_head.lock().take();
         if !opts.undo_write || opts.undo_delete {
             return Err(DiskError::ConditionalDeleteConflict);
         }
@@ -420,6 +483,10 @@ impl LocalDisk {
         let identity_dir = self.io_get_object_path(RUSTFS_META_BUCKET, "pool.bin.identity")?;
         let identity_metadata = os::acquire_metadata_mutation_lease(&identity_key, None).await;
         let metadata = os::acquire_metadata_mutation_lease(&object_key, None).await;
+        #[cfg(unix)]
+        if matches!(request, PoolMetaNativeRecoveryRequest::Apply { .. }) {
+            self.pool_meta_durable_head.lock().take();
+        }
         let metadata: Arc<dyn Send + Sync> = Arc::new((identity_metadata, metadata));
         let identity_owner = os::acquire_namespace_mutation_lease_with_owner(&identity_dir, Some(metadata)).await;
         let owner = os::acquire_rename_data_mutation_lease_with_owner(
@@ -582,6 +649,473 @@ mod tests {
         (dir, disk, parent_bytes, next, attempt)
     }
 
+    #[cfg(unix)]
+    async fn advance_receipt_fixture(
+        disk: &LocalDisk,
+        stamp: i64,
+        raw_parent: bool,
+        force_copy: bool,
+    ) -> (FileInfo, Uuid, PathBuf) {
+        let head = disk
+            .io_get_object_path(RUSTFS_META_BUCKET, OBJECT)
+            .expect("native object path")
+            .join(STORAGE_FORMAT_FILE);
+        let current = fs::read(&head).await.expect("current native metadata");
+        let attempt = Uuid::new_v4();
+        let mut next = inline_info("receipt-next", stamp);
+        PoolMetaNativeCasCondition {
+            attempt_id: attempt,
+            parent: (!raw_parent).then(|| {
+                PoolMetaNativeFileIdentity::from_file_info(&decode(&current).expect("current FI")).expect("current identity")
+            }),
+            parent_raw_sha256: raw_parent.then(|| Sha256::digest(&current).into()),
+        }
+        .insert_into(&mut next.metadata)
+        .expect("receipt test condition");
+        if force_copy {
+            super::super::set_local_inline_rollback_hardlink_failure(&head);
+        }
+        disk.rename_data(
+            RUSTFS_META_TMP_BUCKET,
+            &format!("receipt-{stamp}"),
+            next.clone(),
+            RUSTFS_META_BUCKET,
+            OBJECT,
+        )
+        .await
+        .expect("receipt test commit");
+        let backup = head
+            .parent()
+            .expect("head parent")
+            .join(attempt.to_string())
+            .join(STORAGE_FORMAT_FILE_BACKUP);
+        (next, attempt, backup)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_meta_native_receipt_is_one_shot_and_old_backup_cleanup_keeps_it_warm() {
+        let (_dir, disk, _, _, previous_attempt) = replacement().await;
+        assert!(disk.pool_meta_durable_head.lock().is_some());
+        disk.delete(
+            RUSTFS_META_BUCKET,
+            &format!("{OBJECT}/{previous_attempt}/{STORAGE_FORMAT_FILE_BACKUP}"),
+            DeleteOptions::default(),
+        )
+        .await
+        .expect("unrelated predecessor cleanup");
+        assert!(disk.pool_meta_durable_head.lock().is_some());
+        let (_, _, warm_backup) = advance_receipt_fixture(&disk, 12, false, false).await;
+        assert_eq!(
+            os::take_pool_meta_backup_sync_count(&warm_backup),
+            0,
+            "a proved hardlink needs no second inode sync"
+        );
+        let consumed = disk.pool_meta_durable_head.lock().take();
+        assert!(consumed.is_some());
+        assert!(disk.pool_meta_durable_head.lock().take().is_none());
+        drop(consumed);
+        let (_, _, cold_backup) = advance_receipt_fixture(&disk, 13, false, false).await;
+        assert_eq!(
+            os::take_pool_meta_backup_sync_count(&cold_backup),
+            1,
+            "an evicted receipt must fall back to full sync"
+        );
+        assert!(disk.pool_meta_durable_head.lock().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_meta_native_receipt_raw_parent_and_copy_fallback_remain_cold() {
+        for (raw_parent, force_copy) in [(true, false), (false, true)] {
+            let (_dir, disk, _, _, _) = replacement().await;
+            assert!(disk.pool_meta_durable_head.lock().is_some());
+            let (_, _, backup) = advance_receipt_fixture(&disk, 12, raw_parent, force_copy).await;
+            assert_eq!(os::take_pool_meta_backup_sync_count(&backup), 1);
+            assert!(disk.pool_meta_durable_head.lock().is_none());
+            let (_, _, cold_backup) = advance_receipt_fixture(&disk, 13, false, false).await;
+            assert_eq!(os::take_pool_meta_backup_sync_count(&cold_backup), 1);
+            assert!(disk.pool_meta_durable_head.lock().is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_meta_native_receipt_rejects_replaced_inode_and_changed_raw_bytes() {
+        for replace_inode in [true, false] {
+            let (_dir, disk, _, _, _) = replacement().await;
+            let head = disk
+                .io_get_object_path(RUSTFS_META_BUCKET, "pool.bin/xl.meta")
+                .expect("head path");
+            let raw = fs::read(&head).await.expect("current bytes");
+            if replace_inode {
+                let temporary = head.with_extension("replacement");
+                fs::write(&temporary, raw).await.expect("same-content replacement");
+                fs::rename(&temporary, &head).await.expect("replace physical inode");
+            } else {
+                let mut fi = decode(&raw).expect("current FI");
+                fi.metadata.insert("receipt-negative-test".to_string(), "changed".to_string());
+                fs::write(&head, test_meta(fi)).await.expect("same-inode raw metadata change");
+            }
+            let (_, _, backup) = advance_receipt_fixture(&disk, 12, false, false).await;
+            assert_eq!(os::take_pool_meta_backup_sync_count(&backup), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_meta_native_receipt_binds_root_and_read_only_pinned_inode() {
+        let first = tempfile::tempdir().expect("first root");
+        let second = tempfile::tempdir().expect("second root");
+        let first_root = os::PublicationRoot::new(first.path()).expect("first anchored root");
+        let second_root = os::PublicationRoot::new(second.path()).expect("second anchored root");
+        let head = first.path().join("head");
+        fs::write(&head, b"immutable metadata").await.expect("head fixture");
+        let receipt = os::DurableFileReceipt::capture(&first_root, &head, b"immutable metadata").expect("candidate receipt");
+        let alias = second.path().join("head");
+        fs::hard_link(&head, &alias).await.expect("same inode under a different root");
+        let source = std::fs::File::open(&alias).expect("read-only alias");
+        assert!(receipt.matches_source(&first_root, &source, b"immutable metadata"));
+        assert!(!receipt.matches_source(&second_root, &source, b"immutable metadata"));
+        assert!(!receipt.matches_source(&first_root, &source, b"different metadata"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_meta_native_receipt_cancelled_namespace_wait_stays_cold() {
+        let (_dir, disk, _, _, _) = replacement().await;
+        let disk = Arc::new(disk);
+        assert!(disk.pool_meta_durable_head.lock().is_some());
+        let object = disk.io_get_object_path(RUSTFS_META_BUCKET, OBJECT).expect("object path");
+        let original = fs::read(object.join(STORAGE_FORMAT_FILE)).await.expect("current metadata");
+        let namespace = os::acquire_namespace_mutation_lease_with_owner(&object, None).await;
+        let worker_disk = disk.clone();
+        let worker = tokio::spawn(async move { advance_receipt_fixture(&worker_disk, 12, false, false).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while disk.pool_meta_durable_head.lock().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("head mutator must consume proof before waiting on its namespace");
+        worker.abort();
+        assert!(worker.await.expect_err("namespace waiter must be cancelled").is_cancelled());
+        drop(namespace);
+        assert_eq!(fs::read(object.join(STORAGE_FORMAT_FILE)).await.expect("unchanged head"), original);
+        assert!(disk.pool_meta_durable_head.lock().is_none());
+        let (_, _, backup) = advance_receipt_fixture(&disk, 13, false, false).await;
+        assert_eq!(os::take_pool_meta_backup_sync_count(&backup), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_meta_native_receipt_failed_head_sync_and_apply_stay_cold() {
+        let (_dir, disk, _, _, _) = replacement().await;
+        assert!(disk.pool_meta_durable_head.lock().is_some());
+        let object = disk.io_get_object_path(RUSTFS_META_BUCKET, OBJECT).expect("object path");
+        let original = fs::read(object.join(STORAGE_FORMAT_FILE)).await.expect("current metadata");
+        let parent = decode(&original).expect("current FI");
+        let mut next = inline_info("failed", 12);
+        PoolMetaNativeCasCondition {
+            attempt_id: Uuid::new_v4(),
+            parent: Some(PoolMetaNativeFileIdentity::from_file_info(&parent).expect("parent identity")),
+            parent_raw_sha256: None,
+        }
+        .insert_into(&mut next.metadata)
+        .expect("failure test condition");
+        os::fsync_dir_recorder::set_failure(&object, ErrorKind::Other);
+        assert!(
+            disk.rename_data(RUSTFS_META_TMP_BUCKET, "failed", next, RUSTFS_META_BUCKET, OBJECT)
+                .await
+                .is_err()
+        );
+        assert!(disk.pool_meta_durable_head.lock().is_none());
+        assert_eq!(
+            fs::read(object.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("restored predecessor"),
+            original
+        );
+        advance_receipt_fixture(&disk, 13, false, false).await;
+        assert!(disk.pool_meta_durable_head.lock().is_some());
+        assert!(
+            disk.pool_meta_native_recovery(PoolMetaNativeRecoveryRequest::Apply {
+                object: crate::disk::PoolMetaNativeObject::PoolBin,
+                expected_disk_id: Uuid::new_v4(),
+                expected_current_sha256: None,
+                expected_backup_inventory_sha256: [0; 32],
+                replacement: Bytes::new(),
+            })
+            .await
+            .is_err()
+        );
+        assert!(disk.pool_meta_durable_head.lock().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_meta_native_receipt_successful_apply_stays_cold_until_a_normal_full_sync() {
+        let (_dir, disk, _) = formatted_disk().await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        let mut initial = inline_info("initial", 11);
+        PoolMetaNativeCasCondition {
+            attempt_id: Uuid::new_v4(),
+            parent: None,
+            parent_raw_sha256: None,
+        }
+        .insert_into(&mut initial.metadata)
+        .expect("initial condition");
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, "initial", initial, RUSTFS_META_BUCKET, OBJECT)
+            .await
+            .expect("durable initial head");
+        assert!(disk.pool_meta_durable_head.lock().is_some());
+        let PoolMetaNativeRecoveryResponse::Inspected(inspection) = disk
+            .pool_meta_native_recovery(PoolMetaNativeRecoveryRequest::Inspect {
+                object: crate::disk::PoolMetaNativeObject::PoolBin,
+            })
+            .await
+            .expect("current native inventory")
+        else {
+            panic!("inventory response")
+        };
+        let mut repaired = inline_info("repaired", 12);
+        let decoded = decode(&test_meta(repaired.clone())).expect("replacement checksum format");
+        let algorithm = if decoded.uses_legacy_checksum {
+            HashAlgorithm::HighwayHash256SLegacy
+        } else {
+            HashAlgorithm::HighwayHash256S
+        };
+        let payload = b"metadata";
+        let mut shard = algorithm.hash_encode(payload).as_ref().to_vec();
+        shard.extend_from_slice(payload);
+        repaired.data = Some(Bytes::from(shard));
+        assert_eq!(
+            disk.pool_meta_native_recovery(PoolMetaNativeRecoveryRequest::Apply {
+                object: crate::disk::PoolMetaNativeObject::PoolBin,
+                expected_disk_id: inspection.disk_id,
+                expected_current_sha256: inspection.current.as_ref().map(|bytes| Sha256::digest(bytes).into()),
+                expected_backup_inventory_sha256: inspection.inventory_sha256().expect("inventory digest"),
+                replacement: test_meta(repaired).into(),
+            })
+            .await
+            .expect("guarded native repair"),
+            PoolMetaNativeRecoveryResponse::Applied,
+        );
+        assert!(disk.pool_meta_durable_head.lock().is_none());
+        let (_, _, backup) = advance_receipt_fixture(&disk, 13, false, false).await;
+        assert_eq!(os::take_pool_meta_backup_sync_count(&backup), 1);
+        assert!(disk.pool_meta_durable_head.lock().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_meta_native_receipt_reopened_local_disk_does_not_inherit_proof() {
+        let (dir, original_disk, _, _, _) = replacement().await;
+        assert!(original_disk.pool_meta_durable_head.lock().is_some());
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("endpoint");
+        let reopened = LocalDisk::new(&endpoint, false).await.expect("reopened disk");
+        assert!(reopened.pool_meta_durable_head.lock().is_none());
+        let (_, _, backup) = advance_receipt_fixture(&reopened, 12, false, false).await;
+        assert_eq!(os::take_pool_meta_backup_sync_count(&backup), 1);
+        // The original instance still pins the previous inode; an identical
+        // pathname does not let its obsolete proof authorize a later head.
+        let (_, _, backup) = advance_receipt_fixture(&original_disk, 13, false, false).await;
+        assert_eq!(os::take_pool_meta_backup_sync_count(&backup), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_meta_native_receipt_fresh_head_and_ancestor_sync_failures_never_seed() {
+        for ancestor in [false, true] {
+            let dir = tempfile::tempdir().expect("temporary disk");
+            let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("endpoint");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+            ensure_test_volume(&disk, RUSTFS_META_BUCKET).await;
+            ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+            let object = disk
+                .io_get_object_path(RUSTFS_META_BUCKET, OBJECT)
+                .expect("native object path");
+            let failure = if ancestor {
+                disk.io_get_bucket_path(RUSTFS_META_BUCKET).expect("metadata volume")
+            } else {
+                object.clone()
+            };
+            os::fsync_dir_recorder::set_failure(&failure, ErrorKind::Other);
+            let mut fi = inline_info("initial", 11);
+            PoolMetaNativeCasCondition {
+                attempt_id: Uuid::new_v4(),
+                parent: None,
+                parent_raw_sha256: None,
+            }
+            .insert_into(&mut fi.metadata)
+            .expect("initial condition");
+            assert!(
+                disk.rename_data(RUSTFS_META_TMP_BUCKET, "initial", fi, RUSTFS_META_BUCKET, OBJECT)
+                    .await
+                    .is_err()
+            );
+            assert!(disk.pool_meta_durable_head.lock().is_none());
+            assert!(
+                !fs::try_exists(object.join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("rolled-back initial head lookup")
+            );
+        }
+    }
+
+    #[test]
+    fn pool_meta_native_hardlink_failure_hooks_are_path_scoped_and_consumed_once() {
+        let root = tempfile::tempdir().expect("hook paths");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        super::super::set_local_inline_rollback_hardlink_failure(&first);
+        super::super::set_local_inline_rollback_hardlink_failure(&second);
+        assert!(!super::super::should_fail_local_inline_rollback_hardlink(&root.path().join("unrelated")));
+        assert!(super::super::should_fail_local_inline_rollback_hardlink(&first));
+        assert!(super::super::should_fail_local_inline_rollback_hardlink(&second));
+        assert!(!super::super::should_fail_local_inline_rollback_hardlink(&first));
+        assert!(!super::super::should_fail_local_inline_rollback_hardlink(&second));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_meta_native_receipt_late_cancellation_guard_discards_a_seeded_candidate() {
+        let (_dir, disk, _, _, _) = replacement().await;
+        let key = disk.get_object_path(RUSTFS_META_BUCKET, OBJECT).expect("head key");
+        let owner = os::acquire_metadata_mutation_lease(&key, None).await;
+        {
+            let _cancelled = ReceiptMutationGuard::new(&disk.pool_meta_durable_head, owner.clone());
+            assert!(disk.pool_meta_durable_head.lock().is_some());
+        }
+        assert!(disk.pool_meta_durable_head.lock().is_none());
+        drop(owner);
+        advance_receipt_fixture(&disk, 12, false, false).await;
+        let owner = os::acquire_metadata_mutation_lease(&key, None).await;
+        {
+            let mut completed = ReceiptMutationGuard::new(&disk.pool_meta_durable_head, owner);
+            completed.complete();
+        }
+        assert!(disk.pool_meta_durable_head.lock().is_some());
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual stage profiling; run alone with --ignored --exact --nocapture"]
+    async fn pool_meta_native_profile_commit_stages() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+
+        fn profile_info(name: &str, stamp: i64) -> FileInfo {
+            let mut fi = inline_info(&format!("profile-{stamp}"), stamp);
+            fi.name = name.to_string();
+            fi.data = Some(Bytes::from(vec![b'm'; 2048]));
+            fi.size = 2048;
+            fi.parts[0].size = 2048;
+            fi.parts[0].actual_size = 2048;
+            fi
+        }
+
+        fn print_snapshot(snapshotter: &Snapshotter, profile: &str) {
+            for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+                if key.key().name() != "rustfs_s3_put_object_stage_duration_ms" {
+                    continue;
+                }
+                let Some(stage) = key.key().labels().find(|label| label.key() == "stage") else {
+                    continue;
+                };
+                let DebugValue::Histogram(values) = value else { continue };
+                let mut values = values.into_iter().map(|value| value.into_inner()).collect::<Vec<_>>();
+                if values.is_empty() {
+                    continue;
+                }
+                values.sort_by(f64::total_cmp);
+                println!("{}", serde_json::json!({"profile": profile, "stage": stage.value(), "values_ms": values}));
+            }
+        }
+
+        struct ResetMetricsGate(bool);
+        impl Drop for ResetMetricsGate {
+            fn drop(&mut self) {
+                rustfs_io_metrics::set_put_stage_metrics_enabled(self.0);
+            }
+        }
+
+        // tempfile honors TMPDIR, allowing the manual run to use an isolated
+        // filesystem. Each root gets the same native worker and sync limits as
+        // one real drive. Eight roots provide fixed concurrent sync pressure;
+        // the distributed topology case has four drives on each node.
+        let fixture = tempfile::tempdir().expect("profiling filesystem");
+        let mut disks = Vec::new();
+        for index in 0..8 {
+            let root = fixture.path().join(format!("drive-{index}"));
+            fs::create_dir_all(&root).await.expect("profiling drive root");
+            let endpoint = Endpoint::try_from(root.to_str().expect("UTF-8 drive root")).expect("profiling endpoint");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("profiling local disk");
+            for volume in [RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, "profile-objects"] {
+                ensure_test_volume(&disk, volume).await;
+            }
+            let mut fi = profile_info(OBJECT, 1);
+            PoolMetaNativeCasCondition {
+                attempt_id: Uuid::new_v4(),
+                parent: None,
+                parent_raw_sha256: None,
+            }
+            .insert_into(&mut fi.metadata)
+            .expect("initial profiling condition");
+            disk.rename_data(RUSTFS_META_TMP_BUCKET, "initial", fi.clone(), RUSTFS_META_BUCKET, OBJECT)
+                .await
+                .expect("durable initial profiling parent");
+            disks.push((disk, fi));
+        }
+        // A local recorder is not inherited by blocking workers. This ignored
+        // test must run alone, so its process recorder can observe the actual
+        // worker dispatch and syscall stages as well as the async waiter.
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::set_global_recorder(recorder).expect("standalone profiling recorder");
+        let _reset = ResetMetricsGate(rustfs_io_metrics::put_stage_metrics_enabled());
+        rustfs_io_metrics::set_put_stage_metrics_enabled(true);
+        for (batch, profile) in ["native", "ordinary", "ordinary", "native"].into_iter().enumerate() {
+            let started = std::time::Instant::now();
+            for iteration in 0..4 {
+                let stamp = i64::try_from(2 + batch * 4 + iteration).expect("profiling timestamp");
+                futures::future::join_all(disks.iter_mut().map(|(disk, parent)| async move {
+                    let path = if profile == "native" {
+                        OBJECT.to_string()
+                    } else {
+                        format!("fresh-{stamp}")
+                    };
+                    let mut fi = profile_info(&path, stamp);
+                    let destination = if profile == "native" {
+                        RUSTFS_META_BUCKET
+                    } else {
+                        "profile-objects"
+                    };
+                    if profile == "native" {
+                        PoolMetaNativeCasCondition {
+                            attempt_id: Uuid::new_v4(),
+                            parent: Some(PoolMetaNativeFileIdentity::from_file_info(parent).expect("profiling predecessor")),
+                            parent_raw_sha256: None,
+                        }
+                        .insert_into(&mut fi.metadata)
+                        .expect("profiling overwrite condition");
+                    }
+                    disk.rename_data(RUSTFS_META_TMP_BUCKET, &format!("staged-{stamp}"), fi.clone(), destination, &path)
+                        .await
+                        .expect("profiled metadata commit");
+                    if profile == "native" {
+                        *parent = fi;
+                    }
+                }))
+                .await;
+            }
+            println!(
+                "{}",
+                serde_json::json!({"profile": profile, "batch": batch, "calls": 32, "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0})
+            );
+            print_snapshot(&snapshotter, profile);
+        }
+    }
+
     #[test]
     fn pool_meta_native_condition_is_strict_transient_and_dual_prefixed() {
         let mut fi = inline_info("new", 11);
@@ -661,6 +1195,115 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_meta_native_direct_owned_backup_preserves_inode_or_exact_copy_and_undo() {
+        use std::os::unix::fs::MetadataExt;
+
+        for force_copy in [false, true] {
+            let dir = tempfile::tempdir().expect("temporary disk");
+            let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+            ensure_test_volume(&disk, RUSTFS_META_BUCKET).await;
+            ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+            let object = dir.path().join(RUSTFS_META_BUCKET).join(OBJECT);
+            fs::create_dir_all(&object).await.expect("object directory");
+            let parent = inline_info("parent", 10);
+            let parent_bytes = test_meta(parent.clone());
+            fs::write(object.join(STORAGE_FORMAT_FILE), &parent_bytes)
+                .await
+                .expect("predecessor fixture");
+            let old = std::fs::File::open(object.join(STORAGE_FORMAT_FILE)).expect("pin predecessor inode");
+            if force_copy {
+                super::super::set_local_inline_rollback_hardlink_failure(
+                    &disk
+                        .io_get_object_path(RUSTFS_META_BUCKET, OBJECT)
+                        .expect("native object path")
+                        .join(STORAGE_FORMAT_FILE),
+                );
+            }
+            let attempt = Uuid::new_v4();
+            let mut next = inline_info("next", 11);
+            PoolMetaNativeCasCondition {
+                attempt_id: attempt,
+                parent: Some(PoolMetaNativeFileIdentity::from_file_info(&parent).expect("predecessor identity")),
+                parent_raw_sha256: None,
+            }
+            .insert_into(&mut next.metadata)
+            .expect("native CAS condition");
+            let result = disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, "direct", next.clone(), RUSTFS_META_BUCKET, OBJECT)
+                .await
+                .expect("direct owned predecessor publication");
+            assert_eq!(result.rollback_data_dir, Some(attempt));
+            let backup = object.join(attempt.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+            assert_eq!(fs::read(&backup).await.expect("owned original bytes"), parent_bytes);
+            let old_identity = old.metadata().expect("pinned predecessor metadata");
+            let backup_identity = fs::metadata(&backup).await.expect("owned backup metadata");
+            assert_eq!(backup_identity.dev(), old_identity.dev());
+            assert_eq!(backup_identity.ino() == old_identity.ino(), !force_copy);
+            assert!(
+                !fs::try_exists(
+                    dir.path()
+                        .join(RUSTFS_META_TMP_BUCKET)
+                        .join("direct")
+                        .join(STORAGE_FORMAT_FILE_BACKUP)
+                )
+                .await
+                .expect("temporary backup lookup"),
+                "native predecessor publication must not stage a second rollback name"
+            );
+            disk.undo_write_with_namespace_owner(
+                RUSTFS_META_BUCKET,
+                OBJECT,
+                next,
+                DeleteOptions {
+                    undo_write: true,
+                    old_data_dir: Some(attempt),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("the owning attempt may restore either exact backup representation");
+            assert_eq!(
+                fs::read(object.join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("restored predecessor"),
+                parent_bytes
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_meta_native_direct_owned_backup_rejects_changed_and_redirected_paths() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("metadata root");
+        let root = os::PublicationRoot::new(dir.path()).expect("anchored metadata root");
+        let base = dir.path().join(RUSTFS_META_BUCKET);
+        let object = base.join(OBJECT);
+        fs::create_dir_all(&object).await.expect("object directory");
+        let source = object.join(STORAGE_FORMAT_FILE);
+        fs::write(&source, b"predecessor").await.expect("predecessor fixture");
+        let backup_path = object.join(Uuid::new_v4().to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+        assert!(os::prepare_pool_meta_owned_backup(&source, &backup_path, &base, &root, b"wrong predecessor", false).is_err());
+        assert!(!fs::try_exists(&backup_path).await.expect("rejected backup lookup"));
+        let prepared = os::prepare_pool_meta_owned_backup(&source, &backup_path, &base, &root, b"predecessor", false)
+            .expect("direct predecessor backup");
+        prepared.sync_data().expect("backup file durability");
+        prepared.verify_paths(&base, &root).expect("published inode identities");
+        let replacement = object.join("replacement");
+        fs::write(&replacement, b"different").await.expect("replacement fixture");
+        fs::rename(&replacement, &source).await.expect("replace current inode");
+        assert!(prepared.verify_paths(&base, &root).is_err());
+        fs::remove_file(&backup_path).await.expect("remove test backup link");
+        symlink(&source, &backup_path).expect("redirect backup to current metadata");
+        assert!(prepared.verify_paths(&base, &root).is_err());
+        assert_eq!(fs::read(&source).await.expect("retained current bytes"), b"different");
+    }
+
     #[tokio::test]
     async fn pool_meta_native_fresh_undo_removes_only_its_matching_initial_write() {
         for batch in [false, true] {
@@ -686,6 +1329,11 @@ mod tests {
                 .await
                 .expect("initial pool metadata publication");
             assert_eq!(committed.rollback_data_dir, None);
+            #[cfg(unix)]
+            assert!(
+                disk.pool_meta_durable_head.lock().is_some(),
+                "fresh commit must seed only after all barriers"
+            );
             let head = dir.path().join(RUSTFS_META_BUCKET).join(OBJECT).join(STORAGE_FORMAT_FILE);
             let original = fs::read(&head).await.expect("initial metadata");
             assert!(matches!(
@@ -715,6 +1363,11 @@ mod tests {
                     .expect("undo may remove its exact initial publication after quorum failure");
             }
             assert!(!fs::try_exists(&head).await.expect("rolled-back head lookup"));
+            #[cfg(unix)]
+            assert!(
+                disk.pool_meta_durable_head.lock().is_none(),
+                "single and batch Undo must evict the new-head proof"
+            );
             assert!(
                 fs::try_exists(dir.path().join(RUSTFS_META_BUCKET))
                     .await
@@ -927,6 +1580,8 @@ mod tests {
             .expect_err("duplicate or late CAS must not replace its predecessor backup");
         assert!(matches!(error, DiskError::ConditionalDeleteConflict));
         assert_eq!(fs::read(object.join(STORAGE_FORMAT_FILE)).await.expect("retained current"), current);
+        #[cfg(unix)]
+        assert!(disk.pool_meta_durable_head.lock().is_none());
         assert_eq!(
             fs::read(object.join(attempt.to_string()).join(STORAGE_FORMAT_FILE_BACKUP))
                 .await
@@ -1017,6 +1672,8 @@ mod tests {
         )
         .await
         .expect("the owning attempt may restore its verified predecessor");
+        #[cfg(unix)]
+        assert!(disk.pool_meta_durable_head.lock().is_none());
         assert_eq!(
             fs::read(dir.path().join(RUSTFS_META_BUCKET).join(OBJECT).join(STORAGE_FORMAT_FILE))
                 .await

@@ -42,6 +42,10 @@ Recovery checks each disk ID, current SHA and complete backup inventory inside t
 
 Normal `pool.bin` CAS also compares the exact per-disk predecessor under the native mutation lease. Each physical PREPARE and COMMIT uses a separate rollback directory. Undo must match both its own new head and its exact parent backup; late writes, undo and cleanup cannot replace a later acknowledged head. Ordinary object writes retain their existing behavior.
 
+On Unix, guarded inline writes create the predecessor backup directly in that write's owned UUID directory. A fully synchronized head can seed one in-memory durability receipt per disk, holding two read-only descriptors for the head and root. A later write consumes it once and may omit only the backup inode data sync when the current root, inode, complete raw SHA and length, and file identity match, and the backup is proven to be a hardlink to that inode. New head data sync and every backup, head and ancestor directory sync remain required. This receipt carries no commit, identity, quorum or namespace authority.
+
+Restart, a new disk handle, raw-SHA parents, copy fallback, non-inline writes, failed or cancelled publication, Undo and native Apply retain the cold path. They cannot reuse an earlier durability proof. Cleaning an unrelated old backup does not invalidate an unchanged live head receipt.
+
 The native CAS, undo and recovery RPC methods require all participating storage nodes to support them. They never fall back to legacy mutators on `Unimplemented`. Pause pool metadata mutations during a mixed-version rollout and finish upgrading the storage nodes before resuming decommission or rebalance. V3 payloads remain unchanged; downgrading the entire fleet to binaries without native CAS requires a stopped cluster and offline reconciliation.
 
 ## Runtime write recovery

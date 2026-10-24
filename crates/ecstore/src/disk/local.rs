@@ -2776,7 +2776,8 @@ static RENAME_DATA_FAIL_COMMIT_RENAME: std::sync::Mutex<Option<String>> = std::s
 #[cfg(test)]
 static RENAME_DATA_REMOVE_STAGED_META_BEFORE_COMMIT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 #[cfg(test)]
-static LOCAL_INLINE_ROLLBACK_HARDLINK_FAILURE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+static LOCAL_INLINE_ROLLBACK_HARDLINK_FAILURE: std::sync::LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 #[cfg(test)]
 static RENAME_DATA_REMOVE_DST_BASE_BEFORE_COMMIT: std::sync::Mutex<Option<(String, PathBuf)>> = std::sync::Mutex::new(None);
 #[cfg(test)]
@@ -2840,9 +2841,10 @@ fn set_rename_data_remove_staged_meta_before_commit(dst_path: &str) {
 
 #[cfg(test)]
 fn set_local_inline_rollback_hardlink_failure(dst_path: &Path) {
-    *LOCAL_INLINE_ROLLBACK_HARDLINK_FAILURE
+    LOCAL_INLINE_ROLLBACK_HARDLINK_FAILURE
         .lock()
-        .expect("test failpoint lock should not be poisoned") = Some(dst_path.to_path_buf());
+        .expect("test failpoint lock should not be poisoned")
+        .insert(dst_path.to_path_buf());
 }
 
 #[cfg(test)]
@@ -2962,15 +2964,10 @@ fn should_remove_staged_meta_before_commit(dst_path: &str) -> bool {
 
 #[cfg(test)]
 fn should_fail_local_inline_rollback_hardlink(dst_path: &Path) -> bool {
-    let mut target = LOCAL_INLINE_ROLLBACK_HARDLINK_FAILURE
+    LOCAL_INLINE_ROLLBACK_HARDLINK_FAILURE
         .lock()
-        .expect("test failpoint lock should not be poisoned");
-    if target.as_deref() == Some(dst_path) {
-        target.take();
-        true
-    } else {
-        false
-    }
+        .expect("test failpoint lock should not be poisoned")
+        .remove(dst_path)
 }
 
 #[cfg(test)]
@@ -5784,6 +5781,8 @@ pub struct LocalDisk {
     _blocking_queue: Arc<os::DiskBlockingQueue>,
     metadata_read_queue: Arc<MetadataReadQueue>,
     snapshot_leases: Arc<ParkingLotMutex<SnapshotLeaseRegistry>>,
+    #[cfg(unix)]
+    pool_meta_durable_head: ParkingLotMutex<Option<pool_meta_native::DurableHeadReceipt>>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -6272,6 +6271,8 @@ impl LocalDisk {
             _blocking_queue: os::register_disk_blocking_queue(&root, &io_root),
             metadata_read_queue,
             snapshot_leases: Arc::new(ParkingLotMutex::new(SnapshotLeaseRegistry::default())),
+            #[cfg(unix)]
+            pool_meta_durable_head: ParkingLotMutex::new(None),
         };
         let (info, _root) = get_disk_info(root.clone()).await.inspect_err(|err| {
             log_startup_disk_error("get_disk_info", &root, err);

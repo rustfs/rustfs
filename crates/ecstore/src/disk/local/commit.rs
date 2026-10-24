@@ -281,10 +281,12 @@ type PreparedInlineMetadata = (
     Option<StagedRollbackBackup>,
     bool,
     os::PreparedRenameSource,
+    Option<Arc<os::PreparedPoolMetaBackup>>,
+    Option<super::pool_meta_native::DurableHeadReceipt>,
 );
 
 enum InlinePreparationOutcome {
-    Committed(RenameDataResp),
+    Committed(RenameDataResp, Option<super::pool_meta_native::DurableHeadReceipt>),
     CommitErr(DiskError),
     Prepared(PreparedInlineMetadata),
 }
@@ -418,13 +420,13 @@ impl LocalDisk {
         }
         let mut fi = fi;
         let pool_meta_condition = if super::pool_meta_native::is_object(dst_volume, dst_path) {
-            Some(super::pool_meta_native::PoolMetaNativeCasCondition::take(&mut fi).map_err(|err| {
+            Some(super::pool_meta_native::PoolMetaNativeCasCondition::take(&mut fi).inspect_err(|_| {
                 state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
-                err
             })?)
         } else {
             None
         };
+        let native_timing = pool_meta_condition.is_some();
         if pool_meta_condition
             .as_ref()
             .is_some_and(|condition| fi.data_dir == Some(condition.attempt_id))
@@ -481,8 +483,24 @@ impl LocalDisk {
                 .strip_prefix(self.io_root())
                 .map_err(|_| DiskError::InvalidPath)?,
         );
+        let metadata_wait = os::StageTimer::new(native_timing, "pool_meta_native_metadata_lease_wait");
         let metadata_lease =
             os::acquire_metadata_mutation_lease(&root_destination_object_path, state.namespace_owner.take()).await;
+        drop(metadata_wait);
+        #[cfg(unix)]
+        let parent_receipt = if native_timing {
+            self.pool_meta_durable_head.lock().take().filter(|receipt| {
+                pool_meta_condition.as_ref().is_some_and(|condition| {
+                    condition.parent_raw_sha256.is_none() && condition.parent.as_ref() == Some(&receipt.identity)
+                })
+            })
+        } else {
+            None
+        };
+        #[cfg(unix)]
+        let mut receipt_mutation = native_timing
+            .then(|| super::pool_meta_native::ReceiptMutationGuard::new(&self.pool_meta_durable_head, metadata_lease.clone()));
+        let namespace_wait = os::StageTimer::new(native_timing, "pool_meta_native_namespace_lease_wait");
         let mutation_lease = os::acquire_rename_data_mutation_lease_with_owner(
             &self.root,
             dst_volume,
@@ -491,10 +509,12 @@ impl LocalDisk {
             Some(metadata_lease),
         )
         .await;
+        drop(namespace_wait);
         if let Some(claim) = quota_fence_claim {
             mutation_lease.attach_external_guard(claim);
         }
         if let Some(condition) = &pool_meta_condition {
+            let _parent_check = os::StageTimer::new(native_timing, "pool_meta_native_parent_check");
             if let Err(err) = self.check_pool_meta_parent(condition, &destination_object_path).await {
                 state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
                 return Err(err);
@@ -1069,9 +1089,37 @@ impl LocalDisk {
             let source_parent = src_file_parent.to_path_buf();
             let rename_commit_guard_for_preparation = commit.directory_guard.clone();
             let sync = durability.syncs_commit_metadata();
+            #[cfg(unix)]
+            let receipt_identity = if sync
+                && pool_meta_condition
+                    .as_ref()
+                    .is_some_and(|condition| condition.parent_raw_sha256.is_none())
+            {
+                Some(super::pool_meta_native::PoolMetaNativeFileIdentity::from_file_info(&fi)?)
+            } else {
+                None
+            };
+            #[cfg(unix)]
+            let owned_backup_path = pool_meta_condition
+                .as_ref()
+                .filter(|condition| condition.has_parent())
+                .map(|condition| {
+                    destination_object_path
+                        .join(condition.attempt_id.to_string())
+                        .join(STORAGE_FORMAT_FILE_BACKUP)
+                });
+            #[cfg(unix)]
+            if let Some(backup) = &owned_backup_path {
+                let parent = backup
+                    .parent()
+                    .ok_or_else(|| DiskError::other("missing owned backup parent"))?;
+                commit.mutation_lease =
+                    os::acquire_namespace_mutation_lease_with_owner(parent, Some(commit.mutation_lease.clone())).await;
+            }
             #[cfg(test)]
             run_inline_before_file_sync_admission(dst_path);
             let mut file_sync_admission = if sync {
+                let _admission = os::StageTimer::new(native_timing, "pool_meta_native_file_sync_admission");
                 Some(
                     os::acquire_file_sync_admission(self.file_sync_permits.clone())
                         .await
@@ -1081,7 +1129,10 @@ impl LocalDisk {
             } else {
                 None
             };
+            let preparation_dispatch = os::StageTimer::new(native_timing, "pool_meta_native_prepare_dispatch_wait");
             let prepare_inline_metadata = move |is_cancelled: &dyn Fn() -> bool| {
+                drop(preparation_dispatch);
+                let _preparation = os::StageTimer::new(native_timing, "pool_meta_native_prepare_execute");
                 let mut prepared_metadata_source =
                     os::create_prepared_rename_source_with_commit_guard(&src, &dst, &rename_commit_guard_for_preparation)?;
                 #[cfg(windows)]
@@ -1140,13 +1191,61 @@ impl LocalDisk {
                 // relaxed tiers do no per-object fsync here at all (aligned
                 // with MinIO's default), trading a documented power-loss
                 // window for latency.
-                prepared_metadata_source.write_all(&new_buf, sync)?;
+                {
+                    let _new_file = os::StageTimer::new(native_timing, "pool_meta_native_staged_write_sync");
+                    prepared_metadata_source.write_all(&new_buf, sync)?;
+                }
                 run_inline_preparation_before_backup(&dst_path_for_failpoint);
+                #[cfg(unix)]
+                let mut receipt_candidate = receipt_identity.and_then(|identity| {
+                    os::DurableFileReceipt::capture(&publication_root_for_commit, &src, &new_buf)
+                        .ok()
+                        .map(|physical| super::pool_meta_native::DurableHeadReceipt { physical, identity })
+                });
+                #[cfg(not(unix))]
+                let receipt_candidate = None;
+                #[cfg(unix)]
+                let owned_backup = match (owned_backup_path.as_ref(), has_dst_buf.as_ref()) {
+                    (Some(backup_path), Some(old_metadata)) => {
+                        let backup = {
+                            let _create = os::StageTimer::new(native_timing, "pool_meta_native_backup_create");
+                            Arc::new(os::prepare_pool_meta_owned_backup(
+                                &dst,
+                                backup_path,
+                                &dst_volume_dir_for_commit,
+                                &publication_root_for_commit,
+                                old_metadata,
+                                should_fail_local_inline_rollback_hardlink(&dst),
+                            )?)
+                        };
+                        let reuses_durability = parent_receipt.as_ref().is_some_and(|receipt| {
+                            backup.can_reuse_durability(&receipt.physical, &publication_root_for_commit, old_metadata)
+                        });
+                        if !backup.is_linked() {
+                            receipt_candidate = None;
+                        }
+                        if sync && !reuses_durability {
+                            let _backup_sync = os::StageTimer::new(native_timing, "pool_meta_native_backup_file_sync");
+                            backup.sync_data()?;
+                        } else if sync {
+                            rustfs_io_metrics::record_put_object_stage_count("pool_meta_native_backup_sync_reused", 1);
+                        }
+                        Some(backup)
+                    }
+                    (Some(_), None) => {
+                        return Err(std::io::Error::new(ErrorKind::InvalidData, "pool metadata predecessor disappeared"));
+                    }
+                    (None, _) => None,
+                };
+                #[cfg(not(unix))]
+                let owned_backup = None;
                 if let Some(ref old_metadata) = has_dst_buf
+                    && owned_backup.is_none()
                     && (rollback_data_dir.is_some() || fi_healing || sync || cfg!(test))
                 {
                     #[cfg(windows)]
                     let backup_path = {
+                        let _backup = os::StageTimer::new(native_timing, "pool_meta_native_backup_create_sync");
                         let backup_path = src
                             .parent()
                             .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "missing staging metadata parent"))?
@@ -1155,9 +1254,13 @@ impl LocalDisk {
                         backup_path
                     };
                     #[cfg(not(windows))]
-                    let backup_path = create_local_inline_rollback_backup(&dst, &src, old_metadata)?;
+                    let backup_path = {
+                        let _backup = os::StageTimer::new(native_timing, "pool_meta_native_backup_create");
+                        create_local_inline_rollback_backup(&dst, &src, old_metadata)?
+                    };
                     #[cfg(not(windows))]
                     if sync {
+                        let _backup_sync = os::StageTimer::new(native_timing, "pool_meta_native_backup_file_sync");
                         std::fs::File::open(&backup_path)?.sync_data()?;
                     }
                     staged_rollback_path = Some(StagedRollbackBackup(backup_path));
@@ -1216,15 +1319,18 @@ impl LocalDisk {
                         let _ = std::fs::remove_dir(parent);
                     }
 
-                    return Ok::<_, std::io::Error>(InlinePreparationOutcome::Committed(RenameDataResp {
-                        old_data_dir,
-                        rollback_data_dir,
-                        cleanup_data_dir: old_data_dir,
-                        sign: version_signature,
-                        old_current_size,
-                        old_current_source_checked,
-                        old_current_source,
-                    }));
+                    return Ok::<_, std::io::Error>(InlinePreparationOutcome::Committed(
+                        RenameDataResp {
+                            old_data_dir,
+                            rollback_data_dir,
+                            cleanup_data_dir: old_data_dir,
+                            sign: version_signature,
+                            old_current_size,
+                            old_current_source_checked,
+                            old_current_source,
+                        },
+                        receipt_candidate,
+                    ));
                 }
 
                 Ok::<_, std::io::Error>(InlinePreparationOutcome::Prepared((
@@ -1237,8 +1343,11 @@ impl LocalDisk {
                     staged_rollback_path,
                     destination_was_absent,
                     prepared_metadata_source,
+                    owned_backup,
+                    receipt_candidate,
                 )))
             };
+            let preparation_total = os::StageTimer::new(native_timing, "pool_meta_native_prepare_total");
             let inline_preparation = if let Some(admission) = file_sync_admission.as_ref() {
                 os::run_cancellable_blocking_namespace_file_sync_operation(
                     commit.mutation_lease.clone(),
@@ -1251,6 +1360,7 @@ impl LocalDisk {
             }
             .map_err(to_file_error)
             .map_err(DiskError::from);
+            drop(preparation_total);
             let (
                 rollback_data_dir,
                 cleanup_data_dir,
@@ -1261,9 +1371,16 @@ impl LocalDisk {
                 mut local_rollback_path,
                 destination_was_absent,
                 prepared_metadata_source,
+                owned_backup,
+                receipt_candidate,
             ) = match inline_preparation {
-                Ok(InlinePreparationOutcome::Committed(resp)) => {
+                Ok(InlinePreparationOutcome::Committed(resp, receipt_candidate)) => {
                     drop(file_sync_admission.take());
+                    #[cfg(unix)]
+                    self.publish_pool_meta_durable_head(receipt_candidate, dst_file_path.clone(), commit.mutation_lease.clone())
+                        .await;
+                    #[cfg(not(unix))]
+                    let _ = receipt_candidate;
                     #[cfg(windows)]
                     drop(commit.directory_guard);
                     if let Some(ref cleanup) = cleanup_path {
@@ -1276,6 +1393,10 @@ impl LocalDisk {
                     }
                     for part_path in &invalidate_part_paths {
                         self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                    }
+                    #[cfg(unix)]
+                    if let Some(receipt_mutation) = receipt_mutation.as_mut() {
+                        receipt_mutation.complete();
                     }
                     return Ok(resp);
                 }
@@ -1310,6 +1431,42 @@ impl LocalDisk {
                 return Err(DiskError::FileNotFound);
             }
 
+            #[cfg(unix)]
+            if let Some(backup) = &owned_backup {
+                // The backup namespace lease owns the head transaction; retain
+                // its directory and inode guards in every later detached job.
+                commit.mutation_lease.attach_external_guard(backup.clone());
+                #[cfg(test)]
+                run_rename_data_after_first_publication(&self.root, dst_volume, dst_path);
+                let backup_base = dst_volume_dir.clone();
+                let backup_root = commit.publication_root.clone();
+                if let Some(admission) = file_sync_admission.as_ref() {
+                    let _backup_dir = os::StageTimer::new(native_timing, "pool_meta_native_backup_dir_sync");
+                    let fsync_started = rustfs_io_metrics::put_stage_timer();
+                    let backup = backup.clone();
+                    let result =
+                        os::run_blocking_namespace_file_sync_operation(commit.mutation_lease.clone(), admission, move || {
+                            backup.verify_paths(&backup_base, &backup_root)?;
+                            backup.sync_directory()
+                        })
+                        .await;
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_BACKUP_DIR_FSYNC,
+                        fsync_started,
+                    );
+                    result.map_err(to_file_error)?;
+                } else {
+                    let backup = backup.clone();
+                    os::run_blocking_namespace_operation(commit.mutation_lease.clone(), move || {
+                        backup.verify_paths(&backup_base, &backup_root)
+                    })
+                    .await
+                    .map_err(to_file_error)?;
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = owned_backup;
+
             if let (Some(rollback_data_dir), Some(staged_backup)) =
                 (rollback_data_dir, local_rollback_path.as_ref().map(StagedRollbackBackup::path))
             {
@@ -1322,21 +1479,24 @@ impl LocalDisk {
                 // rename_all acquires the backup path's namespace lease. Do not
                 // hold a disk admission while acquiring another namespace lock.
                 drop(file_sync_admission.take());
-                if let Err(err) = os::rename_all_with_owner(
+                let backup_publish = os::StageTimer::new(native_timing, "pool_meta_native_backup_publish");
+                let backup_result = os::rename_all_with_owner(
                     staged_backup,
                     &backup_path,
                     &dst_volume_dir,
                     commit.publication_root,
                     Some(commit.mutation_lease.clone()),
                 )
-                .await
-                {
+                .await;
+                drop(backup_publish);
+                if let Err(err) = backup_result {
                     let _ = remove_file_if_exists(staged_backup);
                     return Err(err);
                 }
                 #[cfg(test)]
                 run_rename_data_after_first_publication(&self.root, dst_volume, dst_path);
                 if sync {
+                    let _admission = os::StageTimer::new(native_timing, "pool_meta_native_file_sync_readmission");
                     file_sync_admission = Some(
                         os::acquire_file_sync_admission(self.file_sync_permits.clone())
                             .await
@@ -1347,6 +1507,7 @@ impl LocalDisk {
                 if let Some(admission) = file_sync_admission.as_ref()
                     && let Some(backup_parent) = backup_path.parent()
                 {
+                    let _backup_dir = os::StageTimer::new(native_timing, "pool_meta_native_backup_dir_sync");
                     let fsync_started = rustfs_io_metrics::put_stage_timer();
                     if let Err(err) =
                         os::fsync_dir_with_namespace_file_sync_limit(backup_parent, commit.mutation_lease.clone(), admission)
@@ -1366,6 +1527,7 @@ impl LocalDisk {
                 local_rollback_path = None;
             }
 
+            let head_publish = os::StageTimer::new(native_timing, "pool_meta_native_head_publish");
             let commit_result = if should_fail_commit_rename(dst_path) {
                 Err(DiskError::other("test fail during metadata commit rename"))
             } else {
@@ -1380,6 +1542,7 @@ impl LocalDisk {
                 )
                 .await
             };
+            drop(head_publish);
             if let Err(err) = commit_result {
                 if let Some(backup_path) = local_rollback_path.as_ref().map(StagedRollbackBackup::path) {
                     let _ = remove_file_if_exists(backup_path);
@@ -1400,6 +1563,7 @@ impl LocalDisk {
                 if let Some(admission) = file_sync_admission.as_ref()
                     && let Some(dst_parent) = dst_file_path.parent()
                 {
+                    let _head_dir = os::StageTimer::new(native_timing, "pool_meta_native_head_dir_sync");
                     let fsync_started = rustfs_io_metrics::put_stage_timer();
                     if let Err(err) = os::fsync_commit_directory(
                         dst_parent,
@@ -1480,6 +1644,12 @@ impl LocalDisk {
                 return Err(DiskError::from(err));
             }
 
+            #[cfg(unix)]
+            self.publish_pool_meta_durable_head(receipt_candidate, dst_file_path.clone(), commit.mutation_lease.clone())
+                .await;
+            #[cfg(not(unix))]
+            let _ = receipt_candidate;
+
             // The commit no longer has a rollback path. Release the Windows
             // object identity guard before best-effort staging cleanup.
             #[cfg(windows)]
@@ -1511,6 +1681,10 @@ impl LocalDisk {
                 self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
             }
 
+            #[cfg(unix)]
+            if let Some(receipt_mutation) = receipt_mutation.as_mut() {
+                receipt_mutation.complete();
+            }
             Ok(RenameDataResp {
                 old_data_dir: cleanup_data_dir,
                 rollback_data_dir,

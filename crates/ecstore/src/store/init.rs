@@ -737,29 +737,20 @@ impl ECStore {
         #[cfg(feature = "e2e-test-hooks")]
         let startup_attempt = uuid::Uuid::new_v4();
         let (meta, pool_meta_replica_state) = {
-            let mut write_state = &mut *startup_write_state;
+            let write_state = &mut *startup_write_state;
             let establish = async {
                 if should_persist_pool_meta && write_state.bootstrap_identity_proven() {
-                    persist_startup_identity_with_guard(
-                        self.pools.clone(),
-                        &mut write_state,
-                        false,
-                        startup_pool_meta_guard.as_ref(),
-                    )
-                    .await
+                    persist_startup_identity_with_guard(self.pools.clone(), write_state, false, startup_pool_meta_guard.as_ref())
+                        .await
                 } else {
-                    establish_pool_meta_bootstrap_identity_if_proven(
-                        self.pools.clone(),
-                        &mut write_state,
-                        should_persist_pool_meta,
-                    )
-                    .await
+                    establish_pool_meta_bootstrap_identity_if_proven(self.pools.clone(), write_state, should_persist_pool_meta)
+                        .await
                 }
             };
             establish
                 .await
                 .map_err(|err| Error::other(format!("store init failed during establish_pool_meta_bootstrap_identity: {err}")))?;
-            let load = load_pool_meta_for_startup(self.pools.clone(), &mut write_state);
+            let load = load_pool_meta_for_startup(self.pools.clone(), write_state);
             #[cfg(feature = "e2e-test-hooks")]
             let load = crate::core::pools::startup_cas_test_scope(startup_attempt, "load", &self.pools, load);
             match load.await {
@@ -771,7 +762,7 @@ impl ECStore {
                         && startup_pool_meta_guard.is_some() =>
                 {
                     self.recover_native_pool_meta_for_startup(
-                        &mut write_state,
+                        write_state,
                         Arc::clone(
                             startup_pool_meta_guard
                                 .as_ref()
@@ -779,7 +770,7 @@ impl ECStore {
                         ),
                     )
                     .await?;
-                    load_pool_meta_for_startup(self.pools.clone(), &mut write_state).await?
+                    load_pool_meta_for_startup(self.pools.clone(), write_state).await?
                 }
                 Err(err) => return Err(err),
             }
@@ -803,12 +794,12 @@ impl ECStore {
         // Only one local node should persist validated pool metadata here; otherwise
         // distributed startup can race on the same lock and replay the prior init bug.
         {
-            let mut write_state = &mut *startup_write_state;
+            let write_state = &mut *startup_write_state;
             let persist = persist_pool_meta_for_startup_guarded(
                 &installed_pool_meta,
                 self.pools.clone(),
                 pool_meta_replica_state,
-                &mut write_state,
+                write_state,
                 update,
                 should_persist_pool_meta,
                 startup_pool_meta_guard.clone(),

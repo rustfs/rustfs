@@ -33,6 +33,27 @@ use tokio::sync::{
 };
 use tracing::warn;
 
+/// Fixed-cardinality diagnostics, disabled by the existing detailed PUT gate.
+pub(in crate::disk) struct StageTimer {
+    stage: &'static str,
+    started_at: Option<Instant>,
+}
+
+impl StageTimer {
+    pub(in crate::disk) fn new(enabled: bool, stage: &'static str) -> Self {
+        Self {
+            stage,
+            started_at: enabled.then(rustfs_io_metrics::put_stage_timer).flatten(),
+        }
+    }
+}
+
+impl Drop for StageTimer {
+    fn drop(&mut self) {
+        rustfs_io_metrics::record_put_object_stage_duration_from(self.stage, self.started_at);
+    }
+}
+
 /// Check path length according to OS limits.
 pub fn check_path_length(path_name: &str) -> Result<()> {
     // Apple OS X path length is limited to 1016
@@ -500,6 +521,7 @@ pub(crate) fn fsync_directory_handle_std(dir: &Path, opened: Option<&std::fs::Fi
         if let Some(kind) = fsync_dir_recorder::take_failure(dir) {
             return Err(io::Error::from(kind));
         }
+        let _sync = StageTimer::new(true, "disk_directory_open_fsync");
         match opened {
             Some(file) => file.sync_all()?,
             None => std::fs::File::open(dir)?.sync_all()?,
@@ -1693,7 +1715,10 @@ impl DiskBlockingQueue {
         operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
     ) -> io::Result<T> {
         let (tx, rx) = oneshot::channel();
+        let dispatch = StageTimer::new(true, "disk_namespace_worker_dispatch_wait");
         self.enqueue(Box::new(move || {
+            drop(dispatch);
+            let _execution = StageTimer::new(true, "disk_namespace_worker_execute");
             let result = operation(&|| tx.is_closed());
             let _ = tx.send(result);
         }));
@@ -2685,6 +2710,305 @@ pub(crate) async fn rename_all_with_commit_guard(
     Ok(())
 }
 
+#[cfg(unix)]
+pub(crate) struct DurableFileReceipt {
+    root: std::fs::File,
+    head: std::fs::File,
+    raw_length: u64,
+    sha256: [u8; 32],
+}
+
+#[cfg(unix)]
+fn open_anchored_metadata(path: &Path, publication_root: &PublicationRoot) -> io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags, openat};
+    #[cfg(target_os = "linux")]
+    let logical_path = publication_root.path().join(publication_root.relative_path(path)?);
+    #[cfg(target_os = "linux")]
+    let path = logical_path.as_path();
+    let parents = open_existing_directory_below_base_std(
+        path.parent().ok_or_else(|| io::Error::other("metadata has no parent"))?,
+        publication_root.path(),
+        publication_root,
+    )?;
+    let directory = parents
+        .last()
+        .ok_or_else(|| io::Error::other("missing metadata directory guard"))?;
+    Ok(openat(
+        directory,
+        path.file_name().ok_or_else(|| io::Error::other("metadata has no name"))?,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into())
+}
+
+#[cfg(unix)]
+fn same_inode(first: &std::fs::File, second: &std::fs::File) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let first = first.metadata()?;
+    let second = second.metadata()?;
+    Ok(first.dev() == second.dev() && first.ino() == second.ino())
+}
+
+#[cfg(unix)]
+fn bounded_file_sha256(file: &mut std::fs::File, length: u64) -> io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != length || length > 64 * 1024 * 1024 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "metadata receipt length changed"));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(length).map_err(|_| io::Error::other("metadata length overflow"))?);
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, length + 1), &mut bytes)?;
+    if bytes.len() as u64 != length {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "metadata receipt contents changed"));
+    }
+    Ok(Sha256::digest(bytes).into())
+}
+
+#[cfg(unix)]
+impl DurableFileReceipt {
+    /// This is only a candidate until the caller completes the head and all
+    /// ancestor barriers. Both descriptors are read-only and pin their inodes.
+    pub(crate) fn capture(root: &PublicationRoot, path: &Path, expected: &[u8]) -> io::Result<Self> {
+        use sha2::{Digest, Sha256};
+        let parents = open_existing_directory_below_base_std(root.path(), root.path(), root)?;
+        let directory = parents
+            .last()
+            .ok_or_else(|| io::Error::other("missing root directory guard"))?;
+        let mut head = open_anchored_metadata(path, root)?;
+        let raw_length = u64::try_from(expected.len()).map_err(|_| io::Error::other("metadata length overflow"))?;
+        let sha256 = Sha256::digest(expected).into();
+        if bounded_file_sha256(&mut head, raw_length)? != sha256 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "metadata receipt contents changed"));
+        }
+        Ok(Self {
+            root: directory.try_clone()?.into(),
+            head,
+            raw_length,
+            sha256,
+        })
+    }
+
+    fn matches_root(&self, root: &PublicationRoot) -> io::Result<bool> {
+        let parents = open_existing_directory_below_base_std(root.path(), root.path(), root)?;
+        let directory = std::fs::File::from(
+            parents
+                .last()
+                .ok_or_else(|| io::Error::other("missing root directory guard"))?
+                .try_clone()?,
+        );
+        same_inode(&self.root, &directory)
+    }
+
+    pub(crate) fn matches_source(&self, root: &PublicationRoot, source: &std::fs::File, expected: &[u8]) -> bool {
+        use sha2::{Digest, Sha256};
+        self.matches_root(root).unwrap_or(false)
+            && same_inode(&self.head, source).unwrap_or(false)
+            && self.raw_length == expected.len() as u64
+            && self.sha256 == <[u8; 32]>::from(Sha256::digest(expected))
+    }
+
+    pub(crate) fn matches_current(&self, root: &PublicationRoot, path: &Path) -> bool {
+        (|| -> io::Result<bool> {
+            let mut current = open_anchored_metadata(path, root)?;
+            Ok(self.matches_root(root)?
+                && same_inode(&self.head, &current)?
+                && bounded_file_sha256(&mut current, self.raw_length)? == self.sha256)
+        })()
+        .unwrap_or(false)
+    }
+}
+
+#[cfg(all(test, unix))]
+static POOL_META_BACKUP_SYNCS: LazyLock<Mutex<HashMap<PathBuf, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(all(test, unix))]
+pub(in crate::disk) fn take_pool_meta_backup_sync_count(path: &Path) -> usize {
+    POOL_META_BACKUP_SYNCS.lock().remove(path).unwrap_or(0)
+}
+
+#[cfg(unix)]
+pub(crate) struct PreparedPoolMetaBackup {
+    path: PathBuf,
+    source_path: PathBuf,
+    file: std::fs::File,
+    directory: std::fs::File,
+    source: std::fs::File,
+    linked: bool,
+    _ancestors: (ExistingBaseDirectoryGuard, ExistingBaseDirectoryGuard),
+}
+
+#[cfg(not(unix))]
+pub(crate) struct PreparedPoolMetaBackup;
+
+#[cfg(unix)]
+impl PreparedPoolMetaBackup {
+    pub(crate) fn sync_data(&self) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            *POOL_META_BACKUP_SYNCS.lock().entry(self.path.clone()).or_default() += 1;
+        }
+        self.file.sync_data()
+    }
+
+    pub(crate) fn is_linked(&self) -> bool {
+        self.linked
+    }
+
+    pub(crate) fn can_reuse_durability(&self, receipt: &DurableFileReceipt, root: &PublicationRoot, expected: &[u8]) -> bool {
+        self.linked
+            && receipt.matches_source(root, &self.source, expected)
+            && same_inode(&self.source, &self.file).unwrap_or(false)
+    }
+
+    pub(crate) fn sync_directory(&self) -> io::Result<()> {
+        fsync_directory_handle_std(
+            self.path.parent().ok_or_else(|| io::Error::other("backup has no parent"))?,
+            Some(&self.directory),
+        )
+    }
+
+    pub(crate) fn verify_paths(&self, base: &Path, publication_root: &PublicationRoot) -> io::Result<()> {
+        use rustix::fs::{Mode, OFlags, openat};
+        use std::os::unix::fs::MetadataExt;
+        for (path, expected) in [(&self.source_path, &self.source), (&self.path, &self.file)] {
+            let parents = open_existing_directory_below_base_std(
+                path.parent().ok_or_else(|| io::Error::other("metadata has no parent"))?,
+                base,
+                publication_root,
+            )?;
+            let directory = parents
+                .last()
+                .ok_or_else(|| io::Error::other("missing metadata directory guard"))?;
+            let name = path.file_name().ok_or_else(|| io::Error::other("metadata has no name"))?;
+            let current = std::fs::File::from(openat(
+                directory,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?);
+            let current = current.metadata()?;
+            let expected = expected.metadata()?;
+            if current.dev() != expected.dev() || current.ino() != expected.ino() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "pool metadata backup publication changed"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn open_existing_directory_below_base_std(
+    directory: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<ExistingBaseDirectoryGuard> {
+    use rustix::fs::{Mode, OFlags, openat};
+    let relative = existing_base_directory_suffix(directory, base)?;
+    #[cfg(target_os = "linux")]
+    let base = publication_root.open_directory(base)?.into();
+    #[cfg(not(target_os = "linux"))]
+    let base = {
+        let _ = publication_root;
+        rustix::fs::open(
+            base,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+    };
+    let mut parents = vec![base];
+    for component in relative.components() {
+        let Component::Normal(component) = component else { continue };
+        let parent = parents
+            .last()
+            .ok_or_else(|| io::Error::other("missing base directory guard"))?;
+        parents.push(openat(
+            parent,
+            component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+    }
+    Ok(parents)
+}
+
+/// Publish the immutable predecessor directly into its exclusive rollback
+/// directory. The caller owns metadata, head and backup namespace leases.
+#[cfg(unix)]
+pub(crate) fn prepare_pool_meta_owned_backup(
+    source: &Path,
+    backup: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+    expected: &[u8],
+    force_copy: bool,
+) -> io::Result<PreparedPoolMetaBackup> {
+    use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat, unlinkat};
+    use std::os::unix::fs::MetadataExt;
+
+    let source_parent = source.parent().ok_or_else(|| io::Error::other("source has no parent"))?;
+    let backup_parent = backup.parent().ok_or_else(|| io::Error::other("backup has no parent"))?;
+    let source_guards = open_existing_directory_below_base_std(source_parent, base, publication_root)?;
+    let backup_guards = mkdir_all_below_existing_base_std(backup_parent, base, publication_root)?;
+    let source_directory = source_guards
+        .last()
+        .ok_or_else(|| io::Error::other("missing source directory guard"))?;
+    let backup_directory = backup_guards
+        .last()
+        .ok_or_else(|| io::Error::other("missing backup directory guard"))?;
+    let source_name = source.file_name().ok_or_else(|| io::Error::other("source has no name"))?;
+    let backup_name = backup.file_name().ok_or_else(|| io::Error::other("backup has no name"))?;
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut old = std::fs::File::from(openat(source_directory, source_name, flags, Mode::empty())?);
+    let identity = old.metadata()?;
+    let expected_length = u64::try_from(expected.len()).map_err(|_| io::Error::other("pool metadata length overflow"))?;
+    if !identity.is_file() || identity.len() != expected_length {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "pool metadata predecessor changed"));
+    }
+    let mut observed = Vec::with_capacity(expected.len());
+    let read_limit = expected_length
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("pool metadata length overflow"))?;
+    std::io::Read::read_to_end(&mut std::io::Read::take(&mut old, read_limit), &mut observed)?;
+    if observed != expected {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "pool metadata predecessor changed"));
+    }
+
+    let linked = !force_copy && linkat(source_directory, source_name, backup_directory, backup_name, AtFlags::empty()).is_ok();
+    let file = if linked {
+        let file = std::fs::File::from(openat(backup_directory, backup_name, flags, Mode::empty())?);
+        let actual = file.metadata()?;
+        if actual.dev() != identity.dev() || actual.ino() != identity.ino() {
+            let _ = unlinkat(backup_directory, backup_name, AtFlags::empty());
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "pool metadata hardlink source changed"));
+        }
+        file
+    } else {
+        let mut file = std::fs::File::from(openat(
+            backup_directory,
+            backup_name,
+            OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o666),
+        )?);
+        if let Err(error) = std::io::Write::write_all(&mut file, expected) {
+            drop(file);
+            let _ = unlinkat(backup_directory, backup_name, AtFlags::empty());
+            return Err(error);
+        }
+        file
+    };
+    let directory = std::fs::File::from(backup_directory.try_clone()?);
+    Ok(PreparedPoolMetaBackup {
+        path: backup.to_path_buf(),
+        source_path: source.to_path_buf(),
+        file,
+        directory,
+        source: old,
+        linked,
+        _ancestors: (source_guards, backup_guards),
+    })
+}
+
 pub(crate) struct PreparedRenameSource {
     path: PathBuf,
     #[cfg(windows)]
@@ -2706,6 +3030,7 @@ impl PreparedRenameSource {
         #[cfg(not(windows))]
         std::io::Write::write_all(&mut self.source, data)?;
         if sync {
+            let _sync = StageTimer::new(true, "disk_prepared_metadata_fdatasync");
             #[cfg(windows)]
             self.source.as_file().sync_data()?;
             #[cfg(not(windows))]
@@ -3254,7 +3579,10 @@ async fn run_cancellable_blocking_namespace_file_sync_operation_with_global<T: S
     );
     let disk_permit = admission.disk_permit.clone();
     let (tx, rx) = oneshot::channel();
+    let dispatch = StageTimer::new(true, "disk_fsync_worker_dispatch_wait");
     drop(fsync_spawn_blocking(move || {
+        drop(dispatch);
+        let _execution = StageTimer::new(true, "disk_fsync_worker_execute");
         let _lease = lease;
         let _disk_permit = disk_permit;
         let result = operation(&|| tx.is_closed());
