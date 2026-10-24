@@ -1698,25 +1698,31 @@ pub(crate) struct DiskBlockingQueue {
     lanes: [DiskBlockingQueueLane; 3],
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiskBlockingWorkerState {
+    Submitted,
+    Running,
+    Retired,
+}
+
 struct DiskBlockingWorkerGuard {
     queue: Arc<DiskBlockingQueue>,
     lane: DiskBlockingLane,
-    started: bool,
-    disarmed: bool,
+    state: DiskBlockingWorkerState,
 }
 
 impl Drop for DiskBlockingWorkerGuard {
     fn drop(&mut self) {
         #[cfg(any(test, feature = "test-util"))]
-        if self.started {
+        if self.state != DiskBlockingWorkerState::Submitted {
             CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
                 let _ = slot.borrow_mut().take();
             });
         }
-        if self.disarmed {
+        if self.state == DiskBlockingWorkerState::Retired {
             return;
         }
-        if !self.started {
+        if self.state == DiskBlockingWorkerState::Submitted {
             let cancelled = {
                 let mut state = self.queue.lane(self.lane).state.lock();
                 state.active_workers = state.active_workers.saturating_sub(1);
@@ -1818,8 +1824,7 @@ impl DiskBlockingQueue {
         let guard = DiskBlockingWorkerGuard {
             queue: Arc::clone(&queue),
             lane,
-            started: false,
-            disarmed: false,
+            state: DiskBlockingWorkerState::Submitted,
         };
         let worker = move || {
             let mut guard = guard;
@@ -1827,14 +1832,15 @@ impl DiskBlockingQueue {
             CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
                 *slot.borrow_mut() = Some((Arc::clone(&queue), lane));
             });
-            guard.started = true;
+            guard.state = DiskBlockingWorkerState::Running;
             let mut remaining_jobs = MAX_BLOCKING_JOBS_PER_WORKER;
+            let mut idle_polled = false;
             loop {
                 let job = {
                     let mut state = queue.lane(lane).state.lock();
-                    if state.active_workers > queue.effective_max_workers(&state) {
-                        state.active_workers -= 1;
-                        guard.disarmed = true;
+                    if state.active_workers > queue.effective_max_workers(&state) || (idle_polled && state.jobs.is_empty()) {
+                        state.active_workers = state.active_workers.saturating_sub(1);
+                        guard.state = DiskBlockingWorkerState::Retired;
                         return;
                     }
                     let job = state.jobs.pop_front();
@@ -1850,42 +1856,20 @@ impl DiskBlockingQueue {
                     if remaining_jobs == 0 {
                         return;
                     }
-                    continue;
-                }
-                for i in 0..WORKER_IDLE_SPIN_ITERS {
-                    if queue.lane(lane).ready.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
+                    idle_polled = false;
+                } else {
+                    for i in 0..WORKER_IDLE_SPIN_ITERS {
+                        if queue.lane(lane).ready.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        if i & 15 == 15 {
+                            std::thread::yield_now();
+                        } else {
+                            std::hint::spin_loop();
+                        }
                     }
-                    if i & 15 == 15 {
-                        std::thread::yield_now();
-                    } else {
-                        std::hint::spin_loop();
-                    }
-                }
-                let Some(job) = ({
-                    let mut state = queue.lane(lane).state.lock();
-                    if state.active_workers > queue.effective_max_workers(&state) {
-                        state.active_workers -= 1;
-                        guard.disarmed = true;
-                        None
-                    } else if let Some(job) = state.jobs.pop_front() {
-                        queue
-                            .lane(lane)
-                            .ready
-                            .store(!state.jobs.is_empty(), std::sync::atomic::Ordering::Relaxed);
-                        Some(job)
-                    } else {
-                        state.active_workers = state.active_workers.saturating_sub(1);
-                        guard.disarmed = true;
-                        None
-                    }
-                }) else {
-                    return;
-                };
-                job();
-                remaining_jobs -= 1;
-                if remaining_jobs == 0 {
-                    return;
+                    // Recheck and retire under the same mutex used by enqueue.
+                    idle_polled = true;
                 }
             }
         };
