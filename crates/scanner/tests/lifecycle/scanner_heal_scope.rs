@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use rustfs_filemeta::{FileInfo, FileMeta};
-use rustfs_heal_contracts::heal_channel::{HealAdmissionResult, HealChannelCommand, HealRequestSource, init_heal_channel};
+use rustfs_heal_contracts::heal_channel::{
+    HealAdmissionReceipt, HealAdmissionResult, HealReceiptCommand, HealRequestSource, init_heal_channels,
+};
 use rustfs_scanner::DataUsageCacheSource;
 use rustfs_scanner::scanner_folder::ScannerItem;
 use rustfs_scanner::scanner_io::ScannerIODisk;
@@ -45,14 +47,17 @@ fn scanner_object_requests_bind_the_actual_disk_scope() {
 }
 
 async fn check_scanner_object_scope() {
-    let mut commands = init_heal_channel().expect("initialize isolated scanner request channel");
+    let (_commands, mut receipts) = init_heal_channels().expect("initialize isolated scanner request channels");
     let (captured, mut requests) = mpsc::unbounded_channel();
     let responder = tokio::spawn(async move {
-        while let Some(command) = commands.recv().await {
-            if let HealChannelCommand::Start { request, response_tx } = command {
-                captured.send(request).expect("retain scanner request");
-                let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
-            }
+        while let Some(command) = receipts.recv().await {
+            let HealReceiptCommand { request, response_tx } = command;
+            let receipt = HealAdmissionReceipt {
+                result: HealAdmissionResult::Accepted,
+                task_id: request.id.clone(),
+            };
+            captured.send(request).expect("retain scanner request");
+            let _ = response_tx.send(Ok(receipt));
         }
     });
 
