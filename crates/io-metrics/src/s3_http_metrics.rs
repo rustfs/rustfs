@@ -15,6 +15,12 @@
 //! External S3 HTTP outcomes, including requests rejected before S3 dispatch.
 //! Admin snapshots and metric exporters share these counters. The older
 //! operation counter counts handler entries and is not an HTTP denominator.
+//!
+//! Entry-to-dispatch wall time starts at the external request guard and ends
+//! at its first typed S3 dispatch, or at response/error/cancellation when no
+//! operation was dispatched. It includes authentication, parsing and scheduler
+//! waits within that boundary; it is not pure queue time or body-stream time.
+//! Timing is enabled only when the general metrics gate is on at entry.
 
 use rustfs_s3_ops::S3Operation;
 use std::cell::Cell;
@@ -31,6 +37,7 @@ pub type S3HttpCompletionObserverEnabled = fn() -> bool;
 
 const METRIC: &str = "rustfs_s3_http_requests_total";
 const LOCK_FAILURE_METRIC: &str = "rustfs_s3_lock_failures_total";
+const ENTRY_TO_DISPATCH_METRIC: &str = "rustfs_s3_http_entry_to_dispatch_duration_seconds";
 const METHODS: [&str; 10] = [
     "GET", "PUT", "POST", "DELETE", "HEAD", "OPTIONS", "PATCH", "CONNECT", "TRACE", "OTHER",
 ];
@@ -63,7 +70,7 @@ pub fn current_s3_http_operation_context() -> Option<S3HttpOperationContext> {
     }
     CURRENT_OPERATION
         .try_with(|current| {
-            let index = current.get();
+            let index = current.get().operation;
             S3Operation::ALL.get(index).copied().map(S3HttpOperationContext)
         })
         .ok()
@@ -85,7 +92,9 @@ where
             #[cfg(feature = "diagnostic-read-version-caller")]
             return with_isolated_s3_http_operation_context(Some(context), future).await;
             #[cfg(not(feature = "diagnostic-read-version-caller"))]
-            CURRENT_OPERATION.scope(Cell::new(context.operation_index()), future).await
+            CURRENT_OPERATION
+                .scope(Cell::new(RequestScopeState::operation_only(context.operation_index())), future)
+                .await
         }
         None => future.await,
     }
@@ -102,7 +111,11 @@ where
     ISOLATED_OPERATION
         .scope(Cell::new(index), async {
             match context {
-                Some(context) => CURRENT_OPERATION.scope(Cell::new(context.operation_index()), future).await,
+                Some(context) => {
+                    CURRENT_OPERATION
+                        .scope(Cell::new(RequestScopeState::operation_only(context.operation_index())), future)
+                        .await
+                }
                 None => future.await,
             }
         })
@@ -114,8 +127,24 @@ tokio::task_local! {
     static ISOLATED_OPERATION: Cell<usize>;
 }
 
+#[derive(Clone, Copy)]
+struct RequestScopeState {
+    operation: usize,
+    entry_started: Option<Instant>,
+}
+
+impl RequestScopeState {
+    // A child operation carries identity, never ownership of its parent's timer.
+    fn operation_only(operation: usize) -> Self {
+        Self {
+            operation,
+            entry_started: None,
+        }
+    }
+}
+
 tokio::task_local! {
-    static CURRENT_OPERATION: Cell<usize>;
+    static CURRENT_OPERATION: Cell<RequestScopeState>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,12 +208,19 @@ fn operation_label(index: usize) -> &'static str {
     S3Operation::ALL.get(index).map_or("unknown", |op| op.as_str())
 }
 
-pub(crate) fn observe_s3_http_operation(op: S3Operation) {
+/// Set the request's first dispatched operation without counting another handler entry.
+pub fn observe_s3_http_operation(op: S3Operation) {
     let _ = CURRENT_OPERATION.try_with(|current| {
         // Internal operations must not overwrite the external request's first
         // dispatched operation. No task-local scope means non-HTTP work.
-        if current.get() == UNKNOWN_OPERATION {
-            current.set(op.metric_index());
+        let mut state = current.get();
+        if state.operation == UNKNOWN_OPERATION {
+            state.operation = op.metric_index();
+            let started = state.entry_started.take();
+            current.set(state);
+            if let Some(started) = started {
+                record_entry_to_dispatch(op.metric_index(), "dispatched", started);
+            }
         }
     });
 }
@@ -195,7 +231,7 @@ pub fn record_s3_http_lock_failure(resource_class: &'static str, mode: &'static 
     let _ = CURRENT_OPERATION.try_with(|current| {
         counter!(
             LOCK_FAILURE_METRIC,
-            "op" => operation_label(current.get()),
+            "op" => operation_label(current.get().operation),
             "resource_class" => resource_class,
             "mode" => mode,
             "reason" => reason
@@ -212,9 +248,16 @@ pub struct S3HttpRequestGuard {
     operation: usize,
     completion: Option<(S3HttpCompletionObserver, Instant)>,
     finished: bool,
+    entry_started: Option<Instant>,
 }
 
 impl S3HttpRequestGuard {
+    /// First typed external operation seen so far, including after a pending
+    /// service poll. This does not finish or transfer HTTP outcome accounting.
+    pub fn operation(&self) -> Option<S3Operation> {
+        S3Operation::ALL.get(self.operation).copied()
+    }
+
     pub fn is_active() -> bool {
         CURRENT_OPERATION.try_with(|_| ()).is_ok()
     }
@@ -225,8 +268,9 @@ impl S3HttpRequestGuard {
             operation: UNKNOWN_OPERATION,
             completion: COMPLETION_OBSERVER
                 .get()
-                .and_then(|(enabled, observer)| enabled().then_some((*observer, Instant::now()))),
+                .and_then(|(enabled, observer)| enabled().then(|| (*observer, Instant::now()))),
             finished: false,
+            entry_started: crate::metrics_enabled().then(Instant::now),
         }
     }
 
@@ -240,10 +284,23 @@ impl S3HttpRequestGuard {
     /// Attribute existing operation instrumentation without changing S3
     /// handlers or propagating metric labels through storage/RPC contracts.
     pub fn in_scope<T>(&mut self, f: impl FnOnce() -> T) -> T {
-        CURRENT_OPERATION.sync_scope(Cell::new(self.operation), || {
-            let result = f();
-            self.operation = CURRENT_OPERATION.with(Cell::get);
-            result
+        // Copy back even while unwinding: a dispatch already consumed this
+        // entry timer and must not be emitted again by the outer drop guard.
+        struct CopyBack<'a>(&'a mut S3HttpRequestGuard);
+        impl Drop for CopyBack<'_> {
+            fn drop(&mut self) {
+                let state = CURRENT_OPERATION.with(Cell::get);
+                self.0.operation = state.operation;
+                self.0.entry_started = state.entry_started;
+            }
+        }
+        let state = RequestScopeState {
+            operation: self.operation,
+            entry_started: self.entry_started,
+        };
+        CURRENT_OPERATION.sync_scope(Cell::new(state), || {
+            let _copy_back = CopyBack(self);
+            f()
         })
     }
 
@@ -261,6 +318,9 @@ impl S3HttpRequestGuard {
 
     fn finish(&mut self, outcome: usize) {
         if !self.finished {
+            if let Some(started) = self.entry_started.take() {
+                record_entry_to_dispatch(UNKNOWN_OPERATION, OUTCOMES[outcome], started);
+            }
             COUNTERS.record(self.method, self.operation, outcome);
             if let Some(((observer, started_at), operation)) = self.completion.take().zip(S3Operation::ALL.get(self.operation)) {
                 observer(*operation, started_at.elapsed(), outcome == 1);
@@ -268,6 +328,13 @@ impl S3HttpRequestGuard {
             self.finished = true;
         }
     }
+}
+
+fn record_entry_to_dispatch(operation: usize, outcome: &'static str, started: Instant) {
+    // The entry gate owns this sample. A later gate change must neither lose an
+    // enabled request nor start timing an already-running disabled request.
+    histogram!(ENTRY_TO_DISPATCH_METRIC, "op" => operation_label(operation), "outcome" => outcome)
+        .record(started.elapsed().as_secs_f64());
 }
 
 pub fn install_s3_http_completion_observer(enabled: S3HttpCompletionObserverEnabled, observer: S3HttpCompletionObserver) {
@@ -289,6 +356,278 @@ mod tests {
     use super::*;
     use metrics::with_local_recorder;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    use crate::tests::METRICS_FLAG_LOCK;
+    use std::collections::BTreeMap;
+
+    struct RestoreMetricsGate(bool);
+
+    impl Drop for RestoreMetricsGate {
+        fn drop(&mut self) {
+            crate::set_metrics_enabled(self.0);
+        }
+    }
+
+    fn entry_samples(recorder: &DebuggingRecorder) -> BTreeMap<(String, String), Vec<f64>> {
+        recorder
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == ENTRY_TO_DISPATCH_METRIC)
+            .map(|(key, _, _, value)| {
+                let labels: BTreeMap<_, _> = key.key().labels().map(|label| (label.key(), label.value())).collect();
+                assert_eq!(labels.keys().copied().collect::<Vec<_>>(), ["op", "outcome"]);
+                let DebugValue::Histogram(samples) = value else {
+                    panic!("entry-to-dispatch metric must be a histogram");
+                };
+                (
+                    (labels["op"].to_owned(), labels["outcome"].to_owned()),
+                    samples.into_iter().map(|sample| sample.0).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn entry_to_dispatch_stops_at_first_typed_dispatch_across_polls() {
+        let _lock = METRICS_FLAG_LOCK.lock().expect("metrics gate lock");
+        let _restore = RestoreMetricsGate(crate::metrics_enabled());
+        let recorder = DebuggingRecorder::new();
+        with_local_recorder(&recorder, || {
+            crate::set_metrics_enabled(true);
+            let mut request = S3HttpRequestGuard::new("PUT");
+            let started = Instant::now() - Duration::from_secs(2);
+            request.entry_started = Some(started);
+            request.in_scope(|| assert_eq!(current_s3_http_operation_context(), None));
+            assert_eq!(request.entry_started, Some(started));
+            assert!(entry_samples(&recorder).is_empty());
+            request.in_scope(|| {
+                observe_s3_http_operation(S3Operation::PutObject);
+                observe_s3_http_operation(S3Operation::GetObject);
+            });
+            assert!(request.entry_started.is_none());
+            let dispatched = entry_samples(&recorder);
+            assert_eq!(dispatched.len(), 1);
+            let samples = &dispatched[&("s3:PutObject".to_owned(), "dispatched".to_owned())];
+            assert_eq!(samples.len(), 1);
+            assert!(samples[0] >= 2.0, "wall time must include pre-dispatch polls");
+            request.in_scope(|| observe_s3_http_operation(S3Operation::DeleteObject));
+            request.response(200);
+            request.service_error();
+            drop(request);
+            // DebuggingRecorder drains histogram samples on snapshot. The
+            // dispatch snapshot above held exactly one sample; completion must
+            // not produce another sample after that drain. Empty registered
+            // series remain in the snapshot and are not additional samples.
+            assert!(
+                entry_samples(&recorder).values().all(Vec::is_empty),
+                "completion cannot extend or duplicate dispatch timing"
+            );
+        });
+    }
+
+    #[test]
+    fn entry_to_dispatch_records_undispatched_response_error_and_drop_once() {
+        let _lock = METRICS_FLAG_LOCK.lock().expect("metrics gate lock");
+        let _restore = RestoreMetricsGate(crate::metrics_enabled());
+        let recorder = DebuggingRecorder::new();
+        with_local_recorder(&recorder, || {
+            crate::set_metrics_enabled(true);
+            let mut rejected = S3HttpRequestGuard::new("GET");
+            rejected.in_scope(|| assert!(S3HttpRequestGuard::is_active()));
+            rejected.response(403);
+            rejected.service_error();
+            drop(rejected);
+            let mut failed = S3HttpRequestGuard::new("DELETE");
+            failed.service_error();
+            failed.response(500);
+            drop(failed);
+            drop(S3HttpRequestGuard::new("POST"));
+        });
+        let samples = entry_samples(&recorder);
+        assert_eq!(samples.len(), 3);
+        for outcome in ["4xx", "service_error", "cancelled"] {
+            let row = &samples[&("unknown".to_owned(), outcome.to_owned())];
+            assert_eq!(row.len(), 1, "{outcome} must be terminal exactly once");
+            assert!(row[0].is_finite() && row[0] >= 0.0);
+        }
+    }
+
+    #[test]
+    fn entry_to_dispatch_captures_gate_at_entry() {
+        let _lock = METRICS_FLAG_LOCK.lock().expect("metrics gate lock");
+        let _restore = RestoreMetricsGate(crate::metrics_enabled());
+        let recorder = DebuggingRecorder::new();
+        with_local_recorder(&recorder, || {
+            crate::set_metrics_enabled(false);
+            let mut disabled = S3HttpRequestGuard::new("GET");
+            assert!(disabled.entry_started.is_none(), "disabled entry must not read the clock");
+            crate::set_metrics_enabled(true);
+            disabled.in_scope(|| observe_s3_http_operation(S3Operation::GetObject));
+            disabled.response(200);
+            assert!(entry_samples(&recorder).is_empty(), "enabling mid-request cannot create a partial sample");
+            let mut dispatched = S3HttpRequestGuard::new("PUT");
+            let mut undispatched = S3HttpRequestGuard::new("DELETE");
+            crate::set_metrics_enabled(false);
+            dispatched.in_scope(|| observe_s3_http_operation(S3Operation::PutObject));
+            dispatched.response(204);
+            undispatched.response(503);
+        });
+        let samples = entry_samples(&recorder);
+        assert_eq!(samples.len(), 2, "disabling mid-request must preserve both enabled entry samples");
+        assert_eq!(samples[&("s3:PutObject".to_owned(), "dispatched".to_owned())].len(), 1);
+        assert_eq!(samples[&("unknown".to_owned(), "5xx".to_owned())].len(), 1);
+    }
+
+    #[test]
+    fn entry_to_dispatch_nested_disabled_request_does_not_consume_outer_timer() {
+        let _lock = METRICS_FLAG_LOCK.lock().expect("metrics gate lock");
+        let _restore = RestoreMetricsGate(crate::metrics_enabled());
+        let recorder = DebuggingRecorder::new();
+        with_local_recorder(&recorder, || {
+            crate::set_metrics_enabled(true);
+            let mut outer = S3HttpRequestGuard::new("PUT");
+            let outer_started = outer.entry_started;
+            outer.in_scope(|| {
+                crate::set_metrics_enabled(false);
+                let mut inner = S3HttpRequestGuard::new("GET");
+                inner.in_scope(|| observe_s3_http_operation(S3Operation::GetObject));
+                inner.response(200);
+                let current = CURRENT_OPERATION.with(Cell::get);
+                assert_eq!(current.operation, UNKNOWN_OPERATION);
+                assert_eq!(current.entry_started, outer_started);
+                observe_s3_http_operation(S3Operation::PutObject);
+            });
+            outer.response(204);
+        });
+        let samples = entry_samples(&recorder);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[&("s3:PutObject".to_owned(), "dispatched".to_owned())].len(), 1);
+    }
+
+    #[test]
+    fn entry_to_dispatch_nested_unwind_consumes_each_timer_once() {
+        let _lock = METRICS_FLAG_LOCK.lock().expect("metrics gate lock");
+        let _restore = RestoreMetricsGate(crate::metrics_enabled());
+        let recorder = DebuggingRecorder::new();
+        with_local_recorder(&recorder, || {
+            crate::set_metrics_enabled(true);
+            let mut outer = S3HttpRequestGuard::new("PUT");
+            outer.in_scope(|| {
+                let failed = std::panic::catch_unwind(|| {
+                    let mut inner = S3HttpRequestGuard::new("GET");
+                    inner.in_scope(|| {
+                        observe_s3_http_operation(S3Operation::GetObject);
+                        panic!("dispatch then unwind");
+                    });
+                });
+                assert!(failed.is_err());
+                assert_eq!(current_s3_http_operation_context(), None, "outer operation must be restored");
+                assert!(CURRENT_OPERATION.with(Cell::get).entry_started.is_some());
+                observe_s3_http_operation(S3Operation::PutObject);
+            });
+            outer.response(200);
+            assert!(!S3HttpRequestGuard::is_active());
+        });
+        let samples = entry_samples(&recorder);
+        assert_eq!(samples.len(), 2, "unwinding cannot emit a second unknown/cancelled sample");
+        for op in ["s3:GetObject", "s3:PutObject"] {
+            assert_eq!(samples[&(op.to_owned(), "dispatched".to_owned())].len(), 1);
+        }
+    }
+
+    #[test]
+    fn entry_to_dispatch_child_context_carries_no_parent_timer() {
+        let _lock = METRICS_FLAG_LOCK.lock().expect("metrics gate lock");
+        let _restore = RestoreMetricsGate(crate::metrics_enabled());
+        let recorder = DebuggingRecorder::new();
+        with_local_recorder(&recorder, || {
+            crate::set_metrics_enabled(true);
+            let mut origin = S3HttpRequestGuard::new("GET");
+            let context = origin.in_scope(|| {
+                observe_s3_http_operation(S3Operation::GetObject);
+                current_s3_http_operation_context().expect("typed origin operation")
+            });
+            origin.response(200);
+            let mut outer = S3HttpRequestGuard::new("PUT");
+            outer.in_scope(|| {
+                let outer_started = CURRENT_OPERATION.with(Cell::get).entry_started;
+                let mut child = std::pin::pin!(with_s3_http_operation_context(Some(context), async {
+                    assert_eq!(current_s3_http_operation_name(), Some("s3:GetObject"));
+                    assert!(CURRENT_OPERATION.with(Cell::get).entry_started.is_none());
+                    observe_s3_http_operation(S3Operation::DeleteObject);
+                }));
+                assert!(
+                    child
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                        .is_ready()
+                );
+                assert_eq!(CURRENT_OPERATION.with(Cell::get).entry_started, outer_started);
+                observe_s3_http_operation(S3Operation::PutObject);
+            });
+            outer.response(200);
+        });
+        let samples = entry_samples(&recorder);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[&("s3:GetObject".to_owned(), "dispatched".to_owned())].len(), 1);
+        assert_eq!(samples[&("s3:PutObject".to_owned(), "dispatched".to_owned())].len(), 1);
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[test]
+    fn entry_to_dispatch_absent_operation_scope_preserves_ambient_timer_across_polls() {
+        let _lock = METRICS_FLAG_LOCK.lock().expect("metrics gate lock");
+        let _restore = RestoreMetricsGate(crate::metrics_enabled());
+        let recorder = DebuggingRecorder::new();
+        with_local_recorder(&recorder, || {
+            crate::set_metrics_enabled(true);
+            let mut request = S3HttpRequestGuard::new("PUT");
+            let started = request.entry_started;
+            let mut polls = 0;
+            let mut isolated = Box::pin(with_isolated_s3_http_operation_context(
+                None,
+                std::future::poll_fn(|_| {
+                    polls += 1;
+                    assert_eq!(current_s3_http_operation_context(), None);
+                    assert!(S3HttpRequestGuard::is_active());
+                    let ambient = CURRENT_OPERATION.with(Cell::get);
+                    assert_eq!(ambient.operation, UNKNOWN_OPERATION);
+                    assert_eq!(ambient.entry_started, started);
+                    if polls == 1 {
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(17)
+                    }
+                }),
+            ));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            request.in_scope(|| assert!(isolated.as_mut().poll(&mut cx).is_pending()));
+            assert_eq!(request.entry_started, started);
+            assert!(entry_samples(&recorder).is_empty());
+            request.in_scope(|| assert_eq!(isolated.as_mut().poll(&mut cx), std::task::Poll::Ready(17)));
+            drop(isolated);
+            assert_eq!(polls, 2);
+            assert_eq!(request.entry_started, started);
+            assert!(
+                ISOLATED_OPERATION.try_with(Cell::get).is_err(),
+                "absence scope must restore its task local"
+            );
+            assert!(
+                entry_samples(&recorder).is_empty(),
+                "the absence scope itself cannot consume the ambient timer"
+            );
+            request.in_scope(|| {
+                observe_s3_http_operation(S3Operation::PutObject);
+                observe_s3_http_operation(S3Operation::GetObject);
+            });
+            request.response(200);
+        });
+        let samples = entry_samples(&recorder);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[&("s3:PutObject".to_owned(), "dispatched".to_owned())].len(), 1);
+    }
 
     #[test]
     fn completion_observer_sees_each_dispatched_request_once() {
@@ -333,6 +672,23 @@ mod tests {
         .expect("child task should finish");
 
         assert_eq!(child_operation, Some("s3:GetObject"));
+    }
+
+    #[test]
+    fn observing_dispatch_does_not_count_a_second_handler_entry() {
+        let _lock = METRICS_FLAG_LOCK.lock().expect("metrics gate lock");
+        let _restore = RestoreMetricsGate(crate::metrics_enabled());
+        crate::set_metrics_enabled(false);
+        let recorder = DebuggingRecorder::new();
+        let mut request = S3HttpRequestGuard::new("PUT");
+        with_local_recorder(&recorder, || {
+            request.in_scope(|| {
+                observe_s3_http_operation(S3Operation::CreateBucket);
+                observe_s3_http_operation(S3Operation::DeleteBucket);
+                assert_eq!(current_s3_http_operation_name(), Some("s3:CreateBucket"));
+            });
+        });
+        assert!(recorder.snapshotter().snapshot().into_vec().is_empty());
     }
 
     #[test]

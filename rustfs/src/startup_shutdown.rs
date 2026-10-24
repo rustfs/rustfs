@@ -248,12 +248,12 @@ pub(crate) struct StartupBackgroundTasks {
 pub(crate) async fn run_startup_shutdown_sequence(
     state_manager: &ServiceStateManager,
     shutdown_signal: ShutdownSignal,
-    listener_shutdown_handles: (Option<ShutdownHandle>, Option<ShutdownHandle>),
+    s3_shutdown_handle: Option<ShutdownHandle>,
+    console_shutdown_handle: Option<ShutdownHandle>,
     optional_runtimes: OptionalRuntimeServices,
     background_tasks: StartupBackgroundTasks,
     ctx: CancellationToken,
-) -> std::io::Result<()> {
-    let (s3_shutdown_handle, console_shutdown_handle) = listener_shutdown_handles;
+) {
     let StartupBackgroundTasks {
         capacity: capacity_tasks,
         table_maintenance,
@@ -494,7 +494,6 @@ pub(crate) async fn run_startup_shutdown_sequence(
         state = "stopped",
         "RustFS server stopped"
     );
-    Ok(())
 }
 
 async fn run_embedded_runtime_cleanup(mut cleanup: EmbeddedRuntimeCleanup) {

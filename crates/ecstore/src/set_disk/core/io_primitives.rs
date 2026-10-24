@@ -5248,6 +5248,8 @@ impl SetDisks {
                         transaction_parts.insert(part_number);
                     }
                 }
+                // UploadPart creates this directory; an empty upload has no transactions to recover.
+                Err(DiskError::FileNotFound) => errs.push(None),
                 Err(err) => errs.push(Some(err)),
             }
         }
@@ -12831,7 +12833,7 @@ mod tests {
             ScannerPublicationCommitScope, ScannerPublicationCommitScopeGuard, ScannerPublicationCommitState,
         };
         use crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_isolated;
-        use rustfs_storage_api::BucketOperations;
+        use crate::storage_api_contracts::bucket::BucketOperations;
 
         let (_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
         let bucket = "path-delete-scanner";

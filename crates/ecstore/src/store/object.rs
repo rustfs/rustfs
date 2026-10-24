@@ -3516,9 +3516,7 @@ impl ECStore {
         ))
     }
 
-    /// Publish a native scanner replica without allowing stale pool selection
-    /// to race retirement. Failed/canceled membership repair remains permitted.
-    /// A canceled waiter cannot release publication fences from an in-flight write.
+    #[cfg(feature = "test-util")]
     pub async fn save_scanner_pause_backlog_replica(
         self: &Arc<Self>,
         pool_index: usize,
@@ -3526,6 +3524,36 @@ impl ECStore {
         data: Vec<u8>,
         preconditions: crate::storage_api_contracts::object::HTTPPreconditions,
     ) -> Result<ObjectInfo> {
+        let writable_pool_indices = self
+            .scanner_pause_backlog_writable_set_disks()
+            .await
+            .into_iter()
+            .map(|set| set.pool_index)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        self.save_scanner_pause_backlog_replica_for_membership(pool_index, set_index, data, preconditions, writable_pool_indices)
+            .await
+    }
+
+    /// Publish a native scanner replica without allowing stale pool selection
+    /// to race retirement. Failed/canceled membership repair remains permitted.
+    /// A canceled waiter cannot release publication fences from an in-flight write.
+    pub async fn save_scanner_pause_backlog_replica_for_membership(
+        self: &Arc<Self>,
+        pool_index: usize,
+        set_index: usize,
+        data: Vec<u8>,
+        preconditions: crate::storage_api_contracts::object::HTTPPreconditions,
+        writable_pool_indices: Arc<[usize]>,
+    ) -> Result<ObjectInfo> {
+        if !writable_pool_indices.contains(&pool_index) {
+            return Err(Error::InvalidArgument(
+                "scanner-backlog".into(),
+                "membership".into(),
+                "replica is outside the publication cohort".into(),
+            ));
+        }
         let set = self
             .pools
             .get(pool_index)
@@ -3550,6 +3578,9 @@ impl ECStore {
                         .await?,
                 )
             };
+            // Fence every member of the captured publication cohort. After
+            // retirement, a stale fan-out must not stabilize its old record on
+            // still-writable targets and invalidate their native rollback point.
             let capacity_guard = if let Some(guard) = object_guard.as_ref() {
                 guard.add_namespace_lock_fence(&mut opts);
                 opts.no_lock = match store.pools.first().and_then(|pool| pool.disk_set.first()) {
@@ -3557,7 +3588,10 @@ impl ECStore {
                     None => false,
                 };
                 let capacity_guard = store
-                    .acquire_external_decommission_capacity_fence(&[pool_index], DecommissionCapacityAdmission::ScannerBacklog)
+                    .acquire_external_decommission_capacity_fence(
+                        &writable_pool_indices,
+                        DecommissionCapacityAdmission::ScannerBacklog,
+                    )
                     .await?;
                 opts.add_namespace_lock_guard(&capacity_guard);
                 Some(capacity_guard)
@@ -4757,7 +4791,8 @@ impl ECStore {
 
     /// Return metadata for DELETE preflight, including an explicitly addressed
     /// delete marker. GET/HEAD may also use this metadata-only lookup to enrich
-    /// an already failed read with marker headers, never to serve marker data.
+    /// an already failed read with marker headers, never to serve marker data;
+    /// delete-marker replication uses it to confirm the source marker.
     /// Normal reads must keep using `get_object_info`; authorization and Object
     /// Lock enforcement still belong to the caller and locked delete.
     #[instrument(level = "trace", skip_all)]
@@ -5480,7 +5515,11 @@ impl ECStore {
             if opts.delete_marker && should_check_data_movement_resume_target(opts.src_pool_idx, target_pool_idx) {
                 let source = self
                     .find_data_movement_target_info(bucket, object, opts.src_pool_idx, &opts)
-                    .await?;
+                    .await;
+                #[cfg(test)]
+                let source =
+                    crate::core::pools::decommission_test_wrap_result("delete_marker_source_recheck", bucket, object, 0, source);
+                let source = source.map_err(|err| crate::data_movement::data_movement_source_read_error(bucket, object, err))?;
                 let Some(source) = source else {
                     return Err(StorageError::DataMovementOverwriteErr(
                         bucket.to_owned(),
@@ -5506,20 +5545,44 @@ impl ECStore {
                     .find_data_movement_target_info(bucket, object, target_pool_idx, &target_opts)
                     .await?;
                 if let Some(target) = target {
-                    if is_equivalent_data_movement_delete_marker(&source, &target) {
-                        if let Some(owner) = DecommissionCapacityOwner::from_options(&target_opts) {
-                            self.reconcile_decommission_capacity_after_equivalent_target(owner, target_pool_idx, 0)
-                                .await?;
-                        }
-                        let mut target = target;
-                        target.name = decode_dir_object(object);
-                        return Ok(target);
+                    if !is_equivalent_data_movement_delete_marker(&source, &target) {
+                        return Err(StorageError::DataMovementOverwriteErr(
+                            bucket.to_owned(),
+                            object.to_owned(),
+                            opts.version_id.unwrap_or_default(),
+                        ));
                     }
-                    return Err(StorageError::DataMovementOverwriteErr(
-                        bucket.to_owned(),
-                        object.to_owned(),
-                        opts.version_id.unwrap_or_default(),
-                    ));
+                    let marker_version_id = target_opts
+                        .version_id
+                        .as_deref()
+                        .ok_or_else(|| StorageError::other("data movement marker verification requires an exact version id"))?;
+                    let confirmation = self.pools[target_pool_idx]
+                        .get_disks_by_key(object)
+                        .verify_data_movement_delete_marker_write_quorum(bucket, object, marker_version_id)
+                        .await;
+                    match confirmation {
+                        Ok(()) => {
+                            if let Some(owner) = DecommissionCapacityOwner::from_options(&target_opts) {
+                                self.reconcile_decommission_capacity_after_equivalent_target(owner, target_pool_idx, 0)
+                                    .await?;
+                            }
+                            let mut target = target;
+                            target.name = decode_dir_object(object);
+                            return Ok(target);
+                        }
+                        Err(error)
+                            if matches!(error, StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _))
+                                && target_opts.version_purge_status().is_empty()
+                                && target.version_purge_status.is_empty() => {}
+                        Err(error) => return Err(error),
+                    }
+                    if let Some(owner) = DecommissionCapacityOwner::from_options(&target_opts) {
+                        self.reconcile_decommission_capacity_after_equivalent_target(owner, target_pool_idx, 0)
+                            .await?;
+                    }
+                    // An exact-version read proves only read quorum. Republish
+                    // the same marker so retries restore its write quorum before
+                    // a later latest-version lookup or source cleanup can proceed.
                 }
                 delete_marker_target_opts = Some(target_opts);
             }
@@ -8727,6 +8790,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_versioned_delete_preserves_quorum_and_legacy_backups() {
+        for (batch, offline) in [(false, false), (true, false), (false, true), (true, true)] {
+            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            let (dirs, set_disks) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[set_disks], ctx).await);
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+            let bucket = "repeated-versioned-delete-write-quorum";
+            let object = "object.bin";
+            let opts = ObjectOptions {
+                versioned: true,
+                ..Default::default()
+            };
+            store
+                .make_bucket(
+                    bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create versioned-delete fixture bucket");
+            let payload = b"historical payload survives repeated deletes";
+            let original = store
+                .put_object(bucket, object, &mut PutObjReader::from_vec(payload.to_vec()), &opts)
+                .await
+                .expect("write historical object version");
+            let first = store
+                .delete_object_with_tier_delete_journal(bucket, object, opts.clone())
+                .await
+                .expect("create first delete marker");
+            let set = store.pools[0].get_disks_by_key(object);
+            let disks = set.disks.read().await.clone();
+            let legacy = if offline {
+                set.disks.write().await[3] = None;
+                None
+            } else {
+                let transaction = Uuid::new_v4();
+                disks[3]
+                    .as_ref()
+                    .expect("fourth disk")
+                    .delete_version(
+                        bucket,
+                        object,
+                        FileInfo {
+                            name: object.to_owned(),
+                            version_id: original.version_id,
+                            ..Default::default()
+                        },
+                        false,
+                        crate::disk::DeleteOptions {
+                            old_data_dir: Some(transaction),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("leave an unrelated legacy backup behind the current marker");
+                let path = dirs[3]
+                    .path()
+                    .join(bucket)
+                    .join(object)
+                    .join(transaction.to_string())
+                    .join("xl.meta.bkp");
+                let bytes = tokio::fs::read(&path).await.expect("legacy metadata backup");
+                Some((transaction, path, bytes))
+            };
+
+            let second_id = if batch {
+                let (deleted, errors) = store
+                    .delete_objects_with_tier_delete_journal(
+                        bucket,
+                        vec![ObjectToDelete {
+                            object_name: object.to_owned(),
+                            ..Default::default()
+                        }],
+                        opts.clone(),
+                    )
+                    .await;
+                assert_eq!(errors.len(), 1);
+                assert!(errors[0].is_none(), "batch DELETE retains write quorum: {errors:?}");
+                assert!(deleted[0].delete_marker);
+                deleted[0].delete_marker_version_id
+            } else {
+                let second = store
+                    .delete_object_with_tier_delete_journal(bucket, object, opts.clone())
+                    .await
+                    .expect("repeated DELETE of a current marker must succeed at write quorum");
+                assert!(second.delete_marker);
+                second.version_id
+            };
+            assert!(first.delete_marker);
+            assert!(second_id.is_some());
+            assert_ne!(first.version_id, second_id);
+
+            for disk in disks.iter().take(3).flatten() {
+                for id in [
+                    first.version_id.expect("first marker identity"),
+                    second_id.expect("second marker identity"),
+                ] {
+                    let marker = disk
+                        .read_version(bucket, bucket, object, &id.to_string(), &crate::disk::ReadOptions::default())
+                        .await
+                        .expect("both marker versions must remain durable on a write quorum");
+                    assert!(marker.deleted);
+                    assert_eq!(marker.version_id, Some(id));
+                }
+            }
+
+            if let Some((transaction, path, bytes)) = legacy {
+                assert_eq!(tokio::fs::read(path).await.expect("legacy backup retained"), bytes);
+                let state = disks[3]
+                    .as_ref()
+                    .expect("fourth disk")
+                    .inspect_delete_transaction(bucket, object, transaction)
+                    .await
+                    .expect("inspect retained legacy backup");
+                assert_eq!(state.state, crate::disk::DeleteRecoveryState::LegacyAmbiguous);
+            }
+
+            let mut actual = Vec::new();
+            set.get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: original.version_id.map(|id| id.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("historical version remains readable at quorum")
+            .stream
+            .read_to_end(&mut actual)
+            .await
+            .expect("read historical object payload");
+            assert_eq!(actual, payload);
+            *set.disks.write().await = disks;
+        }
+    }
+
+    #[tokio::test]
     async fn versioned_delete_quorum_failure_rolls_back_and_retries_require_quorum() {
         for marker_copies in [0, 2, 4] {
             let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
@@ -8778,12 +8983,13 @@ mod tests {
                         .expect("initial metadata should exist"),
                 );
             }
-            {
-                let mut online = set.disks.write().await;
-                online[2] = None;
-                online[3] = None;
+            // Keep the health-offline handles in the set instead of exposing empty slots.
+            for disk in disks.iter().skip(2).flatten() {
+                disk.close().await.expect("stop offline disk health monitoring");
+                disk.force_offline_for_test();
             }
             for attempt in 1..=3 {
+                set.connect_disks().await;
                 let err = store
                     .handle_delete_object(bucket, object, opts.clone())
                     .await
@@ -8821,7 +9027,10 @@ mod tests {
                     }
                 }
             }
-            *set.disks.write().await = disks;
+            for disk in disks.iter().skip(2).flatten() {
+                disk.reset_health_for_store_init_retry();
+            }
+            set.connect_disks().await;
             if marker_copies != 0 {
                 continue;
             }
@@ -9888,6 +10097,63 @@ mod tests {
             .await
             .expect("create the bucket in both pools");
         (dirs, store)
+    }
+
+    // rustfs#8746: delete-marker replication confirms the source marker by
+    // version before sending; a multi-pool source must not reject that read.
+    async fn assert_replication_reads_source_delete_marker(pool_count: usize) {
+        let bucket = format!("replication-marker-read-{pool_count}");
+        let object = "deleted.bin";
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let mut dirs = Vec::new();
+        let mut sets = Vec::new();
+        for _ in 0..pool_count {
+            let (set_dirs, set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            dirs.extend(set_dirs);
+            sets.push(set);
+        }
+        let store = Arc::new(new_prepared_reader_test_store_with_ctx(&sets, ctx).await);
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        store
+            .handle_make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the versioned bucket in every pool");
+        let versioned = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        store
+            .put_object(&bucket, object, &mut PutObjReader::from_vec(b"replicated payload".to_vec()), &versioned)
+            .await
+            .expect("write the version the marker will hide");
+        let marker = store
+            .delete_object_with_tier_delete_journal(&bucket, object, versioned)
+            .await
+            .expect("an unversioned DELETE creates a delete marker");
+        assert!(marker.delete_marker);
+        let marker_version_id = marker.version_id.expect("delete marker version id");
+
+        let read = crate::bucket::replication::read_source_delete_marker(store.as_ref(), &bucket, object, marker_version_id)
+            .await
+            .unwrap_or_else(|err| panic!("{pool_count}-pool source must return its delete marker: {err:?}"));
+        assert!(read.delete_marker);
+        assert_eq!(read.version_id, Some(marker_version_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replication_reads_source_delete_marker_on_single_pool() {
+        assert_replication_reads_source_delete_marker(1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replication_reads_source_delete_marker_on_multi_pool() {
+        assert_replication_reads_source_delete_marker(2).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

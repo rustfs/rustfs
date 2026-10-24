@@ -54,9 +54,9 @@ use rustfs_data_usage::observed_data_usage_is_newer;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_lock::{NamespaceLockGuard, error::LockError};
 use rustfs_scanner_metrics::metrics::{
-    CurrentCycle, Metric, Metrics, RemoteScanProgress, ScanCyclePartialReason, ScanCycleWorkSnapshot, ScannerUsageSaveResult,
-    ScannerWorkSource, emit_scan_cycle_complete, emit_scan_cycle_deferred, emit_scan_cycle_partial_with_source,
-    emit_scan_cycle_superseded, global_metrics,
+    CurrentCycle, Metric, Metrics, RemoteScanProgress, ScanCyclePartialReason, ScanCycleWorkSnapshot,
+    ScannerUsagePublicationObservation, ScannerUsageSaveResult, ScannerWorkSource, emit_scan_cycle_complete,
+    emit_scan_cycle_deferred, emit_scan_cycle_partial_with_source, emit_scan_cycle_superseded, global_metrics,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1699,6 +1699,25 @@ async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle, cycle_metrics_guard
 struct ScannerCycleScheduling {
     requires_full_scan: bool,
     service_cohort: Option<Arc<StdMutex<crate::scanner_io::ScannerServiceCohort>>>,
+    /// Receives the reason when a `Complete` cycle walked every bucket in
+    /// place of an eligible dirty-bucket scope.
+    scope_fallback: Option<Arc<ScannerScopeFallbackSlot>>,
+}
+
+/// Hand-off from a cycle to the leader loop: while dirty buckets remain after
+/// a full-namespace fallback, the next cycle is paced by a bounded retry
+/// schedule, not by the immediate dirty-usage wake that scoped cycles use.
+#[derive(Debug, Default)]
+struct ScannerScopeFallbackSlot(StdMutex<Option<crate::scanner_io::ScannerScopeFallbackReason>>);
+
+impl ScannerScopeFallbackSlot {
+    fn set(&self, reason: Option<crate::scanner_io::ScannerScopeFallbackReason>) {
+        *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = reason;
+    }
+
+    fn take(&self) -> Option<crate::scanner_io::ScannerScopeFallbackReason> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+    }
 }
 
 #[cfg(test)]
@@ -1723,6 +1742,7 @@ where
         ScannerCycleScheduling {
             requires_full_scan: true,
             service_cohort: None,
+            scope_fallback: None,
         },
     )
     .await
@@ -1773,7 +1793,8 @@ where
     let now = Instant::now();
     cycle_info.started = Utc::now();
 
-    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone(), cycle_budget.remote_scan_progress()).await;
+    let mut cycle_metrics_guard =
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), leader_epoch, cycle_budget.remote_scan_progress()).await;
 
     // Refresh the storage-owned movement snapshot before reading background
     // heal state. A missing heal object yields an in-memory default; do not
@@ -1918,6 +1939,14 @@ where
         },
     )
     .await;
+    if let Some(slot) = &scheduling.scope_fallback {
+        slot.set(
+            scan_result
+                .as_ref()
+                .ok()
+                .and_then(ScannerCycleResult::completed_scope_fallback),
+        );
+    }
     let publication_plan = scan_result
         .as_ref()
         .map(ScannerCyclePublicationPlan::for_result)
@@ -2246,6 +2275,14 @@ where
         mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Failed;
     }
+    cycle_metrics_guard
+        .publication
+        .record(usage_publication_result.observation_for_attempt(
+            leader_epoch,
+            cycle_info.current,
+            !scan_cycle_result.has_usage_update(),
+            usage_persist_outcome,
+        ));
     let required_cycle_floor = scan_cycle_result.required_cycle_floor();
     let pre_commit_outcome = scanner_cycle_pre_commit_outcome(required_cycle_floor, &usage_persist_outcome);
     update_scanner_cache_cycle_recovery_status(
@@ -2613,21 +2650,25 @@ where
 
 struct ScannerCycleMetricsGuard {
     start: Option<ScanCycleWorkSnapshot>,
+    publication: Arc<ScannerUsagePublicationObservation>,
 }
 
 impl ScannerCycleMetricsGuard {
-    async fn new(cycle: CurrentCycle, remote_progress: Arc<RemoteScanProgress>) -> Self {
+    async fn new(cycle: CurrentCycle, leader_epoch: u64, remote_progress: Arc<RemoteScanProgress>) -> Self {
+        let publication = Arc::new(ScannerUsagePublicationObservation::new(leader_epoch, cycle.current));
         Self {
             start: Some(
                 global_metrics()
-                    .start_scan_cycle_work_with_cycle_and_remote_progress(cycle, remote_progress)
+                    .start_scan_cycle_work_with_publication(cycle, remote_progress, publication.clone())
                     .await,
             ),
+            publication,
         }
     }
 
     async fn finish(&mut self, cycle: CurrentCycle) {
         if let Some(start) = self.start {
+            self.publication.finish();
             global_metrics().finish_scan_cycle_work_with_cycle(start, cycle).await;
             self.start = None;
         }
@@ -2637,6 +2678,7 @@ impl ScannerCycleMetricsGuard {
 impl Drop for ScannerCycleMetricsGuard {
     fn drop(&mut self) {
         if let Some(start) = self.start.take() {
+            self.publication.interrupt();
             global_metrics().finish_scan_cycle_work(start);
         }
     }
@@ -2844,6 +2886,8 @@ where
     let mut clean_idle_backoff = ScannerCleanIdleBackoff::default();
     let mut superseded_backoff = ScannerRetryBackoff::default();
     let mut deferred_backoff = ScannerRetryBackoff::default();
+    let mut scope_fallback_backoff = ScannerRetryBackoff::default();
+    let scope_fallback_slot = Arc::new(ScannerScopeFallbackSlot::default());
     let service_cohort = Arc::new(StdMutex::new(crate::scanner_io::ScannerServiceCohort::default()));
     let initial_runtime_config = resolve_scanner_runtime_config();
     if clean_idle_topology_supported && maintenance_generation_seen.is_none() {
@@ -2893,7 +2937,25 @@ where
                 return Err(err);
             }
         };
-    let (usage_floor, usage_floor_startup) = match persisted_usage_floor_for_startup(storeapi.clone(), true).await {
+    let mut usage_floor_result = persisted_usage_floor_for_startup(storeapi.clone(), true).await;
+    if usage_floor_result.is_err() {
+        match recover_dual_corrupt_scanner_state(storeapi.clone(), &cycle_revision, || {
+            !ctx.is_cancelled() && !guard.is_lock_lost()
+        })
+        .await
+        {
+            Ok(Some((cycle, epoch, revision))) => {
+                cycle_info = cycle;
+                leader_epoch = epoch;
+                cycle_revision = revision;
+                rebuild_from_quarantine = true;
+                usage_floor_result = persisted_usage_floor_for_startup(storeapi.clone(), true).await;
+            }
+            Ok(None) => {}
+            Err(err) => usage_floor_result = Err(err),
+        }
+    }
+    let (usage_floor, usage_floor_startup) = match usage_floor_result {
         Ok(result) => result,
         Err(err) => {
             let error = err.to_string();
@@ -3065,6 +3127,7 @@ where
         }
         let cycle_ctx = ctx.child_token();
         let cycle_budget = ScannerCycleBudget::new_with_runtime_progress_tracking(&cycle_ctx, scanner_cycle_budget_config());
+        record_scanner_cycle_attempt(None);
         let initial_outcome = match await_scanner_cycle_with_budget_fence(
             &cycle_ctx,
             &cycle_budget,
@@ -3078,6 +3141,7 @@ where
                 ScannerCycleScheduling {
                     requires_full_scan: true,
                     service_cohort: Some(service_cohort.clone()),
+                    scope_fallback: None,
                 },
             ),
             guard.lock_lost_notified(),
@@ -3225,7 +3289,10 @@ where
         let superseded_retry_interval =
             scanner_superseded_retry_interval(superseded_backoff, &runtime_config, maintenance_features);
         let deferred_retry_interval = deferred_backoff.retry_interval(runtime_config.cycle_interval);
-        let mut convergence_retry_interval = superseded_retry_interval.or(deferred_retry_interval);
+        let scope_fallback_retry_interval = scanner_scope_fallback_retry_interval(scope_fallback_backoff, &runtime_config);
+        let mut convergence_retry_interval = superseded_retry_interval
+            .or(scope_fallback_retry_interval)
+            .or(deferred_retry_interval);
         if let Some(retry_interval) = convergence_retry_interval {
             wait_plan.effective_interval = retry_interval;
             wait_plan.delay = randomized_cycle_delay_for(retry_interval).min(retry_interval);
@@ -3265,6 +3332,8 @@ where
             superseded_cycles = superseded_backoff.consecutive_cycles,
             deferred_retry_backoff_enabled = deferred_retry_interval.is_some(),
             deferred_cycles = deferred_backoff.consecutive_cycles,
+            scope_fallback_retry_backoff_enabled = scope_fallback_retry_interval.is_some(),
+            scope_fallback_cycles = scope_fallback_backoff.consecutive_cycles,
             lifecycle_active = maintenance_features.lifecycle,
             replication_active = maintenance_features.replication,
             feature_inspection_failed = maintenance_features.inspection_failed,
@@ -3299,6 +3368,7 @@ where
             || probe_scanner_activity(storeapi.as_ref(), distributed),
         )
         .await;
+        record_scanner_cycle_wakeup(wake_reason);
         scanner_activity_backoff_blocked =
             scanner_activity_backoff_blocked_after_wake(scanner_activity_backoff_blocked, wake_reason);
         match wake_reason {
@@ -3387,6 +3457,7 @@ where
         let dirty_generation_before_cycle = dirty_usage_generation();
         let cycle_ctx = ctx.child_token();
         let cycle_budget = ScannerCycleBudget::new_with_runtime_progress_tracking(&cycle_ctx, scanner_cycle_budget_config());
+        record_scanner_cycle_attempt(Some(wake_reason));
         let outcome = match await_scanner_cycle_with_budget_fence(
             &cycle_ctx,
             &cycle_budget,
@@ -3404,9 +3475,10 @@ where
                         maintenance_generation_seen,
                         scanner_maintenance_generation(),
                         wake_reason,
-                        superseded_retry_interval.is_some(),
+                        superseded_retry_interval.is_some() || scope_fallback_retry_interval.is_some(),
                     ),
                     service_cohort: Some(service_cohort.clone()),
+                    scope_fallback: Some(scope_fallback_slot.clone()),
                 },
             ),
             guard.lock_lost_notified(),
@@ -3462,6 +3534,15 @@ where
             outcome,
             ScannerCycleOutcome::Deferred(_) | ScannerCycleOutcome::StatePersistenceFailed
         ));
+        // Writes that land after the walk would otherwise wake the next full
+        // walk immediately; with no dirty bucket left there is nothing to pace.
+        let scope_fallback = scope_fallback_slot.take().filter(|_| {
+            matches!(
+                outcome,
+                ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
+            ) && dirty_usage_buckets_pending()
+        });
+        scope_fallback_backoff.record_retryable_cycle(scope_fallback.is_some());
         dirty_usage_generation_seen = dirty_generation_before_cycle;
         if guard.is_lock_lost() {
             record_scanner_leader_lock_lost("Scanner leader lock lost during a scanner cycle").await;

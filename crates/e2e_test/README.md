@@ -200,9 +200,10 @@ python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run
 python3 scripts/e2e_binary.py run --binary "$RUSTFS_E2E_STARTUP_CAS_BINARY" --features e2e-test-hooks -- cargo nextest run --profile e2e-full -p e2e_test
 python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-nightly -p e2e_test
 
-# Distributed 4-node 4-disk lane includes physical-worker fault injection.
+# Distributed 4-node 4-disk lane includes physical-worker fault injection and
+# scanner_heal_topology_ cases; both require the fault-test hooks server.
 # Upgrade cases require RUSTFS_UPGRADE_SOURCE_BINARY and fail closed without it.
-python3 scripts/e2e_binary.py build --features e2e-test-hooks
+python3 scripts/e2e_binary.py build --bins --features e2e-test-hooks
 python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test
 
 # Replication nightly uses the default server; awscurl is required for STS.

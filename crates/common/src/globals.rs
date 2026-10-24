@@ -97,6 +97,45 @@ pub fn try_get_global_local_node_name() -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
+/// Run a synchronous test callback while publishing a name under its writer lock.
+/// Call from a blocking worker; returning or unwinding releases the writer.
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub fn with_local_node_name_write_lock_for_test<T>(name: &str, work: impl FnOnce() -> T) -> T {
+    let mut writer = GLOBAL_LOCAL_NODE_NAME.blocking_write();
+    *writer = name.to_string();
+    let result = work();
+    drop(writer);
+    result
+}
+
+#[cfg(test)]
+mod node_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_node_name_nonblocking_read_recovers_after_writer_release() {
+        let previous = get_global_local_node_name().await;
+        let (unavailable, published, panicked) = tokio::task::spawn_blocking(|| {
+            let unavailable = with_local_node_name_write_lock_for_test("published-node", try_get_global_local_node_name);
+            let published = try_get_global_local_node_name();
+            let panicked = std::panic::catch_unwind(|| {
+                with_local_node_name_write_lock_for_test("unwound-node", || panic!("identity callback failed"));
+            });
+            (unavailable, published, panicked)
+        })
+        .await
+        .expect("identity writer worker must complete");
+        let after_unwind = try_get_global_local_node_name();
+        set_global_local_node_name(&previous).await;
+
+        assert!(unavailable.is_none(), "a held writer must make the nonblocking getter unavailable");
+        assert_eq!(published.as_deref(), Some("published-node"));
+        assert!(panicked.is_err(), "the callback panic must propagate after releasing the lock");
+        assert_eq!(after_unwind.as_deref(), Some("unwound-node"));
+    }
+}
+
 /// Set the global RustFS address used for gRPC connections.
 ///
 /// # Arguments

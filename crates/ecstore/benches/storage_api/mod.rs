@@ -33,3 +33,7 @@ pub(crate) mod single_block_non_inline {
 pub(crate) mod multipart {
     pub(crate) use rustfs_ecstore::api::disk::{DiskAPI, DiskOption, Endpoint, new_disk};
 }
+
+pub(crate) mod local_walk_dir {
+    pub(crate) use rustfs_ecstore::api::disk::{Disk, DiskAPI, DiskOption, Endpoint, WalkDirOptions, new_disk};
+}

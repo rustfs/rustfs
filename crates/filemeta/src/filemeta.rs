@@ -503,7 +503,7 @@ impl FileMeta {
         if fi.version_id.is_some_and(|id| !id.is_nil()) {
             return Ok(None);
         }
-        let legacy_id = if contains_key_str(&fi.metadata, SUFFIX_TIER_FV_ID) {
+        let legacy_id = if contains_key_str(&fi.metadata, rustfs_utils::http::SUFFIX_TIER_FV_ID) {
             Some(Uuid::parse_str(
                 get_consistent_str(&fi.metadata, SUFFIX_TIER_FV_ID).ok_or(Error::FileCorrupt)?,
             )?)
@@ -596,7 +596,9 @@ impl FileMeta {
     }
 
     fn add_version_inner(&mut self, mut fi: FileInfo) -> Result<()> {
-        rustfs_utils::http::remove_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_TIER_FV_ID);
+        if contains_key_str(&fi.metadata, rustfs_utils::http::SUFFIX_TIER_FV_ID) {
+            rustfs_utils::http::remove_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_TIER_FV_ID);
+        }
         // empty version_id means "null" (versioning disabled/suspended)
         if fi.version_id.is_none() {
             fi.version_id = Some(Uuid::nil());
@@ -640,6 +642,13 @@ impl FileMeta {
         };
 
         if let Some(fidx) = existing_idx {
+            if !version.free_version()
+                && let Ok(summary) = FileMetaVersion::inspect_v2_object_slice(&self.versions[fidx].meta)
+                && (!summary.has_reconciled_transition
+                    || version.object.as_ref().is_none_or(|next| next.data_dir != summary.data_dir))
+            {
+                return self.set_idx(fidx, version);
+            }
             let existing = self.versions[fidx].parse_version_meta()?;
             if existing.free_version() != version.free_version() {
                 return Err(Error::other("cannot replace a free version with a non-free version"));
@@ -703,6 +712,15 @@ impl FileMeta {
     /// Apply a disk deletion batch while compacting inline payloads only once.
     /// Missing non-marker requests retain the disk layer's idempotent semantics.
     pub fn delete_versions(&mut self, requests: &[FileInfo]) -> Result<Vec<Option<Uuid>>> {
+        let index = inline_data::BatchDeleteIndex::new(self, requests);
+        self.delete_versions_with_index(requests, index)
+    }
+
+    fn delete_versions_with_index(
+        &mut self,
+        requests: &[FileInfo],
+        mut index: Option<inline_data::BatchDeleteIndex>,
+    ) -> Result<Vec<Option<Uuid>>> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -710,19 +728,40 @@ impl FileMeta {
         let mut removed_keys = std::collections::HashSet::new();
         let mut data_dirs = Vec::with_capacity(requests.len());
         let mut failure = None;
+        let version_ok = self.data.version_ok();
+        let mut uuid_buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
         for request in requests {
             // Later requests must observe earlier inline removals even though
             // the payload buffer is not rebuilt until the batch is complete.
-            let has_inline_data = self.data.version_ok()
-                && (inline_keys.contains(data_key_for_version(request.version_id).as_bytes())
-                    || legacy_data_key_for_version(request.version_id).is_some_and(|key| inline_keys.contains(key.as_bytes())));
-            match self.delete_version_inner(request, Some(has_inline_data)) {
+            let has_inline_data = version_ok && !inline_keys.is_empty() && {
+                let vid = request.version_id.unwrap_or_default();
+                if vid.is_nil() {
+                    inline_keys.contains(NULL_VERSION_ID.as_bytes())
+                        || inline_keys.contains(Uuid::nil().hyphenated().encode_lower(&mut uuid_buf).as_bytes())
+                } else {
+                    inline_keys.contains(vid.hyphenated().encode_lower(&mut uuid_buf).as_bytes())
+                }
+            };
+            let indexed = index
+                .as_mut()
+                .map(|index| index.delete(&self.versions, request, has_inline_data));
+            let result = match indexed {
+                Some(Ok(inline_data::IndexedDelete::Applied(dir))) => Ok(dir),
+                Some(Err(error)) => Err(error),
+                _ => {
+                    if let Some(index) = index.take() {
+                        index.finish(&mut self.versions);
+                    }
+                    self.delete_version_inner(request, Some(has_inline_data))
+                }
+            };
+            match result {
                 Ok(data_dir) => {
                     if let Some(dir) = data_dir {
                         for key in [request.version_id.unwrap_or_default(), dir] {
-                            let key = key.to_string().into_bytes();
-                            if inline_keys.remove(&key) {
-                                removed_keys.insert(key);
+                            let key_bytes = key.hyphenated().encode_lower(&mut uuid_buf).as_bytes();
+                            if inline_keys.remove(key_bytes) {
+                                removed_keys.insert(key_bytes.to_vec());
                             }
                         }
                     }
@@ -734,6 +773,9 @@ impl FileMeta {
                     break;
                 }
             }
+        }
+        if let Some(index) = index {
+            index.finish(&mut self.versions);
         }
         self.data.remove_keys(&removed_keys)?;
         if let Some(err) = failure {
@@ -766,12 +808,6 @@ impl FileMeta {
             self.versions.remove(index);
             return Ok(None);
         }
-
-        let target_is_delete_marker = self
-            .versions
-            .iter()
-            .find(|ver| ver.header.version_id == vid)
-            .is_some_and(|ver| ver.header.version_type == VersionType::Delete);
 
         let mut ventry = FileMetaVersion::default();
         if fi.deleted {
@@ -811,7 +847,14 @@ impl FileMeta {
             }
         }
 
-        if target_is_delete_marker && !fi.deleted && !fi.version_purge_status().is_empty() {
+        if !fi.deleted
+            && !fi.version_purge_status().is_empty()
+            && self
+                .versions
+                .iter()
+                .find(|ver| ver.header.version_id == vid)
+                .is_some_and(|ver| ver.header.version_type == VersionType::Delete)
+        {
             update_version = false;
         }
 
@@ -937,6 +980,21 @@ impl FileMeta {
             return Err(Error::FileVersionNotFound);
         };
 
+        if !fi.expire_restored
+            && fi.transition_status != TRANSITION_COMPLETE
+            && let Ok(summary) = FileMetaVersion::inspect_v2_object_slice(&self.versions[i].meta)
+            && (!summary.transition_complete || fi.skip_tier_free_version())
+        {
+            self.versions.remove(i);
+            if fi.deleted {
+                self.add_version_filemata(ventry)?;
+            }
+            if self.shared_data_dir_count_with_inline_data(summary.version_id, summary.data_dir, has_inline_data, true) > 0 {
+                return Ok(None);
+            }
+            return Ok(summary.data_dir);
+        }
+
         let mut ver = self.get_idx(i)?;
 
         let Some(obj) = &mut ver.object else {
@@ -980,7 +1038,7 @@ impl FileMeta {
             return Err(e);
         }
 
-        if self.shared_data_dir_count_with_inline_data(obj_version_id, obj_data_dir, has_inline_data) > 0 {
+        if self.shared_data_dir_count_with_inline_data(obj_version_id, obj_data_dir, has_inline_data, true) > 0 {
             return Ok(None);
         }
 
@@ -1180,8 +1238,7 @@ impl FileMeta {
             found = true;
 
             found_fi = Some(
-                FileMetaVersion::try_from(ver_meta)
-                    .and_then(|v| v.into_fileinfo_with_part_checksums(volume, path, opts.all_parts, opts.include_part_checksums))
+                FileMetaVersion::decode_fileinfo_from_slice(ver_meta, volume, path, opts.all_parts, opts.include_part_checksums)
                     .and_then(|mut fi| {
                         fi.is_latest = is_latest;
 
@@ -1227,37 +1284,59 @@ impl FileMeta {
     }
 
     pub fn get_file_info_versions(&self, volume: &str, path: &str, include_free_versions: bool) -> Result<FileInfoVersions> {
-        let mut versions = self.into_file_info_versions(volume, path, true)?;
+        let versions = self.into_file_info_versions(volume, path, true)?;
+        Ok(Self::partition_free_versions(versions, include_free_versions))
+    }
 
-        let mut n = 0;
+    pub(crate) fn decode_file_info_versions_from_buf(
+        buf: &[u8],
+        volume: &str,
+        path: &str,
+        include_free_versions: bool,
+    ) -> Result<FileInfoVersions> {
+        let (meta, _inline_buf) = Self::parse_validated_xl_envelope(buf)?;
+        let (versions_len, header_ver, meta) = if meta.is_empty() {
+            (0, 0, meta)
+        } else {
+            let (versions_len, header_ver, _meta_ver, meta) = Self::decode_validated_xl_headers(meta)?;
+            (versions_len, header_ver, meta)
+        };
 
-        let mut versions_vec = Vec::new();
-
-        for fi in versions.versions.iter() {
-            if fi.tier_free_version() {
-                if !include_free_versions {
-                    versions.free_versions.push(fi.clone());
-                }
-            } else {
-                if !include_free_versions {
-                    versions_vec.push(fi.clone());
-                }
-                n += 1;
-            }
+        let mut versions = Vec::with_capacity(super::filemeta::msgp_decode::prealloc_hint(versions_len).max(1));
+        let mut cur = Cursor::new(meta);
+        for _ in 0..versions_len {
+            let (_header, ver_meta) = Self::read_next_shallow_slice(meta, &mut cur, header_ver)?;
+            let fi = FileMetaVersion::decode_fileinfo_from_slice(ver_meta, volume, path, true, true)?;
+            versions.push(fi);
         }
 
+        let versions = Self::finalize_file_info_versions(versions, volume, path);
+        Ok(Self::partition_free_versions(versions, include_free_versions))
+    }
+
+    fn partition_free_versions(mut versions: FileInfoVersions, include_free_versions: bool) -> FileInfoVersions {
         if !include_free_versions {
-            versions.versions = versions_vec;
+            if versions.versions.iter().any(FileInfo::tier_free_version) {
+                let mut versions_vec = Vec::with_capacity(versions.versions.len());
+                for fi in std::mem::take(&mut versions.versions) {
+                    if fi.tier_free_version() {
+                        versions.free_versions.push(fi);
+                    } else {
+                        versions_vec.push(fi);
+                    }
+                }
+                versions.versions = versions_vec;
+            }
 
-            for fi in versions.versions.iter_mut() {
+            let n = versions.versions.len();
+            for fi in &mut versions.versions {
                 fi.num_versions = n;
             }
-            for fi in versions.free_versions.iter_mut() {
+            for fi in &mut versions.free_versions {
                 fi.num_versions = n;
             }
         }
-
-        Ok(versions)
+        versions
     }
 
     pub fn get_all_file_info_versions(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfoVersions> {
@@ -1265,12 +1344,16 @@ impl FileMeta {
     }
 
     pub fn into_file_info_versions(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfoVersions> {
-        let mut versions = Vec::new();
+        let mut versions = Vec::with_capacity(self.versions.len().max(1));
         for version in self.versions.iter() {
             let fi = version.into_fileinfo(volume, path, all_parts)?;
             versions.push(fi);
         }
 
+        Ok(Self::finalize_file_info_versions(versions, volume, path))
+    }
+
+    fn finalize_file_info_versions(mut versions: Vec<FileInfo>, volume: &str, path: &str) -> FileInfoVersions {
         let num = versions.len();
         let mut prev_mod_time = None;
         for (i, fi) in versions.iter_mut().enumerate() {
@@ -1293,13 +1376,13 @@ impl FileMeta {
             });
         }
 
-        Ok(FileInfoVersions {
+        FileInfoVersions {
             volume: volume.to_string(),
             name: path.to_string(),
             latest_mod_time: versions[0].mod_time,
             versions,
             ..Default::default()
-        })
+        }
     }
 
     pub fn latest_mod_time(&self) -> Option<OffsetDateTime> {

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// GCS-enabled ECStore futures need the same layout recursion budget as the library.
+#![recursion_limit = "256"]
+
 mod storage_api;
 
 use rustfs_filemeta::{FileInfoOpts, get_file_info};

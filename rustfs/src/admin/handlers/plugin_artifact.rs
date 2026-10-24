@@ -5,6 +5,8 @@ mod inventory;
 
 use self::inventory::Inventory;
 use super::plugin_delegation::{owner_for_resource, response};
+use crate::admin::storage_api::error::Error;
+use crate::admin::storage_api::runtime::ECStore;
 use crate::{
     admin::{
         auth::AdminResourceScope,
@@ -170,7 +172,7 @@ async fn request_body<T: DeserializeOwned>(req: &mut S3Request<Body>) -> S3Resul
     serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid artifact request"))
 }
 
-fn request_store(req: &S3Request<Body>) -> S3Result<Arc<crate::admin::storage_api::ECStore>> {
+fn request_store(req: &S3Request<Body>) -> S3Result<Arc<ECStore>> {
     // These new controls require the owning server slot, never an ambient store.
     if req.extensions.get::<Arc<ServerContextSlot>>().is_none() {
         return Err(s3_error!(ServiceUnavailable, "artifact application context unavailable"));
@@ -252,7 +254,7 @@ impl Operation for Create {
                 .await
                 .map_err(|_| unconfirmed())?
                 .map_err(|error| match error {
-                    crate::admin::storage_api::Error::BucketExists(_) => {
+                    Error::BucketExists(_) => {
                         s3_error!(BucketAlreadyExists, "artifact bucket already exists")
                     }
                     _ => unconfirmed(),

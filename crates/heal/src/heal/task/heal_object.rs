@@ -47,7 +47,7 @@ impl HealTask {
         if let Some(error) = storage_result.error {
             return Err(error);
         }
-        if !self.record_verified_storage_receipt(expected, storage_result.receipt).await {
+        if !self.record_verified_storage_receipt(&expected, storage_result.receipt).await {
             return Err(Error::TaskExecutionFailed {
                 message: format!("delete-marker purge returned no exact storage proof for {bucket}/{object}/{version_id}"),
             });
@@ -257,18 +257,19 @@ impl HealTask {
                         return self.complete_absent_object(bucket, object, &e).await;
                     }
 
-                    error!(
-                        target: "rustfs::heal::task",
+                    demote_to_debug_when!(
+                        !self.should_log_failure(&e),
+                        error, target: "rustfs::heal::task", {
                         event = EVENT_HEAL_OBJECT_RESULT,
                         component = LOG_COMPONENT_HEAL,
                         subsystem = LOG_SUBSYSTEM_OBJECT,
+                        result = "failed",
                         task_id = %self.id,
                         bucket,
                         object,
-                        result = "failed",
                         error = %e,
                         "Heal object operation failed"
-                    );
+                    });
 
                     {
                         let mut progress = self.progress.write().await;
@@ -328,8 +329,17 @@ impl HealTask {
                     let mut progress = self.progress.write().await;
                     progress.update_object_progress(1, 1, 0, 0, object_size);
                 }
-                self.record_verified_storage_receipt(expected_identity, storage_result.receipt)
-                    .await;
+                if !self
+                    .record_verified_storage_receipt(&expected_identity, storage_result.receipt)
+                    .await
+                    && !self.options.dry_run
+                {
+                    self.outcome.write().await.record(HealObjectOutcome {
+                        identity: expected_identity,
+                        disposition: HealObjectDisposition::Unknown,
+                        detail: (!result.detail.is_empty()).then(|| result.detail.clone()),
+                    });
+                }
                 self.record_result_item(result).await;
                 Ok(())
             }
@@ -348,18 +358,19 @@ impl HealTask {
                     return self.complete_absent_object(bucket, object, &e).await;
                 }
 
-                error!(
-                    target: "rustfs::heal::task",
+                demote_to_debug_when!(
+                    !self.should_log_failure(&e),
+                    error, target: "rustfs::heal::task", {
                     event = EVENT_HEAL_OBJECT_RESULT,
                     component = LOG_COMPONENT_HEAL,
                     subsystem = LOG_SUBSYSTEM_OBJECT,
+                    result = "failed",
                     task_id = %self.id,
                     bucket,
                     object,
-                    result = "failed",
                     error = %e,
                     "Heal object operation failed"
-                );
+                });
 
                 {
                     let mut progress = self.progress.write().await;
@@ -489,13 +500,10 @@ impl HealTask {
             Some(HealObjectDisposition::AuthoritativelyAbsent)
         );
         let receipt_missing = storage_result.receipt.is_none();
-        if !self
-            .record_verified_storage_receipt(expected.clone(), storage_result.receipt)
-            .await
-        {
+        if !self.record_verified_storage_receipt(&expected, storage_result.receipt).await {
             let ok_drive_state = DriveState::Ok.to_string();
             let healthy_legacy_without_repair = receipt_missing
-                && storage_result.item.detail == rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL
+                && storage_result.item.legacy_identity_unverified
                 && storage_result.item.drives_healed() == Some(0)
                 && !storage_result.item.after.drives.is_empty()
                 && storage_result
@@ -512,8 +520,14 @@ impl HealTask {
                 });
             }
             self.record_result_item(storage_result.item).await;
-            return Err(Error::TaskExecutionFailed {
-                message: format!("Missing exact storage proof for durable MRF repair {bucket}/{object}"),
+            return Err(if healthy_legacy_without_repair {
+                Error::LegacyMrfUnverified {
+                    target: format!("{bucket}/{object}"),
+                }
+            } else {
+                Error::TaskExecutionFailed {
+                    message: format!("Missing exact storage proof for durable MRF repair {bucket}/{object}"),
+                }
             });
         }
 

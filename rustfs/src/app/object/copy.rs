@@ -17,6 +17,7 @@
 use super::*;
 use rustfs_utils::path::fold_object_name_path_separators;
 
+use crate::app::storage_api::object_usecase::BucketIncarnationFenceGuard;
 use crate::auth::{VerifiedPresignedRequest, reject_presigned_put_max_content_length_for_other_operation};
 use crate::error::ServerSideSourceReadError;
 
@@ -125,7 +126,7 @@ where
 pub(crate) async fn acquire_copy_bucket_lifecycle_lock(
     store: &ECStore,
     bucket: &str,
-) -> S3Result<Arc<rustfs_ecstore::BucketIncarnationFenceGuard>> {
+) -> S3Result<Arc<BucketIncarnationFenceGuard>> {
     let expected = store.bucket_incarnation_id_from_disk(bucket).await.map_err(ApiError::from)?;
     store
         .acquire_bucket_incarnation_fence(bucket, expected)
@@ -138,10 +139,7 @@ pub(crate) async fn acquire_copy_bucket_lifecycle_locks(
     store: &ECStore,
     source_bucket: &str,
     destination_bucket: &str,
-) -> S3Result<(
-    Arc<rustfs_ecstore::BucketIncarnationFenceGuard>,
-    Option<Arc<rustfs_ecstore::BucketIncarnationFenceGuard>>,
-)> {
+) -> S3Result<(Arc<BucketIncarnationFenceGuard>, Option<Arc<BucketIncarnationFenceGuard>>)> {
     if source_bucket == destination_bucket {
         return Ok((acquire_copy_bucket_lifecycle_lock(store, source_bucket).await?, None));
     }

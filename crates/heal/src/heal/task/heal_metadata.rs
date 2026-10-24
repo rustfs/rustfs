@@ -109,21 +109,23 @@ impl HealTask {
         match heal_result {
             Ok((result, error)) => {
                 if let Some(e) = error {
-                    error!(
-                        target: "rustfs::heal::task",
+                    demote_to_debug_when!(!self.should_log_failure(&e), error, target: "rustfs::heal::task", {
                         event = EVENT_HEAL_METADATA_RESULT,
                         component = LOG_COMPONENT_HEAL,
                         subsystem = LOG_SUBSYSTEM_TASK,
+                        result = "failed",
                         task_id = %self.id,
                         bucket,
                         object,
-                        result = "failed",
                         error = %e,
                         "Heal metadata failed"
-                    );
+                    });
                     {
                         let mut progress = self.progress.write().await;
                         progress.update_stage(3, 3);
+                    }
+                    if matches!(&e, Error::Storage(crate::heal::StorageError::DeleteRecoveryLegacyAmbiguous)) {
+                        return Err(e);
                     }
                     return Err(Error::TaskExecutionFailed {
                         message: format!("Failed to heal metadata {bucket}/{object}: {e}"),
@@ -154,21 +156,23 @@ impl HealTask {
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
-                error!(
-                    target: "rustfs::heal::task",
+                demote_to_debug_when!(!self.should_log_failure(&e), error, target: "rustfs::heal::task", {
                     event = EVENT_HEAL_METADATA_RESULT,
                     component = LOG_COMPONENT_HEAL,
                     subsystem = LOG_SUBSYSTEM_TASK,
+                    result = "failed",
                     task_id = %self.id,
                     bucket,
                     object,
-                    result = "failed",
                     error = %e,
                     "Heal metadata failed"
-                );
+                });
                 {
                     let mut progress = self.progress.write().await;
                     progress.update_stage(3, 3);
+                }
+                if matches!(&e, Error::Storage(crate::heal::StorageError::DeleteRecoveryLegacyAmbiguous)) {
+                    return Err(e);
                 }
                 Err(Error::TaskExecutionFailed {
                     message: format!("Failed to heal metadata {bucket}/{object}: {e}"),
@@ -272,21 +276,23 @@ impl HealTask {
         match heal_result {
             Ok((result, error)) => {
                 if let Some(e) = error {
-                    error!(
-                        target: "rustfs::heal::task",
+                    demote_to_debug_when!(!self.should_log_failure(&e), error, target: "rustfs::heal::task", {
                         event = EVENT_HEAL_EC_DECODE_RESULT,
                         component = LOG_COMPONENT_HEAL,
                         subsystem = LOG_SUBSYSTEM_TASK,
+                        result = "failed",
                         task_id = %self.id,
                         bucket,
                         object,
-                        result = "failed",
                         error = %e,
                         "Heal EC decode failed"
-                    );
+                    });
                     {
                         let mut progress = self.progress.write().await;
                         progress.update_stage(3, 3);
+                    }
+                    if matches!(&e, Error::Storage(crate::heal::StorageError::DeleteRecoveryLegacyAmbiguous)) {
+                        return Err(e);
                     }
                     return Err(Error::TaskExecutionFailed {
                         message: format!("Failed to heal EC decode {bucket}/{object}: {e}"),
@@ -319,21 +325,23 @@ impl HealTask {
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
-                error!(
-                    target: "rustfs::heal::task",
+                demote_to_debug_when!(!self.should_log_failure(&e), error, target: "rustfs::heal::task", {
                     event = EVENT_HEAL_EC_DECODE_RESULT,
                     component = LOG_COMPONENT_HEAL,
                     subsystem = LOG_SUBSYSTEM_TASK,
+                    result = "failed",
                     task_id = %self.id,
                     bucket,
                     object,
-                    result = "failed",
                     error = %e,
                     "Heal EC decode failed"
-                );
+                });
                 {
                     let mut progress = self.progress.write().await;
                     progress.update_stage(3, 3);
+                }
+                if matches!(&e, Error::Storage(crate::heal::StorageError::DeleteRecoveryLegacyAmbiguous)) {
+                    return Err(e);
                 }
                 Err(Error::TaskExecutionFailed {
                     message: format!("Failed to heal EC decode {bucket}/{object}: {e}"),

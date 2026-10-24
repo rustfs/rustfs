@@ -34,7 +34,7 @@ use rustfs_signer::sign_v4;
 use s3s::Body;
 use serde_json;
 use std::fs as stdfs;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -1312,7 +1312,10 @@ impl RustFSTestClusterEnvironment {
     pub async fn with_topology(topology: ClusterTopology) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         topology.validate()?;
 
-        let temp_dir = format!("/tmp/rustfs_cluster_test_{}", Uuid::new_v4());
+        let temp_dir = std::env::temp_dir()
+            .join(format!("rustfs_cluster_test_{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
         fs::create_dir_all(&temp_dir).await?;
 
         // Map every node to its owning pool index.
@@ -1463,6 +1466,29 @@ impl RustFSTestClusterEnvironment {
         // listener from the direct IPv4 server and S3 client address.
         let listen = SocketAddr::from((Ipv6Addr::LOCALHOST, target.port()));
         let proxy = crate::fault_proxy::FaultProxy::start_on(listen, target).await?;
+        self.volume_proxy_addresses[node_idx] = Some(proxy.local_addr());
+        Ok(proxy)
+    }
+
+    /// Route internode traffic through a method-aware HTTP proxy.
+    pub(crate) async fn start_rpc_proxy_for_node(
+        &mut self,
+        node_idx: usize,
+    ) -> io::Result<crate::rpc_fault_proxy::RpcFaultProxy> {
+        self.ensure_node_index(node_idx)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        if self.volume_proxy_addresses[node_idx].is_some() {
+            return Err(io::Error::new(
+                ErrorKind::AlreadyExists,
+                format!("a volume proxy is already configured for node {node_idx}"),
+            ));
+        }
+        let target = self.nodes[node_idx]
+            .address
+            .parse::<SocketAddr>()
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        let listen = SocketAddr::from((Ipv6Addr::LOCALHOST, target.port()));
+        let proxy = crate::rpc_fault_proxy::RpcFaultProxy::start_on(listen, target).await?;
         self.volume_proxy_addresses[node_idx] = Some(proxy.local_addr());
         Ok(proxy)
     }
@@ -1844,6 +1870,47 @@ impl RustFSTestClusterEnvironment {
         }
 
         Ok(new_idx)
+    }
+
+    /// Remove retired single-node pools from a stopped multi-pool cluster.
+    ///
+    /// A decommissioned pool must leave the server command line before the
+    /// next start; the server refuses to start while it is still listed. The
+    /// remaining pools keep their node order and are renumbered from zero.
+    /// Data directories are left on disk for the owning harness to clean up.
+    pub fn remove_single_node_pools(&mut self, retired: &[usize]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.nodes.iter().any(|node| node.process.is_some()) {
+            return Err("stop the cluster before removing a pool".into());
+        }
+        let pools = self.topology.normalized_pools();
+        if pools.iter().any(|nodes| nodes.len() != 1) {
+            return Err("remove_single_node_pools requires one node per pool".into());
+        }
+        if retired.iter().any(|pool| *pool >= pools.len()) || retired.len() >= pools.len() {
+            return Err(format!("cannot remove pools {retired:?} from {} pools", pools.len()).into());
+        }
+        let keep: Vec<usize> = (0..self.nodes.len())
+            .filter(|node_idx| !retired.contains(&self.nodes[*node_idx].pool_idx))
+            .collect();
+        fn retain_indices<T>(values: &mut Vec<T>, keep: &[usize]) {
+            let old = std::mem::take(values);
+            *values = old
+                .into_iter()
+                .enumerate()
+                .filter(|(idx, _)| keep.contains(idx))
+                .map(|(_, value)| value)
+                .collect();
+        }
+        retain_indices(&mut self.nodes, &keep);
+        retain_indices(&mut self.node_extra_env, &keep);
+        retain_indices(&mut self.node_capture_log_paths, &keep);
+        retain_indices(&mut self.volume_proxy_addresses, &keep);
+        for (pool_idx, node) in self.nodes.iter_mut().enumerate() {
+            node.pool_idx = pool_idx;
+        }
+        self.topology.node_count = self.nodes.len();
+        self.topology.pools = (0..self.nodes.len()).map(|node_idx| vec![node_idx]).collect();
+        Ok(())
     }
 
     /// Gracefully stop one cluster node and wait for its process to exit.
@@ -2512,6 +2579,22 @@ mod tests {
         );
 
         proxy.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cluster_data_dirs_use_os_temporary_directory() {
+        let cluster = RustFSTestClusterEnvironment::new(1).await.expect("allocate isolated cluster");
+        let root = PathBuf::from(&cluster.temp_dir);
+        assert!(
+            root.starts_with(std::env::temp_dir()),
+            "cluster must honor the selected temporary filesystem"
+        );
+        for node in &cluster.nodes {
+            assert!(Path::new(&node.data_dir).starts_with(&root));
+            assert!(node.data_dirs.iter().all(|drive| Path::new(drive).starts_with(&root)));
+        }
+        drop(cluster);
+        assert!(!root.exists(), "dropping the fixture must remove its owned directories");
     }
 
     #[test]

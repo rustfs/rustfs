@@ -64,6 +64,7 @@ const DATA_USAGE_CACHE_PERSISTENCE_MARGIN: Duration = Duration::from_secs(5);
 const METRIC_CACHE_SAVE_ATTEMPT_TOTAL: &str = "rustfs_scanner_cache_save_attempt_total";
 const METRIC_CACHE_SAVE_TIMEOUT_TOTAL: &str = "rustfs_scanner_cache_save_timeout_total";
 const METRIC_CACHE_SAVE_RETRY_TOTAL: &str = "rustfs_scanner_cache_save_retry_total";
+const METRIC_CACHE_SAVE_PAYLOAD_BYTES_TOTAL: &str = "rustfs_scanner_cache_save_payload_bytes_total";
 const METRIC_CACHE_SAVE_DURATION_SECONDS: &str = "rustfs_scanner_cache_save_duration_seconds";
 const METRIC_CACHE_BACKUP_REVISION_FAILURE_TOTAL: &str = "rustfs_scanner_cache_backup_revision_failure_total";
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -1283,6 +1284,11 @@ impl DataUsageCache {
             describe_counter!(
                 METRIC_CACHE_SAVE_RETRY_TOTAL,
                 "Total scanner data usage cache save retries by cache type."
+            );
+            describe_counter!(
+                METRIC_CACHE_SAVE_PAYLOAD_BYTES_TOTAL,
+                metrics::Unit::Bytes,
+                "Payload bytes submitted to scanner cache saves, including failed attempts, by cache type."
             );
             describe_histogram!(
                 METRIC_CACHE_SAVE_DURATION_SECONDS,

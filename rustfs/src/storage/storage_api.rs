@@ -30,11 +30,11 @@ pub(crate) mod ecstore_integrity {
 
 #[cfg(feature = "diagnostic-read-version-caller")]
 pub(crate) mod ecstore_diagnostic {
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::diagnostic::current_read_version_entry_source;
     pub(crate) use rustfs_ecstore::api::diagnostic::{
-        ReadVersionContextBoundary, ReadVersionEntrySource, with_read_version_spawn_context,
+        ReadVersionContextBoundary, ReadVersionEntrySource, with_captured_read_version_context, with_read_version_spawn_context,
     };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::diagnostic::{current_read_version_entry_source, with_read_version_entry};
 }
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
@@ -268,7 +268,7 @@ pub(crate) mod rpc_consumer {
         };
         pub(crate) use super::super::{
             DiskStore, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce, find_local_disk_by_ref,
-            sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability, verify_put_file_auth_trailer,
+            sign_ns_scanner_capability_with_checkpoint_coverage, sign_put_file_capability, verify_put_file_auth_trailer,
             verify_rpc_signature,
         };
     }
@@ -574,11 +574,13 @@ pub(crate) mod ecstore_rio {
 }
 
 pub(crate) mod ecstore_rpc {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::rpc::verify_ns_scanner_capability_with_checkpoint_coverage;
     pub(crate) use rustfs_ecstore::api::rpc::{
         KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION, NetworkPeerProbeClient,
         NetworkPeerProbeError, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
         SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, check_and_record_signed_rpc_nonce,
-        decode_heal_bucket_rpc_options, normalize_tonic_rpc_audience, sign_ns_scanner_capability_with_tier_registry_generation,
+        decode_heal_bucket_rpc_options, normalize_tonic_rpc_audience, sign_ns_scanner_capability_with_checkpoint_coverage,
         sign_put_file_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
         tonic_rpc_auth_failure_reason, verify_put_file_auth_trailer, verify_rpc_signature, verify_tonic_canonical_body_digest,
         verify_tonic_mutation_body_digest, verify_tonic_mutation_body_digest_reject_unsigned,
@@ -635,6 +637,7 @@ pub(crate) mod ecstore_erasure {
 pub(crate) use rustfs_ecstore::api::erasure::{BitrotSelfTestError, bitrot_self_test};
 
 pub(crate) mod ecstore_storage {
+    pub(crate) use rustfs_ecstore::BucketIncarnationFenceGuard;
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
     pub(crate) use rustfs_ecstore::api::storage::{
@@ -725,7 +728,6 @@ pub(crate) type EndpointServerPools = ecstore_layout::EndpointServerPools;
 pub(crate) type EventArgs = ecstore_event::EventArgs;
 pub(crate) type ExpiryState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::ExpiryState;
 pub(crate) type FileInfoVersions = ecstore_disk::FileInfoVersions;
-pub(crate) type GuardedFileInfoVersions = ecstore_disk::GuardedFileInfoVersions;
 pub(crate) type GuardedDeleteVersionsPayload = ecstore_disk::GuardedDeleteVersionsPayload;
 pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
@@ -754,11 +756,6 @@ pub(crate) type ReadMultipleReq = ecstore_disk::ReadMultipleReq;
 pub(crate) type ReadMultipleResp = ecstore_disk::ReadMultipleResp;
 pub(crate) type ReadOptions = ecstore_disk::ReadOptions;
 pub(crate) type OldCurrentSize = ecstore_disk::OldCurrentSize;
-pub(crate) type DeleteRecoveryCursor = ecstore_disk::DeleteRecoveryCursor;
-pub(crate) type DeleteRecoveryPage = ecstore_disk::DeleteRecoveryPage;
-pub(crate) type DeleteRecoveryInspection = ecstore_disk::DeleteRecoveryInspection;
-pub(crate) type DeleteRecoveryDigest = ecstore_disk::DeleteRecoveryDigest;
-pub(crate) type DeleteRecoveryAction = ecstore_disk::DeleteRecoveryAction;
 pub(crate) type DeleteRecoveryRpcOperation = ecstore_disk::DeleteRecoveryRpcOperation;
 pub(crate) type DeleteRecoveryRpcReply = ecstore_disk::DeleteRecoveryRpcReply;
 pub(crate) const DELETE_RECOVERY_PROTOCOL_VERSION: u32 = ecstore_disk::DELETE_RECOVERY_PROTOCOL_VERSION;
@@ -1436,14 +1433,6 @@ pub(crate) trait StorageDiskRpcExt {
     async fn batch_read_version(&self, req: BatchReadVersionReq) -> DiskResult<Vec<BatchReadVersionResp>>;
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions)
     -> Vec<Option<DiskError>>;
-    async fn delete_version(
-        &self,
-        volume: &str,
-        path: &str,
-        file_info: rustfs_filemeta::FileInfo,
-        force_del_marker: bool,
-        opts: DeleteOptions,
-    ) -> DiskResult<()>;
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> DiskResult<RawFileInfo>;
     async fn read_version(
         &self,
@@ -1509,17 +1498,6 @@ where
         opts: DeleteOptions,
     ) -> Vec<Option<DiskError>> {
         ecstore_disk::DiskAPI::delete_versions(self, volume, versions, opts).await
-    }
-
-    async fn delete_version(
-        &self,
-        volume: &str,
-        path: &str,
-        file_info: rustfs_filemeta::FileInfo,
-        force_del_marker: bool,
-        opts: DeleteOptions,
-    ) -> DiskResult<()> {
-        ecstore_disk::DiskAPI::delete_version(self, volume, path, file_info, force_del_marker, opts).await
     }
 
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> DiskResult<RawFileInfo> {
@@ -2062,15 +2040,17 @@ pub(crate) fn verify_put_file_auth_trailer(
     ecstore_rpc::verify_put_file_auth_trailer(url, method, nonce, trailer)
 }
 
-pub(crate) fn sign_ns_scanner_capability_with_tier_registry_generation(
+pub(crate) fn sign_ns_scanner_capability_with_checkpoint_coverage(
     challenge: uuid::Uuid,
     server_epoch: uuid::Uuid,
     supports_tier_registry_generation: bool,
+    supports_checkpoint_coverage: bool,
 ) -> std::io::Result<Vec<u8>> {
-    ecstore_rpc::sign_ns_scanner_capability_with_tier_registry_generation(
+    ecstore_rpc::sign_ns_scanner_capability_with_checkpoint_coverage(
         challenge,
         server_epoch,
         supports_tier_registry_generation,
+        supports_checkpoint_coverage,
     )
 }
 

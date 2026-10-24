@@ -78,6 +78,7 @@ pub(crate) struct DistCluster {
     pub cluster: RustFSTestClusterEnvironment,
     pool_storage_roots: Option<Vec<PathBuf>>,
     owned_pool_dirs: Vec<PathBuf>,
+    capture_log_dir: Option<PathBuf>,
 }
 
 impl DistCluster {
@@ -129,11 +130,12 @@ impl DistCluster {
         for &(key, value) in extra_env {
             cluster.set_env(key, value);
         }
-        configure_node_logs(&mut cluster)?;
+        configure_node_logs(&mut cluster, None)?;
         Ok(Self {
             cluster,
             pool_storage_roots,
             owned_pool_dirs,
+            capture_log_dir: None,
         })
     }
 
@@ -171,6 +173,14 @@ impl DistCluster {
         Ok(())
     }
 
+    /// Append every node's stdout/stderr to `directory/node-<idx>.log`, including
+    /// nodes added by later pool expansion. Call before the first start so startup
+    /// events such as the resolved durability mode are captured.
+    pub fn capture_logs_under(&mut self, directory: &Path) -> TestResult {
+        self.capture_log_dir = Some(directory.to_path_buf());
+        configure_node_logs(&mut self.cluster, Some(directory))
+    }
+
     pub fn client_with_credentials(&self, node_idx: usize, access_key: &str, secret_key: &str) -> TestResult<Client> {
         if node_idx >= self.cluster.nodes.len() {
             return Err("node_idx is invalid".into());
@@ -184,6 +194,16 @@ impl DistCluster {
         )))
     }
 
+    /// Stop the fleet, drop retired pools from the command line, and restart
+    /// the remaining pools, which are renumbered from zero.
+    pub async fn remove_retired_pools_and_restart(&mut self, retired: &[usize]) -> TestResult {
+        self.stop_all_gracefully().await?;
+        self.cluster.remove_single_node_pools(retired)?;
+        self.cluster.start().await?;
+        wait_for_ready(&self.cluster).await?;
+        Ok(())
+    }
+
     pub async fn append_pool_and_restart(&mut self) -> TestResult<usize> {
         self.stop_all_gracefully().await?;
         let node_idx = self.cluster.append_single_node_pool().await?;
@@ -193,7 +213,7 @@ impl DistCluster {
             .ok_or("pool expansion requires configured isolated pool filesystems")?;
         self.owned_pool_dirs
             .push(relocate_pool_storage(&mut self.cluster, node_idx, roots)?);
-        configure_node_logs(&mut self.cluster)?;
+        configure_node_logs(&mut self.cluster, self.capture_log_dir.as_deref())?;
         self.cluster.start().await?;
         wait_for_ready(&self.cluster).await?;
         Ok(node_idx)
@@ -327,7 +347,19 @@ fn relocate_pool_storage(cluster: &mut RustFSTestClusterEnvironment, node_idx: u
     Ok(pool_run_root)
 }
 
-fn configure_node_logs(cluster: &mut RustFSTestClusterEnvironment) -> TestResult {
+pub(super) fn configure_node_logs(cluster: &mut RustFSTestClusterEnvironment, capture_dir: Option<&Path>) -> TestResult {
+    if let Some(directory) = capture_dir {
+        std::fs::create_dir_all(directory)?;
+        for node_idx in 0..cluster.nodes.len() {
+            // Overrides a path assigned from RUSTFS_E2E_LOG_DIR so every node of
+            // the run, including the seed node, logs into the same directory.
+            let path = directory.join(format!("node-{node_idx}.log"));
+            if cluster.node_capture_log_paths[node_idx].as_deref() != Some(path.to_string_lossy().as_ref()) {
+                cluster.set_node_capture_log_path(node_idx, path.to_string_lossy().into_owned())?;
+            }
+        }
+        return Ok(());
+    }
     let Some(log_dir) = std::env::var_os("RUSTFS_E2E_LOG_DIR") else {
         return Ok(());
     };
@@ -724,23 +756,44 @@ pub(crate) async fn set_bucket_quota(cluster: &RustFSTestClusterEnvironment, buc
     .await
 }
 
+/// The existing decommission cases wait up to 180 s for movement to finish; a
+/// start refused because a movement gate is busy is retried within the same budget.
+const DECOMMISSION_START_BUSY_BUDGET: Duration = Duration::from_secs(180);
+const DECOMMISSION_START_PROOF_BUDGET: Duration = Duration::from_secs(45);
+
 /// Start decommission and fail closed unless the admin API acknowledges it.
 pub(crate) async fn start_decommission(cluster: &RustFSTestClusterEnvironment, pool_id: usize) -> TestResult {
     let path = format!("/rustfs/admin/v3/pools/decommission?pool={pool_id}&by-id=true");
-    let deadline = Instant::now() + Duration::from_secs(45);
+    post_decommission_start(cluster, &path, DECOMMISSION_START_BUSY_BUDGET).await?;
+    Ok(())
+}
+
+/// POST a decommission start and return the response body. A start that meets
+/// a busy movement gate answers a retryable 503 and is retried within
+/// `busy_budget`; the init stage's missing fleet capability proof (500) is
+/// retried for 45 s. Every other status is fatal.
+pub(crate) async fn post_decommission_start(
+    cluster: &RustFSTestClusterEnvironment,
+    path: &str,
+    busy_budget: Duration,
+) -> TestResult<String> {
+    let started = Instant::now();
+    let mut delay = Duration::from_millis(250);
     loop {
-        let (status, response) = cluster_admin(cluster, Method::POST, &path, None).await?;
+        let (status, response) = cluster_admin(cluster, Method::POST, path, None).await?;
         if status.is_success() {
-            return Ok(());
+            return Ok(response);
         }
-        if status == StatusCode::INTERNAL_SERVER_ERROR
+        let elapsed = started.elapsed();
+        let busy = status == StatusCode::SERVICE_UNAVAILABLE && elapsed < busy_budget;
+        let awaiting_proof = status == StatusCode::INTERNAL_SERVER_ERROR
             && response.contains("requires a live fleet capability proof")
-            && Instant::now() < deadline
-        {
-            sleep(Duration::from_secs(1)).await;
-            continue;
+            && elapsed < DECOMMISSION_START_PROOF_BUDGET;
+        if !busy && !awaiting_proof {
+            return Err(format!("POST {path} did not start decommission: {status} {response}").into());
         }
-        return Err(format!("POST {path} did not start decommission: {status} {response}").into());
+        sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(2));
     }
 }
 
@@ -923,6 +976,21 @@ pub(crate) async fn rebalance_status_json(cluster: &RustFSTestClusterEnvironment
     Ok(serde_json::from_str(&body)?)
 }
 
+/// Mirrors `REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX` in `crates/ecstore/src/services/rebalance`.
+const REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX: &str = "deferred transient rebalance entry failure:";
+
+/// A transient entry failure (for example a write quorum miss on a busy
+/// target) is recorded as `lastError` and retried at the end of the run; the
+/// worker clears it when the pool completes. It is only acceptable while the
+/// pool is still started: a terminal pool keeping it is a real failure.
+fn is_retrying_deferred_rebalance_error(pool: &serde_json::Value, error: &str) -> bool {
+    error.starts_with(REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX)
+        && pool
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|status| status.eq_ignore_ascii_case("started"))
+}
+
 fn validate_rebalance_status<'a>(status: &'a serde_json::Value, expected_id: &str) -> TestResult<&'a [serde_json::Value]> {
     let id = status
         .get("id")
@@ -950,7 +1018,7 @@ fn validate_rebalance_status<'a>(status: &'a serde_json::Value, expected_id: &st
         if pool
             .get("lastError")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|error| !error.is_empty())
+            .is_some_and(|error| !error.is_empty() && !is_retrying_deferred_rebalance_error(pool, error))
         {
             return Err(format!("rebalance reported lastError: {status}").into());
         }
@@ -1298,6 +1366,29 @@ async fn append_single_node_pool_extends_ellipses_volumes() {
 }
 
 #[tokio::test]
+async fn remove_single_node_pools_drops_retired_pools_and_renumbers() {
+    let mut env =
+        RustFSTestClusterEnvironment::with_topology(ClusterTopology::per_node_pools(2, vec![vec![0], vec![1], vec![2], vec![3]]))
+            .await
+            .expect("four-pool topology");
+    let kept: Vec<String> = env.nodes[2..].iter().map(|node| node.address.clone()).collect();
+
+    env.remove_single_node_pools(&[0, 1]).expect("remove two retired pools");
+    assert_eq!(env.nodes.len(), 2);
+    assert_eq!(env.nodes.iter().map(|node| node.address.clone()).collect::<Vec<_>>(), kept);
+    assert_eq!(env.nodes.iter().map(|node| node.pool_idx).collect::<Vec<_>>(), vec![0, 1]);
+    let volumes = env.rustfs_volumes_arg();
+    assert_eq!(volumes.split(' ').count(), 2, "expected two pool arguments, got: {volumes}");
+    assert!(
+        volumes.contains(&kept[0]) && volumes.contains(&kept[1]),
+        "retired pools must leave the command line: {volumes}"
+    );
+
+    env.remove_single_node_pools(&[0, 1])
+        .expect_err("the last remaining pool cannot be removed");
+}
+
+#[tokio::test]
 async fn append_single_node_pool_rejects_striped_single_pool() {
     let mut env = RustFSTestClusterEnvironment::new(4).await.expect("four-node single pool");
     let err = env
@@ -1449,4 +1540,24 @@ fn rebalance_complete_accepts_non_participating_pools_but_requires_progress() {
         ]
     });
     assert!(!rebalance_complete(&no_movement, "run-1").unwrap());
+}
+
+#[test]
+fn rebalance_status_tolerates_deferred_entry_error_only_while_started() {
+    let deferred = "deferred transient rebalance entry failure: Storage resources are insufficient for the write operation: b/k";
+    let mut status = serde_json::json!({
+        "id": "run-1",
+        "pools": [{ "id": 0, "status": "Started", "stopping": false, "lastError": deferred, "progress": { "objects": 1, "bytes": 1 } }]
+    });
+    assert!(rebalance_active(&status, "run-1").expect("a retried deferral keeps the run active"));
+
+    status["pools"][0]["status"] = serde_json::json!("Completed");
+    assert!(
+        rebalance_complete(&status, "run-1").is_err(),
+        "a completed pool must have cleared its deferred entry error"
+    );
+
+    status["pools"][0]["status"] = serde_json::json!("Started");
+    status["pools"][0]["lastError"] = serde_json::json!("rebalance entry failed: Storage resources are insufficient");
+    assert!(rebalance_active(&status, "run-1").is_err(), "a non-deferred lastError stays fatal");
 }

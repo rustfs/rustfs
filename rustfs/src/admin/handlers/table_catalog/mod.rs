@@ -1224,6 +1224,31 @@ async fn authorize_table_catalog_resource_for_principal(
     action: AdminAction,
 ) -> S3Result<()> {
     let object_path = resource.object_path();
+    authorize_table_catalog_object_for_principal(req, principal, resource.warehouse, object_path.as_deref().unwrap_or(""), action)
+        .await
+}
+
+async fn authorize_table_warehouse_location_request(req: &S3Request<Body>, bucket: &str, location: &str) -> S3Result<()> {
+    let prefix =
+        crate::table_catalog::table_warehouse_object_prefix_from_location(bucket, location).map_err(catalog_store_error)?;
+    let principal = table_catalog_request_principal(req).await?;
+    authorize_table_catalog_object_for_principal(
+        req,
+        &principal,
+        bucket,
+        prefix.trim_end_matches('/'),
+        AdminAction::ClaimTableLocationAction,
+    )
+    .await
+}
+
+async fn authorize_table_catalog_object_for_principal(
+    req: &S3Request<Body>,
+    principal: &TableCatalogRequestPrincipal,
+    bucket: &str,
+    object: &str,
+    action: AdminAction,
+) -> S3Result<()> {
     validate_admin_action_with_bucket_object_for_iam(
         principal.iam_store.clone(),
         &req.headers,
@@ -1231,7 +1256,7 @@ async fn authorize_table_catalog_resource_for_principal(
         principal.owner,
         Action::AdminAction(action),
         req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        AdminResourceScope::bucket_object(resource.warehouse, object_path.as_deref().unwrap_or("")),
+        AdminResourceScope::bucket_object(bucket, object),
     )
     .await
 }
@@ -1443,6 +1468,10 @@ where
                 }
             }
         };
+        self.record_authorization_result(result).await
+    }
+
+    async fn record_authorization_result(&self, result: S3Result<()>) -> crate::table_catalog::TableCatalogStoreResult<()> {
         if let Err(err) = result {
             let mut authorization_error = self.authorization_error.lock().await;
             if authorization_error.is_none() {
@@ -1866,6 +1895,25 @@ where
         table_bucket: &str,
     ) -> crate::table_catalog::TableCatalogStoreResult<()> {
         self.begin_bucket_publication(table_bucket).await
+    }
+
+    async fn authorize_table_warehouse_location(
+        &self,
+        table_bucket: &str,
+        location: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        let result = match &self.authorization {
+            TableCommitObjectAuthorization::Request(req) => {
+                let req = req.lock().await;
+                authorize_table_warehouse_location_request(&req, table_bucket, location).await
+            }
+            TableCommitObjectAuthorization::Preauthorized => Ok(()),
+            #[cfg(test)]
+            TableCommitObjectAuthorization::Test { .. } => {
+                return self.backend.authorize_table_warehouse_location(table_bucket, location).await;
+            }
+        };
+        self.record_authorization_result(result).await
     }
 
     fn table_bucket_commit_publication_is_held(&self, table_bucket: &str) -> bool {
@@ -4691,9 +4739,23 @@ struct SnapshotFileChanges {
     added_delete_files: BTreeSet<String>,
     deleted_data_files: BTreeSet<String>,
     deleted_delete_files: BTreeSet<String>,
+    existing_files: BTreeSet<String>,
+    invalid_existing_files: bool,
 }
 
 impl SnapshotFileChanges {
+    fn record_existing_file(
+        &mut self,
+        reference: crate::table_catalog::ManifestDataFileReference,
+        current_live_files: &SnapshotLiveFiles,
+        partition_spec_id: i32,
+    ) {
+        self.invalid_existing_files |= !current_live_files
+            .identity(&reference.location, &reference.object_kind)
+            .is_some_and(|identity| identity.matches_existing_reference(&reference, partition_spec_id));
+        self.invalid_existing_files |= !self.existing_files.insert(reference.location);
+    }
+
     fn has_delete_or_row_level_change(&self) -> bool {
         !self.added_delete_files.is_empty() || !self.deleted_data_files.is_empty() || !self.deleted_delete_files.is_empty()
     }
@@ -4709,6 +4771,7 @@ impl SnapshotFileChanges {
 
 struct SnapshotChangeContext<'a> {
     current_live_files: &'a SnapshotLiveFiles,
+    track_existing_files: bool,
     snapshot_id: i64,
     sequence_number: i64,
 }
@@ -4719,10 +4782,29 @@ struct SnapshotManifestIdentity {
     added_snapshot_id: Option<i64>,
 }
 
-#[derive(PartialEq, Eq)]
 struct SnapshotFileIdentity {
+    content: crate::table_catalog::ManifestDataFileContent,
+    snapshot_id: Option<i64>,
+    partition_spec_id: i32,
+    data_file_metadata: crate::table_catalog::ManifestDataFileMetadata,
     sequence_number: Option<i64>,
     file_sequence_number: Option<i64>,
+}
+
+impl SnapshotFileIdentity {
+    fn matches_existing_reference(
+        &self,
+        reference: &crate::table_catalog::ManifestDataFileReference,
+        partition_spec_id: i32,
+    ) -> bool {
+        // Iceberg v1 files have implicit sequence zero when carried into v2 manifests.
+        self.content == reference.content
+            && self.snapshot_id == reference.snapshot_id
+            && self.partition_spec_id == partition_spec_id
+            && self.data_file_metadata == reference.data_file_metadata
+            && self.sequence_number.unwrap_or(0) == reference.sequence_number.unwrap_or(0)
+            && self.file_sequence_number.unwrap_or(0) == reference.file_sequence_number.unwrap_or(0)
+    }
 }
 
 async fn validate_table_snapshot_commit_conflicts<B>(
@@ -4785,6 +4867,7 @@ where
         snapshot,
         SnapshotChangeContext {
             current_live_files: &parent_live_files,
+            track_existing_files: operation == "replace",
             snapshot_id,
             sequence_number,
         },
@@ -4809,7 +4892,16 @@ where
             if parent_snapshot_id.is_none() {
                 return Err(s3_error!(InvalidRequest, "row-level snapshot operation requires a parent snapshot"));
             }
-            if operation == "overwrite" {
+            if operation == "replace" && !changes.has_any_change() {
+                if changes.invalid_existing_files
+                    || changes.existing_files.len() != parent_live_files.data_files.len() + parent_live_files.delete_files.len()
+                {
+                    return Err(s3_error!(
+                        InvalidRequest,
+                        "manifest rewrite must preserve the parent snapshot's live files"
+                    ));
+                }
+            } else if operation == "overwrite" {
                 if !changes.has_any_change() {
                     return Err(s3_error!(InvalidRequest, "overwrite snapshot operation requires changed files"));
                 }
@@ -4862,6 +4954,7 @@ where
             manifest_path,
             sequence_number,
             added_snapshot_id,
+            partition_spec_id,
         } = manifest.location;
         live_files.manifest_files.insert(
             manifest_path,
@@ -4877,6 +4970,10 @@ where
             match status {
                 0 | 1 => {
                     let identity = SnapshotFileIdentity {
+                        content: reference.content,
+                        snapshot_id: reference.snapshot_id,
+                        partition_spec_id: partition_spec_id.unwrap_or(0),
+                        data_file_metadata: reference.data_file_metadata,
                         sequence_number: reference.sequence_number,
                         file_sequence_number: reference.file_sequence_number,
                     };
@@ -4928,6 +5025,19 @@ where
             {
                 return Err(s3_error!(InvalidRequest, "inherited manifest must preserve its manifest-list identity"));
             }
+            if context.track_existing_files {
+                for reference in manifest
+                    .references
+                    .into_iter()
+                    .filter(|reference| matches!(reference.entry_status, Some(0 | 1)))
+                {
+                    changes.record_existing_file(
+                        reference,
+                        context.current_live_files,
+                        manifest.location.partition_spec_id.unwrap_or(0),
+                    );
+                }
+            }
             continue;
         }
         if manifest
@@ -4969,11 +5079,8 @@ where
                     .current_live_files
                     .identity(&reference.location, &reference.object_kind)
                     .is_some_and(|current_identity| {
-                        current_identity
-                            != &SnapshotFileIdentity {
-                                sequence_number: reference.sequence_number,
-                                file_sequence_number: reference.file_sequence_number,
-                            }
+                        current_identity.sequence_number != reference.sequence_number
+                            || current_identity.file_sequence_number != reference.file_sequence_number
                     })
             {
                 return Err(s3_error!(
@@ -4982,8 +5089,16 @@ where
                 ));
             }
 
-            match (status, reference.object_kind) {
-                (0, _) => {}
+            match (status, &reference.object_kind) {
+                (0, _) => {
+                    if context.track_existing_files {
+                        changes.record_existing_file(
+                            reference,
+                            context.current_live_files,
+                            manifest.location.partition_spec_id.unwrap_or(0),
+                        );
+                    }
+                }
                 (1, crate::table_catalog::TableMetadataMaintenanceObjectKind::DataFile) => {
                     changes.added_data_files.insert(reference.location);
                 }
@@ -5019,7 +5134,7 @@ where
 {
     let manifest_locations = snapshot_manifest_locations(metadata_backend, bucket, entry, snapshot).await?;
     let mut manifests = Vec::new();
-    for manifest_location in manifest_locations {
+    for mut manifest_location in manifest_locations {
         let manifest_key = table_commit_object_key(
             bucket,
             entry,
@@ -5031,10 +5146,11 @@ where
             .await
             .map_err(catalog_store_error)?
             .ok_or_else(|| s3_error!(InvalidRequest, "snapshot manifest object is missing"))?;
-        let file_references = crate::table_catalog::decode_manifest_avro_async(manifest_object.data)
+        let decoded_manifest = crate::table_catalog::decode_manifest_avro_async(manifest_object.data)
             .await
-            .map_err(catalog_store_error)?
-            .references;
+            .map_err(catalog_store_error)?;
+        manifest_location.partition_spec_id = manifest_location.partition_spec_id.or(decoded_manifest.partition_spec_id);
+        let file_references = decoded_manifest.references;
         let mut references = Vec::with_capacity(file_references.len());
         for mut reference in file_references {
             if reference.snapshot_id.is_none() {
@@ -5060,6 +5176,7 @@ where
 #[derive(Debug)]
 struct SnapshotManifestLocation {
     manifest_path: String,
+    partition_spec_id: Option<i32>,
     sequence_number: Option<i64>,
     added_snapshot_id: Option<i64>,
 }
@@ -5093,6 +5210,7 @@ where
             .into_iter()
             .map(|reference| SnapshotManifestLocation {
                 manifest_path: reference.manifest_path,
+                partition_spec_id: reference.partition_spec_id,
                 sequence_number: reference.sequence_number,
                 added_snapshot_id: reference.added_snapshot_id,
             })
@@ -5110,6 +5228,7 @@ where
                 .filter(|manifest| !manifest.is_empty())
                 .map(|manifest| SnapshotManifestLocation {
                     manifest_path: manifest.to_string(),
+                    partition_spec_id: None,
                     sequence_number: None,
                     added_snapshot_id: None,
                 })
@@ -5127,9 +5246,13 @@ async fn validate_manifest_data_file_reference<B>(
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
-    table_commit_object_key(bucket, entry, &reference.location, reference.object_kind.clone())?;
-    let object_key = crate::table_catalog::table_catalog_object_key_from_location(bucket, &reference.location)
-        .ok_or_else(|| s3_error!(InvalidRequest, "manifest data file location is invalid"))?;
+    let object_key = table_commit_object_key(bucket, entry, &reference.location, reference.object_kind.clone())?;
+    match reference.entry_status {
+        Some(0 | 1) => {}
+        Some(2) => return Ok(()),
+        Some(_) => return Err(s3_error!(InvalidRequest, "manifest entry status is unsupported")),
+        None => return Err(s3_error!(InvalidRequest, "manifest entry status is required")),
+    }
     if !metadata_backend
         .object_exists(bucket, &object_key)
         .await
@@ -5764,6 +5887,10 @@ where
     let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
     validate_metadata_table_location_in_bucket(bucket, &metadata)?;
     adopt_registered_metadata_identity(&mut entry, &metadata)?;
+    metadata_backend
+        .authorize_table_warehouse_location(bucket, &entry.warehouse_location)
+        .await
+        .map_err(catalog_store_error)?;
     validate_table_metadata_snapshot_graph(metadata_backend, bucket, &entry, None, &metadata).await?;
     store
         .register_table_with_publication(entry.clone(), metadata_backend)
@@ -5953,6 +6080,13 @@ where
 {
     let mut target_entry = entry.clone();
     target_entry.warehouse_location = crate::table_catalog::table_metadata_location(metadata)?.to_string();
+    if crate::table_catalog::table_warehouse_object_prefix(&target_entry)?
+        != crate::table_catalog::table_warehouse_object_prefix(entry)?
+    {
+        metadata_backend
+            .authorize_table_warehouse_location(bucket, &target_entry.warehouse_location)
+            .await?;
+    }
     let context = crate::table_catalog::TableSnapshotGraphValidationContext::new(metadata_backend, bucket, &target_entry);
     crate::table_catalog::validate_table_snapshot_changes(&context, current_metadata, metadata).await
 }
@@ -6639,6 +6773,10 @@ where
         updated_at: None,
     };
     adopt_registered_metadata_identity(&mut entry, &metadata)?;
+    metadata_backend
+        .authorize_table_warehouse_location(bucket, &entry.warehouse_location)
+        .await
+        .map_err(catalog_store_error)?;
     validate_table_metadata_snapshot_graph(metadata_backend, bucket, &entry, None, &metadata).await?;
 
     crate::table_catalog::TableCommitPublication::begin_table_bucket(metadata_backend, bucket)
@@ -7637,6 +7775,10 @@ where
             },
         )?;
         adopt_registered_metadata_identity(&mut entry, &target_metadata)?;
+        metadata_backend
+            .authorize_table_warehouse_location(bucket, &entry.warehouse_location)
+            .await
+            .map_err(catalog_store_error)?;
         validate_table_metadata_snapshot_graph(metadata_backend, bucket, &entry, None, &target_metadata).await?;
         store
             .register_table_with_publication(entry.clone(), metadata_backend)
@@ -7680,6 +7822,10 @@ where
         let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
         validate_metadata_table_location_in_bucket(bucket, &metadata)?;
         adopt_registered_metadata_identity(&mut entry, &metadata)?;
+        metadata_backend
+            .authorize_table_warehouse_location(bucket, &entry.warehouse_location)
+            .await
+            .map_err(catalog_store_error)?;
         validate_table_metadata_snapshot_graph(metadata_backend, bucket, &entry, None, &metadata).await?;
         if let Some(existing) = store
             .load_table(bucket, &namespace.public_name(), table)

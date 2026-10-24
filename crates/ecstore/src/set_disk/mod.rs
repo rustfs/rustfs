@@ -941,6 +941,7 @@ struct OwnedGetObjectFileInfo {
     fi: FileInfo,
     parts_metadata: Vec<FileInfo>,
     online_disks: Vec<Option<DiskStore>>,
+    verified_inline_body: Option<Bytes>,
 }
 
 enum LateMetadataFanout {
@@ -957,6 +958,7 @@ impl GetObjectFileInfo {
                 fi,
                 parts_metadata,
                 online_disks,
+                verified_inline_body: None,
             }),
             shared: None,
             condition_stopped: false,
@@ -1017,6 +1019,27 @@ impl GetObjectFileInfo {
 
     fn has_late_metadata_fanout(&self) -> bool {
         self.late_metadata_fanout.is_some()
+    }
+
+    fn set_verified_inline_body(&mut self, body: Option<Bytes>) {
+        if let Some(owned) = self.owned.as_mut() {
+            owned.verified_inline_body = body;
+        }
+    }
+
+    fn take_verified_inline_body(&mut self) -> Option<Bytes> {
+        self.owned.as_mut().and_then(|owned| owned.verified_inline_body.take())
+    }
+
+    fn into_object_info(self, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
+        match (self.owned, self.shared) {
+            (Some(snapshot), None) => ObjectInfo::from_owned_file_info(snapshot.fi, bucket, object, versioned),
+            (None, Some(entry)) => match Arc::try_unwrap(entry) {
+                Ok(entry) => ObjectInfo::from_owned_file_info(entry.fi, bucket, object, versioned),
+                Err(entry) => ObjectInfo::from_file_info(&entry.fi, bucket, object, versioned),
+            },
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
     }
 
     fn into_owned(self) -> (FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>) {
@@ -2513,7 +2536,7 @@ mod prepared_get_object_metadata_tests {
         let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
         rustfs_io_metrics::set_get_stage_metrics_enabled(true);
 
-        let (restored, object_size, calls_total) = metrics::with_local_recorder(&recorder, || {
+        let (restored, object_size, calls_total, body_decodes) = metrics::with_local_recorder(&recorder, || {
             runtime.block_on(async {
                 let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
                 let opts = ObjectOptions {
@@ -2567,7 +2590,12 @@ mod prepared_get_object_metadata_tests {
                             .await
                             .expect("inline GET body should stream");
 
-                        (restored, object_size, calls.total(disk_call_counters::KIND_READ_VERSION))
+                        (
+                            restored,
+                            object_size,
+                            calls.total(disk_call_counters::KIND_READ_VERSION),
+                            calls.total(disk_call_counters::KIND_BODY_DECODE),
+                        )
                     },
                 )
                 .await
@@ -2580,6 +2608,10 @@ mod prepared_get_object_metadata_tests {
         assert_eq!(
             calls_total, 4,
             "default production inline GET should schedule the initial bounded quorum plus one hedge"
+        );
+        assert_eq!(
+            body_decodes, 1,
+            "cold inline early-stop GET must reuse the quorum-verified inline body instead of decoding shards twice"
         );
         assert_eq!(
             recorder.histogram_values(
@@ -2605,6 +2637,124 @@ mod prepared_get_object_metadata_tests {
             vec![1.0],
             "default production GET should record the aborted slow parity metadata task"
         );
+    }
+
+    #[test]
+    #[serial_test::serial(body_cache_hook)]
+    fn get_object_info_uses_early_stop_for_locked_or_cache_safe_reads_and_full_wait_for_unlocked() {
+        use crate::storage_api_contracts::object::ObjectOperations;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime should build");
+        let bucket = "get-object-info-early-stop-bucket";
+        let object = object_with_initial_data_shards(bucket, "get-object-info-early-stop-object");
+        let payload = b"head object early-stop payload".repeat(128);
+
+        runtime.block_on(async {
+            let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+            let write_opts = ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            };
+
+            set_disks
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            let mut put_reader = PutObjReader::from_vec(payload.clone());
+            set_disks
+                .put_object(bucket, &object, &mut put_reader, &write_opts)
+                .await
+                .expect("inline object should be written");
+
+            temp_env::async_with_vars(
+                [
+                    ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", None::<&str>),
+                    ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", None::<&str>),
+                    ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", None::<&str>),
+                ],
+                async {
+                    let slow_parity_disk = bounded_initial_parity_disk_index(bucket, &object);
+                    let barrier =
+                        rename_fanout_barrier::arm(&object, slow_parity_disk, rename_fanout_barrier::PHASE_READ_VERSION);
+                    let calls = disk_call_counters::observe(&object);
+                    let set_disks_for_head = Arc::clone(&set_disks);
+                    let object_for_head = object.clone();
+                    let head_opts = ObjectOptions {
+                        no_lock: true,
+                        metadata_cache_safe: true,
+                        ..Default::default()
+                    };
+                    let mut head_task =
+                        tokio::spawn(
+                            async move { set_disks_for_head.get_object_info(bucket, &object_for_head, &head_opts).await },
+                        );
+
+                    tokio::time::timeout(READ_VERSION_BARRIER_GUARD, barrier.wait_until_paused())
+                        .await
+                        .expect("cache-safe HEAD should pause a slow parity metadata read");
+                    let info = tokio::time::timeout(READ_VERSION_BARRIER_GUARD, &mut head_task)
+                        .await
+                        .expect("cache-safe HEAD should return before the paused parity metadata response")
+                        .expect("HEAD task should not panic")
+                        .expect("HEAD should succeed");
+                    assert_eq!(info.size, payload.len() as i64);
+                    assert_eq!(
+                        calls.total(disk_call_counters::KIND_READ_VERSION),
+                        4,
+                        "cache-safe HEAD should schedule bounded quorum plus one hedge"
+                    );
+                    assert_eq!(
+                        calls.total(disk_call_counters::KIND_BODY_DECODE),
+                        1,
+                        "early-stop HEAD verifies inline quorum once"
+                    );
+
+                    // Second cache-safe HEAD should hit the QuorumSelected metadata cache entry (0 new disk reads).
+                    let cached_info = set_disks
+                        .get_object_info(bucket, &object, &ObjectOptions::default())
+                        .await
+                        .expect("cached HEAD with default locked options should succeed");
+                    assert_eq!(cached_info.size, payload.len() as i64);
+                    assert_eq!(
+                        calls.total(disk_call_counters::KIND_READ_VERSION),
+                        4,
+                        "repeat locked HEAD must hit the QuorumSelected metadata cache entry"
+                    );
+
+                    // Release the slow parity barrier so full-wait can complete all 4 disks.
+                    barrier.release();
+
+                    // Unlocked internal preflight (no_lock=true, metadata_cache_safe=false) must bypass cache and full-wait.
+                    let unlocked_info = set_disks
+                        .get_object_info(
+                            bucket,
+                            &object,
+                            &ObjectOptions {
+                                no_lock: true,
+                                metadata_cache_safe: false,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("unlocked preflight get_object_info should succeed");
+                    assert_eq!(unlocked_info.size, payload.len() as i64);
+                    assert_eq!(
+                        calls.total(disk_call_counters::KIND_READ_VERSION),
+                        8,
+                        "unlocked preflight get_object_info must query all 4 disks"
+                    );
+                    assert_eq!(
+                        calls.total(disk_call_counters::KIND_BODY_DECODE),
+                        1,
+                        "unlocked preflight full-wait must not run early-stop inline body decode"
+                    );
+                },
+            )
+            .await;
+        });
     }
 
     #[test]
@@ -2942,8 +3092,8 @@ impl SetDisks {
     }
 }
 
-/// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
-/// Defaults to 30 seconds if not set or invalid
+/// Get the namespace lock acquisition budget from
+/// `RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT` (seconds, default 5).
 /// Lock acquisition timeout. Cached: this is consulted on every object
 /// lock acquisition and `std::env::var` takes a process-global lock. In test
 /// builds the env var is read directly so `temp_env` overrides take effect.
@@ -6864,6 +7014,16 @@ fn should_force_delete_marker_for_missing_version(opts: &ObjectOptions) -> bool 
     opts.delete_marker || ((opts.versioned || opts.version_suspended) && opts.version_id.is_none() && !opts.data_movement)
 }
 
+fn republishes_data_movement_delete_marker(opts: &ObjectOptions, goi: &ObjectInfo, version_found: bool) -> bool {
+    opts.data_movement
+        && opts.delete_marker
+        && version_found
+        && goi.delete_marker
+        && opts.version_purge_status().is_empty()
+        && goi.version_purge_status.is_empty()
+        && opts.version_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()) == Some(goi.version_id.unwrap_or_else(Uuid::nil))
+}
+
 /// Whether a plain client delete addressed to an explicit version removed an
 /// existing delete marker, so the response must carry delete-marker semantics
 /// (`x-amz-delete-marker: true` / `DeleteMarker` in `DeleteObjects` entries).
@@ -6879,6 +7039,7 @@ fn should_force_delete_marker_for_missing_version(opts: &ObjectOptions) -> bool 
 /// `resolve_delete_version_state` that clear `delete_marker` for them.
 fn explicit_delete_removed_marker(opts: &ObjectOptions, goi: &ObjectInfo, version_found: bool) -> bool {
     opts.version_id.is_some()
+        && !republishes_data_movement_delete_marker(opts, goi, version_found)
         && version_found
         && goi.delete_marker
         && goi.version_purge_status.is_empty()
@@ -6887,6 +7048,9 @@ fn explicit_delete_removed_marker(opts: &ObjectOptions, goi: &ObjectInfo, versio
 }
 
 fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_found: bool) -> (bool, bool) {
+    if republishes_data_movement_delete_marker(opts, goi, version_found) {
+        return (true, true);
+    }
     let mut mark_delete = goi.version_id.is_some() || ((opts.versioned || opts.version_suspended) && opts.version_id.is_none());
     let mut delete_marker = opts.versioned;
 
@@ -6941,6 +7105,29 @@ fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_
 }
 
 impl SetDisks {
+    pub(crate) async fn verify_data_movement_delete_marker_write_quorum(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+    ) -> Result<()> {
+        let requested_version = Uuid::parse_str(version_id)?;
+        let disks = self.disk_inventory().await;
+        let (metadata, errors) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false).await?;
+        // Match delete_object_version_with_purge, independently of data parity or online inventory size.
+        let quorum = self.set_drive_count / 2 + 1;
+        let (_, marker, _) = Self::select_valid_fileinfo(&disks, &metadata, &errors, version_id, quorum, quorum)
+            .map_err(|error| to_object_err(error.into(), vec![bucket, object, version_id]))?;
+        if !marker.deleted || marker.tier_free_version() || marker.version_id.unwrap_or_else(Uuid::nil) != requested_version {
+            return Err(Error::DataMovementOverwriteErr(
+                bucket.to_owned(),
+                object.to_owned(),
+                version_id.to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Publish an internal tier free-version record without changing its
     /// delete-marker shape or remote-tier identity. The caller holds the
     /// source and target object locks; a write quorum is required before the
@@ -7996,18 +8183,25 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
     format!("{}-{}", etag_hex, parts.len())
 }
 
-fn completed_multipart_object_part(part_num: usize, ext_part: &ObjectPartInfo) -> ObjectPartInfo {
-    ObjectPartInfo {
-        etag: ext_part.etag.clone(),
-        number: part_num,
-        size: ext_part.size,
-        mod_time: ext_part.mod_time,
-        actual_size: ext_part.actual_size,
-        index: ext_part.index.clone(),
-        checksums: ext_part.checksums.clone(),
-        integrity: ext_part.integrity.clone(),
-        ..Default::default()
+fn prepare_complete_multipart_parts(fi: &mut FileInfo, parts: Vec<ObjectPartInfo>) -> Vec<usize> {
+    // Preserve legacy cleanup ordering, including replacement-only manifests.
+    let capacity = fi.parts.len() + parts.len();
+    let mut staged_part_numbers = Vec::with_capacity(capacity);
+    staged_part_numbers.extend(fi.parts.iter().map(|part| part.number));
+    let mut seen = HashSet::with_capacity(capacity);
+    seen.extend(staged_part_numbers.iter().copied());
+    let mut inserted = false;
+    for part in &parts {
+        if seen.insert(part.number) {
+            staged_part_numbers.push(part.number);
+            inserted = true;
+        }
     }
+    if inserted {
+        staged_part_numbers.sort_unstable();
+    }
+    fi.parts = parts;
+    staged_part_numbers
 }
 
 fn complete_part_checksum(part: &CompletePart, checksum_type: rustfs_rio::ChecksumType) -> Option<Option<String>> {
@@ -9439,6 +9633,56 @@ mod tests {
     }
 
     #[test]
+    fn data_movement_marker_republication_preserves_creation_and_exact_identity() {
+        for version in [Uuid::nil(), Uuid::new_v4()] {
+            for replica in [false, true] {
+                let opts = ObjectOptions {
+                    versioned: !version.is_nil(),
+                    version_suspended: version.is_nil(),
+                    version_id: Some(version.to_string()),
+                    data_movement: true,
+                    delete_marker: true,
+                    delete_replication: replica.then(|| ReplicationState {
+                        replica_status: ReplicationStatusType::Replica,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let current = ObjectInfo {
+                    version_id: (!version.is_nil()).then_some(version),
+                    delete_marker: true,
+                    ..Default::default()
+                };
+                assert_eq!(resolve_delete_version_state(&opts, &current, true), (true, true));
+                assert!(!explicit_delete_removed_marker(&opts, &current, true));
+                let mut changed = current.clone();
+                changed.version_id = Some(Uuid::new_v4());
+                assert!(!republishes_data_movement_delete_marker(&opts, &changed, true));
+                changed.version_id = current.version_id;
+                changed.delete_marker = false;
+                assert!(!republishes_data_movement_delete_marker(&opts, &changed, true));
+                changed = current.clone();
+                changed.version_purge_status = VersionPurgeStatusType::Complete;
+                assert!(!republishes_data_movement_delete_marker(&opts, &changed, true));
+                let purging = ObjectOptions {
+                    delete_replication: Some(ReplicationState {
+                        version_purge_status_internal: Some("target=PENDING;".to_string()),
+                        purge_targets: version_purge_statuses_map("target=PENDING;"),
+                        ..Default::default()
+                    }),
+                    ..opts.clone()
+                };
+                assert!(!republishes_data_movement_delete_marker(&purging, &current, true));
+                let ordinary = ObjectOptions {
+                    data_movement: false,
+                    ..opts
+                };
+                assert!(!republishes_data_movement_delete_marker(&ordinary, &current, true));
+            }
+        }
+    }
+
+    #[test]
     fn resolve_delete_version_state_keeps_delete_marker_for_replica_marker_creation() {
         let opts = ObjectOptions {
             versioned: true,
@@ -9643,30 +9887,61 @@ mod tests {
     }
 
     #[test]
-    fn test_completed_multipart_object_part_preserves_checksums() {
+    fn prepare_complete_multipart_parts_preserves_metadata_and_cleanup_order() {
         let checksums = HashMap::from([
-            (rustfs_rio::ChecksumType::CRC32.to_string(), "crc32-value".to_string()),
-            (rustfs_rio::ChecksumType::CRC32C.to_string(), "crc32c-value".to_string()),
+            (rustfs_rio::ChecksumType::CRC32.to_string(), "crc32-value".to_owned()),
+            (rustfs_rio::ChecksumType::CRC32C.to_string(), "crc32c-value".to_owned()),
         ]);
-        let ext_part = ObjectPartInfo {
+        let part = ObjectPartInfo {
             number: 7,
-            etag: "etag-7".to_string(),
+            etag: "etag-7".to_owned(),
             size: 123,
             actual_size: 456,
             mod_time: Some(OffsetDateTime::UNIX_EPOCH),
             index: Some(Bytes::from_static(&[1, 2, 3])),
-            checksums: Some(checksums.clone()),
+            checksums: Some(checksums),
+            integrity: Some(
+                rustfs_filemeta::shard_integrity::PartIntegrity::new(
+                    rustfs_filemeta::shard_integrity::IntegrityLayout::new(2, 2, 1024 * 1024, false).expect("valid layout"),
+                    7,
+                )
+                .expect("valid integrity"),
+            ),
             ..Default::default()
         };
-
-        let completed = completed_multipart_object_part(7, &ext_part);
-
-        assert_eq!(completed.number, 7);
-        assert_eq!(completed.etag, ext_part.etag);
-        assert_eq!(completed.size, ext_part.size);
-        assert_eq!(completed.actual_size, ext_part.actual_size);
-        assert_eq!(completed.index, ext_part.index);
-        assert_eq!(completed.checksums, Some(checksums));
+        let incoming = vec![part.clone()];
+        let pointer = incoming.as_ptr();
+        let mut fi = FileInfo {
+            parts: vec![
+                ObjectPartInfo {
+                    number: 9,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    number: 7,
+                    etag: "stale".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(prepare_complete_multipart_parts(&mut fi, incoming), vec![9, 7]);
+        assert_eq!(fi.parts, vec![part.clone()]);
+        assert_eq!(fi.parts.as_ptr(), pointer, "move the existing allocation");
+        let mut fi = FileInfo {
+            parts: vec![
+                ObjectPartInfo {
+                    number: 9,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    number: 1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(prepare_complete_multipart_parts(&mut fi, vec![part]), vec![1, 7, 9]);
     }
 
     #[test]

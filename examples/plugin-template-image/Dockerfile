@@ -12,4 +12,4 @@ COPY --from=build /src/target/release/rustfs-image-transform /usr/local/bin/rust
 ENV VIPS_CONCURRENCY=1
 USER 65534:65534
 WORKDIR /output
-ENTRYPOINT ["/usr/local/bin/rustfs-image-transform"]
+CMD ["/usr/local/bin/rustfs-image-transform"]

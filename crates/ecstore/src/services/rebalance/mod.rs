@@ -66,7 +66,8 @@ pub async fn test_store_with_persisted_rebalance_meta(
     let ctx = std::sync::Arc::new(crate::runtime::instance::InstanceContext::new());
     let (temp_dirs, pool) = crate::core::sets::make_local_two_set_sets_with_ctx(ctx.clone()).await;
     let pools = vec![pool.clone()];
-    let pool_meta = crate::core::pools::PoolMeta::new(&pools, &crate::core::pools::PoolMeta::default());
+    let pool_meta = crate::core::pools::PoolMeta::new(&pools, &crate::core::pools::PoolMeta::default())
+        .expect("new pool topology should produce valid pool metadata");
     pool_meta
         .save_for_startup(pools.clone())
         .await
@@ -146,6 +147,19 @@ pub(crate) async fn test_three_pool_stores_with_isolated_node_contexts(
     test_pool_stores_with_contexts(rebalance_meta, true, 3, 2).await
 }
 
+/// Four drives per set, so a set can hold metadata on fewer than its read
+/// quorum of drives while each drive stays online.
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) async fn test_three_pool_stores_with_four_disk_sets_with_isolated_node_contexts(
+    rebalance_meta: Option<RebalanceMeta>,
+) -> (
+    Vec<tempfile::TempDir>,
+    std::sync::Arc<crate::store::ECStore>,
+    std::sync::Arc<crate::store::ECStore>,
+) {
+    test_pool_stores_with_contexts(rebalance_meta, true, 3, 4).await
+}
+
 #[cfg(all(test, feature = "test-util"))]
 pub(crate) async fn test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(
     rebalance_meta: Option<RebalanceMeta>,
@@ -199,7 +213,8 @@ async fn test_pool_stores_with_contexts(
             }
         }
     }
-    let mut pool_meta = PoolMeta::new(&pools, &PoolMeta::default());
+    let mut pool_meta =
+        PoolMeta::new(&pools, &PoolMeta::default()).expect("new pool topology should produce valid pool metadata");
     pool_meta.version = POOL_META_VERSION;
     pool_meta
         .save_for_startup(pools.clone())

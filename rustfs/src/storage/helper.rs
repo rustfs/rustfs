@@ -41,6 +41,8 @@ use std::future::Future;
 use tokio::runtime::{Builder, Handle};
 use tracing::{Instrument, info_span, warn};
 
+#[cfg(feature = "diagnostic-read-version-caller")]
+use super::storage_api::ecstore_diagnostic;
 use crate::storage::storage_api::helper_consumer::StorageObjectInfo as ObjectInfo;
 
 /// Schedules an asynchronous task on the current runtime;
@@ -49,6 +51,17 @@ pub(crate) fn spawn_background<F>(fut: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    // Capture before handing work to either runtime; request task-locals are not inherited.
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let fut = ecstore_diagnostic::with_captured_read_version_context(
+        ecstore_diagnostic::ReadVersionContextBoundary::BackgroundTask,
+        fut,
+    );
+    #[cfg(not(feature = "diagnostic-read-version-caller"))]
+    let fut = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(
+        rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context(),
+        fut,
+    );
     if let Ok(handle) = Handle::try_current() {
         drop(handle.spawn(fut));
     } else {
@@ -460,6 +473,158 @@ mod tests {
     use s3s::{S3Error, S3ErrorCode, S3Request, S3Response};
     use std::sync::{Arc, Mutex};
     use temp_env::{async_with_vars, with_vars};
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn diagnostic_background_tasks_keep_existing_entry_across_nested_spawns() {
+        use super::ecstore_diagnostic::{ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry};
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, current_s3_http_operation_name, observe_s3_http_operation,
+            with_s3_http_operation_context,
+        };
+
+        let mut request = S3HttpRequestGuard::new("GET");
+        let operation = request.in_scope(|| {
+            observe_s3_http_operation(S3Operation::GetObject);
+            current_s3_http_operation_context().expect("captured GET operation")
+        });
+        for has_request_context in [false, true] {
+            let context = has_request_context.then(|| RequestContext::from_headers(&HeaderMap::new()));
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            with_s3_http_operation_context(Some(operation), async {
+                with_read_version_entry(ReadVersionEntrySource::TierConfigReload, async {
+                    super::spawn_background_with_context(context, async move {
+                        release_rx.await.expect("parent releases background work");
+                        with_read_version_entry(ReadVersionEntrySource::ConfigRead, async move {
+                            super::spawn_background_with_context(None, async move {
+                                tx.send((current_s3_http_operation_name(), current_read_version_entry_source()))
+                                    .expect("context observer remains live");
+                            });
+                        })
+                        .await;
+                    });
+                })
+                .await;
+            })
+            .await;
+            assert_eq!(current_read_version_entry_source(), None);
+            release_tx.send(()).expect("detached background work remains alive");
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+                    .await
+                    .expect("background completion deadline")
+                    .expect("context result"),
+                (Some("s3:GetObject"), Some(ReadVersionEntrySource::TierConfigReload))
+            );
+        }
+        drop(request);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        super::spawn_background(async move {
+            tx.send((current_s3_http_operation_name(), current_read_version_entry_source()))
+                .expect("unscoped observer remains live");
+        });
+        assert_eq!(rx.await.expect("unscoped task completes"), (None, None));
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[test]
+    fn diagnostic_background_tasks_keep_existing_entry_on_fallback_thread() {
+        use super::ecstore_diagnostic::{ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry};
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, current_s3_http_operation_name, observe_s3_http_operation,
+            with_s3_http_operation_context,
+        };
+
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let mut request = S3HttpRequestGuard::new("DELETE");
+        let operation = request.in_scope(|| {
+            observe_s3_http_operation(S3Operation::DeleteObject);
+            current_s3_http_operation_context().expect("captured DELETE operation")
+        });
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        futures::executor::block_on(with_s3_http_operation_context(Some(operation), async {
+            with_read_version_entry(ReadVersionEntrySource::TierConfigReload, async {
+                super::spawn_background(async move {
+                    release_rx.await.expect("parent releases fallback work");
+                    tx.send((current_s3_http_operation_name(), current_read_version_entry_source()))
+                        .expect("fallback observer remains live");
+                });
+            })
+            .await;
+        }));
+        drop(request);
+        assert_eq!(current_read_version_entry_source(), None);
+        release_tx.send(()).expect("fallback work remains alive");
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("fallback thread completes"),
+            (Some("s3:DeleteObject"), Some(ReadVersionEntrySource::TierConfigReload))
+        );
+        assert_eq!(current_s3_http_operation_name(), None);
+    }
+
+    #[tokio::test]
+    async fn background_tasks_keep_operation_after_parent_scope_ends() {
+        use rustfs_io_metrics::s3_http_metrics::{S3HttpRequestGuard, current_s3_http_operation_name, observe_s3_http_operation};
+
+        for context in [None, Some(RequestContext::from_headers(&HeaderMap::new()))] {
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+            let mut request = S3HttpRequestGuard::new("GET");
+            request.in_scope(|| {
+                observe_s3_http_operation(S3Operation::GetObject);
+                super::spawn_background_with_context(context, async move {
+                    release_rx.await.expect("parent releases detached task");
+                    completed_tx
+                        .send(current_s3_http_operation_name())
+                        .expect("receiver remains live");
+                });
+            });
+            drop(request);
+            assert_eq!(current_s3_http_operation_name(), None);
+            release_tx.send(()).expect("detached task remains live");
+            let observed = tokio::time::timeout(std::time::Duration::from_secs(5), completed_rx)
+                .await
+                .expect("detached completion deadline")
+                .expect("detached task sends operation");
+            assert_eq!(observed, Some("s3:GetObject"));
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        super::spawn_background_with_context(None, async move {
+            tx.send(current_s3_http_operation_name())
+                .expect("internal receiver remains live");
+        });
+        assert_eq!(rx.await.expect("internal task completes"), None);
+    }
+
+    #[test]
+    fn background_tasks_keep_operation_on_fallback_thread() {
+        use rustfs_io_metrics::s3_http_metrics::{S3HttpRequestGuard, current_s3_http_operation_name, observe_s3_http_operation};
+
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut request = S3HttpRequestGuard::new("DELETE");
+        request.in_scope(|| {
+            observe_s3_http_operation(S3Operation::DeleteObject);
+            super::spawn_background_with_context(Some(RequestContext::from_headers(&HeaderMap::new())), async move {
+                release_rx.await.expect("parent releases fallback thread");
+                tx.send(current_s3_http_operation_name())
+                    .expect("fallback receiver remains live");
+            });
+        });
+        drop(request);
+        release_tx.send(()).expect("fallback task remains live");
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("fallback thread completes"),
+            Some("s3:DeleteObject")
+        );
+        assert_eq!(current_s3_http_operation_name(), None);
+    }
 
     fn build_request<T>(input: T, method: Method, uri: Uri) -> S3Request<T> {
         S3Request {

@@ -68,33 +68,74 @@ async fn pause_orphan_multipart_cleanup(bucket: &str) {
     }
 }
 
+/// Why a decommission multipart cleanup cannot decide whether its staged
+/// identity reached the target pool. These are identity proofs, not free-space
+/// decisions, so they stay out of the capacity-blocked error and its minimum
+/// free drive wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum DecommissionMultipartTargetProofError {
+    #[error("decommission multipart cleanup cannot prove exact target absence without a modification time")]
+    MissingModTime,
+    #[error("decommission multipart cleanup exact target version id is invalid")]
+    InvalidVersionId,
+    #[error("decommission multipart cleanup found the staged version id with a different modification time")]
+    AmbiguousVersion,
+    #[error("decommission multipart cleanup found the exact staged target without its ownership proof")]
+    UnownedExactTarget,
+}
+
+impl From<DecommissionMultipartTargetProofError> for Error {
+    fn from(err: DecommissionMultipartTargetProofError) -> Self {
+        Error::other(err)
+    }
+}
+
+/// Decide whether the cleanup of a staged decommission upload may clear the
+/// mutation's pending capacity intent, from the exact-version lookup of the
+/// staged identity on the target pool.
+///
+/// The staged upload itself is already proven absent. `true` means its
+/// identity is not published on the target either: no target, or a target that
+/// is a different object. A different version id is a different object. A null
+/// version has one slot per key, so a null target with another modification
+/// time replaced whatever was there: a newer unversioned write that superseded
+/// the source, or an object the staged copy never reached. In those cases the
+/// staged copy holds no bytes on the target. `false` means the exact staged
+/// identity is published and owned, so its pending intent stays for the commit
+/// to charge. A versioned target with the staged version id but another
+/// modification time cannot be told apart and fails closed.
+///
+/// Known residual: a metadata-only self-copy (CopyObject with REPLACE) keeps
+/// an object's data and only moves its modification time. If the staged copy
+/// was already published but not yet charged (an adopted completion, or a
+/// pending intent left by an ambiguous commit) and is then rewritten that way,
+/// this cleanup releases its marker and one object's bytes stay uncharged. That
+/// is a bounded estimate error with no data loss; failing closed here instead
+/// stalled the decommission for good, so no fence is added for it.
 fn decommission_multipart_target_clear_pending(opts: &ObjectOptions, target: Option<&ObjectInfo>) -> Result<bool> {
-    let expected_mod_time = opts.mod_time.ok_or_else(|| Error::DecommissionCapacityBlocked {
-        message: "multipart cleanup cannot prove exact target absence without a modification time".to_string(),
-    })?;
+    let expected_mod_time = opts.mod_time.ok_or(DecommissionMultipartTargetProofError::MissingModTime)?;
     let expected_version_id = opts
         .version_id
         .as_deref()
         .map(Uuid::parse_str)
         .transpose()
-        .map_err(|err| Error::DecommissionCapacityBlocked {
-            message: format!("multipart cleanup exact target version is invalid: {err}"),
-        })?
+        .map_err(|_| DecommissionMultipartTargetProofError::InvalidVersionId)?
         .filter(|version_id| !version_id.is_nil());
     let Some(target) = target else {
         return Ok(true);
     };
-    if target.version_id.filter(|version_id| !version_id.is_nil()) != expected_version_id
-        || target.mod_time != Some(expected_mod_time)
-    {
-        return Err(Error::DecommissionCapacityBlocked {
-            message: "multipart cleanup found a target but cannot prove the exact staged identity is absent".to_string(),
-        });
+    let target_version_id = target.version_id.filter(|version_id| !version_id.is_nil());
+    if target_version_id != expected_version_id {
+        return Ok(true);
+    }
+    if target.mod_time != Some(expected_mod_time) {
+        if expected_version_id.is_none() {
+            return Ok(true);
+        }
+        return Err(DecommissionMultipartTargetProofError::AmbiguousVersion.into());
     }
     if !crate::data_movement::is_owned_data_movement_target(target) {
-        return Err(Error::DecommissionCapacityBlocked {
-            message: "multipart cleanup found an exact target without its ownership proof".to_string(),
-        });
+        return Err(DecommissionMultipartTargetProofError::UnownedExactTarget.into());
     }
     Ok(false)
 }
@@ -128,11 +169,11 @@ fn map_multipart_namespace_lock_error(
 }
 
 fn ensure_multipart_bucket_lifecycle_guard_held(
-    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    guard: Option<&super::BucketIncarnationFenceGuard>,
     bucket: &str,
     object: &str,
 ) -> Result<()> {
-    if guard.is_some_and(rustfs_lock::NamespaceLockGuard::is_lock_lost) {
+    if guard.is_some_and(super::BucketIncarnationFenceGuard::is_lock_lost) {
         return Err(StorageError::NamespaceLockQuorumUnavailable {
             mode: "multipart_bucket_generation",
             bucket: bucket.to_string(),
@@ -375,27 +416,31 @@ impl ECStore {
         &self,
         bucket: &str,
         opts: &ObjectOptions,
-    ) -> Result<(ObjectOptions, Option<rustfs_lock::NamespaceLockGuard>)> {
+    ) -> Result<(ObjectOptions, Option<super::BucketIncarnationFenceGuard>)> {
         let mut opts = opts.clone();
         if is_meta_bucketname(bucket) {
             return Ok((opts, None));
         }
-        if opts.expected_bucket_incarnation_id.is_none() {
-            opts.expected_bucket_incarnation_id = Some(self.bucket_incarnation_id(bucket).await?);
-        }
-        let guard = if opts.bucket_lifecycle_lock_fence.is_some() {
-            None
-        } else {
-            Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
+        let expected = match opts.expected_bucket_incarnation_id {
+            Some(expected) => expected,
+            None => {
+                let expected = self.bucket_incarnation_id(bucket).await?;
+                opts.expected_bucket_incarnation_id = Some(expected);
+                expected
+            }
         };
-        if let Some(guard) = guard.as_ref() {
-            opts.add_bucket_lifecycle_lock_guard(guard);
+        if opts.bucket_lifecycle_lock_fence.is_some() {
+            let current = crate::bucket::metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
+            if current != expected {
+                return Err(StorageError::BucketNotFound(bucket.to_owned()));
+            }
+            return Ok((opts, None));
         }
-        let current = crate::bucket::metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
-        if opts.expected_bucket_incarnation_id != Some(current) {
-            return Err(StorageError::BucketNotFound(bucket.to_string()));
-        }
-        Ok((opts, guard))
+        let guard = self
+            .acquire_bucket_incarnation_fence_with_options(bucket, expected, Some(&opts))
+            .await?;
+        guard.attach_to_object_options(&mut opts);
+        Ok((opts, Some(guard)))
     }
 
     async fn acquire_list_parts_read_lock(
@@ -820,7 +865,7 @@ impl ECStore {
         object: &str,
         upload_id: &str,
         opts: ObjectOptions,
-        bucket_lifecycle_guard: Option<rustfs_lock::NamespaceLockGuard>,
+        bucket_lifecycle_guard: Option<super::BucketIncarnationFenceGuard>,
     ) -> Result<()> {
         let invalid_upload = || StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned());
         if self.ctx.lock_manager().is_disabled() {
@@ -1369,34 +1414,104 @@ mod tests {
                 .expect("an exact owned target should preserve pending capacity")
         );
 
+        let assert_proof_error = |result: Result<bool>, expected: DecommissionMultipartTargetProofError| {
+            let err = result.expect_err("an unprovable target identity must fail closed");
+            assert!(
+                !matches!(err, Error::DecommissionCapacityBlocked { .. }),
+                "a target identity proof is not a capacity block: {err}"
+            );
+            assert!(!err.to_string().contains("minimum free drive"), "{err}");
+            let Error::Io(io_err) = &err else {
+                panic!("the target proof error must stay typed: {err:?}");
+            };
+            assert_eq!(
+                io_err
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<DecommissionMultipartTargetProofError>()),
+                Some(&expected)
+            );
+        };
+
         let missing_identity = ObjectOptions {
             mod_time: None,
             ..opts.clone()
         };
-        assert!(matches!(
+        assert_proof_error(
             decommission_multipart_target_clear_pending(&missing_identity, None),
-            Err(Error::DecommissionCapacityBlocked { .. })
-        ));
+            DecommissionMultipartTargetProofError::MissingModTime,
+        );
 
-        let mismatched_target = ObjectInfo {
+        let other_version_target = ObjectInfo {
             version_id: Some(Uuid::new_v4()),
             mod_time: Some(mod_time),
             ..Default::default()
         };
-        assert!(matches!(
-            decommission_multipart_target_clear_pending(&opts, Some(&mismatched_target)),
-            Err(Error::DecommissionCapacityBlocked { .. })
-        ));
+        assert!(
+            decommission_multipart_target_clear_pending(&opts, Some(&other_version_target))
+                .expect("another version is not the staged identity")
+        );
+
+        let rewritten_version_target = ObjectInfo {
+            version_id: Some(version_id),
+            mod_time: Some(mod_time + time::Duration::seconds(1)),
+            ..Default::default()
+        };
+        assert_proof_error(
+            decommission_multipart_target_clear_pending(&opts, Some(&rewritten_version_target)),
+            DecommissionMultipartTargetProofError::AmbiguousVersion,
+        );
 
         let unowned_target = ObjectInfo {
             version_id: Some(version_id),
             mod_time: Some(mod_time),
             ..Default::default()
         };
-        assert!(matches!(
+        assert_proof_error(
             decommission_multipart_target_clear_pending(&opts, Some(&unowned_target)),
-            Err(Error::DecommissionCapacityBlocked { .. })
-        ));
+            DecommissionMultipartTargetProofError::UnownedExactTarget,
+        );
+    }
+
+    /// A null version has one slot per key: a null target with another
+    /// modification time is a different object, such as a newer unversioned
+    /// write that superseded the source, so the staged copy holds nothing on
+    /// the target (rustfs/backlog#2873).
+    #[test]
+    fn decommission_multipart_cleanup_clears_pending_for_a_replaced_null_target() {
+        let mod_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(7);
+        for version_id in [None, Some(Uuid::nil().to_string())] {
+            let opts = ObjectOptions {
+                version_id: version_id.clone(),
+                mod_time: Some(mod_time),
+                ..Default::default()
+            };
+            for target_version_id in [None, Some(Uuid::nil())] {
+                for target_mod_time in [mod_time + time::Duration::seconds(1), mod_time - time::Duration::seconds(1)] {
+                    let replaced = ObjectInfo {
+                        version_id: target_version_id,
+                        mod_time: Some(target_mod_time),
+                        ..Default::default()
+                    };
+                    assert!(
+                        decommission_multipart_target_clear_pending(&opts, Some(&replaced))
+                            .expect("a replaced null target is not the staged identity"),
+                        "version_id={version_id:?} target_version_id={target_version_id:?} target_mod_time={target_mod_time}"
+                    );
+                }
+            }
+            let mut metadata = HashMap::new();
+            rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_DATA_MOVED, "true".to_string());
+            rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_DATA_MOVED_TAGS, "v1:".to_string());
+            let staged = ObjectInfo {
+                mod_time: Some(mod_time),
+                user_defined: Arc::new(metadata),
+                ..Default::default()
+            };
+            assert!(
+                !decommission_multipart_target_clear_pending(&opts, Some(&staged))
+                    .expect("the exact owned null target keeps its pending intent")
+            );
+        }
     }
 
     /// Models a single pool's `list_multipart_uploads`: returns uploads strictly

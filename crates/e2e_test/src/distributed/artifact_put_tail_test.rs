@@ -6,9 +6,10 @@ use super::artifact_seal_test::{assert_exact_version, confirm_seal, create_artif
 use super::harness::{DistCluster, DistLayout, TestResult, payload_for, wait_until};
 use crate::chaos::census_object_version_on_disk;
 use crate::common::init_logging;
+use crate::storage_api::artifact_rpc::{
+    DiskError, TONIC_RPC_PREFIX, gen_tonic_signature_headers, set_tonic_canonical_body_digest,
+};
 use http::StatusCode;
-use rustfs_ecstore::api::disk::DiskError;
-use rustfs_ecstore::api::rpc::{TONIC_RPC_PREFIX, gen_tonic_signature_headers, set_tonic_canonical_body_digest};
 use rustfs_filemeta::FileMeta;
 use rustfs_protos::proto_gen::node_service::{RenameDataRequest, node_service_client::NodeServiceClient};
 use serde_json::{Value, json};

@@ -3343,15 +3343,35 @@ mod tests {
 
 #[cfg(test)]
 mod legacy_artifact_tests {
-    use super::*;
+    use super::{decode_msgpack_or_json, encode_file_info_msgpack, encode_msgpack, encode_msgpack_named};
+    use crate::storage::rpc::node_service::{LocalMutationTarget, NodeService};
     use crate::storage::storage_api::ecstore_disk;
+    use crate::storage::storage_api::rpc_consumer::node_service::{
+        DeleteOptions, DiskError, DiskInfoOptions, FileInfoVersions, GuardedDeleteVersionsPayload, ReadOptions,
+        StorageDiskRpcExt as _, UpdateMetadataOpts,
+    };
     use crate::storage::storage_api::set_tonic_canonical_body_digest;
+    use crate::storage::storage_api::{
+        DELETE_RECOVERY_PROTOCOL_VERSION, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, LegacyPartOperation,
+        LegacyPathDeleteOperation, PartTransactionAction, RenameDataResp,
+    };
+    use bytes::Bytes;
+    use rustfs_filemeta::FileInfo;
     use rustfs_iam::store::{
         Store as _,
         object::{IAM_CONFIG_PREFIX, ObjectStore},
     };
     use rustfs_kms::KmsServiceManager;
+    use rustfs_protos::proto_gen::node_service::{
+        CompareAndUpdateFileOutcome, CompareAndUpdateFileRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest,
+        DeleteVersionResponse, DeleteVersionsRequest, DeleteVersionsResponse, DeleteVolumeRequest, GuardedDeleteVersionsRequest,
+        MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, RecoverDeleteTransactionRequest, RenameDataRequest,
+        RenameDataResponse, RenameFileRequest, RenameFileResponse, RenamePartRequest, SettlePartTransactionRequest,
+        UpdateMetadataRequest, UpdateMetadataResponse, WriteAllRequest, WriteMetadataRequest,
+    };
     use std::sync::Arc;
+    use tonic::{Request, Response, Status};
+    use uuid::Uuid;
 
     fn mark_v2_authenticated<T>(request: &mut Request<T>) {
         request
@@ -7626,7 +7646,8 @@ mod legacy_artifact_tests {
         let object_dir = ecstore_disk::DiskAPI::path(disk.as_ref()).join(volume).join(path);
         let rollback = Uuid::new_v4();
         let (fi, original) = prepare_legacy_delete_rollback(disk, volume, path, case).await;
-        disk.delete_version(
+        ecstore_disk::DiskAPI::delete_version(
+            disk.as_ref(),
             volume,
             path,
             fi.clone(),

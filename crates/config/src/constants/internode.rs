@@ -276,6 +276,9 @@ pub const DEFAULT_INTERNODE_BULK_CHANNELS: usize = 2;
 pub const ENV_INTERNODE_HTTP_TUNING_PROFILE: &str = "RUSTFS_INTERNODE_HTTP_TUNING_PROFILE";
 pub const DEFAULT_INTERNODE_HTTP_TUNING_PROFILE: &str = "legacy";
 
+/// Internode HTTP data-plane protocol: `http1` (default) or `auto` (TLS ALPN).
+pub const ENV_INTERNODE_HTTP_PROTOCOL: &str = "RUSTFS_INTERNODE_HTTP_PROTOCOL";
+
 /// Internode HTTP connection pool maximum idle connections per host.
 pub const ENV_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST: &str = "RUSTFS_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST";
 
@@ -287,8 +290,9 @@ pub const ENV_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS: &str = "RUSTFS_INTERNODE_HT
 /// NOTE (backlog#805-C3): all `RUSTFS_INTERNODE_HTTP2_*` tuning (window sizes,
 /// adaptive window, keepalive timeout) only takes effect when the internode
 /// connection actually negotiates HTTP/2, which happens via TLS-ALPN. Over
-/// plaintext internode transport the connection is HTTP/1.1 and these settings
-/// are silently inert — enable internode TLS to use them.
+/// plaintext internode transport or with the default `http1` protocol policy,
+/// these settings are inert. Select `RUSTFS_INTERNODE_HTTP_PROTOCOL=auto` and
+/// enable internode TLS to use them.
 pub const ENV_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE: &str = "RUSTFS_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE";
 
 /// Internode HTTP/2 initial connection window size in bytes.

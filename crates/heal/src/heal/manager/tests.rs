@@ -27,10 +27,13 @@ use std::sync::Mutex as StdMutex;
 use tempfile::TempDir;
 
 pub(super) mod admin_overlap;
+mod admission_timing;
 mod root_recovery;
 use uuid::Uuid;
 mod auto_scan;
+mod completion;
 mod disposition;
+mod legacy_ambiguity_logging;
 mod running_mainline;
 
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk, storage_api::status::BucketInfo};
@@ -563,6 +566,14 @@ async fn completed_retention_scheduler_preserves_progress_aliases_and_atomic_han
 
 #[async_trait::async_trait]
 impl HealStorageAPI for MockStorage {
+    async fn bucket_incarnation_id(&self, bucket: &str) -> Result<Option<Uuid>> {
+        Ok(if bucket.starts_with("legacy-held-") {
+            root_recovery::test_bucket_incarnation(bucket)
+        } else {
+            None
+        })
+    }
+
     async fn admit_bucket_incarnation(&self, bucket: &str) -> Result<Uuid> {
         if bucket.starts_with("incarnation-metadata-unavailable-") {
             return Err(Error::Storage(EcstoreError::SlowDown));
@@ -625,7 +636,9 @@ impl HealStorageAPI for MockStorage {
             hook.execute.notified().await;
             return Ok(true);
         }
-        Ok(bucket == "retry-transition")
+        Ok(bucket == "retry-transition"
+            || bucket.starts_with("legacy-held-")
+            || bucket.starts_with("legacy-ambiguity-scheduler-"))
     }
 
     async fn heal_object(
@@ -639,6 +652,9 @@ impl HealStorageAPI for MockStorage {
             let hook = COMPLETED_RETENTION_HOOKS.lock().await[bucket].clone();
             hook.started.notify_one();
             std::future::pending::<()>().await;
+        }
+        if bucket.starts_with("legacy-ambiguity-scheduler-") {
+            return Err(Error::Storage(EcstoreError::DeleteRecoveryLegacyAmbiguous));
         }
         if bucket == "completed-retention-failed" {
             return Err(Error::TaskExecutionFailed {
@@ -660,7 +676,17 @@ impl HealStorageAPI for MockStorage {
                 ))),
             ));
         }
-        Ok((HealResultItem::default(), None))
+        Ok((
+            HealResultItem {
+                detail: if bucket.starts_with("legacy-held-") {
+                    rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL.to_owned()
+                } else {
+                    String::new()
+                },
+                ..Default::default()
+            },
+            None,
+        ))
     }
 
     async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<HealResultItem> {
@@ -1463,14 +1489,13 @@ fn mrf_verified_repair_event_requires_positive_exact_identity() {
     }
 }
 
-#[test]
-fn unverified_legacy_notice_requires_the_exact_partial_write_target() {
+fn unverified_legacy_fixture(bucket: &str) -> (MrfRepairNoticeTarget, crate::heal::outcome::HealObjectOutcome) {
     use crate::heal::outcome::{HealObjectIdentity, HealObjectKind, HealObjectOutcome};
     use rustfs_common::mrf_channel::{
         MrfDurableRepairAnchor, MrfIngressResult, MrfIntent, MrfKind, MrfScope, try_rearm_mrf_replay_intent,
     };
 
-    let bucket = Arc::<str>::from("legacy-held-bucket");
+    let bucket = Arc::<str>::from(bucket);
     let object = Arc::<str>::from("legacy-held-object");
     let scope = MrfScope {
         pool_index: 1,
@@ -1497,7 +1522,7 @@ fn unverified_legacy_notice_requires_the_exact_partial_write_target() {
         scope: Some(scope),
         delete_marker_purge: None,
         lease,
-        bucket_incarnation_id: uuid::Uuid::new_v4(),
+        bucket_incarnation_id: root_recovery::test_bucket_incarnation(&bucket).expect("legacy fixture incarnation"),
     };
     let target = MrfRepairNoticeTarget {
         bucket: bucket.clone(),
@@ -1509,14 +1534,13 @@ fn unverified_legacy_notice_requires_the_exact_partial_write_target() {
         lease: Some(lease),
         durable_anchor: Some(anchor.clone()),
     };
-    let incarnation = anchor.bucket_incarnation_id;
     let outcome = HealObjectOutcome {
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
             bucket: bucket.to_string(),
             object: object.to_string(),
             version_id: None,
-            bucket_incarnation_id: Some(incarnation),
+            bucket_incarnation_id: Some(anchor.bucket_incarnation_id),
             pool_index: Some(1),
             set_index: Some(2),
         },
@@ -1524,9 +1548,17 @@ fn unverified_legacy_notice_requires_the_exact_partial_write_target() {
         detail: Some(rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL.to_string()),
     };
 
+    (target, outcome)
+}
+
+#[test]
+fn unverified_legacy_notice_requires_the_exact_partial_write_target() {
+    use crate::heal::outcome::{HealObjectIdentity, HealObjectOutcome};
+    let (target, outcome) = unverified_legacy_fixture("legacy-held-identity");
+    let anchor = target.durable_anchor.as_ref().expect("durable fixture anchor");
     let event = super::scheduler::unverified_legacy_mrf_event_for_target(&target, &outcome)
         .expect("exact legacy partial-write outcome should park only its runtime retry");
-    assert_eq!(event.anchor, anchor);
+    assert_eq!(&event.anchor, anchor);
 
     let wrong_identity = HealObjectOutcome {
         identity: HealObjectIdentity {
@@ -1556,7 +1588,115 @@ fn unverified_legacy_notice_requires_the_exact_partial_write_target() {
         detail: Some("object was readable".to_string()),
         ..outcome
     };
-    assert!(super::scheduler::unverified_legacy_mrf_event_for_target(&target, &wrong_reason).is_none());
+    assert!(
+        super::scheduler::unverified_legacy_mrf_event_for_target(&target, &wrong_reason).is_some(),
+        "display wording does not qualify or disqualify an already typed result"
+    );
+}
+
+#[tokio::test]
+async fn queued_non_mrf_diagnostic_cannot_pause_durable_legacy_repair() {
+    let (target, outcome) = unverified_legacy_fixture("legacy-held-merged");
+    let bucket = target.bucket.clone();
+    let object = target.object.clone();
+    let incarnation = target
+        .durable_anchor
+        .as_ref()
+        .expect("durable fixture anchor")
+        .bucket_incarnation_id;
+    for source in [
+        HealRequestSource::Admin,
+        HealRequestSource::Scanner,
+        HealRequestSource::Internal,
+        HealRequestSource::ReadRepair,
+        HealRequestSource::AutoHeal,
+    ] {
+        let _ = rustfs_common::mrf_channel::take_mrf_unverified_legacy_events_for(&bucket);
+        let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
+        let mut owner = HealRequest::object(bucket.to_string(), object.to_string(), None);
+        owner.source = source;
+        owner.options.pool_index = Some(1);
+        owner.options.set_index = Some(2);
+        owner.options.scan_mode = rustfs_heal_contracts::heal_channel::HealScanMode::Normal;
+        let mut mrf = owner.clone();
+        mrf.id = Uuid::new_v4().to_string();
+        mrf.source = HealRequestSource::Mrf;
+        mrf.bucket_incarnation_id = Some(incarnation);
+        let owner_id = owner.id.clone();
+        manager.submit_heal_request(owner).await.expect("queue normal owner");
+        let receipt = manager
+            .submit_mrf_heal_request_with_receipt_and_identity(mrf, target.clone())
+            .await
+            .expect("admit durable MRF duplicate");
+        assert_eq!(receipt.result, HealAdmissionResult::Merged);
+        assert_eq!(receipt.task_id, owner_id);
+        process_manager_queue_once(&manager).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let stats = manager.get_statistics().await;
+                if stats.successful_tasks + stats.failed_tasks > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("normal owner completes");
+        let report = manager.get_task_report(&owner_id).await.expect("completed normal report");
+        let completed = report.outcome.expect("canonical diagnostic");
+        assert_eq!(completed.counters.unknown, 1);
+        assert_eq!(completed.objects[0].detail, outcome.detail);
+        assert!(
+            super::scheduler::unverified_legacy_mrf_event_for_target(&target, &completed.objects[0]).is_some(),
+            "the fixture must match every existing identity and diagnostic condition"
+        );
+        assert!(
+            rustfs_common::mrf_channel::take_mrf_unverified_legacy_events_for(&bucket).is_empty(),
+            "{source:?} diagnostics must not pause the merged durable MRF responsibility"
+        );
+        assert!(rustfs_common::mrf_channel::take_mrf_verified_repair_events_for(&bucket).is_empty());
+        assert!(!lock_mrf_repair_notice_targets(&manager.mrf_repair_notice_targets).contains_key(&owner_id));
+    }
+}
+
+#[test]
+fn only_typed_mrf_result_can_pause_unverified_legacy() {
+    let (target, outcome) = unverified_legacy_fixture("legacy-held-source");
+    let bucket = target.bucket.clone();
+    let anchor = target.durable_anchor.as_ref().expect("durable fixture anchor");
+    let mut canonical = crate::heal::outcome::HealTaskOutcome::default();
+    canonical.record(outcome);
+    canonical.finish(None);
+    for status in [
+        HealTaskStatus::Completed,
+        HealTaskStatus::Failed {
+            error: "missing exact proof".to_owned(),
+        },
+    ] {
+        let completed = CompletedHealStatus {
+            status,
+            outcome: Some(Arc::new(canonical.clone())),
+            ..completed_retention_fixture(SystemTime::now())
+        };
+        for result in [
+            Ok(()),
+            Err(Error::LegacyMrfUnverified {
+                target: "display only".to_owned(),
+            }),
+            Err(Error::TaskExecutionFailed {
+                message: "Missing exact storage proof for durable MRF repair display only".to_owned(),
+            }),
+            Err(Error::TaskCancelled),
+            Err(Error::TaskTimeout),
+        ] {
+            super::scheduler::publish_unverified_legacy_mrf_events(std::slice::from_ref(&target), &completed, &result);
+            let events = rustfs_common::mrf_channel::take_mrf_unverified_legacy_events_for(&bucket);
+            assert_eq!(events.len(), usize::from(matches!(result, Err(Error::LegacyMrfUnverified { .. }))));
+            if let Some(event) = events.first() {
+                assert_eq!(&event.anchor, anchor);
+            }
+        }
+    }
 }
 
 #[test]
@@ -4038,7 +4178,7 @@ async fn admission_snapshot_tracks_start_duplicate_force_start_and_displacement(
     assert_eq!(admission.force_start, 1);
     assert!(
         admission.max_lock_phase_micros > 0,
-        "snapshot should expose a measurable queue/admission lock phase for p95-style external aggregation"
+        "snapshot should expose a measurable maximum queue/admission lock phase"
     );
 }
 

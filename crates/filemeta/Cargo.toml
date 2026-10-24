@@ -65,6 +65,10 @@ proptest = "1"
 name = "xl_meta_bench"
 harness = false
 
+[[bench]]
+name = "rename_data_meta_benchmark"
+harness = false
+
 [lints]
 workspace = true
 

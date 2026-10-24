@@ -94,6 +94,108 @@ pub struct ReplacementRecoverySnapshot {
     pub reason: Option<String>,
 }
 
+/// Read-only recovery evidence from this node's local disks. It is never
+/// merged with peer status and does not certify completion.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalHealRecoveryDiagnostics {
+    pub scope: &'static str,
+    pub definitive: bool,
+    pub reason: Option<String>,
+    pub root_blocked: Vec<RootHealRecoveryBlock>,
+    pub checkpoint_blocked: Vec<BlockedCheckpointRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RootHealRecoveryBlock {
+    pub task_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedCheckpointRecord {
+    pub task_id: String,
+    pub disk_id: Option<uuid::Uuid>,
+    pub reason: String,
+    pub blocked_at: Option<u64>,
+    pub revalidate_after: Option<u64>,
+    pub validation: CheckpointValidation,
+}
+
+/// A bounded, read-only observation of the execution reader's validation.
+/// Acceptance proves neither a live owner/fence nor permission to execute.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointValidation {
+    schema_version: Option<u32>,
+    stage: CheckpointValidationStage,
+    signature_present: Option<bool>,
+    signature_valid: Option<bool>,
+    task_identity_matches: Option<bool>,
+    legacy_rewind: Option<bool>,
+    reader_accepted: Option<bool>,
+    recovery_status: CheckpointRecoveryStatus,
+    owner_fence: &'static str,
+    execution_authorized: bool,
+}
+
+impl Default for CheckpointValidation {
+    fn default() -> Self {
+        Self {
+            schema_version: None,
+            stage: CheckpointValidationStage::ReadUnavailable,
+            signature_present: None,
+            signature_valid: None,
+            task_identity_matches: None,
+            legacy_rewind: None,
+            reader_accepted: None,
+            recovery_status: CheckpointRecoveryStatus::Unknown,
+            owner_fence: "unknown",
+            execution_authorized: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckpointValidationStage {
+    InvalidTaskId,
+    SnapshotMissing,
+    ReadUnavailable,
+    TooLarge,
+    BudgetExhausted,
+    Malformed,
+    IdentityConflict,
+    InvalidDeadline,
+    InvalidAdminSchema,
+    FutureSchema,
+    SignatureMissing,
+    DigestMismatch,
+    Validated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckpointRecoveryStatus {
+    Unknown,
+    Rejected,
+    CandidateExecutionUnauthorized,
+}
+
+impl LocalHealRecoveryDiagnostics {
+    fn unavailable(reason: &str) -> Self {
+        Self {
+            scope: "local_disks",
+            definitive: false,
+            reason: Some(reason.to_owned()),
+            root_blocked: Vec::new(),
+            checkpoint_blocked: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 struct HealRuntimeInitTestHook {
@@ -275,6 +377,15 @@ pub fn current_replacement_recovery_blocks() -> Vec<ReplacementRecoveryBlock> {
     get_heal_manager()
         .map(|manager| manager.replacement_recovery_blocks())
         .unwrap_or_default()
+}
+
+/// List local root and checkpoint blocks without repairing records or
+/// revalidating, resetting or removing checkpoint markers.
+pub async fn current_local_heal_recovery_diagnostics() -> LocalHealRecoveryDiagnostics {
+    match get_heal_manager() {
+        Some(manager) => manager.local_recovery_diagnostics().await,
+        None => LocalHealRecoveryDiagnostics::unavailable("heal_runtime_not_initialized"),
+    }
 }
 
 /// Read all local survivor-disk replacement records without conflating an I/O

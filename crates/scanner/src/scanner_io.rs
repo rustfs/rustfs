@@ -127,7 +127,11 @@ struct DirtyUsageSnapshot {
     buckets: Arc<DirtyUsageBuckets>,
     scopes: Arc<DirtyUsageBucketScopes>,
     generation: u64,
+    /// Nothing moved in the dirty map during the bucket listing.
     covers_all_pending: bool,
+    /// Every pending bucket this cycle listed is in the snapshot; see
+    /// `snapshot_dirty_usage_buckets_after_listing`. Admits a scoped walk.
+    covers_listed_pending: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -617,6 +621,80 @@ fn scoped_scan_scope_from_dirty_buckets(
     ScannerBucketScanScope::from_dirty_buckets(selected_buckets, selected_bucket_prefixes, baseline_scan_plan_digest)
 }
 
+/// Why a cycle eligible for a dirty-bucket scope walked the whole namespace.
+///
+/// Only cycles that were not required to walk everything are classified, so
+/// scheduled maintenance, deep scans, and the startup cycle never report one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScannerScopeFallbackReason {
+    /// A dirty entry was removed or replaced during the bucket listing.
+    DirtySnapshotIncomplete,
+    /// The dirty-usage generation is exhausted and cannot be verified.
+    DirtyGenerationExhausted,
+    /// More buckets are dirty than one scoped cycle may select.
+    DirtyBucketOverflow,
+    /// No dirty bucket is in the listing, so there is nothing to scope to.
+    NoListedDirtyBuckets,
+    /// No complete authoritative or observed baseline matches the plan.
+    BaselineUnavailable,
+    /// Peer dirty usage could not be verified or scoped acknowledgements
+    /// were rejected.
+    PeerScopeUnavailable,
+}
+
+impl ScannerScopeFallbackReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::DirtySnapshotIncomplete => "dirty_snapshot_incomplete",
+            Self::DirtyGenerationExhausted => "dirty_generation_exhausted",
+            Self::DirtyBucketOverflow => "dirty_bucket_overflow",
+            Self::NoListedDirtyBuckets => "no_listed_dirty_buckets",
+            Self::BaselineUnavailable => "baseline_unavailable",
+            Self::PeerScopeUnavailable => "peer_scope_unavailable",
+        }
+    }
+}
+
+/// Classify a resolved full-namespace scope against the preconditions
+/// `resolve_scanner_bucket_scan_scope` checks, in the same order. Returns
+/// `None` when the cycle was required to walk everything or was scoped.
+fn scanner_scope_fallback_reason(
+    scope_eligible: bool,
+    resolved_scope: &ScannerBucketScanScope,
+    dirty_usage_snapshot: &DirtyUsageSnapshot,
+    all_buckets: &[BucketInfo],
+    baseline_proof: ScannerCacheBaselineProof<'_>,
+    distributed: bool,
+) -> Option<ScannerScopeFallbackReason> {
+    if !scope_eligible || !resolved_scope.is_default() {
+        return None;
+    }
+    if dirty_usage_snapshot.generation == u64::MAX {
+        return Some(ScannerScopeFallbackReason::DirtyGenerationExhausted);
+    }
+    if !dirty_usage_snapshot.covers_listed_pending {
+        return Some(ScannerScopeFallbackReason::DirtySnapshotIncomplete);
+    }
+    if dirty_usage_snapshot.buckets.len() > crate::SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES {
+        return Some(ScannerScopeFallbackReason::DirtyBucketOverflow);
+    }
+    // Peers may contribute dirty buckets the local snapshot does not hold.
+    if !distributed {
+        let listed = all_buckets.iter().map(|bucket| bucket.name.as_str()).collect::<HashSet<_>>();
+        if !dirty_usage_snapshot
+            .buckets
+            .keys()
+            .any(|bucket| listed.contains(bucket.as_str()))
+        {
+            return Some(ScannerScopeFallbackReason::NoListedDirtyBuckets);
+        }
+    }
+    if complete_scanner_cache_baseline_plan_digest(baseline_proof).is_none() {
+        return Some(ScannerScopeFallbackReason::BaselineUnavailable);
+    }
+    distributed.then_some(ScannerScopeFallbackReason::PeerScopeUnavailable)
+}
+
 fn scanner_segment_reuse_activation_preflight() -> ScannerSegmentReuseActivationPreflight {
     scanner_segment_reuse_activation_preflight_from_proof(ScannerSegmentReuseActivationProof {
         production_activation: true,
@@ -957,6 +1035,25 @@ fn scanner_bucket_cache_digest(
     hasher.update(scan_plan_digest.0);
     hasher.update(dirty_generation.to_be_bytes());
     DataUsageScanPlanDigest(hasher.finalize().into())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScannerBucketPlanDigests {
+    pub(crate) reuse: DataUsageScanPlanDigest,
+    pub(crate) coverage: DataUsageScanPlanDigest,
+}
+
+impl ScannerBucketPlanDigests {
+    pub(crate) fn from_work_plans(
+        reuse: DataUsageScanPlanDigest,
+        coverage: DataUsageScanPlanDigest,
+        dirty_generation: Option<u64>,
+    ) -> Self {
+        Self {
+            reuse: scanner_bucket_cache_digest(reuse, dirty_generation),
+            coverage: scanner_bucket_cache_digest(coverage, dirty_generation),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1432,7 +1529,7 @@ fn scanner_results_form_complete_snapshot(results: &[DataUsageCache], expected_s
         && scanner_results_match_scan_scope(results, expected_sources)
 }
 
-fn checked_bucket_usage_info(entry: &DataUsageEntry) -> Option<BucketUsageInfo> {
+fn checked_bucket_usage_info(entry: DataUsageEntry) -> Option<BucketUsageInfo> {
     let mut usage = BucketUsageInfo {
         size: u64::try_from(entry.size).ok()?,
         versions_count: u64::try_from(entry.versions).ok()?,
@@ -1443,12 +1540,12 @@ fn checked_bucket_usage_info(entry: &DataUsageEntry) -> Option<BucketUsageInfo> 
         ..Default::default()
     };
 
-    if let Some(replication) = &entry.replication_stats {
+    if let Some(replication) = entry.replication_stats {
         usage.replica_size = replication.replica_size;
         usage.replica_count = replication.replica_count;
-        for (target, stats) in &replication.targets {
+        for (target, stats) in replication.targets {
             usage.replication_info.insert(
-                target.clone(),
+                target,
                 BucketTargetUsageInfo {
                     replication_pending_size: stats.pending_size,
                     replicated_size: stats.replicated_size,
@@ -1652,6 +1749,7 @@ pub(crate) struct ScannerCycleResult {
     failed_dirty_usage: bool,
     pending_maintenance_work: bool,
     required_cycle_floor: Option<u64>,
+    scope_fallback: Option<ScannerScopeFallbackReason>,
     publication_expectation: Option<ScannerPublicationExpectation>,
 }
 
@@ -1673,6 +1771,7 @@ impl ScannerCycleResult {
             failed_dirty_usage: false,
             pending_maintenance_work: false,
             required_cycle_floor: None,
+            scope_fallback: None,
             publication_expectation: None,
         }
     }
@@ -1751,6 +1850,27 @@ impl ScannerCycleResult {
         self.publication_expectation = None;
         self.pending_maintenance_work = pending_maintenance_work;
         self
+    }
+
+    fn with_scope_fallback(mut self, scope_fallback: Option<ScannerScopeFallbackReason>) -> Self {
+        self.publication_expectation = None;
+        self.scope_fallback = scope_fallback;
+        self
+    }
+
+    /// Why this cycle walked the whole namespace although a dirty-bucket
+    /// scope was eligible.
+    #[cfg(test)]
+    pub(crate) fn scope_fallback(&self) -> Option<ScannerScopeFallbackReason> {
+        self.scope_fallback
+    }
+
+    /// A `Complete` full-namespace fallback: while dirty buckets remain, the
+    /// next cycle must not run under the scoped cycle's immediate wake.
+    pub(crate) fn completed_scope_fallback(&self) -> Option<ScannerScopeFallbackReason> {
+        (self.status == ScannerCycleStatus::Complete)
+            .then_some(self.scope_fallback)
+            .flatten()
     }
 
     fn with_required_cycle_floor(mut self, required_cycle_floor: Option<u64>) -> Self {

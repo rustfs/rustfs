@@ -158,10 +158,11 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
     let scanner_cleanup = init_scanner_with_recovery(shutdown_token.clone(), store, enable_scanner).await;
 
     let shutdown_signal = wait_for_shutdown().await;
-    let shutdown_result = run_startup_shutdown_sequence(
+    run_startup_shutdown_sequence(
         &state_manager,
         shutdown_signal,
-        (s3_shutdown_tx, console_shutdown_tx),
+        s3_shutdown_tx,
+        console_shutdown_tx,
         optional_runtimes,
         StartupBackgroundTasks {
             capacity: capacity_tasks,
@@ -200,8 +201,6 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
             "Persisted notification runtime reconciler task failed to join"
         );
     }
-
-    shutdown_result?;
 
     info!(
         target: "rustfs::main::run",

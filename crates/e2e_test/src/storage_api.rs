@@ -15,12 +15,14 @@
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys;
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::api::disk::{Endpoint, RUSTFS_META_BUCKET, VolumeInfo, WalkDirOptions};
+pub(crate) use rustfs_ecstore::api::disk::{
+    DiskError, DiskOption, Endpoint, RUSTFS_META_BUCKET, VolumeInfo, WalkDirOptions, new_disk,
+};
 pub(crate) use rustfs_ecstore::api::rpc::{AuthenticatedChannel, TonicInterceptor, node_service_time_out_client_no_auth};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::rpc::{
     TONIC_RPC_PREFIX, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
-    verify_tonic_boot_epoch_response,
+    set_tonic_canonical_body_digest, verify_tonic_boot_epoch_response,
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::rpc::{gen_tonic_signature_interceptor, node_service_time_out_client};
@@ -34,6 +36,11 @@ pub(crate) mod node_interact {
 
 pub(crate) mod grpc_lock {
     pub(crate) use super::{AuthenticatedChannel, TonicInterceptor, node_service_time_out_client_no_auth};
+}
+
+#[cfg(test)]
+pub(crate) mod artifact_rpc {
+    pub(crate) use super::{DiskError, TONIC_RPC_PREFIX, gen_tonic_signature_headers, set_tonic_canonical_body_digest};
 }
 
 /// Signing/transport surface used by the cross-process internode RPC signature
@@ -51,4 +58,9 @@ pub(crate) mod internode_rpc_signature {
 #[cfg(test)]
 pub(crate) mod replication_extension {
     pub(crate) use super::BucketTargetSys;
+}
+
+#[cfg(test)]
+pub(crate) mod upgrade_compatibility {
+    pub(crate) use super::{DiskOption, Endpoint, new_disk};
 }

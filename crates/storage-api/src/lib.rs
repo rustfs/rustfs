@@ -46,6 +46,7 @@ pub const NS_SCANNER_SERVER_EPOCH_QUERY: &str = "ns_scanner_server_epoch";
 pub const NS_SCANNER_SESSION_ID_QUERY: &str = "ns_scanner_session_id";
 pub const NS_SCANNER_SESSION_SEQUENCE_QUERY: &str = "ns_scanner_session_sequence";
 pub const NS_SCANNER_PROTOCOL_VERSION_QUERY: &str = "ns_scanner_protocol";
+pub const NS_SCANNER_CHECKPOINT_COVERAGE_QUERY: &str = "ns_scanner_checkpoint_coverage";
 pub const NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY: &str = "ns_scanner_tier_registry_generation";
 pub const NS_SCANNER_PROTOCOL_VERSION: u16 = 3;
 pub const SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION: u32 = 0;
@@ -69,6 +70,8 @@ pub struct NsScannerCapabilityResponse {
     pub proof: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_tier_registry_generation: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_checkpoint_coverage: Option<bool>,
 }
 
 pub mod admin;

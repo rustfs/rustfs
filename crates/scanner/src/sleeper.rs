@@ -134,7 +134,7 @@ pub static SCANNER_SLEEPER: LazyLock<DynamicSleeper> = LazyLock::new(|| {
 /// For folder-level gaps, [`sleep_folder`] uses `MIN_SLEEP * factor`,
 /// clamped only by `max_sleep`. All sleeps are gated on [`SCANNER_IDLE_MODE`];
 /// the per-disk background I/O budget bound with [`DynamicSleeper::for_disk`]
-/// is a hard ceiling that applies regardless of idle mode or preset.
+/// applies regardless of idle mode or preset.
 #[derive(Clone)]
 pub struct DynamicSleeper {
     inner: Arc<SleeperParams>,
@@ -166,6 +166,15 @@ impl DynamicSleeper {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_disk_with_budget_for_tests(&self, disk_path: &Path, limits: ScannerDiskIoBudgetLimits) -> Self {
+        let sleeper = self.for_disk(disk_path);
+        if let Some(budget) = &sleeper.disk_io_budget {
+            budget.reconfigure(limits);
+        }
+        sleeper
+    }
+
     /// Whether byte charges can change pacing on the bound disk.
     pub fn budgets_disk_io_bytes(&self) -> bool {
         self.disk_io_budget.as_ref().is_some_and(|budget| budget.budgets_bytes())
@@ -173,9 +182,9 @@ impl DynamicSleeper {
 
     /// Charge the bound disk's background I/O budget and wait it out.
     ///
-    /// This is a hard ceiling layered on the local-disk foreground-priority
-    /// admission gate: it runs regardless of idle mode or speed preset, and
-    /// it only ever delays, so it can never admit more than the gate allows.
+    /// This pacing applies regardless of idle mode or speed preset and is
+    /// layered on the local-disk foreground-priority admission gate. It is a
+    /// scanner work budget, not a strict OS-level IOPS or bandwidth limit.
     pub async fn admit_disk_io(&self, ops: u64, bytes: u64) {
         if let Some(budget) = self.disk_io_budget.as_ref() {
             budget.admit(ops, bytes).await;
@@ -216,7 +225,7 @@ impl DynamicSleeper {
         self.admit_disk_io(1, 0).await;
     }
 
-    async fn sleep_folder_preset(&self) {
+    pub(crate) async fn sleep_folder_preset(&self) {
         if !Self::should_sleep() {
             return;
         }
@@ -477,7 +486,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     #[serial]
-    async fn sleeper_bound_to_a_disk_charges_folder_and_object_io_as_a_hard_ceiling() {
+    async fn sleeper_bound_to_a_disk_paces_folder_and_object_io() {
         let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
         // Sleeps are disabled and the preset is `fastest`: only the explicit
         // budget can pace this walk.

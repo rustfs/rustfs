@@ -45,6 +45,9 @@ pub mod on_demand_migration;
 #[cfg(test)]
 pub mod fault_proxy;
 
+#[cfg(test)]
+mod rpc_fault_proxy;
+
 // Reliability tests built on the fault-injection harness
 #[cfg(test)]
 mod reliability_disk_fault_test;
@@ -188,6 +191,9 @@ mod conditional_delete_objects_test;
 
 #[cfg(test)]
 mod delete_authorization_test;
+
+#[cfg(test)]
+mod table_location_authorization_test;
 
 // Regression test for signed DELETE Object?versionId requests without Content-Length.
 #[cfg(test)]

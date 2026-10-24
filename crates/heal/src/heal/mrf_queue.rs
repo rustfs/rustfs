@@ -139,7 +139,7 @@ pub async fn recheck_legacy_responsibility(
 
 pub async fn refresh_legacy_responsibility(
     responsibility_id: Uuid,
-    expected_bucket_incarnation_id: Uuid,
+    expected_bucket_incarnation_id: Option<Uuid>,
 ) -> Result<(), MrfLifecycleControlError> {
     let sender = GLOBAL_MRF_LIFECYCLE_SENDER
         .get()
@@ -181,7 +181,7 @@ enum MrfLifecycleCommand {
     },
     Refresh {
         responsibility_id: Uuid,
-        expected_bucket_incarnation_id: Uuid,
+        expected_bucket_incarnation_id: Option<Uuid>,
         response: tokio::sync::oneshot::Sender<Result<(), MrfLifecycleControlError>>,
     },
     AcceptUnverifiedRisk {
@@ -1011,15 +1011,16 @@ impl MrfRuntime {
 
     fn list_unverified_legacy(&self, after: Option<Uuid>, limit: usize) -> MrfLegacyResponsibilitySnapshot {
         let (responsibilities, next_cursor) = self.partial_writes.list_unverified_legacy(after, limit);
+        let lifecycle = self.partial_writes.lifecycle_summary();
         MrfLegacyResponsibilitySnapshot {
-            contract_version: 1,
+            contract_version: 2,
             node_local: true,
             checkpoint_owner: self.runtime_checkpoint.map(|(owner, _)| owner),
             checkpoint_sequence: self.runtime_checkpoint.map(|(_, sequence)| sequence),
-            held_count: self.partial_writes.unverified_legacy_count(),
-            legacy_generation_unknown_count: self.partial_writes.legacy_generation_unknown_count(),
-            bucket_incarnation_changed_count: self.partial_writes.bucket_incarnation_changed_count(),
-            operator_accepted_count: self.partial_writes.operator_accepted_unverified_count(),
+            held_count: lifecycle.held_count,
+            legacy_generation_unknown_count: lifecycle.legacy_generation_unknown_count,
+            bucket_incarnation_changed_count: lifecycle.bucket_incarnation_changed_count,
+            operator_accepted_count: lifecycle.operator_accepted_count,
             responsibilities,
             next_cursor,
         }
@@ -1085,20 +1086,25 @@ impl MrfRuntime {
         &mut self,
         manager: &HealManager,
         responsibility_id: Uuid,
-        expected_bucket_incarnation_id: Uuid,
+        expected_bucket_incarnation_id: Option<Uuid>,
     ) -> Result<(), MrfLifecycleControlError> {
         let (intent, state, source_incarnation) = self
             .partial_writes
             .intent_for_responsibility(responsibility_id)
             .ok_or(MrfLifecycleControlError::StaleGeneration)?;
-        if state.bucket_incarnation_id() != Some(expected_bucket_incarnation_id) {
+        if state.bucket_incarnation_id() != expected_bucket_incarnation_id {
+            return Err(MrfLifecycleControlError::StaleGeneration);
+        }
+        if expected_bucket_incarnation_id.is_none()
+            && (source_incarnation.is_some() || !matches!(state, partial_write::ResponsibilityState::Active))
+        {
             return Err(MrfLifecycleControlError::StaleGeneration);
         }
         let anchor = manager
             .durable_mrf_repair_anchor(&intent)
             .await
             .ok_or(MrfLifecycleControlError::IncarnationChanged)?;
-        if anchor.bucket_incarnation_id == expected_bucket_incarnation_id {
+        if Some(anchor.bucket_incarnation_id) == expected_bucket_incarnation_id {
             return Ok(());
         }
         let previous_acceptance = self.partial_writes.last_operator_acceptance(responsibility_id);
@@ -1382,15 +1388,21 @@ impl MrfRuntime {
     }
 
     fn discharge_durable_replay_anchors(&mut self) {
+        if self.durable_replay_anchors.is_empty() && self.partial_writes.anchors().next().is_none() {
+            return;
+        }
+        if !rustfs_common::mrf_channel::mrf_durable_repair_events_may_be_pending() {
+            // Keep the nonempty-anchor publication. An empty observation
+            // acknowledges nothing; concurrent events can wait or be evicted.
+            self.publish_metrics();
+            return;
+        }
         let mut anchors: Vec<_> = self
             .durable_replay_anchors
             .iter()
             .chain(self.partial_writes.anchors())
             .cloned()
             .collect();
-        if anchors.is_empty() {
-            return;
-        }
         let mut buckets: Vec<Arc<str>> = anchors.iter().map(|anchor| anchor.bucket.clone()).collect();
         buckets.sort_unstable();
         buckets.dedup();
@@ -1415,28 +1427,23 @@ impl MrfRuntime {
     fn publish_metrics(&self) {
         gauge!("rustfs_heal_mrf_queue_depth").set(metric_f64(self.queue.depth() + self.partial_writes.depth()));
         gauge!("rustfs_heal_mrf_queue_bytes").set(metric_f64(self.queue.bytes() + self.partial_writes.bytes()));
-        let held = self.partial_writes.unverified_legacy_count();
-        gauge!("rustfs_heal_mrf_unverified_legacy").set(metric_f64(held));
-        gauge!("rustfs_heal_mrf_legacy_generation_unknown")
-            .set(metric_f64(self.partial_writes.legacy_generation_unknown_count()));
-        gauge!("rustfs_heal_mrf_bucket_incarnation_changed")
-            .set(metric_f64(self.partial_writes.bucket_incarnation_changed_count()));
-        gauge!("rustfs_heal_mrf_operator_accepted_unverified")
-            .set(metric_f64(self.partial_writes.operator_accepted_unverified_count()));
+        let lifecycle = self.partial_writes.lifecycle_summary();
+        gauge!("rustfs_heal_mrf_unverified_legacy").set(metric_f64(lifecycle.held_count));
+        gauge!("rustfs_heal_mrf_legacy_generation_unknown").set(metric_f64(lifecycle.legacy_generation_unknown_count));
+        gauge!("rustfs_heal_mrf_bucket_incarnation_changed").set(metric_f64(lifecycle.bucket_incarnation_changed_count));
+        gauge!("rustfs_heal_mrf_operator_accepted_unverified").set(metric_f64(lifecycle.operator_accepted_count));
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or_default();
-        let oldest_age_seconds = self
-            .partial_writes
-            .oldest_unverified_legacy_enqueued_at_ms()
+        let oldest_age_seconds = lifecycle
+            .oldest_unverified_legacy_enqueued_at_ms
             .map(|held_since_ms| now_ms.saturating_sub(held_since_ms) / 1_000)
             .unwrap_or_default();
         gauge!("rustfs_heal_mrf_unverified_legacy_oldest_age_seconds")
             .set(metric_f64(usize::try_from(oldest_age_seconds).unwrap_or(usize::MAX)));
-        let oldest_operator_accepted_age_seconds = self
-            .partial_writes
-            .oldest_operator_accepted_at_ms()
+        let oldest_operator_accepted_age_seconds = lifecycle
+            .oldest_operator_accepted_at_ms
             .map(|accepted_at_ms| now_ms.saturating_sub(accepted_at_ms) / 1_000)
             .unwrap_or_default();
         gauge!("rustfs_heal_mrf_operator_accepted_unverified_oldest_age_seconds")
@@ -2055,6 +2062,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc as StdArc;
     use std::time::{Duration as StdDuration, Instant};
+
+    mod empty_events_tests;
 
     #[tokio::test(start_paused = true)]
     async fn journal_disk_io_bounds_fanout_and_collects_every_result() {

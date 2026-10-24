@@ -27,6 +27,10 @@ use crate::diagnostics::object_lock::ObjectLockAttempt;
 use crate::set_disk::{ObjectLockDiagGuard, is_object_lock_diag_enabled};
 use std::sync::Arc;
 
+#[cfg(test)]
+#[path = "heal_lock_wait_tests.rs"]
+mod heal_lock_wait_tests;
+
 #[derive(Clone, Copy)]
 struct ExplicitVersionHeal<'a> {
     opts: &'a HealOpts,
@@ -51,6 +55,49 @@ const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_HEAL_OBJECT_RENAME: &str = "heal_object_rename";
 const HEAL_RENAME_INCOMPLETE: &str = "heal rename incomplete";
 const READ_REPAIR_DATA_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+// Observation state never owns a namespace guard. A dropped pending future
+// records a censored wait separately from completed acquisitions.
+struct HealObjectLockWait {
+    started_at: std::time::Instant,
+    op: &'static str,
+    mode: &'static str,
+    result: &'static str,
+}
+
+impl Drop for HealObjectLockWait {
+    fn drop(&mut self) {
+        let elapsed = self.started_at.elapsed();
+        metrics::histogram!(
+            "rustfs_heal_object_lock_wait_seconds",
+            "op" => self.op,
+            "mode" => self.mode,
+            "result" => self.result,
+        )
+        .record(elapsed.as_secs_f64());
+    }
+}
+
+async fn measure_heal_object_lock(
+    op: &'static str,
+    kind: HealObjectLockKind,
+    acquire: impl std::future::Future<Output = std::result::Result<rustfs_lock::NamespaceLockGuard, rustfs_lock::LockError>>,
+) -> std::result::Result<rustfs_lock::NamespaceLockGuard, rustfs_lock::LockError> {
+    let mut wait = HealObjectLockWait {
+        started_at: std::time::Instant::now(),
+        op,
+        mode: kind.as_str(),
+        result: "cancelled",
+    };
+    let result = acquire.await;
+    wait.result = match &result {
+        Ok(rustfs_lock::NamespaceLockGuard::Fast(guard)) if guard.is_disabled() => "disabled",
+        Ok(_) => "acquired",
+        Err(_) => "failed",
+    };
+    drop(wait);
+    result
+}
 
 /// Exact set-local absence, established while the object mutation lock is held.
 #[derive(Debug)]
@@ -852,10 +899,13 @@ impl SetDisks {
             .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
         let timeout = get_lock_acquire_timeout();
         let mut attempt = ObjectLockAttempt::start(op, bucket, object, Some(version_id), &ns_lock, kind.as_str(), timeout);
-        let lock_result = match kind {
-            HealObjectLockKind::Read => ns_lock.get_read_lock(timeout).await,
-            HealObjectLockKind::Write => ns_lock.get_write_lock(timeout).await,
-        };
+        let lock_result = measure_heal_object_lock(op, kind, async {
+            match kind {
+                HealObjectLockKind::Read => ns_lock.get_read_lock(timeout).await,
+                HealObjectLockKind::Write => ns_lock.get_write_lock(timeout).await,
+            }
+        })
+        .await;
         attempt.observe(&lock_result);
         let guard = lock_result.map_err(|e| {
             self.map_namespace_lock_error(bucket, object, kind.as_str(), e)
@@ -1258,6 +1308,7 @@ impl SetDisks {
                                 .all(|drive| drive.state == DriveState::Ok.to_string());
 
                         if !latest_meta.deleted && !latest_meta.is_remote() && !protected {
+                            result.legacy_identity_unverified = true;
                             result.detail =
                                 rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL.to_owned();
                         }
@@ -3096,12 +3147,16 @@ impl SetDisks {
         dry_run: bool,
         remove: bool,
     ) -> Result<(HealResultItem, Option<DiskError>)> {
-        let _write_lock_guard = self
-            .new_ns_lock(bucket, object)
-            .await?
-            .get_write_lock(get_lock_acquire_timeout())
+        let _write_lock_guard = {
+            let ns_lock = self.new_ns_lock(bucket, object).await?;
+            measure_heal_object_lock(
+                "heal_object_dir",
+                HealObjectLockKind::Write,
+                ns_lock.get_write_lock(get_lock_acquire_timeout()),
+            )
             .await
-            .map_err(|e| DiskError::other(self.map_namespace_lock_error(bucket, object, "write", e).to_string()))?;
+            .map_err(|e| DiskError::other(self.map_namespace_lock_error(bucket, object, "write", e).to_string()))?
+        };
 
         self.heal_object_dir_locked(bucket, object, dry_run, remove).await
     }
@@ -3204,6 +3259,7 @@ fn finalize_object_heal_result(
         result.repair_verified = false;
         result.metadata_verified = false;
         result.metadata_repair_verified = false;
+        result.legacy_identity_unverified = false;
         *absence = None;
         error = Some(Error::NamespaceLockQuorumUnavailable {
             mode: "write",
@@ -3418,11 +3474,19 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
                 .new_ns_lock(bucket, object)
                 .await
                 .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
-            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                self.map_namespace_lock_error(bucket, object, "write", e)
-                    .narrow_to_disk()
-                    .unwrap_or_else(DiskError::other)
-            })?)
+            Some(
+                measure_heal_object_lock(
+                    "check_abandoned_parts",
+                    HealObjectLockKind::Write,
+                    ns_lock.get_write_lock(get_lock_acquire_timeout()),
+                )
+                .await
+                .map_err(|e| {
+                    self.map_namespace_lock_error(bucket, object, "write", e)
+                        .narrow_to_disk()
+                        .unwrap_or_else(DiskError::other)
+                })?,
+            )
         } else {
             None
         };
@@ -3588,11 +3652,19 @@ impl SetDisks {
                 .new_ns_lock(bucket, object)
                 .await
                 .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
-            Some(Arc::new(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                self.map_namespace_lock_error(bucket, object, "write", e)
-                    .narrow_to_disk()
-                    .unwrap_or_else(DiskError::other)
-            })?))
+            Some(Arc::new(
+                measure_heal_object_lock(
+                    "heal_object",
+                    HealObjectLockKind::Write,
+                    ns_lock.get_write_lock(get_lock_acquire_timeout()),
+                )
+                .await
+                .map_err(|e| {
+                    self.map_namespace_lock_error(bucket, object, "write", e)
+                        .narrow_to_disk()
+                        .unwrap_or_else(DiskError::other)
+                })?,
+            ))
         } else {
             None
         };
@@ -3869,6 +3941,7 @@ mod heal_result_report_tests {
             repair_verified: true,
             metadata_verified: true,
             metadata_repair_verified: true,
+            legacy_identity_unverified: true,
             ..Default::default()
         };
 
@@ -3878,6 +3951,7 @@ mod heal_result_report_tests {
         assert!(!result.repair_verified);
         assert!(!result.metadata_verified);
         assert!(!result.metadata_repair_verified);
+        assert!(!result.legacy_identity_unverified);
         assert!(absence.is_none());
         assert!(matches!(
             error,
@@ -8664,6 +8738,7 @@ mod shard_identity_tests {
             let (result, error) = heal.expect("legacy scan");
             assert!(error.is_none(), "legacy scan remains observable");
             assert!(!result.integrity_verified, "a foreign codeword must not be certified");
+            assert!(result.legacy_identity_unverified, "format classification is not an integrity proof");
             assert_eq!(result.drives_healed(), Some(0), "legacy scan must not rewrite data");
         }
     }

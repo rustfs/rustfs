@@ -16,6 +16,7 @@ use crate::SCANNER_SLEEPER;
 
 use super::*;
 
+pub(super) mod erasure_probe;
 mod mrf_ownership;
 use crate::storage_api::VersionPurgeStatusType;
 use crate::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, TierStats, new_disk, storageclass};
@@ -29,6 +30,7 @@ use std::sync::Mutex;
 pub(super) mod checkpoint_fixture;
 pub(super) mod enumeration_restart;
 mod incremental_enumeration;
+mod metadata_visits;
 
 /// Reset the process-global alert cooldown map; test-only.
 fn reset_alert_cooldowns() {
@@ -151,6 +153,29 @@ struct CapturedLogWriter {
 }
 
 impl CapturedLogs {
+    fn capture<F: std::future::Future>(&self, level: tracing::Level, future: F) -> impl std::future::Future<Output = F::Output> {
+        use tracing::instrument::WithSubscriber as _;
+
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(level)
+            .with_writer(self.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        // Re-enter the dispatcher on every poll instead of leaving a
+        // thread-local default installed while this future is suspended.
+        let captured = future.with_subscriber(subscriber);
+        // Match ecstore's test_tracing guard: with a single dispatcher,
+        // first registration on an unsubscribed sibling can cache Never.
+        // Construct both dispatchers before polling and retain the inert one.
+        let interest_guard = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        async move {
+            let _interest_guard = interest_guard;
+            captured.await
+        }
+    }
+
     fn contents(&self) -> String {
         let buffer = self
             .buffer
@@ -347,6 +372,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         checkpoint_depth: 0,
         last_update: SystemTime::UNIX_EPOCH,
         checkpoint_objects: 0,
+        object_metadata_visits: metrics::Counter::noop(),
         last_checkpoint_objects: 0,
         last_checkpoint_at: Instant::now(),
         last_checkpoint_build_time: Duration::ZERO,
@@ -587,6 +613,7 @@ async fn checkpoint_ancestor_depth_limit_preserves_suspended_accounting() {
             &mut hash,
             &mut parent,
             &mut child,
+            FolderScanMode::Namespace,
         )
         .await
         .expect_err("unsupported depth must stop before recursion");
@@ -803,7 +830,7 @@ fn test_should_account_replication_stats_only_for_live_object_versions() {
 
 #[tokio::test]
 #[serial]
-async fn test_heal_replication_only_queues_pending_null_deletes() {
+async fn test_heal_replication_skips_only_unversioned_data_versions() {
     async fn replication_skipped_count() -> u64 {
         global_metrics()
             .report()
@@ -832,18 +859,39 @@ async fn test_heal_replication_only_queues_pending_null_deletes() {
         heal_bitrot: false,
         debug: false,
     };
-    let null_object = ObjectInfo {
+    // An unversioned listing carries no version id: nothing can be replicated
+    // from it, so it never reaches replication admission.
+    let unversioned_object = ObjectInfo {
         bucket: "bucket".to_string(),
         name: "object".to_string(),
-        version_id: Some(Uuid::nil()),
+        version_id: None,
         mod_time: Some(OffsetDateTime::now_utc()),
         ..Default::default()
     };
     let mut size_summary = SizeSummary::default();
     let before = replication_skipped_count().await;
 
+    item.heal_replication(&unversioned_object, &mut size_summary).await;
+    assert_eq!(
+        replication_skipped_count().await,
+        before,
+        "an unversioned data version must not reach replication admission"
+    );
+
+    // A versioned bucket lists its null version (written before versioning
+    // was enabled) as the nil UUID; it is an existing object like any other
+    // and must reach admission (rustfs/rustfs#8747). Without rules the
+    // admission records it as skipped.
+    let null_object = ObjectInfo {
+        version_id: Some(Uuid::nil()),
+        ..unversioned_object
+    };
     item.heal_replication(&null_object, &mut size_summary).await;
-    assert_eq!(replication_skipped_count().await, before);
+    assert_eq!(
+        replication_skipped_count().await,
+        before + 1,
+        "a versioned null data version must reach replication admission"
+    );
 
     item.heal_replication(
         &ObjectInfo {
@@ -853,7 +901,7 @@ async fn test_heal_replication_only_queues_pending_null_deletes() {
         &mut size_summary,
     )
     .await;
-    assert_eq!(replication_skipped_count().await, before + 1);
+    assert_eq!(replication_skipped_count().await, before + 2);
 }
 
 #[tokio::test]
@@ -2293,6 +2341,142 @@ async fn test_scan_folder_treats_child_removed_before_open_as_empty() {
     assert_eq!(into.size, 0);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn scan_folder_charges_each_enumerated_entry_to_the_disk_budget() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    let bucket_dir = temp_dir.join("bucket");
+    tokio::fs::create_dir_all(&bucket_dir)
+        .await
+        .expect("failed to create bucket directory");
+    for name in ["one", "two", "three"] {
+        symlink("missing-target", bucket_dir.join(name)).expect("failed to create dangling symlink");
+    }
+
+    scanner.sleeper = SCANNER_SLEEPER.for_disk(&temp_dir);
+    scanner.old_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.update_cache.info.name = "bucket".to_string();
+
+    let folder = CachedFolder {
+        name: "bucket".to_string(),
+        parent: None,
+        object_heal_prob_div: 1,
+    };
+    let mut into = DataUsageEntry::default();
+    scanner
+        .scan_folder(CancellationToken::new(), folder, &mut into)
+        .await
+        .expect("directory enumeration should complete");
+
+    let disk = temp_dir.to_string_lossy();
+    let status = crate::sleeper::scanner_disk_io_budget_status()
+        .into_iter()
+        .find(|status| status.disk == disk)
+        .expect("scanner disk budget should expose its charge count");
+    assert_eq!(status.charged_ops, 7, "one directory open, three entries, and three target stats");
+}
+
+#[tokio::test]
+#[serial]
+async fn scan_folder_budgets_payload_entries_without_metadata_io() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let visits = metadata_visits::observe(&mut scanner);
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    let bucket_dir = temp_dir.join("bucket");
+    tokio::fs::create_dir_all(&bucket_dir).await.expect("create bucket");
+    for index in 0..33 {
+        tokio::fs::write(bucket_dir.join(format!("part.{index}")), b"payload")
+            .await
+            .expect("create payload entry");
+    }
+    scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest).for_disk_with_budget_for_tests(
+        &temp_dir,
+        crate::sleeper::ScannerDiskIoBudgetLimits {
+            iops: Some(1_000_000),
+            bytes_per_sec: Some(1_000_000),
+        },
+    );
+    let mut into = DataUsageEntry::default();
+    scanner
+        .scan_folder(
+            CancellationToken::new(),
+            CachedFolder {
+                name: "bucket".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            &mut into,
+        )
+        .await
+        .expect("scan payload entries across a directory prefetch boundary");
+    assert_eq!(visits.load(Ordering::Relaxed), 0, "payload enumeration is not a metadata visit");
+
+    let status = crate::sleeper::scanner_disk_io_budget_status()
+        .into_iter()
+        .find(|status| status.disk == temp_dir.to_string_lossy())
+        .expect("bound disk budget");
+    assert_eq!(status.charged_ops, 34, "one directory open and 33 entries, without size stats or reads");
+    assert_eq!(status.charged_bytes, 0);
+    assert_eq!(into.objects, 0);
+    assert_eq!(into.failed_objects, 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn scan_folder_reuses_symlink_size_without_bypassing_disk_validation() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    let object_dir = temp_dir.join("bucket/object");
+    tokio::fs::create_dir_all(&object_dir).await.expect("create object directory");
+    let metadata = metadata_for_object("bucket", "object");
+    let target = temp_dir.join("metadata-target");
+    tokio::fs::write(&target, &metadata).await.expect("write metadata target");
+    symlink(&target, object_dir.join(STORAGE_FORMAT_FILE)).expect("create metadata symlink");
+    scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest).for_disk_with_budget_for_tests(
+        &temp_dir,
+        crate::sleeper::ScannerDiskIoBudgetLimits {
+            iops: Some(1_000_000),
+            bytes_per_sec: Some(1_000_000),
+        },
+    );
+    let mut into = DataUsageEntry::default();
+    scanner
+        .scan_folder(
+            CancellationToken::new(),
+            CachedFolder {
+                name: "bucket/object".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            &mut into,
+        )
+        .await
+        .expect("scan symlinked object metadata");
+
+    let status = crate::sleeper::scanner_disk_io_budget_status()
+        .into_iter()
+        .find(|status| status.disk == temp_dir.to_string_lossy())
+        .expect("bound disk budget");
+    assert_eq!(
+        status.charged_ops, 4,
+        "directory, entry, target stat, and read reservation without a second stat"
+    );
+    assert_eq!(status.charged_bytes, u64::try_from(metadata.len()).expect("metadata length fits u64"));
+    assert_eq!(into.objects, 0, "the disk must continue rejecting symlinked metadata");
+    assert_eq!(into.failed_objects, 1);
+    assert!(
+        scanner
+            .new_cache
+            .info
+            .failed_objects
+            .contains_key(object_dir.join(STORAGE_FORMAT_FILE).to_string_lossy().as_ref())
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn test_scan_folder_missing_bucket_root_still_reports_not_found() {
@@ -2327,20 +2511,21 @@ async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
     let heal_starts_clone = heal_starts.clone();
     let healed_versions = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
     let healed_versions_clone = healed_versions.clone();
-    let mut heal_rx =
-        rustfs_heal_contracts::heal_channel::init_heal_channel().expect("heal channel should initialize once for scanner tests");
+    let (_commands, mut heal_rx) = rustfs_heal_contracts::heal_channel::init_heal_channels()
+        .expect("heal channels should initialize once for scanner tests");
     let _heal_responder = tokio::spawn(async move {
         while let Some(command) = heal_rx.recv().await {
-            if let rustfs_heal_contracts::heal_channel::HealChannelCommand::Start {
-                request, response_tx, ..
-            } = command
+            let rustfs_heal_contracts::heal_channel::HealReceiptCommand { request, response_tx } = command;
             {
                 heal_starts_clone.fetch_add(1, Ordering::Relaxed);
                 healed_versions_clone
                     .lock()
                     .expect("heal version capture lock should not be poisoned")
                     .push(request.object_version_id);
-                let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                let _ = response_tx.send(Ok(rustfs_heal_contracts::heal_channel::HealAdmissionReceipt {
+                    result: HealAdmissionResult::Accepted,
+                    task_id: request.id,
+                }));
             }
         }
     });
@@ -2482,16 +2667,13 @@ async fn test_scan_folder_xl_meta_named_directory_uses_namespace_descent() {
 #[serial]
 async fn test_scan_folder_corrupt_xl_meta_stops_erasure_data_dir_descent() {
     let logs = CapturedLogs::default();
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_max_level(tracing::Level::ERROR)
-        .with_writer(logs.clone())
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    logs.capture(tracing::Level::ERROR, scan_corrupt_metadata_with_captured_logs(&logs))
+        .await;
+}
 
+async fn scan_corrupt_metadata_with_captured_logs(logs: &CapturedLogs) {
     let (mut scanner, temp_dir) = build_test_scanner().await;
+    let visits = metadata_visits::observe(&mut scanner);
     // Canonicalize for the "drive" field comparison (scanner resolves symlinks).
     let canonical_temp_dir = std::fs::canonicalize(&temp_dir).unwrap_or_else(|_| temp_dir.clone());
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -2534,6 +2716,7 @@ async fn test_scan_folder_corrupt_xl_meta_stops_erasure_data_dir_descent() {
         .expect("failed metadata must not make scanner descend into erasure data directories");
 
     assert_eq!(into.failed_objects, 1);
+    assert_eq!(visits.load(Ordering::Relaxed), 1, "failed metadata reads still consume a visit");
     assert!(
         scanner
             .new_cache
@@ -2660,6 +2843,13 @@ async fn test_scan_folder_missing_xl_meta_stops_erasure_data_dir_descent() {
     scanner.new_cache.info.name = "bucket".to_string();
     scanner.update_cache.info.name = "bucket".to_string();
     scanner.is_erasure_mode = true;
+    scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest).for_disk_with_budget_for_tests(
+        &temp_dir,
+        crate::sleeper::ScannerDiskIoBudgetLimits {
+            iops: Some(1_000_000),
+            bytes_per_sec: None,
+        },
+    );
 
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(
@@ -2682,6 +2872,11 @@ async fn test_scan_folder_missing_xl_meta_stops_erasure_data_dir_descent() {
         .await
         .expect("missing metadata must not make scanner descend into erasure data directories");
 
+    let disk_budget = crate::sleeper::scanner_disk_io_budget_status()
+        .into_iter()
+        .find(|status| status.disk == temp_dir.to_string_lossy())
+        .expect("bound disk budget");
+    assert_eq!(disk_budget.charged_ops, 4, "parent open/entry and part-directory probe open/entry");
     assert_eq!(into.failed_objects, 1);
     assert!(
         scanner
@@ -2889,6 +3084,7 @@ async fn scoped_root_scan_reuses_clean_top_level_entries_and_rescans_dirty_entri
 
 async fn scan_hot_cold_segment_fixture(scoped: bool) -> (DataUsageEntry, Vec<String>) {
     let (mut scanner, temp_dir) = build_test_scanner().await;
+    let visits = metadata_visits::observe(&mut scanner);
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
     write_test_object_metadata(&temp_dir, "bucket", "cold/object").await;
     write_test_object_metadata(&temp_dir, "bucket", "hot/object").await;
@@ -2930,6 +3126,11 @@ async fn scan_hot_cold_segment_fixture(scoped: bool) -> (DataUsageEntry, Vec<Str
         .scan_folder(CancellationToken::new(), folder, &mut root)
         .await
         .expect("segment fixture scan should finish");
+    assert_eq!(
+        visits.load(Ordering::Relaxed),
+        if scoped { 1 } else { 2 },
+        "reused cold cache entries must not count as metadata visits"
+    );
     let root = scanner
         .new_cache
         .size_recursive("bucket")
@@ -3940,14 +4141,11 @@ async fn test_scan_data_folder_success_clears_resume_hint() {
 #[serial]
 async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
     let logs = CapturedLogs::default();
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_writer(logs.clone())
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    logs.capture(tracing::Level::DEBUG, scan_unresolved_objects_with_captured_logs(&logs))
+        .await;
+}
+
+async fn scan_unresolved_objects_with_captured_logs(logs: &CapturedLogs) {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
         temp_dir: Some(temp_dir.clone()),

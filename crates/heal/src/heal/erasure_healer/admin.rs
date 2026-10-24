@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::heal::outcome::HealObjectReceiptExt;
 use crate::heal::outcome::{
     HealDeferredReason, HealFailureClass, HealObjectDisposition, HealObjectIdentity, HealObjectKind,
     HealObjectOutcome as CanonicalObjectOutcome, HealTaskOutcome,
@@ -189,9 +190,9 @@ pub(super) async fn heal_object(
                 );
             }
         };
-        let (size, receipt, error) = match result {
-            Ok(result) => (result_object_size_u64(&result.item), result.receipt, result.error),
-            Err(error) => (0, None, Some(error)),
+        let (size, receipt, error, storage_detail) = match result {
+            Ok(result) => (result_object_size_u64(&result.item), result.receipt, result.error, result.item.detail),
+            Err(error) => (0, None, Some(error), String::new()),
         };
         if matches!(error, Some(Error::TaskCancelled | Error::TaskTimeout)) {
             return ((size, Err(error.unwrap_or(Error::TaskCancelled))), None);
@@ -220,7 +221,10 @@ pub(super) async fn heal_object(
         {
             disposition = receipt.disposition;
         }
-        let detail = error.as_ref().map(ToString::to_string);
+        let detail = error
+            .as_ref()
+            .map(ToString::to_string)
+            .or_else(|| (disposition == HealObjectDisposition::Unknown && !storage_detail.is_empty()).then_some(storage_detail));
         let legacy = match error {
             None => Ok(!matches!(disposition, HealObjectDisposition::AuthoritativelyAbsent)),
             Some(error) => {

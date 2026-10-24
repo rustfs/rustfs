@@ -480,8 +480,11 @@ pub(super) async fn send_scanner_heal_request(
 ) -> Result<HealAdmissionResult, ScannerError> {
     let priority = request.priority;
     let trace_context = scanner_heal_candidate_trace_context(&request);
-    match send_heal_request_with_admission(request).await {
-        Ok(result) => {
+    let candidate = crate::heal_completion::prepare(&request);
+    match send_heal_request_with_receipt(request).await {
+        Ok(receipt) => {
+            crate::heal_completion::observe(candidate, Ok(&receipt));
+            let result = receipt.result;
             record_heal_candidate_admission(candidate_type, priority, result);
             if let Some(trace_context) = trace_context.as_ref() {
                 emit_scanner_heal_candidate_trace(ScannerHealCandidateTrace {
@@ -498,6 +501,7 @@ pub(super) async fn send_scanner_heal_request(
             Ok(result)
         }
         Err(err) => {
+            crate::heal_completion::observe(candidate, Err(()));
             counter!(
                 "rustfs_heal_candidate_enqueue_total",
                 "type" => candidate_type.to_string(),
@@ -1032,7 +1036,11 @@ impl ScannerItem {
     }
 
     pub(super) async fn heal_replication(&mut self, oi: &ObjectInfo, size_summary: &mut SizeSummary) {
-        if oi.version_id.is_none_or(|version| version.is_nil()) && !oi.delete_marker && oi.version_purge_status.is_empty() {
+        // Only an unversioned listing (no version id) carries nothing to
+        // replicate. A versioned or suspended bucket lists its null version as
+        // the nil UUID — MinIO's "null" — and it is an existing object like
+        // any other (rustfs/rustfs#8747).
+        if oi.version_id.is_none() && !oi.delete_marker && oi.version_purge_status.is_empty() {
             return;
         }
 
@@ -1292,41 +1300,10 @@ pub(super) fn classify_get_size_failure(item: &ScannerItem, err: &StorageError) 
     GetSizeFailureAction::RecordFailed
 }
 
-pub(super) async fn contains_erasure_part_file(path: &str) -> Result<bool, ScannerError> {
-    let mut entries = match tokio::fs::read_dir(path).await {
-        Ok(entries) => entries,
-        Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => return Ok(false),
-        Err(err) => return Err(ScannerError::Io(err)),
-    };
-
-    for _ in 0..ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT {
-        let entry = match entries.next_entry().await {
-            Ok(Some(entry)) => entry,
-            Ok(None) => return Ok(false),
-            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => return Ok(false),
-            Err(err) => return Err(ScannerError::Io(err)),
-        };
-        let file_name = entry.file_name();
-        let Some(part_number) = file_name
-            .to_str()
-            .and_then(|name| name.strip_prefix("part."))
-            .and_then(|number| number.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if part_number == 0 {
-            continue;
-        }
-
-        match entry.file_type().await {
-            Ok(file_type) if file_type.is_file() => return Ok(true),
-            Ok(_) => {}
-            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::TooManyLinks) => {}
-            Err(err) => return Err(ScannerError::Io(err)),
-        }
-    }
-
-    Ok(false)
+pub(super) fn is_erasure_part_name(name: &str) -> bool {
+    name.strip_prefix("part.")
+        .and_then(|number| number.parse::<u32>().ok())
+        .is_some_and(|number| number > 0)
 }
 
 #[cfg(test)]

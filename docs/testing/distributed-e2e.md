@@ -23,7 +23,7 @@ The expansion fixture is an all-current-binary fleet, so it initializes pool met
 
 ## What this lane covers
 
-`python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-distributed -p e2e_test` selects `distributed::*`:
+`python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test` selects `distributed::*`:
 
 - S3 put / get / head / list / copy / rename / delete / presign, range and conditional reads, special keys, metadata, tags, pagination, empty objects, multipart complete and abort
 - Object Lock COMPLIANCE, GOVERNANCE and bypass, legal hold, bucket default retention, and non-lock bucket rejection
@@ -36,6 +36,7 @@ The expansion fixture is an all-current-binary fleet, so it initializes pool met
 - Node kill/restart, full process restart, node-facing TCP blackhole/recovery, in-flight streaming GETs across a peer kill, and fresh-drive replacement verified by physical `xl.meta`/part-shard census
 - Multipart, cross-node listing, list-buckets agreement
 - Direct and rolling upgrade from the pinned previous release: historical objects, versioned history, and IAM user AK/SK still work afterwards
+- The `scanner_heal_topology_` protection matrix: versioned, locked and multipart inventory verified through every node across expansion, rebalance stop/restart and queued decommission, with kill and commit-failure injection at proven movement windows; gate map and timeouts in [scanner-heal-topology-gates.md](scanner-heal-topology-gates.md)
 
 ## Existing Actions gaps this lane does not replace
 
@@ -56,7 +57,7 @@ Hardware power-loss, physical NIC pull, authenticated inter-node partition, firm
 ## Run
 
 ```bash
-python3 scripts/e2e_binary.py build --bins
+python3 scripts/e2e_binary.py build --bins --features e2e-test-hooks
 # Expansion/decommission/rebalance cases require four paths on distinct filesystems.
 # If you do not already have four disks, sized tmpfs is enough:
 #   for p in 0 1 2 3; do
@@ -66,13 +67,13 @@ python3 scripts/e2e_binary.py build --bins
 export RUSTFS_E2E_POOL_ROOTS=/mnt/rustfs-pool-0:/mnt/rustfs-pool-1:/mnt/rustfs-pool-2:/mnt/rustfs-pool-3
 # Upgrade cases require the pinned previous binary (CI downloads it).
 export RUSTFS_UPGRADE_SOURCE_BINARY=/path/to/rustfs-1.0.0-rc.2
-python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-distributed -p e2e_test
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test
 ```
 
 Without `RUSTFS_UPGRADE_SOURCE_BINARY` the two `distributed::upgrade_test::*` cases fail closed. Without four distinct `RUSTFS_E2E_POOL_ROOTS`, the expansion and data-movement cases fail closed. Filter upgrades out for a local run that is not checking upgrade:
 
 ```bash
-python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-distributed -p e2e_test -E 'not test(/^distributed::upgrade_test::/)'
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test -E 'not test(/^distributed::upgrade_test::/)'
 ```
 
 The upgrade topology is `ClusterTopology::single_pool(4)` (4 nodes × 1 drive). That matches the proven mixed-version fixture in `upgrade_compatibility_test`; 4×4 localhost drives are rejected by the previous release's same-device disk check.
@@ -104,3 +105,23 @@ keeps the wider release gate blocked until the remaining release evidence lanes
 have measured artifacts.
 
 Membership is pinned by `.config/e2e-distributed-selection.txt`. Update the Linux and Darwin entries with `python3 ./scripts/check_test_wiring.py --update-profile e2e-distributed <listing.json> <platform>` after adding or renaming a case.
+
+## Multipart fence fault acceptance
+
+The `distributed::multipart_fence_acceptance_test` cases separate remote storage RPC delays from lock RPC delays through a method-selective proxy. They require the selected RPC to reach its pause before checking quorum, recovery, or cancellation. The proxy forwards opaque bodies and gRPC trailers and is confined to the test process. It does not change server timeouts, locking, retry policy, or the commit path.
+
+Lock-layer regressions also cover every four-node read-quorum ordering, an eight-node write quorum behind silent voters, and the initial fan-out bound for prompt replies. Distributed acquisition probes unstarted voters within its existing attempt budget so silent early peers cannot hide a reachable quorum. Vote thresholds, owner identities, heartbeat checks, and late-grant cleanup retain their existing contracts.
+
+Faults match the test bucket or upload suffix in bounded control-packet bodies, preserving their signed bytes and trailers. Readiness requires an actual matching RPC, without waiting for voters that adaptive fan-out does not contact. Recovery cases release waiting packets while the request is active; quorum cases discard expired packets before restoring the peer. Replaying a packet after its caller has timed out is a separate late-delivery fault model.
+
+The four-node EC:2 cases cover exactly quorum and quorum-minus-one for storage writes and exclusive locks (three votes) and ordinary Create shared locks (two votes), error-cause and retry headers, each multipart phase, and bucket recreation after client cancellation. A sixteen-shard EC12+4 case repeats all four metadata commit phases at exactly twelve and eleven available shards. The eight-node, eight-drive case checks the server-reported one-pool/four-set EC12+4 geometry, uploads 45 MiB objects using 8 MiB parts with two files and four parts in flight, verifies complete bytes through every node, and checks aborted and completed uploads leave no visible sessions.
+
+```bash
+python3 scripts/e2e_binary.py build --features e2e-test-hooks
+RUSTFS_E2E_LOG_DIR=/path/to/isolated-run/logs \
+RUSTFS_E2E_MPU_LOAD_ROUNDS=12 \
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- \
+  cargo test -p e2e_test distributed::multipart_fence_acceptance_test -- --test-threads=1 --nocapture
+```
+
+`RUSTFS_E2E_MPU_LOAD_ROUNDS` accepts 1–256 and defaults to three rounds. Allocate a private target directory and bounded CPU/memory resources before running the eight-process case. Temporary drive directories follow `TMPDIR`; use a task-owned directory on the intended filesystem. These are plaintext loopback processes and logical drives on one host, so passing them does not establish physical-drive independence, TLS behavior, the original incident cause, or a throughput improvement. Performance comparisons require a separate controlled baseline and drift-checked measurement.

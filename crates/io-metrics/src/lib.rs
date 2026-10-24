@@ -516,6 +516,7 @@ pub mod s3_http_metrics;
 pub mod sampler;
 pub mod system_path_metrics;
 pub mod timeout_metrics;
+pub mod walk_metrics;
 
 pub use autotuner::{AutoTuner, TunerConfig, TuningResult};
 
@@ -2776,14 +2777,36 @@ pub struct AllocatorMemoryObservation {
     pub malloc_requested_peak_bytes: Option<u64>,
     pub malloc_requested_total_bytes: Option<u64>,
     pub heap_count: Option<u64>,
+    /// Bytes submitted to allocator reset operations, including failed attempts.
+    pub reset_bytes_total: Option<u64>,
+    /// Bytes submitted to allocator purge operations, not OS-released RSS.
+    pub purged_bytes_total: Option<u64>,
+    pub commit_calls_total: Option<u64>,
+    pub reset_calls_total: Option<u64>,
+    pub purge_calls_total: Option<u64>,
+    /// Arena purge passes after the allocator's eligibility checks.
+    pub arena_purge_passes_total: Option<u64>,
 }
 
 /// Record allocator-level memory attribution when supported by the allocator.
+///
+/// Availability describes this observation; byte gauges retain their last value
+/// when unavailable. Consumers also need observation progress to detect a stalled
+/// sampler across its configured sampling interval, rather than every scrape.
+/// The observation counter includes unavailable samples. These metric families
+/// do not form an atomic snapshot. Reclaim-stat availability means the field
+/// was present and valid, not that statistical accounting is enabled or that
+/// memory was successfully returned to the OS. Cumulative allocator statistics
+/// are sampled as gauges so a lower observation is not hidden by a counter.
 #[inline(always)]
 pub fn record_allocator_memory_observation(backend: &'static str, observation: AllocatorMemoryObservation) {
     if !metrics_enabled() {
         return;
     }
+    gauge!("rustfs_memory_allocator_reserved_bytes_available", "backend" => backend)
+        .set(if observation.reserved_bytes.is_some() { 1.0 } else { 0.0 });
+    gauge!("rustfs_memory_allocator_committed_bytes_available", "backend" => backend)
+        .set(if observation.committed_bytes.is_some() { 1.0 } else { 0.0 });
     if let Some(reserved_bytes) = observation.reserved_bytes {
         gauge!("rustfs_memory_allocator_reserved_bytes", "backend" => backend).set(reserved_bytes as f64);
     }
@@ -2814,6 +2837,44 @@ pub fn record_allocator_memory_observation(backend: &'static str, observation: A
     if let Some(heap_count) = observation.heap_count {
         gauge!("rustfs_memory_allocator_heap_count", "backend" => backend).set(heap_count as f64);
     }
+    for (metric, availability_metric, value) in [
+        (
+            "rustfs_memory_allocator_reset_bytes_total",
+            "rustfs_memory_allocator_reset_bytes_total_available",
+            observation.reset_bytes_total,
+        ),
+        (
+            "rustfs_memory_allocator_purged_bytes_total",
+            "rustfs_memory_allocator_purged_bytes_total_available",
+            observation.purged_bytes_total,
+        ),
+        (
+            "rustfs_memory_allocator_commit_calls_total",
+            "rustfs_memory_allocator_commit_calls_total_available",
+            observation.commit_calls_total,
+        ),
+        (
+            "rustfs_memory_allocator_reset_calls_total",
+            "rustfs_memory_allocator_reset_calls_total_available",
+            observation.reset_calls_total,
+        ),
+        (
+            "rustfs_memory_allocator_purge_calls_total",
+            "rustfs_memory_allocator_purge_calls_total_available",
+            observation.purge_calls_total,
+        ),
+        (
+            "rustfs_memory_allocator_arena_purge_passes_total",
+            "rustfs_memory_allocator_arena_purge_passes_total_available",
+            observation.arena_purge_passes_total,
+        ),
+    ] {
+        gauge!(availability_metric, "backend" => backend).set(if value.is_some() { 1.0 } else { 0.0 });
+        if let Some(value) = value {
+            gauge!(metric, "backend" => backend).set(value as f64);
+        }
+    }
+    counter!("rustfs_memory_allocator_observations_total", "backend" => backend).increment(1);
 }
 
 /// Track encoded bytes in the queue hand-off between erasure encode and disk writers.
@@ -3218,6 +3279,204 @@ mod tests {
             );
             assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_malloc_requested_bytes"), expected_value);
         }
+    }
+
+    #[test]
+    fn allocator_current_availability_tracks_missing_zero_and_recovery() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sequence = [
+            (None, None, None, None, 0.0, 0.0),
+            (Some(128), None, Some(128.0), None, 1.0, 0.0),
+            (None, Some(256), Some(128.0), Some(256.0), 0.0, 1.0),
+            (None, None, Some(128.0), Some(256.0), 0.0, 0.0),
+            (Some(0), Some(0), Some(0.0), Some(0.0), 1.0, 1.0),
+            (Some(64), Some(32), Some(64.0), Some(32.0), 1.0, 1.0),
+        ];
+        for (index, (_, _, expected_reserved, expected_committed, reserved_available, committed_available)) in
+            sequence.into_iter().enumerate()
+        {
+            // Debugging snapshots consume values, so replay each prefix before its only snapshot.
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                set_metrics_enabled(true);
+                for (reserved, committed, ..) in sequence.iter().take(index + 1) {
+                    record_allocator_memory_observation(
+                        "mimalloc",
+                        AllocatorMemoryObservation {
+                            reserved_bytes: *reserved,
+                            committed_bytes: *committed,
+                            ..Default::default()
+                        },
+                    );
+                }
+                set_metrics_enabled(false);
+            });
+            let rows = snapshotter.snapshot().into_vec();
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_reserved_bytes"), expected_reserved);
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_committed_bytes"), expected_committed);
+            assert_eq!(
+                gauge_value(&rows, "rustfs_memory_allocator_reserved_bytes_available"),
+                Some(reserved_available),
+            );
+            assert_eq!(
+                gauge_value(&rows, "rustfs_memory_allocator_committed_bytes_available"),
+                Some(committed_available),
+            );
+            assert_eq!(
+                counter_total(&rows, "rustfs_memory_allocator_observations_total"),
+                Some(u64::try_from(index + 1).expect("test sequence length fits in u64")),
+                "unavailable samples must still advance the observation count",
+            );
+        }
+    }
+
+    const ALLOCATOR_RECLAIM_TOTAL_METRICS: [(&str, &str); 6] = [
+        (
+            "rustfs_memory_allocator_reset_bytes_total",
+            "rustfs_memory_allocator_reset_bytes_total_available",
+        ),
+        (
+            "rustfs_memory_allocator_purged_bytes_total",
+            "rustfs_memory_allocator_purged_bytes_total_available",
+        ),
+        (
+            "rustfs_memory_allocator_commit_calls_total",
+            "rustfs_memory_allocator_commit_calls_total_available",
+        ),
+        (
+            "rustfs_memory_allocator_reset_calls_total",
+            "rustfs_memory_allocator_reset_calls_total_available",
+        ),
+        (
+            "rustfs_memory_allocator_purge_calls_total",
+            "rustfs_memory_allocator_purge_calls_total_available",
+        ),
+        (
+            "rustfs_memory_allocator_arena_purge_passes_total",
+            "rustfs_memory_allocator_arena_purge_passes_total_available",
+        ),
+    ];
+
+    fn allocator_reclaim_observation(values: [Option<u64>; 6]) -> AllocatorMemoryObservation {
+        AllocatorMemoryObservation {
+            reset_bytes_total: values[0],
+            purged_bytes_total: values[1],
+            commit_calls_total: values[2],
+            reset_calls_total: values[3],
+            purge_calls_total: values[4],
+            arena_purge_passes_total: values[5],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn allocator_reclaim_totals_track_presence_zero_decrease_and_recovery() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sequence = [
+            [None; 6],
+            [Some(8192), Some(4096), Some(30), Some(20), Some(10), Some(5)],
+            [None, Some(2048), None, Some(15), None, Some(4)],
+            [Some(0); 6],
+            [None; 6],
+            [Some(1024), Some(2048), Some(3), Some(4), Some(5), Some(6)],
+        ];
+        for (index, current) in sequence.iter().enumerate() {
+            // Recorder snapshots consume values; replay each prefix before its only snapshot.
+            let recorder = DebuggingRecorder::new();
+            metrics::with_local_recorder(&recorder, || {
+                set_metrics_enabled(true);
+                for values in sequence.iter().take(index + 1) {
+                    record_allocator_memory_observation("mimalloc", allocator_reclaim_observation(*values));
+                }
+                set_metrics_enabled(false);
+            });
+            let rows = recorder.snapshotter().snapshot().into_vec();
+            for (field, (metric, availability_metric)) in ALLOCATOR_RECLAIM_TOTAL_METRICS.iter().enumerate() {
+                let expected = sequence[..=index]
+                    .iter()
+                    .rev()
+                    .find_map(|values| values[field])
+                    .map(|value| value as f64);
+                assert_eq!(gauge_value(&rows, metric), expected, "sample {index}, {metric}");
+                assert_eq!(
+                    gauge_value(&rows, availability_metric),
+                    Some(if current[field].is_some() { 1.0 } else { 0.0 }),
+                    "sample {index}, {availability_metric}",
+                );
+            }
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_reserved_bytes_available"), Some(0.0));
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_committed_bytes_available"), Some(0.0));
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_malloc_requested_bytes_available"), Some(0.0));
+            assert_eq!(
+                counter_total(&rows, "rustfs_memory_allocator_observations_total"),
+                Some(u64::try_from(index + 1).expect("sample count fits in u64")),
+            );
+        }
+    }
+
+    #[test]
+    fn allocator_reclaim_totals_respect_disabled_recording() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        metrics::with_local_recorder(&recorder, || {
+            set_metrics_enabled(false);
+            record_allocator_memory_observation("mimalloc", allocator_reclaim_observation([Some(128); 6]));
+        });
+        let rows = recorder.snapshotter().snapshot().into_vec();
+        for (metric, availability_metric) in ALLOCATOR_RECLAIM_TOTAL_METRICS {
+            assert_eq!(gauge_value(&rows, metric), None);
+            assert_eq!(gauge_value(&rows, availability_metric), None);
+        }
+        assert_eq!(counter_total(&rows, "rustfs_memory_allocator_observations_total"), None);
+    }
+
+    #[test]
+    fn allocator_observation_progress_includes_unavailable_samples() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            set_metrics_enabled(true);
+            record_allocator_memory_observation("mimalloc", AllocatorMemoryObservation::default());
+            record_allocator_memory_observation("mimalloc", AllocatorMemoryObservation::default());
+            set_metrics_enabled(false);
+        });
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(counter_total(&rows, "rustfs_memory_allocator_observations_total"), Some(2));
+        assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_reserved_bytes"), None);
+        assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_committed_bytes"), None);
+        // The first snapshot consumed the counter; reading again must add no observations.
+        let unchanged = snapshotter.snapshot().into_vec();
+        assert_eq!(counter_total(&unchanged, "rustfs_memory_allocator_observations_total"), Some(0));
+    }
+
+    #[test]
+    fn allocator_observation_metrics_respect_disabled_recording() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            set_metrics_enabled(false);
+            record_allocator_memory_observation(
+                "mimalloc",
+                AllocatorMemoryObservation {
+                    reserved_bytes: Some(64),
+                    committed_bytes: Some(32),
+                    ..Default::default()
+                },
+            );
+        });
+        let rows = snapshotter.snapshot().into_vec();
+        for name in [
+            "rustfs_memory_allocator_reserved_bytes_available",
+            "rustfs_memory_allocator_committed_bytes_available",
+            "rustfs_memory_allocator_reserved_bytes",
+            "rustfs_memory_allocator_committed_bytes",
+        ] {
+            assert_eq!(gauge_value(&rows, name), None);
+        }
+        assert_eq!(counter_total(&rows, "rustfs_memory_allocator_observations_total"), None);
     }
 
     /// Replaces four smoke tests that called the zero-copy and bytes-pool recorders

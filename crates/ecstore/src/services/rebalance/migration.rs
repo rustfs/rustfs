@@ -1,5 +1,6 @@
 use super::worker::{is_transient_rebalance_error, rebalance_migration_retry_delay, sleep_rebalance_migration_retry};
 use crate::bucket::replication::replication_state_from_filemeta;
+use crate::data_movement::DataMovementCopy;
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
@@ -15,6 +16,9 @@ use tokio::time::Duration;
 #[derive(Debug, Default, Clone)]
 pub(crate) struct MigrationVersionResult {
     pub moved: bool,
+    /// The copy found the source replaced by a newer unversioned object on the
+    /// target, which holds no copy of the source version.
+    pub superseded: bool,
     pub ignored: bool,
     pub cleanup_ignored: bool,
     pub failed: bool,
@@ -177,7 +181,7 @@ pub(crate) async fn migrate_entry_version<Backend, F, Fut, D, DFut>(
 where
     Backend: MigrationBackend + ?Sized,
     F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
-    Fut: Future<Output = Result<()>> + Send,
+    Fut: Future<Output = Result<DataMovementCopy>> + Send,
     D: FnMut(String, String, ObjectOptions) -> DFut + Send,
     DFut: Future<Output = Result<ObjectInfo>> + Send,
 {
@@ -214,7 +218,7 @@ pub(super) async fn migrate_entry_version_with_retry_wait<Backend, F, Fut, D, DF
 where
     Backend: MigrationBackend + ?Sized,
     F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
-    Fut: Future<Output = Result<()>> + Send,
+    Fut: Future<Output = Result<DataMovementCopy>> + Send,
     D: FnMut(String, String, ObjectOptions) -> DFut + Send,
     DFut: Future<Output = Result<ObjectInfo>> + Send,
     W: FnMut(Duration) -> WFut + Send,
@@ -253,7 +257,7 @@ async fn migrate_entry_version_with_retry_wait_and_incarnation<Backend, F, Fut, 
 where
     Backend: MigrationBackend + ?Sized,
     F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
-    Fut: Future<Output = Result<()>> + Send,
+    Fut: Future<Output = Result<DataMovementCopy>> + Send,
     D: FnMut(String, String, ObjectOptions) -> DFut + Send,
     DFut: Future<Output = Result<ObjectInfo>> + Send,
     W: FnMut(Duration) -> WFut + Send,
@@ -264,6 +268,7 @@ where
     if ignore_data_usage_cache && bucket == crate::disk::RUSTFS_META_BUCKET && version.name.contains(DATA_USAGE_CACHE_NAME) {
         return MigrationVersionResult {
             moved: false,
+            superseded: false,
             ignored: true,
             cleanup_ignored: false,
             failed: false,
@@ -272,7 +277,10 @@ where
         };
     }
 
-    if version.is_remote() {
+    // A tier free version carries no transition status and reads as a delete
+    // marker, but it owns the remote object of a removed transitioned version:
+    // move it as tier metadata, never as a delete marker that drops the owner.
+    if version.is_remote() || version.tier_free_version() {
         if let Err(err) = set
             .move_remote_version_for_migration(
                 &bucket,
@@ -285,6 +293,7 @@ where
             if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                 return MigrationVersionResult {
                     moved: false,
+                    superseded: false,
                     ignored: true,
                     cleanup_ignored: true,
                     failed: false,
@@ -295,6 +304,7 @@ where
 
             return MigrationVersionResult {
                 moved: false,
+                superseded: false,
                 ignored: false,
                 cleanup_ignored: false,
                 failed: true,
@@ -305,6 +315,7 @@ where
 
         return MigrationVersionResult {
             moved: true,
+            superseded: false,
             ignored: false,
             cleanup_ignored: false,
             failed: false,
@@ -328,6 +339,7 @@ where
             if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                 return MigrationVersionResult {
                     moved: false,
+                    superseded: false,
                     ignored: true,
                     cleanup_ignored: true,
                     failed: false,
@@ -338,6 +350,7 @@ where
 
             return MigrationVersionResult {
                 moved: false,
+                superseded: false,
                 ignored: false,
                 cleanup_ignored: false,
                 failed: true,
@@ -348,6 +361,7 @@ where
 
         return MigrationVersionResult {
             moved: true,
+            superseded: false,
             ignored: false,
             cleanup_ignored: false,
             failed: false,
@@ -373,6 +387,7 @@ where
                 if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                     return MigrationVersionResult {
                         moved: false,
+                        superseded: false,
                         ignored: true,
                         cleanup_ignored: true,
                         failed: false,
@@ -388,6 +403,7 @@ where
                 if attempt + 1 >= max_attempts || !is_transient_rebalance_error(err) {
                     return MigrationVersionResult {
                         moved: false,
+                        superseded: false,
                         ignored: false,
                         cleanup_ignored: false,
                         failed: true,
@@ -401,39 +417,45 @@ where
             }
         };
 
-        if let Err(err) = transfer(pool_index, bucket.clone(), rd).await {
-            if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
-                return MigrationVersionResult {
-                    moved: false,
-                    ignored: true,
-                    cleanup_ignored: true,
-                    failed: false,
-                    stage: Some("write_target"),
-                    error: None,
-                };
-            }
+        let copy = match transfer(pool_index, bucket.clone(), rd).await {
+            Ok(copy) => copy,
+            Err(err) => {
+                if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                    return MigrationVersionResult {
+                        moved: false,
+                        superseded: false,
+                        ignored: true,
+                        cleanup_ignored: true,
+                        failed: false,
+                        stage: Some("write_target"),
+                        error: None,
+                    };
+                }
 
-            last_error = Some(err);
-            let Some(err) = last_error.as_ref() else {
+                last_error = Some(err);
+                let Some(err) = last_error.as_ref() else {
+                    continue;
+                };
+                if attempt + 1 >= max_attempts || !is_transient_rebalance_error(err) {
+                    return MigrationVersionResult {
+                        moved: false,
+                        superseded: false,
+                        ignored: false,
+                        cleanup_ignored: false,
+                        failed: true,
+                        stage: Some("write_target"),
+                        error: last_error,
+                    };
+                }
+
+                wait_retry(rebalance_migration_retry_delay(attempt, err)).await;
                 continue;
-            };
-            if attempt + 1 >= max_attempts || !is_transient_rebalance_error(err) {
-                return MigrationVersionResult {
-                    moved: false,
-                    ignored: false,
-                    cleanup_ignored: false,
-                    failed: true,
-                    stage: Some("write_target"),
-                    error: last_error,
-                };
             }
-
-            wait_retry(rebalance_migration_retry_delay(attempt, err)).await;
-            continue;
-        }
+        };
 
         return MigrationVersionResult {
             moved: true,
+            superseded: copy == DataMovementCopy::Superseded,
             ignored: false,
             cleanup_ignored: false,
             failed: false,
@@ -444,6 +466,7 @@ where
 
     MigrationVersionResult {
         moved: false,
+        superseded: false,
         ignored: false,
         cleanup_ignored: false,
         failed: true,

@@ -283,9 +283,12 @@ impl NodeService {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::storage::rpc::node_service::make_server_for_context;
     use crate::storage::storage_api::set_tonic_canonical_body_digest;
+    use rustfs_protos::proto_gen::node_service::{
+        ArtifactRepairRenameDataRequest, ArtifactRepairWriteMetadataRequest, RenameDataRequest, SealArtifactAttemptPutsRequest,
+    };
+    use tonic::Request;
 
     fn authenticated<T>(message: T, canonical: &[u8]) -> Request<T> {
         let mut request = Request::new(message);

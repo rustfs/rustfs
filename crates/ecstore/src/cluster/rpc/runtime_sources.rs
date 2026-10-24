@@ -322,6 +322,19 @@ where
     with_read_version_diagnostic_context(context, boundary, future)
 }
 
+/// Capture before spawning without inventing an entry for a generic task.
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub fn with_captured_read_version_context<F>(
+    boundary: ReadVersionContextBoundary,
+    future: F,
+) -> impl std::future::Future<Output = F::Output>
+where
+    F: std::future::Future,
+{
+    let context = ReadVersionDiagnosticContext::capture();
+    with_read_version_diagnostic_context(context, boundary, Box::pin(future))
+}
+
 /// Observe a named entry even when its scope retains an earlier source.
 #[cfg(feature = "diagnostic-read-version-caller")]
 pub fn observe_read_version_context_boundary(boundary: ReadVersionContextBoundary) {
@@ -1336,5 +1349,66 @@ mod tests {
                 .await;
         assert_eq!(caller, Some(ReadVersionRequestCaller::Peer));
         assert_eq!(current_read_version_request_caller(), None);
+    }
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn captured_context_keeps_existing_values_without_creating_an_entry() {
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_name, observe_s3_http_operation, with_s3_http_operation_context,
+        };
+
+        let mut request = S3HttpRequestGuard::new("PUT");
+        let operation = request.in_scope(|| {
+            observe_s3_http_operation(rustfs_s3_ops::S3Operation::PutObject);
+            current_s3_http_operation_context().expect("captured PUT operation")
+        });
+        for inherited in [false, true] {
+            let make_future = || {
+                with_captured_read_version_context(ReadVersionContextBoundary::BackgroundTask, async {
+                    tokio::task::yield_now().await;
+                    (
+                        current_read_version_request_caller(),
+                        current_read_version_entry_source(),
+                        current_s3_http_operation_name(),
+                    )
+                })
+            };
+            let captured = if inherited {
+                with_s3_http_operation_context(Some(operation), async {
+                    with_read_version_request_caller(ReadVersionRequestCaller::Object, async {
+                        with_read_version_entry(ReadVersionEntrySource::TierConfigReload, async { make_future() }).await
+                    })
+                    .await
+                })
+                .await
+            } else {
+                make_future()
+            };
+            assert_eq!(current_read_version_request_caller(), None);
+            assert_eq!(current_read_version_entry_source(), None);
+            let observed = tokio::spawn(captured).await.expect("captured child joins");
+            let expected = if inherited {
+                (
+                    Some(ReadVersionRequestCaller::Object),
+                    Some(ReadVersionEntrySource::TierConfigReload),
+                    Some("s3:PutObject"),
+                )
+            } else {
+                (None, None, None)
+            };
+            assert_eq!(observed, expected);
+            assert_eq!(current_s3_http_operation_name(), None);
+        }
+
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        with_read_version_entry(ReadVersionEntrySource::TierConfigReload, async {
+            let unpolled = with_captured_read_version_context(ReadVersionContextBoundary::BackgroundTask, async {
+                polled.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            drop(unpolled);
+        })
+        .await;
+        assert!(!polled.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(current_read_version_entry_source(), None);
     }
 }

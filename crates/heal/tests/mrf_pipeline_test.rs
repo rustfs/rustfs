@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
     io::Write,
+    process::Child,
 };
 use std::{
     path::{Path, PathBuf},
@@ -315,9 +316,9 @@ fn committed_checkpoint_matches_on_all_disks(disk_paths: &[PathBuf], sequence: u
 async fn assert_legacy_responsibilities_parked(
     disk_paths: &[PathBuf],
     expected_records: &[&[u8]],
-    observed_bucket_incarnation_id: uuid::Uuid,
+    current_bucket_incarnation_id: uuid::Uuid,
 ) {
-    assert!(!observed_bucket_incarnation_id.is_nil(), "the observed bucket generation must be real");
+    assert!(!current_bucket_incarnation_id.is_nil(), "the fixture current generation must be real");
     let checkpoint = mrf_queue::snapshot::inspect_local_committed_snapshot(rustfs_config::DEFAULT_HEAL_MRF_JOURNAL_MAX_BYTES)
         .await
         .expect("inspect the committed legacy responsibility checkpoint")
@@ -384,12 +385,11 @@ async fn assert_legacy_responsibilities_parked(
             Some(&serde_json::Value::Null),
             "replay must not fabricate operator authorization"
         );
-        assert_eq!(record["state"]["state"], "legacy_generation_unknown");
         assert_eq!(
-            record["state"]["observed_bucket_incarnation_id"],
-            observed_bucket_incarnation_id.to_string()
+            record["state"],
+            serde_json::json!({"state": "active"}),
+            "the source-unbound hold must preserve the old disk state without inventing an observation"
         );
-        assert!(record["state"]["detected_at_ms"].as_u64().is_some_and(|time| time > 0));
     }
 }
 
@@ -406,6 +406,51 @@ where
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     false
+}
+
+#[cfg(unix)]
+struct ChildGuard(Child);
+
+#[cfg(unix)]
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_child_marker(child: &mut Child, marker: &Path, boundary: &str) {
+    let reached = wait_until(Duration::from_secs(10), || {
+        let status = child.try_wait().expect("read child fixture status");
+        assert!(status.is_none(), "child process exited before {boundary}: {status:?}");
+        std::future::ready(marker.exists())
+    })
+    .await;
+    assert!(reached, "child process did not reach {boundary}");
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn child_marker_wait_reports_early_exit() {
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
+    let root = tempfile::tempdir().expect("child-exit fixture root");
+    let mut child = ChildGuard(
+        Command::new(std::env::current_exe().expect("test binary path"))
+            .args(["mrf_successor_flush_waiting_child_process_fixture", "--exact"])
+            .env_remove("RUSTFS_MRF_SUCCESSOR_KILL_CHILD_ROOT")
+            .spawn()
+            .expect("spawn child that exits without a marker"),
+    );
+    assert!(child.0.wait().expect("wait for fixture exit").success());
+    let panic = AssertUnwindSafe(wait_for_child_marker(&mut child.0, &root.path().join("missing.ready"), "test boundary"))
+        .catch_unwind()
+        .await
+        .expect_err("an exited child must fail before the marker timeout");
+    let message = panic.downcast_ref::<String>().expect("child-exit diagnostic");
+    assert!(message.contains("child process exited before test boundary"), "{message}");
 }
 
 /// A decode-failure intent delivered on the global channel must surface in the
@@ -923,6 +968,7 @@ fn mrf_successor_flush_waiting_child_process_fixture() {
         startup.extend(journal_record(1, "service-kill-bucket", "second-object", None, 0));
         write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &startup);
         write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &startup);
+        std::fs::write(ready_path.with_extension("prepared"), b"prepared").expect("publish child fixture readiness");
 
         let manager = Arc::new(HealManager::new(
             storage,
@@ -974,6 +1020,7 @@ fn mrf_authoritative_fsync_waiting_child_process_fixture() {
         startup.extend(journal_record(1, "fsync-kill-bucket", "second-object", None, 0));
         write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &startup);
         write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &startup);
+        std::fs::write(ready_path.with_extension("prepared"), b"prepared").expect("publish child fixture readiness");
 
         let successor = journal_record(1, "fsync-kill-bucket", "second-object", None, 2);
         write_journal_path_to_disks_synced(&disk_paths, SCOPED_JOURNAL_REL, &successor);
@@ -1087,18 +1134,17 @@ async fn journal_replay_survives_service_kill_after_successor_flush() {
         .arg("--nocapture")
         .env("RUSTFS_MRF_SUCCESSOR_KILL_CHILD_ROOT", temp_dir.path())
         .env("RUSTFS_MRF_SUCCESSOR_KILL_READY", &ready)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()
+        .map(ChildGuard)
         .expect("child MRF successor fixture should start");
-    let ready_seen = wait_until(Duration::from_secs(10), || {
-        let ready = ready.clone();
-        async move { ready.exists() }
-    })
-    .await;
-    assert!(ready_seen, "child process did not reach the successor flush boundary");
-    child.kill().expect("kill child fixture");
-    let status = child.wait().expect("wait for killed child fixture");
+    // Disk initialization has its own readiness gate; it must not consume
+    // the consumer's unchanged flush/fsync boundary budget.
+    wait_for_child_marker(&mut child.0, &ready.with_extension("prepared"), "fixture preparation").await;
+    wait_for_child_marker(&mut child.0, &ready, "the successor flush boundary").await;
+    child.0.kill().expect("kill child fixture");
+    let status = child.0.wait().expect("wait for killed child fixture");
     assert!(!status.success(), "child fixture must be terminated instead of exiting cleanly");
 
     let (disk_paths, storage) = heal_env_at(Some(temp_dir.path())).await;
@@ -1141,18 +1187,17 @@ async fn journal_replay_survives_sigkill_after_authoritative_successor_fsync_bef
         .arg("--nocapture")
         .env("RUSTFS_MRF_FSYNC_KILL_CHILD_ROOT", temp_dir.path())
         .env("RUSTFS_MRF_FSYNC_KILL_READY", &ready)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()
+        .map(ChildGuard)
         .expect("child MRF fsync fixture should start");
-    let ready_seen = wait_until(Duration::from_secs(10), || {
-        let ready = ready.clone();
-        async move { ready.exists() }
-    })
-    .await;
-    assert!(ready_seen, "child process did not reach the authoritative fsync boundary");
-    child.kill().expect("kill child fixture");
-    let status = child.wait().expect("wait for killed child fixture");
+    // Disk initialization has its own readiness gate; it must not consume
+    // the consumer's unchanged flush/fsync boundary budget.
+    wait_for_child_marker(&mut child.0, &ready.with_extension("prepared"), "fixture preparation").await;
+    wait_for_child_marker(&mut child.0, &ready, "the authoritative fsync boundary").await;
+    child.0.kill().expect("kill child fixture");
+    let status = child.0.wait().expect("wait for killed child fixture");
     assert!(!status.success(), "child fixture must be terminated instead of exiting cleanly");
 
     let (disk_paths, storage) = heal_env_at(Some(temp_dir.path())).await;

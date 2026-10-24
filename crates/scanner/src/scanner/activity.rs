@@ -32,6 +32,46 @@ pub(super) enum ScannerCycleWakeReason {
     Cancelled,
 }
 
+// Literal labels keep recorder keys bounded and avoid allocating label vectors
+// when telemetry is not installed. Only the outer scheduler records wakeups;
+// activity-poll timer slices are not independent scheduler wakeups.
+fn record_scanner_cycle_trigger(reason: ScannerCycleWakeReason, attempt: bool) {
+    macro_rules! record {
+        ($reason:literal) => {
+            if attempt {
+                metrics::counter!("rustfs_scanner_cycle_attempts_total", "reason" => $reason).increment(1);
+            } else {
+                metrics::counter!("rustfs_scanner_cycle_wakeups_total", "reason" => $reason).increment(1);
+            }
+        };
+    }
+    match reason {
+        ScannerCycleWakeReason::Timer => record!("timer"),
+        ScannerCycleWakeReason::DirtyUsage => record!("dirty_usage"),
+        ScannerCycleWakeReason::MovementGeneration => record!("movement_generation"),
+        ScannerCycleWakeReason::ClusterActivity => record!("cluster_activity"),
+        ScannerCycleWakeReason::ClusterMaintenance => record!("cluster_maintenance"),
+        ScannerCycleWakeReason::ClusterActivityUnavailable => record!("cluster_activity_unavailable"),
+        ScannerCycleWakeReason::RuntimeConfig => record!("runtime_config"),
+        ScannerCycleWakeReason::MaintenanceConfig => record!("maintenance_config"),
+        ScannerCycleWakeReason::Recovery => record!("recovery"),
+        ScannerCycleWakeReason::LeaderLockLost => record!("leader_lock_lost"),
+        ScannerCycleWakeReason::Cancelled => record!("cancelled"),
+    }
+}
+
+pub(super) fn record_scanner_cycle_wakeup(reason: ScannerCycleWakeReason) {
+    record_scanner_cycle_trigger(reason, false);
+}
+
+pub(super) fn record_scanner_cycle_attempt(reason: Option<ScannerCycleWakeReason>) {
+    if let Some(reason) = reason {
+        record_scanner_cycle_trigger(reason, true);
+    } else {
+        metrics::counter!("rustfs_scanner_cycle_attempts_total", "reason" => "initial").increment(1);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScannerCycleOutcome {
     Completed,
@@ -163,6 +203,27 @@ pub(super) fn scanner_superseded_retry_interval(
     // replication evaluation beyond its ordinary maintenance cadence.
     if maintenance_features.needs_regular_cycle() {
         retry_interval = retry_interval.min(runtime_config.cycle_interval.max(Duration::from_secs(1)));
+    }
+    Some(retry_interval)
+}
+
+/// Pacing for the cycle after a full-namespace scope fallback while dirty
+/// buckets remain. The scoped cycle's immediate dirty-usage wake would run
+/// such full walks back to back under sustained writes, so the next attempt
+/// waits on the capped retry schedule instead. The wait never exceeds the
+/// configured cycle interval: a namespace that stays unscopable is walked at
+/// the ordinary cadence rather than starved by the superseded cap. The next
+/// timer wake still requests a scope, so a scoped cycle resumes as soon as
+/// one is admitted and resets this schedule.
+pub(super) fn scanner_scope_fallback_retry_interval(
+    backoff: ScannerRetryBackoff,
+    runtime_config: &ScannerRuntimeConfig,
+) -> Option<Duration> {
+    let cycle_interval = runtime_config.cycle_interval.max(Duration::from_secs(1));
+    let retry_interval = backoff.retry_interval(runtime_config.cycle_interval)?.min(cycle_interval);
+    // Preserve an operator-selected duty-cycle floor, as superseded retries do.
+    if runtime_config.cycle_interval_source != ScannerRuntimeConfigSource::Default {
+        return Some(cycle_interval);
     }
     Some(retry_interval)
 }

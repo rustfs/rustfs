@@ -110,6 +110,82 @@ impl Drop for NamespaceCommitGuard {
     }
 }
 
+/// A durable decommission pause as seen by this instance's worker watchdog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecommissionPauseRecord {
+    pub(crate) reason: String,
+    /// The pool's settled progress when it paused; see
+    /// [`DecommissionCountLedger::progress`].
+    pub(crate) progress: u64,
+    /// Consecutive pauses on `reason` without progress in between.
+    pub(crate) repeats: u32,
+    /// The watchdog does not relaunch the pool before this instant.
+    pub(crate) relaunch_after: Instant,
+}
+
+/// What this instance counted for one decommission generation of a pool.
+///
+/// Progress counters persist only at checkpoints and a resumed pass relists
+/// the bucket, so a retained entry (one whose source stays) is seen again on
+/// every pass. The ledger keeps its counted versions so a relist in the same
+/// process does not count them twice.
+#[derive(Debug, Default)]
+pub(crate) struct DecommissionCountLedger {
+    generation: Option<time::OffsetDateTime>,
+    /// (bucket, object, version id, delete marker) of retained versions.
+    retained: HashSet<(String, String, Option<uuid::Uuid>, bool)>,
+    retained_key_bytes: usize,
+    /// Entries whose source was cleaned up. Only moving an entry off the pool
+    /// advances it; a relisted retained entry cannot.
+    cleaned_entries: u64,
+}
+
+impl DecommissionCountLedger {
+    const MAX_RETAINED_VERSIONS: usize = 1024;
+    const MAX_RETAINED_KEY_BYTES: usize = 1024 * 1024;
+
+    /// Whether this version is counted now: a retained version once, and a
+    /// cleaned-up version unless it was already counted while retained.
+    /// When the retained ledger is full, omit that progress count until source
+    /// cleanup. This bounds diagnostic memory without evicting deduplication
+    /// evidence or blocking data movement.
+    pub(crate) fn admit(&mut self, bucket: &str, object: &str, version: (Option<uuid::Uuid>, bool), cleaned: bool) -> bool {
+        let key_bytes = bucket.len().saturating_add(object.len());
+        if cleaned {
+            // Most successful entries never needed retained-version tracking.
+            if self.retained.is_empty() || key_bytes > Self::MAX_RETAINED_KEY_BYTES {
+                return true;
+            }
+            let key = (bucket.to_owned(), object.to_owned(), version.0, version.1);
+            if self.retained.remove(&key) {
+                self.retained_key_bytes -= key_bytes;
+                return false;
+            }
+            return true;
+        }
+        if self.retained.len() >= Self::MAX_RETAINED_VERSIONS
+            || key_bytes > Self::MAX_RETAINED_KEY_BYTES.saturating_sub(self.retained_key_bytes)
+        {
+            return false;
+        }
+        let key = (bucket.to_owned(), object.to_owned(), version.0, version.1);
+        if self.retained.insert(key) {
+            self.retained_key_bytes += key_bytes;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn record_cleaned_entry(&mut self) {
+        self.cleaned_entries = self.cleaned_entries.saturating_add(1);
+    }
+
+    pub(crate) fn progress(&self) -> u64 {
+        self.cleaned_entries
+    }
+}
+
 /// Runtime state owned by a single `ECStore` instance.
 ///
 /// This is intentionally minimal in the first migration slice; subsequent
@@ -221,6 +297,12 @@ pub struct InstanceContext {
     /// start runs detached from its caller, so this keeps abandoned requests
     /// and their retries from stacking concurrent starts and preflight heals.
     decommission_start_in_flight: AtomicBool,
+    /// The last durable pause of each local decommission, keyed by pool
+    /// index. The worker watchdog backs off relaunching a pool that keeps
+    /// pausing on the same cause without progress.
+    decommission_pauses: std::sync::Mutex<HashMap<usize, DecommissionPauseRecord>>,
+    /// Per-pool counting ledger of the current decommission generation.
+    decommission_count_ledgers: std::sync::Mutex<HashMap<usize, DecommissionCountLedger>>,
     /// Remote scanner publication leases own a read guard until explicit
     /// release or bounded expiry.  Keeping the guard in storage-owned state
     /// makes a remote movement transition wait on the same fence as a local
@@ -295,6 +377,8 @@ impl InstanceContext {
             background_cancel_token: OnceLock::new(),
             data_movement_operation_gate: Arc::new(RwLock::new(())),
             decommission_start_in_flight: AtomicBool::new(false),
+            decommission_pauses: std::sync::Mutex::new(HashMap::new()),
+            decommission_count_ledgers: std::sync::Mutex::new(HashMap::new()),
             scanner_publication_leases: Arc::new(Mutex::new(HashMap::new())),
             data_movement_operation_epoch: AtomicU64::new(0),
             data_movement_operation_epoch_exhausted: AtomicBool::new(false),
@@ -335,6 +419,16 @@ impl InstanceContext {
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        // Capture before spawning: Tokio tasks do not inherit request task-locals.
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let mutation = crate::cluster::rpc::runtime_sources::with_captured_read_version_context(
+            rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::DetachedMutation,
+            mutation,
+        );
+        #[cfg(not(feature = "diagnostic-read-version-caller"))]
+        let context = rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context();
+        #[cfg(not(feature = "diagnostic-read-version-caller"))]
+        let mutation = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(context, mutation);
         self.detached_mutations.spawn(mutation.in_current_span()).await
     }
 
@@ -368,6 +462,52 @@ impl InstanceContext {
 
     pub(crate) fn decommission_start_running(&self) -> bool {
         self.decommission_start_in_flight.load(Ordering::Acquire)
+    }
+
+    /// Record a durable pause of `pool_index`; `update` derives the new record
+    /// from the previous one.
+    pub(crate) fn record_decommission_pause(
+        &self,
+        pool_index: usize,
+        update: impl FnOnce(Option<&DecommissionPauseRecord>) -> DecommissionPauseRecord,
+    ) -> DecommissionPauseRecord {
+        let mut pauses = self
+            .decommission_pauses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = update(pauses.get(&pool_index));
+        pauses.insert(pool_index, record.clone());
+        record
+    }
+
+    /// Run `update` on `pool_index`'s counting ledger for `generation`,
+    /// starting a fresh ledger when the generation changed.
+    pub(crate) fn with_decommission_count_ledger<T>(
+        &self,
+        pool_index: usize,
+        generation: time::OffsetDateTime,
+        update: impl FnOnce(&mut DecommissionCountLedger) -> T,
+    ) -> T {
+        let mut ledgers = self
+            .decommission_count_ledgers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ledger = ledgers.entry(pool_index).or_default();
+        if ledger.generation != Some(generation) {
+            *ledger = DecommissionCountLedger {
+                generation: Some(generation),
+                ..Default::default()
+            };
+        }
+        update(ledger)
+    }
+
+    pub(crate) fn decommission_pause(&self, pool_index: usize) -> Option<DecommissionPauseRecord> {
+        self.decommission_pauses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&pool_index)
+            .cloned()
     }
 
     pub(crate) async fn install_scanner_publication_lease(
@@ -918,6 +1058,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decommission_count_ledger_bounds_retained_entries() {
+        let mut ledger = super::DecommissionCountLedger::default();
+        for index in 0..1024 {
+            assert!(ledger.admit("bucket", &format!("key-{index}"), (None, false), false));
+        }
+        assert!(!ledger.admit("bucket", "overflow", (None, false), false));
+        assert_eq!(ledger.retained.len(), 1024);
+        // An uncounted retained version can still be counted after cleanup.
+        assert!(ledger.admit("bucket", "overflow", (None, false), true));
+        assert!(!ledger.admit("bucket", "key-0", (None, false), true));
+        assert!(ledger.admit("bucket", "next", (None, false), false));
+        assert!(!ledger.admit("bucket", "next", (None, false), false));
+        assert_eq!(ledger.retained.len(), 1024);
+    }
+
+    #[test]
+    fn decommission_count_ledger_bounds_retained_key_bytes() {
+        let mut ledger = super::DecommissionCountLedger::default();
+        let bucket = "b".repeat(63);
+        let object_prefix = "x".repeat(1020);
+        let mut admitted = 0;
+        for index in 0..1024 {
+            admitted += usize::from(ledger.admit(&bucket, &format!("{object_prefix}{index:04}"), (None, false), false));
+        }
+        assert!(admitted > 0 && admitted < 1024);
+        assert!(ledger.retained.iter().map(|(b, o, _, _)| b.len() + o.len()).sum::<usize>() <= 1024 * 1024);
+        // Removal releases the byte reservation as well as the entry slot.
+        assert!(!ledger.admit(&bucket, &format!("{object_prefix}0000"), (None, false), true));
+        assert!(ledger.admit(&bucket, &format!("{object_prefix}1024"), (None, false), false));
+    }
+
+    #[test]
     fn namespace_commit_guards_are_instance_local_and_count_until_last_owner() {
         let first = Arc::new(InstanceContext::new());
         let other = Arc::new(InstanceContext::new());
@@ -1040,6 +1212,132 @@ mod tests {
         release_tx.send(()).expect("the detached mutation should still be waiting");
         assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
         assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn detached_mutations_keep_operation_and_guards_after_caller_drops() {
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, current_s3_http_operation_name, with_s3_http_operation_context,
+        };
+
+        let mut request = S3HttpRequestGuard::new("DELETE");
+        let operation = request.in_scope(|| {
+            rustfs_io_metrics::s3_http_metrics::observe_s3_http_operation(rustfs_s3_ops::S3Operation::DeleteObject);
+            current_s3_http_operation_context().expect("delete operation was captured")
+        });
+        for parent in [Some(operation), None] {
+            let ctx = InstanceContext::new();
+            let gate = Arc::new(RwLock::new(()));
+            let guard = gate.clone().read_owned().await;
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let expected = parent.map(|_| "s3:DeleteObject");
+            let mut caller = Box::pin(with_s3_http_operation_context(
+                parent,
+                ctx.run_detached_mutation(async move {
+                    release_rx.await.expect("release detached mutation");
+                    result_tx
+                        .send(current_s3_http_operation_name())
+                        .expect("report detached operation");
+                    drop(guard);
+                }),
+            ));
+            assert!(futures::poll!(caller.as_mut()).is_pending());
+            drop(caller);
+            assert_eq!(current_s3_http_operation_name(), None, "parent scope was restored");
+            assert_eq!(ctx.detached_mutation_count(), 1);
+            assert!(gate.try_write().is_err(), "mutation retains the owned guard after caller cancellation");
+            release_tx.send(()).expect("detached mutation is still alive");
+            assert_eq!(result_rx.await.expect("detached operation result"), expected);
+            assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
+            assert!(gate.try_write().is_ok(), "completion releases the mutation guard");
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_mutation_captures_operation_when_polled_and_keeps_results() {
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, current_s3_http_operation_name, observe_s3_http_operation,
+            with_s3_http_operation_context,
+        };
+
+        let mut request = S3HttpRequestGuard::new("PUT");
+        let operation = request.in_scope(|| {
+            observe_s3_http_operation(rustfs_s3_ops::S3Operation::PutObject);
+            current_s3_http_operation_context().expect("PUT operation context")
+        });
+        let ctx = InstanceContext::new();
+        let mutation = ctx.run_detached_mutation(async { (current_s3_http_operation_name(), Err::<(), _>("mutation failure")) });
+        let result = with_s3_http_operation_context(Some(operation), mutation)
+            .await
+            .expect("mutation task completes");
+        assert_eq!(result, (Some("s3:PutObject"), Err("mutation failure")));
+        assert_eq!(current_s3_http_operation_name(), None);
+
+        let mutation = request.in_scope(|| ctx.run_detached_mutation(async { current_s3_http_operation_name() }));
+        assert_eq!(mutation.await.expect("unscoped poll completes"), None);
+
+        let failure =
+            with_s3_http_operation_context(Some(operation), ctx.run_detached_mutation(async { panic!("mutation panic") }))
+                .await
+                .expect_err("child panic remains a join failure");
+        assert!(failure.is_panic());
+        assert_eq!(current_s3_http_operation_name(), None);
+        assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn detached_mutations_keep_existing_context_after_waiter_drop_and_nested_spawn() {
+        use crate::cluster::rpc::runtime_sources::{
+            current_read_version_entry_source, current_read_version_request_caller, with_read_version_entry,
+            with_read_version_request_caller,
+        };
+        use rustfs_io_metrics::internode_metrics::{ReadVersionEntrySource, ReadVersionRequestCaller};
+
+        let ctx = Arc::new(InstanceContext::new());
+        let child_ctx = Arc::clone(&ctx);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let mut caller = Box::pin(with_read_version_request_caller(ReadVersionRequestCaller::Object, async {
+            with_read_version_entry(ReadVersionEntrySource::LifecycleRecovery, async {
+                ctx.run_detached_mutation(async move {
+                    entered_tx.send(()).expect("mutation caller is present");
+                    release_rx.await.expect("mutation may finish");
+                    let observed = with_read_version_entry(ReadVersionEntrySource::ConfigRead, async {
+                        child_ctx
+                            .run_detached_mutation(async {
+                                (current_read_version_request_caller(), current_read_version_entry_source())
+                            })
+                            .await
+                            .expect("nested mutation joins")
+                    })
+                    .await;
+                    finished_tx.send(observed).expect("completion observer remains live");
+                })
+                .await
+            })
+            .await
+        }));
+        assert!(futures::poll!(caller.as_mut()).is_pending());
+        entered_rx.await.expect("mutation entered");
+        drop(caller);
+        assert_eq!(current_read_version_request_caller(), None);
+        assert_eq!(current_read_version_entry_source(), None);
+        assert_eq!(ctx.detached_mutation_count(), 1);
+        release_tx.send(()).expect("mutation remains alive after waiter drop");
+        assert_eq!(
+            finished_rx.await.expect("nested mutation completes"),
+            (Some(ReadVersionRequestCaller::Object), Some(ReadVersionEntrySource::LifecycleRecovery))
+        );
+        assert_eq!(
+            ctx.run_detached_mutation(async { (current_read_version_request_caller(), current_read_version_entry_source()) })
+                .await
+                .expect("unscoped mutation joins"),
+            (None, None)
+        );
+        assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
     }
 
     // A fresh context (before any update) reflects the initial all-false state.

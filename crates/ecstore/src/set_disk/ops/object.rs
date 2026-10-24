@@ -58,11 +58,12 @@ use super::super::{
     record_get_codec_streaming_gate_decision, record_get_direct_memory_decision, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_object_reader_path_observation, record_get_stage_duration_if_enabled,
     record_lock_acquire, reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate,
-    require_restore_operation_id, resolve_delete_version_state, resolve_tiered_decommission_write_quorum_result,
-    resolve_write_layout, restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, send_event,
-    set_disk_delete_creates_delete_marker, should_force_delete_marker_for_missing_version,
-    should_persist_encryption_original_size, should_preserve_delete_replication_state, should_use_inline_fast_path_with_plan,
-    take_prepared_get_object_metadata, to_object_err, try_read_inline_data_shards_direct, warn,
+    republishes_data_movement_delete_marker, require_restore_operation_id, resolve_delete_version_state,
+    resolve_tiered_decommission_write_quorum_result, resolve_write_layout, restore_commit_operation_id_from_metadata,
+    restore_operation_id_from_metadata, send_event, set_disk_delete_creates_delete_marker,
+    should_force_delete_marker_for_missing_version, should_persist_encryption_original_size,
+    should_preserve_delete_replication_state, should_use_inline_fast_path_with_plan, take_prepared_get_object_metadata,
+    to_object_err, try_read_inline_data_shards_direct, warn,
 };
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
 use super::delete_recovery::DeleteRecoveryContext;
@@ -536,6 +537,7 @@ const GET_MID_SIZE_STREAMING_MAX_SIZE: usize = 512 * 1024;
 const EVENT_LIFECYCLE_TRANSITION_CLEANUP: &str = "lifecycle_transition_cleanup";
 const EVENT_LIFECYCLE_TRANSITIONED_DELETE_CLEANUP_OWNER: &str = "lifecycle_transitioned_delete_cleanup_owner";
 const EVENT_LIFECYCLE_RESTORE_CLEANUP: &str = "lifecycle_restore_cleanup";
+const EVENT_DELETE_VERSION_QUORUM: &str = "delete_version_quorum";
 
 fn replication_status_writeback_is_current(object_info: &ObjectInfo, condition: &ReplicationStatusWritebackCondition) -> bool {
     let current = object_info.replication_generation_snapshot();
@@ -2872,7 +2874,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         };
 
         let metadata_stage_start = stage_metrics_enabled.then(Instant::now);
-        let (snapshot, prepared_object_info) = if let Some(prepared) = take_prepared_get_object_metadata() {
+        let (mut snapshot, prepared_object_info) = if let Some(prepared) = take_prepared_get_object_metadata() {
             (prepared.snapshot, prepared.object_info)
         } else {
             match self
@@ -2902,6 +2904,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 }
             }
         };
+        let verified_inline_body = snapshot.take_verified_inline_body();
         let fi = snapshot.fi();
         let files = snapshot.parts_metadata();
         let disks = snapshot.online_disks();
@@ -3009,6 +3012,42 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     disks.get(index).is_some_and(Option::is_some)
                 })
             {
+                if let Some(body) = verified_inline_body.filter(|body| body.len() == object_size) {
+                    if let Some(inline_prepare_stage_start) = inline_prepare_stage_start.take() {
+                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                            GET_OBJECT_PATH_INLINE_DIRECT,
+                            GET_STAGE_INLINE_PREPARE,
+                            object_class.as_str(),
+                            size_bucket,
+                            inline_prepare_stage_start.elapsed().as_secs_f64(),
+                        );
+                    }
+                    if rustfs_io_metrics::get_stage_metrics_enabled() {
+                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                            GET_OBJECT_PATH_INLINE_DIRECT,
+                            GET_STAGE_READER_SETUP,
+                            object_class.as_str(),
+                            size_bucket,
+                            0.0,
+                        );
+                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                            GET_OBJECT_PATH_INLINE_DIRECT,
+                            GET_STAGE_DECODE,
+                            object_class.as_str(),
+                            size_bucket,
+                            0.0,
+                        );
+                    }
+                    record_get_object_reader_path_observation(GET_OBJECT_PATH_INLINE_DIRECT, object_class, size_bucket);
+                    let reader = GetObjectReader {
+                        stream: Box::new(Cursor::new(body.clone())),
+                        object_info,
+                        buffered_body: Some(body),
+                        body_source: GetObjectBodySource::Unprobed,
+                    };
+                    return Ok(reader);
+                }
+
                 let read_length = inline_erasure_shard_file_offset(
                     0,
                     object_size,
@@ -9034,6 +9073,23 @@ impl SetDisks {
             quorum_result = Err(DiskError::UnsupportedDisk.into());
         }
         let should_rollback = quorum_result.is_err();
+        if should_rollback {
+            // Each drive's own error is the only record of why the write lost
+            // quorum; the rollback that follows logs symptoms, not this cause.
+            warn!(
+                event = EVENT_DELETE_VERSION_QUORUM,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                result = "rollback",
+                bucket,
+                object,
+                pool_index = self.pool_index,
+                set_index = self.set_index,
+                write_quorum,
+                drive_errors = ?errs,
+                "Delete version lost write quorum; rolling back"
+            );
+        }
         let structured_cleanup = !is_meta_bucketname(bucket) && !should_rollback;
         if structured_cleanup {
             self.publish_delete_commit(
@@ -9753,6 +9809,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             } else {
                 (ObjectInfo::default(), FileInfo::default(), None)
             };
+            // A quorum-resolved marker returns not-found with a populated name.
+            // Only missing metadata needs recovery; unrelated legacy residue or
+            // an offline disk must not block a new marker write at quorum.
             if gerr
                 .as_ref()
                 .is_some_and(|error| is_err_object_not_found(error) || is_err_version_not_found(error))
@@ -9761,6 +9820,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 && !opts.replication_request
                 && opts.http_preconditions.is_none()
                 && !guarded
+                && goi.name.is_empty()
             {
                 let recovery = self
                     .recover_delete_key(
@@ -9961,15 +10021,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 delete_marker_purge_candidates[i] =
                     delete_marker_purge_candidate(&authoritative_file_info, opts.expected_bucket_incarnation_id);
             }
-            // Response-side only for the null identity: a delete request marked
-            // `deleted` with `version_id == None` makes `FileMeta::delete_version`
-            // re-create the marker it just removed (the suspended-bucket
-            // "delete mints a marker" write path), so the write shape must stay
-            // untouched for explicit null-marker removals.
-            if removed_delete_marker && version_id.is_some() {
-                vr.deleted = true;
-                vr.mod_time = goi.mod_time;
-            }
+            // Explicit marker removals use the same storage mutation as other
+            // version removals. `deleted` selects marker writes in FileMeta and
+            // batch grouping; marker response metadata stays separate below.
 
             if let Some(incarnation) = opts.expected_bucket_incarnation_id {
                 vr.set_delete_marker_incarnation(incarnation);
@@ -9987,8 +10041,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     } else {
                         vr.version_id
                     },
-                    // For a null-marker removal `vr` stays undeleted (write
-                    // shape), so take the marker's mtime from the source.
+                    // Explicit removals carry the source marker's timestamp.
                     delete_marker_mtime: vr.mod_time.or(goi.mod_time),
                     object_name: vr.name.clone(),
                     replication_state: vr.replication_state_internal.clone(),
@@ -10704,6 +10757,17 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 ..Default::default()
                             };
                             delete_request.set_tier_free_version_id(&Uuid::new_v4().to_string());
+                            // A moved transitioned version's remote object now
+                            // belongs to its target copy; any other removed
+                            // transitioned version keeps its free version.
+                            if opts.data_movement
+                                && opts
+                                    .data_movement_transferred_tier_versions
+                                    .as_ref()
+                                    .is_some_and(|transferred| transferred.contains(version))
+                            {
+                                delete_request.set_skip_tier_free_version();
+                            }
                             begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
                             self.delete_object_version_with_purge(
                                 bucket,
@@ -10800,6 +10864,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // disk array, so the object-derived quorum here is unused.
         let (mut goi, mut authoritative_file_info, _write_quorum, mut gerr) =
             self.get_object_info_fileinfo_and_quorum(bucket, object, &opts).await;
+        // A quorum-resolved marker returns not-found with a populated name.
+        // Only missing metadata needs recovery; unrelated legacy residue or
+        // an offline disk must not block a new marker write at quorum.
         if gerr
             .as_ref()
             .is_some_and(|error| is_err_object_not_found(error) || is_err_version_not_found(error))
@@ -10807,6 +10874,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             && !opts.data_movement
             && !opts.replication_request
             && opts.http_preconditions.is_none()
+            && goi.name.is_empty()
         {
             if let Some(expected) = opts.expected_bucket_incarnation_id {
                 self.validate_bucket_incarnation(bucket, expected, &opts).await?;
@@ -10974,7 +11042,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
             fi.set_tier_free_version_id(&find_vid.to_string());
 
-            if let Some(incarnation) = opts.expected_bucket_incarnation_id {
+            let marker_incarnation = if republishes_data_movement_delete_marker(&opts, &goi, version_found) {
+                // Keep the existing marker's birth identity, including an
+                // unknown legacy identity, identical on newly repaired disks.
+                authoritative_file_info.delete_marker_incarnation()
+            } else {
+                opts.expected_bucket_incarnation_id
+            };
+            if let Some(incarnation) = marker_incarnation {
                 fi.set_delete_marker_incarnation(incarnation);
             }
 
@@ -11005,6 +11080,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             )
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
+            if republishes_data_movement_delete_marker(&opts, &goi, version_found)
+                && let Some(version_id) = opts.version_id.as_deref()
+            {
+                self.verify_data_movement_delete_marker_write_quorum(bucket, object, version_id)
+                    .await?;
+            }
             #[cfg(test)]
             pause_delete_object_commit_after_publish(bucket, object).await;
 
@@ -11112,8 +11193,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         // Use the same full xl.meta read path as GetObject metadata resolution.
         // This avoids HEAD/GetObject metadata visibility skew immediately after
-        // PutObject/CompleteMultipartUpload.
-        let read = self.get_object_fileinfo(bucket, object, opts, true, false);
+        // PutObject/CompleteMultipartUpload. Read-only callers that hold the
+        // shared lock and permit metadata caching can early-stop once write
+        // quorum agrees on the object identity.
+        let allow_early_stop = !opts.no_lock || opts.metadata_cache_safe;
+        let read = self.get_object_fileinfo(bucket, object, opts, true, allow_early_stop);
         #[cfg(feature = "diagnostic-read-version-caller")]
         let read = crate::cluster::rpc::runtime_sources::with_read_version_entry(
             rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ObjectInfoRead,
@@ -11126,7 +11210,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         );
         let snapshot = read.await.map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-        let oi = ObjectInfo::from_file_info(snapshot.fi(), bucket, object, opts.versioned || opts.version_suspended);
+        let oi = snapshot.into_object_info(bucket, object, opts.versioned || opts.version_suspended);
 
         Ok(oi)
     }
@@ -19556,6 +19640,7 @@ mod transition_upload_integrity_tests {
                 object,
                 &expected,
                 &[],
+                &[],
                 crate::data_movement::SourceCleanupBucketFence::default(),
                 "test_data_movement",
             )
@@ -19626,6 +19711,7 @@ mod transition_upload_integrity_tests {
                 object,
                 &expected,
                 &[],
+                &[],
                 crate::data_movement::SourceCleanupBucketFence {
                     expected_incarnation_id: None,
                     lifecycle_guard: Some(&bucket_guard),
@@ -19655,6 +19741,171 @@ mod transition_upload_integrity_tests {
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
         drop(local_cleanup_setup);
         drop(distributed_setup);
+    }
+
+    /// Data-movement source cleanup appends no tier free version for a
+    /// transitioned version the mover copied to a target, and keeps the free
+    /// version, the only remote-delete owner, for one it did not copy (such as
+    /// a version lifecycle expired during the move).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn data_movement_cleanup_keeps_a_free_version_only_for_untransferred_tier_versions() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let object = "object.bin";
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        for (bucket, transferred) in [
+            ("data-movement-cleanup-transferred", true),
+            ("data-movement-cleanup-expired", false),
+        ] {
+            let payload = b"a transitioned source removed by data movement".repeat(64);
+            let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+            set_disks
+                .transition_object(bucket, object, &transition_options(&original, tier_name.clone()))
+                .await
+                .expect("transition should commit");
+            let expected = set_disks
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("source versions should be readable")
+                .expect("source versions should exist");
+            let source = expected.versions[0].clone();
+            assert_eq!(source.transition_status, TRANSITION_COMPLETE);
+            let transferred_tier_versions = if transferred {
+                vec![crate::data_movement::source_cleanup_version_identity(&source)]
+            } else {
+                Vec::new()
+            };
+
+            crate::data_movement::cleanup_source_entry_if_unchanged(
+                Arc::clone(&set_disks),
+                bucket,
+                object,
+                &expected,
+                &[],
+                &transferred_tier_versions,
+                crate::data_movement::SourceCleanupBucketFence::default(),
+                "test_data_movement",
+            )
+            .await
+            .expect("source cleanup should succeed");
+
+            let left = set_disks
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("source versions should be readable")
+                .map(|versions| versions.versions)
+                .unwrap_or_default();
+            if transferred {
+                assert!(left.is_empty(), "a transferred version must leave no free version: {left:?}");
+            } else {
+                assert_eq!(left.len(), 1, "an untransferred version must keep its free version: {left:?}");
+                let free = &left[0];
+                assert!(free.tier_free_version());
+                assert_eq!(free.transition_tier, source.transition_tier);
+                assert_eq!(free.transitioned_objname, source.transitioned_objname);
+                assert_eq!(free.transition_version_id, source.transition_version_id);
+            }
+            assert!(
+                backend.contains(&source.transitioned_objname).await,
+                "source cleanup never deletes the remote object itself"
+            );
+        }
+        assert_eq!(backend.remove_count().await, 0);
+        assert_eq!(backend.exact_remove_count(), 0);
+    }
+
+    /// The skip is decided per version: of two transitioned versions of one
+    /// key, only the one reported as transferred leaves no free version. The
+    /// directory object is listed as `dir/`, while the cleanup deletes its
+    /// encoded key, so the match must not depend on the version's name.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn data_movement_cleanup_skips_the_free_version_per_transferred_version() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        for (bucket, object) in [
+            ("data-movement-cleanup-per-version", "object.bin"),
+            ("data-movement-cleanup-directory", "dir/"),
+        ] {
+            for disk in &disk_stores {
+                disk.make_volume(bucket).await.expect("bucket volume should be created");
+            }
+            let disk_object = rustfs_utils::path::encode_dir_object(object);
+            let mut version_ids = Vec::new();
+            for body in [
+                b"first transitioned version".as_slice(),
+                b"second transitioned version".as_slice(),
+            ] {
+                let original = set_disks
+                    .put_object(
+                        bucket,
+                        &disk_object,
+                        &mut PutObjReader::from_vec(body.repeat(64)),
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("source version should be written");
+                let mut opts = transition_options(&original, tier_name.clone());
+                opts.versioned = true;
+                set_disks
+                    .transition_object(bucket, &disk_object, &opts)
+                    .await
+                    .expect("transition should commit");
+                version_ids.push(original.version_id);
+            }
+            let expected = set_disks
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("source versions should be readable")
+                .expect("source versions should exist");
+            assert_eq!(expected.versions.len(), 2);
+            let version = |version_id| {
+                expected
+                    .versions
+                    .iter()
+                    .find(|version| version.version_id == version_id)
+                    .cloned()
+                    .expect("each written version should be loaded")
+            };
+            let (moved, kept) = (version(version_ids[0]), version(version_ids[1]));
+            assert_eq!(moved.transition_status, TRANSITION_COMPLETE);
+            assert_eq!(kept.transition_status, TRANSITION_COMPLETE);
+            assert_ne!(moved.transitioned_objname, kept.transitioned_objname);
+
+            crate::data_movement::cleanup_source_entry_if_unchanged(
+                Arc::clone(&set_disks),
+                bucket,
+                object,
+                &expected,
+                &[],
+                &[crate::data_movement::source_cleanup_version_identity(&moved)],
+                crate::data_movement::SourceCleanupBucketFence::default(),
+                "test_data_movement",
+            )
+            .await
+            .expect("source cleanup should succeed");
+
+            let left = set_disks
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("source versions should be readable")
+                .map(|versions| versions.versions)
+                .unwrap_or_default();
+            assert_eq!(left.len(), 1, "only the untransferred version keeps a free version: {left:?}");
+            let free = &left[0];
+            assert!(free.tier_free_version());
+            assert_eq!(free.transitioned_objname, kept.transitioned_objname);
+            assert_eq!(free.transition_version_id, kept.transition_version_id);
+            for remote in [&moved.transitioned_objname, &kept.transitioned_objname] {
+                assert!(backend.contains(remote).await, "source cleanup never deletes the remote object itself");
+            }
+        }
+        assert_eq!(backend.remove_count().await, 0);
     }
 
     #[tokio::test]
@@ -24610,7 +24861,20 @@ mod delete_objects_lock_gating_tests {
         for disk in &disks {
             disk.make_volume(bucket).await.expect("create fixture volume");
         }
-        put_plain_object(&set, bucket, object).await;
+        // This fixture inspects a specific drive and then takes it offline.
+        // A quorum ACK alone does not mean that drive's rename has completed.
+        let mut reader = PutObjReader::from_vec(vec![3u8; 1024]);
+        set.put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("fixture rename fan-out should finish before injecting a drive fault");
         let disk_info = disks[0]
             .read_version(bucket, bucket, object, "", &crate::disk::ReadOptions::default())
             .await
@@ -26910,6 +27174,352 @@ mod cleanup_receipt_admission_tests {
 }
 
 #[cfg(test)]
+mod batch_delete_marker_tests {
+    use super::*;
+    use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+    use crate::storage_api_contracts::bucket::{BucketOperations, DeleteBucketOptions, MakeBucketOptions};
+    use crate::storage_api_contracts::list::ListOperations;
+
+    async fn marker_history(store: &Arc<ECStore>, bucket: &str) -> (Vec<Uuid>, Vec<Uuid>) {
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned bucket");
+        let mut data_versions = Vec::new();
+        let mut markers = Vec::new();
+        for body in [b"first".as_slice(), b"second".as_slice()] {
+            let uploaded = store
+                .put_object(
+                    bucket,
+                    "object",
+                    &mut PutObjReader::from_vec(body.to_vec()),
+                    &ObjectOptions {
+                        versioned: true,
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write a data version");
+            data_versions.push(uploaded.version_id.expect("versioned PUT returns an ID"));
+            let marker = store
+                .delete_object(
+                    bucket,
+                    "object",
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create a delete marker");
+            assert!(marker.delete_marker);
+            markers.push(marker.version_id.expect("delete marker has a version ID"));
+        }
+        (data_versions, markers)
+    }
+
+    #[tokio::test]
+    async fn batch_delete_indexed_marker_history_unblocks_bucket_delete() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "batch-indexed-marker-history";
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned bucket");
+        let uploaded = store
+            .put_object(
+                bucket,
+                "object",
+                &mut PutObjReader::from_vec(vec![42; 1024 * 1024]),
+                &ObjectOptions {
+                    versioned: true,
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write a physical data version behind the markers");
+        let mut requests = Vec::with_capacity(17);
+        requests.push(ObjectToDelete {
+            object_name: "object".to_string(),
+            version_id: Some(uploaded.version_id.expect("data version")),
+            ..Default::default()
+        });
+        for _ in 0..16 {
+            let marker = store
+                .delete_object(
+                    bucket,
+                    "object",
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("append a marker to the same key");
+            requests.push(ObjectToDelete {
+                object_name: "object".to_string(),
+                version_id: Some(marker.version_id.expect("marker version")),
+                ..Default::default()
+            });
+        }
+        let (deleted, errors) = store.delete_objects(bucket, requests, ObjectOptions::default()).await;
+        assert_eq!(deleted.len(), 17);
+        assert!(errors.iter().all(Option::is_none), "indexed marker batch must commit: {errors:?}");
+        assert!(!deleted[0].delete_marker);
+        assert!(deleted[1..].iter().all(|result| result.delete_marker));
+        let listed = store
+            .clone()
+            .list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list immediately after indexed deletion");
+        assert!(listed.objects.is_empty());
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("indexed deletion leaves an immediately deletable bucket");
+    }
+
+    #[tokio::test]
+    async fn batch_delete_explicit_marker_does_not_wait_for_pending_replication() {
+        use s3s::dto::{
+            BucketVersioningStatus, DeleteReplication, DeleteReplicationStatus, Destination, ReplicationConfiguration,
+            ReplicationRule, ReplicationRuleStatus, VersioningConfiguration,
+        };
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "batch-marker-replication";
+        let (data_versions, markers) = marker_history(&store, bucket).await;
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
+            VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                ..Default::default()
+            },
+            Some(ReplicationConfiguration {
+                role: String::new(),
+                rules: vec![ReplicationRule {
+                    delete_marker_replication: None,
+                    delete_replication: Some(DeleteReplication {
+                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                    }),
+                    destination: Destination {
+                        bucket: arn.to_string(),
+                        ..Default::default()
+                    },
+                    existing_object_replication: None,
+                    filter: None,
+                    id: Some("delete".to_string()),
+                    prefix: Some(String::new()),
+                    priority: Some(1),
+                    source_selection_criteria: None,
+                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                }],
+            }),
+        ));
+        let (deleted, errors) = store
+            .delete_objects(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: "object".to_owned(),
+                    version_id: Some(markers[1]),
+                    ..Default::default()
+                }],
+                ObjectOptions {
+                    delete_replication_config_snapshot: Some(snapshot),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(errors[0].is_none(), "marker purge must succeed: {errors:?}");
+        assert!(deleted[0].delete_marker);
+        assert_eq!(deleted[0].delete_marker_version_id, Some(markers[1]));
+        assert_eq!(
+            deleted[0]
+                .replication_state
+                .as_ref()
+                .and_then(|state| state.version_purge_status_internal.as_deref()),
+            Some("arn:rustfs:replication:us-east-1:target:bucket=PENDING;")
+        );
+        let current = store
+            .get_object_info(bucket, "object", &ObjectOptions::default())
+            .await
+            .expect("source data must be visible before remote replication completes");
+        assert_eq!(current.version_id, Some(data_versions[1]));
+    }
+
+    #[tokio::test]
+    async fn batch_delete_all_explicit_versions_unblocks_bucket_delete() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "batch-marker-empty-bucket";
+        let (data_versions, markers) = marker_history(&store, bucket).await;
+        let requested = [markers[1], data_versions[0], markers[0], data_versions[1]];
+        let (deleted, errors) = store
+            .delete_objects(
+                bucket,
+                requested
+                    .into_iter()
+                    .map(|version_id| ObjectToDelete {
+                        object_name: "object".to_owned(),
+                        version_id: Some(version_id),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ObjectOptions::default(),
+            )
+            .await;
+        assert!(errors.iter().all(Option::is_none), "all explicit deletes must succeed: {errors:?}");
+        for (index, version) in requested.iter().enumerate() {
+            assert_eq!(deleted[index].delete_marker, markers.contains(version));
+            if markers.contains(version) {
+                assert_eq!(deleted[index].delete_marker_version_id, Some(*version));
+            } else {
+                assert_eq!(deleted[index].version_id, Some(*version));
+            }
+        }
+        let listed = store
+            .clone()
+            .list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list immediately after the successful batch");
+        assert!(listed.objects.is_empty(), "no version or marker may survive: {:?}", listed.objects);
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete the empty bucket immediately without retries or force");
+        for dir in dirs {
+            assert!(!dir.path().join(bucket).exists(), "bucket must be removed on every disk");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_delete_explicit_markers_preserves_data_and_duplicate_idempotency() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "batch-marker-keep-data";
+        let (data_versions, markers) = marker_history(&store, bucket).await;
+        let requested = [markers[0], markers[0], markers[1], markers[1]];
+        let (deleted, errors) = store
+            .delete_objects(
+                bucket,
+                requested
+                    .into_iter()
+                    .map(|version_id| ObjectToDelete {
+                        object_name: "object".to_owned(),
+                        version_id: Some(version_id),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ObjectOptions::default(),
+            )
+            .await;
+        assert!(errors.iter().all(Option::is_none), "duplicate explicit deletes must succeed: {errors:?}");
+        for (result, version) in deleted.iter().zip(requested) {
+            assert!(result.delete_marker);
+            assert_eq!(result.delete_marker_version_id, Some(version));
+        }
+        let listed = store
+            .clone()
+            .list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list remaining data versions immediately");
+        assert_eq!(listed.objects.len(), data_versions.len());
+        assert!(
+            listed
+                .objects
+                .iter()
+                .all(|info| !info.delete_marker && data_versions.contains(&info.version_id.expect("version ID")))
+        );
+        let current = store
+            .get_object_info(bucket, "object", &ObjectOptions::default())
+            .await
+            .expect("removing the markers restores the latest data version");
+        assert_eq!(current.version_id, Some(data_versions[1]));
+        for dir in dirs {
+            let bytes = tokio::fs::read(dir.path().join(bucket).join("object").join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("read committed metadata from each disk");
+            let mut metadata = FileMeta::default();
+            metadata.unmarshal_msg(&bytes).expect("decode committed metadata");
+            assert_eq!(metadata.versions.len(), data_versions.len());
+            assert!(
+                metadata
+                    .versions
+                    .iter()
+                    .all(|version| version.header.version_type == rustfs_filemeta::VersionType::Object)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_delete_mixed_null_and_uuid_markers_preserves_their_identities() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "batch-marker-null-version";
+        let (data_versions, markers) = marker_history(&store, bucket).await;
+        crate::bucket::metadata_sys::update_in(
+            &store.ctx,
+            bucket,
+            crate::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("suspend versioning");
+        store
+            .delete_object(
+                bucket,
+                "object",
+                ObjectOptions {
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the null delete marker");
+        let requested = [markers[1], Uuid::nil(), markers[0]];
+        let (deleted, errors) = store
+            .delete_objects(
+                bucket,
+                requested
+                    .into_iter()
+                    .map(|version_id| ObjectToDelete {
+                        object_name: "object".to_owned(),
+                        version_id: Some(version_id),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ObjectOptions::default(),
+            )
+            .await;
+        assert!(errors.iter().all(Option::is_none), "mixed marker deletes must succeed: {errors:?}");
+        for (result, version) in deleted.iter().zip(requested) {
+            assert!(result.delete_marker);
+            assert_eq!(result.delete_marker_version_id, Some(version));
+        }
+        let listed = store
+            .clone()
+            .list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list immediately after mixed marker deletion");
+        assert_eq!(listed.objects.len(), data_versions.len());
+        assert!(listed.objects.iter().all(|info| !info.delete_marker));
+    }
+}
+
+#[cfg(test)]
 mod crash_delete_retry_tests {
     use super::*;
     use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
@@ -27335,3 +27945,6 @@ mod delete_recovery_inventory_tests {
         assert!(errors.iter().all(Option::is_none), "DELETE result must remain successful: {errors:?}");
     }
 }
+
+#[cfg(all(test, feature = "test-util"))]
+mod data_movement_prefix_cleanup_tests;

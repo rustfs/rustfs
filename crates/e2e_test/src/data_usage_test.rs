@@ -14,6 +14,7 @@
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+use futures::{StreamExt, TryStreamExt, stream};
 use rustfs_data_usage::DataUsageInfo;
 use tokio::time::{Duration, sleep};
 
@@ -74,16 +75,23 @@ async fn data_usage_reports_all_objects() -> Result<(), Box<dyn std::error::Erro
     // Create bucket and upload objects
     client.create_bucket().bucket(TEST_BUCKET).send().await?;
 
-    for i in 0..1000 {
-        let key = format!("obj-{i:04}");
-        client
-            .put_object()
-            .bucket(TEST_BUCKET)
-            .key(key)
-            .body(ByteStream::from_static(b"hello-world"))
-            .send()
-            .await?;
-    }
+    // Keep the full fixture and await every durable PUT before checking publication.
+    stream::iter(0..1000)
+        .map(Ok)
+        .try_for_each_concurrent(16, |i| {
+            let client = &client;
+            async move {
+                client
+                    .put_object()
+                    .bucket(TEST_BUCKET)
+                    .key(format!("obj-{i:04}"))
+                    .body(ByteStream::from_static(b"hello-world"))
+                    .send()
+                    .await
+                    .map(|_| ())
+            }
+        })
+        .await?;
 
     let usage = wait_for_bucket_usage(&env, TEST_BUCKET, |usage| {
         usage

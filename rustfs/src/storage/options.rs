@@ -1065,7 +1065,7 @@ pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
 /// digest, for both header-signed and presigned SigV4 requests, and rejects a
 /// malformed header outright. Every request that reaches a handler with that
 /// header has therefore already had its body verified (or is about to fail in
-/// the body stream with the same `BadDigest` mapping), so hashing it again in
+/// the body stream with `XAmzContentSHA256Mismatch`), so hashing it again in
 /// `HashReader` would cost a second full SHA-256 pass per PUT for no extra
 /// protection. Streaming payloads are verified chunk by chunk by s3s and never
 /// produced a digest here.

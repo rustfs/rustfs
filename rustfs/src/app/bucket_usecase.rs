@@ -64,6 +64,8 @@ use super::storage_api::bucket_usecase::{
     get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
     request_context, validate_list_object_unordered_with_delimiter,
 };
+#[cfg(feature = "diagnostic-read-version-caller")]
+use super::storage_api::diagnostic;
 use crate::app::bucket_list_through as list_through;
 use crate::app::object::shared::mark_on_demand_migration_list_local_only;
 use crate::app::object_data_cache::invalidate_object_data_cache_bucket_after_delete;
@@ -1406,15 +1408,20 @@ where
     MakeFuture: FnOnce(OwnedSemaphorePermit) -> F + Send + 'static,
 {
     let (mutation_permit, in_flight) = admission.acquire(operation).await?;
-    tokio::spawn(
-        async move {
-            let _in_flight = in_flight;
-            make_future(mutation_permit).await
-        }
-        .in_current_span(),
-    )
-    .await
-    .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{operation} task failed: {err}")))?
+    let future = async move {
+        let _in_flight = in_flight;
+        make_future(mutation_permit).await
+    };
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let future = diagnostic::with_captured_read_version_context(diagnostic::ReadVersionContextBoundary::BucketTask, future);
+    #[cfg(not(feature = "diagnostic-read-version-caller"))]
+    let future = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(
+        rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context(),
+        future,
+    );
+    tokio::spawn(future.in_current_span())
+        .await
+        .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{operation} task failed: {err}")))?
 }
 
 impl DefaultBucketUsecase {
@@ -1445,12 +1452,55 @@ impl DefaultBucketUsecase {
         current_object_store_handle_for_context(self.context.as_deref())
     }
 
+    fn create_bucket_exists_result(&self, requester_is_owner: bool) -> S3Result<S3Response<CreateBucketOutput>> {
+        // Match AWS CreateBucket semantics: an owned bucket is idempotent in
+        // us-east-1 and returns BucketAlreadyOwnedByYou elsewhere.
+        let region = self
+            .global_region()
+            .map(|region| region.to_string())
+            .unwrap_or_else(|| RUSTFS_REGION.to_string());
+        create_bucket_exists_response(requester_is_owner, &region)
+    }
+
     #[instrument(
         level = "debug",
         skip(self, req),
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
     pub async fn execute_create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
+        rustfs_io_metrics::s3_http_metrics::observe_s3_http_operation(S3Operation::CreateBucket);
+        if let Some(location) = req
+            .input
+            .create_bucket_configuration
+            .as_ref()
+            .and_then(|config| config.location_constraint.as_ref())
+            .map(BucketLocationConstraint::as_str)
+            .filter(|location| !location.is_empty())
+        {
+            let location = if location == "EU" { "eu-west-1" } else { location };
+            let region = self.global_region();
+            if location != region.as_ref().map_or(RUSTFS_REGION, Region::as_str) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidLocationConstraint,
+                    "The specified location constraint does not match this server's region.",
+                ));
+            }
+        }
+
+        // An existing bucket needs no mutation. Answer before the mutation queue and the
+        // bucket's exclusive locks, which wait for every in-flight object write.
+        if let Ok(req_info) = req_info_ref(&req)
+            && let Some(store) = self.object_store()
+            && store
+                .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+                .await
+                .is_ok()
+        {
+            let helper = OperationHelper::new(&req, EventName::BucketCreated, S3Operation::CreateBucket);
+            let result = self.create_bucket_exists_result(req_info.is_owner);
+            let _ = helper.complete(&result);
+            return result;
+        }
         let usecase = self.clone();
         await_bucket_usecase_on_fresh_task("bucket creation", move |mutation_permit| async move {
             usecase.execute_create_bucket_inner(req, mutation_permit).await
@@ -1530,13 +1580,7 @@ impl DefaultBucketUsecase {
                 .await;
             }
             Err(StorageError::BucketExists(_)) => {
-                // Match AWS CreateBucket semantics: an owned bucket is idempotent in
-                // us-east-1 and returns BucketAlreadyOwnedByYou elsewhere.
-                let region = self
-                    .global_region()
-                    .map(|region| region.to_string())
-                    .unwrap_or_else(|| RUSTFS_REGION.to_string());
-                let result = create_bucket_exists_response(requester_is_owner, &region);
+                let result = self.create_bucket_exists_result(requester_is_owner);
                 let _ = helper.complete(&result);
                 return result;
             }
@@ -1556,6 +1600,7 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
+        rustfs_io_metrics::s3_http_metrics::observe_s3_http_operation(S3Operation::DeleteBucket);
         let usecase = self.clone();
         await_bucket_usecase_on_fresh_task("bucket deletion", move |mutation_permit| async move {
             let _mutation_permit = mutation_permit;
@@ -1672,13 +1717,11 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        if let Some(region) = self.global_region() {
-            return Ok(S3Response::new(GetBucketLocationOutput {
-                location_constraint: Some(BucketLocationConstraint::from(region.to_string())),
-            }));
-        }
-
-        Ok(S3Response::new(GetBucketLocationOutput::default()))
+        let location_constraint = self
+            .global_region()
+            .filter(|region| region.as_str() != RUSTFS_REGION)
+            .map(|region| BucketLocationConstraint::from(region.to_string()));
+        Ok(S3Response::new(GetBucketLocationOutput { location_constraint }))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -3358,6 +3401,115 @@ mod tests {
         assert_eq!(*second_bad.code(), S3ErrorCode::MalformedXML);
     }
 
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn diagnostic_bucket_usecase_task_keeps_entry_and_permits_after_waiter_drop() {
+        use super::diagnostic::{ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry};
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, current_s3_http_operation_name, observe_s3_http_operation,
+            with_s3_http_operation_context,
+        };
+
+        let mut request = S3HttpRequestGuard::new("PUT");
+        let operation = request.in_scope(|| {
+            observe_s3_http_operation(S3Operation::CreateBucket);
+            current_s3_http_operation_context().expect("captured bucket operation")
+        });
+        let admission = Arc::new(BucketOperationAdmission::new(1, 1));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let mut caller = Box::pin(with_s3_http_operation_context(Some(operation), async {
+            with_read_version_entry(ReadVersionEntrySource::TierConfigReload, async {
+                await_bucket_usecase_on_fresh_task_with_admission(
+                    "test bucket operation",
+                    admission.clone(),
+                    |permit| async move {
+                        entered_tx.send(()).expect("caller is present");
+                        release_rx.await.expect("bucket work may finish");
+                        let observed = with_read_version_entry(ReadVersionEntrySource::ConfigRead, async {
+                            (current_s3_http_operation_name(), current_read_version_entry_source())
+                        })
+                        .await;
+                        drop(permit);
+                        finished_tx.send(observed).expect("completion observer is present");
+                        Ok(())
+                    },
+                )
+                .await
+            })
+            .await
+        }));
+        assert!(futures::poll!(caller.as_mut()).is_pending());
+        entered_rx.await.expect("bucket task entered");
+        drop(caller);
+        drop(request);
+        assert_eq!(current_read_version_entry_source(), None);
+        assert_eq!(admission.active.available_permits(), 0);
+        assert_eq!(admission.in_flight.available_permits(), 1);
+        release_tx.send(()).expect("detached bucket task remains alive");
+        assert_eq!(
+            finished_rx.await.expect("bucket task completes"),
+            (Some("s3:CreateBucket"), Some(ReadVersionEntrySource::TierConfigReload))
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while admission.in_flight.available_permits() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed task releases admission");
+        assert_eq!(admission.active.available_permits(), 1);
+        let internal = await_bucket_usecase_on_fresh_task_with_admission("internal test", admission, |_permit| async {
+            Ok((current_s3_http_operation_name(), current_read_version_entry_source()))
+        })
+        .await
+        .expect("unscoped bucket task completes");
+        assert_eq!(internal, (None, None));
+    }
+
+    #[tokio::test]
+    async fn bucket_usecase_task_preserves_http_operation_context() {
+        use rustfs_io_metrics::s3_http_metrics::{S3HttpRequestGuard, current_s3_http_operation_name, observe_s3_http_operation};
+
+        for operation in [S3Operation::CreateBucket, S3Operation::DeleteBucket] {
+            for fail in [false, true] {
+                let mut request = S3HttpRequestGuard::new("PUT");
+                request.in_scope(|| observe_s3_http_operation(operation));
+                let admission = Arc::new(BucketOperationAdmission::new(1, 1));
+                let mut task = Box::pin(await_bucket_usecase_on_fresh_task_with_admission(
+                    "test bucket operation",
+                    admission.clone(),
+                    move |_permit| async move {
+                        assert_eq!(current_s3_http_operation_name(), Some(operation.as_str()));
+                        tokio::task::yield_now().await;
+                        assert_eq!(current_s3_http_operation_name(), Some(operation.as_str()));
+                        if fail {
+                            Err(S3Error::with_message(S3ErrorCode::InternalError, "test failure"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                ));
+                let result = std::future::poll_fn(|cx| request.in_scope(|| task.as_mut().poll(cx))).await;
+                assert_eq!(result.is_err(), fail);
+                assert_eq!(request.in_scope(current_s3_http_operation_name), Some(operation.as_str()));
+                assert_eq!(current_s3_http_operation_name(), None);
+                assert_eq!(admission.active.available_permits(), 1);
+                assert_eq!(admission.in_flight.available_permits(), 2);
+            }
+        }
+
+        let internal = await_bucket_usecase_on_fresh_task_with_admission(
+            "internal bucket operation",
+            Arc::new(BucketOperationAdmission::new(1, 1)),
+            |_permit| async { Ok(current_s3_http_operation_name()) },
+        )
+        .await
+        .expect("internal task should complete");
+        assert_eq!(internal, None, "internal work must not inherit a previous request");
+    }
+
     #[tokio::test]
     async fn bucket_usecase_task_finishes_post_commit_hooks_after_parent_cancellation() {
         let admission = Arc::new(BucketOperationAdmission::new(1, 1));
@@ -3371,18 +3523,29 @@ mod tests {
         let release_hook_for_task = release_hook.clone();
         let finished_for_task = finished.clone();
         let hook_ran_for_task = hook_ran.clone();
-        let parent = tokio::spawn(await_bucket_usecase_on_fresh_task_with_admission(
+        let parent_task = await_bucket_usecase_on_fresh_task_with_admission(
             "test bucket operation",
             admission.clone(),
             move |mutation_permit| async move {
                 drop(mutation_permit);
                 committed_for_task.notify_one();
                 release_hook_for_task.notified().await;
+                assert_eq!(
+                    rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(),
+                    Some("s3:CreateBucket"),
+                    "the detached hook retains attribution after the parent is cancelled"
+                );
                 hook_ran_for_task.store(true, Ordering::SeqCst);
                 finished_for_task.notify_one();
                 Ok(())
             },
-        ));
+        );
+        let parent = tokio::spawn(async move {
+            let mut request = rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard::new("PUT");
+            request.in_scope(|| rustfs_io_metrics::s3_http_metrics::observe_s3_http_operation(S3Operation::CreateBucket));
+            let mut parent_task = Box::pin(parent_task);
+            std::future::poll_fn(|cx| request.in_scope(|| parent_task.as_mut().poll(cx))).await
+        });
         committed_wait.await;
 
         parent.abort();
@@ -4351,8 +4514,108 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_create_bucket(req)).await.unwrap_err();
+        let mut request = rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard::new("PUT");
+        let mut call = Box::pin(usecase.execute_create_bucket(req));
+        let err = std::future::poll_fn(|cx| request.in_scope(|| call.as_mut().poll(cx)))
+            .await
+            .expect_err("an uninitialized store must fail");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(
+            request.in_scope(rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name),
+            Some("s3:CreateBucket")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn execute_create_bucket_on_existing_bucket_does_not_wait_for_bucket_lifecycle_lock() {
+        crate::app::gating_test_env::run_large_stack_test("create-existing-bucket", || async {
+            let context = crate::app::gating_test_env::shared_gating_ambient().await;
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let bucket = format!("create-existing-{}", uuid::Uuid::new_v4().simple());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+
+            // Object writes hold this lock shared; an exclusive guard exposes any lifecycle-lock wait.
+            let _lifecycle_guard = store
+                .lock_bucket_for_recursive_delete(&bucket)
+                .await
+                .expect("hold the bucket lifecycle lock");
+            let usecase = DefaultBucketUsecase::with_context(Some(context));
+
+            for (is_owner, location, expected_error) in [
+                (true, None, None),
+                (false, None, Some(S3ErrorCode::BucketAlreadyExists)),
+                (true, Some("ap-south-1"), Some(S3ErrorCode::InvalidLocationConstraint)),
+            ] {
+                let input = CreateBucketInput {
+                    bucket: bucket.clone(),
+                    create_bucket_configuration: location.map(|location| s3s::dto::CreateBucketConfiguration {
+                        location_constraint: Some(BucketLocationConstraint::from(location.to_string())),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let req = build_request_with_req_info(
+                    input,
+                    Method::PUT,
+                    ReqInfo {
+                        is_owner,
+                        ..Default::default()
+                    },
+                );
+                let result = tokio::time::timeout(Duration::from_secs(2), usecase.execute_create_bucket(req))
+                    .await
+                    .expect("CreateBucket on an existing bucket must not wait for the bucket lifecycle lock");
+                match expected_error {
+                    Some(code) => assert_eq!(result.expect_err("duplicate or invalid request must fail").code(), &code),
+                    None => {
+                        result.expect("the owner recreating a bucket in us-east-1 gets the idempotent success");
+                    }
+                }
+            }
+
+            let req = build_request(
+                CreateBucketInput {
+                    bucket,
+                    ..Default::default()
+                },
+                Method::PUT,
+            );
+            let err = tokio::time::timeout(Duration::from_secs(2), usecase.execute_create_bucket(req))
+                .await
+                .expect("missing request info must fail before storage mutation")
+                .expect_err("an existing bucket must not bypass request-info validation");
+            assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn execute_create_bucket_creates_missing_bucket() {
+        crate::app::gating_test_env::run_large_stack_test("create-missing-bucket", || async {
+            let context = crate::app::gating_test_env::shared_gating_ambient().await;
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let bucket = format!("create-missing-{}", uuid::Uuid::new_v4().simple());
+            let input = CreateBucketInput::builder().bucket(bucket.clone()).build().unwrap();
+            let req = build_request_with_req_info(
+                input,
+                Method::PUT,
+                ReqInfo {
+                    is_owner: true,
+                    ..Default::default()
+                },
+            );
+            let usecase = DefaultBucketUsecase::with_context(Some(context));
+            usecase.execute_create_bucket(req).await.expect("create a missing bucket");
+            let info = store
+                .get_bucket_info(&bucket, &BucketOptions::default())
+                .await
+                .expect("the missing-bucket lookup must fall through to real creation");
+            assert_eq!(info.name, bucket);
+        });
     }
 
     #[tokio::test]
@@ -4365,8 +4628,16 @@ mod tests {
         let req = build_request(input, Method::DELETE);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_delete_bucket(req).await.unwrap_err();
+        let mut request = rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard::new("DELETE");
+        let mut call = Box::pin(usecase.execute_delete_bucket(req));
+        let err = std::future::poll_fn(|cx| request.in_scope(|| call.as_mut().poll(cx)))
+            .await
+            .expect_err("an uninitialized store must fail");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(
+            request.in_scope(rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name),
+            Some("s3:DeleteBucket")
+        );
     }
 
     #[tokio::test]

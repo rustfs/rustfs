@@ -787,7 +787,11 @@ impl ScannerIOCache for SetDisks {
                 NamespaceScannerWorkerMode::RemoteV4(server_epoch) => Some(server_epoch),
                 NamespaceScannerWorkerMode::Coordinator => None,
             };
+            #[cfg(test)]
+            let worker_index = futs.len();
             futs.push(AbortOnDropHandle::new(tokio::spawn(async move {
+                #[cfg(test)]
+                super::tests::observe_coordinator_bucket_worker_started(worker_index).await;
                 let remote_session_id = uuid::Uuid::new_v4();
                 let mut remote_session_sequence = 0_u64;
                 loop {
@@ -855,9 +859,13 @@ impl ScannerIOCache for SetDisks {
                     let bucket_dirty_generation = dirty_usage_buckets_clone.get(&bucket.name).copied();
                     // The reuse plan a complete cache is current under, and the
                     // coverage plan a sweep is started and resumed under.
-                    let bucket_scan_plan_digest = scanner_bucket_cache_digest(bucket_work_digest, bucket_dirty_generation);
-                    let bucket_checkpoint_plan_digest =
-                        scanner_bucket_cache_digest(bucket_checkpoint_work_digest, bucket_dirty_generation);
+                    let bucket_plans = ScannerBucketPlanDigests::from_work_plans(
+                        bucket_work_digest,
+                        bucket_checkpoint_work_digest,
+                        bucket_dirty_generation,
+                    );
+                    let bucket_scan_plan_digest = bucket_plans.reuse;
+                    let bucket_checkpoint_plan_digest = bucket_plans.coverage;
 
                     if let Some(server_epoch) = remote_server_epoch {
                         let request_sequence = remote_session_sequence;
@@ -886,7 +894,7 @@ impl ScannerIOCache for SetDisks {
                                 server_epoch,
                                 session_id: remote_session_id,
                                 session_sequence: request_sequence,
-                                scan_plan_digest: bucket_scan_plan_digest,
+                                plans: bucket_plans,
                                 tier_registry_generation,
                                 skip_healing: healing,
                                 scan_mode,
@@ -1052,7 +1060,7 @@ impl ScannerIOCache for SetDisks {
                         None
                     };
                     #[cfg(test)]
-                    super::tests::observe_coordinator_bucket_scan_admitted(&bucket.name).await;
+                    super::tests::observe_coordinator_bucket_scan_admitted(worker_index, &bucket.name).await;
 
                     // Lock order: scanner leader fence -> set-scoped per-bucket cache lock ->
                     // cache object read/write.
@@ -1285,7 +1293,6 @@ impl ScannerIOCache for SetDisks {
                         "Scanner disk bucket cache ready"
                     );
 
-                    let before = cache.info.last_update;
                     let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel::<DataUsageCache>(1);
 
                     let scan_ctx = ctx_clone.child_token();
@@ -1293,7 +1300,7 @@ impl ScannerIOCache for SetDisks {
                         scan_ctx.clone(),
                         budget_clone.clone(),
                         set_disk_inventory_clone.as_ref().clone(),
-                        cache.clone(),
+                        cache,
                         None,
                         ScannerDiskScanOptions {
                             scan_mode,
@@ -1449,40 +1456,11 @@ impl ScannerIOCache for SetDisks {
                                 );
                             }
 
-                            if !cache_guard.is_lock_lost()
-                                && let (Some(last_update), Some(before_update)) = (cache.info.last_update, before)
-                                && last_update > before_update
-                            {
-                                let done_save = Metrics::time(Metric::SaveUsage);
-                                if let Err(e) = cache
-                                    .save_with_revisions_for_epoch(
-                                        store_clone_clone.clone(),
-                                        cache_name.as_str(),
-                                        &revisions,
-                                        expected_publication_epoch_clone,
-                                    )
-                                    .await
-                                {
-                                    error!(
-                                        target: "rustfs::scanner::io",
-                                        event = EVENT_SCANNER_CACHE_PERSIST_STATE,
-                                        component = LOG_COMPONENT_SCANNER,
-                                        subsystem = LOG_SUBSYSTEM_IO,
-                                        bucket = %bucket.name,
-                                        cache_name = %cache_name,
-                                        state = "save_failed",
-                                        error = %e,
-                                        "Scanner bucket cache save failed"
-                                    );
-                                }
-                                done_save();
-                            }
-
                             continue;
                         }
                     };
 
-                    let partial = match scan_outcome {
+                    let (cache, partial) = match scan_outcome {
                         ScannerDiskScanOutcome::Complete(mut completed_cache) => {
                             // The sweep finished under its coverage plan; the
                             // complete cache is current under the reuse plan,
@@ -1491,10 +1469,9 @@ impl ScannerIOCache for SetDisks {
                             if completed_cache.info.snapshot_complete {
                                 completed_cache.info.scan_plan_digest = Some(bucket_scan_plan_digest);
                             }
-                            cache = completed_cache;
-                            None
+                            (completed_cache, false)
                         }
-                        ScannerDiskScanOutcome::Partial(partial_cache) => Some((partial_cache, &partial_dirty_buckets_clone)),
+                        ScannerDiskScanOutcome::Partial(partial_cache) => (partial_cache, true),
                         ScannerDiskScanOutcome::NamespaceNotFound(_) => {
                             if requeue_bucket_work(&bucket_tx_clone, &bucket, &mut work_guard).await {
                                 increment_disk_bucket_scans_queued(
@@ -1517,13 +1494,13 @@ impl ScannerIOCache for SetDisks {
                             break;
                         }
                     };
-                    if let Some((partial_cache, failure_buckets)) = partial {
-                        record_partial_dirty_bucket(failure_buckets, &bucket.name).await;
+                    if partial {
+                        record_partial_dirty_bucket(&partial_dirty_buckets_clone, &bucket.name).await;
                         let done_save = Metrics::time(Metric::SaveUsage);
                         let partial_saved = if cache_guard.is_lock_lost() {
                             false
                         } else {
-                            match partial_cache
+                            match cache
                                 .save_with_revisions_for_epoch(
                                     store_clone_clone.clone(),
                                     cache_name.as_str(),
@@ -1554,7 +1531,7 @@ impl ScannerIOCache for SetDisks {
                             record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
                         }
                         if partial_saved {
-                            log_saved_partial_bucket_cache(&partial_cache, &cache_name);
+                            log_saved_partial_bucket_cache(&cache, &cache_name);
                         }
 
                         continue;

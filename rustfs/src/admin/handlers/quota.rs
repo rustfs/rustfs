@@ -17,7 +17,10 @@
 use crate::admin::auth::{validate_admin_request, validate_admin_request_with_bucket};
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{current_bucket_metadata_handle, current_object_store_handle};
+use crate::admin::runtime_sources::{
+    AppContext, app_context_from_req, current_bucket_metadata_handle, current_notification_system_for_context,
+    current_object_store_handle,
+};
 use crate::admin::storage_api::bucket::metadata_sys::{self, BucketMetadataSys};
 use crate::admin::storage_api::bucket::quota::checker::{QuotaChecker, record_reservation_protocol_migration};
 use crate::admin::storage_api::bucket::quota::{
@@ -44,6 +47,30 @@ use url::form_urlencoded;
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_QUOTA: &str = "quota";
 const EVENT_ADMIN_QUOTA_STATE: &str = "admin_quota_state";
+
+async fn notify_quota_metadata_reload(context: Option<Arc<AppContext>>, bucket: String, action: &'static str) {
+    let Some(notification_sys) = current_notification_system_for_context(context.as_deref()) else {
+        return;
+    };
+    // The metadata transaction has committed and released its locks. Await
+    // healthy peers, but keep the reload running if the request is cancelled.
+    // Failed peers converge through the periodic metadata refresh.
+    let _ = tokio::spawn(async move {
+        if let Err(error) = notification_sys.load_bucket_metadata(&bucket).await {
+            warn!(
+                event = EVENT_ADMIN_QUOTA_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_QUOTA,
+                state = "peer_metadata_reload_failed",
+                action,
+                bucket = %bucket,
+                error = %error,
+                "admin quota state"
+            );
+        }
+    })
+    .await;
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SetBucketQuotaRequest {
@@ -153,8 +180,9 @@ fn map_quota_query_error(error: QuotaError, bucket: &str, operation: &str) -> S3
 pub struct BucketQuotaResponse {
     pub bucket: String,
     pub quota: Option<u64>,
-    pub size: u64,
-    /// Current usage size in bytes
+    /// Current usage size in bytes; `null` when no usage is available,
+    /// never reported as zero.
+    pub size: Option<u64>,
     pub quota_type: String,
 }
 
@@ -287,19 +315,15 @@ fn bucket_metadata_from_context() -> Option<Arc<RwLock<BucketMetadataSys>>> {
     current_bucket_metadata_handle()
 }
 
-async fn current_usage_from_context(bucket: &str) -> u64 {
-    let Some(store) = current_object_store_handle() else {
-        return 0;
-    };
+async fn current_usage_from_context(bucket: &str) -> Option<u64> {
+    let store = current_object_store_handle()?;
 
-    match crate::admin::storage_api::data_usage::load_data_usage_from_backend(store).await {
-        Ok(data_usage_info) => data_usage_info
-            .buckets_usage
-            .get(bucket)
-            .map(|bucket_usage| bucket_usage.size)
-            .unwrap_or(0),
-        Err(_) => 0,
-    }
+    crate::admin::storage_api::data_usage::load_data_usage_from_backend(store)
+        .await
+        .ok()?
+        .buckets_usage
+        .get(bucket)
+        .map(|bucket_usage| bucket_usage.size)
 }
 
 pub fn register_quota_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -445,6 +469,8 @@ impl Operation for SetBucketQuotaHandler {
         }
         .map_err(ApiError::from)?;
 
+        notify_quota_metadata_reload(app_context_from_req(&req), bucket.clone(), "set_bucket_quota").await;
+
         if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
             bucket: bucket.clone(),
             r#type: "quota-config".to_string(),
@@ -551,7 +577,7 @@ impl Operation for GetBucketQuotaHandler {
         let response = BucketQuotaResponse {
             bucket,
             quota: quota.quota,
-            size: current_usage.unwrap_or(0),
+            size: current_usage,
             quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
         };
 
@@ -622,6 +648,8 @@ impl Operation for ClearBucketQuotaHandler {
             .set_quota_config_if_incarnation(&bucket, quota.clone(), expected_incarnation_id)
             .await
             .map_err(|e| s3_error!(InternalError, "failed to clear quota: {}", e))?;
+
+        notify_quota_metadata_reload(app_context_from_req(&req), bucket.clone(), "clear_bucket_quota").await;
 
         if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
             bucket: bucket.clone(),
@@ -1070,7 +1098,7 @@ mod tests {
         let response = BucketQuotaResponse {
             bucket: "test-bucket".to_string(),
             quota: Some(2147483648),
-            size: 1073741824,
+            size: Some(1073741824),
             quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
         };
 
@@ -1078,5 +1106,18 @@ mod tests {
         assert!(json.contains("test-bucket"));
         assert!(json.contains("2147483648"));
         assert!(json.contains("HARD"));
+    }
+
+    #[test]
+    fn quota_response_reports_unknown_usage_as_null() {
+        let response = BucketQuotaResponse {
+            bucket: "test-bucket".to_string(),
+            quota: Some(2147483648),
+            size: None,
+            quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
+        };
+
+        let json: serde_json::Value = serde_json::to_value(&response).unwrap();
+        assert!(json["size"].is_null(), "unknown usage must not be reported as zero: {json}");
     }
 }

@@ -26,10 +26,12 @@ pub(crate) fn EndpointServerPools(
 
 #[cfg(feature = "diagnostic-read-version-caller")]
 pub(crate) mod diagnostic {
-    #[cfg(test)]
-    pub(crate) use crate::storage::storage_api::ecstore_diagnostic::current_read_version_entry_source;
     pub(crate) use crate::storage::storage_api::ecstore_diagnostic::{
-        ReadVersionContextBoundary, ReadVersionEntrySource, with_read_version_spawn_context,
+        ReadVersionContextBoundary, ReadVersionEntrySource, with_captured_read_version_context, with_read_version_spawn_context,
+    };
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_diagnostic::{
+        current_read_version_entry_source, with_read_version_entry,
     };
 }
 
@@ -51,6 +53,8 @@ pub(crate) mod s3 {
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob, UploadPartInput, UploadPartOutput};
     #[cfg(test)]
     pub(crate) use s3s::service::{S3Service, S3ServiceBuilder};
+    #[cfg(test)]
+    pub(crate) use s3s::stream::upload_stream::{UploadStream, UploadStreamError};
     #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     #[cfg(test)]
@@ -1192,9 +1196,9 @@ pub(crate) mod bucket_usecase {
 }
 
 pub(crate) mod object_usecase {
-    pub(crate) use super::storage_contracts::BUCKET_LIFECYCLE_LOCK_OBJECT;
     pub(crate) use super::storage_contracts::object::DeleteObjectCondition;
     pub(crate) use crate::storage::storage_api::ecstore_object::{WriteCommitGuard, WriteCompletion};
+    pub(crate) use crate::storage::storage_api::ecstore_storage::BucketIncarnationFenceGuard;
 
     pub(crate) mod object_cache {
         #[cfg(test)]

@@ -45,6 +45,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 mod checkpoint_coverage_identity;
+mod collector_lifecycle;
+mod listing_window_scope;
 mod partial_bucket_carry;
 mod per_bucket_certification;
 mod scoped_entry_fallback;
@@ -185,6 +187,7 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_reports_cycle_inputs_wit
         scopes: Arc::new(DirtyUsageBucketScopes::default()),
         generation: 7,
         covers_all_pending: true,
+        covers_listed_pending: true,
     };
     let distributed_evidence = DistributedSegmentInvalidationEvidence {
         invalidation_domain: crate::segment_invalidation::SegmentInvalidationDomain::DistributedEc,
@@ -218,6 +221,7 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_blocks_unbounded_inputs(
         scopes: Arc::new(DirtyUsageBucketScopes::default()),
         generation: u64::MAX,
         covers_all_pending: false,
+        covers_listed_pending: false,
     };
 
     let preflight = scanner_segment_reuse_activation_preflight_for_cycle(
@@ -251,6 +255,7 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_skips_distributed_blocke
         scopes: Arc::new(DirtyUsageBucketScopes::default()),
         generation: 7,
         covers_all_pending: true,
+        covers_listed_pending: true,
     };
 
     let preflight = scanner_segment_reuse_activation_preflight_for_cycle(
@@ -2835,6 +2840,7 @@ fn remote_dirty_usage_invalidates_local_prefix_hints_until_distributed_proof_exi
         scopes: Arc::new(dirty_scopes.clone()),
         generation: 7,
         covers_all_pending: true,
+        covers_listed_pending: true,
     };
     let locally_scoped = scoped_scan_scope_from_dirty_buckets(
         ScannerBucketScanScope::default(),
@@ -3153,6 +3159,7 @@ fn remote_dirty_usage_scope_resolution_falls_back_when_ack_batch_exceeds_thresho
             scopes: Arc::new(HashMap::new()),
             generation: 7,
             covers_all_pending: true,
+            covers_listed_pending: true,
         },
         remote_dirty_usage,
         &all_buckets,
@@ -3279,6 +3286,7 @@ async fn distributed_scoped_scan_falls_back_when_remote_scoped_ack_capability_is
         scopes: Arc::new(HashMap::new()),
         generation: 7,
         covers_all_pending: true,
+        covers_listed_pending: true,
     };
     let activity_before = BTreeMap::from([(
         "node-a:9000".to_string(),
@@ -4639,9 +4647,13 @@ fn cache_root_entry_info_rejects_missing_or_dangling_roots() {
 
 #[tokio::test]
 async fn completed_bucket_results_count_distinct_current_roots_even_after_cancellation() {
-    for cancelled in [false, true] {
+    const BUCKETS: usize = 53;
+    for (cancel_after, fill_missing) in [None, Some(0), Some(26)]
+        .into_iter()
+        .flat_map(|cancel_after| [false, true].map(|fill_missing| (cancel_after, fill_missing)))
+    {
         let ctx = CancellationToken::new();
-        if cancelled {
+        if cancel_after == Some(0) {
             ctx.cancel();
         }
         let mut cache = DataUsageCache {
@@ -4660,27 +4672,60 @@ async fn completed_bucket_results_count_distinct_current_roots_even_after_cancel
                 ..Default::default()
             },
         );
-        let (tx, rx) = mpsc::channel(3);
-        for (bucket, generation, size) in [("complete", 7, 1), ("complete", 7, 2), ("missing", 8, 11)] {
-            tx.send(DataUsageEntryInfo {
-                name: bucket.to_string(),
-                parent: DATA_USAGE_ROOT.to_string(),
-                entry: DataUsageEntry {
-                    size,
-                    ..Default::default()
-                },
-                bucket_incarnation: None,
-                tier_registry_generation: Some(generation),
-            })
+        let (tx, rx) = mpsc::channel(1);
+        let collector =
+            AbortOnDropHandle::new(tokio::spawn(super::io_cache::collect_completed_bucket_results(ctx.clone(), cache, rx)));
+        let mut entries = (0..BUCKETS - 1)
+            .map(|index| (format!("bucket-{index:02}"), 7, 1))
+            .collect::<Vec<_>>();
+        entries.extend([("bucket-00".to_string(), 7, 2), ("missing".to_string(), 8, 11)]);
+        if fill_missing {
+            entries.push(("missing".to_string(), 7, 5));
+        }
+        for (index, (bucket, generation, size)) in entries.into_iter().enumerate() {
+            if cancel_after == Some(index) {
+                ctx.cancel();
+            }
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                tx.send(DataUsageEntryInfo {
+                    name: bucket,
+                    parent: DATA_USAGE_ROOT.to_string(),
+                    entry: DataUsageEntry {
+                        size,
+                        ..Default::default()
+                    },
+                    bucket_incarnation: None,
+                    tier_registry_generation: Some(generation),
+                }),
+            )
             .await
+            .expect("collector must continue receiving after cancellation")
             .expect("fixture result channel");
         }
         drop(tx);
-        let (cache, complete) = super::io_cache::collect_completed_bucket_results(ctx, cache, rx).await;
-        assert_eq!(complete, HashSet::from(["complete".to_string()]));
-        assert!(!should_publish_completed_snapshot(complete.len(), 2, false, false));
-        assert_eq!(cache.find("complete").expect("applied root").size, 2);
-        assert_eq!(cache.find("missing").expect("retained old root").size, 3);
+        let (cache, complete) = tokio::time::timeout(Duration::from_secs(5), collector)
+            .await
+            .expect("collector must drain the closed channel after cancellation")
+            .expect("collector should join");
+        let mut expected = (0..BUCKETS - 1)
+            .map(|index| format!("bucket-{index:02}"))
+            .collect::<HashSet<_>>();
+        if fill_missing {
+            expected.insert("missing".to_string());
+        }
+        assert_eq!(complete, expected, "duplicate and wrong-tier roots cannot fill the missing bucket");
+        assert_eq!(complete.len(), if fill_missing { 53 } else { 52 });
+        assert_eq!(should_publish_completed_snapshot(complete.len(), BUCKETS, false, false), fill_missing);
+        assert!(
+            !should_publish_completed_snapshot(complete.len(), BUCKETS, false, true),
+            "drained coverage must not override cancellation"
+        );
+        assert_eq!(cache.find("bucket-00").expect("applied duplicate root").size, 2);
+        assert_eq!(
+            cache.find("missing").expect("retained or completed root").size,
+            if fill_missing { 5 } else { 3 }
+        );
     }
 }
 
@@ -4962,7 +5007,8 @@ static COORDINATOR_BUCKET_SCAN_PROBE: std::sync::Mutex<Option<Arc<CoordinatorBuc
 /// its disk. The hook is absent from non-test builds and a no-op until a test
 /// installs a probe; the probe then holds the walker so overlapping
 /// admissions become observable as a peak.
-pub(super) async fn observe_coordinator_bucket_scan_admitted(_bucket: &str) {
+pub(super) async fn observe_coordinator_bucket_scan_admitted(worker_index: usize, bucket: &str) {
+    collector_lifecycle::observe_bucket_admission(worker_index, bucket).await;
     let probe = COORDINATOR_BUCKET_SCAN_PROBE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4972,6 +5018,10 @@ pub(super) async fn observe_coordinator_bucket_scan_admitted(_bucket: &str) {
     probe.peak.fetch_max(active, Ordering::SeqCst);
     tokio::time::sleep(probe.hold).await;
     probe.active.fetch_sub(1, Ordering::SeqCst);
+}
+
+pub(super) async fn observe_coordinator_bucket_worker_started(worker_index: usize) {
+    collector_lifecycle::observe_worker_start(worker_index).await;
 }
 
 fn install_coordinator_bucket_scan_probe(hold: Duration) -> Arc<CoordinatorBucketScanProbe> {

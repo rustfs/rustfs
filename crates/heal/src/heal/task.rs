@@ -18,7 +18,7 @@ use crate::heal::{
     erasure_healer::target_outcomes_complete,
     outcome::{
         HealAbortReason, HealDeferredReason, HealExecutionOutcome, HealFailureClass, HealObjectDisposition, HealObjectIdentity,
-        HealObjectKind, HealObjectOutcome, HealObjectReceipt, HealTaskOutcome,
+        HealObjectKind, HealObjectOutcome, HealObjectReceipt, HealObjectReceiptExt, HealTaskOutcome,
     },
     progress::HealProgress,
     resume::{
@@ -674,7 +674,7 @@ impl HealTask {
 
     pub(super) async fn record_verified_storage_receipt(
         &self,
-        expected: HealObjectIdentity,
+        expected: &HealObjectIdentity,
         receipt: Option<HealObjectReceipt>,
     ) -> bool {
         if self.options.dry_run || self.cancel_token.is_cancelled() {
@@ -683,7 +683,7 @@ impl HealTask {
         let Some(receipt) = receipt else {
             return false;
         };
-        if !receipt.verified_for(&expected) {
+        if !receipt.verified_for(expected) {
             return false;
         }
         let mut outcome = self.outcome.write().await;
@@ -913,6 +913,39 @@ impl HealTask {
             .bytes()
             .fold(0_u64, |acc, byte| acc.wrapping_mul(31).wrapping_add(u64::from(byte)));
         Duration::from_millis(jitter_seed % 500).saturating_add(base)
+    }
+
+    pub(crate) fn should_log_failure(&self, error: &Error) -> bool {
+        if !matches!(error, Error::Storage(crate::heal::StorageError::DeleteRecoveryLegacyAmbiguous)) {
+            return true;
+        }
+        let (bucket, object, version_id) = match &self.heal_type {
+            HealType::Object {
+                bucket,
+                object,
+                version_id,
+            }
+            | HealType::ECDecode {
+                bucket,
+                object,
+                version_id,
+            } => (bucket.as_str(), object.as_str(), version_id.as_deref()),
+            HealType::Metadata { bucket, object } => (bucket.as_str(), object.as_str(), None),
+            HealType::DeleteMarkerPurge {
+                bucket,
+                object,
+                version_id,
+                ..
+            } => (bucket.as_str(), object.as_str(), Some(version_id.as_str())),
+            _ => return true,
+        };
+        crate::heal::failure_logging::log_legacy_ambiguity(
+            bucket,
+            object,
+            version_id,
+            self.options.pool_index,
+            self.options.set_index,
+        )
     }
 
     fn should_return_typed_heal_error(err: &Error) -> bool {

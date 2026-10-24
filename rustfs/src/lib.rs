@@ -86,6 +86,7 @@ pub mod delete_tail_activity;
 pub mod diagnose;
 pub mod embedded;
 pub mod error;
+pub mod foreground_observation;
 pub mod init;
 pub mod inspect;
 pub(crate) mod kms_deletion_gate;
