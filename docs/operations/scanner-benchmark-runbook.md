@@ -128,6 +128,62 @@ Adapter responsibilities:
    Preserve data and artifacts for diagnosis. An adapter may restore previous
    settings but must not delete arbitrary paths or stop unrelated deployments.
 
+#### Linux service control
+
+`scripts/scanner_service.py` supplies node-local `start`, `status`, `resize`
+and `stop` operations for an adapter on Linux with Python 3.11+, systemd 255+
+and cgroup v2. Run it as the benchmark user with noninteractive sudo access.
+It is a service primitive, not a complete deployment or measurement adapter.
+The caller still owns topology, data isolation, readiness, load, fault actions,
+the independent oracle and metric provenance.
+
+Before starting any node, retain its immutable JSON plan on the controller and
+node. Use a new UUID for each node/service and a private, user-owned directory
+(mode `0700`). Provision a verified executable and a separate environment file
+(mode `0600`) inside it. Keep credentials out of the plan, arguments and archived
+artifacts. The plan has exactly these fields; replace the example digest with
+the actual binary SHA-256:
+
+```json
+{
+  "run_id": "20718acd-9e81-4697-a0b5-8ac3207f6aef",
+  "root": "/srv/rustfs-bench/run",
+  "binary": "/srv/rustfs-bench/run/rustfs",
+  "binary_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "environment_file": "/srv/rustfs-bench/run/private.env",
+  "args": ["/data/isolated-benchmark"],
+  "runtime_seconds": 10800,
+  "cpu_percent": 200,
+  "memory_bytes": 4294967296
+}
+```
+
+```bash
+python3 scripts/scanner_service.py start node-plan.json
+python3 scripts/scanner_service.py status node-plan.json
+python3 scripts/scanner_service.py resize node-plan.json --cpu-percent 100 --memory-bytes 3221225472
+python3 scripts/scanner_service.py stop node-plan.json
+```
+
+The plan determines the transient unit's name and ownership identity. Recovery
+uses that same plan after SSH loss, including when the start response was lost.
+An existing service is never restarted by `start`; reconcile with `status` or
+`stop`. Stop every planned node after partial preparation, including nodes that
+never started. Stop is idempotent and does not delete binaries, data or evidence;
+retain the private root and plan until cleanup completes. File locking serializes
+controllers, and operations reject a unit with a different plan, user or root.
+Inputs must remain immutable while starting; this is not a sandbox against a
+compromised benchmark user or privileged host administrator.
+
+The finite `runtime_seconds` limit is enforced by systemd independently of SSH.
+Choose it to cover preparation, the entire required measurement and the oracle;
+expiration fails the cell and must not shorten its required duration. The unit
+does not restart automatically. Shutdown targets the whole cgroup, allows 30
+seconds for termination, then kills remaining processes, including descendants
+that changed sessions. Resize reports the kernel CPU/memory limits and rejects
+a changed PID or mismatched limits. Applying limits alone does not demonstrate
+RustFS adaptation or pass the resource hot-shrink gate.
+
 The `measure` response echoes the observed `evidence`, `fixed`, `build`,
 `data_dir`, and `background`, plus `sample_count` (1..3600), `elapsed_seconds`,
 and `metrics`. All metrics must be finite nonnegative numbers: `p99_ms`,
