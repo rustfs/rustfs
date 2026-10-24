@@ -900,14 +900,11 @@ async fn checkpoint_fixture_hot_bucket_certifies_after_mixed_end_and_leader_hand
 
 async fn hot_bucket_certifies_first_full_sweep_after_mixed_end(advance_epoch: bool) {
     let logs = CapturedLogs::default();
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_writer(logs.clone())
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    logs.capture(tracing::Level::DEBUG, run_hot_bucket_certification(advance_epoch, &logs))
+        .await;
+}
+
+async fn run_hot_bucket_certification(advance_epoch: bool, logs: &CapturedLogs) {
     let (scanner, root) = build_test_scanner().await;
     let _guard = TestGuard {
         temp_dir: Some(root.clone()),
@@ -1054,6 +1051,49 @@ async fn hot_bucket_certifies_first_full_sweep_after_mixed_end(advance_epoch: bo
     assert_eq!(fields["coverage_gap"], false);
     assert_eq!(fields["failed_objects"], 0);
     assert_eq!(fields["size_reconciliation_entries"], 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn checkpoint_admission_log_capture_survives_another_future_dispatcher() {
+    let logs = CapturedLogs::default();
+    let (mut cache, identity) = bound_checkpoint();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let captured = logs.capture(tracing::Level::DEBUG, async move {
+        entered_tx.send(()).expect("announce captured future");
+        ready_rx.await.expect("competing dispatcher is installed");
+        for cycle in 100..104 {
+            cache.prepare_bucket_checkpoint("bucket", cycle, 9, SOURCE, PLAN, identity);
+            assert_eq!(cache.info.next_cycle, cycle);
+        }
+        done_tx.send(()).expect("announce checkpoint completion");
+    });
+    let competing = async {
+        entered_rx.await.expect("captured future has yielded");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(std::io::sink)
+            .finish();
+        // An unrelated future keeps a quieter thread-local default while
+        // the captured future resumes on this same runtime thread.
+        let _guard = tracing::subscriber::set_default(subscriber);
+        ready_tx.send(()).expect("announce competing dispatcher");
+        done_rx.await.expect("checkpoint preparation has completed");
+    };
+    tokio::join!(captured, competing);
+
+    let events = logs
+        .contents()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("scanner JSON event"))
+        .filter(|event| event["fields"]["state"] == "bucket_checkpoint_prepared")
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 4, "all checkpoint admissions must use the captured dispatcher");
+    for (cycle, event) in (100..104).zip(events) {
+        assert_eq!(event["fields"]["cycle"], cycle);
+    }
 }
 
 async fn write_checkpoint_object(root: &std::path::Path, object: &str, versions: &[(Option<Uuid>, i64)]) {

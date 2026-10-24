@@ -151,6 +151,21 @@ struct CapturedLogWriter {
 }
 
 impl CapturedLogs {
+    fn capture<F: std::future::Future>(&self, level: tracing::Level, future: F) -> tracing::instrument::WithDispatch<F> {
+        use tracing::instrument::WithSubscriber as _;
+
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(level)
+            .with_writer(self.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        // Re-enter the dispatcher on every poll instead of leaving a
+        // thread-local default installed while this future is suspended.
+        future.with_subscriber(subscriber)
+    }
+
     fn contents(&self) -> String {
         let buffer = self
             .buffer
@@ -2488,34 +2503,43 @@ async fn scanner_directory_probe_budget_wait_cancels_without_rate_delay() {
 
 #[tokio::test]
 async fn erasure_directory_probe_respects_entry_limit_and_disk_budget() {
-    let temp_dir = tempfile::tempdir().expect("create probe directory");
-    for index in 0..=ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT {
-        tokio::fs::write(temp_dir.path().join(format!("namespace-{index}")), b"")
-            .await
-            .expect("create non-part entry");
+    for entry_count in [
+        0,
+        1,
+        ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT - 1,
+        ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT,
+        ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT + 1,
+        2 * ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT + 1,
+    ] {
+        let temp_dir = tempfile::tempdir().expect("create probe directory");
+        for index in 0..entry_count {
+            tokio::fs::write(temp_dir.path().join(format!("namespace-{index}")), b"")
+                .await
+                .expect("create non-part entry");
+        }
+        let sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest).for_disk_with_budget_for_tests(
+            temp_dir.path(),
+            crate::sleeper::ScannerDiskIoBudgetLimits {
+                iops: Some(1_000_000),
+                bytes_per_sec: None,
+            },
+        );
+        assert!(
+            !contains_erasure_part_file(temp_dir.path().to_string_lossy().as_ref(), &CancellationToken::new(), &sleeper)
+                .await
+                .expect("probe directory without erasure parts")
+        );
+        let status = crate::sleeper::scanner_disk_io_budget_status()
+            .into_iter()
+            .find(|status| status.disk == temp_dir.path().to_string_lossy())
+            .expect("bound disk budget");
+        assert_eq!(
+            status.charged_ops,
+            1 + u64::try_from(entry_count.min(ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT)).expect("entry count fits u64"),
+            "directory open and at most 64 entries must be charged; EOF must not be charged (entries={entry_count})"
+        );
+        assert_eq!(status.charged_bytes, 0);
     }
-    let sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest).for_disk_with_budget_for_tests(
-        temp_dir.path(),
-        crate::sleeper::ScannerDiskIoBudgetLimits {
-            iops: Some(1_000_000),
-            bytes_per_sec: None,
-        },
-    );
-    assert!(
-        !contains_erasure_part_file(temp_dir.path().to_string_lossy().as_ref(), &CancellationToken::new(), &sleeper)
-            .await
-            .expect("probe directory without erasure parts")
-    );
-    let status = crate::sleeper::scanner_disk_io_budget_status()
-        .into_iter()
-        .find(|status| status.disk == temp_dir.path().to_string_lossy())
-        .expect("bound disk budget");
-    assert_eq!(
-        status.charged_ops,
-        1 + u64::try_from(ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT).expect("entry limit fits u64"),
-        "one directory open plus at most the bounded probe entries"
-    );
-    assert_eq!(status.charged_bytes, 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2745,15 +2769,11 @@ async fn test_scan_folder_xl_meta_named_directory_uses_namespace_descent() {
 #[serial]
 async fn test_scan_folder_corrupt_xl_meta_stops_erasure_data_dir_descent() {
     let logs = CapturedLogs::default();
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_max_level(tracing::Level::ERROR)
-        .with_writer(logs.clone())
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    logs.capture(tracing::Level::ERROR, scan_corrupt_metadata_with_captured_logs(&logs))
+        .await;
+}
 
+async fn scan_corrupt_metadata_with_captured_logs(logs: &CapturedLogs) {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     // Canonicalize for the "drive" field comparison (scanner resolves symlinks).
     let canonical_temp_dir = std::fs::canonicalize(&temp_dir).unwrap_or_else(|_| temp_dir.clone());
@@ -4215,14 +4235,11 @@ async fn test_scan_data_folder_success_clears_resume_hint() {
 #[serial]
 async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
     let logs = CapturedLogs::default();
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_writer(logs.clone())
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    logs.capture(tracing::Level::DEBUG, scan_unresolved_objects_with_captured_logs(&logs))
+        .await;
+}
+
+async fn scan_unresolved_objects_with_captured_logs(logs: &CapturedLogs) {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
         temp_dir: Some(temp_dir.clone()),
