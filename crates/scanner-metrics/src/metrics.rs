@@ -2940,10 +2940,6 @@ impl Metrics {
             .store(cycle_max_objects.unwrap_or_default(), Ordering::Relaxed);
         self.scanner_cycle_max_directories
             .store(cycle_max_directories.unwrap_or_default(), Ordering::Relaxed);
-        self.scanner_leader_lease_without_progress.store(false, Ordering::Relaxed);
-        self.scanner_cycle_last_progress_age_seconds.store(0, Ordering::Relaxed);
-        metrics::gauge!(OTEL_SCANNER_LEADER_LEASE_WITHOUT_PROGRESS).set(0.0);
-        metrics::gauge!(OTEL_SCANNER_CYCLE_LAST_PROGRESS_AGE).set(0.0);
         self.scanner_bitrot_cycle_enabled
             .store(bitrot_cycle.is_some(), Ordering::Relaxed);
         self.scanner_bitrot_cycle_millis
@@ -3231,6 +3227,10 @@ impl Metrics {
     }
 
     fn begin_scan_cycle_work(&self, remote_progress: Arc<RemoteScanProgress>) -> ScanCycleWorkSnapshot {
+        self.scanner_leader_lease_without_progress.store(false, Ordering::Relaxed);
+        self.scanner_cycle_last_progress_age_seconds.store(0, Ordering::Relaxed);
+        metrics::gauge!(OTEL_SCANNER_LEADER_LEASE_WITHOUT_PROGRESS).set(0.0);
+        metrics::gauge!(OTEL_SCANNER_CYCLE_LAST_PROGRESS_AGE).set(0.0);
         // The cycle transition serializes replacement; workers keep their own Arc.
         *self
             .remote_scan_progress
@@ -5883,6 +5883,11 @@ mod tests {
         assert!(timed_out.leader_lease_without_progress);
 
         metrics.record_scanner_cycle_config(Duration::from_secs(60), None, Some(Duration::from_secs(1)), None, None);
+        let configured = metrics.report().await;
+        assert_eq!(configured.cycle_last_progress_age, 17);
+        assert!(configured.leader_lease_without_progress);
+
+        metrics.start_scan_cycle_work_with_cycle(CurrentCycle::default()).await;
         let current = metrics.report().await;
         assert_eq!(current.cycle_timeout_total, 1);
         assert_eq!(current.cycle_last_progress_age, 0);
