@@ -184,6 +184,38 @@ that changed sessions. Resize reports the kernel CPU/memory limits and rejects
 a changed PID or mismatched limits. Applying limits alone does not demonstrate
 RustFS adaptation or pass the resource hot-shrink gate.
 
+#### Running-process evidence
+
+After readiness and before each measurement, run `scripts/scanner_process_receipt.py`
+as the same benchmark user. Supply the immutable service plan, a JSON object with
+the expected non-secret environment, and one `--data-root` per dedicated local
+data directory. The environment must exactly match the script's supported
+configuration keys present in the process; an unknown `RUSTFS_` key fails closed.
+Credential variables are excluded. Keep both input files private and archive
+only the resulting receipt, never the environment file or raw `/proc` contents.
+
+```bash
+python3 scripts/scanner_process_receipt.py node-plan.json public-environment.json --data-root /data/isolated-benchmark
+```
+
+The receipt binds the boot ID, PID/start ticks, actual `/proc/PID/exe` SHA-256 and
+inode, expected arguments/configuration hashes, service identity, observed kernel
+CPU/memory limits, and directory device/inode/capacity. It rejects changes seen
+between its two process observations or replacement of the executable or data
+directories. Configuration values and raw process arguments are not emitted.
+The observations span a reported interval, not an atomic snapshot; they do not
+protect against a compromised benchmark user or administrator. Resource limits
+are observations, including legitimate hot-shrink changes, and must be checked
+against the workload plan by the adapter.
+
+Environment bytes do not establish which configuration the server accepted.
+Listed directories are caller-selected, not proof of the server's open volumes,
+device isolation or SSD/HDD class. Those claims, the binary's source/build
+provenance and the independent data oracle still need separate evidence. The
+receipt explicitly leaves effective configuration, directory-to-server binding
+and storage acceptance unverified. A failed observation produces no receipt;
+retain the failure and reconcile the service before continuing.
+
 The `measure` response echoes the observed `evidence`, `fixed`, `build`,
 `data_dir`, and `background`, plus `sample_count` (1..3600), `elapsed_seconds`,
 and `metrics`. All metrics must be finite nonnegative numbers: `p99_ms`,
