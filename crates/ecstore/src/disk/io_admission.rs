@@ -24,6 +24,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use metrics::{counter, gauge, histogram};
+use rustfs_concurrency::adaptive::AdaptivePermit;
 use rustfs_rio::ChunkReader;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::Notify;
@@ -35,6 +36,7 @@ const BACKGROUND_MAX_WAIT: Duration = Duration::from_millis(100);
 
 tokio::task_local! {
     static DISK_IO_CONTEXT: DiskIoContext;
+    static RESOURCE_IO_UNIT: AdaptivePermit;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,6 +51,7 @@ pub(crate) struct DiskIoContext {
     pub(crate) cancellation: CancellationToken,
     pub(crate) admission: Option<Arc<DiskIoAdmission>>,
     pub(crate) permit: Option<DiskIoPermit>,
+    pub(crate) resource_unit: Option<AdaptivePermit>,
 }
 
 /// Mark disk I/O issued by `future` as background work for local-disk admission.
@@ -60,10 +63,41 @@ pub async fn with_background_disk_io<F: Future>(cancellation: CancellationToken,
             cancellation,
             admission: None,
             permit: None,
+            resource_unit: current_resource_unit(),
         },
         future,
     )
     .await
+}
+
+/// Retain an already admitted resource unit without changing disk classification,
+/// cancellation or admission. Acquire it before namespace, cache or commit locks.
+/// Existing background scopes and disk leases propagate it into native I/O.
+/// Use this for physical I/O ownership, not node-wide scheduling capacity that
+/// must return with a cancelled waiter so healthy disks can progress independently
+/// of a stalled native operation. Escaping buffers need their own memory leases.
+#[doc(hidden)]
+pub async fn with_background_resource_unit<F: Future>(unit: AdaptivePermit, future: F) -> F::Output {
+    RESOURCE_IO_UNIT.scope(unit, future).await
+}
+
+pub(crate) fn current_resource_unit() -> Option<AdaptivePermit> {
+    RESOURCE_IO_UNIT.try_with(Clone::clone).ok().or_else(|| {
+        DISK_IO_CONTEXT
+            .try_with(|context| context.resource_unit.clone())
+            .ok()
+            .flatten()
+    })
+}
+
+/// Transfer only resource ownership into an existing spawned task. Disk
+/// classification/permits are not inherited: changing those can introduce a
+/// wait behind a disk permit still held by the parent.
+pub(crate) async fn with_optional_resource_unit<F: Future>(unit: Option<AdaptivePermit>, future: F) -> F::Output {
+    match unit {
+        Some(unit) => with_background_resource_unit(unit, future).await,
+        None => future.await,
+    }
 }
 
 pub(crate) async fn with_disk_io_context<F: Future>(context: DiskIoContext, future: F) -> F::Output {
@@ -79,7 +113,11 @@ pub(crate) async fn with_disk_io_permit<F: Future>(permit: Option<DiskIoPermit>,
         cancellation: CancellationToken::new(),
         admission: None,
         permit: None,
+        resource_unit: None,
     });
+    if context.resource_unit.is_none() {
+        context.resource_unit = permit.lease.resource_unit.clone();
+    }
     context.admission = Some(permit.admission());
     with_disk_io_context(
         DiskIoContext {
@@ -91,15 +129,32 @@ pub(crate) async fn with_disk_io_permit<F: Future>(permit: Option<DiskIoPermit>,
     .await
 }
 
-pub(crate) async fn with_optional_disk_io_context<F: Future>(context: Option<DiskIoContext>, future: F) -> F::Output {
-    match context {
-        Some(context) => with_disk_io_context(context, future).await,
-        None => future.await,
+pub(crate) fn with_optional_disk_io_context<F: Future>(
+    context: Option<DiskIoContext>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    // Capture at future construction, before JoinSet/spawn moves polling to a
+    // different task. A resource-only scope has no DiskIoContext to carry it.
+    let unit = current_resource_unit();
+    async move {
+        let future = with_optional_resource_unit(unit, future);
+        match context {
+            Some(context) => with_disk_io_context(context, future).await,
+            None => future.await,
+        }
     }
 }
 
 pub(crate) fn current_disk_io_context() -> Option<DiskIoContext> {
-    DISK_IO_CONTEXT.try_with(Clone::clone).ok()
+    DISK_IO_CONTEXT
+        .try_with(|context| {
+            let mut context = context.clone();
+            if let Ok(unit) = RESOURCE_IO_UNIT.try_with(Clone::clone) {
+                context.resource_unit = Some(unit);
+            }
+            context
+        })
+        .ok()
 }
 
 /// Acquire one low-level permit only when the current walker explicitly owns a gate.
@@ -175,6 +230,10 @@ impl DiskIoAdmission {
     }
 
     pub(crate) fn foreground(self: &Arc<Self>) -> DiskIoPermit {
+        self.foreground_with_resource(current_resource_unit())
+    }
+
+    fn foreground_with_resource(self: &Arc<Self>, resource_unit: Option<AdaptivePermit>) -> DiskIoPermit {
         self.foreground_active.fetch_add(1, Ordering::AcqRel);
         if self.background_waiters.load(Ordering::Acquire) > 0 {
             self.record_state();
@@ -183,11 +242,20 @@ impl DiskIoAdmission {
             lease: Arc::new(DiskIoPermitLease {
                 admission: self.clone(),
                 class: DiskIoClass::Foreground,
+                resource_unit,
             }),
         }
     }
 
     pub(crate) async fn background(self: &Arc<Self>, cancellation: &CancellationToken) -> std::io::Result<DiskIoPermit> {
+        self.background_with_resource(cancellation, current_resource_unit()).await
+    }
+
+    async fn background_with_resource(
+        self: &Arc<Self>,
+        cancellation: &CancellationToken,
+        resource_unit: Option<AdaptivePermit>,
+    ) -> std::io::Result<DiskIoPermit> {
         let started_at = Instant::now();
         let ticket = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -248,6 +316,7 @@ impl DiskIoAdmission {
                     lease: Arc::new(DiskIoPermitLease {
                         admission: self.clone(),
                         class: DiskIoClass::Background,
+                        resource_unit,
                     }),
                 });
             }
@@ -360,6 +429,7 @@ impl DiskIoPermit {
 struct DiskIoPermitLease {
     admission: Arc<DiskIoAdmission>,
     class: DiskIoClass,
+    resource_unit: Option<AdaptivePermit>,
 }
 
 pub(crate) fn spawn_blocking_with_disk_io_permit<T, F>(
@@ -370,8 +440,12 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    // A supplied disk permit can predate this resource scope or carry another
+    // owner's unit. Preserve the current unit independently until native I/O ends.
+    let resource_unit = current_resource_unit();
     tokio::task::spawn_blocking(move || {
         let _io_permit = io_permit;
+        let _resource_unit = resource_unit;
         operation()
     })
 }
@@ -436,7 +510,7 @@ impl<R> AdmissionReader<R> {
         }
 
         if self.context.class == DiskIoClass::Foreground {
-            self.permit = Some(self.admission.foreground());
+            self.permit = Some(self.admission.foreground_with_resource(self.context.resource_unit.clone()));
             return Poll::Ready(Ok(()));
         }
 
@@ -444,7 +518,10 @@ impl<R> AdmissionReader<R> {
         if wait.is_none() {
             let admission = self.admission.clone();
             let cancellation = self.context.cancellation.clone();
-            *wait = Some(Box::pin(async move { admission.background(&cancellation).await }));
+            let resource_unit = self.context.resource_unit.clone();
+            *wait = Some(Box::pin(
+                async move { admission.background_with_resource(&cancellation, resource_unit).await },
+            ));
         }
         let Some(wait_future) = wait.as_mut() else {
             return Poll::Ready(Err(io::Error::other("background disk I/O admission waiter is missing")));
@@ -514,7 +591,165 @@ impl ChunkReader for BoxedChunkReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_concurrency::adaptive::AdaptiveAdmission;
+    use std::num::NonZeroU16;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn resource_unit_outlives_cancelled_scope_until_native_io_finishes() {
+        for permit_mode in 0..4 {
+            let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
+            let previous_gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("previous owner"), 1);
+            let unit = gate.acquire().await;
+            let disk = DiskIoAdmission::new("resource-unit-native");
+            let existing_permit = match permit_mode {
+                2 => Some(disk.foreground()),
+                3 => Some(with_background_resource_unit(previous_gate.acquire().await, async { disk.foreground() }).await),
+                _ => None,
+            };
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(with_background_resource_unit(unit, async move {
+                with_background_disk_io(CancellationToken::new(), async {
+                    let permit = if existing_permit.is_some() {
+                        existing_permit
+                    } else if permit_mode == 1 {
+                        Some(disk.background(&CancellationToken::new()).await.expect("disk permit"))
+                    } else {
+                        None
+                    };
+                    spawn_blocking_with_disk_io_permit(permit, move || {
+                        started_tx.send(()).expect("native I/O started");
+                        release_rx.blocking_recv().expect("native I/O release");
+                    })
+                    .await
+                    .expect("native I/O completed");
+                })
+                .await;
+            }));
+            started_rx.await.expect("native worker owns unit");
+            task.abort();
+            assert!(task.await.expect_err("scope was cancelled").is_cancelled());
+            let held = gate.snapshot().active;
+            let previous_held = previous_gate.snapshot().active;
+            let rejected = gate.try_acquire().is_none();
+            gate.set_limit(0);
+            release_tx.send(()).expect("release native I/O");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while gate.snapshot().active != 0 || previous_gate.snapshot().active != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("native completion releases the unit");
+            gate.set_limit(1);
+            assert!(gate.try_acquire().is_some());
+            assert_eq!(held, 1, "mode {permit_mode}: native I/O still owns the current unit");
+            assert!(rejected, "mode {permit_mode}: a live native worker must retain admission");
+            assert_eq!(previous_held, u32::from(permit_mode == 3), "preserve any older disk lease's unit");
+        }
+    }
+
+    #[tokio::test]
+    async fn escaped_disk_permit_restores_resource_context_without_a_new_unit() {
+        let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
+        let disk = DiskIoAdmission::new("resource-unit-escape");
+        let permit = with_background_resource_unit(gate.acquire().await, async {
+            disk.background(&CancellationToken::new()).await.expect("disk permit")
+        })
+        .await;
+        assert_eq!(gate.snapshot().active, 1);
+        with_background_disk_io(CancellationToken::new(), async {
+            with_disk_io_permit(Some(permit), async {
+                let unit = current_resource_unit().expect("escaped disk lease restores unit into an existing context");
+                assert_eq!(gate.snapshot().active, 1, "cloning retains one unit rather than charging twice");
+                drop(unit);
+            })
+            .await;
+        })
+        .await;
+        assert_eq!(gate.snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn escaped_stream_retains_resource_unit_outside_task_local_scope() {
+        let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
+        let disk = DiskIoAdmission::new("resource-unit-stream");
+        let (mut writer, inner) = tokio::io::duplex(8);
+        let mut reader = with_background_resource_unit(gate.acquire().await, async {
+            with_background_disk_io(CancellationToken::new(), async {
+                AdmissionReader::new(inner, disk, current_disk_io_context().expect("resource context"))
+            })
+            .await
+        })
+        .await;
+        assert_eq!(gate.snapshot().active, 1);
+        writer.write_all(b"rust").await.expect("write complete stream");
+        drop(writer);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.expect("read outside original scope");
+        assert_eq!(bytes, b"rust");
+        assert_eq!(gate.snapshot().active, 1, "reader still owns its context");
+        drop(reader);
+        assert_eq!(gate.snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn resource_scope_preserves_existing_disk_policy_and_cancellation() {
+        let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
+        with_background_resource_unit(gate.acquire().await, async {
+            assert!(current_disk_io_context().is_none(), "resource ownership does not classify disk I/O");
+            assert!(current_resource_unit().is_some());
+        })
+        .await;
+        let cancellation = CancellationToken::new();
+        let existing = DiskIoContext {
+            class: DiskIoClass::Foreground,
+            cancellation: cancellation.clone(),
+            admission: None,
+            permit: None,
+            resource_unit: None,
+        };
+        with_disk_io_context(existing, async {
+            with_background_resource_unit(gate.acquire().await, async {
+                cancellation.cancel();
+                let context = current_disk_io_context().expect("existing disk context");
+                assert_eq!(context.class, DiskIoClass::Foreground);
+                assert!(
+                    context.resource_unit.is_some(),
+                    "captured disk context must retain the current resource unit"
+                );
+                assert!(context.cancellation.is_cancelled(), "retain the original cancellation token");
+                assert!(current_resource_unit().is_some());
+            })
+            .await;
+        })
+        .await;
+        assert_eq!(gate.snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn resource_only_scope_survives_existing_optional_context_spawn_boundary() {
+        let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut worker = None;
+        with_background_resource_unit(gate.acquire().await, async {
+            worker = Some(tokio::spawn(with_optional_disk_io_context(current_disk_io_context(), async {
+                release_rx.await.expect("release child after caller scope ends");
+                assert!(current_disk_io_context().is_none());
+                assert!(current_resource_unit().is_some());
+            })));
+        })
+        .await;
+        let held = gate.snapshot().active;
+        release_tx.send(()).expect("child remains alive");
+        worker
+            .expect("scoped child was spawned")
+            .await
+            .expect("child preserves resource-only scope");
+        assert_eq!(held, 1);
+        assert_eq!(gate.snapshot().active, 0);
+    }
 
     struct BlockingWorker(tokio::task::JoinHandle<()>);
 
@@ -636,6 +871,7 @@ mod tests {
                 cancellation: CancellationToken::new(),
                 admission: None,
                 permit: None,
+                resource_unit: None,
             },
         );
         let read = tokio::spawn(async move {

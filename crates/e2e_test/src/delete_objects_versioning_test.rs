@@ -24,6 +24,163 @@
 //! `xl.meta` immediately visible, and the old file-cache shortcut has been
 //! removed from the read path.
 
+use aws_sdk_s3::Client;
+use aws_sdk_s3::config::retry::RetryConfig;
+use aws_sdk_s3::types::{BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration};
+use std::collections::BTreeMap;
+
+async fn delete_exact_marker_versions(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    versions: &[(String, bool)],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let objects = versions
+        .iter()
+        .map(|(version, _)| ObjectIdentifier::builder().key(key).version_id(version).build())
+        .collect::<Result<Vec<_>, _>>()?;
+    let response = client
+        .delete_objects()
+        .bucket(bucket)
+        .delete(Delete::builder().set_objects(Some(objects)).build()?)
+        .send()
+        .await?;
+    assert!(response.errors().is_empty(), "explicit batch returned errors: {response:?}");
+    let mut actual = BTreeMap::new();
+    for deleted in response.deleted() {
+        assert_eq!(deleted.key(), Some(key));
+        *actual
+            .entry((
+                deleted.version_id().ok_or("Deleted entry omitted version ID")?.to_string(),
+                deleted.delete_marker().unwrap_or(false),
+                deleted.delete_marker_version_id().map(str::to_string),
+            ))
+            .or_insert(0_usize) += 1;
+    }
+    let mut expected = BTreeMap::new();
+    for (version, marker) in versions {
+        *expected
+            .entry((version.clone(), *marker, marker.then(|| version.clone())))
+            .or_insert(0_usize) += 1;
+    }
+    assert_eq!(actual, expected, "every requested occurrence must report its own version identity");
+    Ok(())
+}
+
+pub(crate) async fn assert_explicit_marker_batch_cleanup(
+    clients: &[Client],
+    bucket: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    assert!(!clients.is_empty());
+    let clients: Vec<_> = clients
+        .iter()
+        .map(|client| {
+            Client::from_conf(
+                client
+                    .config()
+                    .to_builder()
+                    .retry_config(RetryConfig::standard().with_max_attempts(1))
+                    .build(),
+            )
+        })
+        .collect();
+    let writer = &clients[0];
+    let marker_writer = &clients[1 % clients.len()];
+    let deleter = &clients[2 % clients.len()];
+    let key = "same-key-history";
+    writer.create_bucket().bucket(bucket).send().await?;
+    writer
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await?;
+    let mut data = Vec::new();
+    for byte in [41_u8, 73_u8] {
+        let body = vec![byte; 1024 * 1024];
+        let uploaded = writer
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(body.clone().into())
+            .send()
+            .await?;
+        data.push((uploaded.version_id().ok_or("versioned PUT omitted ID")?.to_string(), body));
+    }
+    let mut markers = Vec::with_capacity(16);
+    for _ in 0..16 {
+        let deleted = marker_writer.delete_object().bucket(bucket).key(key).send().await?;
+        assert_eq!(deleted.delete_marker(), Some(true));
+        markers.push(deleted.version_id().ok_or("marker creation omitted ID")?.to_string());
+    }
+    let mut requested: Vec<_> = markers.iter().map(|id| (id.clone(), true)).collect();
+    requested.push((markers[0].clone(), true));
+    requested.push((markers[15].clone(), true));
+    delete_exact_marker_versions(deleter, bucket, key, &requested).await?;
+    for client in &clients {
+        let versions = client.list_object_versions().bucket(bucket).send().await?;
+        assert!(versions.delete_markers().is_empty(), "marker survived successful batch: {versions:?}");
+        let mut actual: Vec<_> = versions
+            .versions()
+            .iter()
+            .filter_map(|version| version.version_id())
+            .collect();
+        actual.sort_unstable();
+        let mut expected: Vec<_> = data.iter().map(|(id, _)| id.as_str()).collect();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+        let current = client.get_object().bucket(bucket).key(key).send().await?;
+        assert_eq!(current.body.collect().await?.into_bytes().as_ref(), data[1].1.as_slice());
+        let historical = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(&data[0].0)
+            .send()
+            .await?;
+        assert_eq!(historical.body.collect().await?.into_bytes().as_ref(), data[0].1.as_slice());
+    }
+    let uuid_marker = marker_writer.delete_object().bucket(bucket).key(key).send().await?;
+    let uuid_marker = uuid_marker.version_id().ok_or("marker creation omitted UUID")?.to_string();
+    writer
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Suspended)
+                .build(),
+        )
+        .send()
+        .await?;
+    let null_marker = marker_writer.delete_object().bucket(bucket).key(key).send().await?;
+    assert_eq!(null_marker.delete_marker(), Some(true));
+    assert_eq!(null_marker.version_id(), Some("null"));
+    let requested = [
+        (uuid_marker.clone(), true),
+        (data[1].0.clone(), false),
+        ("null".to_string(), true),
+        (data[0].0.clone(), false),
+        (uuid_marker, true),
+    ];
+    delete_exact_marker_versions(deleter, bucket, key, &requested).await?;
+    for client in &clients {
+        let versions = client.list_object_versions().bucket(bucket).send().await?;
+        assert!(versions.versions().is_empty() && versions.delete_markers().is_empty(), "{versions:?}");
+    }
+    clients
+        .last()
+        .expect("nonempty clients")
+        .delete_bucket()
+        .bucket(bucket)
+        .send()
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
@@ -33,6 +190,16 @@ mod tests {
 
     fn create_s3_client(env: &RustFSTestEnvironment) -> Client {
         env.create_s3_client()
+    }
+
+    #[tokio::test]
+    async fn test_explicit_delete_marker_batch_removes_versions_without_client_retries()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server_with_env(vec![], &[("RUSTFS_CONSOLE_ENABLE", "false")])
+            .await?;
+        super::assert_explicit_marker_batch_cleanup(&[env.create_s3_client()], "explicit-marker-batch").await
     }
 
     /// Regression test for Issue #1878.

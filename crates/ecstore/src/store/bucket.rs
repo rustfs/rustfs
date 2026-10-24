@@ -827,9 +827,9 @@ impl ECStore {
     ///
     /// Semantics are identical to the pre-existing per-PUT
     /// `acquire_bucket_lifecycle_read_lock` + from-disk
-    /// `validate_bucket_incarnation` pair: the first PUT in a coverage window
-    /// performs exactly that authoritative disk validation; overlapping PUTs
-    /// reuse its result, which is sound because bucket deletion/recreation
+    /// `validate_bucket_incarnation` pair: cold requests validate from disk
+    /// concurrently; later overlapping requests reuse a successful result.
+    /// This is sound because bucket deletion/recreation
     /// requires the lifecycle WRITE lock and therefore cannot have run while
     /// any read guard was continuously held.
     pub async fn acquire_bucket_incarnation_fence(
@@ -837,34 +837,36 @@ impl ECStore {
         bucket: &str,
         expected: uuid::Uuid,
     ) -> Result<super::BucketIncarnationFenceGuard> {
+        self.acquire_bucket_incarnation_fence_with_options(bucket, expected, None)
+            .await
+    }
+
+    pub(super) async fn acquire_bucket_incarnation_fence_with_options(
+        &self,
+        bucket: &str,
+        expected: Uuid,
+        opts: Option<&ObjectOptions>,
+    ) -> Result<super::BucketIncarnationFenceGuard> {
         let inner = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
-        let pieces = super::bucket_fence::FencePieces {
-            registry: self.bucket_fence_registry.clone(),
+        let mut guard = super::BucketIncarnationFenceGuard::new(
+            Arc::clone(&self.bucket_fence_registry),
+            bucket,
             inner,
-        };
-        let registration = pieces.enter(bucket);
-        let current = match registration.memoized {
-            Some(current) => current,
-            None => match metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await {
-                Ok(current) => {
-                    // Never memoize under lost coverage: a granted lifecycle
-                    // write lock could already have changed the incarnation.
-                    if !pieces.lock_lost() {
-                        pieces.memoize(bucket, current);
-                    }
-                    current
+            !self.ctx.lock_manager().is_disabled(),
+        );
+        let reuse_memo = opts.is_none_or(|opts| opts.object_lock_config_snapshot.is_none());
+        let current = guard
+            .validate(reuse_memo, || async {
+                match opts {
+                    Some(opts) => metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, opts).await,
+                    None => metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await,
                 }
-                Err(err) => {
-                    pieces.abandon(bucket, registration.token);
-                    return Err(err);
-                }
-            },
-        };
+            })
+            .await?;
         if current != expected {
-            pieces.abandon(bucket, registration.token);
-            return Err(StorageError::BucketNotFound(bucket.to_string()));
+            return Err(StorageError::BucketNotFound(bucket.to_owned()));
         }
-        Ok(pieces.into_guard(bucket, registration.token))
+        Ok(guard)
     }
 
     /// Hold this guard through recursive-delete authorization and mutation so

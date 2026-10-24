@@ -93,12 +93,54 @@ remaining accepted responsibilities are still replayed. A conflicting task ID
 is refused for new admission, and its status query reports `failed` with the
 same reason until an operator repairs the record.
 
+The authenticated `GET /rustfs/admin/v4/heal/replacement-recovery` response
+includes `localDiagnostics` with `scope: "local_disks"`, `rootBlocked`, and
+`checkpointBlocked`. Root entries identify conflicting or quarantined task IDs
+and their reasons. Checkpoint entries include the task ID, available disk UUID,
+reason, and any recorded block/revalidation times. Legacy or unreadable marker
+contents have an explicit unknown reason; invalid task filenames are reported
+without opening their paths. An inventory failure sets `definitive: false` and
+an explicit reason. These lists describe only the receiving node and do not
+change the cluster's replacement proof. Querying them never admits root work,
+writes quarantine markers, or revalidates, resets or removes checkpoints.
+
+Each checkpoint entry's `validation` summarizes a bounded read of the original
+snapshot and, when applicable, its legacy digest sidecar. It reports the schema,
+validation stage, signature presence and validity, task identity match, and
+whether the existing reader would rewind legacy progress. Unchecked values are
+`null`, including when evidence is unreadable, exceeds the read limit, or the
+inspection budget is exhausted. Malformed data, digest mismatch, future schema,
+and identity conflict have distinct stages. The response never includes the
+checkpoint payload, object keys, bucket inventory, or signature bytes.
+
+`readerAccepted: true` only means the snapshot passes the reader's checks.
+An isolated snapshot remains `candidate_execution_unauthorized`, with
+`ownerFence: "unknown"` and `executionAuthorized: false`. This endpoint cannot
+verify the current executor's owner, topology, or commit fence. Recovery still
+requires a separate matching task/scope/owner/topology CAS and proof that the old
+executor has stopped. Do not remove markers or restart an old executor based on
+this diagnostic. The read leaves checkpoint, sidecar, and marker bytes unchanged;
+it neither upgrades the persisted schema nor establishes old-binary execution
+compatibility. Real old-binary and rolling-upgrade validation remain separate
+acceptance requirements.
+
 ## Ambiguous legacy delete residue
 
 Delete recovery that finds a legacy residue it cannot classify no longer
 reports request-rate pressure. The heal returns a dedicated storage error that
-is not retried automatically; the object remains readable and the residue is
+is not a recoverable scheduler error; the object remains readable and the residue is
 retained for operator inspection.
+
+Repeated occurrences of that typed error share a node-local log gate across
+storage, task and scheduler layers, keyed by bucket, object, version and
+pool/set scope. The first occurrence is logged as an error; repeats during the
+next 15 minutes are debug events, including when a producer creates a new task
+ID. Every attempt still fails and keeps its outcome counters and durable
+responsibility. Existing disposition backoff and retry pacing are unchanged.
+The gate keeps at most 4096 identities and resets on process restart. At
+capacity it preserves existing suppression windows and demotes further new
+identities, with one aggregate capacity warning per 15 minutes; those failures
+remain visible in task status and counters.
 
 ## Schema 5/6 maintenance migration
 

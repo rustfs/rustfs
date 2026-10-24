@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::heal::outcome::HealObjectReceiptExt;
 use crate::heal::outcome::{
     HealDeferredReason, HealFailureClass, HealObjectDisposition, HealObjectIdentity, HealObjectKind,
     HealObjectOutcome as CanonicalObjectOutcome, HealTaskOutcome,

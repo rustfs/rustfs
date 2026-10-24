@@ -388,7 +388,9 @@ fn should_purge_empty_directory_listing(
     incl_deleted: bool,
     result: &ListObjectsInfo,
 ) -> bool {
+    // list_path rejects leading slashes, so an empty result cannot justify cleanup.
     !prefix.is_empty()
+        && !prefix.starts_with(SLASH_SEPARATOR)
         && prefix.ends_with(SLASH_SEPARATOR)
         && marker.is_none()
         && max_keys > 0
@@ -450,8 +452,9 @@ const MAX_LIST_OBJECTS_METADATA_FAST_STALENESS_MS: u64 = 60_000;
 const LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY: &str = "walker_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY: &str = "persistent_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION: &str = "persistent-key-only";
-const PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION: u8 = 3;
-const PERSISTENT_KEY_ONLY_INDEX_HEADER: &str = "# rustfs-listobjects-key-only-v3";
+// Rebuild older snapshots that may have discarded plaintext multipart ETags.
+const PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION: u8 = 4;
+const PERSISTENT_KEY_ONLY_INDEX_HEADER: &str = "# rustfs-listobjects-key-only-v4";
 const PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER: &str = "# bucket=";
 const PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER: &str = "# generation=";
 const PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER: &str = "# checkpoint_high_water_mark=";
@@ -660,8 +663,9 @@ impl PersistentListMetadataObject {
             mod_time: object.mod_time,
             etag: object
                 .etag
-                .clone()
-                .filter(|_| rustfs_utils::http::etag_can_be_listed(&object.user_defined)),
+                .as_ref()
+                .filter(|_| rustfs_utils::http::etag_can_be_listed(&object.user_defined))
+                .cloned(),
             storage_class: object.storage_class.clone(),
         }
     }
@@ -9399,6 +9403,27 @@ mod test {
     }
 
     #[test]
+    fn persistent_listing_preserves_legacy_plaintext_multipart_etag() {
+        let object = ObjectInfo {
+            name: "legacy-plain-multipart".to_owned(),
+            size: 10_485_760,
+            etag: Some("1b8a77dff5845270a8d81d86a28f38ea-2".to_owned()),
+            user_defined: Arc::new(HashMap::from([
+                ("x-rustfs-encryption-original-size".to_owned(), "10485760".to_owned()),
+                ("x-rustfs-internal-actual-size".to_owned(), "10485760".to_owned()),
+                ("x-minio-internal-actual-size".to_owned(), "10485760".to_owned()),
+            ])),
+            ..Default::default()
+        };
+        let snapshot = PersistentListMetadataObject::from_object_info(&object);
+        let restored = parse_persistent_list_metadata_object(&encode_persistent_list_metadata_object(&snapshot))
+            .expect("parse legacy plaintext snapshot")
+            .to_object_info("bucket");
+        assert_eq!(restored.etag, object.etag);
+        assert_eq!(restored.size, object.size);
+    }
+
+    #[test]
     fn persistent_key_only_index_parses_legacy_keys_and_metadata_snapshots() {
         let object = PersistentListMetadataObject {
             name: "object-b".to_string(),
@@ -9905,6 +9930,22 @@ mod test {
     }
 
     #[test]
+    fn persistent_listing_rebuilds_v3_snapshot_with_discarded_plaintext_etag() {
+        let legacy = parse_persistent_key_only_index(
+            "# rustfs-listobjects-key-only-v3\n\
+             # bucket=bucket\n\
+             # generation=generation-old\n\
+             # checkpoint_high_water_mark=42\n\
+             # object\tbGVnYWN5\t10485760\t-\t-\tU1RBTkRBUkQ=\n",
+        );
+        assert_eq!(legacy.objects.len(), 1);
+        assert!(legacy.objects[0].etag.is_none());
+        let provider =
+            ListObjectsIndexProviderState::persistent_key_only(Some(PathBuf::from("/tmp/persistent-key-only.index")), None);
+        assert!(!persistent_key_only_index_matches_provider(&legacy, "bucket", &provider));
+    }
+
+    #[test]
     fn current_persistent_snapshot_preserves_an_effective_transition_tier_name() {
         let object = PersistentListMetadataObject::from_object_info(&ObjectInfo {
             bucket: "bucket".to_string(),
@@ -10054,6 +10095,18 @@ mod test {
             ..Default::default()
         };
         assert!(!should_purge_empty_directory_listing("ghost/", None, 1, false, &truncated));
+    }
+
+    #[test]
+    fn empty_directory_listing_does_not_purge_rejected_leading_slash_prefixes() {
+        let empty = ListObjectsInfo::default();
+        for prefix in ["/", "//", "/ghost/"] {
+            assert!(
+                !should_purge_empty_directory_listing(prefix, None, 1000, false, &empty),
+                "rejected prefix {prefix:?} must not initiate orphan cleanup"
+            );
+        }
+        assert!(should_purge_empty_directory_listing("ghost/", None, 1000, false, &empty));
     }
 
     #[test]

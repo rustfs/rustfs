@@ -65,6 +65,11 @@ pub(crate) use rustfs_ecstore::api::bucket::replication::{ReplicationStatusType,
 pub(crate) use rustfs_ecstore::api::bucket::target::BucketTargets as EcstoreBucketTargets;
 pub(crate) use rustfs_ecstore::api::bucket::versioning::VersioningApi as EcstoreVersioningApi;
 pub(crate) use rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys as EcstoreBucketVersioningSys;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::bucket::{
+    metadata_sys::BucketMetadataSys as EcstoreQuotaMetadataSys,
+    quota::{QuotaError as EcstoreQuotaError, checker::QuotaChecker as EcstoreQuotaChecker},
+};
 pub(crate) use rustfs_ecstore::api::cache::{
     ListPathRawOptions as EcstoreListPathRawOptions, list_path_raw as ecstore_list_path_raw,
 };
@@ -127,6 +132,8 @@ pub(crate) use rustfs_ecstore::api::rpc::{
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::runtime::InstanceContext as EcstoreInstanceContext;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::runtime::set_object_store_resolver as ecstore_set_object_store_resolver;
 pub(crate) use rustfs_ecstore::api::runtime::{
     expiry_state_handle as ecstore_expiry_state_handle, global_tier_config_mgr as ecstore_get_global_tier_config_mgr,
     object_store_handle as ecstore_resolve_object_store_handle, setup_is_erasure as ecstore_is_erasure,
@@ -158,6 +165,8 @@ pub(crate) mod ecstore_diagnostic {
 pub(crate) type EcstoreHealResultItem = <EcstoreStore as storage_contracts::HealOperations>::HealResultItem;
 
 pub(crate) mod owner {
+    #[cfg(test)]
+    pub(crate) use super::ecstore_set_object_store_resolver;
     #[cfg(test)]
     pub(crate) use super::storage_contracts::DiskSetSelector;
     pub(crate) use super::{
@@ -352,7 +361,6 @@ impl From<EcstoreReplicationHealQueueResult> for ScannerReplicationHealResult {
 }
 
 pub(crate) mod scan {
-    #[cfg(test)]
     pub(crate) use super::storage_contracts::BucketOperations;
     pub(crate) use super::storage_contracts::{
         BucketOptions, NamespaceLocking, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
@@ -373,7 +381,8 @@ pub(crate) mod scanner_io {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::{
         bucket::{
-            lifecycle::bucket_lifecycle_ops::init_background_expiry, metadata::BUCKET_LIFECYCLE_CONFIG,
+            lifecycle::bucket_lifecycle_ops::init_background_expiry,
+            metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG},
             metadata_sys::update as update_bucket_metadata,
         },
         data_usage::{

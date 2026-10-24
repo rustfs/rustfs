@@ -31,7 +31,7 @@ use crate::server::{
         IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer, S3ErrorMessageCompatLayer, SigV4HeaderGuardLayer,
         StsQueryApiCompatLayer, VirtualHostStyleHintLayer,
     },
-    rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env},
+    rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env, rate_limit_vh_domain_hosts},
     ssec_transport::SsecTransportLayer,
     strip_valid_port_suffix,
     tls_material::{
@@ -117,7 +117,9 @@ type Http3CoreService = tower::util::BoxCloneService<
 #[cfg(feature = "http3")]
 type Http3ExternalService = tower::util::BoxCloneService<
     HttpRequest<http3::RequestBody>,
-    Response<tower_http::body::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+    Response<
+        super::layer::ForegroundResponseBody<tower_http::body::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+    >,
     Box<dyn std::error::Error + Send + Sync>,
 >;
 use tracing::{Level, Span, debug, error, info, instrument, trace, warn};
@@ -1110,7 +1112,7 @@ fn make_http_trace_span<ReqBody>(request: &HttpRequest<ReqBody>) -> Span {
 macro_rules! external_service_stack {
     ($service:expr, $remote_addr:expr, $trusted_proxy_layer:expr, $is_console:expr,
      $rate_limit_layer:expr, $connection_is_tls:expr, $readiness:expr, $keystone_auth:expr,
-     $compression_config:expr, $server_ctx:expr, $server_domains_configured:expr) => {{
+     $compression_config:expr, $server_ctx:expr, $server_domains_configured:expr, $vh_domain_hosts:expr) => {{
         let remote_addr = $remote_addr;
         let trusted_proxy_layer = $trusted_proxy_layer;
         let is_console = $is_console;
@@ -1121,6 +1123,7 @@ macro_rules! external_service_stack {
         let compression_config = $compression_config;
         let server_ctx = $server_ctx;
         let server_domains_configured = $server_domains_configured;
+        let vh_domain_hosts = $vh_domain_hosts;
         ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
             // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
@@ -1240,7 +1243,7 @@ macro_rules! external_service_stack {
             .layer(S3ErrorMessageCompatLayer)
             .layer(IcebergRestErrorCompatLayer)
             .layer(ObjectAttributesEtagFixLayer)
-            .layer(ConditionalCorsLayer::new())
+            .layer(ConditionalCorsLayer::new().with_vh_domain_hosts(vh_domain_hosts))
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .layer(BodylessStatusFixLayer)
             .layer(HeadRequestBodyFixLayer)
@@ -1561,6 +1564,8 @@ pub async fn start_http_server(
     // overlap with the bare domains they were generated from.
     let host_domain_sets = s3_host_domains(config)?;
     let rate_limit_vh_domains: Vec<String> = host_domain_sets.iter().flatten().cloned().collect();
+    // Same domain set for resolving the bucket of virtual-hosted-style CORS requests.
+    let vh_domain_hosts = rate_limit_vh_domain_hosts(rate_limit_vh_domains.clone());
 
     // Setup S3 service
     // This project uses the S3S library to implement S3 services
@@ -1714,6 +1719,7 @@ pub async fn start_http_server(
         let h3_compression = compression_config.clone();
         let h3_trusted_proxy = rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone());
         let h3_domains_configured = !config.server_domains.is_empty();
+        let h3_vh_domain_hosts = vh_domain_hosts.clone();
 
         let make_service = move |peer_addr: SocketAddr| -> Http3ExternalService {
             let remote_addr = RemoteAddr(peer_addr);
@@ -1744,7 +1750,8 @@ pub async fn start_http_server(
                 h3_keystone.clone(),
                 h3_compression.clone(),
                 h3_server_ctx.clone(),
-                h3_domains_configured
+                h3_domains_configured,
+                h3_vh_domain_hosts.clone()
             ))
         };
 
@@ -2007,6 +2014,7 @@ pub async fn start_http_server(
                 compression_config: compression_config.clone(),
                 is_console,
                 server_domains_configured,
+                vh_domain_hosts: vh_domain_hosts.clone(),
                 readiness: readiness.clone(),
                 keystone_auth: auth_keystone::get_keystone_auth(),
                 trusted_proxy_layer: rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone()),
@@ -2084,6 +2092,8 @@ struct ConnectionContext {
     is_console: bool,
     /// Whether `RUSTFS_SERVER_DOMAINS` is configured (i.e. s3s virtual-hosted-style routing is active).
     server_domains_configured: bool,
+    /// Port-stripped virtual-hosted-style domains, for bucket-level CORS resolution.
+    vh_domain_hosts: Arc<[String]>,
     readiness: Arc<GlobalReadiness>,
     /// Pre-computed Keystone auth provider (avoids per-connection OnceLock read).
     keystone_auth: Option<Arc<rustfs_keystone::KeystoneAuthProvider>>,
@@ -2118,14 +2128,16 @@ impl<A, B> PathDispatchService<A, B> {
     }
 }
 
-impl<A, B> Service<HttpRequest<Incoming>> for PathDispatchService<A, B>
+impl<A, B, ExternalBody, InternodeBody> Service<HttpRequest<Incoming>> for PathDispatchService<A, B>
 where
-    A: Service<HttpRequest<Incoming>> + Clone + Send + 'static,
+    A: Service<HttpRequest<Incoming>, Response = Response<ExternalBody>> + Clone + Send + 'static,
     A::Future: Send + 'static,
-    B: Service<HttpRequest<Incoming>, Response = A::Response, Error = A::Error> + Clone + Send + 'static,
+    B: Service<HttpRequest<Incoming>, Response = Response<InternodeBody>, Error = A::Error> + Clone + Send + 'static,
     B::Future: Send + 'static,
+    ExternalBody: 'static,
+    InternodeBody: 'static,
 {
-    type Response = A::Response;
+    type Response = Response<http_body_util::Either<ExternalBody, InternodeBody>>;
     type Error = A::Error;
     type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
@@ -2138,9 +2150,17 @@ where
 
     fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
         if Self::is_internode_path(req.uri().path()) {
-            Box::pin(self.internode.call(req))
+            let future = self.internode.call(req);
+            Box::pin(async move {
+                let (parts, body) = future.await?.into_parts();
+                Ok(Response::from_parts(parts, http_body_util::Either::Right(body)))
+            })
         } else {
-            Box::pin(self.external.call(req))
+            let future = self.external.call(req);
+            Box::pin(async move {
+                let (parts, body) = future.await?.into_parts();
+                Ok(Response::from_parts(parts, http_body_util::Either::Left(body)))
+            })
         }
     }
 }
@@ -2244,6 +2264,7 @@ fn process_connection(
             compression_config,
             is_console,
             server_domains_configured,
+            vh_domain_hosts,
             readiness,
             keystone_auth,
             trusted_proxy_layer,
@@ -2368,7 +2389,8 @@ fn process_connection(
                 keystone_auth.clone(),
                 compression_config.clone(),
                 server_ctx.clone(),
-                server_domains_configured
+                server_domains_configured,
+                vh_domain_hosts.clone()
             )
         };
         let build_internode_stack = |service| {
@@ -2850,7 +2872,11 @@ mod tests {
     >;
     type RateLimitTestStack = tower::util::BoxCloneService<
         HttpRequest<s3s::Body>,
-        Response<tower_http::body::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+        Response<
+            super::super::layer::ForegroundResponseBody<
+                tower_http::body::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>,
+            >,
+        >,
         Box<dyn std::error::Error + Send + Sync>,
     >;
 
@@ -2881,7 +2907,8 @@ mod tests {
             None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
             HttpCompressionConfig::default(),
             ServerContextSlot::new(),
-            false
+            false,
+            Arc::default()
         ))
     }
 
@@ -5023,6 +5050,66 @@ mod tests {
         let _ = service;
     }
 
+    #[tokio::test]
+    async fn path_dispatch_preserves_distinct_response_bodies() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("route listener");
+        let address = listener.local_addr().expect("route address");
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("route connection");
+                let external = tower::service_fn(|_: HttpRequest<Incoming>| async {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .header("x-lane", "external")
+                            .body(Full::new(Bytes::from_static(b"external body")))
+                            .expect("external response"),
+                    )
+                });
+                let internode = tower::service_fn(|_: HttpRequest<Incoming>| async {
+                    let frames =
+                        futures::stream::iter([Ok::<_, Infallible>(http_body::Frame::data(Bytes::from_static(b"rpc body")))]);
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(201)
+                            .header("x-lane", "internode")
+                            .body(http_body_util::StreamBody::new(frames))
+                            .expect("internode response"),
+                    )
+                });
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        TowerToHyperService::new(PathDispatchService::new(external, internode)),
+                    )
+                    .await
+                    .expect("route connection completion");
+            }
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("route client");
+        for (path, status, lane, body) in [
+            ("/bucket/object", 200, "external", "external body"),
+            ("/rustfs/rpc/example", 201, "internode", "rpc body"),
+        ] {
+            let response = client
+                .get(format!("http://{address}{path}"))
+                .header(http::header::CONNECTION, "close")
+                .send()
+                .await
+                .expect("route response");
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(response.headers()["x-lane"], lane);
+            assert_eq!(response.bytes().await.expect("route body"), body.as_bytes());
+        }
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("bounded route shutdown")
+            .expect("route server");
+    }
+
     // backlog#806-35: in-flight gauge must be adjusted exactly once per request.
 
     #[derive(Clone, Copy)]
@@ -5136,7 +5223,7 @@ mod tests {
                 let inner = Http3CoreService::new(inner);
                 Http3ExternalService::new(external_service_stack!(inner, Some(RemoteAddr(peer)), None::<rustfs_trusted_proxies::TrustedProxyLayer>, false,
                     Some(rate.clone()), true, server_readiness.clone(), Some(provider.clone()),
-                    HttpCompressionConfig::default(), ServerContextSlot::new(), false))
+                    HttpCompressionConfig::default(), ServerContextSlot::new(), false, Arc::default()))
             }, 0, Duration::from_secs(1), receiver)?;
             let client_endpoint = client_endpoint(vec![cert])?;
             let (quic, mut client, driver) = connect(&client_endpoint, endpoint.local_addr()?).await?;
@@ -5194,7 +5281,8 @@ mod tests {
                     None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
                     HttpCompressionConfig::default(),
                     ServerContextSlot::new(),
-                    false
+                    false,
+                    Arc::default()
                 ))
             },
             0,
@@ -5459,7 +5547,8 @@ mod tests {
             None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
             HttpCompressionConfig::default(),
             ServerContextSlot::new(),
-            false
+            false,
+            Arc::default()
         );
         fn pin_request_type<S: Service<HttpRequest<Incoming>>>(_: &S) {}
         pin_request_type(&stack);

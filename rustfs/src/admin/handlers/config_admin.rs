@@ -68,17 +68,17 @@ use rustfs_config::{
     ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_DIRECTORIES,
     ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_DELAY,
     ENV_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC, ENV_SCANNER_DISK_IO_BUDGET_IOPS, ENV_SCANNER_IDLE_MODE,
-    ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_MAX_WAIT_SECS, ENV_SCANNER_SPEED,
-    ENV_SCANNER_START_DELAY_SECS, ENV_SCANNER_WALKERS_PER_DISK, ENV_SCANNER_YIELD_EVERY_N_OBJECTS, HEAL_BITROT_CYCLE,
-    HEAL_SUB_SYS, MAX_ADMIN_REQUEST_BODY_SIZE, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR,
-    MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, SCANNER_ALERT_EXCESS_FOLDERS,
-    SCANNER_ALERT_EXCESS_VERSION_SIZE, SCANNER_ALERT_EXCESS_VERSIONS, SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT,
-    SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY,
-    SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC, SCANNER_DISK_IO_BUDGET_IOPS, SCANNER_IDLE_MODE, SCANNER_MAX_CONCURRENT_DISK_SCANS,
-    SCANNER_MAX_CONCURRENT_SET_SCANS, SCANNER_MAX_WAIT, SCANNER_SPEED, SCANNER_START_DELAY, SCANNER_SUB_SYS,
-    SCANNER_WALKERS_PER_DISK, SCANNER_YIELD_EVERY_N_OBJECTS, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE, WEBHOOK_CLIENT_CERT,
-    WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT, WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
-    WEBHOOK_RETRY_INTERVAL,
+    ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_MAX_WAIT_SECS,
+    ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS, ENV_SCANNER_WALKERS_PER_DISK,
+    ENV_SCANNER_YIELD_EVERY_N_OBJECTS, HEAL_BITROT_CYCLE, HEAL_SUB_SYS, MAX_ADMIN_REQUEST_BODY_SIZE, MQTT_BROKER,
+    MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC,
+    MQTT_USERNAME, SCANNER_ALERT_EXCESS_FOLDERS, SCANNER_ALERT_EXCESS_VERSION_SIZE, SCANNER_ALERT_EXCESS_VERSIONS,
+    SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION,
+    SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY, SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC, SCANNER_DISK_IO_BUDGET_IOPS,
+    SCANNER_IDLE_MODE, SCANNER_MAX_CONCURRENT_DISK_SCANS, SCANNER_MAX_CONCURRENT_SET_SCANS, SCANNER_MAX_WAIT,
+    SCANNER_RECOVERY_BACKOFF_CAP, SCANNER_SPEED, SCANNER_START_DELAY, SCANNER_SUB_SYS, SCANNER_WALKERS_PER_DISK,
+    SCANNER_YIELD_EVERY_N_OBJECTS, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY,
+    WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT, WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL,
 };
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -275,6 +275,12 @@ const SCANNER_HELP_KEYS: &[HelpKeyMetadata] = &[
         key: SCANNER_CACHE_SAVE_TIMEOUT,
         type_name: "seconds",
         description: "set scanner data-usage cache save timeout in seconds",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_RECOVERY_BACKOFF_CAP,
+        type_name: "seconds",
+        description: "cap automatic scanner recovery retry waits in positive seconds",
         optional: true,
     },
     HelpKeyMetadata {
@@ -1638,6 +1644,7 @@ fn env_help_key(sub_system: &str, key: &str) -> String {
         (SCANNER_SUB_SYS, SCANNER_BITROT_CYCLE) => ENV_SCANNER_BITROT_CYCLE_SECS.to_string(),
         (SCANNER_SUB_SYS, SCANNER_IDLE_MODE) => ENV_SCANNER_IDLE_MODE.to_string(),
         (SCANNER_SUB_SYS, SCANNER_CACHE_SAVE_TIMEOUT) => ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_RECOVERY_BACKOFF_CAP) => ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS.to_string(),
         (SCANNER_SUB_SYS, SCANNER_MAX_CONCURRENT_SET_SCANS) => ENV_SCANNER_MAX_CONCURRENT_SET_SCANS.to_string(),
         (SCANNER_SUB_SYS, SCANNER_MAX_CONCURRENT_DISK_SCANS) => ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS.to_string(),
         (SCANNER_SUB_SYS, SCANNER_WALKERS_PER_DISK) => ENV_SCANNER_WALKERS_PER_DISK.to_string(),
@@ -2594,6 +2601,43 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
         assert_eq!(response.keys_help.len(), 1);
         assert_eq!(response.keys_help[0].key, "start_delay");
         assert!(response.keys_help[0].description.contains("cycle"));
+    }
+
+    #[test]
+    fn scanner_recovery_backoff_cap_config_and_help_are_registered() {
+        crate::admin::storage_api::config::init_admin_config_defaults();
+        let input = format!("{SCANNER_SUB_SYS} {SCANNER_RECOVERY_BACKOFF_CAP}=\"17\"");
+        let directives = parse_config_directives(&input, false).expect("parse scanner recovery cap directive");
+        validate_config_directives(&directives).expect("scanner recovery cap should be supported");
+        let mut config = ServerConfig::new();
+        apply_set_directives(&mut config, &directives).expect("apply scanner recovery cap directive");
+        assert_eq!(
+            config
+                .get_value(SCANNER_SUB_SYS, DEFAULT_DELIMITER)
+                .expect("scanner KVS")
+                .lookup(SCANNER_RECOVERY_BACKOFF_CAP)
+                .as_deref(),
+            Some("17")
+        );
+
+        for env in [false, true] {
+            let response = build_help_response(Some(SCANNER_SUB_SYS), Some(SCANNER_RECOVERY_BACKOFF_CAP), env)
+                .expect("scanner recovery cap help response");
+            assert_eq!(response.keys_help.len(), 1);
+            let key = &response.keys_help[0];
+            assert_eq!(
+                key.key,
+                if env {
+                    ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS
+                } else {
+                    SCANNER_RECOVERY_BACKOFF_CAP
+                }
+            );
+            assert_eq!(key.type_name, "seconds");
+            assert!(key.optional);
+            assert!(key.description.contains("positive"));
+            assert!(key.description.contains("600"));
+        }
     }
 
     #[test]

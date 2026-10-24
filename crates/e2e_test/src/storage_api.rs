@@ -15,7 +15,7 @@
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys;
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::api::disk::{Endpoint, RUSTFS_META_BUCKET, VolumeInfo, WalkDirOptions};
+pub(crate) use rustfs_ecstore::api::disk::{DiskOption, Endpoint, RUSTFS_META_BUCKET, VolumeInfo, WalkDirOptions, new_disk};
 pub(crate) use rustfs_ecstore::api::rpc::{AuthenticatedChannel, TonicInterceptor, node_service_time_out_client_no_auth};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::rpc::{
@@ -51,4 +51,9 @@ pub(crate) mod internode_rpc_signature {
 #[cfg(test)]
 pub(crate) mod replication_extension {
     pub(crate) use super::BucketTargetSys;
+}
+
+#[cfg(test)]
+pub(crate) mod upgrade_compatibility {
+    pub(crate) use super::{DiskOption, Endpoint, new_disk};
 }

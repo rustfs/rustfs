@@ -25,6 +25,7 @@ on:
       - "crates/e2e_test/src/upgrade_compatibility_test.rs"
       - "crates/ecstore/**"
       - "crates/filemeta/**"
+      - "crates/heal/**"
       - "crates/kms/**"
       - "crates/storage-api/**"
       - "rustfs/**"
@@ -160,6 +161,7 @@ jobs:
           )
           if [[ "$UPGRADE_SOURCE_VERSION" == "1.0.0-rc.5" ]]; then
             cases+=(odm-config-rollback:rc5_rollback_requires_restoring_odm_configuration)
+            cases+=(checkpoint-upgrade:rc5_checkpoint_upgrade_rewinds_signed_progress_without_losing_objects)
           else
             cases+=(legacy-delete-reservation:stable_upgrade_deletes_foreign_reservations_without_losing_live_objects)
           fi

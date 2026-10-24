@@ -72,11 +72,16 @@ JSON
   exit 0
 fi
 
-if [[ "$url" == *"/rustfs/admin/v3/metrics?types=1&by-host=true&n=1" ]]; then
+if [[ "$url" == *"/rustfs/admin/v3/realtime?types=1&by-host=true&n=1" ]]; then
   cat <<'JSON'
 {"node":"node-a","metrics":{"scanner":{"maintenanceControl":{"primaryControl":"active"}}}}
 JSON
   exit 0
+fi
+
+if [[ "$url" != *"/rustfs/admin/v3/scanner/status" ]]; then
+  printf 'unexpected admin URL: %s\n' "$url" >&2
+  exit 1
 fi
 
 cat <<'JSON'
@@ -248,8 +253,8 @@ fi
 grep -q -- 'http://127.0.0.1:9000/rustfs/admin/v3/scanner/status' "$awscurl_log"
 grep -q -- 'http://node-a:9000/rustfs/admin/v3/background-heal/status' "$awscurl_log"
 grep -q -- 'http://node-b:9000/rustfs/admin/v3/background-heal/status' "$awscurl_log"
-grep -q -- 'http://node-a:9000/rustfs/admin/v3/metrics?types=1&by-host=true&n=1' "$awscurl_log"
-grep -q -- 'http://node-b:9000/rustfs/admin/v3/metrics?types=1&by-host=true&n=1' "$awscurl_log"
+grep -q -- 'http://node-a:9000/rustfs/admin/v3/realtime?types=1&by-host=true&n=1' "$awscurl_log"
+grep -q -- 'http://node-b:9000/rustfs/admin/v3/realtime?types=1&by-host=true&n=1' "$awscurl_log"
 
 missing_pid_out="$TMP_DIR/out-missing-pid"
 RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" PATH="$BIN_DIR:$PATH" "$SCRIPT" \
@@ -305,6 +310,8 @@ fi
 
 grep -q -- 'missing value for --alias' "$missing_value_log"
 
+"$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_version_oracle.py"
+
 secret_arg_log="$TMP_DIR/secret-arg.log"
 if PATH="$BIN_DIR:$PATH" "$SCRIPT" --secret-key rustfsadmin >"$secret_arg_log" 2>&1; then
   echo "Expected --secret-key argv to be rejected" >&2
@@ -313,4 +320,7 @@ fi
 
 grep -q -- 'unknown arg: --secret-key' "$secret_arg_log"
 
+"$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_service.py"
+"$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_process_receipt.py"
 "$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_abba.py"
+"$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_otlp_window.py"

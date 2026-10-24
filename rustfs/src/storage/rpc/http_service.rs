@@ -18,7 +18,7 @@ use crate::storage::storage_api::rpc_consumer::http_service::{
     DEFAULT_READ_BUFFER_SIZE, DeleteOptions, DiskStore, NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse,
     PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, StorageDiskRpcExt as _,
     WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, check_and_record_signed_rpc_nonce, find_local_disk_by_ref,
-    sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability, verify_put_file_auth_trailer,
+    sign_ns_scanner_capability_with_checkpoint_coverage, sign_put_file_capability, verify_put_file_auth_trailer,
     verify_rpc_signature,
 };
 #[cfg(test)]
@@ -299,6 +299,7 @@ struct NsScannerCapabilityQuery {
     ns_scanner_challenge: Option<uuid::Uuid>,
     #[serde(rename = "ns_scanner_tier_registry_generation")]
     ns_scanner_tier_registry_generation: Option<bool>,
+    ns_scanner_checkpoint_coverage: Option<bool>,
 }
 
 fn verify_ns_scanner_body_digest(query: &NsScannerQuery, body: &[u8]) -> bool {
@@ -434,9 +435,11 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
         (Method::GET, WALK_DIR_PATH) | (Method::HEAD, WALK_DIR_PATH) => handle_walk_dir(req).await,
         (Method::GET, NS_SCANNER_PATH) => match parse_query::<NsScannerCapabilityQuery>(&req) {
             Ok(query) if query.ns_scanner_protocol == Some(NS_SCANNER_PROTOCOL_VERSION) => match query.ns_scanner_challenge {
-                Some(challenge) if !challenge.is_nil() => {
-                    ns_scanner_capability_response(challenge, query.ns_scanner_tier_registry_generation == Some(true))
-                }
+                Some(challenge) if !challenge.is_nil() => ns_scanner_capability_response(
+                    challenge,
+                    query.ns_scanner_tier_registry_generation == Some(true),
+                    query.ns_scanner_checkpoint_coverage == Some(true),
+                ),
                 Some(_) | None => response_with_status(StatusCode::BAD_REQUEST, "namespace scanner challenge is invalid"),
             },
             Ok(_) => response_with_status(StatusCode::UPGRADE_REQUIRED, "namespace scanner protocol is unsupported"),
@@ -502,34 +505,42 @@ fn record_internode_rpc_error(operation: Option<&'static str>) {
     }
 }
 
-fn ns_scanner_capability_response(challenge: uuid::Uuid, include_tier_registry_generation: bool) -> Response<Body> {
+fn ns_scanner_capability_response(
+    challenge: uuid::Uuid,
+    include_tier_registry_generation: bool,
+    include_checkpoint_coverage: bool,
+) -> Response<Body> {
     let server_epoch = *NS_SCANNER_SERVER_EPOCH;
-    let proof =
-        match sign_ns_scanner_capability_with_tier_registry_generation(challenge, server_epoch, include_tier_registry_generation)
-        {
-            Ok(proof) => proof,
-            Err(err) => {
-                error!(
-                    event = EVENT_RPC_REQUEST_FAILED,
-                    component = LOG_COMPONENT_INTERNODE_RPC,
-                    subsystem = LOG_SUBSYSTEM_NAMESPACE_SCANNER,
-                    operation = INTERNODE_OPERATION_NS_SCANNER,
-                    result = "failed",
-                    status_code = StatusCode::UPGRADE_REQUIRED.as_u16(),
-                    rpc_path = NS_SCANNER_PATH,
-                    method = %Method::GET,
-                    reason = "capability_authentication_unavailable",
-                    error = %err,
-                    "internode rpc request failed"
-                );
-                return response_with_status(StatusCode::UPGRADE_REQUIRED, "namespace scanner RPC authentication is unavailable");
-            }
-        };
+    let proof = match sign_ns_scanner_capability_with_checkpoint_coverage(
+        challenge,
+        server_epoch,
+        include_tier_registry_generation,
+        include_checkpoint_coverage,
+    ) {
+        Ok(proof) => proof,
+        Err(err) => {
+            error!(
+                event = EVENT_RPC_REQUEST_FAILED,
+                component = LOG_COMPONENT_INTERNODE_RPC,
+                subsystem = LOG_SUBSYSTEM_NAMESPACE_SCANNER,
+                operation = INTERNODE_OPERATION_NS_SCANNER,
+                result = "failed",
+                status_code = StatusCode::UPGRADE_REQUIRED.as_u16(),
+                rpc_path = NS_SCANNER_PATH,
+                method = %Method::GET,
+                reason = "capability_authentication_unavailable",
+                error = %err,
+                "internode rpc request failed"
+            );
+            return response_with_status(StatusCode::UPGRADE_REQUIRED, "namespace scanner RPC authentication is unavailable");
+        }
+    };
     let body = match rmp_serde::to_vec_named(&NsScannerCapabilityResponse {
         version: NS_SCANNER_PROTOCOL_VERSION,
         server_epoch,
         proof,
         supports_tier_registry_generation: include_tier_registry_generation.then_some(true),
+        supports_checkpoint_coverage: include_checkpoint_coverage.then_some(true),
     }) {
         Ok(body) => body,
         Err(err) => {
@@ -682,29 +693,31 @@ async fn handle_read_file(req: Request<Incoming>) -> Response<Body> {
         INTERNODE_OPERATION_READ_FILE_STREAM,
         INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
     );
-    read_file_stream_response(file, query.length)
+    read_file_response(file, query.length)
 }
 
-/// The read_file_stream answer: 200 with the file streamed at an unknown
-/// length, so the peer reads it chunked and sees a failed read as a cut
-/// connection rather than a short body.
-fn read_file_stream_response<R>(file: R, length: usize) -> Response<Body>
+fn read_file_response<R>(reader: R, length: usize) -> Response<Body>
 where
     R: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
 {
-    let stream = read_file_body_stream(file, length, INTERNODE_OPERATION_READ_FILE_STREAM);
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .body(Body::from_stream(stream))
-        .expect("failed to build read file stream response")
+    let stream = read_file_body_stream(reader, length, INTERNODE_OPERATION_READ_FILE_STREAM);
+    let mut response = Response::new(Body::from_stream(stream));
+    if length != 0 {
+        // Bounded shard readers stop at the requested byte count. Exact framing
+        // lets HTTP/1.1 reuse the connection without waiting for a chunked EOF.
+        // Zero means read to EOF, not an empty response.
+        response
+            .headers_mut()
+            .insert(http::header::CONTENT_LENGTH, HeaderValue::from(length));
+    }
+    response
 }
 
 fn read_file_body_stream<R>(
     reader: R,
     length: usize,
     operation: &'static str,
-) -> Pin<Box<dyn futures::Stream<Item = io::Result<Bytes>> + Send + Sync>>
+) -> impl futures::Stream<Item = io::Result<Bytes>> + Send + Sync
 where
     R: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
 {
@@ -715,11 +728,10 @@ where
     } else {
         u64::try_from(length).unwrap_or(u64::MAX)
     };
-    let stream = ReaderStream::with_capacity(reader.take(read_limit), read_buffer_size).map_ok(move |bytes| {
+    ReaderStream::with_capacity(reader.take(read_limit), read_buffer_size).map_ok(move |bytes| {
         metrics.record_sent_bytes_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, bytes.len());
         bytes
-    });
-    Box::pin(stream)
+    })
 }
 
 fn read_file_stream_buffer_size(length: usize) -> usize {
@@ -1826,11 +1838,11 @@ mod tests {
         internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path, legacy_meta_bucket_alias,
         ns_scanner_response_body, ns_scanner_server_epoch_matches, put_body_size_mismatch, put_file_auth_nonce,
         put_file_capability_response, put_file_server_epoch_accepted, put_file_server_epoch_matches,
-        put_file_stage_error_message, put_file_target_lock, read_file_body_stream, read_file_stream_buffer_size,
-        read_file_stream_response, remote_scanner_claim_rejection, response_with_disk_error, supports_walk_dir_stream_completion,
-        validate_walk_dir_completion_request, verify_internode_rpc_signature, verify_ns_scanner_body_digest,
-        verify_walk_dir_body_digest, walk_dir_response_body, write_authenticated_put_file, write_body_chunks_to_writer,
-        write_put_file_body_chunks_to_writer,
+        put_file_stage_error_message, put_file_target_lock, read_file_body_stream, read_file_response,
+        read_file_stream_buffer_size, remote_scanner_claim_rejection, response_with_disk_error,
+        supports_walk_dir_stream_completion, validate_walk_dir_completion_request, verify_internode_rpc_signature,
+        verify_ns_scanner_body_digest, verify_walk_dir_body_digest, walk_dir_response_body, write_authenticated_put_file,
+        write_body_chunks_to_writer, write_put_file_body_chunks_to_writer,
     };
     use crate::storage::storage_api::ecstore_rpc::{build_put_file_auth_trailer, gen_signature_headers};
     use crate::storage::storage_api::rpc_consumer::http_service::{DiskAPI as _, DiskOption, DiskStore, Endpoint, new_disk};
@@ -2256,7 +2268,7 @@ mod tests {
 
     #[test]
     fn namespace_scanner_requires_matching_signed_body_digest() {
-        let body = b"scanner-request";
+        let body = br#"{"scan_plan_digest":[1],"checkpoint_plan_digest":[2]}"#;
         let digest = hex_simd::encode_to_string(sha2::Sha256::digest(body), hex_simd::AsciiCase::Lower);
         let request_id = uuid::Uuid::new_v4();
         let server_epoch = uuid::Uuid::new_v4();
@@ -2271,6 +2283,10 @@ mod tests {
         .expect("query should parse");
 
         assert!(verify_ns_scanner_body_digest(&valid, body));
+        assert!(!verify_ns_scanner_body_digest(
+            &valid,
+            br#"{"scan_plan_digest":[1],"checkpoint_plan_digest":[3]}"#
+        ));
         assert!(!verify_ns_scanner_body_digest(&valid, b"tampered"));
         assert!(!verify_ns_scanner_body_digest(&missing, body));
     }
@@ -2293,6 +2309,65 @@ mod tests {
                 .ns_scanner_tier_registry_generation,
             Some(true)
         );
+        let coverage = format!("{marked}&ns_scanner_checkpoint_coverage=true");
+        assert_eq!(
+            serde_urlencoded::from_str::<super::NsScannerCapabilityQuery>(&coverage)
+                .expect("checkpoint marker should be accepted")
+                .ns_scanner_checkpoint_coverage,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn namespace_scanner_checkpoint_capability_get_requires_signature() {
+        let uri: Uri = format!(
+            "{NS_SCANNER_PATH}?ns_scanner_protocol=3&ns_scanner_challenge={}&ns_scanner_tier_registry_generation=true&ns_scanner_checkpoint_coverage=true",
+            uuid::Uuid::new_v4(),
+        ).parse().expect("capability URI");
+        let response = verify_internode_rpc_signature(&uri, &Method::GET, &HeaderMap::new()).expect_err("unsigned capability");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn namespace_scanner_checkpoint_capability_response_keeps_authenticated_legacy_shapes() {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct GenerationCapabilityResponse {
+            version: u16,
+            server_epoch: uuid::Uuid,
+            proof: Vec<u8>,
+            #[serde(default)]
+            supports_tier_registry_generation: Option<bool>,
+        }
+        let _ = rustfs_credentials::set_global_rpc_secret("checkpoint-capability-server-test-secret".to_string());
+        for (tier, coverage) in [(false, false), (true, false), (true, true)] {
+            let challenge = uuid::Uuid::new_v4();
+            let response = super::ns_scanner_capability_response(challenge, tier, coverage);
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .expect("capability body")
+                .to_bytes();
+            let capability: NsScannerCapabilityResponse = rmp_serde::from_slice(&body).expect("capability response");
+            crate::storage::storage_api::ecstore_rpc::verify_ns_scanner_capability_with_checkpoint_coverage(
+                challenge,
+                capability.server_epoch,
+                &capability.proof,
+                tier,
+                coverage,
+            )
+            .expect("capability proof binds exactly the requested extensions");
+            assert_eq!(capability.supports_checkpoint_coverage, coverage.then_some(true));
+            if coverage {
+                assert!(rmp_serde::from_slice::<GenerationCapabilityResponse>(&body).is_err());
+            } else {
+                let legacy: GenerationCapabilityResponse = rmp_serde::from_slice(&body).expect("old coordinator response shape");
+                assert_eq!(legacy.version, super::NS_SCANNER_PROTOCOL_VERSION);
+                assert_eq!(legacy.server_epoch, capability.server_epoch);
+                assert_eq!(legacy.proof, capability.proof);
+                assert_eq!(legacy.supports_tier_registry_generation, tier.then_some(true));
+            }
+        }
     }
 
     #[test]
@@ -2310,10 +2385,12 @@ mod tests {
             server_epoch: uuid::Uuid::new_v4(),
             proof: vec![1, 2, 3],
             supports_tier_registry_generation: None,
+            supports_checkpoint_coverage: None,
         })
         .expect("old response shape should encode");
         let decoded: NsScannerCapabilityResponse = rmp_serde::from_slice(&old).expect("old response should decode");
         assert_eq!(decoded.supports_tier_registry_generation, None);
+        assert_eq!(decoded.supports_checkpoint_coverage, None);
         let legacy_decoded: LegacyCapabilityResponse =
             rmp_serde::from_slice(&old).expect("legacy reader should decode old shape");
         assert_eq!(legacy_decoded.version, super::NS_SCANNER_PROTOCOL_VERSION);
@@ -2325,6 +2402,7 @@ mod tests {
             server_epoch: uuid::Uuid::new_v4(),
             proof: vec![1, 2, 3],
             supports_tier_registry_generation: Some(true),
+            supports_checkpoint_coverage: None,
         })
         .expect("new response shape should encode");
         let decoded: NsScannerCapabilityResponse = rmp_serde::from_slice(&current).expect("new response should decode");
@@ -3201,6 +3279,33 @@ mod tests {
         assert_eq!(out, b"hello");
     }
 
+    #[tokio::test]
+    async fn read_file_response_frames_bounded_reads_and_preserves_unbounded_reads() {
+        for (length, expected_header, expected_body) in
+            [(5, Some("5"), b"hello".as_slice()), (0, None, b"hello world".as_slice())]
+        {
+            let response = super::read_file_response(std::io::Cursor::new(b"hello world".to_vec()), length);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::CONTENT_LENGTH)
+                    .map(|value| value.to_str().expect("ASCII length")),
+                expected_header
+            );
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .expect("read response body")
+                .to_bytes();
+            assert_eq!(body, expected_body);
+        }
+    }
+
+    #[test]
+    fn read_file_response_does_not_hide_a_short_reader_by_shrinking_the_length() {
+        let response = super::read_file_response(std::io::Cursor::new(b"short".to_vec()), 10);
+        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "10");
+    }
+
     #[test]
     fn read_file_body_stream_sizes_buffer_to_requested_length() {
         for (length, expected_capacity) in [
@@ -3282,10 +3387,9 @@ mod tests {
 
     // ---- the wire: the exact bytes a peer reads for each rpc response body ----
     //
-    // The expected strings were captured from these tests run against the s3s
-    // bodies the rpc paths served before rustfs/backlog#2747 batch 4. A body
-    // change that moves a byte (a length or chunking header, a chunk boundary,
-    // the terminating chunk, a cut connection) fails here.
+    // Bounded reads use Content-Length so peers can reuse the connection;
+    // unbounded reads remain chunked. Pin the framing, payload and interrupted
+    // stream bytes independently of the body implementation.
 
     /// Serves `response` to one HTTP/1.1 request through hyper's server encoder
     /// and returns the raw bytes the peer read until the connection closed. The
@@ -3368,8 +3472,7 @@ mod tests {
     const WIRE_EMPTY_OK_HEAD: &str = "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n";
     const WIRE_READ_FILE_WHOLE: &str =
         "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\nB\r\nhello world\r\n0\r\n\r\n";
-    const WIRE_READ_FILE_RANGED: &str =
-        "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    const WIRE_READ_FILE_RANGED: &str = "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello";
     const WIRE_READ_FILE_EMPTY: &str = "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n";
     const WIRE_READ_FILE_BROKEN: &str =
         "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n7\r\npartial\r\n";
@@ -3414,10 +3517,13 @@ mod tests {
         type ResponseBuilder = Box<dyn Fn() -> Response<super::Body>>;
         let builders: [(&str, ResponseBuilder); 3] = [
             ("put_file", Box::new(move || put_file_capability_response(challenge))),
-            ("ns_scanner", Box::new(move || super::ns_scanner_capability_response(challenge, false))),
+            (
+                "ns_scanner",
+                Box::new(move || super::ns_scanner_capability_response(challenge, false, false)),
+            ),
             (
                 "ns_scanner with tier generation",
-                Box::new(move || super::ns_scanner_capability_response(challenge, true)),
+                Box::new(move || super::ns_scanner_capability_response(challenge, true, false)),
             ),
         ];
         for (name, build) in builders {
@@ -3447,13 +3553,13 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_stream_responses_keep_their_wire_bytes() {
-        let whole = read_file_stream_response(std::io::Cursor::new(b"hello world".to_vec()), 0);
+        let whole = read_file_response(std::io::Cursor::new(b"hello world".to_vec()), 0);
         assert_eq!(wire_text(whole, Method::GET).await, WIRE_READ_FILE_WHOLE);
-        let ranged = read_file_stream_response(std::io::Cursor::new(b"hello world".to_vec()), 5);
+        let ranged = read_file_response(std::io::Cursor::new(b"hello world".to_vec()), 5);
         assert_eq!(wire_text(ranged, Method::GET).await, WIRE_READ_FILE_RANGED);
-        let empty = read_file_stream_response(std::io::Cursor::new(Vec::new()), 0);
+        let empty = read_file_response(std::io::Cursor::new(Vec::new()), 0);
         assert_eq!(wire_text(empty, Method::GET).await, WIRE_READ_FILE_EMPTY);
-        let broken = read_file_stream_response(
+        let broken = read_file_response(
             FailAfterData {
                 data: Some(b"partial"),
                 paused: false,

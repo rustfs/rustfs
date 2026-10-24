@@ -178,6 +178,7 @@ scanner_config_output=$(render_chart \
   --set config.rustfs.scanner.bitrot_cycle_secs=0 \
   --set config.rustfs.scanner.idle_mode=false \
   --set config.rustfs.scanner.cache_save_timeout_secs=30 \
+  --set config.rustfs.scanner.recovery_backoff_cap_secs=1200 \
   --set config.rustfs.scanner.max_concurrent_set_scans=2 \
   --set config.rustfs.scanner.max_concurrent_disk_scans=1 \
   --set config.rustfs.scanner.walkers_per_disk=2 \
@@ -196,6 +197,7 @@ grep -q 'RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES: "100000"' <<<"$scanner_config_out
 grep -q 'RUSTFS_SCANNER_BITROT_CYCLE_SECS: "0"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_IDLE_MODE: "false"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS: "30"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS: "1200"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS: "2"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS: "1"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_WALKERS_PER_DISK: "2"' <<<"$scanner_config_output"

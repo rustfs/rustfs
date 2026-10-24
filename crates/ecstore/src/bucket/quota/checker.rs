@@ -254,27 +254,23 @@ impl QuotaChecker {
     }
 
     /// Scanner usage for a bucket the reservation ledger admits is reporting
-    /// input only, so a failed lookup degrades to "unknown" and is counted
+    /// input only, so unavailable memory usage is reported as "unknown" and counted
     /// instead of becoming an error the write path would fail on.
     async fn report_only_usage(&self, bucket: &str) -> Option<u64> {
         // The plain lookup: a report must not wait for an early snapshot reload.
         let usage = get_bucket_usage_memory(bucket).await;
-        match self.usage_or_degraded_baseline(bucket, usage).await {
-            Ok(usage) => Some(usage),
-            Err(err) => {
-                metrics::counter!(METRIC_QUOTA_USAGE_REPORT_UNAVAILABLE_TOTAL).increment(1);
-                debug!(
-                    event = EVENT_QUOTA_USAGE_REPORT,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_QUOTA,
-                    state = "usage_unknown",
-                    bucket = %bucket,
-                    error = %err,
-                    "durable quota usage report degraded"
-                );
-                None
-            }
+        if usage.is_none() {
+            metrics::counter!(METRIC_QUOTA_USAGE_REPORT_UNAVAILABLE_TOTAL).increment(1);
+            debug!(
+                event = EVENT_QUOTA_USAGE_REPORT,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_QUOTA,
+                state = "usage_unknown",
+                bucket = %bucket,
+                "durable quota usage report degraded"
+            );
         }
+        usage
     }
 
     /// Re-save `bucket`'s quota under the sharded durable reservation
@@ -543,6 +539,8 @@ mod tests {
     use crate::error::StorageError;
     use serial_test::serial;
     use uuid::Uuid;
+
+    mod reporting_retirement;
 
     /// Regression (PR #5307 / s3-tests `test_100_continue_error_retry`): a
     /// bucket with no persisted metadata has no quota, so the admission check

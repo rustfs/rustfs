@@ -186,21 +186,18 @@ fn same_user_defined_identity(left: &ObjectInfo, right: &ObjectInfo) -> bool {
     }
 }
 
-/// Pool-specific erasure geometry and data-movement rewrites are intentionally
-/// excluded. The selected winner still carries the chosen pool's layout, while
-/// the remaining read-visible fields must agree before the pool index can
-/// provide a deterministic tie-break.
+/// Pool-specific erasure geometry, version history, and data-movement rewrites
+/// are intentionally excluded. A copied version can be the target's latest
+/// while the source still holds newer versions. The selected winner keeps its
+/// pool's layout; the version's read-visible identity must still agree.
 pub(super) fn same_latest_object_info_identity(left: &ObjectInfo, right: &ObjectInfo) -> bool {
     let same_read_surface = left.bucket == right.bucket
         && left.name == right.name
         && left.is_dir == right.is_dir
         && left.restore_ongoing == right.restore_ongoing
         && left.restore_expires == right.restore_expires
-        && left.is_latest == right.is_latest
         && left.content_type == right.content_type
         && left.content_encoding == right.content_encoding
-        && left.num_versions == right.num_versions
-        && left.successor_mod_time == right.successor_mod_time
         && left.inlined == right.inlined
         && left.metadata_only == right.metadata_only
         && left.version_only == right.version_only
@@ -209,6 +206,18 @@ pub(super) fn same_latest_object_info_identity(left: &ObjectInfo, right: &Object
     if !same_read_surface {
         return false;
     }
+
+    // These describe the pool's version list, not the version itself. A
+    // partially moved entry keeps every version on its source and only some
+    // on its target, so copies of one version legitimately disagree here
+    // (rustfs/backlog#2873, defect F). A version id names one version, so an
+    // exact copy of an identified version needs no matching list. A tiered
+    // null copy identifies the same remote object; an ordinary null version
+    // keeps the full comparison.
+    let same_version_history = left.is_latest == right.is_latest
+        && left.num_versions == right.num_versions
+        && left.successor_mod_time == right.successor_mod_time;
+    let identified_version = left.version_id.is_some_and(|id| !id.is_nil());
 
     let exact_identity = left.storage_class == right.storage_class
         && left.mod_time == right.mod_time
@@ -229,8 +238,22 @@ pub(super) fn same_latest_object_info_identity(left: &ObjectInfo, right: &Object
         && left.version_purge_status == right.version_purge_status
         && left.checksum == right.checksum;
 
-    if exact_identity {
+    let tiered_null_version = !identified_version
+        && !left.delete_marker
+        && !left.transitioned_object.free_version
+        && left.transitioned_object.status == rustfs_filemeta::TRANSITION_COMPLETE
+        && !left.transitioned_object.tier.is_empty()
+        && !left.transitioned_object.name.is_empty();
+    if exact_identity && (same_version_history || identified_version || tiered_null_version) {
         return true;
+    }
+
+    // A copied delete marker carries the target's bucket incarnation fence,
+    // which the source marker does not; data movement already treats that as
+    // the same marker.
+    if left.delete_marker && right.delete_marker {
+        return crate::store::object::is_equivalent_data_movement_delete_marker(left, right)
+            || crate::store::object::is_equivalent_data_movement_delete_marker(right, left);
     }
 
     let left_moved =
@@ -250,7 +273,13 @@ pub(super) fn same_latest_object_info_identity(left: &ObjectInfo, right: &Object
 }
 
 pub(super) fn validate_prepared_pool_refetch_identity(expected: &ObjectInfo, refetched: &ObjectInfo) -> Result<()> {
-    if same_latest_object_info_identity(expected, refetched) {
+    // A refetch stays in the same pool, so its history must still match the
+    // snapshot even though cross-pool copies may have different inventories.
+    if expected.is_latest == refetched.is_latest
+        && expected.num_versions == refetched.num_versions
+        && expected.successor_mod_time == refetched.successor_mod_time
+        && same_latest_object_info_identity(expected, refetched)
+    {
         Ok(())
     } else {
         Err(Error::ErasureReadQuorum)
@@ -346,6 +375,34 @@ mod tests {
             .expect_err("refetched metadata from a changed generation must fail closed");
 
         assert_eq!(error, Error::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn prepared_pool_refetch_identity_fails_closed_on_version_history_change() {
+        let expected = ObjectInfo {
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(10).expect("test timestamp should be valid")),
+            version_id: Some(uuid::Uuid::from_u128(1)),
+            etag: Some("etag-a".to_string()),
+            ..Default::default()
+        };
+        for refetched in [
+            ObjectInfo {
+                is_latest: !expected.is_latest,
+                ..expected.clone()
+            },
+            ObjectInfo {
+                num_versions: expected.num_versions + 1,
+                ..expected.clone()
+            },
+            ObjectInfo {
+                successor_mod_time: Some(OffsetDateTime::from_unix_timestamp(20).expect("successor timestamp should be valid")),
+                ..expected.clone()
+            },
+        ] {
+            let error = validate_prepared_pool_refetch_identity(&expected, &refetched)
+                .expect_err("a changed same-pool history must invalidate the prepared snapshot");
+            assert_eq!(error, Error::ErasureReadQuorum);
+        }
     }
 
     #[test]

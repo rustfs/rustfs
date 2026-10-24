@@ -14,6 +14,7 @@
 
 pub mod channel;
 pub mod erasure_healer;
+mod failure_logging;
 pub mod manager;
 pub mod mrf_queue;
 pub mod outcome;

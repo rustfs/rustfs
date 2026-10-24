@@ -245,12 +245,12 @@ impl Event {
             None => sequencer_from_timestamp(event_time),
         };
 
-        let mut resp_elements = args.resp_elements.clone();
+        let mut resp_elements = args.resp_elements;
         initialize_response_elements(&mut resp_elements, &["x-amz-request-id", "x-amz-id-2"]);
 
         // URL encoding of object keys
         let key_name = form_urlencoded::byte_serialize(args.object.name.as_bytes()).collect::<String>();
-        let principal_id = args.req_params.get("principalId").unwrap_or(&String::new()).to_string();
+        let principal_id = args.req_params.get("principalId").cloned().unwrap_or_default();
 
         // An unversioned object must omit `versionId` entirely rather than emit it as
         // an empty string. Prefer the object's own version id, fall back to the
@@ -261,20 +261,19 @@ impl Event {
         let version_id = args
             .object
             .version_id
-            .clone()
             .filter(|v| !v.is_empty())
-            .or_else(|| Some(args.version_id.clone()))
+            .or(Some(args.version_id))
             .filter(|v| !v.is_empty());
 
         let mut s3_metadata = Metadata {
             schema_version: "1.0".to_string(),
             configuration_id: "Config".to_string(), // or from args
             bucket: Bucket {
-                name: args.bucket_name.clone(),
+                arn: format!("arn:aws:s3:::{}", args.bucket_name),
+                name: args.bucket_name,
                 owner_identity: Identity {
                     principal_id: principal_id.clone(),
                 },
-                arn: format!("arn:aws:s3:::{}", args.bucket_name),
             },
             object: Object {
                 key: key_name,
@@ -288,8 +287,8 @@ impl Event {
 
         if !is_removed_event {
             s3_metadata.object.size = Some(args.object.size);
-            s3_metadata.object.e_tag = args.object.etag.clone();
-            s3_metadata.object.content_type = args.object.content_type.clone();
+            s3_metadata.object.e_tag = args.object.etag;
+            s3_metadata.object.content_type = args.object.content_type;
             // Filter out internal/reserved metadata so it never leaks to downstream
             // notification targets (webhook/MQ). RustFS stores internal metadata under both
             // `x-rustfs-internal-*` and `x-minio-internal-*` (see rustfs_utils metadata_compat),
@@ -308,11 +307,7 @@ impl Event {
 
         let glacier_event_data = if args.event_name == EventName::ObjectRestoreCompleted {
             args.object.restore_expires.and_then(|expiry_time| {
-                let storage_class = args
-                    .object
-                    .storage_class
-                    .clone()
-                    .or_else(|| args.object.transitioned_tier.clone())?;
+                let storage_class = args.object.storage_class.or(args.object.transitioned_tier)?;
                 Some(GlacierEventData {
                     restore_event_data: RestoreEventData {
                         lifecycle_restoration_expiry_time: format_timestamp_rfc3339_millis(&expiry_time),
@@ -386,7 +381,7 @@ fn sequencer_from_timestamp(value: Timestamp) -> String {
 
 fn initialize_response_elements(elements: &mut HashMap<String, String>, keys: &[&str]) {
     for key in keys {
-        elements.entry(key.to_string()).or_default();
+        elements.entry_ref(*key).or_default();
     }
 }
 
@@ -601,24 +596,87 @@ mod tests {
 
     #[test]
     fn object_restore_completed_includes_glacier_event_data() {
-        let args = EventArgsBuilder::new(
-            EventName::ObjectRestoreCompleted,
-            "bucket",
-            NotifyObjectInfo {
-                bucket: "bucket".to_string(),
-                name: "key".to_string(),
-                restore_expires: Timestamp::new(1_700_000_000, 0).ok(),
-                storage_class: Some("GLACIER".to_string()),
-                ..Default::default()
-            },
-        )
-        .build();
-        let event = Event::new(args);
+        for (storage_class, transitioned_tier, expected) in [
+            (Some("GLACIER"), Some("DEEP_ARCHIVE"), Some("GLACIER")),
+            (None, Some("DEEP_ARCHIVE"), Some("DEEP_ARCHIVE")),
+            (None, None, None),
+        ] {
+            let args = EventArgsBuilder::new(
+                EventName::ObjectRestoreCompleted,
+                "bucket",
+                NotifyObjectInfo {
+                    bucket: "bucket".to_string(),
+                    name: "key".to_string(),
+                    restore_expires: Timestamp::new(1_700_000_000, 0).ok(),
+                    storage_class: storage_class.map(str::to_string),
+                    transitioned_tier: transitioned_tier.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+            .build();
+            let event = Event::new(args);
 
-        assert_eq!(event.event_version, "2.3");
-        let glacier = event.glacier_event_data.expect("glacier event data should be present");
-        assert_eq!(glacier.restore_event_data.lifecycle_restoration_expiry_time, "2023-11-14T22:13:20.000Z");
-        assert_eq!(glacier.restore_event_data.lifecycle_restore_storage_class, "GLACIER");
+            assert_eq!(event.event_version, "2.3");
+            match expected {
+                Some(expected) => {
+                    let glacier = event
+                        .glacier_event_data
+                        .expect("restore class should produce glacier event data");
+                    assert_eq!(glacier.restore_event_data.lifecycle_restoration_expiry_time, "2023-11-14T22:13:20.000Z");
+                    assert_eq!(glacier.restore_event_data.lifecycle_restore_storage_class, expected);
+                }
+                None => assert!(event.glacier_event_data.is_none()),
+            }
+        }
+    }
+
+    #[test]
+    fn event_new_preserves_owned_request_and_response_context() {
+        for (request_id, host_id) in [(None, None), (Some("request-id"), Some("host-id")), (Some(""), None)] {
+            let req_params = HashMap::from([
+                ("principalId".to_string(), "actor".to_string()),
+                ("region".to_string(), "region-1".to_string()),
+                ("custom".to_string(), "request-value".to_string()),
+            ]);
+            let mut resp_elements = HashMap::from([("custom".to_string(), "response-value".to_string())]);
+            if let Some(id) = request_id {
+                resp_elements.insert("x-amz-request-id".to_string(), id.to_string());
+            }
+            if let Some(id) = host_id {
+                resp_elements.insert("x-amz-id-2".to_string(), id.to_string());
+            }
+            let args = EventArgsBuilder::new(
+                EventName::ObjectRemovedDeleteMarkerCreated,
+                "bucket",
+                NotifyObjectInfo {
+                    name: "folder/a b".to_string(),
+                    ..Default::default()
+                },
+            )
+            .version_id("marker-version")
+            .req_params(req_params.clone())
+            .resp_elements(resp_elements)
+            .host("client.example")
+            .port(1234)
+            .user_agent("test-agent")
+            .build();
+            let event = Event::new(args);
+            assert_eq!(event.s3.bucket.name, "bucket");
+            assert_eq!(event.s3.bucket.arn, "arn:aws:s3:::bucket");
+            assert_eq!(event.s3.bucket.owner_identity.principal_id, "actor");
+            assert_eq!(event.user_identity.principal_id, "actor");
+            assert_eq!(event.aws_region, "region-1");
+            assert_eq!(event.request_parameters, req_params);
+            assert_eq!(event.response_elements["x-amz-request-id"], request_id.unwrap_or_default());
+            assert_eq!(event.response_elements["x-amz-id-2"], host_id.unwrap_or_default());
+            assert_eq!(event.response_elements["custom"], "response-value");
+            assert_eq!(event.s3.object.key, "folder%2Fa+b");
+            assert_eq!(event.s3.object.version_id.as_deref(), Some("marker-version"));
+            assert_eq!(event.source.host, "client.example");
+            assert_eq!(event.source.port, "1234");
+            assert_eq!(event.source.user_agent, "test-agent");
+            assert!(event.glacier_event_data.is_none());
+        }
     }
 
     #[test]
@@ -737,6 +795,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .version_id("different-request-version")
         .build();
         let event = Event::new(args);
         assert_eq!(event.s3.object.version_id.as_deref(), Some("v-1"));

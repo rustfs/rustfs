@@ -1031,7 +1031,7 @@ impl ErasureSetHealer {
                     // or release its healing markers.
                     checkpoint_manager.reset_for_retry().await?;
                     resume_manager.defer_retry_until_target_ready().await?;
-                    return Err(Error::transient_skip(format!(
+                    return Err(Error::ReplacementTargetNotReady(format!(
                         "Replacement erasure set heal incomplete: {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped; target readiness deferred retry"
                     )));
                 }
@@ -2522,6 +2522,7 @@ mod resume_loop_tests {
         heal_calls: Mutex<Vec<(String, Option<String>)>>,
         list_include_lifecycle_object_info: Mutex<Vec<bool>>,
         replacement_target_identity_sequences: Mutex<VecDeque<Vec<ReplacementTargetIdentity>>>,
+        replacement_targets_unready: AtomicBool,
         pool_metadata_placement: Mutex<Option<ReplacementCommitEvidence>>,
         bucket_metadata_calls: Mutex<Vec<String>>,
         bucket_metadata_failure: AtomicBool,
@@ -2828,6 +2829,15 @@ mod resume_loop_tests {
                 .unwrap()
                 .pop_front()
                 .ok_or_else(|| Error::other("replacement identity sequence exhausted"))
+        }
+
+        async fn replacement_targets_ready_for_retry(
+            &self,
+            _set_disk_id: &str,
+            _targets: &[String],
+            _expected_identities: &[ReplacementTargetIdentity],
+        ) -> Result<bool> {
+            Ok(!self.replacement_targets_unready.load(Ordering::SeqCst))
         }
     }
 
@@ -4136,6 +4146,37 @@ mod resume_loop_tests {
             checkpoint.skipped_objects.is_empty(),
             "the skipped set must be cleared so the retry re-heals the version"
         );
+    }
+
+    #[tokio::test]
+    async fn replacement_target_readiness_deferral_keeps_its_error_type() {
+        let mut env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        env.healer = env
+            .healer
+            .with_replacement_targets(vec!["replacement-a".to_string()], Some(env.task_id.clone()));
+        env.storage.replacement_targets_unready.store(true, Ordering::SeqCst);
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("object", Some("v1"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage.set_outcome("object", Some("v1"), HealOutcome::Transient);
+
+        let error = env
+            .healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect_err("an unavailable replacement target must defer the pass");
+
+        assert!(matches!(error, Error::ReplacementTargetNotReady(_)), "unexpected error: {error}");
+        let state = env.resume.get_state().await;
+        assert!(state.replacement_retry_waiting_for_target);
+        assert_eq!(state.retry_count, 0, "readiness deferral must preserve the retry budget");
+        assert!(!state.completed);
+        assert!(env.checkpoint.get_checkpoint().await.skipped_objects.is_empty());
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ use crate::heal::storage::HealStorageObjectResult;
 mod absent_verdict;
 mod concurrent_delete;
 mod deferred_retry;
+mod legacy_ambiguity_logging;
 mod usage_observation;
 
 mod canonical_outcome {
@@ -1989,6 +1990,7 @@ fn replacement_identity(
 
 #[derive(Clone)]
 enum MockHealObjectOutcome {
+    LegacyAmbiguous { outer: bool },
     MissingObject { outer: bool },
     MissingVersion,
     PermissionDenied,
@@ -2178,6 +2180,14 @@ impl HealStorageAPI for MockStorage {
             .and_then(VecDeque::pop_front)
         {
             return match outcome {
+                MockHealObjectOutcome::LegacyAmbiguous { outer } => {
+                    let error = Error::Storage(EcstoreError::DeleteRecoveryLegacyAmbiguous);
+                    if outer {
+                        Err(error)
+                    } else {
+                        Ok((HealResultItem::default(), Some(error)))
+                    }
+                }
                 MockHealObjectOutcome::MissingObject { outer } => {
                     let error = Error::Storage(EcstoreError::FileNotFound);
                     if outer {
@@ -2246,6 +2256,14 @@ impl HealStorageAPI for MockStorage {
         }
         if let Some(outcome) = self.heal_object_outcome.lock().unwrap().take() {
             return match outcome {
+                MockHealObjectOutcome::LegacyAmbiguous { outer } => {
+                    let error = Error::Storage(EcstoreError::DeleteRecoveryLegacyAmbiguous);
+                    if outer {
+                        Err(error)
+                    } else {
+                        Ok((HealResultItem::default(), Some(error)))
+                    }
+                }
                 MockHealObjectOutcome::MissingObject { outer } => {
                     let error = Error::Storage(EcstoreError::FileNotFound);
                     if outer {

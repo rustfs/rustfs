@@ -779,7 +779,8 @@ where
 
     let first_err = first_err_mutex.lock().await.take();
     let has_set_failure = first_err.is_some();
-    let results = results_mutex.lock().await.clone();
+    // Every collector has joined; transfer the caches without duplicating their trees.
+    let results = std::mem::take(&mut *results_mutex.lock().await);
     let completed_all_sets = bucket_plan_complete && scanner_results_form_complete_snapshot(&results, &expected_sources);
     let result = finalize_nsscanner_result(&results, first_err);
     let failed_buckets = bucket_failures.hard.lock().await.clone();

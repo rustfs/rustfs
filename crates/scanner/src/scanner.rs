@@ -29,8 +29,7 @@ use crate::data_usage_define::{
 };
 use crate::runtime_config::{
     ScannerRuntimeConfig, ScannerRuntimeConfigSource, refresh_scanner_runtime_config_from_global, scanner_bitrot_cycle,
-    scanner_cycle_interval, scanner_runtime_config_changed, scanner_runtime_config_generation, scanner_start_delay,
-    set_scanner_default_cycle_secs,
+    scanner_cycle_interval, scanner_runtime_config_changed, scanner_runtime_config_generation, set_scanner_default_cycle_secs,
 };
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig, ScannerCycleBudgetReason};
 use crate::scanner_folder::{data_usage_update_dir_cycles, heal_object_select_prob};
@@ -54,9 +53,9 @@ use rustfs_data_usage::observed_data_usage_is_newer;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_lock::{NamespaceLockGuard, error::LockError};
 use rustfs_scanner_metrics::metrics::{
-    CurrentCycle, Metric, Metrics, RemoteScanProgress, ScanCyclePartialReason, ScanCycleWorkSnapshot, ScannerUsageSaveResult,
-    ScannerWorkSource, emit_scan_cycle_complete, emit_scan_cycle_deferred, emit_scan_cycle_partial_with_source,
-    emit_scan_cycle_superseded, global_metrics,
+    CurrentCycle, Metric, Metrics, RemoteScanProgress, ScanCyclePartialReason, ScanCycleWorkSnapshot,
+    ScannerUsagePublicationObservation, ScannerUsageSaveResult, ScannerWorkSource, emit_scan_cycle_complete,
+    emit_scan_cycle_deferred, emit_scan_cycle_partial_with_source, emit_scan_cycle_superseded, global_metrics,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -269,6 +268,7 @@ const SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(50);
 const MAINTENANCE_FEATURE_INSPECTION_TIMEOUT: Duration = Duration::from_secs(30);
+const SCANNER_STARTUP_USAGE_INSPECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAINTENANCE_FEATURE_INSPECTION_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const MAINTENANCE_FEATURE_INSPECTION_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const MAX_MAINTENANCE_FEATURE_INSPECTION_ATTEMPTS: usize = 2;
@@ -516,28 +516,127 @@ fn cap_clean_idle_cycle_delay(delay: Duration, max_interval: Duration, enabled: 
         .max(Duration::from_secs(1))
 }
 
-fn initial_scanner_delay_for(start_delay_secs: Option<u64>) -> Duration {
-    start_delay_secs
-        .map(|secs| randomized_cycle_delay_for(Duration::from_secs(secs)))
-        .unwrap_or_else(randomized_cycle_delay)
-}
-
-fn initial_scanner_delay_for_startup(
-    start_delay_secs: Option<u64>,
+// None starts promptly; Some is the normalized interval to jitter once.
+fn scanner_startup_delay_policy(
+    config: &ScannerRuntimeConfig,
     usage_cache_is_cold: bool,
     has_buckets: bool,
     has_active_replication: bool,
-) -> Duration {
-    // Skip the startup delay when the cache is cold (first ever scan) OR when active replication
-    // rules exist. A cold usage cache also covers startup-before-bucket-creation: running the
-    // first cycle promptly keeps later bucket metrics bounded by the normal scanner cycle instead
-    // of an extra startup delay. Replication config is live-read at startup by
-    // configure_scanner_defaults, so this signal is always current regardless of when the persisted
-    // DataUsageInfo was last written.
+) -> Option<Duration> {
     if usage_cache_is_cold || (has_active_replication && has_buckets) {
-        Duration::ZERO
-    } else {
-        initial_scanner_delay_for(start_delay_secs)
+        return None;
+    }
+    Some(
+        config
+            .start_delay
+            .unwrap_or_else(|| config.cycle_interval.min(Duration::from_secs(60)))
+            .max(Duration::from_secs(1))
+            .min(MAX_SCANNER_SCHEDULE_DELAY),
+    )
+}
+
+async fn wait_for_scanner_runtime_wake(
+    ctx: &CancellationToken,
+    deadline: Instant,
+    runtime_generation: u64,
+    maintenance_generation: u64,
+) -> ScannerCycleWakeReason {
+    let timer = tokio::time::sleep_until(deadline);
+    tokio::pin!(timer);
+    loop {
+        if ctx.is_cancelled() {
+            return ScannerCycleWakeReason::Cancelled;
+        }
+        if scanner_runtime_config_generation() != runtime_generation {
+            return ScannerCycleWakeReason::RuntimeConfig;
+        }
+        if scanner_maintenance_generation() != maintenance_generation {
+            return ScannerCycleWakeReason::MaintenanceConfig;
+        }
+        tokio::select! {
+            biased;
+            _ = ctx.cancelled() => return ScannerCycleWakeReason::Cancelled,
+            _ = &mut timer => return ScannerCycleWakeReason::Timer,
+            _ = SCANNER_CYCLE_RECOVERY_WAKE.notified() => return ScannerCycleWakeReason::Recovery,
+            _ = scanner_runtime_config_changed() => {},
+            _ = scanner_maintenance_changed() => {},
+        }
+    }
+}
+
+async fn wait_for_scanner_startup<F, J>(
+    ctx: &CancellationToken,
+    inspection: F,
+    replication_active: bool,
+    maintenance_generation: u64,
+    mut sample_delay: J,
+) -> bool
+where
+    F: Future<Output = (bool, bool)>,
+    J: FnMut(Duration) -> Duration,
+{
+    let started = Instant::now();
+    if ctx.is_cancelled() {
+        return false;
+    }
+    if scanner_maintenance_generation() != maintenance_generation {
+        return true;
+    }
+    let (usage_cache_is_cold, has_buckets) = tokio::select! {
+        biased;
+        _ = ctx.cancelled() => return false,
+        result = tokio::time::timeout(SCANNER_STARTUP_USAGE_INSPECTION_TIMEOUT, inspection) => match result {
+            Ok(state) => state,
+            Err(_) => {
+                warn!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_RUNTIME_CONFIG,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    state = "startup_usage_inspection_timed_out",
+                    "Scanner startup usage inspection timed out; proceeding to the fenced scan attempt"
+                );
+                return true;
+            }
+        },
+    };
+    let mut runtime_generation = scanner_runtime_config_generation();
+    let mut policy = scanner_startup_delay_policy(
+        &crate::runtime_config::current_scanner_runtime_config(),
+        usage_cache_is_cold,
+        has_buckets,
+        replication_active,
+    );
+    let delay = policy.map(&mut sample_delay).unwrap_or_default();
+    if policy.is_none() {
+        info!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_CYCLE_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "startup_delay_skipped",
+            reason = if usage_cache_is_cold { "usage_cache_cold" } else { "replication_active" },
+            "Scanner startup delay skipped"
+        );
+    }
+    let mut deadline = started + delay;
+    loop {
+        let wake = wait_for_scanner_runtime_wake(ctx, deadline, runtime_generation, maintenance_generation).await;
+        if wake != ScannerCycleWakeReason::RuntimeConfig {
+            return wake != ScannerCycleWakeReason::Cancelled;
+        }
+        runtime_generation = scanner_runtime_config_generation();
+        let updated = scanner_startup_delay_policy(
+            &crate::runtime_config::current_scanner_runtime_config(),
+            usage_cache_is_cold,
+            has_buckets,
+            replication_active,
+        );
+        if updated != policy {
+            // Equivalent policies retain their deadline and jitter sample.
+            policy = updated;
+            deadline = started + policy.map(&mut sample_delay).unwrap_or_default();
+        }
     }
 }
 
@@ -877,10 +976,14 @@ where
     }
 }
 
-async fn initial_scanner_startup_usage_state<S>(storeapi: &Arc<S>) -> (bool, bool)
+async fn initial_scanner_startup_usage_state<S>(storeapi: &Arc<S>, replication_active: bool) -> (bool, bool)
 where
-    S: ScannerStorage,
+    S: ScannerObjectIO + ScannerConfigObjectDelete + crate::storage_api::scan::BucketOperations<Error = EcstoreError>,
 {
+    let cold = persisted_usage_cache_is_cold_for_startup(storeapi).await;
+    if cold || !replication_active {
+        return (cold, false);
+    }
     let has_buckets = match storeapi
         .list_bucket(&BucketOptions {
             no_metadata: true,
@@ -902,8 +1005,7 @@ where
             false
         }
     };
-
-    (persisted_usage_cache_is_cold_for_startup(storeapi).await, has_buckets)
+    (cold, has_buckets)
 }
 
 fn prepare_cycle_for_usage_floor_bootstrap(
@@ -1045,30 +1147,16 @@ where
     let runtime_guard = ScannerRuntimeGuard::new();
     tokio::spawn(async move {
         let _runtime_guard = runtime_guard;
-        let (usage_cache_is_cold, has_buckets) = initial_scanner_startup_usage_state(&storeapi_clone).await;
-        let sleep_time = initial_scanner_delay_for_startup(
-            scanner_start_delay().map(|duration| duration.as_secs()),
-            usage_cache_is_cold,
-            has_buckets,
+        if !wait_for_scanner_startup(
+            &ctx_clone,
+            initial_scanner_startup_usage_state(&storeapi_clone, replication_active),
             replication_active,
-        );
-        if sleep_time.is_zero() {
-            let skip_reason = if usage_cache_is_cold {
-                "usage_cache_cold"
-            } else {
-                "replication_active"
-            };
-            info!(
-                target: "rustfs::scanner",
-                event = EVENT_SCANNER_CYCLE_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_RUNTIME,
-                state = "startup_delay_skipped",
-                reason = skip_reason,
-                "Scanner startup delay skipped"
-            );
-        } else {
-            tokio::time::sleep(sleep_time).await;
+            startup_maintenance_generation.unwrap_or_else(scanner_maintenance_generation),
+            randomized_cycle_delay_for,
+        )
+        .await
+        {
+            return;
         }
 
         let mut transient_backoff = ScannerRetryBackoff::default();
@@ -1078,6 +1166,8 @@ where
                 break;
             }
 
+            let runtime_generation = scanner_runtime_config_generation();
+            let maintenance_generation = scanner_maintenance_generation();
             let run_result = run_data_scanner_with_maintenance_state(
                 ctx_clone.clone(),
                 storeapi_clone.clone(),
@@ -1133,12 +1223,11 @@ where
                 transient_backoff.record_retryable_cycle(false);
                 randomized_cycle_delay()
             };
-            // Backoff before retrying after lock contention or scanner-level failures.
-            // Keep this cancellation-aware so shutdown is not delayed by backoff sleep.
-            tokio::select! {
-                _ = ctx_clone.cancelled() => break,
-                _ = SCANNER_CYCLE_RECOVERY_WAKE.notified() => {},
-                _ = tokio::time::sleep(retry_delay) => {}
+            if wait_for_scanner_runtime_wake(&ctx_clone, Instant::now() + retry_delay, runtime_generation, maintenance_generation)
+                .await
+                == ScannerCycleWakeReason::Cancelled
+            {
+                break;
             }
         }
     });
@@ -1328,7 +1417,8 @@ where
             }
         }
 
-        if features.needs_regular_cycle() {
+        // Replication settles both regular-cycle and prompt-start decisions.
+        if features.replication {
             break;
         }
     }
@@ -1774,26 +1864,14 @@ where
             "Scanner runtime config refresh failed"
         );
     }
-    let configured_cycle_interval = scanner_cycle_interval();
     let configured_bitrot_cycle = scanner_bitrot_cycle();
-    let cycle_budget_config = ScannerCycleBudgetConfig {
-        max_duration: cycle_budget.max_duration(),
-        max_objects: cycle_budget.max_objects(),
-        max_directories: cycle_budget.max_directories(),
-    };
     let usage_persist_timeout = data_usage_persist_timeout();
-    global_metrics().record_scanner_cycle_config(
-        configured_cycle_interval,
-        configured_bitrot_cycle,
-        cycle_budget_config.max_duration,
-        cycle_budget_config.max_objects,
-        cycle_budget_config.max_directories,
-    );
     cycle_info.current = cycle_info.next;
     let now = Instant::now();
     cycle_info.started = Utc::now();
 
-    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone(), cycle_budget.remote_scan_progress()).await;
+    let mut cycle_metrics_guard =
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), leader_epoch, cycle_budget.remote_scan_progress()).await;
 
     // Refresh the storage-owned movement snapshot before reading background
     // heal state. A missing heal object yields an in-memory default; do not
@@ -2274,6 +2352,14 @@ where
         mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Failed;
     }
+    cycle_metrics_guard
+        .publication
+        .record(usage_publication_result.observation_for_attempt(
+            leader_epoch,
+            cycle_info.current,
+            !scan_cycle_result.has_usage_update(),
+            usage_persist_outcome,
+        ));
     let required_cycle_floor = scan_cycle_result.required_cycle_floor();
     let pre_commit_outcome = scanner_cycle_pre_commit_outcome(required_cycle_floor, &usage_persist_outcome);
     update_scanner_cache_cycle_recovery_status(
@@ -2641,21 +2727,25 @@ where
 
 struct ScannerCycleMetricsGuard {
     start: Option<ScanCycleWorkSnapshot>,
+    publication: Arc<ScannerUsagePublicationObservation>,
 }
 
 impl ScannerCycleMetricsGuard {
-    async fn new(cycle: CurrentCycle, remote_progress: Arc<RemoteScanProgress>) -> Self {
+    async fn new(cycle: CurrentCycle, leader_epoch: u64, remote_progress: Arc<RemoteScanProgress>) -> Self {
+        let publication = Arc::new(ScannerUsagePublicationObservation::new(leader_epoch, cycle.current));
         Self {
             start: Some(
                 global_metrics()
-                    .start_scan_cycle_work_with_cycle_and_remote_progress(cycle, remote_progress)
+                    .start_scan_cycle_work_with_publication(cycle, remote_progress, publication.clone())
                     .await,
             ),
+            publication,
         }
     }
 
     async fn finish(&mut self, cycle: CurrentCycle) {
         if let Some(start) = self.start {
+            self.publication.finish();
             global_metrics().finish_scan_cycle_work_with_cycle(start, cycle).await;
             self.start = None;
         }
@@ -2665,6 +2755,7 @@ impl ScannerCycleMetricsGuard {
 impl Drop for ScannerCycleMetricsGuard {
     fn drop(&mut self) {
         if let Some(start) = self.start.take() {
+            self.publication.interrupt();
             global_metrics().finish_scan_cycle_work(start);
         }
     }
@@ -2923,7 +3014,25 @@ where
                 return Err(err);
             }
         };
-    let (usage_floor, usage_floor_startup) = match persisted_usage_floor_for_startup(storeapi.clone(), true).await {
+    let mut usage_floor_result = persisted_usage_floor_for_startup(storeapi.clone(), true).await;
+    if usage_floor_result.is_err() {
+        match recover_dual_corrupt_scanner_state(storeapi.clone(), &cycle_revision, || {
+            !ctx.is_cancelled() && !guard.is_lock_lost()
+        })
+        .await
+        {
+            Ok(Some((cycle, epoch, revision))) => {
+                cycle_info = cycle;
+                leader_epoch = epoch;
+                cycle_revision = revision;
+                rebuild_from_quarantine = true;
+                usage_floor_result = persisted_usage_floor_for_startup(storeapi.clone(), true).await;
+            }
+            Ok(None) => {}
+            Err(err) => usage_floor_result = Err(err),
+        }
+    }
+    let (usage_floor, usage_floor_startup) = match usage_floor_result {
         Ok(result) => result,
         Err(err) => {
             let error = err.to_string();

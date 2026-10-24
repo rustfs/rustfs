@@ -16,6 +16,7 @@
 //! PUT admission precedes staging; receiver and GC disk work share a separate
 //! budget so coordinators waiting for peers cannot exhaust receiver capacity.
 
+use crate::disk::io_admission::{current_resource_unit, with_optional_resource_unit};
 use crate::disk::{LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_DISK};
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -422,7 +423,7 @@ impl CleanupRuntime {
         // the result receiver's lifetime to discard work cancelled during
         // runtime scheduling, before its first poll can start filesystem I/O.
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let task = runtime.spawn(async move {
+        let task = runtime.spawn(with_optional_resource_unit(current_resource_unit(), async move {
             if result_tx.is_closed() {
                 return;
             }
@@ -430,7 +431,7 @@ impl CleanupRuntime {
             // through I/O even if the waiter cancels and closes result_rx.
             let result = execute_disk(pending, Some(active), execution, started, future).await;
             let _ = result_tx.send(result);
-        });
+        }));
         match result_rx.await {
             Ok(result) => result,
             Err(err) => {
@@ -469,11 +470,11 @@ impl CleanupRuntime {
             gates: Some((self.disk_admission.clone(), self.disk_execution.clone())),
         };
         handle
-            .spawn(async move {
+            .spawn(with_optional_resource_unit(current_resource_unit(), async move {
                 let active = execution.acquire_owned().await.map_err(super::error::DiskError::other)?;
                 let _active = Admission::new(active, "rustfs_cleanup_gc_active");
                 scan(budget).await
-            })
+            }))
             .await
             .map_err(super::error::DiskError::other)?
     }
@@ -582,6 +583,7 @@ where
     F::Output: Send + 'static,
 {
     let started = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
+    let future = with_optional_resource_unit(current_resource_unit(), future);
     match reservation {
         Some(reservation) => reservation.handle.clone().spawn(async move {
             // This semaphore is never closed. Both queued work and overflow
@@ -620,6 +622,62 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::oneshot;
 
+    #[tokio::test]
+    async fn cleanup_dispatch_retains_resource_units_without_inheriting_disk_policy() {
+        use crate::disk::io_admission::{current_disk_io_context, with_background_disk_io, with_background_resource_unit};
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+        use tokio_util::sync::CancellationToken;
+
+        for mode in 0..4 {
+            let runtime = Arc::new(CleanupRuntime::new(config(1, 1, 1)).expect("cleanup runtime"));
+            let worker_runtime = runtime.clone();
+            let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let work = async move {
+                started_tx
+                    .send((current_resource_unit().is_some(), current_disk_io_context().is_none()))
+                    .expect("report worker context");
+                release_rx.await.expect("release owned worker");
+                Ok::<_, super::super::error::DiskError>(())
+            };
+            let task = tokio::spawn(with_background_disk_io(
+                CancellationToken::new(),
+                with_background_resource_unit(gate.acquire().await, async move {
+                    match mode {
+                        0 => worker_runtime
+                            .disk_operation(work, DiskAdmission::Request)
+                            .await
+                            .expect("disk operation"),
+                        1 => worker_runtime.gc_operation(move |_| work).await.expect("GC operation"),
+                        2 => {
+                            let reservation = worker_runtime.reserve().expect("cleanup reservation");
+                            run(Some(reservation), async { work.await.expect("cleanup operation") }).await;
+                        }
+                        _ => spawn(None, work)
+                            .await
+                            .expect("unisolated worker")
+                            .expect("unisolated operation"),
+                    }
+                }),
+            ));
+            let (inherited, original_policy) = deadline(started_rx).await.expect("owned work starts");
+            task.abort();
+            assert!(task.await.expect_err("waiter cancelled").is_cancelled());
+            let held = gate.snapshot().active;
+            release_tx.send(()).expect("owned work survives cancellation");
+            deadline(async {
+                while gate.snapshot().active != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert!(inherited, "mode {mode} lost resource ownership");
+            assert!(original_policy, "mode {mode} changed the detached worker's disk policy");
+            assert_eq!(held, 1, "mode {mode} released a live worker's unit");
+        }
+    }
     fn config(pending: usize, workers: usize, blocking_threads: usize) -> Config {
         Config {
             pending,
