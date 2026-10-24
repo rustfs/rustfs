@@ -19,12 +19,13 @@ use metrics::{counter, gauge};
 use rustfs_heal_contracts::{
     completion::{HealCompletion, MAX_COMPLETION_IDENTITY_BYTES, subscribe_heal_completions},
     heal_channel::{HealAdmissionReceipt, HealChannelRequest, HealScanMode},
-    outcome::{HealExecutionOutcome, HealObjectDisposition, HealObjectIdentity, HealObjectKind},
+    outcome::{HealAbortReason, HealExecutionOutcome, HealObjectDisposition, HealObjectIdentity, HealObjectKind},
 };
+use serde::Serialize;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::{broadcast, mpsc};
 
@@ -32,6 +33,59 @@ const MAX_PENDING: usize = 1024;
 const MAX_RECENT: usize = 1024;
 const PENDING_TTL: Duration = Duration::from_secs(60 * 60);
 const RECENT_TTL: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ScannerHealTerminalObservation {
+    pub execution: &'static str,
+    pub disposition: &'static str,
+    pub scope: &'static str,
+    pub scan_mode: &'static str,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ScannerHealUnknownObservation {
+    pub reason: &'static str,
+    pub count: u64,
+}
+
+/// A bounded local observation, not a cluster backlog or a repair receipt.
+#[derive(Clone, Debug, Serialize)]
+pub struct ScannerHealObservationStatus {
+    pub state: &'static str,
+    pub generation: Option<u64>,
+    pub started_at_unix_secs: Option<u64>,
+    pub sampled_at_unix_secs: Option<u64>,
+    pub retained_pending_tasks: Option<usize>,
+    pub retained_pending_candidates: Option<u64>,
+    pub oldest_pending_seconds: Option<f64>,
+    pub queued_admissions: Option<usize>,
+    pub terminal_task_observations_total: Option<u64>,
+    pub terminal_candidates: Vec<ScannerHealTerminalObservation>,
+    pub unknown_candidates: Vec<ScannerHealUnknownObservation>,
+    pub lost_completion_notifications: Option<u64>,
+    pub integrity_state: &'static str,
+}
+
+impl Default for ScannerHealObservationStatus {
+    fn default() -> Self {
+        Self {
+            state: "not_started",
+            generation: None,
+            started_at_unix_secs: None,
+            sampled_at_unix_secs: None,
+            retained_pending_tasks: None,
+            retained_pending_candidates: None,
+            oldest_pending_seconds: None,
+            queued_admissions: None,
+            terminal_task_observations_total: None,
+            terminal_candidates: Vec::new(),
+            unknown_candidates: Vec::new(),
+            lost_completion_notifications: None,
+            integrity_state: "unknown",
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct Candidate {
@@ -80,12 +134,18 @@ struct Observations {
     pending: HashMap<String, Candidate>,
     recent: HashMap<String, Recent>,
     recent_order: VecDeque<(Instant, String)>,
+    // All keys come from fixed execution/disposition/scope/mode labels, never task or object identities.
+    terminal_counts: BTreeMap<(&'static str, &'static str, &'static str, &'static str), u64>,
+    terminal_tasks: u64,
+    unknown_counts: BTreeMap<&'static str, u64>,
+    lost_notifications: u64,
 }
 
 #[derive(Debug)]
 struct Settlement {
     candidates: u64,
     first_task_observation: bool,
+    execution: &'static str,
     disposition: &'static str,
     scope: &'static str,
     mode: HealScanMode,
@@ -94,6 +154,16 @@ struct Settlement {
 impl Settlement {
     fn new(candidate: Candidate, recent: &mut Recent) -> Self {
         let completion = &recent.completion;
+        let execution = match completion.execution {
+            Some(HealExecutionOutcome::Pending) => "pending",
+            Some(HealExecutionOutcome::Running) => "running",
+            Some(HealExecutionOutcome::Completed) => "completed",
+            Some(HealExecutionOutcome::CompletedWithErrors) => "completed_with_errors",
+            Some(HealExecutionOutcome::Aborted(HealAbortReason::Cancelled)) => "aborted_cancelled",
+            Some(HealExecutionOutcome::Aborted(HealAbortReason::Deadline)) => "aborted_deadline",
+            Some(HealExecutionOutcome::Aborted(HealAbortReason::Untraversable)) => "aborted_untraversable",
+            None => "unknown",
+        };
         let disposition = match completion.object.as_ref().map(|object| &object.disposition) {
             Some(HealObjectDisposition::VerifiedHealthy) => "verified_healthy",
             Some(HealObjectDisposition::MetadataHealthy) => "metadata_healthy",
@@ -132,33 +202,49 @@ impl Settlement {
         Self {
             candidates: candidate.count,
             first_task_observation,
+            execution,
             disposition,
             scope,
             mode: candidate.mode,
         }
     }
 
-    fn record(self) {
+    fn record(&self) {
         counter!("rustfs_scanner_heal_candidate_terminal_total",
             "disposition" => self.disposition, "scope" => self.scope, "scan_mode" => self.mode.as_str())
         .increment(self.candidates);
         if self.first_task_observation {
             counter!("rustfs_scanner_heal_task_terminal_observations_total").increment(1);
         }
-        // No terminal here can certify payload coverage. In particular repaired,
-        // metadata-healthy and authoritative absence never imply verified bytes.
-        record_unknown(self.scope, self.candidates);
     }
 }
 
-fn record_unknown(reason: &'static str, count: u64) {
-    counter!("rustfs_scanner_heal_candidate_unknown_total", "reason" => reason).increment(count);
-}
-
 impl Observations {
+    fn record_unknown(&mut self, reason: &'static str, count: u64) {
+        let total = self.unknown_counts.entry(reason).or_default();
+        *total = total.saturating_add(count);
+        counter!("rustfs_scanner_heal_candidate_unknown_total", "reason" => reason).increment(count);
+    }
+
+    fn record_settlement(&mut self, settlement: &Settlement) {
+        let total = self
+            .terminal_counts
+            .entry((settlement.execution, settlement.disposition, settlement.scope, settlement.mode.as_str()))
+            .or_default();
+        *total = total.saturating_add(settlement.candidates);
+        if settlement.first_task_observation {
+            self.terminal_tasks = self.terminal_tasks.saturating_add(1);
+        }
+        settlement.record();
+        // Even a typed terminal lacks the candidate's content and leader proof.
+        self.record_unknown(settlement.scope, settlement.candidates);
+    }
+
     fn admit(&mut self, task_id: String, candidate: Candidate) -> Option<Settlement> {
         if let Some(recent) = self.recent.get_mut(&task_id) {
-            return Some(Settlement::new(candidate, recent));
+            let settlement = Settlement::new(candidate, recent);
+            self.record_settlement(&settlement);
+            return Some(settlement);
         }
         if let Some(pending) = self.pending.get_mut(&task_id) {
             pending.count = pending.count.saturating_add(candidate.count);
@@ -172,7 +258,7 @@ impl Observations {
         } else if self.pending.len() < MAX_PENDING {
             self.pending.insert(task_id, candidate);
         } else {
-            record_unknown("pending_full", candidate.count);
+            self.record_unknown("pending_full", candidate.count);
         }
         None
     }
@@ -195,6 +281,9 @@ impl Observations {
         }
         self.recent_order.push_back((now, task_id.clone()));
         self.recent.insert(task_id, recent);
+        if let Some(settlement) = &settled {
+            self.record_settlement(settlement);
+        }
         settled
     }
 
@@ -205,22 +294,36 @@ impl Observations {
     }
 
     fn lost(&mut self) {
-        for (_, candidate) in self.pending.drain() {
-            record_unknown("completion_lost", candidate.count);
+        let candidates = self
+            .pending
+            .drain()
+            .fold(0u64, |count, (_, candidate)| count.saturating_add(candidate.count));
+        if candidates > 0 {
+            self.record_unknown("completion_lost", candidates);
         }
         self.recent.clear();
         self.recent_order.clear();
     }
 
+    fn lagged(&mut self, skipped: u64) {
+        counter!("rustfs_scanner_heal_completion_lost_total").increment(skipped);
+        self.lost_notifications = self.lost_notifications.saturating_add(skipped);
+        self.lost();
+    }
+
     fn maintain(&mut self, now: Instant) {
+        let mut expired = 0u64;
         self.pending.retain(|_, candidate| {
             if now.saturating_duration_since(candidate.first_seen) >= PENDING_TTL {
-                record_unknown("expired", candidate.count);
+                expired = expired.saturating_add(candidate.count);
                 false
             } else {
                 true
             }
         });
+        if expired > 0 {
+            self.record_unknown("expired", expired);
+        }
         while self
             .recent_order
             .front()
@@ -240,50 +343,144 @@ impl Observations {
 
 type AdmissionSender = mpsc::Sender<(String, Candidate)>;
 
-fn observer_from(registry: &Mutex<Option<AdmissionSender>>) -> AdmissionSender {
-    // This lock protects installation only; no I/O or await occurs while held.
-    let mut installed = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(sender) = installed.as_ref().filter(|sender| !sender.is_closed()) {
-        return sender.clone();
+#[derive(Clone)]
+struct ObserverHandle {
+    sender: AdmissionSender,
+    state: Arc<Mutex<Observations>>,
+    generation: u64,
+    started_at_unix_secs: Option<u64>,
+}
+
+impl ObserverHandle {
+    fn record_unknown(&self, reason: &'static str, count: u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_unknown(reason, count);
     }
-    let sender = {
+}
+
+static OBSERVER: Mutex<Option<ObserverHandle>> = Mutex::new(None);
+
+fn observer_from(registry: &Mutex<Option<ObserverHandle>>) -> ObserverHandle {
+    // Installation takes only the registry lock. Readers release it before taking state; workers take only state.
+    let mut installed = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(handle) = installed.as_ref().filter(|handle| !handle.sender.is_closed()) {
+        return handle.clone();
+    }
+    let state = Arc::new(Mutex::new(Observations::default()));
+    let handle = {
         let (sender, mut admissions) = mpsc::channel(MAX_PENDING);
         let mut completions = subscribe_heal_completions();
+        let observations = state.clone();
         tokio::spawn(async move {
-            let mut observations = Observations::default();
             let mut tick = tokio::time::interval(Duration::from_secs(5));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                let settlement = tokio::select! {
+                tokio::select! {
                     candidate = admissions.recv() => match candidate {
-                        Some((id, candidate)) => observations.admit(id, candidate),
+                        Some((id, candidate)) => {
+                            let _ = observations.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).admit(id, candidate);
+                        },
                         None => break,
                     },
                     completion = completions.recv() => match completion {
-                        Ok(completion) => observations.complete(completion, Instant::now()),
-                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                            counter!("rustfs_scanner_heal_completion_lost_total").increment(skipped);
-                            observations.lost();
-                            None
+                        Ok(completion) => {
+                            let _ = observations.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .complete(completion, Instant::now());
                         },
-                        Err(broadcast::error::RecvError::Closed) => { observations.lost(); break },
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            observations.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).lagged(skipped);
+                        },
+                        Err(broadcast::error::RecvError::Closed) => {
+                            observations.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).lost();
+                            break;
+                        },
                     },
-                    _ = tick.tick() => { observations.maintain(Instant::now()); None },
-                };
-                if let Some(settlement) = settlement {
-                    settlement.record();
+                    _ = tick.tick() => {
+                        observations.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).maintain(Instant::now());
+                    },
                 }
             }
         });
-        sender
+        ObserverHandle {
+            sender,
+            state,
+            generation: installed.as_ref().map_or(1, |handle| handle.generation.saturating_add(1)),
+            started_at_unix_secs: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|age| age.as_secs()),
+        }
     };
-    *installed = Some(sender.clone());
-    sender
+    *installed = Some(handle.clone());
+    handle
 }
 
-fn observer() -> AdmissionSender {
-    static OBSERVER: Mutex<Option<AdmissionSender>> = Mutex::new(None);
+fn observer() -> ObserverHandle {
     observer_from(&OBSERVER)
+}
+
+fn observation_status_from(registry: &Mutex<Option<ObserverHandle>>) -> ScannerHealObservationStatus {
+    let handle = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+    let mut status = ScannerHealObservationStatus {
+        sampled_at_unix_secs: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .map(|age| age.as_secs()),
+        ..Default::default()
+    };
+    let Some(handle) = handle else {
+        return status;
+    };
+    status.generation = Some(handle.generation);
+    status.started_at_unix_secs = handle.started_at_unix_secs;
+    let observations = handle.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if handle.sender.is_closed() {
+        status.state = "stopped";
+    } else {
+        status.state = "active";
+        status.retained_pending_tasks = Some(observations.pending.len());
+        status.retained_pending_candidates = Some(
+            observations
+                .pending
+                .values()
+                .fold(0u64, |count, candidate| count.saturating_add(candidate.count)),
+        );
+        let now = Instant::now();
+        status.oldest_pending_seconds = observations
+            .pending
+            .values()
+            .map(|candidate| now.saturating_duration_since(candidate.first_seen))
+            .max()
+            .map(|age| age.as_secs_f64());
+        // A local channel sample, not an atomic cluster backlog or a completion test.
+        status.queued_admissions = Some(handle.sender.max_capacity().saturating_sub(handle.sender.capacity()));
+    }
+    status.terminal_task_observations_total = Some(observations.terminal_tasks);
+    status.terminal_candidates = observations
+        .terminal_counts
+        .iter()
+        .map(|(&(execution, disposition, scope, scan_mode), &count)| ScannerHealTerminalObservation {
+            execution,
+            disposition,
+            scope,
+            scan_mode,
+            count,
+        })
+        .collect();
+    status.unknown_candidates = observations
+        .unknown_counts
+        .iter()
+        .map(|(&reason, &count)| ScannerHealUnknownObservation { reason, count })
+        .collect();
+    status.lost_completion_notifications = Some(observations.lost_notifications);
+    status
+}
+
+/// Read existing diagnostics without starting an observer or admitting work.
+pub fn scanner_heal_observation_status() -> ScannerHealObservationStatus {
+    observation_status_from(&OBSERVER)
 }
 
 /// Capture only the identity actually available at discovery, before dispatch.
@@ -296,23 +493,23 @@ pub(crate) fn observe(candidate: Option<Candidate>, receipt: Result<&HealAdmissi
     observe_on(&observer(), candidate, receipt);
 }
 
-fn observe_on(sender: &AdmissionSender, candidate: Option<Candidate>, receipt: Result<&HealAdmissionReceipt, ()>) {
+fn observe_on(observer: &ObserverHandle, candidate: Option<Candidate>, receipt: Result<&HealAdmissionReceipt, ()>) {
     match receipt {
         Ok(receipt) if receipt.result.is_admitted() => {
             let Some(candidate) = candidate else {
-                record_unknown("identity_too_large", 1);
+                observer.record_unknown("identity_too_large", 1);
                 return;
             };
             let task_id = &receipt.task_id;
             if task_id.is_empty() || task_id.len() > 128 {
-                record_unknown("missing_task_id", 1);
+                observer.record_unknown("missing_task_id", 1);
                 return;
             }
-            if sender.try_send((task_id.clone(), candidate)).is_err() {
-                record_unknown("observer_full_or_closed", 1);
+            if observer.sender.try_send((task_id.clone(), candidate)).is_err() {
+                observer.record_unknown("observer_full_or_closed", 1);
             }
         }
-        _ => record_unknown("not_admitted", 1),
+        _ => observer.record_unknown("not_admitted", 1),
     }
 }
 
