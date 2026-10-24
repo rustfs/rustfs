@@ -30,6 +30,7 @@ use std::sync::Mutex;
 pub(super) mod checkpoint_fixture;
 pub(super) mod enumeration_restart;
 mod incremental_enumeration;
+mod metadata_visits;
 
 /// Reset the process-global alert cooldown map; test-only.
 fn reset_alert_cooldowns() {
@@ -371,6 +372,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         checkpoint_depth: 0,
         last_update: SystemTime::UNIX_EPOCH,
         checkpoint_objects: 0,
+        object_metadata_visits: metrics::Counter::noop(),
         last_checkpoint_objects: 0,
         last_checkpoint_at: Instant::now(),
         last_checkpoint_build_time: Duration::ZERO,
@@ -2381,6 +2383,7 @@ async fn scan_folder_charges_each_enumerated_entry_to_the_disk_budget() {
 #[serial]
 async fn scan_folder_budgets_payload_entries_without_metadata_io() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
+    let visits = metadata_visits::observe(&mut scanner);
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
     let bucket_dir = temp_dir.join("bucket");
     tokio::fs::create_dir_all(&bucket_dir).await.expect("create bucket");
@@ -2409,6 +2412,7 @@ async fn scan_folder_budgets_payload_entries_without_metadata_io() {
         )
         .await
         .expect("scan payload entries across a directory prefetch boundary");
+    assert_eq!(visits.load(Ordering::Relaxed), 0, "payload enumeration is not a metadata visit");
 
     let status = crate::sleeper::scanner_disk_io_budget_status()
         .into_iter()
@@ -2669,6 +2673,7 @@ async fn test_scan_folder_corrupt_xl_meta_stops_erasure_data_dir_descent() {
 
 async fn scan_corrupt_metadata_with_captured_logs(logs: &CapturedLogs) {
     let (mut scanner, temp_dir) = build_test_scanner().await;
+    let visits = metadata_visits::observe(&mut scanner);
     // Canonicalize for the "drive" field comparison (scanner resolves symlinks).
     let canonical_temp_dir = std::fs::canonicalize(&temp_dir).unwrap_or_else(|_| temp_dir.clone());
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -2711,6 +2716,7 @@ async fn scan_corrupt_metadata_with_captured_logs(logs: &CapturedLogs) {
         .expect("failed metadata must not make scanner descend into erasure data directories");
 
     assert_eq!(into.failed_objects, 1);
+    assert_eq!(visits.load(Ordering::Relaxed), 1, "failed metadata reads still consume a visit");
     assert!(
         scanner
             .new_cache
@@ -3078,6 +3084,7 @@ async fn scoped_root_scan_reuses_clean_top_level_entries_and_rescans_dirty_entri
 
 async fn scan_hot_cold_segment_fixture(scoped: bool) -> (DataUsageEntry, Vec<String>) {
     let (mut scanner, temp_dir) = build_test_scanner().await;
+    let visits = metadata_visits::observe(&mut scanner);
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
     write_test_object_metadata(&temp_dir, "bucket", "cold/object").await;
     write_test_object_metadata(&temp_dir, "bucket", "hot/object").await;
@@ -3119,6 +3126,11 @@ async fn scan_hot_cold_segment_fixture(scoped: bool) -> (DataUsageEntry, Vec<Str
         .scan_folder(CancellationToken::new(), folder, &mut root)
         .await
         .expect("segment fixture scan should finish");
+    assert_eq!(
+        visits.load(Ordering::Relaxed),
+        if scoped { 1 } else { 2 },
+        "reused cold cache entries must not count as metadata visits"
+    );
     let root = scanner
         .new_cache
         .size_recursive("bucket")

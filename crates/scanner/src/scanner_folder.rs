@@ -779,6 +779,7 @@ pub struct FolderScanner {
     checkpoint_depth: usize,
     last_update: SystemTime,
     checkpoint_objects: u64,
+    object_metadata_visits: metrics::Counter,
     last_checkpoint_objects: u64,
     last_checkpoint_at: Instant,
     last_checkpoint_build_time: Duration,
@@ -2212,6 +2213,7 @@ impl FolderScanner {
                 };
                 wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, budgeted_bytes)).await?;
 
+                self.object_metadata_visits.increment(1);
                 let sz = match self
                     .local_disk
                     .get_size_with_tier_names(item.clone(), &self.tier_registry.names)
@@ -3158,6 +3160,11 @@ pub(crate) async fn scan_data_folder_scoped(
         global_metrics().record_scanner_checkpoint_used();
     }
     let bucket_name = cache.info.name.clone();
+    let object_metadata_visits = metrics::counter!(
+        "rustfs_scanner_object_metadata_visits_total",
+        "bucket" => bucket_name.clone(),
+        "disk" => base_path.clone()
+    );
     let next_cycle = cache.info.next_cycle;
     let resume_position_on_entry = cache.has_scan_position();
     let had_scan_checkpoint = cache.info.scan_checkpoint.is_some();
@@ -3198,6 +3205,7 @@ pub(crate) async fn scan_data_folder_scoped(
         checkpoint_depth: 0,
         last_update: SystemTime::UNIX_EPOCH,
         checkpoint_objects: 0,
+        object_metadata_visits,
         last_checkpoint_objects: 0,
         last_checkpoint_at: Instant::now(),
         last_checkpoint_build_time: Duration::ZERO,
