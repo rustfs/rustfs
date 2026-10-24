@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract observed histogram windows without converting missing data to zero."""
+"""Extract histogram and integer counter windows without filling missing data."""
 
 import argparse
 import hashlib
@@ -61,11 +61,23 @@ def identity(resource, scope, metric, point, resource_schema, scope_schema):
     }
 
 
-def histogram_point(point):
-    require(uint(point.get("flags", 0), "point flags") == 0, "histogram has no recorded value or unknown flags")
+def point_times(point):
+    require(uint(point.get("flags", 0), "point flags") == 0, "point has no recorded value or unknown flags")
     start = uint(point.get("startTimeUnixNano"), "startTimeUnixNano")
     end = uint(point.get("timeUnixNano"), "timeUnixNano")
-    require(0 < start <= end, "missing or reversed histogram timestamps")
+    require(0 < start <= end, "missing or reversed point timestamps")
+    return {"start": start, "end": end}
+
+
+def counter_point(point):
+    require(set(point) & {"asInt", "asDouble"} == {"asInt"}, "counter must have one integer value")
+    value = uint(point.get("asInt"), "counter value")
+    require(value < 2**63, "counter exceeds OTLP signed int64 range")
+    return {**point_times(point), "kind": "sum", "value": value}
+
+
+def histogram_point(point):
+    times = point_times(point)
     bounds = point.get("explicitBounds", [])
     buckets = point.get("bucketCounts", [])
     require(isinstance(bounds, list) and isinstance(buckets, list), "invalid histogram buckets")
@@ -75,7 +87,7 @@ def histogram_point(point):
     buckets = [uint(value, "bucket count") for value in buckets]
     count = uint(point.get("count", 0), "histogram count")
     require(sum(buckets) == count, "histogram count does not match buckets")
-    return {"start": start, "end": end, "count": count, "bounds": bounds, "buckets": buckets}
+    return {**times, "kind": "histogram", "count": count, "bounds": bounds, "buckets": buckets}
 
 
 def snapshot(document, names):
@@ -90,19 +102,22 @@ def snapshot(document, names):
                 if metric.get("name") not in names:
                     continue
                 kinds = set(metric) & {"histogram", "exponentialHistogram", "sum", "gauge", "summary"}
-                require(kinds == {"histogram"}, "ambiguous or unsupported metric type")
-                data = metric.get("histogram")
-                require(isinstance(data, dict), f"{metric['name']} is not an explicit histogram")
+                require(kinds in ({"histogram"}, {"sum"}), "ambiguous or unsupported metric type")
+                kind = next(iter(kinds))
+                data = metric[kind]
+                require(isinstance(data, dict), f"{metric['name']} has invalid metric data")
                 require(data.get("aggregationTemporality") in (2, "AGGREGATION_TEMPORALITY_CUMULATIVE"),
                         f"{metric['name']} is not cumulative")
+                if kind == "sum":
+                    require(data.get("isMonotonic") is True, "counter sum must be monotonic")
                 for point in data.get("dataPoints", []):
                     key = identity(resource, scope, metric, point,
                                    resource_metrics.get("schemaUrl", ""), scope_metrics.get("schemaUrl", ""))
                     encoded = json.dumps(key, sort_keys=True, allow_nan=False)
-                    require(encoded not in series, "duplicate histogram series in snapshot")
-                    series[encoded] = (key, histogram_point(point))
+                    require(encoded not in series, "duplicate metric series in snapshot")
+                    series[encoded] = (key, histogram_point(point) if kind == "histogram" else counter_point(point))
                     seen.add(metric["name"])
-    require(seen == set(names), "snapshot is missing requested histogram observations")
+    require(seen == set(names), "snapshot is missing requested metric observations")
     return series
 
 
@@ -129,22 +144,29 @@ def window(before, after, names, expected_start=None, expected_end=None):
         expected_end = uint(expected_end, "expected end")
         require(0 < expected_start < expected_end, "invalid expected window")
     first, last = snapshot(before, names), snapshot(after, names)
-    require(first.keys() == last.keys(), "histogram series identity changed or is missing at a boundary")
+    require(first.keys() == last.keys(), "metric series identity changed or is missing at a boundary")
     rows = []
     for key in sorted(first):
         descriptor, a = first[key]
         _, b = last[key]
-        require(a["start"] == b["start"], "histogram reset within measurement window")
+        require(a["kind"] == b["kind"], "metric type changed within measurement window")
+        require(a["start"] == b["start"], "metric reset within measurement window")
         require(a["end"] < b["end"], "duplicate or reversed snapshot time")
-        require(a["bounds"] == b["bounds"], "histogram boundaries changed")
         if expected_start is not None:
             require((a["end"], b["end"]) == (expected_start, expected_end),
-                    "histogram does not match the requested measurement window")
+                    "metric does not match the requested measurement window")
+        row = {**descriptor, "kind": a["kind"], "window_start_ns": a["end"], "window_end_ns": b["end"]}
+        if a["kind"] == "sum":
+            delta = b["value"] - a["value"]
+            require(delta >= 0, "integer counter decreased")
+            rows.append({**row, "delta": delta})
+            continue
+        require(a["bounds"] == b["bounds"], "histogram boundaries changed")
         buckets = [end - start for start, end in zip(a["buckets"], b["buckets"])]
         require(all(value >= 0 for value in buckets), "histogram bucket counter decreased")
         count = b["count"] - a["count"]
         require(count == sum(buckets), "window count does not match buckets")
-        rows.append({**descriptor, "window_start_ns": a["end"], "window_end_ns": b["end"],
+        rows.append({**row,
                      "count": count, "explicit_bounds": a["bounds"], "bucket_counts": buckets,
                      "p95": quantile_bounds(buckets, a["bounds"], 95),
                      "p99": quantile_bounds(buckets, a["bounds"], 99)})

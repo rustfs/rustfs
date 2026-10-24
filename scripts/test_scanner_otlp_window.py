@@ -115,7 +115,7 @@ class WindowTests(unittest.TestCase):
     def test_rejects_duplicate_series_or_missing_metric(self):
         scope = self.after["resourceMetrics"][0]["scopeMetrics"][0]
         scope["metrics"].append(copy.deepcopy(metric(self.after)))
-        with self.assertRaisesRegex(ValueError, "duplicate histogram"):
+        with self.assertRaisesRegex(ValueError, "duplicate metric"):
             self.result()
         scope["metrics"] = []
         with self.assertRaisesRegex(ValueError, "missing requested"):
@@ -170,11 +170,11 @@ class WindowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "both expected"):
             collector.window(self.before, self.after, [METRIC], START + 10)
 
-    def test_rejects_delta_or_non_histogram(self):
+    def test_rejects_delta_or_gauge(self):
         metric(self.after)["histogram"]["aggregationTemporality"] = 1
         with self.assertRaisesRegex(ValueError, "not cumulative"):
             self.result()
-        metric(self.after)["sum"] = metric(self.after).pop("histogram")
+        metric(self.after)["gauge"] = metric(self.after).pop("histogram")
         with self.assertRaisesRegex(ValueError, "unsupported metric type"):
             self.result()
 
@@ -210,6 +210,144 @@ class WindowTests(unittest.TestCase):
             after.write_text(json.dumps(self.after))
             self.assertNotEqual(subprocess.run(command, capture_output=True).returncode, 0)
             self.assertFalse(output.exists())
+
+
+COUNTER = "rustfs_scanner_cache_serialized_bytes_total"
+
+
+def counter_export(end, value):
+    document = export(end, [0, 0, 0])
+    data = metric(document)
+    data.update(name=COUNTER, unit="By")
+    data.pop("histogram")
+    data["sum"] = {"aggregationTemporality": 2, "isMonotonic": True, "dataPoints": [{
+        "startTimeUnixNano": str(START), "timeUnixNano": str(end), "asInt": str(value),
+        "attributes": [{"key": "cache", "value": {"stringValue": "main"}}],
+    }]}
+    return document
+
+
+def counter_point(document):
+    return metric(document)["sum"]["dataPoints"][0]
+
+
+class CounterWindowTests(unittest.TestCase):
+    def setUp(self):
+        self.before = counter_export(START + 10, 2**60 + 3)
+        self.after = counter_export(START + 20, 2**60 + 4)
+
+    def result(self):
+        return collector.window(self.before, self.after, [COUNTER], START + 10, START + 20)
+
+    def test_counter_delta_preserves_large_integer_precision(self):
+        row = self.result()["series"][0]
+        self.assertEqual(row["kind"], "sum")
+        self.assertEqual(row["delta"], 1)
+        self.assertIs(type(row["delta"]), int)
+        self.assertEqual((row["window_start_ns"], row["window_end_ns"]), (START + 10, START + 20))
+        self.assertNotIn("p99", row)
+
+    def test_observed_unchanged_counter_is_zero(self):
+        for value in (0, 2**63 - 1):
+            with self.subTest(value=value):
+                counter_point(self.before)["asInt"] = value
+                counter_point(self.after)["asInt"] = str(value)
+                self.assertEqual(self.result()["series"][0]["delta"], 0)
+
+    def test_counter_rejects_reset_and_decrease(self):
+        counter_point(self.after)["startTimeUnixNano"] = str(START + 1)
+        with self.assertRaisesRegex(ValueError, "reset"):
+            self.result()
+        counter_point(self.after)["startTimeUnixNano"] = str(START)
+        counter_point(self.after)["asInt"] = "1"
+        with self.assertRaisesRegex(ValueError, "counter decreased"):
+            self.result()
+
+    def test_counter_requires_monotonic_cumulative_sum(self):
+        for value in (False, None, 1, "true"):
+            with self.subTest(value=value):
+                metric(self.after)["sum"]["isMonotonic"] = value
+                with self.assertRaises(ValueError):
+                    self.result()
+        metric(self.after)["sum"]["isMonotonic"] = True
+        metric(self.after)["sum"]["aggregationTemporality"] = 1
+        with self.assertRaises(ValueError):
+            self.result()
+
+    def test_counter_rejects_non_int64_or_ambiguous_values(self):
+        for value in (-1, "-1", str(2**63), True, 3.0, "3.0", None):
+            with self.subTest(value=value):
+                counter_point(self.after)["asInt"] = value
+                with self.assertRaises(ValueError):
+                    self.result()
+        for values in ({}, {"asDouble": 3.0}, {"asInt": "3", "asDouble": 3.0}):
+            with self.subTest(values=values):
+                p = counter_point(self.after)
+                p.pop("asInt", None)
+                p.pop("asDouble", None)
+                p.update(values)
+                with self.assertRaises(ValueError):
+                    self.result()
+
+    def test_counter_rejects_missing_series_or_changed_identity(self):
+        for change in ("missing", "duplicate", "labels", "unit"):
+            with self.subTest(change=change):
+                after = copy.deepcopy(self.after)
+                if change == "missing":
+                    metric(after)["sum"]["dataPoints"] = []
+                elif change == "duplicate":
+                    metric(after)["sum"]["dataPoints"] *= 2
+                elif change == "labels":
+                    counter_point(after)["attributes"][0]["value"]["stringValue"] = "backup"
+                else:
+                    metric(after)["unit"] = "KiB"
+                with self.assertRaises(ValueError):
+                    collector.window(self.before, after, [COUNTER])
+
+    def test_counter_rejects_flags_and_invalid_times(self):
+        for update in ({"flags": 1}, {"startTimeUnixNano": "0"},
+                       {"timeUnixNano": str(START + 10)}, {"timeUnixNano": str(START + 21)}):
+            with self.subTest(update=update):
+                after = copy.deepcopy(self.after)
+                counter_point(after).update(update)
+                with self.assertRaises(ValueError):
+                    collector.window(self.before, after, [COUNTER], START + 10, START + 20)
+
+    def test_counter_rejects_metric_type_change(self):
+        after = export(START + 20, [1, 2, 3])
+        metric(after).update(name=COUNTER, unit="By")
+        point(after)["attributes"] = counter_point(self.before)["attributes"]
+        with self.assertRaisesRegex(ValueError, "type changed"):
+            collector.window(self.before, after, [COUNTER])
+
+    def test_counter_and_histogram_share_checked_window(self):
+        for document, end, buckets in ((self.before, START + 10, [1, 2, 3]),
+                                       (self.after, START + 20, [2, 4, 6])):
+            document["resourceMetrics"][0]["scopeMetrics"][0]["metrics"].append(metric(export(end, buckets)))
+        result = collector.window(self.before, self.after, [COUNTER, METRIC], START + 10, START + 20)
+        rows = {row["name"]: row for row in result["series"]}
+        self.assertEqual(rows[COUNTER]["delta"], 1)
+        self.assertEqual(rows[METRIC]["count"], 6)
+        self.assertTrue(result["window_checked"])
+        counter_point(self.after)["timeUnixNano"] = str(START + 21)
+        with self.assertRaisesRegex(ValueError, "requested measurement window"):
+            collector.window(self.before, self.after, [COUNTER, METRIC], START + 10, START + 20)
+
+    def test_counter_cli_keeps_provenance_and_exact_value(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            before, after, output = (root / name for name in ("before.json", "after.json", "window.json"))
+            before.write_text(json.dumps(self.before))
+            after.write_text(json.dumps(self.after))
+            command = [sys.executable, collector.__file__, "--before", str(before), "--after", str(after),
+                       "--metric", COUNTER, "--start-ns", str(START + 10), "--end-ns", str(START + 20),
+                       "--out", str(output)]
+            run = subprocess.run(command, capture_output=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            result = json.loads(output.read_text())
+            self.assertTrue(result["window_checked"])
+            self.assertEqual(result["series"][0]["delta"], 1)
+            self.assertEqual(result["snapshots"]["after_sha256"], collector.load(after, "json")[1])
 
 
 if __name__ == "__main__":
