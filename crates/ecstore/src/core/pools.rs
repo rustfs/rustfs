@@ -16974,28 +16974,36 @@ impl ECStore {
                         DecommissionCapacityAdmission::ScannerBacklog,
                     )?;
                 }
-                let results = join_all(
+                let persist = |read: &data_movement::scanner_backlog::ScannerPauseBacklogRetirementRead| {
+                    let target = Arc::clone(&self.pools[read.replica.pool_index].disk_set[read.replica.set_index]);
+                    let record = record.clone();
+                    let preconditions = read.preconditions();
+                    let object_fence = &object_fence;
+                    let pool_meta_guard = &pool_meta_guard;
+                    async move {
+                        let mut opts = ObjectOptions {
+                            no_lock: self.pools[0].disk_set[0].shares_namespace_lock_domain(&target).await,
+                            ..Default::default()
+                        };
+                        object_fence.add_namespace_lock_fence(&mut opts);
+                        opts.add_namespace_lock_guard(pool_meta_guard);
+                        persist_native_scanner_pause_backlog_replica(target, record, preconditions, opts, phase).await
+                    }
+                };
+                let survivors = || {
                     replicas
                         .iter()
                         .filter(|read| read.replica.pool_index != idx && read.replica.writable)
-                        .map(|read| {
-                            let target = Arc::clone(&self.pools[read.replica.pool_index].disk_set[read.replica.set_index]);
-                            let record = record.clone();
-                            let object_fence = &object_fence;
-                            let pool_meta_guard = &pool_meta_guard;
-                            async move {
-                                let mut opts = ObjectOptions {
-                                    no_lock: self.pools[0].disk_set[0].shares_namespace_lock_domain(&target).await,
-                                    ..Default::default()
-                                };
-                                object_fence.add_namespace_lock_fence(&mut opts);
-                                opts.add_namespace_lock_guard(pool_meta_guard);
-                                persist_native_scanner_pause_backlog_replica(target, record, read.preconditions(), opts, phase)
-                                    .await
-                            }
-                        }),
-                )
-                .await;
+                };
+                // Create survivors that read as missing first, one at a time, and
+                // stop at the first failure. A failed create then leaves every
+                // stored survivor unchanged, so the retry re-plans from the same
+                // authority; a survivor that only read as missing rejects its
+                // create before any stored survivor is overwritten.
+                for read in survivors().filter(|read| read.replica.data.is_none()) {
+                    persist(read).await?;
+                }
+                let results = join_all(survivors().filter(|read| read.replica.data.is_some()).map(persist)).await;
                 // Every dispatched native CAS has finished before an error can
                 // release the owned task's object and durable membership fences.
                 for result in results {
