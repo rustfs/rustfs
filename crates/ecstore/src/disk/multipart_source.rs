@@ -18,6 +18,10 @@ pub const MULTIPART_SOURCE_MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 pub const MULTIPART_SOURCE_CONDITION_SUFFIX: &str = "multipart-source-condition";
 const PUBLICATION_SUFFIX: &str = "multipart-source-publication";
 const STATUS_SUFFIX: &str = "multipart-source-status";
+#[path = "multipart_source_abort.rs"]
+mod abort;
+pub use abort::*;
+
 const PROOF_DOMAIN: &[u8] = b"rustfs-mpu-source-native-proof-v1\0";
 
 /// A native-only proof scope, bound to one complete local instance topology.
@@ -292,6 +296,7 @@ pub enum MultipartSourcePhase {
     LocalTerminalSeal,
     GlobalTerminalCertified,
     RootMissing,
+    Aborting,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -650,6 +655,12 @@ pub struct MultipartSourceInspection {
     pub negative_certificate: Option<MultipartCertificate>,
     pub ready_certificate: Option<MultipartCertificate>,
     pub terminal_certificate: Vec<MultipartSourceProof>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub root_missing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abort_round: Option<MultipartAbortRound>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abort_certificate: Option<MultipartAbortCertificate>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -657,6 +668,26 @@ pub struct MultipartSourceInspection {
 pub enum MultipartSourceOperation {
     Inspect {
         lineage: Option<SourceLineage>,
+    },
+    UpgradeLegacy {
+        expected: MultipartSourceSnapshot,
+    },
+    PrepareAbort {
+        expected: MultipartSourceSnapshot,
+        round: MultipartAbortRound,
+    },
+    CommitAbort {
+        expected: MultipartSourceSnapshot,
+        certificate: MultipartAbortCertificate,
+    },
+    DeleteAborted {
+        expected: MultipartSourceSnapshot,
+        certificate: MultipartAbortCertificate,
+    },
+    ConfirmCleanupTarget {
+        expected: MultipartSourceSnapshot,
+        publication: PublicationIdentity,
+        challenge: Uuid,
     },
     Claim {
         expected: MultipartSourceSnapshot,
@@ -710,6 +741,8 @@ impl MultipartSourceRequest {
             MultipartSourceOperation::Restore { certificate, .. } | MultipartSourceOperation::Activate { certificate, .. } => {
                 certificate.prepare_wire()
             }
+            MultipartSourceOperation::CommitAbort { certificate, .. }
+            | MultipartSourceOperation::DeleteAborted { certificate, .. } => certificate.prepare_wire(),
             _ => Ok(()),
         }
     }
@@ -719,6 +752,8 @@ impl MultipartSourceRequest {
             MultipartSourceOperation::Restore { certificate, .. } | MultipartSourceOperation::Activate { certificate, .. } => {
                 certificate.validate_wire()
             }
+            MultipartSourceOperation::CommitAbort { certificate, .. }
+            | MultipartSourceOperation::DeleteAborted { certificate, .. } => certificate.validate_wire(),
             _ => Ok(()),
         }
     }
@@ -727,9 +762,43 @@ impl MultipartSourceRequest {
             return Err(DiskError::UnsupportedDisk);
         }
         validate_path(&self.path)?;
+        match &self.operation {
+            MultipartSourceOperation::PrepareAbort { expected, round } => {
+                round.validate()?;
+                if expected.lineage != round.lineage {
+                    return Err(DiskError::ConditionalDeleteConflict);
+                }
+            }
+            MultipartSourceOperation::CommitAbort { expected, certificate }
+            | MultipartSourceOperation::DeleteAborted { expected, certificate } => {
+                certificate.validate_shape()?;
+                if expected.lineage != certificate.round.lineage || expected.phase != MultipartSourcePhase::Aborting {
+                    return Err(DiskError::ConditionalDeleteConflict);
+                }
+            }
+            MultipartSourceOperation::ConfirmCleanupTarget {
+                expected,
+                publication,
+                challenge,
+            } => {
+                publication.lineage.validate()?;
+                if expected.lineage != publication.lineage
+                    || expected.phase != MultipartSourcePhase::Aborting
+                    || challenge.is_nil()
+                {
+                    return Err(DiskError::ConditionalDeleteConflict);
+                }
+            }
+            _ => {}
+        }
         let lineage = match &self.operation {
             MultipartSourceOperation::Inspect { lineage } => lineage.as_ref(),
-            MultipartSourceOperation::Claim { expected, .. }
+            MultipartSourceOperation::UpgradeLegacy { expected }
+            | MultipartSourceOperation::PrepareAbort { expected, .. }
+            | MultipartSourceOperation::CommitAbort { expected, .. }
+            | MultipartSourceOperation::DeleteAborted { expected, .. }
+            | MultipartSourceOperation::ConfirmCleanupTarget { expected, .. }
+            | MultipartSourceOperation::Claim { expected, .. }
             | MultipartSourceOperation::UndoAndClaim { expected, .. }
             | MultipartSourceOperation::Restore { expected, .. }
             | MultipartSourceOperation::Activate { expected, .. }
@@ -750,6 +819,11 @@ impl MultipartSourceRequest {
 #[serde(tag = "result", content = "value", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MultipartSourceResponse {
     Inspected(MultipartSourceInspection),
+    LegacyUpgraded(MultipartSourceInspection),
+    AbortPrepared(MultipartAbortProof),
+    AbortCommitted(MultipartAbortProof),
+    AbortDeleted(MultipartAbortProof),
+    CleanupTargetConfirmed(MultipartAbortProof),
     Claimed(MultipartSourceProof),
     Restored(MultipartSourceProof),
     Activated(MultipartSourceProof),
@@ -758,11 +832,14 @@ pub enum MultipartSourceResponse {
 impl MultipartSourceResponse {
     pub fn prepare_wire(&mut self) -> Result<()> {
         match self {
-            Self::Inspected(inspection) => {
+            Self::Inspected(inspection) | Self::LegacyUpgraded(inspection) => {
                 if let Some(certificate) = &mut inspection.negative_certificate {
                     certificate.prepare_wire()?;
                 }
                 if let Some(certificate) = &mut inspection.ready_certificate {
+                    certificate.prepare_wire()?;
+                }
+                if let Some(certificate) = &mut inspection.abort_certificate {
                     certificate.prepare_wire()?;
                 }
                 if inspection.terminal_certificate.len() > 16 {
@@ -773,6 +850,10 @@ impl MultipartSourceResponse {
                 }
                 Ok(())
             }
+            Self::AbortPrepared(proof)
+            | Self::AbortCommitted(proof)
+            | Self::AbortDeleted(proof)
+            | Self::CleanupTargetConfirmed(proof) => proof.prepare_wire(),
             Self::Claimed(proof) | Self::Restored(proof) | Self::Activated(proof) | Self::TerminalConfirmed(proof) => {
                 proof.prepare_wire()
             }
@@ -780,11 +861,14 @@ impl MultipartSourceResponse {
     }
     pub fn validate_wire(&self) -> Result<()> {
         match self {
-            Self::Inspected(inspection) => {
+            Self::Inspected(inspection) | Self::LegacyUpgraded(inspection) => {
                 if let Some(certificate) = &inspection.negative_certificate {
                     certificate.validate_wire()?;
                 }
                 if let Some(certificate) = &inspection.ready_certificate {
+                    certificate.validate_wire()?;
+                }
+                if let Some(certificate) = &inspection.abort_certificate {
                     certificate.validate_wire()?;
                 }
                 if inspection.terminal_certificate.len() > 16 {
@@ -795,6 +879,10 @@ impl MultipartSourceResponse {
                 }
                 Ok(())
             }
+            Self::AbortPrepared(proof)
+            | Self::AbortCommitted(proof)
+            | Self::AbortDeleted(proof)
+            | Self::CleanupTargetConfirmed(proof) => proof.verify(),
             Self::Claimed(proof) | Self::Restored(proof) | Self::Activated(proof) | Self::TerminalConfirmed(proof) => {
                 proof.verify()
             }
@@ -810,6 +898,54 @@ impl MultipartSourceResponse {
     ) -> Result<()> {
         request.validate()?;
         match (self, &request.operation) {
+            (Self::LegacyUpgraded(inspection), MultipartSourceOperation::UpgradeLegacy { expected })
+                if inspection.disk_id == expected.disk_id
+                    && inspection.snapshot.as_ref().is_some_and(|s| {
+                        s.lineage == expected.lineage
+                            && s.disk_id == expected.disk_id
+                            && s.physical_slot == expected.physical_slot
+                    }) =>
+            {
+                Ok(())
+            }
+            (Self::AbortPrepared(proof), MultipartSourceOperation::PrepareAbort { round, expected })
+                if proof.kind == MultipartAbortProofKind::Prepared
+                    && proof.round == *round
+                    && proof.challenge == round.round
+                    && proof.snapshot.disk_id == expected.disk_id
+                    && proof.snapshot.physical_slot == expected.physical_slot =>
+            {
+                proof.verify_with_authority(authority)
+            }
+            (Self::AbortCommitted(proof), MultipartSourceOperation::CommitAbort { certificate, expected })
+            | (Self::AbortDeleted(proof), MultipartSourceOperation::DeleteAborted { certificate, expected })
+                if proof.round == certificate.round
+                    && proof.challenge == certificate.round.round
+                    && proof.snapshot.disk_id == expected.disk_id
+                    && proof.snapshot.physical_slot == expected.physical_slot
+                    && proof.certificate_sha256 == Some(certificate.digest()?)
+                    && matches!(
+                        (self, proof.kind),
+                        (Self::AbortCommitted(_), MultipartAbortProofKind::Committed)
+                            | (Self::AbortDeleted(_), MultipartAbortProofKind::Deleted)
+                    ) =>
+            {
+                proof.verify_with_authority(authority)
+            }
+            (
+                Self::CleanupTargetConfirmed(proof),
+                MultipartSourceOperation::ConfirmCleanupTarget {
+                    expected,
+                    publication,
+                    challenge,
+                },
+            ) if proof.kind == MultipartAbortProofKind::CleanupTarget
+                && proof.challenge == *challenge
+                && proof.publication.as_ref() == Some(publication)
+                && proof.snapshot == *expected =>
+            {
+                proof.verify_with_authority(authority)
+            }
             (Self::Inspected(inspection), MultipartSourceOperation::Inspect { .. }) if !inspection.disk_id.is_nil() => {
                 if inspection
                     .snapshot
@@ -1029,6 +1165,7 @@ pub fn capture_source_condition(
     if !is_active_source(fi)? || attempt.is_nil() {
         return Err(DiskError::ConditionalDeleteConflict);
     }
+    native_source_protocol(fi)?;
     let original = normalized_info(fi, false);
     let source_dir = fi.data_dir.filter(|dir| !dir.is_nil()).ok_or(DiskError::FileCorrupt)?;
     let generation = source_status(fi)?.map_or(
@@ -1073,6 +1210,9 @@ impl SourceConditionV1 {
     }
     /// Adds the common persisted tuple and the transport-only precondition.
     pub fn attach(&self, fi: &mut FileInfo) -> Result<PublicationIdentity> {
+        native_source_protocol(fi)?;
+        rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, NATIVE_SOURCE_PROTOCOL_SUFFIX);
+
         self.validate()?;
         let publication = PublicationIdentity {
             lineage: self.lineage.clone(),
@@ -1093,6 +1233,7 @@ impl SourceConditionV1 {
         Ok(condition)
     }
     pub(super) fn matches_original(&self, fi: &FileInfo) -> Result<bool> {
+        native_source_protocol(fi)?;
         Ok(digest_value(&normalized_info(fi, false))? == self.lineage.original_identity)
     }
 }
@@ -1109,6 +1250,7 @@ pub(super) fn source_status(fi: &FileInfo) -> Result<Option<SourceStatus>> {
     decode_metadata(&fi.metadata, STATUS_SUFFIX)
 }
 pub fn is_active_source(fi: &FileInfo) -> Result<bool> {
+    native_source_protocol(fi)?;
     if publication_identity(fi)?.is_some() {
         return Ok(false);
     }
@@ -1147,7 +1289,12 @@ pub fn strip_transport_condition(metadata: &mut HashMap<String, String>) {
     rustfs_utils::http::metadata_compat::remove_str(metadata, MULTIPART_SOURCE_CONDITION_SUFFIX);
 }
 pub fn strip_native_controls(metadata: &mut HashMap<String, String>) {
-    for suffix in [MULTIPART_SOURCE_CONDITION_SUFFIX, PUBLICATION_SUFFIX, STATUS_SUFFIX] {
+    for suffix in [
+        MULTIPART_SOURCE_CONDITION_SUFFIX,
+        PUBLICATION_SUFFIX,
+        STATUS_SUFFIX,
+        NATIVE_SOURCE_PROTOCOL_SUFFIX,
+    ] {
         rustfs_utils::http::metadata_compat::remove_str(metadata, suffix);
     }
 }
@@ -1221,13 +1368,13 @@ mod multipart_proof_authority_tests {
         EndpointServerPools(pools)
     }
 
-    fn local_authority() -> ProofVerificationContext {
+    pub(super) fn local_authority() -> ProofVerificationContext {
         ProofVerificationContext::for_topology(&topology(false))
             .expect("complete local topology")
             .1
     }
 
-    fn fixture() -> (MultipartRecoveryRound, MultipartSourceSnapshot) {
+    pub(super) fn fixture() -> (MultipartRecoveryRound, MultipartSourceSnapshot) {
         let original_data_dir = Uuid::new_v4();
         let lineage = SourceLineage {
             bucket: "bucket".into(),
@@ -1463,6 +1610,9 @@ mod multipart_proof_authority_tests {
                 negative_certificate: (nested == 0).then(|| cert.clone()),
                 ready_certificate: (nested == 1).then(|| cert.clone()),
                 terminal_certificate: if nested == 2 { cert.proofs.clone() } else { Vec::new() },
+                root_missing: false,
+                abort_round: None,
+                abort_certificate: None,
             };
             let response = MultipartSourceResponse::Inspected(inspection);
             let bytes = rmp_serde::to_vec_named(&response).unwrap();

@@ -61,6 +61,8 @@ pub(super) struct SourceState {
     pub undo: Option<NativeUndoIntent>,
     #[serde(default)]
     pub restore_from: Option<MultipartSourceSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abort: Option<super::multipart_source_abort::NativeAbortState>,
 }
 impl SourceState {
     pub fn advance(&mut self, phase: MultipartSourcePhase) -> Result<()> {
@@ -68,7 +70,7 @@ impl SourceState {
         self.phase = phase;
         Ok(())
     }
-    fn validate(&self, disk_id: Uuid, path: &str) -> Result<()> {
+    pub(super) fn validate(&self, disk_id: Uuid, path: &str) -> Result<()> {
         self.lineage.validate()?;
         if self.protocol_version != MULTIPART_SOURCE_PROTOCOL_VERSION
             || self.disk_id != disk_id
@@ -81,6 +83,11 @@ impl SourceState {
             || self.previous_target_sha256.is_some() != self.previous_target_length.is_some()
             || self.publication.as_ref().is_some_and(|p| p.lineage != self.lineage)
         {
+            return Err(DiskError::FileCorrupt);
+        }
+        if let Some(abort) = &self.abort {
+            abort.validate(self)?;
+        } else if self.phase == MultipartSourcePhase::Aborting {
             return Err(DiskError::FileCorrupt);
         }
         Ok(())
@@ -193,13 +200,13 @@ impl LocalDisk {
     }
 }
 
-fn raw_sha(raw: &[u8]) -> [u8; 32] {
+pub(super) fn raw_sha(raw: &[u8]) -> [u8; 32] {
     Sha256::digest(raw).into()
 }
-fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
+pub(super) fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
     Ok(rmp_serde::to_vec_named(value).map_err(Error::other)?)
 }
-fn decode<T: serde::de::DeserializeOwned>(raw: &[u8]) -> Result<T> {
+pub(super) fn decode<T: serde::de::DeserializeOwned>(raw: &[u8]) -> Result<T> {
     if raw.len() > MULTIPART_SOURCE_MAX_PAYLOAD_BYTES {
         return Err(DiskError::FileCorrupt);
     }
@@ -210,7 +217,7 @@ fn decode<T: serde::de::DeserializeOwned>(raw: &[u8]) -> Result<T> {
     }
     Ok(value)
 }
-fn read_optional(path: &Path, base: &Path, root: &os::PublicationRoot) -> Result<Option<Bytes>> {
+pub(super) fn read_optional(path: &Path, base: &Path, root: &os::PublicationRoot) -> Result<Option<Bytes>> {
     match os::read_multipart_source_metadata(path, base, root) {
         Ok(bytes) => Ok(Some(Bytes::from(bytes))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -245,6 +252,7 @@ pub(super) fn validate_source_mutation(source: &Path, base: &Path, root: &os::Pu
         },
     )
     .map_err(Error::other)?;
+    native_source_protocol(&fi)?;
     if fi.deleted || !is_active_source(&fi)? {
         return Err(DiskError::ConditionalDeleteConflict);
     }
@@ -296,7 +304,7 @@ fn certificate_path(source: &Path, round: Uuid, ready: bool) -> PathBuf {
         .join(round.to_string())
         .join(if ready { "ready.msgpack" } else { "negative.msgpack" })
 }
-fn original_path(source: &Path, owner: Uuid) -> PathBuf {
+pub(super) fn original_path(source: &Path, owner: Uuid) -> PathBuf {
     source
         .join(".mpu-completions")
         .join(owner.to_string())
@@ -411,6 +419,7 @@ impl SourceStore {
             negative_claim: None,
             undo: None,
             restore_from: None,
+            abort: None,
         };
         self.write_owned_backup(state.backup_owner, false, original).await?;
         self.persist(&state).await?;
@@ -473,6 +482,9 @@ impl SourceStore {
     }
     /// Writes only the head; the caller persists its fence and owns revisions.
     pub async fn restore_original(&self, state: &mut SourceState, recovering: bool, ready: Option<[u8; 32]>) -> Result<()> {
+        if state.phase == MultipartSourcePhase::Aborting || state.abort.is_some() {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
         let loaded = self.load().await?;
         let actual = loaded.state.as_ref().ok_or(DiskError::ConditionalDeleteConflict)?;
         if encode(actual)? != encode(state)? {
@@ -541,6 +553,7 @@ impl SourceStore {
         }
         let mut info = file_info(&raw, RUSTFS_META_MULTIPART_BUCKET, &self.path, state.lineage.original_version_id)?;
         strip_native_controls(&mut info.metadata);
+        mark_native_source(&mut info);
         set_source_status(
             &mut info,
             &SourceStatus {
@@ -750,7 +763,7 @@ impl SourceStore {
     }
 }
 
-fn load_source(
+pub(super) fn load_source(
     source: &Path,
     base: &Path,
     root: &os::PublicationRoot,
@@ -761,6 +774,9 @@ fn load_source(
 ) -> Result<LoadedSource> {
     let state_raw = read_optional(&source.join(STATE), base, root)?;
     let state: Option<SourceState> = state_raw.as_deref().map(decode).transpose()?;
+    if state.is_none() && os::multipart_source_has_native_controls(source, base, root)? {
+        return Err(DiskError::ConditionalDeleteConflict);
+    }
     let head_path = source.join(STORAGE_FORMAT_FILE);
     let head = if let Some(state) = state.as_ref() {
         let maximum = state
@@ -806,6 +822,8 @@ fn load_source(
             return Err(DiskError::FileCorrupt);
         }
         let original_info = file_info(&raw, RUSTFS_META_MULTIPART_BUCKET, path, state.lineage.original_version_id)?;
+        native_source_protocol(&original_info)?;
+        super::multipart_source_abort::validate_retired_head(source, base, root, state, head.as_ref())?;
         let condition = SourceConditionV1 {
             lineage: state.lineage.clone(),
             generation: state.generation,
@@ -886,6 +904,13 @@ fn load_source(
             },
         )
         .map_err(Error::other)?;
+        native_source_protocol(&current)?;
+        if source_status(&current)?.is_some()
+            || publication_identity(&current)?.is_some()
+            || SourceConditionV1::take(&mut current.clone())?.is_some()
+        {
+            return Err(DiskError::FileCorrupt);
+        }
         let bucket = rustfs_utils::http::metadata_compat::get_consistent_str(&current.metadata, "multipart-bucket")
             .ok_or(DiskError::FileCorrupt)?;
         let object = rustfs_utils::http::metadata_compat::get_consistent_str(&current.metadata, "multipart-object")
@@ -989,6 +1014,47 @@ impl SourceStore {
         .map_err(DiskError::from)
     }
     /// This caller already owns SourceRW and destination metadata ownership.
+    /// An Aborting survivor can confirm a historical target only with its
+    /// independent, same-disk publication anchor. Closure never creates one.
+    pub async fn validate_cleanup_target(&self, publication: &PublicationIdentity) -> Result<()> {
+        publication.lineage.validate()?;
+        let loaded = self.load().await?;
+        let state = loaded.state.as_ref().ok_or(DiskError::ConditionalDeleteConflict)?;
+        if state.phase != MultipartSourcePhase::Aborting
+            || loaded.head.is_some()
+            || state.lineage != publication.lineage
+            || self.read_abort_certificate(&loaded).await?.is_none()
+        {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
+        let raw = self
+            .read_target(publication)
+            .await?
+            .ok_or(DiskError::ConditionalDeleteConflict)?;
+        if !self.target_matches(publication, &raw)? {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
+        let anchor_path = self
+            .target_path(publication)?
+            .join(publication.final_data_dir.to_string())
+            .join(RETIREMENT_ANCHOR);
+        let base = self.base.clone();
+        let root = self.publication_root.clone();
+        let bytes = os::run_blocking_namespace_operation(self.lease.clone(), move || {
+            os::read_multipart_source_metadata(&anchor_path, &base, &root)
+        })
+        .await?;
+        let anchor: NativeRetirementAnchor = decode(&bytes)?;
+        if anchor.protocol_version != MULTIPART_SOURCE_PROTOCOL_VERSION
+            || anchor.disk_id != self.disk_id
+            || anchor.physical_slot != self.physical_slot
+            || anchor.publication != *publication
+            || anchor.source_validation_receipt_id.is_nil()
+        {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
+        self.sync_target(publication).await
+    }
     /// No absent-source operation creates a head, record, capability or anchor.
     pub async fn confirm_root_missing(&self, publication: &PublicationIdentity, challenge: Uuid) -> Result<MultipartSourceProof> {
         if self.path != publication.lineage.path
@@ -1097,6 +1163,10 @@ impl LocalDisk {
         let existing_publication = publication_identity(incoming)?;
         let supplied = SourceConditionV1::take(incoming)?;
         let legacy = supplied.is_none();
+        let marked = native_source_protocol(info)?;
+        if marked == legacy {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
         let condition = match supplied {
             Some(condition) => {
                 condition.validate()?;
@@ -1166,6 +1236,7 @@ impl LocalDisk {
             negative_claim: None,
             undo: None,
             restore_from: None,
+            abort: None,
         };
         // Copy the small source FI to an independent immutable inode. Its
         // canonical inode is never truncated to build the destination proxy.

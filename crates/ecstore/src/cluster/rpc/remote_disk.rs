@@ -4933,6 +4933,9 @@ mod tests {
             negative_certificate: None,
             ready_certificate: None,
             terminal_certificate: Vec::new(),
+            root_missing: false,
+            abort_round: None,
+            abort_certificate: None,
         });
         let valid = RecoverMultipartSourceRpcResponse {
             success: true,
@@ -4952,6 +4955,9 @@ mod tests {
             negative_certificate: None,
             ready_certificate: None,
             terminal_certificate: Vec::new(),
+            root_missing: false,
+            abort_round: None,
+            abort_certificate: None,
         });
         let wrong_scope = RecoverMultipartSourceRpcResponse {
             result: rmp_serde::to_vec_named(&wrong_scope).expect("unrelated inspection").into(),

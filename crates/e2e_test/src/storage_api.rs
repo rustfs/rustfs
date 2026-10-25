@@ -57,3 +57,12 @@ pub(crate) mod replication_extension {
 pub(crate) mod upgrade_compatibility {
     pub(crate) use super::{DiskOption, Endpoint, new_disk};
 }
+
+#[cfg(test)]
+pub(crate) mod multipart_source_rpc {
+    pub(crate) use rustfs_ecstore::api::disk::{
+        MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartAbortCertificate, MultipartAbortProof, MultipartAbortProofKind,
+        MultipartAbortRound, MultipartSourceOperation, MultipartSourcePhase, MultipartSourceRequest, MultipartSourceSnapshot,
+        PublicationIdentity, SourceGeneration, SourceGeometry, SourceLineage,
+    };
+}

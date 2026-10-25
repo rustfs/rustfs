@@ -14,6 +14,9 @@
 
 //! Method-selective faults without changing the server or gRPC body/trailers.
 
+use crate::storage_api::multipart_source_rpc::{
+    MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartSourceOperation, MultipartSourceRequest as NativeSourceRequest,
+};
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full, Limited, combinators::BoxBody};
 use hyper::{Request, body::Incoming, service::service_fn};
@@ -23,8 +26,9 @@ use hyper_util::{
     server::conn::auto,
 };
 use prost::Message as _;
-use rustfs_protos::proto_gen::node_service::DeleteRequest;
+use rustfs_protos::proto_gen::node_service::{DeleteRequest, ReadVersionRequest, RecoverMultipartSourceRequest};
 use std::{
+    collections::HashSet,
     io,
     net::SocketAddr,
     sync::{
@@ -56,6 +60,7 @@ struct PauseState {
     matched: AtomicUsize,
     blocked: AtomicUsize,
     forwarded: AtomicUsize,
+    forwarded_routes: Mutex<HashSet<String>>,
     reached: Notify,
     release: watch::Sender<Disposition>,
 }
@@ -75,6 +80,10 @@ impl RpcPause {
     /// Selected RPCs whose backend returned a response, excluding discarded packets.
     pub(crate) fn forwarded(&self) -> usize {
         self.state.forwarded.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn forwarded_routes(&self) -> usize {
+        self.state.forwarded_routes.lock().expect("RPC route observations").len()
     }
 
     pub(crate) async fn wait_for_hits(&self, count: usize) -> io::Result<()> {
@@ -186,6 +195,7 @@ impl RpcFaultProxy {
             matched: AtomicUsize::new(0),
             blocked: AtomicUsize::new(0),
             forwarded: AtomicUsize::new(0),
+            forwarded_routes: Mutex::new(HashSet::new()),
             reached: Notify::new(),
             release,
         });
@@ -197,24 +207,45 @@ impl RpcFaultProxy {
     }
 }
 
-fn scope_matches(method: &str, body: &[u8], scope: &[u8]) -> io::Result<bool> {
-    if method != "Delete" {
-        return Ok(body.windows(scope.len()).any(|window| window == scope));
-    }
-    // Abort's recursive root delete must not be confused with transaction or
-    // part cleanup below that root. This is a unary, uncompressed gRPC frame.
+fn unary_payload(body: &[u8]) -> io::Result<&[u8]> {
     if body.len() < 5 || body[0] != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "scoped Delete needs an uncompressed unary frame",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "scoped RPC needs an uncompressed unary frame"));
     }
     let mut encoded_length = [0; 4];
     encoded_length.copy_from_slice(&body[1..5]);
     if u32::try_from(body.len() - 5).ok() != Some(u32::from_be_bytes(encoded_length)) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "scoped Delete frame length mismatch"));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "scoped RPC frame length mismatch"));
     }
-    let request = DeleteRequest::decode(&body[5..]).map_err(io::Error::other)?;
+    Ok(&body[5..])
+}
+
+fn scope_matches(method: &str, body: &[u8], scope: &[u8]) -> io::Result<bool> {
+    if method == "RecoverMultipartSource" {
+        let request = RecoverMultipartSourceRequest::decode(unary_payload(body)?).map_err(io::Error::other)?;
+        if request.protocol_version != u32::from(MULTIPART_SOURCE_PROTOCOL_VERSION) || request.path.as_bytes() != scope {
+            return Ok(false);
+        }
+        let operation = rustfs_protos::decode_multipart_source_recovery_payload(&request.operation)?;
+        let request = NativeSourceRequest {
+            protocol_version: MULTIPART_SOURCE_PROTOCOL_VERSION,
+            path: request.path,
+            operation,
+        };
+        let MultipartSourceOperation::DeleteAborted { expected, certificate } = &request.operation else {
+            return Ok(false);
+        };
+        if expected.lineage != certificate.round.lineage {
+            return Ok(false);
+        }
+        request.validate().map_err(io::Error::other)?;
+        // Authentication remains opaque; only storage can authorize deletion.
+        // The proxy must not pause preparation or another upload's cleanup.
+        return Ok(true);
+    }
+    if method != "Delete" {
+        return Ok(body.windows(scope.len()).any(|window| window == scope));
+    }
+    let request = DeleteRequest::decode(unary_payload(body)?).map_err(io::Error::other)?;
     let options: serde_json::Value = serde_json::from_str(&request.options).map_err(io::Error::other)?;
     Ok(request.volume == ".rustfs.sys/multipart"
         && request.path.trim_end_matches('/').as_bytes() == scope
@@ -233,13 +264,22 @@ async fn forward_request(
     if let Some(pause) = pause {
         let method = parts.uri.path().strip_prefix("/node_service.NodeService/");
         if let Some(method) = method.filter(|name| pause.methods.contains(name)) {
+            let mut route = None;
             let matches = if let Some(scope) = pause.scope.as_deref() {
-                // Inspect bounded routing data while retaining the exact
-                // original bytes covered by the RPC signature.
+                // Inspect bounded control routing while preserving the exact
+                // signed bytes and trailers forwarded to the backend.
                 let collected = Limited::new(body, 1024 * 1024).collect().await.map_err(io::Error::other)?;
                 let trailers = collected.trailers().cloned();
                 let bytes = collected.to_bytes();
                 let matches = scope_matches(method, &bytes, scope)?;
+                if matches && method == "ReadVersion" {
+                    let disk = ReadVersionRequest::decode(unary_payload(&bytes)?)
+                        .map_err(io::Error::other)?
+                        .disk;
+                    if !disk.is_empty() {
+                        route = Some(disk);
+                    }
+                }
                 body = Full::new(bytes)
                     .map_err(|never| match never {})
                     .with_trailers(async move { trailers.map(Ok::<_, io::Error>) })
@@ -264,7 +304,7 @@ async fn forward_request(
                 if disposition == Disposition::Discard {
                     return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "injected RPC packet loss"));
                 }
-                observed = Some(pause);
+                observed = Some((pause, route));
             }
         }
     }
@@ -286,11 +326,14 @@ async fn forward_request(
         .request(Request::from_parts(parts, body))
         .await
         .map_err(io::Error::other)?;
-    if let Some(pause) = observed
+    if let Some((pause, route)) = observed
         && response.status().is_success()
         && response.headers().get("grpc-status").is_none_or(|status| status == "0")
     {
         pause.forwarded.fetch_add(1, Ordering::SeqCst);
+        if let Some(route) = route {
+            pause.forwarded_routes.lock().expect("RPC route observations").insert(route);
+        }
     }
     Ok(response)
 }
@@ -378,6 +421,271 @@ mod tests {
             .body(body)
             .map_err(io::Error::other)?;
         client.request(request).await.map_err(io::Error::other)
+    }
+
+    fn unary_frame(message: &impl prost::Message) -> Bytes {
+        let payload = message.encode_to_vec();
+        let mut frame = vec![0];
+        frame.extend_from_slice(&u32::try_from(payload.len()).expect("small test packet").to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame.into()
+    }
+
+    fn native_abort_request(path: &str) -> RecoverMultipartSourceRequest {
+        use crate::storage_api::multipart_source_rpc::{
+            MultipartAbortCertificate, MultipartAbortProof, MultipartAbortProofKind, MultipartAbortRound, MultipartSourcePhase,
+            MultipartSourceSnapshot, SourceGeneration, SourceGeometry, SourceLineage,
+        };
+        use uuid::Uuid;
+
+        let lineage = SourceLineage {
+            bucket: "bucket".to_owned(),
+            object: "object".to_owned(),
+            path: path.to_owned(),
+            original_data_dir: Uuid::new_v4(),
+            original_version_id: None,
+            created_unix_nanos: 1,
+            original_identity: [1; 32],
+            geometry: SourceGeometry {
+                data_blocks: 2,
+                parity_blocks: 2,
+                block_size: 1024,
+                distribution: vec![1, 2, 3, 4],
+            },
+        };
+        let generation = SourceGeneration {
+            epoch: 1,
+            nonce: Uuid::new_v4(),
+        };
+        let disk_ids = (0..4).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        let expected = MultipartSourceSnapshot {
+            disk_id: disk_ids[0],
+            physical_slot: 0,
+            lineage: lineage.clone(),
+            generation,
+            revision: 1,
+            phase: MultipartSourcePhase::Aborting,
+            state_sha256: [2; 32],
+            head_sha256: None,
+            inventory_sha256: [3; 32],
+            capability_sha256: None,
+            publication: None,
+        };
+        let round = MultipartAbortRound {
+            lineage,
+            generation,
+            round: Uuid::new_v4(),
+        };
+        let proofs = disk_ids
+            .iter()
+            .enumerate()
+            .map(|(slot, disk_id)| {
+                let mut snapshot = expected.clone();
+                snapshot.disk_id = *disk_id;
+                snapshot.physical_slot = slot;
+                // Valid N-proof structure with opaque dummy authentication;
+                // this fixture grants no native or cluster authority.
+                serde_json::from_value::<MultipartAbortProof>(serde_json::json!({
+                    "kind": MultipartAbortProofKind::Prepared,
+                    "challenge": round.round,
+                    "round": round,
+                    "snapshot": snapshot,
+                    "certificate_sha256": null,
+                    "publication": null,
+                    "authentication": { "class": "cluster_hmac", "mac": vec![7_u8; 32] },
+                }))
+                .expect("structural abort proof")
+            })
+            .collect();
+        let certificate = MultipartAbortCertificate { round, disk_ids, proofs };
+        RecoverMultipartSourceRequest {
+            disk: "opaque-source-disk".to_owned(),
+            path: path.to_owned(),
+            protocol_version: u32::from(MULTIPART_SOURCE_PROTOCOL_VERSION),
+            operation: rmp_serde::to_vec_named(&MultipartSourceOperation::DeleteAborted { expected, certificate })
+                .expect("typed native deletion")
+                .into(),
+        }
+    }
+
+    #[test]
+    fn native_abort_scope_matches_only_delete_aborted_at_the_exact_upload_root() {
+        use crate::storage_api::multipart_source_rpc::PublicationIdentity;
+        use uuid::Uuid;
+
+        let root = b"hash/upload";
+        let request = native_abort_request("hash/upload");
+        assert!(scope_matches("RecoverMultipartSource", &unary_frame(&request), root).expect("native deletion"));
+        for path in [
+            "hash/upload/",
+            "hash/upload/part.1",
+            "hash/upload/.abort-authority",
+            "hash/upload-other",
+            "other/hash/upload",
+        ] {
+            assert!(
+                !scope_matches("RecoverMultipartSource", &unary_frame(&native_abort_request(path)), root).expect("other scope")
+            );
+        }
+        let MultipartSourceOperation::DeleteAborted { expected, certificate } =
+            rustfs_protos::decode_multipart_source_recovery_payload(&request.operation).expect("native operation")
+        else {
+            panic!("native deletion fixture");
+        };
+        let publication = PublicationIdentity {
+            lineage: expected.lineage.clone(),
+            source_generation: expected.generation,
+            attempt: Uuid::new_v4(),
+            version_id: None,
+            final_data_dir: Uuid::new_v4(),
+            modified_unix_nanos: 2,
+            completion_identity: [4; 32],
+        };
+        for operation in [
+            MultipartSourceOperation::Inspect {
+                lineage: Some(expected.lineage.clone()),
+            },
+            MultipartSourceOperation::PrepareAbort {
+                expected: expected.clone(),
+                round: certificate.round.clone(),
+            },
+            MultipartSourceOperation::CommitAbort {
+                expected: expected.clone(),
+                certificate: certificate.clone(),
+            },
+            MultipartSourceOperation::ConfirmCleanupTarget {
+                expected: expected.clone(),
+                publication: publication.clone(),
+                challenge: Uuid::new_v4(),
+            },
+            MultipartSourceOperation::ConfirmTerminal {
+                expected: Some(expected.clone()),
+                publication,
+                challenge: Uuid::new_v4(),
+            },
+        ] {
+            let mut other = request.clone();
+            other.operation = rmp_serde::to_vec_named(&operation).expect("other typed operation").into();
+            assert!(!scope_matches("RecoverMultipartSource", &unary_frame(&other), root).expect("non-deleting operation"));
+        }
+        let mut other_certificate = certificate;
+        other_certificate.round.lineage.path.push_str("/child");
+        let mut other = request;
+        other.operation = rmp_serde::to_vec_named(&MultipartSourceOperation::DeleteAborted {
+            expected,
+            certificate: other_certificate,
+        })
+        .expect("different certificate scope")
+        .into();
+        assert!(!scope_matches("RecoverMultipartSource", &unary_frame(&other), root).expect("certificate mismatch"));
+    }
+
+    #[test]
+    fn native_abort_scope_rejects_unknown_protocol_and_malformed_operation_packets() {
+        let root = b"hash/upload";
+        let request = native_abort_request("hash/upload");
+        let mut unsupported = request.clone();
+        unsupported.protocol_version += 1;
+        assert!(!scope_matches("RecoverMultipartSource", &unary_frame(&unsupported), root).expect("unsupported protocol"));
+        let mut operation: MultipartSourceOperation =
+            rustfs_protos::decode_multipart_source_recovery_payload(&request.operation).expect("typed operation fields");
+        let mut unknown_scope = serde_json::to_value(&operation).expect("named operation fields");
+        unknown_scope["volume"] = ".rustfs.sys/tmp".into();
+        let MultipartSourceOperation::DeleteAborted { certificate, .. } = &mut operation else {
+            panic!("native deletion fixture");
+        };
+        certificate.proofs.pop();
+        for operation in [
+            Vec::new(),
+            vec![0xc1],
+            rmp_serde::to_vec_named(&unknown_scope).expect("unknown scope field"),
+            rmp_serde::to_vec_named(&operation).expect("incomplete N-proof certificate"),
+            {
+                let mut trailing = request.operation.to_vec();
+                trailing.push(0xc0);
+                trailing
+            },
+        ] {
+            let mut malformed = request.clone();
+            malformed.operation = operation.into();
+            assert!(scope_matches("RecoverMultipartSource", &unary_frame(&malformed), root).is_err());
+        }
+        let mut compressed = unary_frame(&request).to_vec();
+        compressed[0] = 1;
+        assert!(scope_matches("RecoverMultipartSource", &compressed, root).is_err());
+        assert!(scope_matches("RecoverMultipartSource", &[0, 0, 0, 0, 1], root).is_err());
+    }
+
+    #[tokio::test]
+    async fn native_abort_scoped_pause_preserves_opaque_payload_and_grpc_trailers() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let backend = backend().await.expect("backend listener");
+            let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback address"), backend.address)
+                .await
+                .expect("proxy listener");
+            let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(true).build_http();
+            let pause = proxy
+                .pause(&["Delete", "RecoverMultipartSource"], 1, Some("hash/upload"))
+                .expect("exact abort deletion barrier");
+            let request = native_abort_request("hash/upload");
+            let preparation = RecoverMultipartSourceRequest {
+                operation: rmp_serde::to_vec_named(&MultipartSourceOperation::Inspect { lineage: None })
+                    .expect("inspection operation")
+                    .into(),
+                ..request.clone()
+            };
+            let preparation = unary_frame(&preparation);
+            let forwarded = call_body(&client, proxy.local_addr(), "RecoverMultipartSource", preparation.clone())
+                .await
+                .expect("preparation must reach storage before the deletion barrier")
+                .into_body()
+                .collect()
+                .await
+                .expect("preparation response");
+            assert_eq!(forwarded.to_bytes(), preparation);
+            assert_eq!(pause.hits(), 0, "preparation must not consume the deletion fault");
+
+            let original = unary_frame(&request);
+            let sent = original.clone();
+            let task_client = client.clone();
+            let address = proxy.local_addr();
+            let blocked = tokio::spawn(async move { call_body(&task_client, address, "RecoverMultipartSource", sent).await });
+            pause
+                .wait_for_hits(1)
+                .await
+                .expect("native deletion reached its exact barrier");
+            assert!(!blocked.is_finished());
+            let child = unary_frame(&DeleteRequest {
+                volume: ".rustfs.sys/multipart".to_owned(),
+                path: "hash/upload/part.1".to_owned(),
+                options: r#"{"recursive":true}"#.to_owned(),
+                ..Default::default()
+            });
+            let forwarded = call_body(&client, address, "Delete", child.clone())
+                .await
+                .expect("child cleanup must progress")
+                .into_body()
+                .collect()
+                .await
+                .expect("child response");
+            assert_eq!(forwarded.to_bytes(), child);
+            assert_eq!(pause.hits(), 1);
+            pause.release();
+            let forwarded = blocked
+                .await
+                .expect("request task")
+                .expect("released deletion")
+                .into_body()
+                .collect()
+                .await
+                .expect("native deletion body and trailers");
+            assert_eq!(forwarded.trailers().expect("gRPC trailers")["grpc-status"], "0");
+            assert_eq!(forwarded.trailers().expect("opaque proof trailer")["x-proof"], "unchanged-proof");
+            assert_eq!(forwarded.to_bytes(), original, "routing inspection must never re-encode signed bytes");
+            assert_eq!(backend.received.load(Ordering::SeqCst), 3);
+        })
+        .await
+        .expect("native abort scope deadline");
     }
 
     #[tokio::test]
@@ -487,6 +795,30 @@ mod tests {
                 .expect("observer forwards without pausing");
             another.into_body().collect().await.expect("second body");
             assert_eq!(observer.forwarded(), 2);
+            drop(observer);
+            let routes = proxy
+                .pause(&["ReadVersion"], usize::MAX, Some("recovery-route"))
+                .expect("disk-route observer");
+            routes.release();
+            for (disk, expected) in [("drive-a", 1), ("drive-a", 1), ("drive-b", 2)] {
+                let request = ReadVersionRequest {
+                    disk: disk.to_owned(),
+                    path: "recovery-route".to_owned(),
+                    ..Default::default()
+                }
+                .encode_to_vec();
+                let mut frame = vec![0];
+                frame.extend_from_slice(&u32::try_from(request.len()).expect("small frame").to_be_bytes());
+                frame.extend_from_slice(&request);
+                call_body(&client, address, "ReadVersion", Bytes::from(frame))
+                    .await
+                    .expect("routed read")
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("routed response");
+                assert_eq!(routes.forwarded_routes(), expected, "repeated traffic from one disk is only one voter");
+            }
         })
         .await
         .expect("passive observer deadline");
@@ -549,7 +881,7 @@ mod tests {
         let root = b"hash/upload";
         assert!(scope_matches("Delete", &frame(".rustfs.sys/multipart", "hash/upload"), root).expect("root frame"));
         assert!(scope_matches("Delete", &frame(".rustfs.sys/multipart", "hash/upload/"), root).expect("directory frame"));
-        for path in ["hash/upload/part.1", "hash/upload-other"] {
+        for path in ["hash/upload/part.1", "hash/upload/.abort-authority", "hash/upload-other"] {
             assert!(!scope_matches("Delete", &frame(".rustfs.sys/multipart", path), root).expect("other path"));
         }
         assert!(!scope_matches("Delete", &frame(".rustfs.sys/tmp", "hash/upload"), root).expect("other volume"));

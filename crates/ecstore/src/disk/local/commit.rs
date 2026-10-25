@@ -617,10 +617,18 @@ impl LocalDisk {
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
 
-        // xl.meta path
+        // Native publication consumes its canonical head. The legacy path
+        // keeps main's independent recovery authority and staging filename.
+        let preserve_upload_metadata =
+            multipart_publication.is_none() && src_volume == super::super::RUSTFS_META_MULTIPART_BUCKET;
+        let source_metadata_name = if preserve_upload_metadata {
+            super::super::MULTIPART_COMMIT_METADATA_FILE
+        } else {
+            STORAGE_FORMAT_FILE
+        };
         let src_file_path = match multipart_publication.as_ref() {
             Some(publication) => publication.canonical_head(),
-            None => self.io_get_object_path(src_volume, format!("{}/{}", src_path, STORAGE_FORMAT_FILE).as_str())?,
+            None => self.io_get_object_path(src_volume, format!("{src_path}/{source_metadata_name}").as_str())?,
         };
         let dst_file_path = self.io_get_object_open_path(dst_volume, format!("{}/{}", dst_path, STORAGE_FORMAT_FILE).as_str())?;
 
@@ -701,6 +709,39 @@ impl LocalDisk {
             source_volume_dir: &src_volume_dir,
             data_paths: has_data_dir_path.as_ref(),
         };
+
+        if preserve_upload_metadata {
+            let source_object_path = self.get_object_path(src_volume, src_path)?;
+            let authority_owner: Arc<dyn Send + Sync> = if source_object_path == root_destination_object_path {
+                commit.mutation_lease.clone()
+            } else {
+                os::acquire_metadata_mutation_lease(&source_object_path, Some(commit.mutation_lease.clone())).await
+            };
+            let authority = self.io_get_object_path(src_volume, &format!("{src_path}/{STORAGE_FORMAT_FILE}"))?;
+            let recovery = self.io_get_object_path(
+                src_volume,
+                &format!("{src_path}/{}/{STORAGE_FORMAT_FILE}", super::super::MULTIPART_RECOVERY_DIR),
+            )?;
+            check_path_length(recovery.to_string_lossy().as_ref())?;
+            os::rename_all_with_owner(
+                &authority,
+                &recovery,
+                &src_volume_dir,
+                commit.publication_root,
+                Some(authority_owner.clone()),
+            )
+            .await?;
+            // This is system metadata authority, so use its existing strict
+            // durability policy even when the object payload is relaxed.
+            if effective_durability(src_volume).syncs_commit_metadata() {
+                os::fsync_dir_with_owner(recovery.parent().ok_or(DiskError::InvalidPath)?, Some(authority_owner.clone()))
+                    .await
+                    .map_err(to_file_error)?;
+                os::fsync_dir_with_owner(src_file_parent, Some(authority_owner.clone()))
+                    .await
+                    .map_err(to_file_error)?;
+            }
+        }
 
         if no_inline {
             // Non-inline: read xl.meta, parse, write, rename data dir, rename xl.meta
@@ -1136,15 +1177,10 @@ impl LocalDisk {
             drop(commit.directory_guard);
 
             if multipart_publication.is_none()
-                && let Some(src_file_path_parent) = src_file_path.parent()
+                && !preserve_upload_metadata
+                && let Some(parent) = src_file_path.parent()
             {
-                if src_volume != super::super::RUSTFS_META_MULTIPART_BUCKET {
-                    let _ = std::fs::remove_dir(src_file_path_parent);
-                } else {
-                    let _ = self
-                        .delete_file(&dst_volume_dir, &src_file_path_parent.to_path_buf(), true, false)
-                        .await;
-                }
+                let _ = std::fs::remove_dir(parent);
             }
 
             // Heal reuses a version's `data_dir` and lands the rebuilt shard on
@@ -1192,18 +1228,12 @@ impl LocalDisk {
             // allowing a retry to reuse the deterministic staging path too early.
             let src = src_file_path.clone();
             let dst = dst_file_path.clone();
-            let cleanup_path = if src_volume == super::super::RUSTFS_META_MULTIPART_BUCKET {
-                src_file_path.parent().map(|p| p.to_path_buf())
-            } else {
-                None
-            };
             let dst_path_for_failpoint = dst_path.to_string();
             let dst_volume_for_source = dst_volume.to_string();
             let dst_path_for_source = dst_path.to_string();
             let dst_volume_dir_for_commit = dst_volume_dir.clone();
             let publication_root_for_commit = self.publication_root.clone();
-            #[cfg(not(windows))]
-            let cleanup_src_parent = cleanup_path.is_none();
+            let cleanup_src_parent = multipart_publication.is_none() && !preserve_upload_metadata;
             #[cfg(windows)]
             let source_parent = src_file_parent.to_path_buf();
             let rename_commit_guard_for_preparation = commit.directory_guard.clone();
@@ -1503,13 +1533,9 @@ impl LocalDisk {
                     let _ = receipt_candidate;
                     #[cfg(windows)]
                     drop(commit.directory_guard);
-                    if let Some(ref cleanup) = cleanup_path {
-                        let _ = self.delete_file(&dst_volume_dir, cleanup, true, false).await;
-                    } else {
-                        #[cfg(windows)]
-                        if let Some(parent) = src_file_path.parent() {
-                            let _ = std::fs::remove_dir(parent);
-                        }
+                    #[cfg(windows)]
+                    if cleanup_src_parent && let Some(parent) = src_file_path.parent() {
+                        let _ = std::fs::remove_dir(parent);
                     }
                     for part_path in &invalidate_part_paths {
                         self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
@@ -1780,9 +1806,7 @@ impl LocalDisk {
             }
 
             // Cleanup
-            if let Some(ref cleanup) = cleanup_path {
-                let _ = self.delete_file(&dst_volume_dir, cleanup, true, false).await;
-            } else if let Some(parent) = src_file_path.parent() {
+            if cleanup_src_parent && let Some(parent) = src_file_path.parent() {
                 let _ = std::fs::remove_dir(parent);
             }
 

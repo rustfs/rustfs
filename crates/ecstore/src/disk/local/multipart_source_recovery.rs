@@ -132,6 +132,13 @@ impl LocalDisk {
         // target publication ownership. Every filesystem tail retains it.
         let store = self.open_multipart_source_store(&request.path, None).await?;
         match request.operation {
+            operation @ (MultipartSourceOperation::UpgradeLegacy { .. }
+            | MultipartSourceOperation::PrepareAbort { .. }
+            | MultipartSourceOperation::CommitAbort { .. }
+            | MultipartSourceOperation::DeleteAborted { .. }
+            | MultipartSourceOperation::ConfirmCleanupTarget { .. }) => {
+                self.recover_multipart_abort_owned(store, operation).await
+            }
             MultipartSourceOperation::Inspect { lineage } => {
                 let loaded = store.load().await?;
                 if let (Some(expected), Some(snapshot)) = (lineage.as_ref(), loaded.snapshot.as_ref())
@@ -142,6 +149,7 @@ impl LocalDisk {
                 let mut negative_certificate = None;
                 let mut ready_certificate = None;
                 if let Some(state) = loaded.state.as_ref()
+                    && state.phase != MultipartSourcePhase::Aborting
                     && let Some(round) = state.recovery.as_ref()
                 {
                     if state.negative_certificate_sha256.is_some() {
@@ -151,6 +159,7 @@ impl LocalDisk {
                         ready_certificate = Some(store.read_certificate(round.round, true).await?);
                     }
                 }
+                let abort_certificate = store.read_abort_certificate(&loaded).await?;
                 Ok(MultipartSourceResponse::Inspected(MultipartSourceInspection {
                     disk_id: store.disk_id,
                     snapshot: loaded.snapshot,
@@ -158,6 +167,12 @@ impl LocalDisk {
                     recovery: loaded.state.as_ref().and_then(|state| state.recovery.clone()),
                     negative_certificate,
                     ready_certificate,
+                    root_missing: store.root_missing().await?,
+                    abort_round: loaded
+                        .state
+                        .as_ref()
+                        .and_then(|state| state.abort.as_ref().map(|abort| abort.round.clone())),
+                    abort_certificate,
                     terminal_certificate: loaded.state.map_or_else(Vec::new, |state| state.terminal_certificate),
                 }))
             }
@@ -355,7 +370,9 @@ impl LocalDisk {
                     if state.generation != round.from_generation
                         || matches!(
                             state.phase,
-                            MultipartSourcePhase::RootMissing | MultipartSourcePhase::GlobalTerminalCertified
+                            MultipartSourcePhase::RootMissing
+                                | MultipartSourcePhase::GlobalTerminalCertified
+                                | MultipartSourcePhase::Aborting
                         )
                         || (matches!(
                             state.phase,
@@ -596,6 +613,15 @@ mod tests {
     use rustfs_filemeta::{FileInfo, FileInfoOpts, FileMeta, ObjectPartInfo, get_file_info};
     use sha2::{Digest, Sha256};
 
+    mod abort_tests {
+        include!("multipart_source_abort_tests.rs");
+    }
+
+    #[cfg(unix)]
+    mod abort_race_tests {
+        include!("multipart_source_abort_race_tests.rs");
+    }
+
     #[derive(serde::Serialize, serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct UntrustedAnchorBlob {
@@ -657,6 +683,7 @@ mod tests {
                 source
                     .metadata
                     .insert(RUSTFS_MULTIPART_OBJECT_KEY.to_owned(), "object".to_owned());
+                crate::disk::multipart_source::mark_native_source(&mut source);
                 let mut meta = FileMeta::new();
                 meta.add_version(source).expect("native original source version");
                 let upload_root = disk_root.join(RUSTFS_META_MULTIPART_BUCKET).join(&path);

@@ -19,10 +19,11 @@
 use crate::disk::error::{DiskError, Result};
 use crate::disk::multipart_source::bind_multipart_proof_snapshot;
 use crate::disk::multipart_source::{
-    MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartCertificate, MultipartProofKind, MultipartPublicationResult,
-    MultipartRecoveryRound, MultipartSourceInspection, MultipartSourceOperation, MultipartSourcePhase, MultipartSourceProof,
-    MultipartSourceRequest, MultipartSourceResponse, ProofVerificationContext, PublicationIdentity, SourceGeneration,
-    SourceLineage,
+    MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartAbortCertificate, MultipartAbortProof, MultipartAbortProofKind,
+    MultipartAbortRound, MultipartCertificate, MultipartProofKind, MultipartPublicationResult, MultipartRecoveryRound,
+    MultipartSourceInspection, MultipartSourceOperation, MultipartSourcePhase, MultipartSourceProof, MultipartSourceRequest,
+    MultipartSourceResponse, ProofVerificationContext, PublicationIdentity, SourceGeneration, SourceLineage,
+    native_source_protocol, recognized_native_source_controls,
 };
 use crate::disk::{DiskAPI, DiskStore};
 use futures::future::join_all;
@@ -141,6 +142,10 @@ pub(in crate::set_disk) async fn confirm_target(
     }
     let ids = disk_ids(disks).await;
     let challenge = Uuid::new_v4();
+    enum Confirmation {
+        Terminal(MultipartSourceProof),
+        Cleanup(MultipartAbortProof),
+    }
     let proofs = join_all(disks.iter().map(|disk| async {
         let disk = disk.as_ref()?;
         let operation = MultipartSourceOperation::ConfirmTerminal {
@@ -148,8 +153,42 @@ pub(in crate::set_disk) async fn confirm_target(
             publication: publication.clone(),
             challenge,
         };
-        match disk.recover_multipart_source(request(&lineage.path, operation)).await {
-            Ok(MultipartSourceResponse::TerminalConfirmed(proof)) => Some(proof),
+        if let Ok(MultipartSourceResponse::TerminalConfirmed(proof)) =
+            disk.recover_multipart_source(request(&lineage.path, operation)).await
+        {
+            return Some(Confirmation::Terminal(proof));
+        }
+        // A partial source delete can leave a real producer Aborting. Its
+        // independent own anchor may still confirm this exact historical
+        // target, without changing the source phase or restoring any rights.
+        let inspection = match disk
+            .recover_multipart_source(request(
+                &lineage.path,
+                MultipartSourceOperation::Inspect {
+                    lineage: Some(lineage.clone()),
+                },
+            ))
+            .await
+        {
+            Ok(MultipartSourceResponse::Inspected(inspection)) => inspection,
+            _ => return None,
+        };
+        let expected = inspection.snapshot?;
+        if expected.phase != MultipartSourcePhase::Aborting {
+            return None;
+        }
+        match disk
+            .recover_multipart_source(request(
+                &lineage.path,
+                MultipartSourceOperation::ConfirmCleanupTarget {
+                    expected,
+                    publication: publication.clone(),
+                    challenge,
+                },
+            ))
+            .await
+        {
+            Ok(MultipartSourceResponse::CleanupTargetConfirmed(proof)) => Some(Confirmation::Cleanup(proof)),
             _ => None,
         }
     }))
@@ -157,17 +196,32 @@ pub(in crate::set_disk) async fn confirm_target(
     let mut confirmed = Vec::new();
     for (slot, proof) in proofs.into_iter().enumerate() {
         let Some(proof) = proof else { continue };
-        verify_slot(&proof, slot, ids[slot], lineage, authority)?;
-        if proof.challenge != challenge
-            || proof.snapshot.publication.as_ref() != Some(publication)
-            || !matches!(proof.kind, MultipartProofKind::TerminalTarget | MultipartProofKind::RootMissingTerminal)
-        {
+        let disk_id = match proof {
+            Confirmation::Terminal(proof) => {
+                verify_slot(&proof, slot, ids[slot], lineage, authority)?;
+                if proof.challenge != challenge
+                    || proof.snapshot.publication.as_ref() != Some(publication)
+                    || !matches!(proof.kind, MultipartProofKind::TerminalTarget | MultipartProofKind::RootMissingTerminal)
+                {
+                    return Err(DiskError::FileCorrupt);
+                }
+                proof.snapshot.disk_id
+            }
+            Confirmation::Cleanup(proof) => {
+                abort_slot(&proof, slot, ids[slot], lineage, authority)?;
+                if proof.kind != MultipartAbortProofKind::CleanupTarget
+                    || proof.challenge != challenge
+                    || proof.publication.as_ref() != Some(publication)
+                {
+                    return Err(DiskError::FileCorrupt);
+                }
+                proof.snapshot.disk_id
+            }
+        };
+        if confirmed.contains(&disk_id) {
             return Err(DiskError::FileCorrupt);
         }
-        if confirmed.contains(&proof.snapshot.disk_id) {
-            return Err(DiskError::FileCorrupt);
-        }
-        confirmed.push(proof.snapshot.disk_id);
+        confirmed.push(disk_id);
     }
     if confirmed.len() < lineage.geometry.write_quorum() {
         return Err(DiskError::ErasureWriteQuorum);
@@ -250,6 +304,558 @@ fn compatible_inspections(
     Ok(())
 }
 
+/// Readonly cleanup metadata never grants publication or source-deletion rights.
+pub(in crate::set_disk) struct CleanupSourceMetadata {
+    pub metadata: Vec<rustfs_filemeta::FileInfo>,
+    pub errors: Vec<Option<DiskError>>,
+    pub certified_original: Option<rustfs_filemeta::FileInfo>,
+}
+
+/// A successful close is useful only to the guarded cleanup caller. Its owned
+/// certificate must also be checked inside each actual delete executor.
+pub(in crate::set_disk) enum SourceCleanupAuthority {
+    Legacy,
+    Native {
+        certificate: MultipartAbortCertificate,
+        snapshots: Vec<Option<crate::disk::multipart_source::MultipartSourceSnapshot>>,
+    },
+}
+
+fn abort_slot(
+    proof: &MultipartAbortProof,
+    slot: usize,
+    id: Option<Uuid>,
+    lineage: &SourceLineage,
+    authority: &ProofVerificationContext,
+) -> Result<()> {
+    proof.verify_with_authority(authority)?;
+    if id != Some(proof.snapshot.disk_id)
+        || proof.snapshot.physical_slot != slot
+        || &proof.snapshot.lineage != lineage
+        || proof.snapshot.phase != MultipartSourcePhase::Aborting
+        || proof.snapshot.head_sha256.is_some()
+        || proof.snapshot.capability_sha256.is_some()
+    {
+        return Err(DiskError::FileCorrupt);
+    }
+    Ok(())
+}
+
+fn abort_certificate_cohort(
+    certificate: &MultipartAbortCertificate,
+    ids: &[Option<Uuid>],
+    authority: &ProofVerificationContext,
+) -> Result<()> {
+    certificate.verify_with_authority(authority)?;
+    if ids.len() != certificate.disk_ids.len()
+        || ids.iter().copied().collect::<Option<Vec<_>>>().as_ref() != Some(&certificate.disk_ids)
+    {
+        return Err(DiskError::FileCorrupt);
+    }
+    Ok(())
+}
+
+fn cleanup_original(
+    inspection: &MultipartSourceInspection,
+    slot: usize,
+    id: Option<Uuid>,
+    bucket: &str,
+    object: &str,
+    path: &str,
+) -> Result<Option<rustfs_filemeta::FileInfo>> {
+    if id != Some(inspection.disk_id) {
+        return Err(DiskError::FileCorrupt);
+    }
+    let Some(snapshot) = inspection.snapshot.as_ref() else {
+        if inspection.original.is_some() || inspection.abort_certificate.is_some() || inspection.abort_round.is_some() {
+            return Err(DiskError::FileCorrupt);
+        }
+        return Ok(None);
+    };
+    snapshot.lineage.validate()?;
+    if snapshot.disk_id != inspection.disk_id
+        || snapshot.physical_slot != slot
+        || snapshot.lineage.path != path
+        || (!bucket.is_empty() && snapshot.lineage.bucket != bucket)
+        || (!object.is_empty() && snapshot.lineage.object != object)
+    {
+        return Err(DiskError::FileCorrupt);
+    }
+    let raw = inspection.original.as_ref().ok_or(DiskError::FileCorrupt)?;
+    let original = rustfs_filemeta::get_file_info(
+        raw,
+        crate::disk::RUSTFS_META_MULTIPART_BUCKET,
+        path,
+        "",
+        rustfs_filemeta::FileInfoOpts {
+            data: false,
+            include_free_versions: false,
+            include_part_checksums: true,
+        },
+    )
+    .map_err(crate::disk::error::Error::other)?;
+    let condition = crate::disk::multipart_source::capture_source_condition(
+        &snapshot.lineage.bucket,
+        &snapshot.lineage.object,
+        path,
+        &original,
+        Uuid::new_v4(),
+    )?;
+    if rustfs_utils::http::get_consistent_str(&original.metadata, "multipart-bucket") != Some(snapshot.lineage.bucket.as_str())
+        || rustfs_utils::http::get_consistent_str(&original.metadata, "multipart-object")
+            != Some(snapshot.lineage.object.as_str())
+        || condition.lineage != snapshot.lineage
+        || original.erasure.distribution.get(slot) != Some(&original.erasure.index)
+    {
+        return Err(DiskError::FileCorrupt);
+    }
+    Ok(Some(original))
+}
+
+async fn cleanup_inspections(
+    disks: &[Option<DiskStore>],
+    path: &str,
+    namespace_owner: Option<&Arc<dyn Send + Sync>>,
+) -> Vec<Result<MultipartSourceInspection>> {
+    join_all(disks.iter().map(|disk| async {
+        let disk = disk.as_ref().ok_or(DiskError::DiskNotFound)?;
+        match recover_on_disk(
+            disk,
+            request(path, MultipartSourceOperation::Inspect { lineage: None }),
+            namespace_owner.cloned(),
+        )
+        .await?
+        {
+            MultipartSourceResponse::Inspected(inspection) => Ok(inspection),
+            _ => Err(DiskError::FileCorrupt),
+        }
+    }))
+    .await
+}
+
+fn existing_abort_certificate(
+    inspections: &[Result<MultipartSourceInspection>],
+    ids: &[Option<Uuid>],
+    authority: &ProofVerificationContext,
+) -> Result<Option<MultipartAbortCertificate>> {
+    let mut selected: Option<MultipartAbortCertificate> = None;
+    for inspection in inspections {
+        let Ok(inspection) = inspection else { continue };
+        let Some(certificate) = inspection.abort_certificate.as_ref() else { continue };
+        abort_certificate_cohort(certificate, ids, authority)?;
+        if let Some(current) = selected.as_ref() {
+            if current.round.lineage != certificate.round.lineage {
+                return Err(DiskError::FileCorrupt);
+            }
+            if (current.round.generation.epoch, current.round.round)
+                >= (certificate.round.generation.epoch, certificate.round.round)
+            {
+                continue;
+            }
+        }
+        selected = Some(certificate.clone());
+    }
+    Ok(selected)
+}
+
+/// Augment each physical slot with its independently validated native original.
+/// A complete committed closure certificate can identify a cold residual below
+/// a new read quorum; it is never returned as an ACTIVE source or an extra vote.
+pub(in crate::set_disk) async fn cleanup_source_metadata(
+    disks: &[Option<DiskStore>],
+    scope: (&str, &str, &str),
+    mut metadata: Vec<rustfs_filemeta::FileInfo>,
+    mut errors: Vec<Option<DiskError>>,
+    authority: &ProofVerificationContext,
+) -> Result<CleanupSourceMetadata> {
+    let (bucket, object, path) = scope;
+    bind_multipart_proof_snapshot(disks, authority)?;
+    let ids = disk_ids(disks).await;
+    let inspections = cleanup_inspections(disks, path, None).await;
+    if metadata.len() != disks.len() || errors.len() != disks.len() {
+        return Err(DiskError::FileCorrupt);
+    }
+    let mut native = false;
+    for (slot, info) in metadata.iter().enumerate() {
+        if errors[slot].is_none() && recognized_native_source_controls(info)? {
+            native = true;
+        }
+    }
+    let mut originals = vec![None; disks.len()];
+    for (slot, inspected) in inspections.iter().enumerate() {
+        match inspected {
+            Ok(inspection) => {
+                if inspection
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.state_sha256 != [0; 32])
+                    || inspection.abort_round.is_some()
+                    || inspection.abort_certificate.is_some()
+                {
+                    native = true;
+                }
+                if let Some(original) = cleanup_original(inspection, slot, ids[slot], bucket, object, path)? {
+                    native |= recognized_native_source_controls(&original)?;
+                    originals[slot] = Some(original);
+                }
+            }
+            Err(DiskError::UnsupportedDisk) => {}
+            Err(DiskError::FileCorrupt | DiskError::ConditionalDeleteConflict) => {
+                // A recognized corrupt native source cannot be downgraded to a
+                // copied legacy recovery marker in the same physical slot.
+                native = true;
+            }
+            Err(_) => {}
+        }
+    }
+    if !native {
+        return Ok(CleanupSourceMetadata {
+            metadata,
+            errors,
+            certified_original: None,
+        });
+    }
+    for (slot, original) in originals.iter_mut().enumerate() {
+        if let Some(original) = original.take() {
+            metadata[slot] = original;
+            errors[slot] = None;
+        } else {
+            errors[slot] = Some(match &inspections[slot] {
+                Err(error) => error.clone(),
+                Ok(_) => DiskError::ErasureWriteQuorum,
+            });
+        }
+    }
+    let certificate = existing_abort_certificate(&inspections, &ids, authority)?;
+    let certified_original = if let Some(certificate) = certificate {
+        let mut original = None;
+        for (slot, inspected) in inspections.iter().enumerate() {
+            let inspection = inspected.as_ref().map_err(|_| DiskError::ErasureWriteQuorum)?;
+            if ids[slot] != Some(inspection.disk_id) {
+                return Err(DiskError::FileCorrupt);
+            }
+            if inspection.root_missing && inspection.snapshot.is_none() {
+                continue;
+            }
+            let snapshot = inspection.snapshot.as_ref().ok_or(DiskError::ErasureWriteQuorum)?;
+            if snapshot.phase != MultipartSourcePhase::Aborting
+                || snapshot.lineage != certificate.round.lineage
+                || snapshot.generation.epoch < certificate.round.generation.epoch
+                || snapshot.head_sha256.is_some()
+                || snapshot.capability_sha256.is_some()
+            {
+                return Err(DiskError::ErasureWriteQuorum);
+            }
+            if original.is_none() && errors[slot].is_none() {
+                original = Some(metadata[slot].clone());
+            }
+        }
+        original
+    } else {
+        None
+    };
+    Ok(CleanupSourceMetadata {
+        metadata,
+        errors,
+        certified_original,
+    })
+}
+
+/// Genuine untagged legacy heads are upgraded under physical SourceRW CAS
+/// before the new native publisher dispatches. Marked ordinary completion does
+/// not enter this exceptional fanout.
+pub(in crate::set_disk) async fn upgrade_legacy_source(
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    path: &str,
+    authority: &ProofVerificationContext,
+) -> Result<()> {
+    bind_multipart_proof_snapshot(disks, authority)?;
+    let ids = disk_ids(disks).await;
+    let inspections = cleanup_inspections(disks, path, None).await;
+    let mut lineage = None;
+    for (slot, inspected) in inspections.iter().enumerate() {
+        let inspection = inspected.as_ref().map_err(|_| DiskError::ErasureWriteQuorum)?;
+        let original =
+            cleanup_original(inspection, slot, ids[slot], bucket, object, path)?.ok_or(DiskError::ErasureWriteQuorum)?;
+        let snapshot = inspection.snapshot.as_ref().ok_or(DiskError::ErasureWriteQuorum)?;
+        if snapshot.phase != MultipartSourcePhase::Active
+            || snapshot.generation.epoch != 0
+            || snapshot.state_sha256 != [0; 32]
+            || snapshot.head_sha256.is_none()
+        {
+            return Err(DiskError::ErasureWriteQuorum);
+        }
+        native_source_protocol(&original)?;
+        if lineage.as_ref().is_some_and(|lineage| lineage != &snapshot.lineage) {
+            return Err(DiskError::FileCorrupt);
+        }
+        lineage = Some(snapshot.lineage.clone());
+    }
+    let results = join_all(disks.iter().zip(&inspections).enumerate().map(|(slot, (disk, inspected))| {
+        let id = ids[slot];
+        async move {
+            let disk = disk.as_ref().ok_or(DiskError::DiskNotFound)?;
+            let expected = inspected
+                .as_ref()
+                .map_err(|_| DiskError::ErasureWriteQuorum)?
+                .snapshot
+                .clone()
+                .ok_or(DiskError::ErasureWriteQuorum)?;
+            match recover_on_disk(disk, request(path, MultipartSourceOperation::UpgradeLegacy { expected }), None).await? {
+                MultipartSourceResponse::LegacyUpgraded(inspection) => {
+                    let original =
+                        cleanup_original(&inspection, slot, id, bucket, object, path)?.ok_or(DiskError::ErasureWriteQuorum)?;
+                    if !native_source_protocol(&original)? {
+                        return Err(DiskError::FileCorrupt);
+                    }
+                    Ok(())
+                }
+                _ => Err(DiskError::FileCorrupt),
+            }
+        }
+    }))
+    .await;
+    for result in results {
+        result?;
+    }
+    Ok(())
+}
+
+/// Close every native participant without touching target metadata or bytes.
+/// No source delete is dispatched until every surviving root has durably bound
+/// the same complete N-proof certificate.
+pub(in crate::set_disk) async fn prepare_source_cleanup(
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    path: &str,
+    require_native: bool,
+    authority: &ProofVerificationContext,
+) -> Result<SourceCleanupAuthority> {
+    bind_multipart_proof_snapshot(disks, authority)?;
+    let ids = disk_ids(disks).await;
+    let mut inspections = cleanup_inspections(disks, path, None).await;
+    let mut native = require_native;
+    for (slot, inspected) in inspections.iter().enumerate() {
+        match inspected {
+            Ok(inspection) => {
+                let original = cleanup_original(inspection, slot, ids[slot], bucket, object, path)?;
+                native |= inspection
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.state_sha256 != [0; 32])
+                    || inspection.abort_round.is_some()
+                    || inspection.abort_certificate.is_some();
+                if let Some(original) = original {
+                    native |= recognized_native_source_controls(&original)?;
+                }
+            }
+            Err(DiskError::FileCorrupt | DiskError::ConditionalDeleteConflict) => native = true,
+            Err(_) => {}
+        }
+    }
+    if !native {
+        return Ok(SourceCleanupAuthority::Legacy);
+    }
+    let mut certificate = existing_abort_certificate(&inspections, &ids, authority)?;
+    if certificate.is_none() {
+        let mut snapshots = Vec::with_capacity(disks.len());
+        let mut lineage = None;
+        let mut epoch = 0;
+        for inspected in &inspections {
+            let inspection = inspected.as_ref().map_err(|_| DiskError::ErasureWriteQuorum)?;
+            let snapshot = inspection.snapshot.clone().ok_or(DiskError::ErasureWriteQuorum)?;
+            if lineage.as_ref().is_some_and(|lineage| lineage != &snapshot.lineage) {
+                return Err(DiskError::FileCorrupt);
+            }
+            epoch = epoch.max(snapshot.generation.epoch);
+            lineage = Some(snapshot.lineage.clone());
+            snapshots.push(snapshot);
+        }
+        let round = MultipartAbortRound {
+            lineage: lineage.ok_or(DiskError::ErasureWriteQuorum)?,
+            generation: SourceGeneration {
+                epoch: epoch.checked_add(1).ok_or(DiskError::FileCorrupt)?,
+                nonce: Uuid::new_v4(),
+            },
+            round: Uuid::new_v4(),
+        };
+        round.validate()?;
+        let prepared = join_all(disks.iter().zip(snapshots).map(|(disk, expected)| {
+            let round = round.clone();
+            async move {
+                let disk = disk.as_ref().ok_or(DiskError::DiskNotFound)?;
+                match recover_on_disk(disk, request(path, MultipartSourceOperation::PrepareAbort { expected, round }), None)
+                    .await?
+                {
+                    MultipartSourceResponse::AbortPrepared(proof) => Ok(proof),
+                    _ => Err(DiskError::FileCorrupt),
+                }
+            }
+        }))
+        .await;
+        let mut proofs = Vec::with_capacity(disks.len());
+        for (slot, result) in prepared.into_iter().enumerate() {
+            let proof = result?;
+            abort_slot(&proof, slot, ids[slot], &round.lineage, authority)?;
+            if proof.kind != MultipartAbortProofKind::Prepared
+                || proof.round != round
+                || proof.challenge != round.round
+                || proof.snapshot.generation != round.generation
+                || proof.certificate_sha256.is_some()
+            {
+                return Err(DiskError::FileCorrupt);
+            }
+            proofs.push(proof);
+        }
+        let complete = MultipartAbortCertificate {
+            round,
+            disk_ids: ids
+                .iter()
+                .copied()
+                .collect::<Option<Vec<_>>>()
+                .ok_or(DiskError::ErasureWriteQuorum)?,
+            proofs,
+        };
+        abort_certificate_cohort(&complete, &ids, authority)?;
+        certificate = Some(complete);
+        inspections = cleanup_inspections(disks, path, None).await;
+    }
+    let certificate = certificate.ok_or(DiskError::ErasureWriteQuorum)?;
+    let digest = certificate.digest()?;
+    let mut present = 0;
+    for (slot, inspected) in inspections.iter().enumerate() {
+        let inspection = inspected.as_ref().map_err(|_| DiskError::ErasureWriteQuorum)?;
+        if ids[slot] != Some(inspection.disk_id) {
+            return Err(DiskError::FileCorrupt);
+        }
+        if inspection.root_missing && inspection.snapshot.is_none() {
+            continue;
+        }
+        let snapshot = inspection.snapshot.as_ref().ok_or(DiskError::ErasureWriteQuorum)?;
+        if snapshot.phase != MultipartSourcePhase::Aborting
+            || snapshot.lineage != certificate.round.lineage
+            || snapshot.generation.epoch < certificate.round.generation.epoch
+            || snapshot.head_sha256.is_some()
+            || snapshot.capability_sha256.is_some()
+        {
+            return Err(DiskError::ErasureWriteQuorum);
+        }
+        present += 1;
+    }
+    if present == 0 {
+        return Err(DiskError::FileNotFound);
+    }
+    let committed = join_all(disks.iter().zip(&inspections).map(|(disk, inspected)| {
+        let certificate = certificate.clone();
+        async move {
+            let disk = disk.as_ref().ok_or(DiskError::DiskNotFound)?;
+            let inspection = inspected.as_ref().map_err(|_| DiskError::ErasureWriteQuorum)?;
+            if inspection.root_missing && inspection.snapshot.is_none() {
+                return Ok(None);
+            }
+            let expected = inspection.snapshot.clone().ok_or(DiskError::ErasureWriteQuorum)?;
+            match recover_on_disk(disk, request(path, MultipartSourceOperation::CommitAbort { expected, certificate }), None)
+                .await?
+            {
+                MultipartSourceResponse::AbortCommitted(proof) => Ok(Some(proof)),
+                _ => Err(DiskError::FileCorrupt),
+            }
+        }
+    }))
+    .await;
+    let mut snapshots = Vec::with_capacity(disks.len());
+    for (slot, result) in committed.into_iter().enumerate() {
+        let Some(proof) = result? else {
+            snapshots.push(None);
+            continue;
+        };
+        abort_slot(&proof, slot, ids[slot], &certificate.round.lineage, authority)?;
+        if proof.kind != MultipartAbortProofKind::Committed
+            || proof.round != certificate.round
+            || proof.challenge != certificate.round.round
+            || proof.certificate_sha256 != Some(digest)
+        {
+            return Err(DiskError::FileCorrupt);
+        }
+        snapshots.push(Some(proof.snapshot));
+    }
+    Ok(SourceCleanupAuthority::Native { certificate, snapshots })
+}
+
+pub(in crate::set_disk) async fn delete_closed_source(
+    disks: &[Option<DiskStore>],
+    path: &str,
+    certificate: &MultipartAbortCertificate,
+    snapshots: Vec<Option<crate::disk::multipart_source::MultipartSourceSnapshot>>,
+    authority: &ProofVerificationContext,
+    quorum: usize,
+) -> Result<()> {
+    let ids = disk_ids(disks).await;
+    abort_certificate_cohort(certificate, &ids, authority)?;
+    if snapshots.len() != disks.len() {
+        return Err(DiskError::FileCorrupt);
+    }
+    let digest = certificate.digest()?;
+    let deleted = join_all(disks.iter().zip(snapshots).map(|(disk, expected)| {
+        let certificate = certificate.clone();
+        async move {
+            let Some(expected) = expected else {
+                return Ok(None);
+            };
+            let disk = disk.as_ref().ok_or(DiskError::DiskNotFound)?;
+            match recover_on_disk(
+                disk,
+                request(path, MultipartSourceOperation::DeleteAborted { expected, certificate }),
+                None,
+            )
+            .await?
+            {
+                MultipartSourceResponse::AbortDeleted(proof) => Ok(Some(proof)),
+                _ => Err(DiskError::FileCorrupt),
+            }
+        }
+    }))
+    .await;
+    let mut count = 0;
+    let mut failed = false;
+    for (slot, result) in deleted.into_iter().enumerate() {
+        match result {
+            Ok(Some(proof)) => {
+                abort_slot(&proof, slot, ids[slot], &certificate.round.lineage, authority)?;
+                if proof.kind != MultipartAbortProofKind::Deleted
+                    || proof.round != certificate.round
+                    || proof.challenge != certificate.round.round
+                    || proof.certificate_sha256 != Some(digest)
+                {
+                    return Err(DiskError::FileCorrupt);
+                }
+                count += 1;
+            }
+            Ok(None) => {}
+            Err(_) => failed = true,
+        }
+    }
+    if count >= quorum {
+        return Ok(());
+    }
+    if !failed {
+        // A cold residual can be smaller than Q. Do not count absent roots as
+        // votes: prove every configured root is physically absent instead.
+        let after = cleanup_inspections(disks, path, None).await;
+        if after.iter().enumerate().all(|(slot, inspected)| {
+            inspected.as_ref().is_ok_and(|inspection| {
+                ids[slot] == Some(inspection.disk_id) && inspection.root_missing && inspection.snapshot.is_none()
+            })
+        }) {
+            return Ok(());
+        }
+    }
+    Err(DiskError::ErasureWriteQuorum)
+}
+
 /// Capabilities enter only from the original failed publication owner. Cold
 /// recovery passes `None`; inspection can never recreate an Undo capability.
 pub(in crate::set_disk) async fn recover_source(
@@ -264,6 +870,14 @@ pub(in crate::set_disk) async fn recover_source(
     bind_multipart_proof_snapshot(disks, authority)?;
     let ids = disk_ids(disks).await;
     let mut inspections = inspect(disks, path, namespace_owner.as_ref()).await;
+    if inspections
+        .iter()
+        .flatten()
+        .filter_map(|inspection| inspection.snapshot.as_ref())
+        .any(|snapshot| snapshot.phase == MultipartSourcePhase::Aborting)
+    {
+        return Err(DiskError::ErasureWriteQuorum);
+    }
     let lineage = inspections
         .iter()
         .flatten()
