@@ -9743,11 +9743,29 @@ impl LocalDisk {
         let retry_delay = bitrot_size_mismatch_retry_delay();
 
         for attempt in 0..=retry_count {
-            let file = super::fs::open_file(part_path, O_RDONLY).await.map_err(to_file_error)?;
-            let meta = file.metadata().await.map_err(to_file_error)?;
-            let file_size = meta.len() as usize;
+            let (reader, meta): (FileReader, std::fs::Metadata) = if let Some(resources) = current_resource_unit() {
+                let path = part_path.clone();
+                #[cfg(target_os = "linux")]
+                let mount_lease = self.mount_lease.clone();
+                tokio::task::spawn_blocking(move || -> Result<(FileReader, std::fs::Metadata)> {
+                    #[cfg(target_os = "linux")]
+                    let _mount_lease = mount_lease;
+                    #[cfg(test)]
+                    run_owned_file_before_open(&path);
+                    let file = std::fs::File::open(path).map_err(to_file_error)?;
+                    let meta = file.metadata().map_err(to_file_error)?;
+                    Ok((Box::new(ResourceFileReader::new(file, resources, None)), meta))
+                })
+                .await
+                .map_err(DiskError::from)??
+            } else {
+                let file = super::fs::open_file(part_path, O_RDONLY).await.map_err(to_file_error)?;
+                let meta = file.metadata().await.map_err(to_file_error)?;
+                (Box::new(file), meta)
+            };
+            let file_size = usize::try_from(meta.len()).map_err(|_| DiskError::FileCorrupt)?;
 
-            match bitrot_verify(Box::new(file), file_size, part_size, algo.clone(), shard_size).await {
+            match bitrot_verify(reader, file_size, part_size, algo.clone(), shard_size).await {
                 Ok(()) => return Ok(()),
                 Err(err) if attempt < retry_count && is_bitrot_size_mismatch_error(&err) => {
                     info!(
@@ -28851,8 +28869,75 @@ mod test {
         assert_eq!(err, DiskError::FileCorrupt);
     }
 
+    #[test]
+    fn cancelled_bitrot_verification_retains_native_resources() {
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
+        use crate::erasure::coding::BitrotWriter;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single bitrot native worker");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("bitrot cancellation fixture");
+            let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+            let payload = b"bitrot cancellation must retain the native worker's disk";
+            let algo = HashAlgorithm::HighwayHash256S;
+            let shard_size = 16;
+            let mut writer = BitrotWriter::new(io::Cursor::new(Vec::new()), shard_size, algo.clone());
+            for chunk in payload.chunks(shard_size) {
+                writer.write(chunk).await.expect("valid bitrot frame");
+            }
+            writer.shutdown().await.expect("complete bitrot frames");
+            let path = dir.path().join("part.1");
+            std::fs::write(&path, writer.into_inner().into_inner()).expect("write encoded shard");
+            disk.bitrot_verify(&path, payload.len(), algo.clone(), shard_size)
+                .await
+                .expect("fixture verifies before cancellation");
+            let mut observations = Vec::new();
+            for count in 1..=2 {
+                for resume_step in [1, 2] {
+                    let (resources, gates) = test_resource_units(count);
+                    let mut future = Some(Box::pin(with_optional_resource_unit(
+                        Some(resources),
+                        disk.bitrot_verify(&path, payload.len(), algo.clone(), shard_size),
+                    )));
+                    for step in 0..=resume_step {
+                        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                        let (release_tx, release_rx) = std::sync::mpsc::channel();
+                        let blocker = tokio::task::spawn_blocking(move || {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.recv();
+                        });
+                        started_rx.await.expect("native worker occupied");
+                        let pending = futures::poll!(future.as_mut().expect("active verification")).is_pending();
+                        if step == resume_step {
+                            drop(future.take());
+                            let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
+                            observations.push((count, resume_step, held));
+                        }
+                        release_tx.send(()).expect("release native worker before assertions");
+                        blocker.await.expect("native blocker completed");
+                        tokio::task::spawn_blocking(|| ()).await.expect("native queue drained");
+                        assert!(pending, "step={step}: verification queued native I/O");
+                    }
+                    assert!(gates.iter().all(|gate| gate.snapshot().active == 0));
+                }
+            }
+            disk.bitrot_verify(&path, payload.len(), algo, shard_size)
+                .await
+                .expect("cancellation preserves the encoded shard");
+            for (count, step, held) in observations {
+                assert_eq!(held, vec![1; count], "step={step}: queued verifier I/O keeps its physical resources");
+            }
+        });
+    }
+
     #[tokio::test]
     async fn local_disk_read_file_verifier_reports_bitrot_mismatch() {
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
         use crate::erasure::coding::BitrotWriter;
         use rustfs_filemeta::ChecksumInfo;
         use tempfile::tempdir;
@@ -28902,16 +28987,24 @@ mod test {
             .await
             .expect("corrupted encoded part should be written");
 
-        let result = disk
-            .verify_file(volume, object, &file_info)
-            .await
-            .expect("verify_file should return per-part status");
-
-        assert_eq!(result.results, vec![CHECK_PART_FILE_CORRUPT]);
+        for count in 0..=2 {
+            let (resources, gates) = if count == 0 {
+                (None, Vec::new())
+            } else {
+                let (resources, gates) = test_resource_units(count);
+                (Some(resources), gates)
+            };
+            let result = with_optional_resource_unit(resources, disk.verify_file(volume, object, &file_info))
+                .await
+                .expect("verify_file should return per-part status");
+            assert_eq!(result.results, vec![CHECK_PART_FILE_CORRUPT]);
+            assert!(gates.iter().all(|gate| gate.snapshot().active == 0));
+        }
     }
 
     #[tokio::test]
     async fn local_disk_verify_file_matches_legacy_and_nonlegacy_shard_geometry() {
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
         use crate::erasure::coding::{BitrotWriter, Erasure};
         use rustfs_filemeta::ChecksumInfo;
         use tempfile::tempdir;
@@ -28964,12 +29057,19 @@ mod test {
                 .await
                 .expect("encoded part should be written");
 
-            let result = disk
-                .verify_file(volume, object, &file_info)
-                .await
-                .expect("verify_file should return per-part status");
-
-            assert_eq!(result.results, vec![CHECK_PART_SUCCESS]);
+            for count in 0..=2 {
+                let (resources, gates) = if count == 0 {
+                    (None, Vec::new())
+                } else {
+                    let (resources, gates) = test_resource_units(count);
+                    (Some(resources), gates)
+                };
+                let result = with_optional_resource_unit(resources, disk.verify_file(volume, object, &file_info))
+                    .await
+                    .expect("verify_file should return per-part status");
+                assert_eq!(result.results, vec![CHECK_PART_SUCCESS]);
+                assert!(gates.iter().all(|gate| gate.snapshot().active == 0));
+            }
         }
     }
 
@@ -29272,7 +29372,7 @@ mod test {
     async fn resource_reader_cancelled_open_retains_resources_and_mount_lease() {
         use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
 
-        for stream in [false, true] {
+        for operation in ["full", "range", "bitrot"] {
             let dir = tempfile::tempdir().expect("reader open fixture");
             let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
             let mut disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
@@ -29298,10 +29398,11 @@ mod test {
                 let _ = release_rx.blocking_recv();
             });
             let task = tokio::spawn(with_optional_resource_unit(Some(resources), async move {
-                if stream {
-                    disk.read_file_stream("test-volume", "shard", 3, 1021).await
-                } else {
-                    disk.read_file("test-volume", "shard").await
+                match operation {
+                    "full" => disk.read_file("test-volume", "shard").await.map(drop),
+                    "range" => disk.read_file_stream("test-volume", "shard", 3, 1021).await.map(drop),
+                    "bitrot" => disk.bitrot_verify(&path, 992, HashAlgorithm::HighwayHash256S, 992).await,
+                    _ => unreachable!("fixed operation list"),
                 }
             }));
             tokio::time::timeout(Duration::from_secs(5), started_rx)
