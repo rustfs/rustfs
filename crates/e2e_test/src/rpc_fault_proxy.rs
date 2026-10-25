@@ -287,9 +287,9 @@ impl RpcFaultProxy {
         self.pause_with_lifetime(&["Lock", "LockBatch"], usize::MAX, Some(scope), false, true, None)
     }
 
-    /// Hold one coordinator's locks independently of the part-transaction gate.
+    /// Hold one coordinator's locks while observing other scoped lock owners.
     pub(crate) fn pause_upload_lock_owner(&self, scope: &str, owner: &str) -> io::Result<RpcPause> {
-        self.pause_with_lifetime(&["Lock", "LockBatch"], usize::MAX, Some(scope), false, false, Some(owner))
+        self.pause_with_lifetime(&["Lock", "LockBatch"], usize::MAX, Some(scope), false, true, Some(owner))
     }
 
     /// Retain bounded control packets until explicit delivery after caller retirement.
@@ -433,6 +433,9 @@ async fn forward_request(
                     lock_owners = scoped_lock_owners(method, &bytes, scope)?;
                     if let Some(owner) = &pause.lock_owner {
                         matches = lock_owners.iter().any(|candidate| candidate == owner);
+                        if !matches && pause.record_lock_owners {
+                            observed = Some((pause.clone(), None, std::mem::take(&mut lock_owners), false));
+                        }
                     }
                 }
                 if matches && method == "ReadVersion" {
@@ -848,6 +851,8 @@ mod tests {
                 assert_eq!(returned.to_bytes(), packet);
             }
             assert_eq!(owner.hits(), 1, "unrelated owners and uploads cannot count as the held contender");
+            assert!(owner.has_forwarded_lock_owner("allowed"));
+            assert!(!owner.has_forwarded_lock_owner("held"), "an unrelated upload is not forwarded admission");
             storage.release();
             assert_eq!(
                 part.await

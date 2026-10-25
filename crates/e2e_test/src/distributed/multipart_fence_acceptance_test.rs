@@ -1354,19 +1354,29 @@ async fn simultaneous_resend_complete_and_abort(
         };
 
         // The part owns the upload lock before either terminal call starts.
-        // Ordered rows hold only the losing coordinator on two remote peers.
+        // Ordered rows hold the loser's remote votes so partial lock grants
+        // cannot prevent the winner from reaching its quorum.
         let held_locks = if let Some(complete_wins) = preferred_complete {
             let loser = if complete_wins { 2 } else { 1 };
             let owner = proxies[loser].local_addr().to_string();
-            (1..4)
+            (0..4)
                 .filter(|node| *node != loser)
                 .map(|node| proxies[node].pause_upload_lock_owner(&scope, &owner))
                 .collect::<Result<Vec<_>, _>>()?
         } else {
             Vec::new()
         };
-        let admission = proxies[0].pause_upload_locks(&scope)?;
-        admission.release();
+        let admission = if preferred_complete.is_none() {
+            let admission = proxies[0].pause_upload_locks(&scope)?;
+            admission.release();
+            Some(admission)
+        } else {
+            None
+        };
+        let observer = admission
+            .as_ref()
+            .or_else(|| held_locks.first())
+            .expect("peer-zero lock observer");
         let start = std::sync::Arc::new(tokio::sync::Barrier::new(3));
         let complete_request = clients[1]
             .complete_multipart_upload()
@@ -1400,14 +1410,14 @@ async fn simultaneous_resend_complete_and_abort(
             wait_for_faults(&held_locks, &["Lock", "LockBatch"]).await?;
             wait_until(
                 DEADLINE,
-                || async { Ok(admission.has_forwarded_lock_owner(&owner)) },
+                || async { Ok(observer.has_forwarded_lock_owner(&owner)) },
                 "preferred terminal coordinator reaches the peer while its competitor is held",
             )
             .await?;
         } else {
             wait_until(
                 DEADLINE,
-                || async { Ok(admission.forwarded_lock_owners() == 2) },
+                || async { Ok(observer.forwarded_lock_owners() == 2) },
                 "Complete and Abort from distinct upload-lock owners reach the peer",
             )
             .await?;
@@ -1420,11 +1430,11 @@ async fn simultaneous_resend_complete_and_abort(
             tokio::time::timeout(Duration::from_millis(150), &mut abort).await.is_err(),
             "Abort must wait while the resent part is prepared: cancel_waiter={cancel_waiter}"
         );
-        let terminal_owners = admission.forwarded_lock_owners();
+        let terminal_owners = observer.forwarded_lock_owners();
         if preferred_complete.is_none() {
             assert_eq!(terminal_owners, 2, "both ungated terminal coordinators reach the peer");
         } else {
-            assert!((1..=2).contains(&terminal_owners), "only the two terminal coordinators can contend");
+            assert_eq!(terminal_owners, 1, "only the preferred coordinator may pass the owner gate");
         }
         let held_lock_calls = held_locks.iter().map(RpcPause::hits).sum::<usize>();
         assert_eq!(held_lock_calls > 0, preferred_complete.is_some());
@@ -1436,7 +1446,7 @@ async fn simultaneous_resend_complete_and_abort(
             let part = tokio::time::timeout(DEADLINE, caller).await???;
             assert_eq!(part.e_tag(), Some(replacement_etag.as_str()));
         }
-        // Keep two peers unavailable only to the losing coordinator until
+        // Keep remote peers unavailable only to the losing coordinator until
         // the winner finishes. The part owner and winner remain unaffected.
         let (completion, abortion) = if preferred_complete == Some(false) {
             let abortion = tokio::time::timeout(DEADLINE, &mut abort).await??;
