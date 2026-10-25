@@ -19,6 +19,7 @@ use super::heal_info::{
 use super::*;
 
 mod startup_gate;
+mod startup_observation;
 use crate::EcstoreResult;
 use crate::storage_api::owner::{
     WriteCommitGuard, WriteCompletion, ecstore_hold_namespace_commit, ecstore_namespace_commits_pending,

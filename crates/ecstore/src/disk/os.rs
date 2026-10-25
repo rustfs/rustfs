@@ -4420,6 +4420,17 @@ impl RenameDestinationPathGuard {
         sync_file: bool,
         sync_parent: bool,
     ) -> io::Result<()> {
+        self.write_file_for_path_access_guarded(file_path, data, sync_file, sync_parent, || Ok(()))
+    }
+
+    fn write_file_for_path_access_guarded(
+        &self,
+        file_path: &Path,
+        data: &[u8],
+        sync_file: bool,
+        sync_parent: bool,
+        before_publish: impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
         #[cfg(windows)]
         {
             if file_path.parent() != Some(self.directory.as_path()) {
@@ -4455,7 +4466,9 @@ impl RenameDestinationPathGuard {
             // the separate publication handle as the identity anchor and close
             // the writer before issuing the handle-relative rename.
             drop(writer);
-            if let Err(rename_err) = rename_windows_prepared(file_path, &self._directory_guard, &publication, 0) {
+            if let Err(rename_err) =
+                before_publish().and_then(|()| rename_windows_prepared(file_path, &self._directory_guard, &publication, 0))
+            {
                 if let Err(cleanup_err) = set_windows_file_delete_on_close(&publication, true) {
                     return Err(io::Error::new(
                         rename_err.kind(),
@@ -4474,6 +4487,7 @@ impl RenameDestinationPathGuard {
         #[cfg(not(windows))]
         {
             let _ = self;
+            before_publish()?;
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -5192,6 +5206,7 @@ pub(crate) fn compare_and_update_control_file(
     replacement: Option<&[u8]>,
     sync_metadata: bool,
     publication_root: &PublicationRoot,
+    before_publish: impl Fn() -> io::Result<()>,
 ) -> io::Result<ConditionalFileUpdate> {
     use windows_sys::{
         Wdk::Storage::FileSystem::{
@@ -5241,7 +5256,7 @@ pub(crate) fn compare_and_update_control_file(
             directory: parent.to_path_buf(),
             _directory_guard: parent_guard,
         }
-        .write_file_for_path_access(file_path, replacement, sync_metadata, sync_metadata)?,
+        .write_file_for_path_access_guarded(file_path, replacement, sync_metadata, sync_metadata, before_publish)?,
         None => {
             let file_name = file_path
                 .file_name()
@@ -5257,6 +5272,7 @@ pub(crate) fn compare_and_update_control_file(
                 true,
             )?;
             validate_windows_owned_file(&file)?;
+            before_publish()?;
             set_windows_file_delete_on_close(&file, true)?;
             drop(file);
             if sync_metadata {

@@ -113,6 +113,7 @@ pub(crate) struct DeleteRecoveryContext<'a> {
     pub repair_marker_source: bool,
     pub namespace_owner: Option<Arc<dyn Send + Sync>>,
     pub recovery_ticket: Option<crate::store::delete_recovery_runtime::DeleteRecoveryTicket>,
+    pub published_hint: Option<(Uuid, &'a [Result<DeleteRecoveryInspection>])>,
     pub can_commit: &'a (dyn Fn() -> bool + Sync),
 }
 
@@ -125,6 +126,7 @@ impl<'a> DeleteRecoveryContext<'a> {
             repair_marker_source: false,
             namespace_owner: None,
             recovery_ticket: None,
+            published_hint: None,
             can_commit,
         }
     }
@@ -421,7 +423,9 @@ impl SetDisks {
         let cleanup = loop {
             #[cfg(test)]
             test_hooks::record_cleanup_attempt(bucket, object);
-            match self.recover_delete_key(bucket, object, context.clone()).await {
+            let mut attempt_context = context.clone();
+            attempt_context.published_hint = (attempt == 1).then_some((transaction, published.as_slice()));
+            match self.recover_delete_key(bucket, object, attempt_context).await {
                 // A stale settlement fingerprint only means the snapshot raced
                 // another writer; each attempt re-inspects every participant.
                 Err(DiskError::OutdatedXLMeta) if attempt < PUBLISHED_CLEANUP_ATTEMPTS && can_commit() => attempt += 1,
@@ -551,6 +555,7 @@ impl SetDisks {
             explicit_delete,
             repair_marker_source,
             namespace_owner,
+            published_hint,
             can_commit,
             recovery_ticket: _,
         } = context;
@@ -589,7 +594,18 @@ impl SetDisks {
         let mut all_states = BTreeMap::new();
         for transaction in transactions {
             let mut complete = Vec::with_capacity(disks.len());
-            for state in inspect(&disks, bucket, object, transaction).await {
+            let inspections = if let Some((published_tx, published_states)) = published_hint
+                && !repair_marker_source
+                && !dry_run
+                && published_tx == transaction
+                && published_states.len() == disks.len()
+                && published_states.iter().all(Result::is_ok)
+            {
+                published_states.to_vec()
+            } else {
+                inspect(&disks, bucket, object, transaction).await
+            };
+            for state in inspections {
                 match state {
                     Ok(state) => {
                         if let Some(journal) = &state.journal {
@@ -832,6 +848,9 @@ impl SetDisks {
                     bucket,
                     copies,
                     |copy| {
+                        if receipt(copy.state) && copy.commit_data_safe {
+                            return None;
+                        }
                         Some(
                             if copy.state == DeleteRecoveryState::Absent
                                 || (certified_same_transaction
@@ -857,7 +876,10 @@ impl SetDisks {
                         &disks,
                         bucket,
                         copies,
-                        |_| Some(DeleteRecoveryAction::FinishCommit),
+                        |copy| {
+                            (copy.state != DeleteRecoveryState::CommitFinished || !copy.commit_data_safe)
+                                .then_some(DeleteRecoveryAction::FinishCommit)
+                        },
                         can_commit,
                         namespace_owner.as_ref(),
                         &mut summary.removed_versions,
@@ -922,13 +944,25 @@ impl SetDisks {
             // GC is a key-wide barrier: every predecessor must have settled
             // before the last surviving commit witness can disappear.
             let mut settled = Vec::with_capacity(all_states.len());
-            for transaction in all_states.keys() {
-                let fresh = inspect(&disks, bucket, object, *transaction).await;
-                if fresh.iter().any(|state| !matches!(state, Ok(state) if matches!(state.state, DeleteRecoveryState::Absent | DeleteRecoveryState::CommitFinished))) {
+            if all_states.len() == 1 {
+                let copies = all_states.into_values().next().ok_or(DiskError::FileCorrupt)?;
+                if copies
+                    .iter()
+                    .any(|state| !matches!(state.state, DeleteRecoveryState::Absent | DeleteRecoveryState::CommitFinished))
+                {
                     summary.pending += 1;
                     return Ok(summary);
                 }
-                settled.push(fresh.into_iter().collect::<Result<Vec<_>>>()?);
+                settled.push(copies);
+            } else {
+                for transaction in all_states.keys() {
+                    let fresh = inspect(&disks, bucket, object, *transaction).await;
+                    if fresh.iter().any(|state| !matches!(state, Ok(state) if matches!(state.state, DeleteRecoveryState::Absent | DeleteRecoveryState::CommitFinished))) {
+                        summary.pending += 1;
+                        return Ok(summary);
+                    }
+                    settled.push(fresh.into_iter().collect::<Result<Vec<_>>>()?);
+                }
             }
             for (index, mut copies) in settled.into_iter().enumerate() {
                 if index > 0 {
