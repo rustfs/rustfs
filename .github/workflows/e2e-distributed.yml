@@ -62,7 +62,7 @@ on:
   workflow_dispatch:
     inputs:
       filter:
-        description: "Optional e2e-full diagnostic filter (default: the whole e2e-distributed profile)"
+        description: "Optional nextest -E filter (default: the whole e2e-distributed profile)"
         required: false
         default: ""
   schedule:
@@ -166,17 +166,15 @@ jobs:
         env:
           RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-distributed-logs
           FILTER: ${{ inputs.filter }}
-          RUSTFS_E2E_ADD_TIER_LOG: "rustfs=info,rustfs_notify=debug,rustfs_ecstore::object_lock_diag=trace,rustfs_lock=debug,rustfs_ecstore::cluster::rpc::remote_locker=debug"
         run: |
           set -euo pipefail
-          rm -f target/nextest/e2e-distributed/junit.xml target/nextest/e2e-full/junit.xml
+          rm -f target/nextest/e2e-distributed/junit.xml
           if [ -n "${FILTER}" ]; then
-            python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-full -p e2e_test -E "${FILTER}" --no-tests=fail --success-output=immediate
-            test -s target/nextest/e2e-full/junit.xml
+            python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test -E "${FILTER}"
           else
             python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test --no-tests=fail
-            test -s target/nextest/e2e-distributed/junit.xml
           fi
+          test -s target/nextest/e2e-distributed/junit.xml
 
       - name: Upload distributed e2e diagnostics
         if: always()
@@ -185,7 +183,6 @@ jobs:
           name: e2e-distributed-${{ github.run_number }}
           path: |
             target/nextest/e2e-distributed/junit.xml
-            target/nextest/e2e-full/junit.xml
             ${{ runner.temp }}/rustfs-e2e-distributed-list.json
             ${{ runner.temp }}/rustfs-e2e-distributed-logs/
           retention-days: 7
