@@ -535,3 +535,477 @@ fn lifecycle_v2_reader_keeps_first_hold_across_repeated_incarnation_refresh() {
         "changing the observed bucket cannot reset when this responsibility was first retained"
     );
 }
+
+fn with_writer_fixture<F, Fut>(test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    temp_env::with_var("RUSTFS_MRF_LIFECYCLE_V2_ENABLE", Some("true"), || {
+        const STACK_SIZE: usize = 8 * 1024 * 1024;
+        std::thread::Builder::new()
+            .name("mrf-lifecycle-writer".to_owned())
+            .stack_size(STACK_SIZE)
+            .spawn(move || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .thread_stack_size(STACK_SIZE)
+                    .enable_all()
+                    .build()
+                    .expect("writer fixture runtime")
+                    .block_on(async {
+                        let env = rustfs_test_utils::TestECStoreEnv::builder()
+                            .prefix("rustfs_mrf_lifecycle_writer")
+                            .build()
+                            .await;
+                        rustfs_common::set_global_local_node_name("mrf-writer-test:9000").await;
+                        crate::heal::storage_api::ecstore_new_global_notification_sys(env.endpoint_pools.clone())
+                            .await
+                            .expect("publish the single-node notification system");
+                        crate::heal::storage_api::ecstore_start_remote_version_state_fleet_probe(
+                            "mrf-writer-test-topology".to_owned(),
+                        );
+                        test().await;
+                    });
+            })
+            .expect("writer fixture thread")
+            .join()
+            .expect("writer fixture must finish");
+    });
+}
+
+#[test]
+#[serial]
+fn unknown_source_deleted_bucket_writer_commits_only_the_retained_identity() {
+    with_writer_fixture(|| async {
+        let storage = Arc::new(ProbeStorage {
+            lookup: Mutex::new(Lookup::Identity(None)),
+            calls: AtomicUsize::new(0),
+        });
+        let manager = HealManager::new_without_root_recovery_for_test(storage.clone(), None);
+        let mut runtime = runtime();
+        let mut original = intent("writer-unresolved");
+        original.scope = Some(rustfs_common::mrf_channel::MrfScope {
+            pool_index: 0,
+            set_index: 0,
+        });
+        let key = PartialWriteKey::new(&original, None);
+        runtime
+            .admit_partial_write(original.clone(), None)
+            .expect("retain the legacy responsibility");
+        assert!(runtime.flush().await, "commit the old-format responsibility first");
+        let before = runtime.partial_writes.checkpoint_records(super::super::super::intent_digest);
+        assert_eq!(before.len(), 1);
+        assert!(matches!(before[0].state, ResponsibilityState::Active {}));
+        runtime
+            .partial_writes
+            .entries
+            .get_mut(&key)
+            .expect("retained entry")
+            .next_attempt = Instant::now();
+        runtime.dispatch_partial_writes(&manager).await;
+        let checkpoint = super::super::super::read_mrf_lifecycle_checkpoint(
+            runtime.checkpoint_owner,
+            runtime.runtime_checkpoint.expect("committed owner").1,
+            runtime.config.journal_max_bytes,
+            runtime.config.journal_max_bytes * 4,
+        )
+        .await
+        .expect("read the committed lifecycle")
+        .expect("lifecycle companion");
+        assert_eq!(checkpoint.format_version, 2, "an authorized unresolved observation must persist V2");
+        assert_eq!(checkpoint.records.len(), 1);
+        let retained = &checkpoint.records[0];
+        assert_eq!(retained.responsibility_id, before[0].responsibility_id);
+        assert_eq!(retained.intent_digest, before[0].intent_digest);
+        assert_eq!(retained.source_bucket_incarnation_id, None);
+        assert!(matches!(retained.state, ResponsibilityState::SourceAndCurrentGenerationUnknown { .. }));
+        assert_eq!(runtime.partial_writes.depth(), 1);
+        assert_eq!(runtime.partial_writes.intents().next().expect("retained intent").scope, original.scope);
+        assert_eq!(storage.calls.load(Ordering::Relaxed), 1);
+        let (listed, _) = runtime.partial_writes.list_unverified_legacy(None, 1);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].responsibility_id, before[0].responsibility_id);
+        assert_eq!(listed[0].bucket_incarnation_id, None);
+        assert_eq!(listed[0].source_bucket_incarnation_id, None);
+        assert!(listed[0].held_since_ms.is_some());
+    });
+}
+
+#[tokio::test(start_paused = true)]
+async fn unknown_source_deleted_bucket_writer_does_not_promote_errors_or_disabled_observations() {
+    for (enabled, lookup) in [
+        (false, Lookup::Identity(None)),
+        (true, Lookup::PermissionDenied),
+        (true, Lookup::Quorum),
+        (true, Lookup::Transport),
+        (true, Lookup::Identity(Some(Uuid::nil()))),
+        (true, Lookup::Pending),
+    ] {
+        let storage = Arc::new(ProbeStorage {
+            lookup: Mutex::new(lookup),
+            calls: AtomicUsize::new(0),
+        });
+        let manager = HealManager::new_without_root_recovery_for_test(storage.clone(), None);
+        let mut runtime = runtime();
+        runtime.config.lifecycle_v2_writer_enabled = enabled;
+        let original = intent("writer-ineligible");
+        let key = PartialWriteKey::new(&original, None);
+        runtime
+            .admit_partial_write(original, None)
+            .expect("retain legacy responsibility");
+        runtime.partial_writes.mark_persisted();
+        runtime
+            .partial_writes
+            .entries
+            .get_mut(&key)
+            .expect("legacy entry")
+            .next_attempt = Instant::now();
+        let before = runtime.partial_writes.checkpoint_records(super::super::super::intent_digest);
+        assert!(
+            !runtime
+                .partial_writes
+                .dispatch_collecting_lifecycle_change(&manager, &runtime.config)
+                .await
+        );
+        assert!(runtime.partial_writes.take_unresolved_generation_candidate().is_none());
+        assert_eq!(runtime.partial_writes.checkpoint_records(super::super::super::intent_digest), before);
+        assert!(runtime.partial_writes.entries[&key].next_attempt > Instant::now());
+        assert_eq!(storage.calls.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unknown_source_deleted_bucket_writer_without_fleet_proof_keeps_v1_visible_and_backed_off() {
+    let storage = Arc::new(ProbeStorage {
+        lookup: Mutex::new(Lookup::Identity(None)),
+        calls: AtomicUsize::new(0),
+    });
+    let manager = HealManager::new_without_root_recovery_for_test(storage.clone(), None);
+    let mut runtime = runtime();
+    runtime.config.lifecycle_v2_writer_enabled = true;
+    let original = intent("writer-without-fleet");
+    let key = PartialWriteKey::new(&original, None);
+    runtime
+        .admit_partial_write(original, None)
+        .expect("retain legacy responsibility");
+    runtime.partial_writes.mark_persisted();
+    runtime
+        .partial_writes
+        .entries
+        .get_mut(&key)
+        .expect("legacy entry")
+        .next_attempt = Instant::now();
+    let before = runtime.partial_writes.checkpoint_records(super::super::super::intent_digest);
+    for _ in 0..20 {
+        runtime.dispatch_partial_writes(&manager).await;
+    }
+    assert_eq!(storage.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(runtime.lifecycle_format_version, 1);
+    assert!(runtime.partial_writes.pending_lifecycle_transition.is_none());
+    assert_eq!(runtime.partial_writes.checkpoint_records(super::super::super::intent_digest), before);
+    let page = runtime
+        .list_unverified_legacy(None, 1)
+        .expect("legacy responsibility remains visible");
+    assert_eq!(page.responsibilities.len(), 1);
+    assert_eq!(page.responsibilities[0].responsibility_id, before[0].responsibility_id);
+    assert_eq!(page.responsibilities[0].bucket_incarnation_id, None);
+
+    // Earlier unresolved observations remain the retention origin even when
+    // fleet unavailability forces another identity lookup before promotion.
+    runtime
+        .partial_writes
+        .entries
+        .get_mut(&key)
+        .expect("legacy entry")
+        .first_unresolved_at_ms = Some(7);
+    tokio::time::advance(Duration::from_secs(61)).await;
+    runtime.dispatch_partial_writes(&manager).await;
+    assert_eq!(runtime.partial_writes.entries[&key].first_unresolved_at_ms, Some(7));
+    tokio::time::advance(Duration::from_secs(61)).await;
+    runtime
+        .partial_writes
+        .dispatch_collecting_lifecycle_change(&manager, &runtime.config)
+        .await;
+    let candidate = runtime
+        .partial_writes
+        .take_unresolved_generation_candidate()
+        .expect("a later unresolved observation");
+    assert!(matches!(
+        candidate.record.state,
+        ResponsibilityState::SourceAndCurrentGenerationUnknown { since_ms: 7, .. }
+    ));
+    assert_eq!(storage.calls.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+#[serial]
+fn unknown_source_deleted_bucket_writer_failed_companion_keeps_owner_until_bounded_retry() {
+    with_writer_fixture(|| async {
+        use crate::heal::mrf_queue::{MRF_LIFECYCLE_PATHS, journal_disks, read_mrf_lifecycle_checkpoint};
+        use crate::heal::storage_api::EcstoreDiskAPI;
+
+        let storage = Arc::new(ProbeStorage {
+            lookup: Mutex::new(Lookup::Identity(None)),
+            calls: AtomicUsize::new(0),
+        });
+        let manager = HealManager::new_without_root_recovery_for_test(storage.clone(), None);
+        let mut runtime = runtime();
+        let original = intent("writer-failed-companion");
+        let key = PartialWriteKey::new(&original, None);
+        runtime
+            .admit_partial_write(original, None)
+            .expect("retain legacy responsibility");
+        assert!(runtime.flush().await);
+        let owner = runtime.runtime_checkpoint.expect("old checkpoint");
+        let before = runtime.partial_writes.checkpoint_records(super::super::super::intent_digest);
+        let mut obstacles = Vec::new();
+        for disk in journal_disks().await {
+            let path = EcstoreDiskAPI::path(disk.as_ref())
+                .join(crate::heal::RUSTFS_META_BUCKET)
+                .join(MRF_LIFECYCLE_PATHS[1]);
+            std::fs::create_dir(&path).expect("inject an unwritable successor companion");
+            obstacles.push(path);
+        }
+        runtime
+            .partial_writes
+            .entries
+            .get_mut(&key)
+            .expect("legacy entry")
+            .next_attempt = Instant::now();
+        runtime.dispatch_partial_writes(&manager).await;
+        assert!(runtime.partial_writes.pending_lifecycle_transition.is_some());
+        assert_eq!(runtime.runtime_checkpoint, Some(owner));
+        assert_eq!(runtime.lifecycle_format_version, 1);
+        assert_eq!(runtime.partial_writes.checkpoint_records(super::super::super::intent_digest), before);
+        let old = read_mrf_lifecycle_checkpoint(
+            owner.0,
+            owner.1,
+            runtime.config.journal_max_bytes,
+            runtime.config.journal_max_bytes * 4,
+        )
+        .await
+        .expect("read predecessor")
+        .expect("predecessor companion");
+        assert_eq!(old.format_version, 1);
+        assert_eq!(old.records, before);
+        assert_eq!(
+            runtime
+                .list_unverified_legacy(None, 1)
+                .expect("pending owner remains queryable")
+                .responsibilities[0]
+                .responsibility_id,
+            before[0].responsibility_id
+        );
+        assert!(matches!(
+            runtime.admit_partial_write(intent("later"), None),
+            Err(MrfDurableAdmissionError::Persistence)
+        ));
+        assert!(matches!(
+            runtime
+                .recheck_legacy_generation(&manager, before[0].responsibility_id, Uuid::new_v4())
+                .await,
+            Err(MrfLifecycleControlError::Persistence)
+        ));
+        runtime.dispatch_partial_writes(&manager).await;
+        assert_eq!(storage.calls.load(Ordering::Relaxed), 1);
+        assert!(!runtime.flush().await, "a consumer tick cannot bypass the retry deadline");
+        for path in obstacles {
+            std::fs::remove_dir(path).expect("remove only the empty injected obstacle");
+        }
+        runtime
+            .partial_writes
+            .pending_lifecycle_transition
+            .as_mut()
+            .expect("same pending transition")
+            .next_attempt = Instant::now();
+        assert!(runtime.flush().await, "the same owner retries after storage recovery");
+        assert!(runtime.partial_writes.pending_lifecycle_transition.is_none());
+        assert_eq!(runtime.runtime_checkpoint, Some((owner.0, owner.1 + 1)));
+        let committed = read_mrf_lifecycle_checkpoint(
+            owner.0,
+            owner.1 + 1,
+            runtime.config.journal_max_bytes,
+            runtime.config.journal_max_bytes * 4,
+        )
+        .await
+        .expect("read retry commit")
+        .expect("retry companion");
+        assert_eq!(committed.format_version, 2);
+        assert_eq!(committed.records[0].responsibility_id, before[0].responsibility_id);
+        assert_eq!(committed.records[0].source_bucket_incarnation_id, None);
+    });
+}
+
+#[test]
+#[serial]
+fn unknown_source_deleted_bucket_writer_lost_result_is_resolved_by_exact_commit_readback() {
+    with_writer_fixture(|| async {
+        use crate::heal::mrf_queue::{
+            MRF_LIFECYCLE_PATHS, encode_mrf_lifecycle_checkpoint, intent_digest, journal_disks, snapshot,
+        };
+
+        let storage = Arc::new(ProbeStorage {
+            lookup: Mutex::new(Lookup::Identity(None)),
+            calls: AtomicUsize::new(0),
+        });
+        let manager = HealManager::new_without_root_recovery_for_test(storage, None);
+        let mut runtime = runtime();
+        let original = intent("writer-lost-result");
+        let key = PartialWriteKey::new(&original, None);
+        runtime
+            .admit_partial_write(original, None)
+            .expect("retain legacy responsibility");
+        for object in ["writer-lost-result-other-a", "writer-lost-result-other-b"] {
+            runtime
+                .admit_partial_write(intent(object), None)
+                .expect("retain another responsibility");
+        }
+        assert!(runtime.flush().await);
+        runtime
+            .partial_writes
+            .entries
+            .get_mut(&key)
+            .expect("legacy entry")
+            .next_attempt = Instant::now();
+        runtime
+            .partial_writes
+            .dispatch_collecting_lifecycle_change(&manager, &runtime.config)
+            .await;
+        let pending = runtime
+            .partial_writes
+            .take_unresolved_generation_candidate()
+            .expect("unresolved proposal");
+        let record = pending.record.clone();
+        runtime.partial_writes.pending_lifecycle_transition = Some(pending);
+        let sequence = runtime.next_checkpoint_sequence;
+        let (payload, _) = runtime.snapshot();
+        let lifecycle = encode_mrf_lifecycle_checkpoint(
+            2,
+            runtime.checkpoint_owner,
+            sequence,
+            {
+                let mut records = runtime.partial_writes.checkpoint_records(intent_digest);
+                *records
+                    .iter_mut()
+                    .find(|item| item.responsibility_id == record.responsibility_id)
+                    .expect("pending responsibility") = record.clone();
+                records
+            },
+            runtime.config.journal_max_bytes * 4,
+        )
+        .expect("exact candidate body");
+        // Commit the proposal without delivering the result to its runtime.
+        snapshot::publish_committed_snapshot_with_companion(
+            &journal_disks().await,
+            runtime.checkpoint_owner,
+            sequence,
+            &payload,
+            runtime.config.journal_max_bytes,
+            Some((&MRF_LIFECYCLE_PATHS, &lifecycle, runtime.config.journal_max_bytes * 4)),
+        )
+        .await
+        .expect("commit before the simulated lost acknowledgement");
+        crate::heal::storage_api::ecstore_start_remote_version_state_fleet_probe("changed-test-topology".to_owned());
+        assert!(
+            crate::heal::storage_api::ecstore_acquire_mrf_lifecycle_writer_fleet_proof(2)
+                .await
+                .is_none()
+        );
+        assert!(runtime.flush().await, "an exact committed result needs no new writer authority");
+        assert_eq!(runtime.lifecycle_format_version, 2);
+        assert_eq!(runtime.next_checkpoint_sequence, sequence + 1);
+        let restored = runtime.partial_writes.checkpoint_records(intent_digest);
+        assert_eq!(restored.len(), 3);
+        assert_eq!(
+            restored
+                .iter()
+                .find(|item| item.responsibility_id == record.responsibility_id),
+            Some(&record)
+        );
+        assert_eq!(
+            restored
+                .iter()
+                .filter(|item| matches!(item.state, ResponsibilityState::Active {}))
+                .count(),
+            2
+        );
+        assert!(runtime.partial_writes.pending_lifecycle_transition.is_none());
+        let committed = snapshot::inspect_local_committed_snapshot(runtime.config.journal_max_bytes)
+            .await
+            .expect("inspect readback")
+            .expect("committed snapshot");
+        assert_eq!(committed.sequence(), sequence, "resolving a lost result must not publish a new sequence");
+    });
+}
+
+#[test]
+#[serial]
+fn unknown_source_deleted_bucket_writer_failed_mirror_cannot_downgrade_a_committed_owner() {
+    with_writer_fixture(|| async {
+        use crate::heal::mrf_queue::{MRF_SCOPED_JOURNAL_PATH, journal_disks, read_mrf_lifecycle_checkpoint};
+        use crate::heal::storage_api::EcstoreDiskAPI;
+
+        let storage = Arc::new(ProbeStorage {
+            lookup: Mutex::new(Lookup::Identity(None)),
+            calls: AtomicUsize::new(0),
+        });
+        let manager = HealManager::new_without_root_recovery_for_test(storage, None);
+        let mut runtime = runtime();
+        let original = intent("writer-failed-mirror");
+        let key = PartialWriteKey::new(&original, None);
+        runtime.admit_partial_write(original, None).expect("retain responsibility");
+        assert!(runtime.flush().await);
+        let owner = runtime.runtime_checkpoint.expect("old checkpoint");
+        let mut obstacles = Vec::new();
+        for disk in journal_disks().await {
+            let path = EcstoreDiskAPI::path(disk.as_ref())
+                .join(crate::heal::RUSTFS_META_BUCKET)
+                .join(MRF_SCOPED_JOURNAL_PATH);
+            std::fs::remove_file(&path).expect("remove the isolated fixture mirror");
+            std::fs::create_dir(&path).expect("prevent only compatibility-mirror publication");
+            obstacles.push(path);
+        }
+        runtime
+            .partial_writes
+            .entries
+            .get_mut(&key)
+            .expect("legacy entry")
+            .next_attempt = Instant::now();
+        runtime.dispatch_partial_writes(&manager).await;
+        assert_eq!(runtime.runtime_checkpoint, Some((owner.0, owner.1 + 1)));
+        assert_eq!(runtime.lifecycle_format_version, 2);
+        assert!(runtime.partial_writes.pending_lifecycle_transition.is_none());
+        assert!(runtime.dirty, "the failed mirror must be retried");
+        let committed = read_mrf_lifecycle_checkpoint(
+            owner.0,
+            owner.1 + 1,
+            runtime.config.journal_max_bytes,
+            runtime.config.journal_max_bytes * 4,
+        )
+        .await
+        .expect("read committed owner")
+        .expect("committed lifecycle");
+        assert_eq!(committed.format_version, 2);
+        assert!(matches!(
+            committed.records[0].state,
+            ResponsibilityState::SourceAndCurrentGenerationUnknown { .. }
+        ));
+        for path in obstacles {
+            std::fs::remove_dir(path).expect("remove the empty mirror obstacle");
+        }
+        assert!(runtime.flush().await);
+        assert!(!runtime.dirty);
+        let retried = read_mrf_lifecycle_checkpoint(
+            owner.0,
+            owner.1 + 2,
+            runtime.config.journal_max_bytes,
+            runtime.config.journal_max_bytes * 4,
+        )
+        .await
+        .expect("read repaired mirror owner")
+        .expect("repaired lifecycle");
+        assert_eq!(retried.format_version, 2);
+        assert_eq!(retried.records, committed.records);
+    });
+}
