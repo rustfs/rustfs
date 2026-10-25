@@ -1245,7 +1245,7 @@ impl LocalDisk {
                     continue;
                 };
                 #[cfg(test)]
-                run_owned_file_write_before_open(&record_destination.join(name));
+                run_owned_file_before_open(&record_destination.join(name));
                 let mut file = std::fs::File::create(staged.path().join(name))?;
                 std::io::Write::write_all(&mut file, bytes)?;
                 if sync {

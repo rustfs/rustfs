@@ -706,7 +706,7 @@ async fn write_delete_rollback_file(
         std::fs::create_dir_all(&backup_dir)?;
         std::fs::create_dir_all(&staging_root)?;
         #[cfg(test)]
-        run_owned_file_write_before_open(&path);
+        run_owned_file_before_open(&path);
         // tempfile's Windows `persist` hands both the staged and the final path
         // straight to `MoveFileExW`, bypassing std's long-path handling, so a
         // deep object key failed every delete at MAX_PATH (rustfs#8545).
@@ -2754,7 +2754,7 @@ fn open_direct_writer(
     use std::os::unix::fs::OpenOptionsExt;
 
     #[cfg(test)]
-    run_owned_file_write_before_open(file_path);
+    run_owned_file_before_open(file_path);
 
     let open_result = std::fs::OpenOptions::new()
         .create(true)
@@ -2841,7 +2841,7 @@ static RENAME_DATA_AFTER_FIRST_PUBLICATION: std::sync::LazyLock<
 pub(super) static DELETE_ROLLBACK_BACKUP_RESTORES: std::sync::LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 #[cfg(test)]
-static OWNED_FILE_WRITE_BEFORE_OPEN: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, InlinePreparationHook>>> =
+static OWNED_FILE_BEFORE_OPEN: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, InlinePreparationHook>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 #[cfg(all(test, windows))]
 static DESTINATION_COMMIT_DIRECTORY_PREPARATION: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, InlinePreparationHook>>> =
@@ -2919,10 +2919,10 @@ fn set_rename_data_after_first_publication(root: &Path, dst_volume: &str, dst_pa
 }
 
 #[cfg(test)]
-fn set_owned_file_write_before_open(path: &Path, hook: impl FnOnce() + Send + 'static) {
-    OWNED_FILE_WRITE_BEFORE_OPEN
+fn set_owned_file_before_open(path: &Path, hook: impl FnOnce() + Send + 'static) {
+    OWNED_FILE_BEFORE_OPEN
         .lock()
-        .expect("test file write hook lock should not be poisoned")
+        .expect("test file open hook lock should not be poisoned")
         .insert(path.to_path_buf(), Box::new(hook));
 }
 
@@ -3094,10 +3094,10 @@ fn run_rename_data_after_first_publication(root: &Path, dst_volume: &str, dst_pa
 }
 
 #[cfg(test)]
-fn run_owned_file_write_before_open(path: &Path) {
-    let hook = OWNED_FILE_WRITE_BEFORE_OPEN
+fn run_owned_file_before_open(path: &Path) {
+    let hook = OWNED_FILE_BEFORE_OPEN
         .lock()
-        .expect("test file write hook lock should not be poisoned")
+        .expect("test file open hook lock should not be poisoned")
         .remove(path);
     if let Some(hook) = hook {
         hook();
@@ -3566,20 +3566,11 @@ impl FileCacheReclaimReader {
 
     #[cfg(target_os = "linux")]
     fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
-        use core::num::NonZeroU64;
-        use rustix::fs::{Advice, fadvise};
-
         if !self.reclaim_on_drop || self.reclaimed || self.reclaim_len == 0 {
             return Ok(());
         }
-
-        let started = std::time::Instant::now();
-        let reclaim_len =
-            NonZeroU64::new(self.reclaim_len as u64).expect("reclaim_len is guaranteed non-zero by the early return");
-        fadvise(&self.inner, self.reclaim_offset, Some(reclaim_len), Advice::DontNeed).map_err(std::io::Error::from)?;
-
+        reclaim_stream_file_cache(&self.inner, self.reclaim_offset, self.reclaim_len, "read")?;
         self.reclaimed = true;
-        record_file_cache_reclaim_success("read", self.reclaim_len, started);
         Ok(())
     }
 
@@ -3634,6 +3625,137 @@ impl AsyncRead for FileCacheReclaimReader {
     }
 }
 
+// Match Tokio File's maximum staging size and reuse allocations per stream.
+const RESOURCE_FILE_MAX_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+
+struct ResourceReadInner {
+    file: std::fs::File,
+    buffer: Vec<u8>,
+    position: usize,
+    filled: usize,
+    _resource_unit: ResourceIoUnit,
+    #[cfg(target_os = "linux")]
+    reclaim: Option<(u64, usize)>,
+    #[cfg(test)]
+    before_read: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl Drop for ResourceReadInner {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some((offset, length)) = self.reclaim
+            && reclaim_stream_file_cache(&self.file, offset, length, "read").is_err()
+        {
+            record_file_cache_reclaim_error("read");
+        }
+    }
+}
+
+enum ResourceReadState {
+    Idle(Option<ResourceReadInner>),
+    Busy(tokio::task::JoinHandle<(ResourceReadInner, std::io::Result<usize>)>),
+}
+
+struct ResourceFileReader {
+    state: ResourceReadState,
+}
+
+impl ResourceFileReader {
+    fn new(file: std::fs::File, resources: ResourceIoUnit, reclaim: Option<(u64, usize)>) -> Self {
+        #[cfg(target_os = "macos")]
+        if reclaim.is_some() {
+            let _ = set_std_fd_nocache(&file);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = reclaim;
+        Self {
+            state: ResourceReadState::Idle(Some(ResourceReadInner {
+                file,
+                buffer: Vec::new(),
+                position: 0,
+                filled: 0,
+                _resource_unit: resources,
+                #[cfg(target_os = "linux")]
+                reclaim,
+                #[cfg(test)]
+                before_read: None,
+            })),
+        }
+    }
+}
+
+impl AsyncRead for ResourceFileReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        loop {
+            match &mut self.state {
+                ResourceReadState::Idle(slot) => {
+                    let Some(inner) = slot.as_mut() else {
+                        return std::task::Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "background file reader is closed after a native task failure",
+                        )));
+                    };
+                    if inner.position < inner.filled {
+                        let len = buf.remaining().min(inner.filled - inner.position);
+                        buf.put_slice(&inner.buffer[inner.position..inner.position + len]);
+                        inner.position += len;
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                    let Some(mut inner) = slot.take() else {
+                        unreachable!("the closed-reader branch returned above");
+                    };
+                    let length = buf.remaining().min(RESOURCE_FILE_MAX_BUFFER_SIZE);
+                    self.state = ResourceReadState::Busy(tokio::task::spawn_blocking(move || {
+                        #[cfg(test)]
+                        if let Some(hook) = inner.before_read.take() {
+                            hook();
+                        }
+                        // Keep initialized storage between reads, so only growth
+                        // zeroes memory and partial reads never expose stale bytes.
+                        if inner.buffer.len() < length {
+                            inner.buffer.resize(length, 0);
+                        }
+                        inner.position = 0;
+                        inner.filled = 0;
+                        let result = loop {
+                            match std::io::Read::read(&mut inner.file, &mut inner.buffer[..length]) {
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                                result => break result,
+                            }
+                        };
+                        if let Ok(read) = result {
+                            inner.filled = read;
+                        }
+                        (inner, result)
+                    }));
+                }
+                ResourceReadState::Busy(task) => {
+                    let result = std::task::ready!(std::pin::Pin::new(task).poll(cx));
+                    self.state = ResourceReadState::Idle(None);
+                    match result {
+                        Ok((inner, result)) => {
+                            self.state = ResourceReadState::Idle(Some(inner));
+                            match result {
+                                Ok(0) => return std::task::Poll::Ready(Ok(())),
+                                Ok(_) => {}
+                                Err(error) => return std::task::Poll::Ready(Err(error)),
+                            }
+                        }
+                        Err(error) => return std::task::Poll::Ready(Err(std::io::Error::other(error))),
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Tokio File hides its blocking jobs. Background writes need the physical
 // lease to travel with the file and staging buffer into those native jobs.
 struct ResourceWriteInner {
@@ -3658,9 +3780,6 @@ struct ResourceFileWriter {
 }
 
 impl ResourceFileWriter {
-    // Match Tokio File's maximum staging size; reuse the allocation per stream.
-    const MAX_BUFFER_SIZE: usize = 2 * 1024 * 1024;
-
     fn new(file: std::fs::File, resource_unit: ResourceIoUnit, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
         #[cfg(target_os = "macos")]
         if reclaim_on_shutdown {
@@ -3718,9 +3837,9 @@ impl ResourceFileWriter {
             unreachable!("poll_complete rejects closed writers");
         };
         for buf in bufs {
-            let len = buf.len().min(Self::MAX_BUFFER_SIZE - inner.buffer.len());
+            let len = buf.len().min(RESOURCE_FILE_MAX_BUFFER_SIZE - inner.buffer.len());
             inner.buffer.extend_from_slice(&buf[..len]);
-            if inner.buffer.len() == Self::MAX_BUFFER_SIZE {
+            if inner.buffer.len() == RESOURCE_FILE_MAX_BUFFER_SIZE {
                 break;
             }
         }
@@ -3775,7 +3894,7 @@ impl AsyncWrite for ResourceFileWriter {
         #[cfg(target_os = "linux")]
         if self.reclaim_on_shutdown {
             if let ResourceWriteState::Idle(Some(inner)) = &self.state
-                && reclaim_write_file_cache(&inner.file, self.reclaim_len).is_err()
+                && reclaim_stream_file_cache(&inner.file, 0, self.reclaim_len, "write").is_err()
             {
                 record_file_cache_reclaim_error("write");
             }
@@ -3786,7 +3905,12 @@ impl AsyncWrite for ResourceFileWriter {
 }
 
 #[cfg(target_os = "linux")]
-fn reclaim_write_file_cache(file: &impl std::os::fd::AsFd, reclaim_len: usize) -> std::io::Result<()> {
+fn reclaim_stream_file_cache(
+    file: &impl std::os::fd::AsFd,
+    offset: u64,
+    reclaim_len: usize,
+    operation: &'static str,
+) -> std::io::Result<()> {
     use core::num::NonZeroU64;
     use rustix::fs::{Advice, fadvise};
 
@@ -3794,8 +3918,8 @@ fn reclaim_write_file_cache(file: &impl std::os::fd::AsFd, reclaim_len: usize) -
         return Ok(());
     };
     let started = std::time::Instant::now();
-    fadvise(file, 0, Some(length), Advice::DontNeed).map_err(std::io::Error::from)?;
-    record_file_cache_reclaim_success("write", reclaim_len, started);
+    fadvise(file, offset, Some(length), Advice::DontNeed).map_err(std::io::Error::from)?;
+    record_file_cache_reclaim_success(operation, reclaim_len, started);
     Ok(())
 }
 
@@ -3819,7 +3943,7 @@ impl FileCacheReclaimWriter {
         if !self.reclaim_on_shutdown || self.reclaimed || self.reclaim_len == 0 {
             return Ok(());
         }
-        reclaim_write_file_cache(&self.inner, self.reclaim_len)?;
+        reclaim_stream_file_cache(&self.inner, 0, self.reclaim_len, "write")?;
         self.reclaimed = true;
         Ok(())
     }
@@ -4094,6 +4218,52 @@ impl StdBackend {
         Ok(f)
     }
 
+    async fn open_resource_reader(
+        &self,
+        path: PathBuf,
+        range: Option<(usize, usize)>,
+        resources: ResourceIoUnit,
+    ) -> Result<ResourceFileReader> {
+        #[cfg(target_os = "linux")]
+        let mount_lease = self.mount_lease.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(target_os = "linux")]
+            let _mount_lease = mount_lease;
+            #[cfg(test)]
+            run_owned_file_before_open(&path);
+            let mut file = std::fs::File::open(&path).map_err(to_file_error)?;
+            let mut reclaim = None;
+            if let Some((offset, length)) = range {
+                let end = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+                let metadata = file.metadata()?;
+                if metadata.len() < end as u64 {
+                    error!(
+                        event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        result = "failed",
+                        path = %path.display(),
+                        offset,
+                        length,
+                        actual_size = metadata.len(),
+                        reason = "read_file_stream_out_of_bounds",
+                        "Disk local read fallback failed"
+                    );
+                    return Err(DiskError::FileCorrupt);
+                }
+                if offset > 0 {
+                    std::io::Seek::seek(&mut file, SeekFrom::Start(offset as u64))?;
+                }
+                if should_reclaim_file_cache_after_read(length) {
+                    reclaim = Some((offset as u64, length));
+                }
+            }
+            Ok(ResourceFileReader::new(file, resources, reclaim))
+        })
+        .await
+        .map_err(DiskError::from)?
+    }
+
     async fn open_resource_writer(&self, path: PathBuf, mode: WriteMode, resources: ResourceIoUnit) -> Result<FileWriter> {
         #[cfg(target_os = "linux")]
         let mount_lease = self.mount_lease.clone();
@@ -4101,7 +4271,7 @@ impl StdBackend {
             #[cfg(target_os = "linux")]
             let _mount_lease = mount_lease;
             #[cfg(test)]
-            run_owned_file_write_before_open(&path);
+            run_owned_file_before_open(&path);
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create(true);
             let (reclaim_len, reclaim_on_shutdown) = match mode {
@@ -4678,6 +4848,13 @@ impl LocalIoBackend for StdBackend {
         let file_path = local_disk_object_path(self.io_root(), volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
+        if let Some(resources) = current_resource_unit() {
+            let reader = self
+                .open_resource_reader(file_path, Some((offset, length)), resources)
+                .await?;
+            return Ok(Box::new(StallTimeoutReader::new(reader, get_object_disk_read_timeout())));
+        }
+
         let mut f = self.open_file_read_only(file_path).await?;
 
         let meta = f.metadata().await?;
@@ -4717,6 +4894,10 @@ impl LocalIoBackend for StdBackend {
 
         let file_path = local_disk_object_path(self.io_root(), volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
+
+        if let Some(resources) = current_resource_unit() {
+            return Ok(Box::new(self.open_resource_reader(file_path, None, resources).await?));
+        }
 
         let f = self.open_file_read_only(file_path).await?;
 
@@ -9582,7 +9763,7 @@ impl LocalDisk {
                 let root = self.publication_root.clone();
                 tokio::task::spawn_blocking(move || {
                     #[cfg(test)]
-                    run_owned_file_write_before_open(&path);
+                    run_owned_file_before_open(&path);
 
                     let (mut file, parent_handle) = if sync == SyncMode::FileAndDir {
                         root.create_truncate_with_parent(&path).map_err(to_file_error)?
@@ -10917,7 +11098,7 @@ impl LocalDisk {
             let volume = volume.to_string();
             let sync = os::run_blocking_namespace_operation(lease, move || {
                 #[cfg(test)]
-                run_owned_file_write_before_open(&marker_path);
+                run_owned_file_before_open(&marker_path);
                 let marker = std::fs::File::create(marker_path)?;
                 let sync = effective_durability(&volume).syncs_commit_metadata();
                 if sync {
@@ -18078,7 +18259,7 @@ mod test {
             let destination = disk.io_get_object_path(bucket, object).expect("destination should resolve");
             let (entered_tx, entered_rx) = mpsc::channel();
             let (release_tx, release_rx) = mpsc::channel();
-            set_owned_file_write_before_open(&staged_metadata, move || {
+            set_owned_file_before_open(&staged_metadata, move || {
                 entered_tx.send(()).expect("signal staged writer entry");
                 // Dropping the sender also unblocks the syscall if the test fails.
                 let _ = release_rx.recv();
@@ -18266,7 +18447,7 @@ mod test {
 
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        set_owned_file_write_before_open(&staged_metadata, move || {
+        set_owned_file_before_open(&staged_metadata, move || {
             entered_tx.send(()).expect("signal staged metadata write entry");
             release_rx.recv().expect("wait until cancellation has been observed");
         });
@@ -18439,7 +18620,7 @@ mod test {
             .expect("rollback backup io path should resolve");
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        set_owned_file_write_before_open(&backup_hook_path, move || {
+        set_owned_file_before_open(&backup_hook_path, move || {
             entered_tx.send(()).expect("signal backup write entry");
             release_rx.recv().expect("wait until cancellation has been observed");
         });
@@ -28922,6 +29103,251 @@ mod test {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn resource_reader_preserves_ranges_boundaries_and_errors() {
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
+
+        let dir = tempfile::tempdir().expect("resource reader fixture");
+        std::fs::create_dir(dir.path().join("test-volume")).expect("test volume");
+        let content: Vec<_> = (0..RESOURCE_FILE_MAX_BUFFER_SIZE + 17).map(|i| (i % 251) as u8).collect();
+        let path = dir.path().join("test-volume/shard");
+        std::fs::write(&path, &content).expect("seed reader bytes");
+        let backend = StdBackend::new(dir.path().to_path_buf());
+        for range in [None, Some((0, content.len())), Some((17, 1)), Some((content.len(), 0))] {
+            let (resources, gates) = test_resource_units(2);
+            let mut reader = with_optional_resource_unit(Some(resources), async {
+                match range {
+                    Some((offset, length)) => backend.open_read_stream("test-volume", "shard", offset, length).await,
+                    None => backend.open_full_read("test-volume", "shard").await,
+                }
+            })
+            .await
+            .expect("owned reader");
+            assert_eq!(reader.read(&mut []).await.expect("empty read"), 0);
+            let mut actual = Vec::new();
+            reader.read_to_end(&mut actual).await.expect("consume resource reader");
+            assert_eq!(
+                actual,
+                content[range.map_or(0, |(offset, _)| offset)..],
+                "range length validates the request; caller limits consumption"
+            );
+            assert_eq!(reader.read(&mut [0]).await.expect("repeat EOF"), 0);
+            assert!(gates.iter().all(|gate| gate.snapshot().active == 1));
+            drop(reader);
+            assert!(gates.iter().all(|gate| gate.snapshot().active == 0));
+        }
+        for (offset, length) in [(usize::MAX, 1), (content.len() - 1, 2)] {
+            let (resources, gates) = test_resource_units(2);
+            let result =
+                with_optional_resource_unit(Some(resources), backend.open_read_stream("test-volume", "shard", offset, length))
+                    .await;
+            assert!(
+                matches!(result, Err(DiskError::FileCorrupt)),
+                "out-of-range reads fail before exposing a stream"
+            );
+            assert!(gates.iter().all(|gate| gate.snapshot().active == 0));
+        }
+        let (resources, gates) = test_resource_units(1);
+        let file = std::fs::File::open(&path).expect("read descriptor");
+        let mut reader = ResourceFileReader::new(file, resources, None);
+        let mut prefix = [99];
+        reader
+            .read_exact(&mut prefix)
+            .await
+            .expect("successful prefix before a native failure");
+        assert_eq!(prefix, [content[0]]);
+        let ResourceReadState::Idle(Some(inner)) = &mut reader.state else {
+            panic!("prefix read completed")
+        };
+        inner.file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("write-only descriptor");
+        for _ in 0..2 {
+            let mut byte = [99];
+            let error = reader.read(&mut byte).await.expect_err("native read failure");
+            assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+            assert_eq!(byte, [99], "failed native reads expose no stale buffer data");
+            assert_eq!(
+                gates[0].snapshot().active,
+                1,
+                "read error leaves the stream available for an explicit retry"
+            );
+        }
+        drop(reader);
+        assert_eq!(gates[0].snapshot().active, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resource_reader_preserves_bytes_when_pending_read_buffer_shrinks() {
+        use crate::disk::io_admission::test_resource_units;
+
+        let file = tempfile::NamedTempFile::new().expect("read buffer fixture");
+        let content: Vec<_> = (0..RESOURCE_FILE_MAX_BUFFER_SIZE + 33).map(|i| (i % 251) as u8).collect();
+        std::fs::write(file.path(), &content).expect("seed reader bytes");
+        let (resources, gates) = test_resource_units(1);
+        let mut reader = ResourceFileReader::new(std::fs::File::open(file.path()).expect("read descriptor"), resources, None);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let ResourceReadState::Idle(Some(inner)) = &mut reader.state else { panic!("new reader is idle") };
+        inner.before_read = Some(Box::new(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.blocking_recv();
+        }));
+        let mut large = vec![0; RESOURCE_FILE_MAX_BUFFER_SIZE + 1];
+        std::future::poll_fn(|cx| {
+            let mut buffer = ReadBuf::new(&mut large);
+            assert!(std::pin::Pin::new(&mut reader).poll_read(cx, &mut buffer).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("native read starts")
+            .expect("start signal");
+        assert_eq!(reader.read(&mut []).await.expect("empty read while native job is pending"), 0);
+        release_tx.send(()).expect("release native read");
+        let mut first = [0; 1];
+        reader.read_exact(&mut first).await.expect("smaller replacement buffer");
+        let mut actual = first.to_vec();
+        reader
+            .read_to_end(&mut actual)
+            .await
+            .expect("remaining buffered and native bytes");
+        assert_eq!(actual, content, "re-polling with a smaller buffer neither drops nor duplicates bytes");
+        let ResourceReadState::Idle(Some(inner)) = &reader.state else {
+            panic!("completed reader is idle")
+        };
+        assert_eq!(
+            inner.buffer.len(),
+            RESOURCE_FILE_MAX_BUFFER_SIZE,
+            "bounded initialized storage survives short reads"
+        );
+        drop(reader);
+        assert_eq!(gates[0].snapshot().active, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resource_reader_native_panic_closes_stream_without_leaking_resources() {
+        use crate::disk::io_admission::test_resource_units;
+
+        let file = tempfile::NamedTempFile::new().expect("native panic fixture");
+        let (resources, gates) = test_resource_units(1);
+        let mut reader = ResourceFileReader::new(std::fs::File::open(file.path()).expect("read descriptor"), resources, None);
+        let ResourceReadState::Idle(Some(inner)) = &mut reader.state else { panic!("new reader is idle") };
+        inner.before_read = Some(Box::new(|| panic!("injected native read panic")));
+        assert_eq!(
+            reader.read(&mut [0]).await.expect_err("native task failure").kind(),
+            std::io::ErrorKind::Other
+        );
+        assert_eq!(
+            reader.read(&mut [0]).await.expect_err("failed task closes stream").kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(gates[0].snapshot().active, 0, "unwinding releases the native owner");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_reader_keeps_running_native_job_after_runtime_shutdown() {
+        use crate::disk::io_admission::test_resource_units;
+
+        let file = tempfile::NamedTempFile::new().expect("read shutdown fixture");
+        std::fs::write(file.path(), b"native read").expect("seed reader bytes");
+        let (resources, gates) = test_resource_units(2);
+        let mut reader = ResourceFileReader::new(std::fs::File::open(file.path()).expect("read descriptor"), resources, None);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let ResourceReadState::Idle(Some(inner)) = &mut reader.state else { panic!("new reader is idle") };
+        inner.before_read = Some(Box::new(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.blocking_recv();
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("reader runtime");
+        runtime.block_on(async {
+            let task = tokio::spawn(async move { reader.read_exact(&mut [0; 11]).await });
+            tokio::time::timeout(Duration::from_secs(5), started_rx)
+                .await
+                .expect("native read starts")
+                .expect("start signal");
+            task.abort();
+            assert!(task.await.expect_err("cancel read waiter").is_cancelled());
+        });
+        runtime.shutdown_background();
+        let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
+        release_tx.send(()).expect("release native read before asserting");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while gates.iter().any(|gate| gate.snapshot().active != 0) {
+            assert!(std::time::Instant::now() < deadline, "native read completes after runtime shutdown");
+            std::thread::yield_now();
+        }
+        assert_eq!(held, vec![1, 1]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn resource_reader_cancelled_open_retains_resources_and_mount_lease() {
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
+
+        for stream in [false, true] {
+            let dir = tempfile::tempdir().expect("reader open fixture");
+            let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
+            let mut disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+            disk.make_volume("test-volume").await.expect("test volume");
+            std::fs::write(dir.path().join("test-volume/shard"), [37; 1024]).expect("seed reader bytes");
+            let exit = disk.exit_signal.take().expect("cleanup monitor exit sender");
+            exit.send(()).expect("stop fixture cleanup monitor");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while exit.receiver_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cleanup monitor stopped");
+            drop(exit);
+            let lease = Arc::downgrade(&disk.mount_lease);
+            let path = disk.io_get_object_path("test-volume", "shard").expect("pinned shard path");
+            let (resources, gates) = test_resource_units(2);
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            set_owned_file_before_open(&path, move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.blocking_recv();
+            });
+            let task = tokio::spawn(with_optional_resource_unit(Some(resources), async move {
+                if stream {
+                    disk.read_file_stream("test-volume", "shard", 3, 1021).await
+                } else {
+                    disk.read_file("test-volume", "shard").await
+                }
+            }));
+            tokio::time::timeout(Duration::from_secs(5), started_rx)
+                .await
+                .expect("native open starts")
+                .expect("open signal");
+            task.abort();
+            assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+            let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
+            let retained = lease.strong_count() > 0;
+            release_tx.send(()).expect("release native open before asserting");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while lease.strong_count() != 0 || gates.iter().any(|gate| gate.snapshot().active != 0) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("native open releases ownership");
+            assert_eq!(held, vec![1, 1]);
+            assert!(retained, "native reader open pins the retired disk mount");
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn buffered_writer_cancelled_native_job_retains_physical_resources() {
         use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
@@ -29022,7 +29448,7 @@ mod test {
             let dir = tempfile::tempdir().expect("buffered round trip fixture");
             std::fs::create_dir(dir.path().join("test-volume")).expect("test volume");
             let backend = StdBackend::new(dir.path().to_path_buf());
-            let limit = ResourceFileWriter::MAX_BUFFER_SIZE;
+            let limit = RESOURCE_FILE_MAX_BUFFER_SIZE;
             for size in [0, 1, 1024, limit - 1, limit, limit + 1, 2 * limit + 3] {
                 for append in [false, true] {
                     for vectored in [false, true] {
@@ -29180,7 +29606,7 @@ mod test {
                 let (resources, gates) = test_resource_units(2);
                 let (started_tx, started_rx) = tokio::sync::oneshot::channel();
                 let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-                set_owned_file_write_before_open(&path, move || {
+                set_owned_file_before_open(&path, move || {
                     let _ = started_tx.send(());
                     let _ = release_rx.blocking_recv();
                 });
@@ -29302,7 +29728,7 @@ mod test {
         let (resources, gates) = test_resource_units(2);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        set_owned_file_write_before_open(&path, move || {
+        set_owned_file_before_open(&path, move || {
             let _ = started_tx.send(());
             let _ = release_rx.blocking_recv();
         });

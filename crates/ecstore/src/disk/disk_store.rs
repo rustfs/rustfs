@@ -4152,6 +4152,99 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_disk_resource_projection_cancelled_stream_read_retains_native_device() {
+        use rustfs_concurrency::adaptive::{AdaptiveAdmission, permit_set::AdaptivePermitSetOwner};
+        use std::num::NonZeroU16;
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("one-thread native read pool");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("native reader fixture");
+            let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+            let wrapper = LocalDiskWrapper::new(disk, false);
+            std::fs::create_dir(dir.path().join("bucket")).expect("bucket directory");
+            let bytes = b"physical disk native reader payload";
+            std::fs::write(dir.path().join("bucket/object"), bytes).expect("reader bytes");
+            let first = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+            let second = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+            let shared =
+                AdaptivePermitSetOwner::new(NonZeroU16::MIN, vec![first.clone(), second.clone()]).expect("parent resources");
+            wrapper
+                .physical_admission
+                .set_test_shared_capacity(shared.clone(), vec![first.clone()])
+                .expect("reader device");
+            let mut observations = Vec::new();
+            for stream in [false, true] {
+                let a = first.try_acquire().expect("first device");
+                let b = second.try_acquire().expect("second device");
+                let parent = shared.capture(&[&a, &b]).expect("admitted parent");
+                drop((a, b));
+                let mut reader = crate::disk::with_background_resource_set(
+                    parent,
+                    crate::disk::with_background_disk_io(CancellationToken::new(), async {
+                        if stream {
+                            wrapper.read_file_stream("bucket", "object", 3, bytes.len() - 3).await
+                        } else {
+                            wrapper.read_file("bucket", "object").await
+                        }
+                    }),
+                )
+                .await
+                .expect("background reader escapes its parent");
+                assert_eq!([first.snapshot().active, second.snapshot().active], [1, 0]);
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                });
+                started_rx.await.expect("native pool occupied after open");
+                let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+                let task = tokio::spawn(async move {
+                    let mut data = [0; 1];
+                    let mut pending_tx = Some(pending_tx);
+                    std::future::poll_fn(|cx| {
+                        let mut buffer = ReadBuf::new(&mut data);
+                        let result = Pin::new(&mut reader).poll_read(cx, &mut buffer);
+                        if result.is_pending()
+                            && let Some(signal) = pending_tx.take()
+                        {
+                            let _ = signal.send(());
+                        }
+                        result
+                    })
+                    .await
+                });
+                tokio::time::timeout(Duration::from_secs(5), pending_rx)
+                    .await
+                    .expect("read queues behind native worker")
+                    .expect("pending read signal");
+                let admitted = wrapper.background_io_active_for_tests();
+                task.abort();
+                assert!(task.await.expect_err("cancel pending read").is_cancelled());
+                let held = [first.snapshot().active, second.snapshot().active];
+                release_tx.send(()).expect("release native pool before asserting");
+                blocker.await.expect("blocking worker released");
+                tokio::task::spawn_blocking(|| ())
+                    .await
+                    .expect("drain the single native queue");
+                assert_eq!([first.snapshot().active, second.snapshot().active], [0, 0]);
+                observations.push((stream, admitted, held));
+            }
+            for (stream, admitted, held) in observations {
+                assert!(admitted, "stream={stream}: cancellation follows disk admission, not its wait");
+                assert_eq!(held, [1, 0], "stream={stream}: only the pending native read's device stays charged");
+            }
+        });
+    }
+
     #[tokio::test]
     async fn local_disk_resource_projection_auxiliary_metadata_retries_without_parking_or_false_progress() {
         use rustfs_concurrency::adaptive::{
