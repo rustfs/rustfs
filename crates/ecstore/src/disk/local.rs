@@ -4282,7 +4282,11 @@ impl LocalIoBackend for StdBackend {
             let cached_fd: Option<Arc<FdCacheEntry>> = None;
 
             let blocking_wait_start = metrics_enabled.then(std::time::Instant::now);
-            let read_result = tokio::task::spawn_blocking(move || {
+            #[cfg(target_os = "linux")]
+            let mount_lease = self.mount_lease.clone();
+            let read_result = spawn_blocking_with_disk_io_permit(None, move || {
+                #[cfg(target_os = "linux")]
+                let _mount_lease = mount_lease;
                 let blocking_task_start = metrics_enabled.then(StdInstant::now);
 
                 // Resolve the part path unconditionally: the O_DIRECT branch (large
@@ -28867,6 +28871,154 @@ mod test {
             .expect_err("invalid erasure metadata must fail before shard size calculation");
 
         assert_eq!(err, DiskError::FileCorrupt);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_positioned_read_retains_only_its_device_and_mount() {
+        use crate::disk::disk_store::LocalDiskWrapper;
+        use crate::disk::io_admission::{ResourceIoUnit, with_optional_resource_unit};
+        use rustfs_concurrency::adaptive::{AdaptiveAdmission, permit_set::AdaptivePermitSetOwner};
+        use std::num::NonZeroU16;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single positioned-read worker");
+        let mut observations = Vec::new();
+        for method in [
+            RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY,
+            RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY,
+        ] {
+            temp_env::with_vars(
+                [
+                    (ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, Some(method)),
+                    (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, Some("false")),
+                    #[cfg(target_os = "linux")]
+                    (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("false")),
+                ],
+                || {
+                    runtime.block_on(async {
+                        #[cfg(target_os = "linux")]
+                        let cache_modes = [false, true].as_slice();
+                        #[cfg(not(target_os = "linux"))]
+                        let cache_modes = [false].as_slice();
+                        for &cache_hit in cache_modes {
+                            for admitted in [false, true] {
+                                let dir = tempfile::tempdir().expect("positioned-read fixture");
+                                let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("endpoint");
+                                let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+                                #[cfg(target_os = "linux")]
+                                let mut disk = disk;
+                                #[cfg(target_os = "linux")]
+                                {
+                                    let exit = disk.exit_signal.take().expect("cleanup monitor exit sender");
+                                    exit.send(()).expect("stop fixture cleanup monitor");
+                                    tokio::time::timeout(Duration::from_secs(5), async {
+                                        while exit.receiver_count() != 0 {
+                                            tokio::task::yield_now().await;
+                                        }
+                                    })
+                                    .await
+                                    .expect("cleanup monitor stopped");
+                                }
+                                #[cfg(target_os = "linux")]
+                                let lease = Arc::downgrade(&disk.mount_lease);
+                                let backend = StdBackend::new(disk.io_root().to_path_buf());
+                                #[cfg(target_os = "linux")]
+                                let backend = {
+                                    let mut backend = backend;
+                                    backend.mount_lease = Some(disk.mount_lease.clone());
+                                    // This fixture opens one cache entry, independent of host RLIMIT policy.
+                                    backend.fd_cache = Some(FdCache::new());
+                                    backend
+                                };
+                                let content = b"positioned reads retain their physical device";
+                                std::fs::create_dir(dir.path().join("bucket")).expect("bucket");
+                                std::fs::write(dir.path().join("bucket/part.1"), content).expect("shard");
+                                if cache_hit {
+                                    assert_eq!(
+                                        backend
+                                            .pread_bytes("bucket", "part.1", 0, content.len(), None)
+                                            .await
+                                            .expect("warm cache"),
+                                        Bytes::copy_from_slice(content)
+                                    );
+                                    #[cfg(target_os = "linux")]
+                                    assert!(
+                                        backend
+                                            .fd_cache
+                                            .as_ref()
+                                            .expect("cache fixture")
+                                            .get(&FdKey {
+                                                volume: "bucket".into(),
+                                                path: "part.1".into(),
+                                                direct: false,
+                                            })
+                                            .await
+                                            .is_some()
+                                    );
+                                }
+                                let mut disk = disk;
+                                disk.io_backend = Arc::new(backend);
+                                let wrapper = LocalDiskWrapper::new(Arc::new(disk), false);
+                                let first = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+                                let second = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+                                let shared = AdaptivePermitSetOwner::new(NonZeroU16::MIN, vec![first.clone(), second.clone()])
+                                    .expect("resource catalog");
+                                wrapper
+                                    .physical_admission()
+                                    .set_test_shared_capacity(shared.clone(), vec![first.clone()])
+                                    .expect("selected device");
+                                let parent = admitted.then(|| {
+                                    let a = first.try_acquire().expect("selected quota");
+                                    let b = second.try_acquire().expect("unrelated quota");
+                                    ResourceIoUnit::from(shared.capture(&[&a, &b]).expect("admitted parent"))
+                                });
+                                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                                let blocker = tokio::task::spawn_blocking(move || {
+                                    let _ = started_tx.send(());
+                                    let _ = release_rx.recv();
+                                });
+                                started_rx.await.expect("native worker occupied");
+                                let mut future = Box::pin(with_optional_resource_unit(parent, async move {
+                                    wrapper.read_file_mmap_copy("bucket", "part.1", 3, content.len() - 3).await
+                                }));
+                                let pending = futures::poll!(&mut future).is_pending();
+                                drop(future);
+                                let held = [first.snapshot().active, second.snapshot().active];
+                                #[cfg(target_os = "linux")]
+                                let retained_mount = lease.strong_count() > 0;
+                                release_tx.send(()).expect("release worker before assertions");
+                                blocker.await.expect("blocker finished");
+                                tokio::task::spawn_blocking(|| ()).await.expect("native queue drained");
+                                assert!(pending, "positioned read queued native work");
+                                assert_eq!([first.snapshot().active, second.snapshot().active], [0, 0]);
+                                #[cfg(target_os = "linux")]
+                                {
+                                    assert_eq!(lease.strong_count(), 0);
+                                    assert!(
+                                        retained_mount,
+                                        "method={method}, cache_hit={cache_hit}, admitted={admitted}: native read pins the mount"
+                                    );
+                                }
+                                assert_eq!(std::fs::read(dir.path().join("bucket/part.1")).expect("unchanged shard"), content);
+                                observations.push((method, cache_hit, admitted, held));
+                            }
+                        }
+                    });
+                },
+            );
+        }
+        for (method, cache_hit, admitted, held) in observations {
+            assert_eq!(
+                held,
+                [u32::from(admitted), 0],
+                "method={method}, cache_hit={cache_hit}, admitted={admitted}: queued read keeps only its device"
+            );
+        }
     }
 
     #[test]
