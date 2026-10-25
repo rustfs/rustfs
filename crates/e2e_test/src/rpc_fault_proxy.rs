@@ -23,8 +23,9 @@ use hyper_util::{
     server::conn::auto,
 };
 use prost::Message as _;
-use rustfs_protos::proto_gen::node_service::DeleteRequest;
+use rustfs_protos::proto_gen::node_service::{DeleteRequest, ReadVersionRequest};
 use std::{
+    collections::HashSet,
     io,
     net::SocketAddr,
     sync::{
@@ -56,6 +57,7 @@ struct PauseState {
     matched: AtomicUsize,
     blocked: AtomicUsize,
     forwarded: AtomicUsize,
+    forwarded_routes: Mutex<HashSet<String>>,
     reached: Notify,
     release: watch::Sender<Disposition>,
 }
@@ -75,6 +77,10 @@ impl RpcPause {
     /// Selected RPCs whose backend returned a response, excluding discarded packets.
     pub(crate) fn forwarded(&self) -> usize {
         self.state.forwarded.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn forwarded_routes(&self) -> usize {
+        self.state.forwarded_routes.lock().expect("RPC route observations").len()
     }
 
     pub(crate) async fn wait_for_hits(&self, count: usize) -> io::Result<()> {
@@ -186,6 +192,7 @@ impl RpcFaultProxy {
             matched: AtomicUsize::new(0),
             blocked: AtomicUsize::new(0),
             forwarded: AtomicUsize::new(0),
+            forwarded_routes: Mutex::new(HashSet::new()),
             reached: Notify::new(),
             release,
         });
@@ -197,24 +204,23 @@ impl RpcFaultProxy {
     }
 }
 
-fn scope_matches(method: &str, body: &[u8], scope: &[u8]) -> io::Result<bool> {
-    if method != "Delete" {
-        return Ok(body.windows(scope.len()).any(|window| window == scope));
-    }
-    // Abort's recursive root delete must not be confused with transaction or
-    // part cleanup below that root. This is a unary, uncompressed gRPC frame.
+fn unary_payload(body: &[u8]) -> io::Result<&[u8]> {
     if body.len() < 5 || body[0] != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "scoped Delete needs an uncompressed unary frame",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "scoped RPC needs an uncompressed unary frame"));
     }
     let mut encoded_length = [0; 4];
     encoded_length.copy_from_slice(&body[1..5]);
     if u32::try_from(body.len() - 5).ok() != Some(u32::from_be_bytes(encoded_length)) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "scoped Delete frame length mismatch"));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "scoped RPC frame length mismatch"));
     }
-    let request = DeleteRequest::decode(&body[5..]).map_err(io::Error::other)?;
+    Ok(&body[5..])
+}
+
+fn scope_matches(method: &str, body: &[u8], scope: &[u8]) -> io::Result<bool> {
+    if method != "Delete" {
+        return Ok(body.windows(scope.len()).any(|window| window == scope));
+    }
+    let request = DeleteRequest::decode(unary_payload(body)?).map_err(io::Error::other)?;
     let options: serde_json::Value = serde_json::from_str(&request.options).map_err(io::Error::other)?;
     Ok(request.volume == ".rustfs.sys/multipart"
         && request.path.trim_end_matches('/').as_bytes() == scope
@@ -233,13 +239,22 @@ async fn forward_request(
     if let Some(pause) = pause {
         let method = parts.uri.path().strip_prefix("/node_service.NodeService/");
         if let Some(method) = method.filter(|name| pause.methods.contains(name)) {
+            let mut route = None;
             let matches = if let Some(scope) = pause.scope.as_deref() {
-                // Inspect bounded routing data while retaining the exact
-                // original bytes covered by the RPC signature.
+                // Inspect bounded control routing while preserving the exact
+                // signed bytes and trailers forwarded to the backend.
                 let collected = Limited::new(body, 1024 * 1024).collect().await.map_err(io::Error::other)?;
                 let trailers = collected.trailers().cloned();
                 let bytes = collected.to_bytes();
                 let matches = scope_matches(method, &bytes, scope)?;
+                if matches && method == "ReadVersion" {
+                    let disk = ReadVersionRequest::decode(unary_payload(&bytes)?)
+                        .map_err(io::Error::other)?
+                        .disk;
+                    if !disk.is_empty() {
+                        route = Some(disk);
+                    }
+                }
                 body = Full::new(bytes)
                     .map_err(|never| match never {})
                     .with_trailers(async move { trailers.map(Ok::<_, io::Error>) })
@@ -264,7 +279,7 @@ async fn forward_request(
                 if disposition == Disposition::Discard {
                     return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "injected RPC packet loss"));
                 }
-                observed = Some(pause);
+                observed = Some((pause, route));
             }
         }
     }
@@ -286,11 +301,14 @@ async fn forward_request(
         .request(Request::from_parts(parts, body))
         .await
         .map_err(io::Error::other)?;
-    if let Some(pause) = observed
+    if let Some((pause, route)) = observed
         && response.status().is_success()
         && response.headers().get("grpc-status").is_none_or(|status| status == "0")
     {
         pause.forwarded.fetch_add(1, Ordering::SeqCst);
+        if let Some(route) = route {
+            pause.forwarded_routes.lock().expect("RPC route observations").insert(route);
+        }
     }
     Ok(response)
 }
@@ -487,6 +505,30 @@ mod tests {
                 .expect("observer forwards without pausing");
             another.into_body().collect().await.expect("second body");
             assert_eq!(observer.forwarded(), 2);
+            drop(observer);
+            let routes = proxy
+                .pause(&["ReadVersion"], usize::MAX, Some("recovery-route"))
+                .expect("disk-route observer");
+            routes.release();
+            for (disk, expected) in [("drive-a", 1), ("drive-a", 1), ("drive-b", 2)] {
+                let request = ReadVersionRequest {
+                    disk: disk.to_owned(),
+                    path: "recovery-route".to_owned(),
+                    ..Default::default()
+                }
+                .encode_to_vec();
+                let mut frame = vec![0];
+                frame.extend_from_slice(&u32::try_from(request.len()).expect("small frame").to_be_bytes());
+                frame.extend_from_slice(&request);
+                call_body(&client, address, "ReadVersion", Bytes::from(frame))
+                    .await
+                    .expect("routed read")
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("routed response");
+                assert_eq!(routes.forwarded_routes(), expected, "repeated traffic from one disk is only one voter");
+            }
         })
         .await
         .expect("passive observer deadline");
@@ -549,7 +591,7 @@ mod tests {
         let root = b"hash/upload";
         assert!(scope_matches("Delete", &frame(".rustfs.sys/multipart", "hash/upload"), root).expect("root frame"));
         assert!(scope_matches("Delete", &frame(".rustfs.sys/multipart", "hash/upload/"), root).expect("directory frame"));
-        for path in ["hash/upload/part.1", "hash/upload-other"] {
+        for path in ["hash/upload/part.1", "hash/upload/.abort-authority", "hash/upload-other"] {
             assert!(!scope_matches("Delete", &frame(".rustfs.sys/multipart", path), root).expect("other path"));
         }
         assert!(!scope_matches("Delete", &frame(".rustfs.sys/tmp", "hash/upload"), root).expect("other volume"));
