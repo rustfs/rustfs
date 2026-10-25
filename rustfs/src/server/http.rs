@@ -4790,7 +4790,7 @@ mod tests {
                             )
                             .await
                             .expect("receiver must defer without waiting under storage locks");
-                            if !background || phase == "ready" || (phase == "memory_closed" && !stream) {
+                            if !background || phase == "ready" {
                                 assert_eq!(
                                     result.unwrap_or_else(|error| panic!(
                                         "{phase}, background={background}, stream={stream}: {error}"
@@ -4818,8 +4818,8 @@ mod tests {
                     }
                     drop(held);
                 }
-                assert_eq!(node_owner.completed(), Some(3), "failed response bodies do not count completed work");
-                assert_eq!(physical.completed(), Some(3));
+                assert_eq!(node_owner.completed(), Some(2), "failed response bodies do not count completed work");
+                assert_eq!(physical.completed(), Some(2));
                 let mut upload =
                     reqwest::Url::parse(&format!("http://{address}/rustfs/rpc/put_file_stream")).expect("upload URL");
                 upload.query_pairs_mut().extend_pairs([
@@ -4850,8 +4850,8 @@ mod tests {
                 let message = response.text().await.expect("upload error body");
                 assert!(message.contains("body size mismatch"), "unexpected upload failure: {message}");
                 assert!(root.path().join("bucket/incomplete").exists(), "file creation completed before failure");
-                assert_eq!(node_owner.completed(), Some(3), "failed upload must not count its successful preparation");
-                assert_eq!(physical.completed(), Some(3));
+                assert_eq!(node_owner.completed(), Some(2), "failed upload must not count its successful preparation");
+                assert_eq!(physical.completed(), Some(2));
                 let large = tokio::fs::File::create(root.path().join("bucket/large"))
                     .await
                     .expect("large response fixture");
@@ -4886,8 +4886,8 @@ mod tests {
                 .await
                 .expect("disconnect must retire the receiver stream and native reads");
                 assert_eq!(memory.snapshot().used, 0, "disconnect releases the actual receiver buffer");
-                assert_eq!(node_owner.completed(), Some(3), "disconnected body must not count as completed work");
-                assert_eq!(physical.completed(), Some(3));
+                assert_eq!(node_owner.completed(), Some(2), "disconnected body must not count as completed work");
+                assert_eq!(physical.completed(), Some(2));
                 for (path, length) in [("object", 0), ("large", LARGE_LENGTH)] {
                     let mut reader = storage::with_remote_background_io(
                         Some(storage::RemoteBackgroundIo::new(sender_owner.clone())),
@@ -4922,8 +4922,8 @@ mod tests {
                     })
                     .await
                     .expect("finished stream releases physical ownership");
-                    assert_eq!(node_owner.completed(), Some(4), "only a complete body credits progress");
-                    assert_eq!(physical.completed(), Some(4));
+                    assert_eq!(node_owner.completed(), Some(3), "only a complete body credits progress");
+                    assert_eq!(physical.completed(), Some(3));
                     assert_eq!(memory.snapshot().used, 0);
                 }
                 remote.close().await.expect("close remote client");

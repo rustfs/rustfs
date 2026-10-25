@@ -2190,7 +2190,13 @@ fn is_direct_io_unsupported(err: &std::io::Error) -> bool {
 /// only happens on concurrent truncation) and makes the caller fall back
 /// to the buffered path.
 #[cfg(target_os = "linux")]
-fn pread_direct_aligned(file_path: &Path, offset: u64, length: usize, state: &DirectIoReadState) -> std::io::Result<Bytes> {
+fn pread_direct_aligned(
+    file_path: &Path,
+    offset: u64,
+    length: usize,
+    state: &DirectIoReadState,
+    memory: Option<&Arc<super::io_admission::BackgroundMemoryBudget>>,
+) -> std::io::Result<Bytes> {
     use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
     let file = std::fs::OpenOptions::new()
@@ -2206,6 +2212,9 @@ fn pread_direct_aligned(file_path: &Path, offset: u64, length: usize, state: &Di
     let logical_end = logical_start.checked_add(length).ok_or(ErrorKind::InvalidInput)?;
     let aligned_len = logical_end.checked_add(align - 1).ok_or(ErrorKind::InvalidInput)? / align * align;
 
+    // The returned logical range is charged by the caller; this additional
+    // reservation covers the aligned allocation until its native read ends.
+    let _reservation = memory.map(|memory| memory.reserve(aligned_len)).transpose()?;
     let mut buf = AlignedBuf::new(aligned_len, align)?;
 
     let mut filled = 0usize;
@@ -2720,6 +2729,9 @@ pub(super) static DELETE_ROLLBACK_BACKUP_RESTORES: std::sync::LazyLock<std::sync
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 #[cfg(test)]
 static OWNED_FILE_BEFORE_OPEN: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, InlinePreparationHook>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+#[cfg(test)]
+static OWNED_FILE_AFTER_READ: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, InlinePreparationHook>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 #[cfg(all(test, windows))]
 static DESTINATION_COMMIT_DIRECTORY_PREPARATION: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, InlinePreparationHook>>> =
@@ -4288,6 +4300,7 @@ impl LocalIoBackend for StdBackend {
             let cached_fd: Option<Arc<FdCacheEntry>> = None;
 
             let blocking_wait_start = metrics_enabled.then(std::time::Instant::now);
+            let memory = current_resource_unit().and_then(|resources| resources.memory_budget());
             #[cfg(target_os = "linux")]
             let mount_lease = self.mount_lease.clone();
             let read_result = spawn_blocking_with_disk_io_permit(None, move || {
@@ -4353,6 +4366,12 @@ impl LocalIoBackend for StdBackend {
                 let metadata_validate_duration =
                     metadata_validate_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
+                let result_memory = memory
+                    .as_ref()
+                    .map(|memory| memory.reserve(length))
+                    .transpose()
+                    .map_err(DiskError::from)?;
+
                 #[cfg(target_os = "macos")]
                 if should_reclaim_after_read {
                     let _ = set_std_fd_nocache(file);
@@ -4375,13 +4394,14 @@ impl LocalIoBackend for StdBackend {
                 if direct_io_eligible && direct_io_state.supported.load(Ordering::Relaxed) {
                     let direct_start = metrics_enabled.then(StdInstant::now);
                     let direct_faults_before = read_mmap_page_fault_counts(metrics_enabled);
-                    match pread_direct_aligned(&file_path, offset_u64, length, &direct_io_state) {
+                    match pread_direct_aligned(&file_path, offset_u64, length, &direct_io_state, memory.as_ref()) {
                         Ok(bytes) => {
                             let direct_faults_after = read_mmap_page_fault_counts(metrics_enabled);
                             direct_read_copy_duration = direct_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
                             direct_read_copy_fault_delta = mmap_page_fault_delta(direct_faults_before, direct_faults_after);
                             direct_io_bytes = Some(bytes);
                         }
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => return Err(DiskError::from(err).into()),
                         Err(err) => {
                             // Never surface O_DIRECT errors: EINVAL maps to
                             // FileNotFound in to_file_error and would trigger a
@@ -4471,6 +4491,8 @@ impl LocalIoBackend for StdBackend {
                         }
                     }
                 };
+
+                let bytes = super::io_admission::memory::Reservation::wrap(bytes, result_memory);
 
                 #[cfg(target_os = "linux")]
                 if should_reclaim_after_read && _reclaim_len > 0 {
@@ -10690,19 +10712,32 @@ async fn read_file_exists(path: impl AsRef<Path>, root: &os::PublicationRoot) ->
 async fn read_file_all(path: impl AsRef<Path>, root: &os::PublicationRoot) -> Result<(Bytes, Metadata)> {
     let path = path.as_ref().to_path_buf();
     let root = root.clone();
+    let memory = current_resource_unit().and_then(|resources| resources.memory_budget());
     spawn_blocking_with_disk_io_permit(None, move || {
         let result = (|| {
             #[cfg(test)]
             run_owned_file_before_open(&path);
             let mut file = root.open_readonly(&path)?;
             let metadata = file.metadata()?;
+            if let Some(memory) = memory {
+                let hint = usize::try_from(metadata.len()).map_err(|_| std::io::Error::from(ErrorKind::OutOfMemory))?;
+                let data = super::io_admission::memory::BackgroundBuffer::new(Some(memory)).read_to_end(&mut file, hint)?;
+                return Ok((data, metadata));
+            }
             let mut data = Vec::new();
             std::io::Read::read_to_end(&mut file, &mut data)?;
             Ok::<_, std::io::Error>((Bytes::from(data), metadata))
         })();
+        #[cfg(test)]
+        if result.is_ok() {
+            let hook = OWNED_FILE_AFTER_READ.lock().expect("whole-file result hook").remove(&path);
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         result
             .inspect_err(|err| {
-                if err.kind() != ErrorKind::NotFound {
+                if !matches!(err.kind(), ErrorKind::NotFound | ErrorKind::WouldBlock) {
                     log_startup_disk_io_error("read_file_all", &path, err);
                 }
             })
@@ -28941,6 +28976,115 @@ mod test {
 
     #[cfg(unix)]
     #[test]
+    fn background_file_results_charge_storage_until_the_last_clone() {
+        use crate::disk::io_admission::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("read runtime");
+        for (whole_file, method) in [
+            (true, RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY),
+            (false, RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY),
+            (false, RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY),
+        ] {
+            temp_env::with_vars(
+                [
+                    (ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, Some(method)),
+                    (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, Some("false")),
+                ],
+                || {
+                    runtime.block_on(async {
+                        let dir = tempfile::tempdir().expect("result fixture");
+                        std::fs::create_dir(dir.path().join("bucket")).expect("bucket");
+                        let path = dir.path().join("bucket/object");
+                        std::fs::write(&path, b"abcdefgh").expect("payload");
+                        let root = os::PublicationRoot::new(dir.path()).expect("publication root");
+                        let backend = StdBackend::new(dir.path().to_path_buf());
+                        let memory = BackgroundMemoryBudget::new();
+                        let read = || async {
+                            let (resources, _) = test_resource_units(1);
+                            with_optional_resource_unit(Some(resources.with_memory_budget(memory.clone())), async {
+                                if whole_file {
+                                    read_file_all(&path, &root).await.map(|(bytes, _)| bytes)
+                                } else {
+                                    backend.pread_bytes("bucket", "object", 0, 8, None).await
+                                }
+                            })
+                            .await
+                        };
+                        assert!(matches!(read().await, Err(DiskError::Io(error)) if error.kind() == ErrorKind::WouldBlock));
+                        memory.set_sampled_limit(8, Duration::from_secs(30));
+                        let bytes = read().await.expect("exact payload fits");
+                        assert_eq!(bytes.as_ref(), b"abcdefgh");
+                        assert_eq!(memory.snapshot().used, 8);
+                        let slice = bytes.slice(2..6);
+                        drop(bytes);
+                        memory.set_sampled_limit(0, Duration::ZERO);
+                        assert_eq!(memory.snapshot().used, 8, "returned slice owns the complete allocation");
+                        assert_eq!(slice.as_ref(), b"cdef");
+                        drop(slice);
+                        assert_eq!(memory.snapshot().used, 0);
+                    })
+                },
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_whole_file_result_keeps_memory_until_native_completion() {
+        use crate::disk::io_admission::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single native reader");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("cancelled result fixture");
+            let path = dir.path().join("object");
+            std::fs::write(&path, b"abcdefgh").expect("payload");
+            let root = os::PublicationRoot::new(dir.path()).expect("publication root");
+            let memory = BackgroundMemoryBudget::new();
+            memory.set_sampled_limit(8, Duration::from_secs(30));
+            let (resources, physical) = test_resource_units(1);
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            OWNED_FILE_AFTER_READ.lock().expect("result hooks").insert(
+                path.clone(),
+                Box::new(move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                }),
+            );
+            let mut read = Box::pin(with_optional_resource_unit(
+                Some(resources.with_memory_budget(memory.clone())),
+                read_file_all(&path, &root),
+            ));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = read.as_mut() => panic!("native result returned before release"),
+                    result = started_rx => result.expect("native result ready"),
+                }
+            })
+            .await
+            .expect("native result reached the return boundary");
+            drop(read);
+            memory.set_sampled_limit(0, Duration::ZERO);
+            let retained = memory.snapshot().used;
+            let held = physical[0].snapshot().active;
+            release_tx.send(()).expect("release before assertions");
+            tokio::task::spawn_blocking(|| ()).await.expect("native queue drained");
+            assert_eq!(retained, 8, "the cancelled native result remains allocated");
+            assert_eq!(held, 1, "native work retains its selected device");
+            assert_eq!(memory.snapshot().used, 0);
+            assert_eq!(physical[0].snapshot().active, 0);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     #[serial_test::serial(file_sync_probe)]
     fn cancelled_whole_file_io_retains_only_its_native_device() {
         use crate::disk::disk_store::LocalDiskWrapper;
@@ -32170,6 +32314,61 @@ mod test {
     /// buffer is exactly the requested logical range.
     #[cfg(target_os = "linux")]
     #[test]
+    fn direct_read_memory_denial_does_not_fall_back_to_an_uncharged_buffer() {
+        use crate::disk::io_admission::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+
+        let dir = tempfile::tempdir().expect("direct memory fixture");
+        std::fs::create_dir(dir.path().join("bucket")).expect("bucket");
+        let path = dir.path().join("bucket/object");
+        std::fs::write(&path, vec![37; 8192]).expect("aligned file");
+        match pread_direct_aligned(&path, 0, 8, &DirectIoReadState::new(), None) {
+            Err(error) if is_direct_io_unsupported(&error) => {
+                eprintln!("SKIP direct_read_memory_denial_does_not_fall_back_to_an_uncharged_buffer: O_DIRECT unavailable");
+                return;
+            }
+            result => assert_eq!(result.expect("native direct read").as_ref(), &[37; 8]),
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("read runtime");
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, Some("true")),
+                (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, Some("1")),
+            ],
+            || {
+                runtime.block_on(async {
+                    let backend = StdBackend::new(dir.path().to_path_buf());
+                    let memory = BackgroundMemoryBudget::new();
+                    let read = || async {
+                        let (resources, _) = test_resource_units(1);
+                        with_optional_resource_unit(
+                            Some(resources.with_memory_budget(memory.clone())),
+                            backend.pread_bytes("bucket", "object", 0, 8, None),
+                        )
+                        .await
+                    };
+                    memory.set_sampled_limit(8, Duration::from_secs(30));
+                    assert!(matches!(read().await, Err(DiskError::Io(error)) if error.kind() == ErrorKind::WouldBlock));
+                    assert_eq!(memory.snapshot().used, 0, "denied bounce storage refunds the reserved output");
+                    assert!(
+                        backend.direct_io.supported.load(Ordering::Relaxed),
+                        "pressure must not disable direct I/O"
+                    );
+                    memory.set_sampled_limit(8192 + 8, Duration::from_secs(30));
+                    let bytes = read().await.expect("native bounce and logical result fit together");
+                    assert_eq!(bytes.as_ref(), &[37; 8]);
+                    assert_eq!(memory.snapshot().used, 8, "native completion frees only the bounce allocation");
+                    drop(bytes);
+                    assert_eq!(memory.snapshot().used, 0);
+                })
+            },
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn pread_direct_aligned_exact_range_or_unsupported() {
         use std::io::Write;
 
@@ -32181,7 +32380,7 @@ mod test {
             .expect("operation should succeed");
 
         let state = DirectIoReadState::new();
-        match pread_direct_aligned(&file_path, 4090, 100, &state) {
+        match pread_direct_aligned(&file_path, 4090, 100, &state, None) {
             Ok(bytes) => {
                 assert_eq!(&bytes[..], &content[4090..4190], "padding must not leak");
             }

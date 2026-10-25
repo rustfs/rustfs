@@ -1,6 +1,7 @@
 // Copyright 2026 RustFS Team
 // Licensed under the Apache License, Version 2.0.
 
+use bytes::Bytes;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -73,7 +74,7 @@ impl BackgroundMemoryBudget {
         }
     }
 
-    fn reserve(self: &Arc<Self>, bytes: usize) -> io::Result<Reservation> {
+    pub(crate) fn reserve(self: &Arc<Self>, bytes: usize) -> io::Result<Reservation> {
         let bytes = u64::try_from(bytes).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let used = state
@@ -91,9 +92,38 @@ impl BackgroundMemoryBudget {
     }
 }
 
-struct Reservation {
+pub(crate) struct Reservation {
     owner: Arc<BackgroundMemoryBudget>,
     bytes: u64,
+}
+
+impl Reservation {
+    pub(crate) fn wrap(bytes: Bytes, reservation: Option<Self>) -> Bytes {
+        if bytes.is_empty() {
+            drop(bytes);
+            drop(reservation);
+            return Bytes::new();
+        }
+        match reservation {
+            Some(reservation) => Bytes::from_owner(BackgroundBytes {
+                bytes,
+                _reservation: reservation,
+            }),
+            None => bytes,
+        }
+    }
+}
+
+struct BackgroundBytes {
+    // Free the payload before refunding it, including after the last slice.
+    bytes: Bytes,
+    _reservation: Reservation,
+}
+
+impl AsRef<[u8]> for BackgroundBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 impl Drop for Reservation {
@@ -127,6 +157,10 @@ impl BackgroundBuffer {
     /// Call only after the previous contents have been consumed. Growth charges
     /// both allocations until the old buffer is freed, including after shrink.
     pub(crate) fn ensure_len(&mut self, length: usize) -> io::Result<()> {
+        self.grow(length, 0)
+    }
+
+    fn grow(&mut self, length: usize, preserve: usize) -> io::Result<()> {
         if self.bytes.len() >= length {
             return Ok(());
         }
@@ -136,9 +170,44 @@ impl BackgroundBuffer {
             .try_reserve_exact(length)
             .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
         bytes.resize(length, 0);
+        bytes[..preserve].copy_from_slice(&self.bytes[..preserve]);
         self.bytes = bytes.into_boxed_slice();
         self.reservation = reservation;
         Ok(())
+    }
+
+    /// Metadata is only a size hint: concurrent growth still reads through EOF.
+    /// Every replacement is charged before copying the retained prefix.
+    pub(crate) fn read_to_end(mut self, reader: &mut impl io::Read, hint: usize) -> io::Result<Bytes> {
+        self.ensure_len(hint)?;
+        let mut filled = 0;
+        loop {
+            if filled == self.bytes.len() {
+                // Probe EOF without forcing a larger allocation for an exact fit.
+                let mut probe = [0];
+                match reader.read(&mut probe) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let length = self.bytes.len().checked_mul(2).ok_or(io::ErrorKind::OutOfMemory)?.max(32);
+                        self.grow(length, filled)?;
+                        self.bytes[filled] = probe[0];
+                        filled += 1;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            match reader.read(&mut self.bytes[filled..]) {
+                Ok(0) => break,
+                Ok(length) => filled += length,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        let Self { bytes, reservation, .. } = self;
+        let mut bytes = Bytes::from(bytes.into_vec());
+        bytes.truncate(filled);
+        Ok(Reservation::wrap(bytes, reservation))
     }
 
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
@@ -153,6 +222,78 @@ impl BackgroundBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn returned_bytes_keep_the_allocation_charged_through_slices_and_shrink() {
+        let owner = BackgroundMemoryBudget::new();
+        owner.set_sampled_limit(8, Duration::from_secs(30));
+        let bytes = BackgroundBuffer::new(Some(owner.clone()))
+            .read_to_end(&mut &b"abcdefgh"[..], 8)
+            .expect("exact allocation fits without an EOF growth allocation");
+        assert_eq!(bytes.as_ref(), b"abcdefgh");
+        assert_eq!(owner.snapshot().used, 8);
+        let slice = bytes.slice(2..6);
+        owner.set_sampled_limit(0, Duration::ZERO);
+        drop(bytes);
+        assert_eq!(slice.as_ref(), b"cdef");
+        assert_eq!(owner.snapshot().used, 8, "the final slice still owns the complete allocation");
+        assert!(owner.reserve(1).is_err());
+        drop(slice);
+        assert_eq!(owner.snapshot().used, 0);
+    }
+
+    #[test]
+    fn whole_file_size_hint_never_truncates_growth_or_exposes_unused_bytes() {
+        for (hint, retained) in [(0, 32), (4, 32), (8, 8), (16, 16)] {
+            let owner = BackgroundMemoryBudget::new();
+            owner.set_sampled_limit(36, Duration::from_secs(30));
+            let bytes = BackgroundBuffer::new(Some(owner.clone()))
+                .read_to_end(&mut &b"abcdefgh"[..], hint)
+                .expect("read through EOF independently of the metadata hint");
+            assert_eq!(bytes.as_ref(), b"abcdefgh", "hint={hint}");
+            assert_eq!(owner.snapshot().used, retained, "charge allocated capacity, not visible length");
+            drop(bytes);
+            assert_eq!(owner.snapshot().used, 0);
+        }
+        let owner = BackgroundMemoryBudget::new();
+        owner.set_sampled_limit(16, Duration::from_secs(30));
+        let bytes = BackgroundBuffer::new(Some(owner.clone()))
+            .read_to_end(&mut std::io::empty(), 16)
+            .expect("file shrank to empty");
+        assert!(bytes.is_empty());
+        assert_eq!(owner.snapshot().used, 0, "empty results free unused storage before refund");
+    }
+
+    #[test]
+    fn whole_file_growth_denial_and_source_failure_refund_storage() {
+        let owner = BackgroundMemoryBudget::new();
+        owner.set_sampled_limit(35, Duration::from_secs(30));
+        let error = BackgroundBuffer::new(Some(owner.clone()))
+            .read_to_end(&mut &b"abcdefgh"[..], 4)
+            .expect_err("old four plus new thirty-two bytes exceed capacity");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(owner.snapshot().used, 0);
+
+        struct FailedRead(u8);
+        impl io::Read for FailedRead {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.0 += 1;
+                match self.0 {
+                    1 => Err(io::ErrorKind::Interrupted.into()),
+                    2 => {
+                        bytes[..2].copy_from_slice(b"ab");
+                        Ok(2)
+                    }
+                    _ => Err(io::ErrorKind::PermissionDenied.into()),
+                }
+            }
+        }
+        let error = BackgroundBuffer::new(Some(owner.clone()))
+            .read_to_end(&mut FailedRead(0), 8)
+            .expect_err("failure after partial output is not successful EOF");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(owner.snapshot().used, 0);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn shrink_and_expiry_keep_retained_storage_charged() {

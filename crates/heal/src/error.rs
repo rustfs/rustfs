@@ -299,6 +299,9 @@ fn classify_io_error(error: &std::io::Error) -> HealErrorClass {
     if error.kind() == std::io::ErrorKind::WouldBlock {
         return HealErrorClass::LockContention;
     }
+    if error.kind() == std::io::ErrorKind::OutOfMemory {
+        return HealErrorClass::Transient;
+    }
     if DiskError::io_error_is_dangling_delete_grace(error) {
         return HealErrorClass::DanglingGrace {
             retry_not_before: dangling_deadline(DiskError::io_error_dangling_delete_retry_after(error)),
@@ -830,21 +833,21 @@ mod tests {
     }
 
     #[test]
-    fn nonblocking_admission_stays_retryable_across_error_wrappers() {
-        let blocked = || {
-            DiskError::Io(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "background buffer memory budget exhausted",
-            ))
-        };
-        for error in [
-            Error::Disk(blocked()),
-            Error::Storage(EcstoreError::from(blocked())),
-            Error::Io(EcstoreError::from(blocked()).into()),
+    fn resource_pressure_stays_retryable_across_error_wrappers() {
+        for (kind, expected) in [
+            (std::io::ErrorKind::WouldBlock, super::HealErrorClass::LockContention),
+            (std::io::ErrorKind::OutOfMemory, super::HealErrorClass::Transient),
         ] {
-            assert_eq!(super::classify_heal_error(&error), super::HealErrorClass::LockContention);
-            assert!(error.is_recoverable_heal(), "resource pressure must preserve retry responsibility");
-            assert!(!error.is_object_absent());
+            let pressure = || DiskError::Io(std::io::Error::new(kind, "background buffer memory budget exhausted"));
+            for error in [
+                Error::Disk(pressure()),
+                Error::Storage(EcstoreError::from(pressure())),
+                Error::Io(EcstoreError::from(pressure()).into()),
+            ] {
+                assert_eq!(super::classify_heal_error(&error), expected);
+                assert!(error.is_recoverable_heal(), "resource pressure must preserve retry responsibility");
+                assert!(!error.is_object_absent());
+            }
         }
         for kind in [std::io::ErrorKind::Other, std::io::ErrorKind::PermissionDenied] {
             let error = Error::Io(std::io::Error::new(kind, "background buffer memory budget exhausted"));
