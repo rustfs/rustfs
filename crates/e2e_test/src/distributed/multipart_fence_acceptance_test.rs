@@ -1280,8 +1280,20 @@ async fn simultaneous_resend_complete_and_abort(
 ) -> TestResult {
     use md5::{Digest as _, Md5};
 
-    for cancel_waiter in [false, true] {
-        let key = format!("three-way-resend-{cancel_waiter}");
+    for (cancel_waiter, preferred_complete) in [
+        (false, None),
+        (true, None),
+        (false, Some(false)),
+        (true, Some(false)),
+        (false, Some(true)),
+        (true, Some(true)),
+    ] {
+        let schedule = match preferred_complete {
+            None => "race",
+            Some(false) => "abort",
+            Some(true) => "complete",
+        };
+        let key = format!("three-way-resend-{cancel_waiter}-{schedule}");
         let previous = payload_for(&key, 4096);
         clients[0]
             .put_object()
@@ -1341,8 +1353,18 @@ async fn simultaneous_resend_complete_and_abort(
             Some(caller)
         };
 
-        // The part already owns the upload lock. Distinct forwarded owners
-        // prove that both other coordinators contend, rather than one retrying.
+        // The part owns the upload lock before either terminal call starts.
+        // Ordered rows hold only the losing coordinator on two remote peers.
+        let held_locks = if let Some(complete_wins) = preferred_complete {
+            let loser = if complete_wins { 2 } else { 1 };
+            let owner = proxies[loser].local_addr().to_string();
+            (1..4)
+                .filter(|node| *node != loser)
+                .map(|node| proxies[node].pause_upload_lock_owner(&scope, &owner))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         let admission = proxies[0].pause_upload_locks(&scope)?;
         admission.release();
         let start = std::sync::Arc::new(tokio::sync::Barrier::new(3));
@@ -1372,12 +1394,24 @@ async fn simultaneous_resend_complete_and_abort(
             abort_request.send().await
         });
         start.wait().await;
-        wait_until(
-            DEADLINE,
-            || async { Ok(admission.forwarded_lock_owners() == 2) },
-            "Complete and Abort from distinct upload-lock owners reach the peer",
-        )
-        .await?;
+        if let Some(complete_wins) = preferred_complete {
+            let winner = if complete_wins { 1 } else { 2 };
+            let owner = proxies[winner].local_addr().to_string();
+            wait_for_faults(&held_locks, &["Lock", "LockBatch"]).await?;
+            wait_until(
+                DEADLINE,
+                || async { Ok(admission.has_forwarded_lock_owner(&owner)) },
+                "preferred terminal coordinator reaches the peer while its competitor is held",
+            )
+            .await?;
+        } else {
+            wait_until(
+                DEADLINE,
+                || async { Ok(admission.forwarded_lock_owners() == 2) },
+                "Complete and Abort from distinct upload-lock owners reach the peer",
+            )
+            .await?;
+        }
         assert!(
             tokio::time::timeout(Duration::from_millis(150), &mut complete).await.is_err(),
             "Complete must wait while the resent part is prepared: cancel_waiter={cancel_waiter}"
@@ -1387,7 +1421,13 @@ async fn simultaneous_resend_complete_and_abort(
             "Abort must wait while the resent part is prepared: cancel_waiter={cancel_waiter}"
         );
         let terminal_owners = admission.forwarded_lock_owners();
-        assert_eq!(terminal_owners, 2, "only the two terminal coordinators contend before part release");
+        if preferred_complete.is_none() {
+            assert_eq!(terminal_owners, 2, "both ungated terminal coordinators reach the peer");
+        } else {
+            assert!((1..=2).contains(&terminal_owners), "only the two terminal coordinators can contend");
+        }
+        let held_lock_calls = held_locks.iter().map(RpcPause::hits).sum::<usize>();
+        assert_eq!(held_lock_calls > 0, preferred_complete.is_some());
         drop(admission);
         for pause in &pauses {
             pause.release();
@@ -1396,7 +1436,26 @@ async fn simultaneous_resend_complete_and_abort(
             let part = tokio::time::timeout(DEADLINE, caller).await???;
             assert_eq!(part.e_tag(), Some(replacement_etag.as_str()));
         }
-        let completed = match tokio::time::timeout(DEADLINE, complete).await?? {
+        // Keep two peers unavailable only to the losing coordinator until
+        // the winner finishes. The part owner and winner remain unaffected.
+        let (completion, abortion) = if preferred_complete == Some(false) {
+            let abortion = tokio::time::timeout(DEADLINE, &mut abort).await??;
+            assert!(abortion.is_ok(), "preferred Abort must succeed: {abortion:?}");
+            for gate in &held_locks {
+                gate.release();
+            }
+            (tokio::time::timeout(DEADLINE, &mut complete).await??, abortion)
+        } else {
+            let completion = tokio::time::timeout(DEADLINE, &mut complete).await??;
+            if preferred_complete == Some(true) {
+                assert!(completion.is_ok(), "preferred Complete must succeed: {completion:?}");
+            }
+            for gate in &held_locks {
+                gate.release();
+            }
+            (completion, tokio::time::timeout(DEADLINE, &mut abort).await??)
+        };
+        let completed = match completion {
             Ok(_) => true,
             Err(error) => {
                 assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(404), "{error:?}");
@@ -1404,10 +1463,12 @@ async fn simultaneous_resend_complete_and_abort(
                 false
             }
         };
-        let aborted = tokio::time::timeout(DEADLINE, abort).await??;
+        if let Some(expected) = preferred_complete {
+            assert_eq!(completed, expected, "the scoped lock gate must establish the requested terminal order");
+        }
         if !completed {
-            aborted?;
-        } else if let Err(error) = aborted {
+            abortion?;
+        } else if let Err(error) = abortion {
             assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(404), "{error:?}");
             assert_eq!(error.as_service_error().and_then(|error| error.meta().code()), Some("NoSuchUpload"));
         }
@@ -1432,7 +1493,7 @@ async fn simultaneous_resend_complete_and_abort(
         }
         assert_no_uploads(clients, bucket).await?;
         eprintln!(
-            "MPU three-way owner: cancel_waiter={cancel_waiter}, complete_won={completed}, forwarded_terminal_owners={terminal_owners}, prepared_peers=3, retired_roots=4, verified_readers=4"
+            "MPU three-way owner: cancel_waiter={cancel_waiter}, complete_won={completed}, forwarded_terminal_owners={terminal_owners}, prepared_peers=3, retired_roots=4, verified_readers=4, schedule={schedule}, held_lock_calls={held_lock_calls}"
         );
     }
     Ok(())
