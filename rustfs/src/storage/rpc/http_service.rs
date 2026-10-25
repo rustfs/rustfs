@@ -15,12 +15,12 @@
 use crate::server::RPC_PREFIX;
 use crate::storage::request_context::spawn_traced;
 use crate::storage::storage_api::rpc_consumer::http_service::{
-    BackgroundReaderStream, DEFAULT_READ_BUFFER_SIZE, DeleteOptions, DiskStore, NS_SCANNER_PROTOCOL_VERSION,
-    NsScannerCapabilityResponse, PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_VERSION,
-    PutFileCapabilityResponse, RemoteBackgroundIo, StorageDiskRpcExt as _, WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions,
-    check_and_record_signed_rpc_nonce, find_local_disk_by_ref_for_rpc, rpc_background_admission,
-    sign_ns_scanner_capability_with_checkpoint_coverage, sign_put_file_capability, verify_put_file_auth_trailer,
-    verify_rpc_signature, with_remote_background_io,
+    BackgroundPipeWriter, BackgroundReaderStream, DEFAULT_READ_BUFFER_SIZE, DeleteOptions, DiskStore,
+    NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse, PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1,
+    PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, RemoteBackgroundIo, StorageDiskRpcExt as _,
+    WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, background_pipe, check_and_record_signed_rpc_nonce,
+    find_local_disk_by_ref_for_rpc, rpc_background_admission, sign_ns_scanner_capability_with_checkpoint_coverage,
+    sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io,
 };
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::http_service::{
@@ -1284,10 +1284,10 @@ async fn walk_dir_response_body<F, Fut>(
     producer: F,
 ) -> Result<Body, DiskError>
 where
-    F: FnOnce(tokio::io::DuplexStream) -> Fut + Send + 'static,
+    F: FnOnce(BackgroundPipeWriter) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(), DiskError>> + Send + 'static,
 {
-    let (reader, writer) = tokio::io::duplex(DEFAULT_READ_BUFFER_SIZE);
+    let (reader, writer) = background_pipe(DEFAULT_READ_BUFFER_SIZE);
     let reader = BackgroundReaderStream::with_capacity(reader, DEFAULT_READ_BUFFER_SIZE);
     let (mut completion_tx, completion_rx) = oneshot::channel();
     let resource_context = RemoteBackgroundIo::take_current();
@@ -1374,10 +1374,10 @@ where
 
 fn ns_scanner_response_body<F, Fut>(producer: F) -> Body
 where
-    F: FnOnce(tokio::io::DuplexStream, CancellationToken) -> Fut + Send + 'static,
+    F: FnOnce(BackgroundPipeWriter, CancellationToken) -> Fut + Send + 'static,
     Fut: Future<Output = io::Result<()>> + Send + 'static,
 {
-    let (reader, writer) = tokio::io::duplex(NS_SCANNER_STREAM_BUFFER_SIZE);
+    let (reader, writer) = background_pipe(NS_SCANNER_STREAM_BUFFER_SIZE);
     let reader = BackgroundReaderStream::with_capacity(reader, NS_SCANNER_STREAM_BUFFER_SIZE);
     let (mut completion_tx, completion_rx) = oneshot::channel();
     let disconnect = CancellationToken::new();
@@ -3095,6 +3095,74 @@ mod tests {
                 .expect("final data should be readable"),
             Bytes::from_static(b"old-datalegacyauthenticated")
         );
+    }
+
+    #[tokio::test]
+    async fn background_pipe_memory_denial_fails_walk_and_namespace_bodies() {
+        const CHILD: &str = "RUSTFS_PIPE_MEMORY_TEST_CHILD";
+        const TEST: &str = "storage::rpc::http_service::tests::background_pipe_memory_denial_fails_walk_and_namespace_bodies";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .expect("isolated process memory owner test");
+            assert!(
+                output.status.success(),
+                "background pipe memory: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("BACKGROUND_PIPE_MEMORY_OK"));
+            return;
+        }
+
+        use crate::storage::storage_api::ecstore_disk::with_background_resource_unit;
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+        let memory = crate::storage_api::startup::background::BackgroundMemoryBudget::new();
+        assert!(memory.install(), "install the isolated process memory owner");
+        let physical = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        for mode in ["legacy", "capable", "namespace"] {
+            let capacity = if mode == "namespace" {
+                super::NS_SCANNER_STREAM_BUFFER_SIZE
+            } else {
+                DEFAULT_READ_BUFFER_SIZE
+            };
+            memory.set_sampled_limit(u64::try_from(capacity).expect("capacity fits u64"), Duration::from_secs(30));
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let body = with_background_resource_unit(physical.try_acquire().expect("physical admission"), async {
+                if mode == "namespace" {
+                    ns_scanner_response_body(move |mut writer, _| async move {
+                        release_rx.await.expect("release namespace producer");
+                        writer.write_all(b"namespace").await
+                    })
+                } else {
+                    walk_dir_response_body(mode == "capable", false, move |mut writer| async move {
+                        release_rx.await.expect("release directory producer");
+                        writer.write_all(b"directory").await?;
+                        Ok(())
+                    })
+                    .await
+                    .expect("prepare directory stream")
+                }
+            })
+            .await;
+            assert_eq!(physical.snapshot().active, 0, "the escaped pipe must not retain disk capacity");
+            let collected = BodyExt::collect(body);
+            tokio::pin!(collected);
+            assert!(futures_util::poll!(&mut collected).is_pending());
+            assert_eq!(memory.snapshot().used, u64::try_from(capacity).expect("capacity fits u64"));
+            release_tx
+                .send(())
+                .expect("release the producer after output staging reserves the budget");
+            tokio::time::timeout(Duration::from_secs(2), &mut collected)
+                .await
+                .expect("bounded failed body")
+                .expect_err("pipe admission denial must not turn into successful empty EOF");
+            assert_eq!(memory.snapshot().used, 0, "failed body must release its output allocation");
+        }
+        println!("BACKGROUND_PIPE_MEMORY_OK");
     }
 
     #[tokio::test]

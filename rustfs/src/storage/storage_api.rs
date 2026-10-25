@@ -256,7 +256,7 @@ pub(crate) mod rpc_consumer {
         pub(crate) use super::super::Endpoint;
         #[cfg(test)]
         pub(crate) use super::super::ecstore_disk::DiskAPI;
-        pub(crate) use rustfs_ecstore::api::disk::BackgroundReaderStream;
+        pub(crate) use rustfs_ecstore::api::disk::{BackgroundPipeWriter, BackgroundReaderStream, background_pipe};
         #[cfg(test)]
         pub(crate) use rustfs_ecstore::api::disk::{DiskOption, new_disk};
         pub(crate) const DEFAULT_READ_BUFFER_SIZE: usize = super::super::DEFAULT_READ_BUFFER_SIZE;

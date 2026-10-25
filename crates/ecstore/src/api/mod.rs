@@ -427,6 +427,7 @@ pub mod data_usage {
 }
 
 pub mod disk {
+    pub use crate::cluster::rpc::background_pipe::{BackgroundPipeReader, BackgroundPipeWriter, background_pipe};
     pub use crate::cluster::rpc::background_reader_stream::BackgroundReaderStream;
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
     pub use crate::disk::local::{ReplacementExecutionLease, ScanGuard};

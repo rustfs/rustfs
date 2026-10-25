@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub(crate) mod background_monitor;
+pub(crate) mod background_pipe;
 pub(crate) mod background_reader_stream;
 pub(crate) mod client;
 pub(crate) mod context_propagation;
