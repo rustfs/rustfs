@@ -1672,18 +1672,25 @@ impl LocalDiskWrapper {
     async fn with_native_resources<F: std::future::Future>(&self, operation: F) -> Result<F::Output> {
         use crate::disk::io_admission::ResourceIoUnit;
 
-        let Some(ResourceIoUnit::Set(resources)) = current_resource_unit() else {
+        let Some(resources) = current_resource_unit() else {
             return Ok(operation.await);
         };
-        let unavailable = || DiskError::Io(io::Error::from(io::ErrorKind::WouldBlock));
-        let plan = self.physical_admission.plan().ok_or_else(unavailable)?;
-        let native = plan
-            .capture_or_acquire_native(&resources)
-            .map_err(|error| DiskError::Io(io::Error::new(io::ErrorKind::WouldBlock, error)))?;
-        if !plan.is_current() {
-            return Err(unavailable());
-        }
-        Ok(crate::disk::with_background_resource_set(native, operation).await)
+        let resources = if let Some(permits) = resources.as_set() {
+            let unavailable = || DiskError::Io(io::Error::from(io::ErrorKind::WouldBlock));
+            let plan = self.physical_admission.plan().ok_or_else(unavailable)?;
+            let native = plan
+                .capture_or_acquire_native(permits)
+                .map_err(|error| DiskError::Io(io::Error::new(io::ErrorKind::WouldBlock, error)))?;
+            if !plan.is_current() {
+                return Err(unavailable());
+            }
+            ResourceIoUnit::from(native)
+        } else {
+            resources
+        };
+        #[cfg(target_os = "linux")]
+        let resources = resources.with_mount_lease(self.disk.native_mount_lease());
+        Ok(with_optional_resource_unit(Some(resources), operation).await)
     }
 
     async fn acquire_disk_io_permit(&self) -> Result<Option<crate::disk::io_admission::DiskIoPermit>> {

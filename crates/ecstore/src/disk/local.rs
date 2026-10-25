@@ -6365,6 +6365,11 @@ impl LocalDisk {
         &self.io_root
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn native_mount_lease(&self) -> Arc<std::fs::File> {
+        self.mount_lease.clone()
+    }
+
     /// Auto-replacement is destructive, so it is admitted only when the
     /// configured endpoint still names the directory held by `mount_lease`.
     pub fn has_replacement_mount_lease(&self) -> bool {
@@ -29318,6 +29323,80 @@ mod test {
             assert_eq!(held, vec![1, 1]);
             assert!(retained, "native reader open pins the retired disk mount");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelled_filesystem_probe_retains_only_its_device_and_mount_lease() {
+        use crate::disk::disk_store::LocalDiskWrapper;
+        use crate::disk::io_admission::{ResourceIoUnit, with_optional_resource_unit};
+        use rustfs_concurrency::adaptive::{AdaptiveAdmission, permit_set::AdaptivePermitSetOwner};
+        use std::num::NonZeroU16;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single native worker");
+        runtime.block_on(async {
+            let mut observations = Vec::new();
+            for layered in [false, true] {
+                let dir = tempfile::tempdir().expect("filesystem probe fixture");
+                let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
+                let mut disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+                let exit = disk.exit_signal.take().expect("cleanup monitor exit sender");
+                exit.send(()).expect("stop fixture cleanup monitor");
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while exit.receiver_count() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("cleanup monitor stopped");
+                drop(exit);
+                let lease = Arc::downgrade(&disk.mount_lease);
+                let wrapper = LocalDiskWrapper::new(Arc::new(disk), false);
+                let a = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+                let b = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+                let shared = AdaptivePermitSetOwner::new(NonZeroU16::MIN, vec![a.clone(), b.clone()]).expect("catalog");
+                wrapper
+                    .physical_admission()
+                    .set_test_shared_capacity(shared.clone(), vec![a.clone()])
+                    .expect("native device A");
+                let resources = if layered {
+                    let first = a.try_acquire().expect("first device");
+                    let second = b.try_acquire().expect("unrelated device");
+                    ResourceIoUnit::from(shared.capture(&[&first, &second]).expect("admitted parent"))
+                } else {
+                    ResourceIoUnit::from(a.try_acquire().expect("single device"))
+                };
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                });
+                started_rx.await.expect("native worker occupied");
+                let mut future = Box::pin(with_optional_resource_unit(Some(resources), async move {
+                    wrapper.make_volume("probe-volume").await
+                }));
+                assert!(futures::poll!(&mut future).is_pending(), "volume access probe queued");
+                drop(future);
+                let held = [a.snapshot().active, b.snapshot().active];
+                let retained = lease.strong_count() > 0;
+                release_tx.send(()).expect("release native worker before assertions");
+                blocker.await.expect("native blocker completed");
+                tokio::task::spawn_blocking(|| ()).await.expect("native queue drained");
+                assert_eq!([a.snapshot().active, b.snapshot().active], [0, 0]);
+                assert_eq!(lease.strong_count(), 0);
+                assert!(!dir.path().join("probe-volume").exists(), "cancelled access cannot schedule later mkdir");
+                observations.push((layered, held, retained));
+            }
+            for (layered, held, retained) in observations {
+                assert_eq!(held, [1, 0], "layered={layered}: native probe retains only its device");
+                assert!(retained, "layered={layered}: native probe pins the retired disk mount");
+            }
+        });
     }
 
     #[cfg(unix)]

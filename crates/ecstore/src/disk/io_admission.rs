@@ -51,18 +51,62 @@ tokio::task_local! {
 
 /// Native I/O retains the physical subset selected before storage work. A
 /// layered disk may touch several leaves; unrelated devices stay outside it.
+#[derive(Clone, Debug)]
+pub(crate) struct ResourceIoUnit {
+    permits: ResourceIoPermits,
+    #[cfg(target_os = "linux")]
+    _mount_lease: Option<Arc<std::fs::File>>,
+}
+
 #[derive(Debug)]
-pub(crate) enum ResourceIoUnit {
+enum ResourceIoPermits {
     Single(AdaptivePermit),
     Set(AdaptivePermitSet),
 }
 
-impl Clone for ResourceIoUnit {
+impl Clone for ResourceIoPermits {
     fn clone(&self) -> Self {
         match self {
-            Self::Single(unit) => Self::Single(unit.clone()),
-            Self::Set(units) => Self::Set(units.clone()),
+            Self::Single(permit) => Self::Single(permit.clone()),
+            Self::Set(permits) => Self::Set(permits.clone()),
         }
+    }
+}
+
+impl From<AdaptivePermit> for ResourceIoUnit {
+    fn from(permit: AdaptivePermit) -> Self {
+        Self {
+            permits: ResourceIoPermits::Single(permit),
+            #[cfg(target_os = "linux")]
+            _mount_lease: None,
+        }
+    }
+}
+
+impl From<AdaptivePermitSet> for ResourceIoUnit {
+    fn from(permits: AdaptivePermitSet) -> Self {
+        Self {
+            permits: ResourceIoPermits::Set(permits),
+            #[cfg(target_os = "linux")]
+            _mount_lease: None,
+        }
+    }
+}
+
+impl ResourceIoUnit {
+    pub(crate) fn as_set(&self) -> Option<&AdaptivePermitSet> {
+        match &self.permits {
+            ResourceIoPermits::Single(_) => None,
+            ResourceIoPermits::Set(permits) => Some(permits),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_mount_lease(mut self, mount_lease: Arc<std::fs::File>) -> Self {
+        // The selected disk's proc-fd paths must survive native jobs after its
+        // async wrapper retires. Clones carry the same pinned mount generation.
+        self._mount_lease = Some(mount_lease);
+        self
     }
 }
 
@@ -75,10 +119,10 @@ pub(crate) fn test_resource_units(count: usize) -> (ResourceIoUnit, Vec<Arc<rust
     let gates: Vec<_> = (0..count).map(|_| AdaptiveAdmission::new(NonZeroU16::MIN, 1)).collect();
     let mut admitted: Vec<_> = gates.iter().map(|gate| gate.try_acquire().expect("test resource")).collect();
     let unit = if count == 1 {
-        ResourceIoUnit::Single(admitted.pop().expect("single resource"))
+        ResourceIoUnit::from(admitted.pop().expect("single resource"))
     } else {
         let owner = AdaptivePermitSetOwner::new(NonZeroU16::MIN, gates.clone()).expect("layered resource");
-        ResourceIoUnit::Set(owner.capture(&admitted.iter().collect::<Vec<_>>()).expect("admitted subset"))
+        ResourceIoUnit::from(owner.capture(&admitted.iter().collect::<Vec<_>>()).expect("admitted subset"))
     };
     (unit, gates)
 }
@@ -122,7 +166,7 @@ pub async fn with_background_disk_io<F: Future>(cancellation: CancellationToken,
 /// of a stalled native operation. Escaping buffers need their own memory leases.
 #[doc(hidden)]
 pub async fn with_background_resource_unit<F: Future>(unit: AdaptivePermit, future: F) -> F::Output {
-    RESOURCE_IO_UNIT.scope(ResourceIoUnit::Single(unit), future).await
+    RESOURCE_IO_UNIT.scope(ResourceIoUnit::from(unit), future).await
 }
 
 /// Retain only the previously admitted physical leaves touched by this I/O.
@@ -132,7 +176,7 @@ pub async fn with_background_resource_unit<F: Future>(unit: AdaptivePermit, futu
 /// to a native job that touches only some of its disks.
 #[doc(hidden)]
 pub async fn with_background_resource_set<F: Future>(units: AdaptivePermitSet, future: F) -> F::Output {
-    RESOURCE_IO_UNIT.scope(ResourceIoUnit::Set(units), future).await
+    RESOURCE_IO_UNIT.scope(ResourceIoUnit::from(units), future).await
 }
 
 pub(crate) fn current_resource_unit() -> Option<ResourceIoUnit> {
