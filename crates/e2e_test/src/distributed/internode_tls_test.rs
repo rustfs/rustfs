@@ -5,12 +5,13 @@ use super::harness::{DistCluster, DistLayout, TestResult, unique_bucket};
 use crate::{common::tls_diagnostic_log_directory, tls_gen};
 use anyhow::Context;
 use aws_sdk_s3::{Client, config::retry::RetryConfig, primitives::ByteStream};
-use futures::future::try_join_all;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::task::JoinSet;
 
 const MIB: u64 = 1024 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(180);
@@ -194,7 +195,7 @@ async fn four_node_tls_large_and_range_gets_preserve_bytes() -> TestResult {
     let mut results = Vec::new();
     for length in [32 * 1024, 100 * MIB, 1024 * MIB] {
         let fixture_directory = directory.clone();
-        let object = tokio::task::spawn_blocking(move || fixture(&fixture_directory, length)).await??;
+        let object = Arc::new(tokio::task::spawn_blocking(move || fixture(&fixture_directory, length)).await??);
         let started = Instant::now();
         tokio::time::timeout(
             READ_TIMEOUT,
@@ -234,15 +235,18 @@ async fn four_node_tls_large_and_range_gets_preserve_bytes() -> TestResult {
                 results.push(verified_get(client, node, &bucket, &object, expected, false).await?);
             }
         }
-        results.extend(
-            try_join_all(
-                clients
-                    .iter()
-                    .enumerate()
-                    .map(|(node, client)| verified_get(client, node, &bucket, &object, &object.reads[0], true)),
-            )
-            .await?,
-        );
+        // Ready body chunks can exhaust one task's cooperative budget before
+        // its sibling futures are polled. Each GET needs its own budget.
+        let mut concurrent_gets = JoinSet::new();
+        for (node, client) in clients.iter().enumerate() {
+            let client = client.clone();
+            let bucket = bucket.clone();
+            let object = object.clone();
+            concurrent_gets.spawn(async move { verified_get(&client, node, &bucket, &object, &object.reads[0], true).await });
+        }
+        while let Some(result) = concurrent_gets.join_next().await {
+            results.push(result??);
+        }
         tokio::fs::remove_file(&object.path).await?;
     }
     for node in 0..clients.len() {
