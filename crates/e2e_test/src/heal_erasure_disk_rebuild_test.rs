@@ -1206,7 +1206,9 @@ mod tests {
         let interval = interval
             .filter(|interval| *interval != 0)
             .ok_or("scanner schedule has no positive interval")?;
-        let next_cycle = cycle_end
+        // A new leader may already be sleeping before completing its first cycle.
+        let schedule_start = if cycle_end == 0 { now } else { cycle_end };
+        let next_cycle = schedule_start
             .checked_add(interval)
             .ok_or("scanner schedule timestamp overflows")?;
         let budget = next_cycle
@@ -1223,6 +1225,11 @@ mod tests {
             Ok(Duration::from_secs(259)),
         );
         assert_eq!(scanner_cycle_completion_budget(100, Some(1), 110, false), Ok(Duration::from_secs(60)));
+        // A newly elected leader can advertise a sleep before its first completed cycle.
+        assert_eq!(
+            scanner_cycle_completion_budget(0, Some(289), 1_792_913_211, false),
+            Ok(Duration::from_secs(349)),
+        );
     }
 
     #[test]
@@ -1243,7 +1250,7 @@ mod tests {
         previous_cycle_end: u64,
     ) -> Result<u64, Box<dyn Error + Send + Sync>> {
         let mut deadline = Instant::now() + Duration::from_secs(60);
-        let mut schedule_accounted = false;
+        let mut accounted_schedules = HashSet::new();
         loop {
             let mut latest_cycle_end = 0;
             let mut versions_observed = false;
@@ -1290,15 +1297,27 @@ mod tests {
                     return Err("scanner cycle timestamp is in the future".into());
                 }
                 let schedule = &status["cycle_schedule"];
-                if !schedule_accounted && schedule["execution_role"].as_str() == Some("leader") {
+                if schedule["execution_role"].as_str() == Some("leader") {
                     let active = metrics["current_cycle_active"]
                         .as_bool()
                         .ok_or("scanner status is missing its active-cycle flag")?;
-                    if active || (cycle_end != 0 && schedule["effective_interval_available"].as_bool() == Some(true)) {
-                        let interval = schedule["effective_interval_seconds"].as_u64();
-                        let budget = scanner_cycle_completion_budget(cycle_end, interval, now, active)?;
-                        deadline = Instant::now().checked_add(budget).ok_or("scanner deadline overflows")?;
-                        schedule_accounted = true;
+                    if active || schedule["effective_interval_available"].as_bool() == Some(true) {
+                        let interval = if active {
+                            None
+                        } else {
+                            Some(
+                                schedule["effective_interval_seconds"]
+                                    .as_u64()
+                                    .ok_or("scanner schedule is missing its effective interval")?,
+                            )
+                        };
+                        // Reconsider a changed leader or retry plan, but never renew
+                        // the deadline on repeated observations of the same sleep.
+                        if accounted_schedules.insert((node_index, cycle_end, interval)) {
+                            let budget = scanner_cycle_completion_budget(cycle_end, interval, now, active)?;
+                            let scheduled_deadline = Instant::now().checked_add(budget).ok_or("scanner deadline overflows")?;
+                            deadline = deadline.max(scheduled_deadline);
+                        }
                     }
                 }
                 // Superseded walks complete all sets while withholding quota authority.
