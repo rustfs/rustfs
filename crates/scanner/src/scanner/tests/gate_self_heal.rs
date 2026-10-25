@@ -154,7 +154,7 @@ async fn usage_floor_load_failure_backs_off_and_recovers_without_restart() {
         assert!(!crate::scanner_runtime_initialized(), "test must own the scanner runtime");
         let ctx = CancellationToken::new();
         let _cancel_on_drop = ctx.clone().drop_guard();
-        init_data_scanner_with_storage(ctx.clone(), store.clone()).await;
+        init_data_scanner_with_storage(ctx.clone(), store.clone(), ScannerRuntimeGuard::new()).await;
 
         let attempts = MAX_SCANNER_CYCLE_RECOVERY_RETRIES + 2;
         let mut first_detected = None;
@@ -361,7 +361,7 @@ async fn quarantined_corrupt_cycle_state_is_rebuilt_on_the_next_iteration() {
         assert!(!crate::scanner_runtime_initialized(), "test must own the scanner runtime");
         let ctx = CancellationToken::new();
         let _cancel_on_drop = ctx.clone().drop_guard();
-        init_data_scanner_with_storage(ctx.clone(), store.clone()).await;
+        init_data_scanner_with_storage(ctx.clone(), store.clone(), ScannerRuntimeGuard::new()).await;
 
         let marker = tokio::time::timeout(WAIT_BUDGET, async {
             loop {
@@ -547,7 +547,7 @@ async fn dual_corrupt_usage_and_cycle_recover_through_the_production_supervisor(
 
         let ctx = CancellationToken::new();
         let _cancel_on_drop = ctx.clone().drop_guard();
-        init_data_scanner_with_storage(ctx.clone(), store.clone()).await;
+        init_data_scanner_with_storage(ctx.clone(), store.clone(), ScannerRuntimeGuard::new()).await;
         notify_scanner_cycle_recovery_wake();
         let (cycle, epoch) = wait_for_persisted_cycle(&store, |cycle, epoch| cycle.next >= 31 && epoch > 7).await;
         assert!(cycle.next >= 31, "recovery must preserve the surviving cycle lower bound");
@@ -883,7 +883,7 @@ async fn dual_recovery_production_supervisor_resumes_both_committed_interruption
 
             let ctx = CancellationToken::new();
             let _cancel_on_drop = ctx.clone().drop_guard();
-            init_data_scanner_with_storage(ctx.clone(), store.clone()).await;
+            init_data_scanner_with_storage(ctx.clone(), store.clone(), ScannerRuntimeGuard::new()).await;
             notify_scanner_cycle_recovery_wake();
             wait_for_persisted_cycle(&store, |cycle, epoch| cycle.next >= 31 && epoch > 8).await;
             tokio::time::timeout(WAIT_BUDGET, async {
