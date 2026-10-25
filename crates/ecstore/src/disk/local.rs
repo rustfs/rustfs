@@ -2352,6 +2352,8 @@ struct DirectWriteInner {
     /// Aligned bounce buffer; its capacity (`buf.len`) is a whole multiple of
     /// `align`.
     buf: AlignedBuf,
+    // Free the payload before refunding it, including after a detached flush.
+    _memory: Option<super::io_admission::memory::Reservation>,
     /// Bytes currently staged in `buf` and not yet written to the device.
     filled: usize,
     /// Next file offset for an O_DIRECT positioned write; always a multiple of
@@ -2453,9 +2455,15 @@ struct DirectWriter {
 #[cfg(target_os = "linux")]
 impl DirectWriter {
     fn new(file: std::fs::File, align: usize, capacity: usize, resource_unit: Option<ResourceIoUnit>) -> std::io::Result<Self> {
+        let memory = resource_unit
+            .as_ref()
+            .and_then(ResourceIoUnit::memory_budget)
+            .map(|budget| budget.reserve(capacity))
+            .transpose()?;
         let inner = DirectWriteInner {
             file,
             buf: AlignedBuf::new(capacity, align)?,
+            _memory: memory,
             filled: 0,
             write_offset: 0,
             align,
@@ -30429,8 +30437,134 @@ mod test {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn direct_writer_memory_denial_preserves_backend_and_retained_storage() {
+        use crate::disk::io_admission::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+        use std::io::IoSlice;
+
+        let dir = tempfile::tempdir().expect("direct writer memory fixture");
+        std::fs::create_dir(dir.path().join("bucket")).expect("bucket");
+        let backend = StdBackend::new(dir.path().to_path_buf());
+        let probe = open_direct_writer(&dir.path().join("probe"), &backend.direct_io_write, None).expect("probe direct writer");
+        let Some(probe) = probe else {
+            eprintln!("SKIP direct_writer_memory_denial_preserves_backend_and_retained_storage: O_DIRECT unavailable");
+            return;
+        };
+        drop(probe);
+        let capacity = direct_write_staging_capacity(*backend.direct_io_write.align.get().expect("probed alignment"));
+        let memory = BackgroundMemoryBudget::new();
+        temp_env::async_with_vars([(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, Some("true"))], async {
+            for (limit, valid_for) in [
+                (0, Duration::from_secs(30)),
+                (capacity as u64 - 1, Duration::from_secs(30)),
+                (capacity as u64, Duration::ZERO),
+            ] {
+                memory.set_sampled_limit(limit, valid_for);
+                let (resources, gates) = test_resource_units(2);
+                let result = with_optional_resource_unit(
+                    Some(resources.with_memory_budget(memory.clone())),
+                    backend.open_write("bucket", "denied", WriteMode::Truncate { size_hint: 1 }),
+                )
+                .await;
+                assert!(matches!(result, Err(DiskError::Io(error)) if error.kind() == ErrorKind::WouldBlock));
+                assert!(
+                    backend.direct_io_write.supported.load(Ordering::Relaxed),
+                    "pressure must not disable direct writes"
+                );
+                assert!(!backend.direct_io_write.fallback_logged.load(Ordering::Relaxed));
+                assert_eq!(memory.snapshot().used, 0);
+                assert!(gates.iter().all(|gate| gate.snapshot().active == 0));
+            }
+            memory.set_sampled_limit(capacity as u64, Duration::from_secs(30));
+            let (resources, gates) = test_resource_units(2);
+            let mut writer = with_optional_resource_unit(
+                Some(resources.with_memory_budget(memory.clone())),
+                backend.open_write("bucket", "ready", WriteMode::Truncate { size_hint: 1 }),
+            )
+            .await
+            .expect("exact staging capacity fits");
+            assert_eq!(memory.snapshot().used, capacity as u64);
+            memory.set_sampled_limit(0, Duration::ZERO);
+            let content: Vec<u8> = (0..2 * capacity + 17).map(|index| (index % 251) as u8).collect();
+            let written = writer
+                .write_vectored(&[IoSlice::new(&content[..299]), IoSlice::new(&content[299..])])
+                .await
+                .expect("retained storage accepts vectored bytes after shrink");
+            assert!(written > 0);
+            writer
+                .write_all(&content[written..])
+                .await
+                .expect("reuse staging across batches");
+            writer.shutdown().await.expect("flush native batches and buffered tail");
+            assert_eq!(std::fs::read(dir.path().join("bucket/ready")).expect("written bytes"), content);
+            assert_eq!(memory.snapshot().used, capacity as u64, "shutdown retains the reusable allocation");
+            assert!(gates.iter().all(|gate| gate.snapshot().active == 1));
+            drop(writer);
+            assert_eq!(memory.snapshot().used, 0);
+            assert!(gates.iter().all(|gate| gate.snapshot().active == 0));
+        })
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_writer_retains_running_buffer_after_runtime_shutdown() {
+        use crate::disk::io_admission::{BackgroundMemoryBudget, test_resource_units};
+
+        let dir = tempfile::tempdir().expect("direct writer runtime fixture");
+        let path = dir.path().join("shard");
+        let (resources, gates) = test_resource_units(2);
+        let memory = BackgroundMemoryBudget::new();
+        memory.set_sampled_limit(1024, Duration::from_secs(30));
+        let mut writer = DirectWriter::new(
+            std::fs::File::create(&path).expect("shard file"),
+            512,
+            1024,
+            Some(resources.with_memory_budget(memory.clone())),
+        )
+        .expect("accounted direct writer");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let DirectWriteState::Idle(Some(inner)) = &mut writer.state else { panic!("new writer is idle") };
+        inner.before_write = Some(Box::new(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.blocking_recv();
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("direct writer runtime");
+        runtime.block_on(async {
+            let task = tokio::spawn(async move {
+                writer.write_all(&[37; 513]).await?;
+                writer.shutdown().await
+            });
+            tokio::time::timeout(Duration::from_secs(5), started_rx)
+                .await
+                .expect("native write starts")
+                .expect("native start signal");
+            task.abort();
+            assert!(task.await.expect_err("cancel shutdown").is_cancelled());
+        });
+        runtime.shutdown_background();
+        memory.set_sampled_limit(0, Duration::ZERO);
+        let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
+        let retained = memory.snapshot().used;
+        release_tx.send(()).expect("release native write before assertions");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while gates.iter().any(|gate| gate.snapshot().active != 0) || memory.snapshot().used != 0 {
+            assert!(std::time::Instant::now() < deadline, "native direct write finishes after shutdown");
+            std::thread::yield_now();
+        }
+        assert_eq!(held, vec![1, 1]);
+        assert_eq!(retained, 1024, "runtime shutdown must retain native direct-write storage");
+        assert_eq!(std::fs::read(path).expect("completed native bytes"), vec![37; 513]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn direct_writer_cancelled_flush_retains_physical_resources() {
-        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
+        use crate::disk::io_admission::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
         use std::io::IoSlice;
 
         for count in [1, 2] {
@@ -30439,9 +30573,12 @@ mod test {
                 let path = dir.path().join("shard");
                 let file = std::fs::File::create(&path).expect("plain shard file");
                 let (resources, gates) = test_resource_units(count);
-                let mut writer =
-                    with_optional_resource_unit(Some(resources), async { DirectWriter::from_std_file_for_test(file, 512, 1024) })
-                        .await;
+                let memory = BackgroundMemoryBudget::new();
+                memory.set_sampled_limit(1024, Duration::from_secs(30));
+                let mut writer = with_optional_resource_unit(Some(resources.with_memory_budget(memory.clone())), async {
+                    DirectWriter::from_std_file_for_test(file, 512, 1024)
+                })
+                .await;
                 let (started_tx, started_rx) = tokio::sync::oneshot::channel();
                 let (release_tx, release_rx) = tokio::sync::oneshot::channel();
                 let DirectWriteState::Idle(Some(inner)) = &mut writer.state else {
@@ -30472,15 +30609,18 @@ mod test {
                     .expect("native write signal");
                 task.abort();
                 assert!(task.await.expect_err("cancel writer").is_cancelled());
+                memory.set_sampled_limit(0, Duration::ZERO);
+                let retained = memory.snapshot().used;
                 let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
                 release_tx.send(()).expect("release native write before asserting");
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    while gates.iter().any(|gate| gate.snapshot().active != 0) {
+                    while gates.iter().any(|gate| gate.snapshot().active != 0) || memory.snapshot().used != 0 {
                         tokio::task::yield_now().await;
                     }
                 })
                 .await
                 .expect("completed native write returns resources");
+                assert_eq!(retained, 1024, "cancelled native direct-write storage must remain charged");
                 assert_eq!(held, vec![1; count], "{operation}: native write owns every physical leaf");
                 assert_eq!(std::fs::read(&path).expect("read completed native write"), vec![37; size]);
             }
