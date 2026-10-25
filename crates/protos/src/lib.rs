@@ -1265,7 +1265,7 @@ mod pool_meta_native_rpc_tests {
             },
             PoolMetaNativeRecoveryRequest {
                 payload: vec![1, 3].into(),
-                ..baseline.clone()
+                ..baseline
             },
             PoolMetaNativeRecoveryRequest {
                 disk: "disk-a\u{1}".to_owned(),
