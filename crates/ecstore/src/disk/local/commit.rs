@@ -577,8 +577,10 @@ impl LocalDisk {
             .ok_or_else(|| DiskError::other("missing object metadata parent"))?;
         // Acquire the common trees before reading destination metadata. On
         // Windows this pins the object directory identity across publication.
+        // Multipart authority already created its source tree. Recreating it
+        // here would resurrect staging retired before a delayed request arrived.
         let (rename_commit_guard, has_dst_buf) = prepare_rename_commit_and_destination_metadata(
-            !no_inline,
+            !no_inline && !preserve_upload_metadata,
             src_file_parent,
             dst_file_parent,
             &dst_file_path,
@@ -613,7 +615,7 @@ impl LocalDisk {
             os::rename_all_with_owner(
                 &authority,
                 &recovery,
-                &src_volume_dir,
+                src_file_parent,
                 commit.publication_root,
                 Some(authority_owner.clone()),
             )

@@ -5451,8 +5451,22 @@ pub(crate) fn mkdir_all_below_existing_base_std(
         let base = publication_root.open_directory(base_dir)?.into();
         #[cfg(not(target_os = "linux"))]
         let base = {
-            let _ = publication_root;
-            rustix::fs::open(base_dir, flags, Mode::empty()).map_err(io::Error::from)?
+            // The configured endpoint is trusted; every component beneath it
+            // must remain an existing non-symlink directory, even when the
+            // caller supplies a deep base rather than the volume root.
+            let base_relative = existing_base_directory_suffix(base_dir, publication_root.path())?;
+            let root_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+            let mut base = rustix::fs::open(publication_root.path(), root_flags, Mode::empty()).map_err(io::Error::from)?;
+            for component in base_relative.components() {
+                if matches!(component, Component::CurDir) {
+                    continue;
+                }
+                let Component::Normal(component) = component else {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid existing base component"));
+                };
+                base = openat(&base, Path::new(component), flags, Mode::empty()).map_err(io::Error::from)?;
+            }
+            base
         };
         let mut parents = vec![base];
 
@@ -6181,6 +6195,45 @@ mod tests {
         assert_eq!(default_global_file_sync_limit(64, 1024), MAX_GLOBAL_FILE_SYNCS);
         assert_eq!(default_global_file_sync_limit(64, 128), 64);
         assert_eq!(default_global_file_sync_limit(0, 0), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_base_preparation_rejects_symlink_ancestors() {
+        let root = tempdir().expect("publication root");
+        let outside = tempdir().expect("outside publication root");
+        std::fs::create_dir(outside.path().join("upload")).expect("outside existing base");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("hash")).expect("replace an intermediate component");
+        let publication_root = PublicationRoot::new(root.path()).expect("root identity");
+        let base = root.path().join("hash/upload");
+        let result = super::mkdir_all_below_existing_base_std(&base.join("recovery"), &base, &publication_root);
+        assert!(
+            result.is_err(),
+            "an existing base must not follow an ancestor outside the publication root"
+        );
+        assert!(!outside.path().join("upload/recovery").exists());
+
+        let valid = root.path().join("valid/upload");
+        std::fs::create_dir_all(&valid).expect("ordinary nested base");
+        super::mkdir_all_below_existing_base_std(&valid.join("recovery"), &valid, &publication_root)
+            .expect("an existing ordinary base remains usable");
+        assert!(valid.join("recovery").is_dir());
+        assert!(
+            super::mkdir_all_below_existing_base_std(&outside.path().join("direct"), outside.path(), &publication_root,).is_err()
+        );
+        assert!(!outside.path().join("direct").exists());
+        #[cfg(not(target_os = "linux"))]
+        {
+            let alias_directory = tempdir().expect("configured alias directory");
+            let configured = alias_directory.path().join("endpoint");
+            std::os::unix::fs::symlink(root.path(), &configured).expect("configured endpoint alias");
+            let aliased_root = PublicationRoot::new(&configured).expect("trusted configured endpoint");
+            let aliased_base = configured.join("valid/upload");
+            super::mkdir_all_below_existing_base_std(&aliased_base.join("alias-recovery"), &aliased_base, &aliased_root)
+                .expect("configured endpoint aliases remain supported");
+            assert!(valid.join("alias-recovery").is_dir());
+            std::fs::remove_file(configured).expect("remove the test endpoint alias");
+        }
     }
 
     #[tokio::test]

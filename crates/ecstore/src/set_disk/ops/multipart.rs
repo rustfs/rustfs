@@ -7927,6 +7927,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_native_complete_does_not_recreate_retired_staging() {
+        use tokio::io::AsyncReadExt as _;
+
+        for size in [0, 8 * 1024 * 1024] {
+            let (dirs, disks, set) = hermetic_set_disks(4).await;
+            let bucket = "multipart-late-native";
+            let object = "object";
+            make_bucket_on_all(&disks, bucket).await;
+            let (upload, parts) =
+                stage_upload_with_create_opts(&set, bucket, object, &vec![0x62; size], &ObjectOptions::default()).await;
+            let path = SetDisks::get_upload_id_dir(bucket, object, &upload);
+            set.clone()
+                .complete_multipart_upload(bucket, object, &upload, parts, &ObjectOptions::default())
+                .await
+                .expect("publish the old upload and reclaim its staging");
+            let current = set.get_disks_internal().await;
+            let (mut metadata, errors) = SetDisks::read_all_fileinfo(&current, bucket, bucket, object, "", true, false, false)
+                .await
+                .expect("capture valid completed metadata for a delayed native request");
+            assert!(errors.iter().all(Option::is_none));
+            if size > 0 {
+                for info in &mut metadata {
+                    assert!(!info.inline_data(), "the large multipart fixture must use external shards");
+                    // ReadVersion can materialize an empty read-side buffer;
+                    // native RenameData carries no data for external shards.
+                    info.data = None;
+                }
+            }
+            assert_eq!(metadata[0].data.is_none() && metadata[0].size > 0, size > 0);
+            assert!(
+                dirs.iter()
+                    .all(|dir| !dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&path).exists())
+            );
+            let fresh = vec![0x41; 4096];
+            set.put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(fresh.clone()),
+                &ObjectOptions {
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("publish a newer object before stale native work arrives");
+            let other = set
+                .new_multipart_upload(bucket, "unrelated-upload", &ObjectOptions::default())
+                .await
+                .expect("keep the multipart volume alive with another upload");
+            let other_path = SetDisks::get_upload_id_dir(bucket, "unrelated-upload", &other.upload_id);
+            assert!(
+                dirs.iter()
+                    .all(|dir| dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&other_path).exists())
+            );
+            for (index, disk) in current.iter().enumerate() {
+                let refused = disk
+                    .as_ref()
+                    .expect("online fixture disk")
+                    .rename_data(RUSTFS_META_MULTIPART_BUCKET, &path, metadata[index].clone(), bucket, object)
+                    .await;
+                assert!(matches!(refused, Err(DiskError::FileNotFound)), "{refused:?}");
+                assert!(
+                    !dirs[index].path().join(RUSTFS_META_MULTIPART_BUCKET).join(&path).exists(),
+                    "missing multipart authority must not recreate an upload root, bytes={size}, disk={index}"
+                );
+            }
+            assert!(
+                dirs.iter()
+                    .all(|dir| dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&other_path).exists())
+            );
+            set.abort_multipart_upload(bucket, "unrelated-upload", &other.upload_id, &ObjectOptions::default())
+                .await
+                .expect("the unrelated upload remains independently abortable");
+            let mut reader = set
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the newer object remains readable after stale work");
+            let mut actual = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut actual)
+                .await
+                .expect("read the complete newer object");
+            assert_eq!(actual, fresh);
+        }
+    }
+
+    #[tokio::test]
     async fn partial_abort_retry_preserves_surviving_authority_below_metadata_quorum() {
         use crate::set_disk::core::io_primitives::rename_fault_injection;
         use tokio::io::AsyncReadExt as _;

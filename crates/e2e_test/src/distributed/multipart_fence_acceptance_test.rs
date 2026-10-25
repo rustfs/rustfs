@@ -36,6 +36,14 @@ async fn fixture(
     drives_per_node: usize,
     storage_class: &str,
 ) -> TestResult<(RustFSTestClusterEnvironment, Vec<RpcFaultProxy>, Vec<Client>, String)> {
+    fixture_from_binary(drives_per_node, storage_class, None).await
+}
+
+async fn fixture_from_binary(
+    drives_per_node: usize,
+    storage_class: &str,
+    binary: Option<&std::path::Path>,
+) -> TestResult<(RustFSTestClusterEnvironment, Vec<RpcFaultProxy>, Vec<Client>, String)> {
     let mut cluster =
         RustFSTestClusterEnvironment::with_topology(ClusterTopology::single_pool_multidrive(4, drives_per_node)).await?;
     for (name, value) in [
@@ -59,7 +67,11 @@ async fn fixture(
         proxies.push(cluster.start_rpc_proxy_for_node(node).await?);
     }
     configure_node_logs(&mut cluster, None)?;
-    cluster.start().await?;
+    if let Some(binary) = binary {
+        cluster.start_with_binary(binary).await?;
+    } else {
+        cluster.start().await?;
+    }
     let clients = cluster
         .create_all_clients()?
         .into_iter()
@@ -604,6 +616,164 @@ async fn sixteen_shard_multipart_metadata_requires_twelve_votes() -> TestResult 
     assert_eq!(storage.backend.drives_per_set, vec![16]);
     assert_eq!(storage.backend.standard_sc_parity, Some(4));
     phase_quorum_matrix(&proxies, &clients, &bucket, false, 4).await
+}
+
+#[tokio::test]
+async fn mixed_version_failed_complete_requires_current_coordinator_for_abort() -> TestResult {
+    let previous = super::upgrade_test::source_binary()?;
+    let (mut cluster, proxies, clients, bucket) = fixture_from_binary(4, "EC:4", Some(&previous)).await?;
+    let key = "mixed-failed-complete";
+    let unrelated = payload_for("historical-unrelated", 4096);
+    clients[0]
+        .put_object()
+        .bucket(&bucket)
+        .key("unrelated")
+        .body(ByteStream::from(unrelated.clone()))
+        .send()
+        .await?;
+    let upload = clients[0].create_multipart_upload().bucket(&bucket).key(key).send().await?;
+    let upload_id = upload.upload_id().ok_or("missing legacy upload ID")?;
+    let part = clients[0]
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(ByteStream::from(vec![0x62; 9 * 1024 * 1024]))
+        .send()
+        .await?;
+    let path = upload_path_scope(&bucket, key, upload_id)?;
+    let roots = cluster
+        .nodes
+        .iter()
+        .flat_map(|node| &node.data_dirs)
+        .map(|root| std::path::Path::new(root).join(".rustfs.sys/multipart").join(&path))
+        .collect::<Vec<_>>();
+    assert_eq!(roots.len(), 16);
+    let mut original = Vec::new();
+    for root in &roots {
+        original.push(tokio::fs::read(root.join("xl.meta")).await?);
+    }
+    cluster.stop_node(0)?;
+    cluster.start_node(0).await?;
+    let clients = cluster
+        .create_all_clients()?
+        .into_iter()
+        .map(|client| {
+            Client::from_conf(
+                client
+                    .config()
+                    .to_builder()
+                    .retry_config(RetryConfig::standard().with_max_attempts(1))
+                    .build(),
+            )
+        })
+        .collect::<Vec<_>>();
+    crate::upgrade_compatibility_test::wait_for_upgrade_write_readiness(&clients, &bucket, "mixed-mpu-current-writer", DEADLINE)
+        .await?;
+    let scope = upload_scope(upload_id)?;
+    let methods = &["RenameData", "RenameDataAtIncarnation", "RenameDataWithQuotaFence"];
+    let pauses = vec![
+        proxies[1].pause(methods, usize::MAX, Some(&scope))?,
+        proxies[2].pause(methods, 1, Some(&scope))?,
+    ];
+    let complete = clients[0]
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(part.e_tag().ok_or("missing legacy ETag")?)
+                        .build(),
+                )
+                .build(),
+        );
+    let caller = tokio::spawn(async move { complete.send().await });
+    pauses[0].wait_for_hits(4).await?;
+    pauses[1].wait_for_hits(1).await?;
+    let failure = tokio::time::timeout(DEADLINE, caller)
+        .await??
+        .expect_err("mixed publication must miss twelve-disk write quorum");
+    assert_unavailable(&failure, "storage_write_quorum", None);
+    for pause in &pauses {
+        pause.discard_pending();
+    }
+    drop(pauses);
+    wait_for_storage_peer_recovery(&proxies, &clients[0], &bucket, upload_id, 4).await?;
+    let mut retained = Vec::new();
+    let mut primary = 0;
+    let mut recovery = 0;
+    for (index, root) in roots.iter().enumerate() {
+        let primary_path = root.join("xl.meta");
+        let recovery_path = root.join(".abort-authority/xl.meta");
+        let location = if primary_path.is_file() {
+            primary += 1;
+            Some(primary_path)
+        } else if recovery_path.is_file() {
+            recovery += 1;
+            Some(recovery_path)
+        } else {
+            None
+        };
+        if let Some(location) = location {
+            let bytes = tokio::fs::read(&location).await?;
+            assert_eq!(bytes, original[index], "mixed publication must retain the original identity bytes");
+            retained.push((location, bytes));
+        }
+    }
+    assert_eq!(
+        (primary, recovery),
+        (5, 4),
+        "the fixture must exercise seven old publishers and four new publishers"
+    );
+    assert_object_bytes_after_fault(&clients[1], &bucket, "unrelated", &unrelated).await?;
+    // The previous coordinator cannot interpret the new recovery layout. Its
+    // response is diagnostic only; physical retention, not an old status code,
+    // establishes that recovery still requires the current coordinator.
+    let legacy = clients[1]
+        .abort_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await;
+    let legacy_status = match &legacy {
+        Ok(_) => "legacy_success_with_retained_authority".to_owned(),
+        Err(error) => {
+            let response = error
+                .raw_response()
+                .ok_or("legacy probe must receive a service response, not lose its connection")?;
+            assert!(
+                !matches!(response.status().as_u16(), 401 | 403),
+                "legacy HTTP authentication must remain valid"
+            );
+            format!(
+                "http={}, code={:?}",
+                response.status().as_u16(),
+                error.as_service_error().and_then(|error| error.meta().code())
+            )
+        }
+    };
+    for (location, bytes) in &retained {
+        assert_eq!(tokio::fs::read(location).await?, *bytes);
+    }
+    eprintln!(
+        "MPU mixed recovery: current_nodes=1, previous_nodes=3, primary={primary}, recovery={recovery}, legacy_boundary={legacy_status}"
+    );
+    abort_after_fault(&clients[0], &bucket, key, upload_id, false).await?;
+    assert!(
+        roots.iter().all(|root| !root.exists()),
+        "current recovery must reclaim every old and new staging root"
+    );
+    for client in &clients {
+        assert_object_bytes_after_fault(client, &bucket, "unrelated", &unrelated).await?;
+    }
+    assert_no_uploads_after_fault(&clients, &bucket).await?;
+    Ok(())
 }
 
 #[tokio::test]
