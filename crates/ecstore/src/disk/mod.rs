@@ -49,6 +49,9 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub const HEALING_MARKER_PATH: &str = "healing.bin";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
+/// Original upload authority after it stops admitting active part mutations.
+pub(crate) const MULTIPART_RECOVERY_DIR: &str = ".abort-authority";
+pub(crate) const MULTIPART_COMMIT_METADATA_FILE: &str = "xl.meta.complete";
 pub const PART_TRANSACTION_NEW_META: &str = "new.meta";
 pub const PART_TRANSACTION_OLD_META: &str = "old.meta";
 pub const PART_TRANSACTION_ROLLBACK: &str = "rollback";

@@ -99,6 +99,7 @@ fn runtime() -> MrfRuntime {
         config,
         checkpoint_owner: Uuid::new_v4(),
         next_checkpoint_sequence: 1,
+        lifecycle_format_version: crate::heal::mrf_queue::MRF_LIFECYCLE_FORMAT_VERSION,
         new_since_flush: 0,
         dirty: false,
         journal_on_disk: false,
@@ -367,4 +368,170 @@ async fn check_unknown_source_deleted_bucket_replay() {
         );
     }
     assert_eq!(manager.get_queue_length().await, 0, "identity probes must not enqueue object healing");
+}
+
+fn restored_v2_runtime(next_probe_at_ms: u64, probe_attempts: u32) -> (MrfRuntime, PartialWriteKey) {
+    let mut runtime = runtime();
+    runtime.lifecycle_format_version = 2;
+    let original = intent("v2-unknown-generation");
+    let key = PartialWriteKey::new(&original, None);
+    runtime
+        .admit_partial_write(original.clone(), None)
+        .expect("admit retained owner");
+    let record = ResponsibilityCheckpoint {
+        intent_digest: super::super::super::intent_digest(&original).expect("intent identity"),
+        responsibility_id: Uuid::new_v4(),
+        source_bucket_incarnation_id: None,
+        last_operator_acceptance: None,
+        state: ResponsibilityState::SourceAndCurrentGenerationUnknown {
+            since_ms: 7,
+            next_probe_at_ms,
+            probe_attempts,
+        },
+    };
+    assert!(runtime.partial_writes.restore_state(&original, &record));
+    runtime.partial_writes.mark_persisted();
+    (runtime, key)
+}
+
+#[tokio::test(start_paused = true)]
+async fn lifecycle_v2_reader_restores_bounded_probe_schedule_and_attempt_count() {
+    for (deadline, attempts, expected_delay) in [
+        (0, 0, MRF_RETIREMENT_PROOF_RECHECK_INTERVAL),
+        (u64::MAX, u32::MAX, MAX_UNVERIFIED_RETRY_BACKOFF),
+    ] {
+        let now = Instant::now();
+        let (runtime, key) = restored_v2_runtime(deadline, attempts);
+        let entry = runtime.partial_writes.entries.get(&key).expect("retained owner");
+        assert_eq!(entry.next_attempt, now + expected_delay);
+        assert_eq!(entry.consecutive_unverified_attempts, attempts);
+        assert!(entry.anchor.is_none());
+        assert!(!entry.retry_queued);
+        assert!(entry.is_parked());
+        assert_eq!(entry.source_bucket_incarnation_id, None);
+        assert!(
+            matches!(entry.state, ResponsibilityState::SourceAndCurrentGenerationUnknown { since_ms: 7, next_probe_at_ms, probe_attempts } if next_probe_at_ms == deadline && probe_attempts == attempts)
+        );
+        assert_eq!(runtime.partial_writes.bytes(), PartialWrites::entry_cost(entry));
+        assert_eq!(runtime.partial_writes.lifecycle_summary().legacy_generation_unknown_count, 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn lifecycle_v2_reader_persists_failed_probe_pacing_without_object_dispatch() {
+    let storage = Arc::new(ProbeStorage {
+        lookup: Mutex::new(Lookup::Identity(None)),
+        calls: AtomicUsize::new(0),
+    });
+    let manager = HealManager::new_without_root_recovery_for_test(storage.clone(), None);
+    let (mut runtime, key) = restored_v2_runtime(0, u32::MAX);
+    let id = runtime.partial_writes.entries[&key].responsibility_id;
+    let bytes = runtime.partial_writes.bytes();
+    for outcome in [
+        Lookup::Identity(None),
+        Lookup::PermissionDenied,
+        Lookup::Quorum,
+        Lookup::Transport,
+        Lookup::Identity(Some(Uuid::nil())),
+        Lookup::Pending,
+    ] {
+        *storage.lookup.lock().expect("set outcome") = outcome;
+        runtime.partial_writes.entries.get_mut(&key).expect("owner").next_attempt = Instant::now();
+        let calls = storage.calls.load(Ordering::Relaxed);
+        runtime.dirty = false;
+        runtime.dispatch(&manager).await;
+        assert!(runtime.dirty, "failed V2 probes still change the durable retry schedule");
+        assert_eq!(storage.calls.load(Ordering::Relaxed), calls + 1);
+        let entry = &runtime.partial_writes.entries[&key];
+        assert_eq!(entry.responsibility_id, id);
+        assert_eq!(entry.source_bucket_incarnation_id, None);
+        assert!(entry.anchor.is_none());
+        assert!(!entry.retry_queued);
+        assert!(entry.next_attempt > Instant::now());
+        assert!(entry.next_attempt <= Instant::now() + MAX_UNVERIFIED_RETRY_BACKOFF);
+        assert!(
+            matches!(entry.state, ResponsibilityState::SourceAndCurrentGenerationUnknown { since_ms: 7, probe_attempts: u32::MAX, next_probe_at_ms } if next_probe_at_ms > unix_now_ms() && next_probe_at_ms <= unix_now_ms() + 60_000)
+        );
+        assert_eq!(runtime.partial_writes.bytes(), bytes);
+        runtime.dirty = false;
+        runtime.dispatch(&manager).await;
+        assert!(!runtime.dirty);
+        assert_eq!(storage.calls.load(Ordering::Relaxed), calls + 1);
+    }
+    let observed = Uuid::new_v4();
+    *storage.lookup.lock().expect("known outcome") = Lookup::Identity(Some(observed));
+    runtime.partial_writes.entries.get_mut(&key).expect("owner").next_attempt = Instant::now();
+    runtime.dispatch(&manager).await;
+    assert!(runtime.dirty);
+    assert_eq!(runtime.partial_writes.entries[&key].source_bucket_incarnation_id, None);
+    assert!(
+        matches!(runtime.partial_writes.entries[&key].state, ResponsibilityState::LegacyGenerationUnknown { observed_bucket_incarnation_id, detected_at_ms: 7 } if observed_bucket_incarnation_id == observed)
+    );
+    assert_eq!(runtime.partial_writes.bytes(), bytes);
+    assert_eq!(manager.get_queue_length().await, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn lifecycle_v2_reader_rejects_risk_acceptance_and_recheck_without_current_identity() {
+    let storage = Arc::new(ProbeStorage {
+        lookup: Mutex::new(Lookup::Identity(Some(Uuid::new_v4()))),
+        calls: AtomicUsize::new(0),
+    });
+    let manager = HealManager::new_without_root_recovery_for_test(storage.clone(), None);
+    let (mut runtime, key) = restored_v2_runtime(0, 3);
+    let id = runtime.partial_writes.entries[&key].responsibility_id;
+    let before = runtime.partial_writes.checkpoint_records(super::super::super::intent_digest);
+    let expected = Uuid::new_v4();
+    assert!(matches!(
+        runtime.recheck_legacy_generation(&manager, id, expected).await,
+        Err(MrfLifecycleControlError::BucketIdentityUnresolved)
+    ));
+    assert!(matches!(
+        runtime
+            .accept_legacy_risk(
+                &manager,
+                risk_acceptance(id, expected, true, true, "Reviewed the retained owner", "INC-1234")
+            )
+            .await,
+        Err(MrfLifecycleControlError::BucketIdentityUnresolved)
+    ));
+    assert_eq!(runtime.partial_writes.checkpoint_records(super::super::super::intent_digest), before);
+    assert_eq!(
+        storage.calls.load(Ordering::Relaxed),
+        0,
+        "a guessed identity cannot bypass explicit refresh"
+    );
+}
+
+#[test]
+fn lifecycle_v2_reader_keeps_first_hold_across_repeated_incarnation_refresh() {
+    let (mut runtime, key) = restored_v2_runtime(0, 3);
+    let id = runtime.partial_writes.entries[&key].responsibility_id;
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    runtime
+        .partial_writes
+        .replace_observed_incarnation(id, None, first, None)
+        .expect("first observation");
+    assert!(matches!(
+        runtime.partial_writes.entries[&key].state,
+        ResponsibilityState::LegacyGenerationUnknown { detected_at_ms: 7, .. }
+    ));
+    runtime
+        .partial_writes
+        .replace_observed_incarnation(id, Some(first), second, None)
+        .expect("second observation of the same retained responsibility");
+    let row = runtime
+        .list_unverified_legacy(None, 1)
+        .expect("list the retained responsibility")
+        .responsibilities
+        .remove(0);
+    assert_eq!(row.responsibility_id, id);
+    assert_eq!(row.source_bucket_incarnation_id, None);
+    assert_eq!(row.bucket_incarnation_id, Some(second));
+    assert_eq!(
+        row.held_since_ms,
+        Some(7),
+        "changing the observed bucket cannot reset when this responsibility was first retained"
+    );
 }
