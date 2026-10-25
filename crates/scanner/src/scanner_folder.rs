@@ -42,7 +42,7 @@ use crate::storage_api::owner::{
 };
 #[cfg(test)]
 use crate::storage_api::owner::{EcstoreExpirationStatus as ExpirationStatus, EcstoreLifecycleRule as LifecycleRule};
-use crate::workload_admission::run_scanner_node_operation;
+use crate::workload_admission::{run_scanner_metadata_operation, run_scanner_node_operation};
 use metrics::{counter, describe_counter};
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit, trace_subscriber_count};
 use rustfs_filemeta::{
@@ -2236,7 +2236,7 @@ impl FolderScanner {
                 };
                 wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, budgeted_bytes)).await?;
 
-                let sz = match run_scanner_node_operation(self.node_admission.as_ref(), &ctx, async {
+                let sz = match run_scanner_metadata_operation(self.node_admission.as_ref(), &ctx, async {
                     self.object_metadata_visits.increment(1);
                     self.local_disk
                         .get_size_with_tier_names(item.clone(), &self.tier_registry.names)
@@ -3290,7 +3290,10 @@ pub(crate) async fn scan_data_folder_scoped(
     };
 
     // Scan the folder
-    match scanner.scan_folder(ctx.clone(), folder, &mut root).await {
+    let physical = scanner.local_disk.physical_admission();
+    match crate::workload_admission::with_scanner_physical_disk(physical, scanner.scan_folder(ctx.clone(), folder, &mut root))
+        .await
+    {
         Ok(()) => {
             // Get the new cache and finalize it
             let coverage_gap = scanner.coverage_gap;

@@ -91,7 +91,7 @@ pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Resu
         }
         #[cfg(any(target_os = "linux", all(test, unix)))]
         if let Some(admission) = admission {
-            crate::background_admission::start(admission, background_cancel.clone(), workload_provider);
+            crate::background_admission::start(admission, store.clone(), background_cancel.clone(), workload_provider);
         }
     }
 

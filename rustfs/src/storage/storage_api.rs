@@ -20,6 +20,8 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use rand::RngExt as _;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+pub(crate) use rustfs_ecstore::api::disk::{PhysicalDiskSample, PhysicalDiskSampler};
 use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod ecstore_integrity {

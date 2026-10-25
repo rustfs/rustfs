@@ -77,6 +77,11 @@ impl NodeResourcePermit {
     /// Return physical ownership before recording and releasing node progress.
     pub fn complete(self) {
         let Self { resources, node } = self;
+        for owner in &resources.owner.owners {
+            let _ = owner
+                .completed
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1));
+        }
         drop(resources);
         node.complete();
     }

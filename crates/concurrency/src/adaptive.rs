@@ -40,6 +40,7 @@ pub struct AdaptiveAdmission {
     maximum: u32,
     slots: Box<[PermitSlots]>,
     next_chunk: AtomicUsize,
+    completed: AtomicU64,
 }
 
 struct PermitSlots {
@@ -120,11 +121,22 @@ impl NodeAdmission {
 
     /// Publish feedback with this owner's actual completed-work counter.
     pub fn update(&self, controller: &mut FeedbackController, observation: Option<FeedbackObservation>) -> FeedbackDecision {
+        self.update_with_probe(controller, observation, true)
+    }
+
+    /// Coordinate growth with other resource controllers in the same window.
+    /// Protective reductions never depend on permission to probe.
+    pub fn update_with_probe(
+        &self,
+        controller: &mut FeedbackController,
+        observation: Option<FeedbackObservation>,
+        allow_probe: bool,
+    ) -> FeedbackDecision {
         let observation = observation.map(|mut observation| {
             observation.completed_units = self.completed();
             observation
         });
-        controller.update(&self.capacity, observation)
+        controller.update_with_probe(&self.capacity, observation, allow_probe)
     }
 
     /// Current leased scheduling cap and held async units.
@@ -255,16 +267,31 @@ impl FeedbackController {
     /// Consume one sample and publish a three-second lease to the same gate.
     /// If this function stops being called, admission expires independently.
     pub fn update(&mut self, gate: &AdaptiveAdmission, observation: Option<FeedbackObservation>) -> FeedbackDecision {
+        self.update_with_probe(gate, observation, true)
+    }
+
+    /// Allow at most the sampling owner's selected controller to probe upward.
+    pub fn update_with_probe(
+        &mut self,
+        gate: &AdaptiveAdmission,
+        observation: Option<FeedbackObservation>,
+        allow_probe: bool,
+    ) -> FeedbackDecision {
         let observation = observation.map(|mut observation| {
             observation.max_concurrency = observation.max_concurrency.min(gate.maximum);
             observation
         });
-        let decision = self.decide(Instant::now(), observation);
+        let decision = self.decide_with_probe(Instant::now(), observation, allow_probe);
         gate.set_sampled_limit(decision.limit, Duration::from_secs(3));
         decision
     }
 
-    fn decide(&mut self, now: Instant, observation: Option<FeedbackObservation>) -> FeedbackDecision {
+    fn decide_with_probe(
+        &mut self,
+        now: Instant,
+        observation: Option<FeedbackObservation>,
+        allow_probe: bool,
+    ) -> FeedbackDecision {
         let Some(observation) = observation else {
             self.previous = None;
             self.stable_since = None;
@@ -309,7 +336,8 @@ impl FeedbackController {
             FeedbackReason::NewBaseline
         } else {
             let since = *self.stable_since.get_or_insert(now);
-            if advanced
+            if allow_probe
+                && advanced
                 && now.saturating_duration_since(since) >= Duration::from_secs(8)
                 && now.saturating_duration_since(self.last_change) >= Duration::from_secs(8)
                 && self.limit < observation.max_concurrency
@@ -331,6 +359,13 @@ impl FeedbackController {
 }
 
 impl AdaptiveAdmission {
+    /// Successful async operations using this physical owner. Native clones
+    /// retain capacity but never count another completion.
+    pub fn completed(&self) -> Option<u64> {
+        let value = self.completed.load(Ordering::Acquire);
+        (value != u64::MAX).then_some(value)
+    }
+
     /// Construct a bounded owner, with zero initial capacity allowed for unknown
     /// input. The immutable maximum reserves at most 65,535 lease slots once;
     /// acquiring or cloning a permit does not allocate a per-unit Arc.
@@ -357,6 +392,7 @@ impl AdaptiveAdmission {
             maximum: maximum_u32,
             slots,
             next_chunk: AtomicUsize::new(0),
+            completed: AtomicU64::new(0),
         })
     }
 
@@ -874,6 +910,24 @@ mod tests {
             pressure: ResourcePressure::Stable,
             completed_units: Some(completed),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_probe_permission_blocks_growth_but_never_protective_cuts() {
+        let gate = AdaptiveAdmission::new(NonZeroU16::new(8).expect("bound"), 0);
+        let mut controller = FeedbackController::new();
+        controller.update_with_probe(&gate, Some(healthy(0)), false);
+        for completed in 1..=20 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert_eq!(controller.update_with_probe(&gate, Some(healthy(completed)), false).limit, 1);
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(controller.update_with_probe(&gate, Some(healthy(21)), true).reason, FeedbackReason::Probe);
+        assert_eq!(gate.snapshot().limit, 2);
+        let mut busy = healthy(22);
+        busy.pressure = ResourcePressure::Busy;
+        assert_eq!(controller.update_with_probe(&gate, Some(busy), false).limit, 1);
+        assert_eq!(controller.update_with_probe(&gate, None, false).limit, 0);
     }
 
     #[tokio::test(start_paused = true)]

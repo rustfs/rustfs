@@ -52,19 +52,22 @@ impl ScannerIODisk for Disk {
         }
 
         let metadata_object_path = item.object_path();
-        let data = match self.read_metadata(&item.bucket, &metadata_object_path).await {
-            Ok(data) => data,
-            Err(e) if DiskError::is_err_object_not_found(&e) || DiskError::is_err_version_not_found(&e) => {
-                return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
-            }
-            Err(e) => {
-                return Err(scanner_metadata_transient_error(
-                    format!("failed to read metadata: {e}"),
-                    &item.bucket,
-                    &metadata_object_path,
-                ));
-            }
-        };
+        let data =
+            match crate::workload_admission::with_scanner_metadata_io(self.read_metadata(&item.bucket, &metadata_object_path))
+                .await
+            {
+                Ok(data) => data,
+                Err(e) if DiskError::is_err_object_not_found(&e) || DiskError::is_err_version_not_found(&e) => {
+                    return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
+                }
+                Err(e) => {
+                    return Err(scanner_metadata_transient_error(
+                        format!("failed to read metadata: {e}"),
+                        &item.bucket,
+                        &metadata_object_path,
+                    ));
+                }
+            };
 
         item.transform_meta_dir();
         let object_path = item.object_path();

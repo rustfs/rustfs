@@ -181,7 +181,7 @@ impl ScannerCacheLockGuards {
     }
 
     /// Suspend the same traversal while yielding its cache lease. Lock order on
-    /// resumption is node admission -> cache lease -> cache revision reads.
+    /// resumption is physical/node admission -> cache lease -> revision reads.
     pub(crate) async fn resume_node_operation(
         &mut self,
         store: Arc<SetDisks>,
@@ -196,10 +196,23 @@ impl ScannerCacheLockGuards {
         if request.respond.is_closed() {
             return Ok(());
         }
-        let crate::workload_admission::ScannerNodeRequest { owner, respond, cancel } = request;
+        let crate::workload_admission::ScannerNodeRequest {
+            owner,
+            physical,
+            respond,
+            cancel,
+        } = request;
         drop(self.scoped.take());
         let resume = async {
-            let permit = owner.acquire().await;
+            use crate::workload_admission::ScannerNodePermit;
+            let permit = match physical {
+                Some(plan) => plan
+                    .acquire(&owner)
+                    .await
+                    .map(|permit| ScannerNodePermit::Physical { permit, plan })
+                    .ok_or(crate::ScannerError::ResourceDeferred),
+                None => Ok(ScannerNodePermit::Node(owner.acquire().await)),
+            };
             *self = acquire_scanner_cache_locks(store.as_ref(), cache_name, source)
                 .await
                 .map_err(Error::other)?;

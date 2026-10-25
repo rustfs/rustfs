@@ -1,8 +1,8 @@
 // Copyright 2026 RustFS Team
 // Licensed under the Apache License, Version 2.0.
 
-//! Opt-in node scheduling feedback. This is not a physical-disk reservation or
-//! a byte budget: native work and escaping buffers require their own owners.
+//! Opt-in node scheduling and local Scanner physical-device feedback. Escaping
+//! buffers and multi-disk Heal operations require separate ownership.
 
 use rustfs_concurrency::adaptive::{FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure};
 use rustfs_concurrency::foreground::ForegroundWindow;
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::cgroup_resources::live::ResourceSample;
+use crate::storage_api::startup::background::{ECStore, PhysicalDiskSample, PhysicalDiskSampler};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const MAXIMUM: NonZeroU16 = NonZeroU16::new(256).expect("fixed nonzero scheduling bound");
@@ -246,6 +247,7 @@ impl Drop for Lifetime {
 
 pub(crate) fn start(
     owner: Arc<NodeAdmission>,
+    store: Arc<ECStore>,
     cancel: CancellationToken,
     provider: Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>,
 ) {
@@ -254,26 +256,35 @@ pub(crate) fn start(
         let lifetime = lifetime;
         let mut policy = Policy::default();
         let mut controller = FeedbackController::new();
+        let mut physical = PhysicalDiskSampler::default();
         let mut tick = tokio::time::interval(SAMPLE_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! { biased; _ = cancel.cancelled() => break, _ = tick.tick() => {} }
             // One blocking sample at a time. A stuck reader cannot create an
             // unbounded worker queue; the previous admission lease expires.
-            let sample = tokio::select! {
+            let disks = PhysicalDiskSample::collect(&store);
+            let samples = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
-                result = tokio::task::spawn_blocking(|| {
+                result = tokio::task::spawn_blocking(move || {
                     let began = Instant::now();
-                    let sample = crate::cgroup_resources::live::sample()?;
-                    Ok::<_, std::io::Error>(TimedResources { sample, began, ended: Instant::now() })
-                }) => result.ok().and_then(Result::ok),
+                    let sample = crate::cgroup_resources::live::sample().ok()
+                        .map(|sample| TimedResources { sample, began, ended: Instant::now() });
+                    (sample, disks.read())
+                }) => result.ok(),
             };
             let foreground = crate::foreground_observation::latest_window();
             let registry = provider.workload_admission_snapshot();
             // Recheck age after every input read, including a delayed provider.
-            let observation = policy.observe(Instant::now(), sample, foreground, &registry);
-            let decision = lifetime.0.update(&mut controller, observation);
+            let observation =
+                policy.observe(Instant::now(), samples.as_ref().and_then(|(sample, _)| *sample), foreground, &registry);
+            let decision = lifetime
+                .0
+                .update_with_probe(&mut controller, observation, physical.node_may_probe());
+            if let Some((_, disks)) = samples {
+                physical.publish(disks, observation.map_or(ResourcePressure::Unknown, |sample| sample.pressure));
+            }
             if rustfs_io_metrics::metrics_enabled() {
                 metrics::gauge!("rustfs_background_node_admission_limit").set(f64::from(decision.limit));
                 metrics::gauge!("rustfs_background_node_admission_active").set(f64::from(lifetime.0.snapshot().active));

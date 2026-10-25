@@ -23,6 +23,134 @@ fn owner(open: bool) -> Arc<NodeAdmission> {
 }
 
 #[tokio::test]
+async fn scanner_physical_native_tail_releases_node_and_allows_unrelated_disk() {
+    use crate::storage_api::owner::{PhysicalDiskBinding, ecstore_spawn_blocking_with_resource_ownership};
+    use crate::workload_admission::with_scanner_physical_disk;
+    use rustfs_concurrency::adaptive::AdaptiveAdmission;
+
+    let node = owner(true);
+    let disk = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+    let binding = Arc::new(PhysicalDiskBinding::default());
+    binding.set_test_capacity(vec![disk.clone()]).expect("physical fixture");
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (finish, blocked) = std::sync::mpsc::channel();
+    let cancel = CancellationToken::new();
+    let mut operation = Box::pin(with_scanner_physical_disk(
+        Some(binding),
+        run_scanner_node_operation(Some(&node), &cancel, async {
+            ecstore_spawn_blocking_with_resource_ownership(move || {
+                let _ = entered.send(());
+                blocked.recv_timeout(Duration::from_secs(2)).expect("native worker released");
+            })
+            .await
+            .map_err(std::io::Error::other)
+        }),
+    ));
+    assert!(futures::poll!(&mut operation).is_pending());
+    tokio::time::timeout(Duration::from_secs(1), started)
+        .await
+        .expect("native worker starts")
+        .expect("start signal");
+    drop(operation);
+    assert_eq!(node.snapshot().active, 0, "cancelled waiter returns scheduling capacity");
+    assert_eq!(node.completed(), Some(0));
+    assert_eq!(disk.snapshot().active, 1, "native tail still owns its physical capacity");
+    let other = Arc::new(PhysicalDiskBinding::default());
+    other
+        .set_test_capacity(vec![AdaptiveAdmission::new(NonZeroU16::MIN, 1)])
+        .expect("independent disk");
+    with_scanner_physical_disk(
+        Some(other),
+        run_scanner_node_operation(Some(&node), &cancel, async { Ok::<_, std::io::Error>(()) }),
+    )
+    .await
+    .expect("independent disk admission")
+    .expect("independent operation");
+    finish.send(()).expect("finish native work");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while disk.snapshot().active != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("native completion returns capacity");
+    assert_eq!(disk.completed(), Some(0), "cancelled native work is not successful scanner progress");
+}
+
+#[tokio::test]
+async fn scanner_physical_unknown_binding_never_falls_back_to_node_only() {
+    let node = owner(true);
+    let polled = std::cell::Cell::new(false);
+    let cancel = CancellationToken::new();
+    let result = crate::workload_admission::with_scanner_physical_disk(
+        Some(Arc::new(crate::storage_api::owner::PhysicalDiskBinding::default())),
+        run_scanner_node_operation(Some(&node), &cancel, async {
+            polled.set(true);
+            Ok::<_, std::io::Error>(())
+        }),
+    )
+    .await;
+    assert!(matches!(result, Err(ScannerError::ResourceDeferred)));
+    assert!(!polled.get());
+    assert_eq!(node.snapshot().active, 0);
+}
+
+#[tokio::test]
+async fn scanner_physical_metadata_scope_retains_only_the_local_read() {
+    use crate::storage_api::owner::{PhysicalDiskBinding, ecstore_spawn_blocking_with_resource_ownership};
+    use crate::workload_admission::{run_scanner_metadata_operation, with_scanner_metadata_io, with_scanner_physical_disk};
+    use rustfs_concurrency::adaptive::AdaptiveAdmission;
+
+    for local_read in [true, false] {
+        let node = owner(true);
+        let disk = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let binding = Arc::new(PhysicalDiskBinding::default());
+        binding.set_test_capacity(vec![disk.clone()]).expect("physical fixture");
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (finish, blocked) = std::sync::mpsc::channel();
+        let cancel = CancellationToken::new();
+        let mut operation = Box::pin(with_scanner_physical_disk(
+            Some(binding),
+            run_scanner_metadata_operation(Some(&node), &cancel, async {
+                let io = async {
+                    ecstore_spawn_blocking_with_resource_ownership(move || {
+                        let _ = entered.send(());
+                        blocked.recv_timeout(Duration::from_secs(2)).expect("finish native job");
+                    })
+                    .await
+                    .map_err(std::io::Error::other)
+                };
+                if local_read {
+                    with_scanner_metadata_io(io).await
+                } else {
+                    io.await
+                }
+            }),
+        ));
+        assert!(futures::poll!(&mut operation).is_pending());
+        tokio::time::timeout(Duration::from_secs(1), started)
+            .await
+            .expect("native start")
+            .expect("start signal");
+        drop(operation);
+        assert_eq!(node.snapshot().active, 0);
+        assert_eq!(
+            disk.snapshot().active,
+            u32::from(local_read),
+            "later lifecycle work cannot retain the metadata disk's unit"
+        );
+        finish.send(()).expect("release native job");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while disk.snapshot().active != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("physical ownership eventually returned");
+    }
+}
+
+#[tokio::test]
 #[serial]
 async fn scanner_node_admission_blocks_real_walk_before_open_or_metadata() {
     let (mut scanner, root) = build_test_scanner().await;
@@ -239,6 +367,15 @@ async fn scanner_node_admission_mid_walk_shrink_preserves_partial_and_resumes_al
         ..Default::default()
     };
     let baseline = scan(cache.clone()).await.expect("independent full walk");
+    scanner
+        .local_disk
+        .physical_admission()
+        .expect("local physical binding")
+        .set_test_capacity(vec![rustfs_concurrency::adaptive::AdaptiveAdmission::new(
+            std::num::NonZeroU16::MIN,
+            1,
+        )])
+        .expect("synthetic physical device");
     let partial = crate::workload_admission::TEST_SCANNER_NODE_ADMISSION
         .scope(gate.clone(), async {
             let mut scanning = std::pin::pin!(scan(cache));
@@ -302,6 +439,16 @@ async fn scanner_node_admission_does_not_park_while_cache_lease_may_be_held() {
 #[tokio::test]
 #[serial]
 async fn scanner_node_admission_early_deferral_keeps_old_tree_incomplete() {
+    check_early_admission_deferral(false, 1).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_physical_early_deferral_keeps_real_walk_incomplete() {
+    check_early_admission_deferral(true, 0).await;
+}
+
+async fn check_early_admission_deferral(node_open: bool, physical_limit: u32) {
     let (scanner, root) = build_test_scanner().await;
     let _guard = TestGuard { temp_dir: Some(root) };
     let mut cache = DataUsageCache {
@@ -322,7 +469,16 @@ async fn scanner_node_admission_early_deferral_keeps_old_tree_incomplete() {
             ..Default::default()
         },
     );
-    let gate = owner(false);
+    scanner
+        .local_disk
+        .physical_admission()
+        .expect("local binding")
+        .set_test_capacity(vec![rustfs_concurrency::adaptive::AdaptiveAdmission::new(
+            NonZeroU16::MIN,
+            physical_limit,
+        )])
+        .expect("independent physical capacity");
+    let gate = owner(node_open);
     let cancel = CancellationToken::new();
     let result = crate::workload_admission::TEST_SCANNER_NODE_ADMISSION
         .scope(
@@ -523,7 +679,8 @@ async fn scanner_node_admission_progresses_during_continuous_heal_queue() {
                     // coordinators release and revalidate their lease here.
                     let permit = request.owner.acquire().await;
                     assert_eq!(gate.snapshot().active, 1);
-                    request.respond.send(permit).unwrap_or_else(|_| panic!("real walk still waits"));
+                    request.respond.send(Ok(crate::workload_admission::ScannerNodePermit::Node(permit)))
+                        .unwrap_or_else(|_| panic!("real walk still waits"));
                 }
             }
         }

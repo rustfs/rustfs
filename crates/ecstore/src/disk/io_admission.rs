@@ -14,6 +14,12 @@
 
 //! Per-local-disk foreground-priority admission for scanner I/O.
 
+mod physical_identity;
+mod physical_owners;
+mod physical_sampler;
+
+pub use physical_sampler::{PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler};
+
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;

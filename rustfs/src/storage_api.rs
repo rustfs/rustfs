@@ -363,6 +363,8 @@ pub(crate) mod startup {
         pub(crate) use crate::storage::storage_api::{
             BitrotSelfTestError, ECStore, bitrot_self_test, set_workload_admission_snapshot_provider,
         };
+        #[cfg(any(target_os = "linux", all(test, unix)))]
+        pub(crate) use crate::storage::storage_api::{PhysicalDiskSample, PhysicalDiskSampler};
     }
 
     pub(crate) mod bucket_metadata {

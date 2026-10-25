@@ -1493,6 +1493,8 @@ pub struct LocalDiskWrapper {
     metrics: Arc<DiskHealthMetricEpoch>,
     /// Per-drive foreground/background admission shared across wrapper reconnects.
     io_admission: Arc<DiskIoAdmission>,
+    /// Physical leaves are refreshed by the node sampler, never by object I/O.
+    physical_admission: Arc<crate::disk::io_admission::PhysicalDiskBinding>,
     /// Whether health checking is enabled
     health_check: bool,
     /// Cancellation token for monitoring tasks
@@ -1601,6 +1603,7 @@ impl LocalDiskWrapper {
             health,
             metrics,
             io_admission,
+            physical_admission: Arc::new(crate::disk::io_admission::PhysicalDiskBinding::default()),
             health_check: health_check && env_health_check,
             cancel_token: CancellationToken::new(),
             disk_id: Arc::new(RwLock::new(None)),
@@ -1616,6 +1619,10 @@ impl LocalDiskWrapper {
             metrics: self.metrics.clone(),
             io_admission: self.io_admission.clone(),
         }
+    }
+
+    pub(crate) fn physical_admission(&self) -> Arc<crate::disk::io_admission::PhysicalDiskBinding> {
+        self.physical_admission.clone()
     }
 
     pub fn get_disk(&self) -> Arc<LocalDisk> {

@@ -442,6 +442,7 @@ pub mod disk {
         ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
         is_quota_mutation_fence_path, new_disk, validate_batch_read_version_item_count,
     };
+    pub use crate::disk::{PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler};
     pub use bytes::Bytes;
     pub use endpoint::Endpoint;
     pub use error::DiskError;

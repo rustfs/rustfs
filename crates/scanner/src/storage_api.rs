@@ -23,11 +23,9 @@ use tokio::sync::Notify;
 
 pub(crate) use rustfs_ecstore::spawn_blocking_with_resource_ownership as ecstore_spawn_blocking_with_resource_ownership;
 pub(crate) use rustfs_ecstore::with_background_disk_io as ecstore_with_background_disk_io;
+pub(crate) use rustfs_ecstore::with_background_resource_set as ecstore_with_background_resource_set;
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::{
-    with_background_resource_set as ecstore_with_background_resource_set,
-    with_background_resource_unit as ecstore_with_background_resource_unit,
-};
+pub(crate) use rustfs_ecstore::with_background_resource_unit as ecstore_with_background_resource_unit;
 
 pub(crate) use s3s::dto::{
     BucketLifecycleConfiguration as EcstoreBucketLifecycleConfiguration, LifecycleRuleFilter as EcstoreLifecycleRuleFilter,
@@ -170,6 +168,9 @@ pub(crate) mod owner {
     #[cfg(test)]
     pub(crate) use super::ecstore_set_object_store_resolver;
     #[cfg(test)]
+    pub(crate) use super::ecstore_spawn_blocking_with_resource_ownership;
+    pub(crate) use super::ecstore_with_background_resource_set;
+    #[cfg(test)]
     pub(crate) use super::storage_contracts::DiskSetSelector;
     pub(crate) use super::{
         MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
@@ -177,6 +178,7 @@ pub(crate) mod owner {
     };
     #[cfg(test)]
     pub(crate) use super::{NativeScannerPauseBacklogWriteFault, SourceCleanupDeleteBarrier};
+    pub(crate) use rustfs_ecstore::api::disk::{PhysicalDiskBinding, PhysicalDiskPlan};
 
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::object::{WriteCommitGuard, WriteCompletion};
