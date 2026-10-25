@@ -105,3 +105,23 @@ keeps the wider release gate blocked until the remaining release evidence lanes
 have measured artifacts.
 
 Membership is pinned by `.config/e2e-distributed-selection.txt`. Update the Linux and Darwin entries with `python3 ./scripts/check_test_wiring.py --update-profile e2e-distributed <listing.json> <platform>` after adding or renaming a case.
+
+## Multipart fence fault acceptance
+
+The `distributed::multipart_fence_acceptance_test` cases separate remote storage RPC delays from lock RPC delays through a method-selective proxy. They require the selected RPC to reach its pause before checking quorum, recovery, or cancellation. The proxy forwards opaque bodies and gRPC trailers and is confined to the test process. It does not change server timeouts, locking, retry policy, or the commit path.
+
+Lock-layer regressions also cover every four-node read-quorum ordering, an eight-node write quorum behind silent voters, and the initial fan-out bound for prompt replies. Distributed acquisition probes unstarted voters within its existing attempt budget so silent early peers cannot hide a reachable quorum. Vote thresholds, owner identities, heartbeat checks, and late-grant cleanup retain their existing contracts.
+
+Faults match the test bucket or upload suffix in bounded control-packet bodies, preserving their signed bytes and trailers. Abort injection decodes only the unary Delete routing fields and matches the exact multipart root, excluding child transaction cleanup. Readiness requires an actual matching RPC, without waiting for voters that adaptive fan-out does not contact. Recovery cases release waiting packets while the request is active; quorum cases discard expired packets before restoring the peer. Replaying a packet after its caller has timed out is a separate late-delivery fault model. The injected S3 operation has SDK retries disabled. After the fault is removed, ordinary cleanup must recover within 45 seconds, allowing the existing lease and drive-health recovery intervals; only classified ServiceUnavailable responses are polled, and the server's Retry-After advice is honored. The fault-free eight-node workload keeps single-attempt APIs throughout. Failed Complete uses the best-effort rollback contract in [erasure-coding.md](../architecture/erasure-coding.md#7-write-path-and-write-quorum). A below-quorum Abort can also leave partially deleted staging. Each matrix reuses one cluster and bucket, requiring fresh responses from every lock peer before the next row so circuit-breaker history cannot reduce its available votes. After a partial mutation, ordinary Abort must succeed or report an already retired session, ListParts must return NoSuchUpload, and every node must list no residual uploads. This verifies the Abort recovery merged in #8904 without weakening the delete quorum; it does not claim residue-free rollback of a failed Complete. Bucket-generation recreation is covered by the cancellation case.
+
+The four-node EC:2 cases cover exactly quorum and quorum-minus-one for storage writes and exclusive locks (three votes) and ordinary Create shared locks (two votes), error-cause and retry headers, each multipart phase, and bucket recreation after client cancellation. A sixteen-shard EC12+4 case repeats all four metadata commit phases at exactly twelve and eleven available shards. The eight-node, eight-drive case checks the server-reported one-pool/four-set EC12+4 geometry, uploads 45 MiB objects using 8 MiB parts with two files and four parts in flight, verifies complete bytes through every node, and checks aborted and completed uploads leave no visible sessions.
+
+```bash
+python3 scripts/e2e_binary.py build --features e2e-test-hooks
+RUSTFS_E2E_LOG_DIR=/path/to/isolated-run/logs \
+RUSTFS_E2E_MPU_LOAD_ROUNDS=12 \
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- \
+  cargo test -p e2e_test distributed::multipart_fence_acceptance_test -- --test-threads=1 --nocapture
+```
+
+`RUSTFS_E2E_MPU_LOAD_ROUNDS` accepts 1–256 and defaults to three rounds. Allocate a private target directory and bounded CPU/memory resources before running the eight-process case. Temporary drive directories follow `TMPDIR`; use a task-owned directory on the intended filesystem. These are plaintext loopback processes and logical drives on one host, so passing them does not establish physical-drive independence, TLS behavior, the original incident cause, or a throughput improvement. Performance comparisons require a separate controlled baseline and drift-checked measurement.

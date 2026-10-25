@@ -159,6 +159,16 @@ fn command_success_does_not_hide_deferred_failed_cancelled_or_dry_run_objects() 
         counted: false,
     };
     assert_eq!(Settlement::new(candidate(), &mut recent).scope, "execution_incomplete");
+    assert_eq!(Settlement::new(candidate(), &mut recent).execution, "aborted_cancelled");
+    let mut errors = (*completion("errors", HealObjectDisposition::Repaired)).clone();
+    errors.execution = Some(HealExecutionOutcome::CompletedWithErrors);
+    let mut recent = Recent {
+        completion: Arc::new(errors),
+        counted: false,
+    };
+    let settled = Settlement::new(candidate(), &mut recent);
+    assert_eq!(settled.execution, "completed_with_errors");
+    assert_eq!(settled.scope, "execution_incomplete");
 }
 
 #[test]
@@ -231,18 +241,174 @@ fn observer_reinstalls_after_runtime_teardown() {
             .expect("first runtime");
         runtime.block_on(async { observer_from(&registry) })
     };
-    assert!(first.is_closed(), "runtime teardown closes the old observer");
+    assert!(first.sender.is_closed(), "runtime teardown closes the old observer");
+    let stopped = observation_status_from(&registry);
+    assert_eq!(stopped.state, "stopped");
+    assert_eq!(stopped.retained_pending_tasks, None);
+    assert_eq!(stopped.integrity_state, "unknown");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("replacement runtime");
     runtime.block_on(async {
         let replacement = observer_from(&registry);
-        assert!(!replacement.is_closed(), "a stale global sender must not suppress a new observer");
+        assert!(!replacement.sender.is_closed(), "a stale global sender must not suppress a new observer");
+        assert!(replacement.generation > first.generation);
+        first.record_unknown("completion_lost", 9);
+        assert!(observation_status_from(&registry).unknown_candidates.is_empty());
         replacement
+            .sender
             .try_send(("new-runtime".into(), candidate()))
             .expect("replacement observer admits work");
     });
+}
+
+#[test]
+fn observer_status_read_does_not_install_or_invent_zero() {
+    let registry = Mutex::new(None);
+    let status = observation_status_from(&registry);
+    assert_eq!(status.state, "not_started");
+    assert_eq!(status.retained_pending_tasks, None);
+    assert_eq!(status.terminal_task_observations_total, None);
+    assert_eq!(status.integrity_state, "unknown");
+    assert!(
+        registry.lock().expect("registry").is_none(),
+        "a status read must work without a Tokio runtime"
+    );
+    let json = serde_json::to_value(status).expect("serialize unstarted observer");
+    assert!(json["retained_pending_tasks"].is_null());
+}
+
+#[test]
+fn observer_status_preserves_loss_expiry_and_rejected_admissions() {
+    use rustfs_heal_contracts::heal_channel::HealAdmissionResult;
+
+    let (sender, receiver) = mpsc::channel(1);
+    let observer = ObserverHandle {
+        sender,
+        state: Arc::new(Mutex::new(Observations::default())),
+        generation: 1,
+        started_at_unix_secs: Some(20),
+    };
+    let registry = Mutex::new(Some(observer.clone()));
+    {
+        let mut state = observer.state.lock().expect("observations");
+        for index in 0..=MAX_PENDING {
+            let _ = state.admit(format!("pending-{index}"), candidate());
+        }
+        state.lagged(3);
+        let _ = state.admit("expired".into(), candidate());
+        state.maintain(Instant::now() + PENDING_TTL);
+    }
+    let status = observation_status_from(&registry);
+    assert_eq!(status.retained_pending_tasks, Some(0));
+    assert_eq!(status.lost_completion_notifications, Some(3));
+    assert_eq!(status.integrity_state, "unknown");
+    let unknown = status
+        .unknown_candidates
+        .iter()
+        .map(|row| (row.reason, row.count))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(unknown["pending_full"], 1);
+    assert_eq!(unknown["completion_lost"], u64::try_from(MAX_PENDING).expect("bounded pending count"));
+    assert_eq!(unknown["expired"], 1);
+
+    let admitted = HealAdmissionReceipt {
+        result: HealAdmissionResult::Accepted,
+        task_id: "canonical".into(),
+    };
+    observe_on(&observer, None, Ok(&admitted));
+    observe_on(
+        &observer,
+        Some(candidate()),
+        Ok(&HealAdmissionReceipt {
+            result: HealAdmissionResult::Accepted,
+            task_id: String::new(),
+        }),
+    );
+    observe_on(&observer, Some(candidate()), Err(()));
+    observe_on(&observer, Some(candidate()), Ok(&admitted));
+    assert_eq!(observation_status_from(&registry).queued_admissions, Some(1));
+    observe_on(&observer, Some(candidate()), Ok(&admitted));
+    drop(receiver);
+    observe_on(&observer, Some(candidate()), Ok(&admitted));
+    let status = observation_status_from(&registry);
+    assert_eq!(status.state, "stopped");
+    assert_eq!(status.retained_pending_tasks, None);
+    let unknown = status
+        .unknown_candidates
+        .iter()
+        .map(|row| (row.reason, row.count))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(unknown["identity_too_large"], 1);
+    assert_eq!(unknown["missing_task_id"], 1);
+    assert_eq!(unknown["not_admitted"], 1);
+    assert_eq!(unknown["observer_full_or_closed"], 2);
+}
+
+#[tokio::test]
+async fn observer_status_tracks_canonical_terminals_without_a_metrics_recorder() {
+    use rustfs_heal_contracts::{completion::publish_heal_completion, heal_channel::HealAdmissionResult};
+
+    let recorder = metrics::NoopRecorder;
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let registry = Mutex::new(None);
+    let observer = observer_from(&registry);
+    let canonical = Uuid::new_v4().to_string();
+    let deferred = Uuid::new_v4().to_string();
+    for (task_id, result) in [
+        (canonical.clone(), HealAdmissionResult::Accepted),
+        (canonical.clone(), HealAdmissionResult::Merged),
+        (deferred.clone(), HealAdmissionResult::Accepted),
+    ] {
+        observe_on(&observer, Some(candidate()), Ok(&HealAdmissionReceipt { result, task_id }));
+    }
+    publish_heal_completion((*completion(&canonical, HealObjectDisposition::VerifiedHealthy)).clone());
+    publish_heal_completion(
+        (*completion(
+            &deferred,
+            HealObjectDisposition::Deferred {
+                reason: HealDeferredReason::Deadline,
+                retry_not_before: None,
+            },
+        ))
+        .clone(),
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = observation_status_from(&registry);
+            if status.terminal_candidates.iter().map(|row| row.count).sum::<u64>() == 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("real observer must update its own status without an exporter");
+
+    let status = observation_status_from(&registry);
+    assert_eq!(status.retained_pending_tasks, Some(0));
+    assert_eq!(status.terminal_task_observations_total, Some(2));
+    assert_eq!(status.unknown_candidates.iter().map(|row| row.count).sum::<u64>(), 3);
+    assert_eq!(status.integrity_state, "unknown");
+    assert!(
+        status
+            .terminal_candidates
+            .iter()
+            .all(|row| row.execution == "completed" && row.scope == "content_and_leader_unknown")
+    );
+    assert!(
+        status
+            .terminal_candidates
+            .iter()
+            .any(|row| row.disposition == "verified_healthy" && row.count == 2)
+    );
+    assert!(
+        status
+            .terminal_candidates
+            .iter()
+            .any(|row| row.disposition == "deferred" && row.count == 1)
+    );
 }
 
 #[derive(Default)]

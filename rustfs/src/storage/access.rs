@@ -22,7 +22,7 @@ use crate::auth::{
     get_request_auth_type_with_query, get_session_token, parse_presigned_multipart_max_total_object_size,
     parse_presigned_put_max_content_length, reject_unsigned_amz_headers_on_sigv4_request,
 };
-use crate::error::{ApiError, normalize_put_read_quorum_error};
+use crate::error::{ApiError, normalize_read_quorum_error};
 use crate::license::license_check;
 use crate::shared_types::RemoteAddr;
 use crate::storage::request_context::RequestContext;
@@ -3378,7 +3378,7 @@ impl S3Access for FS {
             Ok(())
         }
         .await
-        .map_err(normalize_put_read_quorum_error)
+        .map_err(normalize_read_quorum_error)
     }
 
     /// Checks whether the PutObjectAcl request has accesses to the resources.

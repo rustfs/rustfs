@@ -72,7 +72,9 @@ completed or canceled probes do not consume shared discovery cursors.
 ## Entry points
 
 Every startup, including a clean restart, starts incremental raw discovery of
-local transaction records. During normal operation, deletion registers a
+local transaction records once the instance's bucket metadata system has been
+published. Bootstrap is not classified as a failed disk scope and cannot
+consume the initial discovery obligation. During normal operation, deletion registers a
 bounded, coalesced exact-key retry hint before preparing metadata. Synchronous
 completion clears only its own hint generation; an uncertain publication or
 unfinished cleanup remains eligible for automatic replay without another
@@ -82,6 +84,16 @@ Returning drives and queue overflow request discovery again, and a low-frequency
 bounded reconciliation scan covers records written through remote participants.
 Discovery advances by pages and retries failed sources separately, rather than
 rescanning every healthy bucket on each maintenance tick.
+
+Settlement uses a rolling window of at most four distinct keys, admitting at
+most sixteen attempts per maintenance tick. A slow shard verification or
+exact-key lock does not hold up other keys or later admission windows. A newer
+hint for an active key remains queued until that key's attempt completes.
+Cancellation retries admitted generations without clearing newer hints. Queue
+overflow remains covered by durable discovery, including after a restart.
+These limits bound background work, not the canonical rollback deadline or
+its durability checks.
+
 Corrupt record contents remain discoverable by their physical key; exact-key
 inspection rejects them without hiding later records. Unsafe paths, symlinks,
 and structural filesystem errors still stop that discovery scope.
@@ -206,7 +218,21 @@ curl with `--image`, and a unique Docker namespace. The optional
 `--baseline-binary` enables the mixed-version case. The harness uses synthetic
 S3 objects, localhost ports, labeled isolated volumes, and a non-root server.
 It stops only its own containers and keeps JSON results and logs in the chosen
-artifact directory. Production builds must not enable `e2e-test-hooks`.
+artifact directory. Production builds must not enable `e2e-test-hooks`. The `release-batch-crash`
+case accepts a normal release binary: it observes persisted preparation before
+SIGKILL in one round and persisted commit receipts in another, verifies automatic
+mixed inline/external recovery without a new DELETE
+or administrator request, and checks that a second clean restart is stable.
+This case does not pin an individual instruction or transaction phase.
+
+Physical settlement permits directory-only remnants that ordinary non-force
+bucket removal safely prunes. It rejects retained payloads, backup or transaction
+records, unknown files, and symbolic links. Final cleanup deletes only surviving
+objects before requiring ordinary bucket removal. An interrupted proof GC can
+also leave an empty transaction directory beside another drive's receipt.
+Recovery retires only that exact empty leaf before republishing a replay
+witness; a nonempty directory, including an empty nested prefix, remains
+protected. No recursive removal grants transaction authority.
 
 Run the preactivation/prepare/apply/decision process-stop cases, interrupted restore,
 returning and untouched peers, both generation orderings, version/retention
@@ -214,3 +240,52 @@ and prefix protection, administrator dry-run/removal, response-loss,
 permission/corruption, and mixed-version cases. Preserve the source identity
 of both binaries with the results. A passing process-stop matrix does not
 cover hardware power cuts, Windows runtime behavior, or DELETE throughput.
+
+
+## Performance acceptance
+
+Linux forward batch preparation admits at most eight independent keys per
+local disk request. Duplicate keys, ancestor/descendant keys, noncanonical
+paths, legacy operations, and rollback keep their ordered execution. Other
+platforms retain serial preparation. The existing per-key metadata lease,
+transaction publication, namespace ownership, and strict synchronization
+barriers still apply to every admitted operation.
+
+Use `scripts/test/delete_recovery_perf.py` for resource-matched release
+comparisons. Supply separate binaries and build receipts; each receipt binds
+`binary_sha256`, `source_head`, and the build fields `profile`, `opt_level`,
+`target`, `rustc`, `features`, `default_features`, `lto`, and `codegen_units`.
+Receipts must describe matching release builds at optimization level 3 without
+`e2e-test-hooks`. Preserve any source patch and the build command with them.
+For example:
+
+```sh
+python3 scripts/test/delete_recovery_perf.py \
+  --baseline-binary ./baseline/rustfs --baseline-receipt ./baseline/build.json \
+  --candidate-binary ./candidate/rustfs --candidate-receipt ./candidate/build.json \
+  --image rust:1.99.1-trixie --artifact-dir ./delete-performance-results \
+  --cpuset-cpus 2-5 --memory 4g
+```
+
+The runner uses an A1/B1/B2/A2 sequence with at least three repetitions per
+cohort. It checks original bytes and ETags, physical inline/external layouts,
+empty listings, physical cleanup, and bucket removal. Each sample also cleanly
+restarts its isolated server and waits for the bounded raw discovery page on
+every local disk. Startup observations retain whether discovery exceeded
+thirty seconds, including for historical baselines whose bootstrap race enters
+the thirty-second retry interval; the observation deadline is ninety seconds.
+A candidate exceeding the thirty-second budget fails acceptance even when the
+longer observation eventually completes.
+This separates server readiness and local discovery service time from the
+timed DELETE. DELETE begins no earlier than thirty-five seconds after restart
+in either variant, keeping process age and early maintenance phases comparable.
+Normal scanner/heal loops are disabled for this
+controlled attribution; automatic transaction recovery remains enabled.
+
+Cohorts share the same image, CPU set, memory limit, strict durability policy,
+and workload. A baseline or candidate drift above ten percent makes the result
+inconclusive and withholds improvement percentages. The artifact retains raw
+samples and per-operation cumulative disk service times. These concurrent
+service times are not an additive wall-clock decomposition. Four logical
+volumes on one Docker host filesystem do not represent four independent
+physical devices or establish hardware power-loss durability.

@@ -14,6 +14,10 @@
 
 pub(in crate::disk) use self::commit::LocalRenamePreflightRejection;
 #[cfg(test)]
+#[path = "local/read_path_tests.rs"]
+mod read_path_tests;
+
+#[cfg(test)]
 use self::commit::lock_rename_commit_directories;
 
 mod commit;
@@ -50,7 +54,7 @@ use crate::diagnostics::get::{
 #[cfg(test)]
 use crate::disk::HEALING_MARKER_PATH;
 use crate::disk::disk_store::{get_drive_walkdir_stall_timeout, get_object_disk_read_timeout};
-use crate::disk::io_admission::{DiskIoPermit, spawn_blocking_with_disk_io_permit};
+use crate::disk::io_admission::{DiskIoPermit, current_resource_unit, spawn_blocking_with_disk_io_permit};
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, ConditionalFileUpdate, CurrentDeleteGeneration, DataDirDeleteStatus,
@@ -79,6 +83,7 @@ use metrics::counter;
 #[cfg(target_os = "linux")]
 use metrics::gauge;
 use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock};
+use rustfs_concurrency::adaptive::AdaptivePermit;
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
     ValidationMode, get_file_info, read_xl_meta_no_data_sync,
@@ -113,6 +118,31 @@ use uuid::Uuid;
 
 // Bound outstanding filesystem jobs and metadata buffers per disk request.
 const PART_METADATA_READ_CONCURRENCY: usize = 8;
+
+// Keep independent forward transactions bounded without reordering aliases,
+// parent/child keys, rollback, or legacy operations.
+const DELETE_VERSION_PREPARE_CONCURRENCY: usize = 8;
+
+fn delete_version_batch_concurrency(versions: &[FileInfoVersions], opts: &DeleteOptions) -> usize {
+    if !cfg!(target_os = "linux") || !opts.recoverable_delete || opts.undo_write || opts.undo_delete || versions.len() < 2 {
+        return 1;
+    }
+    let mut names = HashSet::with_capacity(versions.len());
+    for version in versions {
+        let name = version.name.as_str();
+        if name.split('/').any(|segment| matches!(segment, "" | "." | "..")) || !names.insert(name) {
+            return 1;
+        }
+    }
+    for name in &names {
+        for (separator, _) in name.match_indices('/') {
+            if names.contains(&name[..separator]) {
+                return 1;
+            }
+        }
+    }
+    DELETE_VERSION_PREPARE_CONCURRENCY
+}
 
 /// The fresh health path uses a synchronous capacity syscall. Keep the permit
 /// inside the blocking closure so cancelling its async caller cannot admit a
@@ -314,6 +344,7 @@ enum MetadataReadOp {
 }
 
 struct MetadataReadJob {
+    resource_unit: Option<AdaptivePermit>,
     path: PathBuf,
     io_permit: Option<DiskIoPermit>,
     op: MetadataReadOp,
@@ -335,6 +366,7 @@ impl MetadataReadJob {
         if self.is_cancelled() {
             return;
         }
+        let _resource_unit = self.resource_unit;
         let _io_permit = self.io_permit;
         match self.op {
             MetadataReadOp::ReadAll { tx } => {
@@ -394,7 +426,8 @@ impl MetadataReadQueue {
         })
     }
 
-    fn enqueue(self: &Arc<Self>, job: MetadataReadJob) {
+    fn enqueue(self: &Arc<Self>, mut job: MetadataReadJob) {
+        job.resource_unit = current_resource_unit();
         let should_spawn = {
             let mut state = self.state.lock();
             state.jobs.push_back(job);
@@ -4479,6 +4512,7 @@ impl LocalIoBackend for StdBackend {
     }
 
     async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter> {
+        self.invalidate_cached_fd(volume, path).await;
         match mode {
             WriteMode::Truncate { size_hint } => {
                 let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
@@ -5697,6 +5731,7 @@ impl LocalIoBackend for UringBackend {
     }
 
     async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter> {
+        self.invalidate_cached_fd(volume, path).await;
         self.inner.open_write(volume, path, mode).await
     }
 
@@ -5704,24 +5739,28 @@ impl LocalIoBackend for UringBackend {
         if let Some(cache) = self.fd_cache.as_ref() {
             cache.invalidate_exact(volume, path).await;
         }
+        self.inner.invalidate_cached_fd(volume, path).await;
     }
 
     fn invalidate_cached_fds_under(&self, volume: &str, path: &str) {
         if let Some(cache) = self.fd_cache.as_ref() {
             cache.invalidate_under(volume, path);
         }
+        self.inner.invalidate_cached_fds_under(volume, path);
     }
 
     fn invalidate_cached_fds_for_volume(&self, volume: &str) {
         if let Some(cache) = self.fd_cache.as_ref() {
             cache.invalidate_volume(volume);
         }
+        self.inner.invalidate_cached_fds_for_volume(volume);
     }
 
     async fn clear_cached_fds(&self) {
         if let Some(cache) = self.fd_cache.as_ref() {
             cache.clear();
         }
+        self.inner.clear_cached_fds().await;
     }
 }
 
@@ -6753,8 +6792,19 @@ impl LocalDisk {
         self.local_disk_bucket_and_object_path(self.io_root(), bucket, key)
     }
 
+    fn io_get_checked_read_paths(&self, bucket: &str, key: &str) -> Result<(PathBuf, PathBuf)> {
+        let (bucket_path, path) = self.io_get_bucket_and_object_path(bucket, key)?;
+        #[cfg(test)]
+        read_path_tests::before_bucket_recheck();
+        // Reuse the buffer, not the validation result: retain the bucket
+        // recheck after the full object-path check and before queued IO.
+        self.check_valid_path(&bucket_path)?;
+        Ok((bucket_path, path))
+    }
+
     /// Only for operations that open through PublicationRoot or a commit guard:
-    /// containment and symlink checks happen with the actual open, off the runtime.
+    /// Linux checks containment and symlinks at the actual open, off the runtime;
+    /// other platforms retain their preflight checks.
     fn io_get_object_open_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
         #[cfg(target_os = "linux")]
         {
@@ -6767,7 +6817,8 @@ impl LocalDisk {
     }
 
     /// Only for operations that open through PublicationRoot or a commit guard:
-    /// containment and symlink checks happen with the actual open, off the runtime.
+    /// Linux checks containment and symlinks at the actual open, off the runtime;
+    /// other platforms retain their preflight checks.
     fn io_get_bucket_and_object_open_path(&self, bucket: &str, key: &str) -> Result<(PathBuf, PathBuf)> {
         #[cfg(target_os = "linux")]
         {
@@ -6779,11 +6830,7 @@ impl LocalDisk {
             Ok((bucket_path, path))
         }
         #[cfg(not(target_os = "linux"))]
-        {
-            let path = self.io_get_object_path(bucket, key)?;
-            let bucket_path = self.io_get_bucket_path(bucket)?;
-            Ok((bucket_path, path))
-        }
+        self.io_get_checked_read_paths(bucket, key)
     }
 
     fn io_get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
@@ -6857,10 +6904,6 @@ impl LocalDisk {
     }
 
     // Check if a path is valid
-    #[allow(
-        dead_code,
-        reason = "method wrapper over the live free function check_local_disk_valid_path; no caller in this port (backlog#1823)"
-    )]
     fn check_valid_path<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -7103,23 +7146,29 @@ impl LocalDisk {
         opts: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Vec<Option<Error>> {
-        let mut errs = Vec::with_capacity(versions.len());
-        for _ in 0..versions.len() {
-            errs.push(None);
+        let concurrency = delete_version_batch_concurrency(&versions, &opts);
+        let mut errors = vec![None; versions.len()];
+        let mut pending = stream::iter(
+            versions
+                .into_iter()
+                .enumerate()
+                .map(|(index, version): (usize, FileInfoVersions)| {
+                    let owner = namespace_owner.clone();
+                    let options = &opts;
+                    async move {
+                        let error = self
+                            .delete_versions_internal(volume, &version.name, &version.versions, options, owner)
+                            .await
+                            .err();
+                        (index, error)
+                    }
+                }),
+        )
+        .buffer_unordered(concurrency);
+        while let Some((index, error)) = pending.next().await {
+            errors[index] = error;
         }
-
-        for (i, ver) in versions.iter().enumerate() {
-            if let Err(e) = self
-                .delete_versions_internal(volume, ver.name.as_str(), &ver.versions, &opts, namespace_owner.clone())
-                .await
-            {
-                errs[i] = Some(e);
-            } else {
-                errs[i] = None;
-            }
-        }
-
-        errs
+        errors
     }
 
     pub(crate) async fn delete_versions_guarded_with_namespace_owner(
@@ -8252,6 +8301,7 @@ impl LocalDisk {
         let path = file_path.as_ref().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.metadata_read_queue.enqueue(MetadataReadJob {
+            resource_unit: None,
             path,
             io_permit,
             op: MetadataReadOp::ReadMetadataOnly { tx },
@@ -8429,6 +8479,7 @@ impl LocalDisk {
         let path = file_path.as_ref().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.metadata_read_queue.enqueue(MetadataReadJob {
+            resource_unit: None,
             path,
             io_permit,
             op: MetadataReadOp::ReadAll { tx },
@@ -9199,10 +9250,12 @@ impl LocalDisk {
         let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
-        self.write_all_internal(&file_path, InternalBuf::Owned(buf), sync, skip_parent)
-            .await?;
-
-        Ok(())
+        self.io_backend.invalidate_cached_fd(volume, path).await;
+        let res = self
+            .write_all_internal(&file_path, InternalBuf::Owned(buf), sync, skip_parent)
+            .await;
+        self.io_backend.invalidate_cached_fd(volume, path).await;
+        res
     }
     // write_all_internal do write file.
     // Executes the given SyncMode verbatim: durability policy (tier gating,
@@ -10348,6 +10401,8 @@ fn local_disk_bucket_path(root: &Path, bucket: &str) -> Result<PathBuf> {
 }
 
 fn build_local_disk_bucket_path(root: &Path, bucket: &str) -> PathBuf {
+    #[cfg(test)]
+    read_path_tests::record_bucket_rebuild();
     #[cfg(windows)]
     let bucket_path = root.join(bucket.replace('/', "\\"));
     #[cfg(not(windows))]
@@ -10357,8 +10412,8 @@ fn build_local_disk_bucket_path(root: &Path, bucket: &str) -> PathBuf {
 }
 
 fn check_local_disk_valid_object_path(root: &Path, bucket_path: &Path, path: &Path) -> Result<()> {
-    let bucket_path = normalize_path_components(bucket_path);
-    let path = normalize_path_components(path);
+    let bucket_path = normalize_path_cow(bucket_path);
+    let path = normalize_path_cow(path);
     if !bucket_path.starts_with(root) || !path.starts_with(&bucket_path) {
         return Err(DiskError::InvalidPath);
     }
@@ -10367,7 +10422,7 @@ fn check_local_disk_valid_object_path(root: &Path, bucket_path: &Path, path: &Pa
 }
 
 fn check_local_disk_valid_path(root: &Path, path: impl AsRef<Path>) -> Result<()> {
-    let path = normalize_path_components(path);
+    let path = normalize_path_cow(path.as_ref());
     if !path.starts_with(root) {
         return Err(DiskError::InvalidPath);
     }
@@ -10398,7 +10453,7 @@ fn check_local_disk_object_path_components<'a>(
 
 #[cfg(target_os = "linux")]
 fn check_local_disk_valid_path_at(root: &Path, root_fd: &std::fs::File, path: impl AsRef<Path>) -> Result<()> {
-    let path = normalize_path_components(path);
+    let path = normalize_path_cow(path.as_ref());
     if !path.starts_with(root) {
         return Err(DiskError::InvalidPath);
     }
@@ -10480,9 +10535,10 @@ fn reject_local_disk_symlink_components(root: &Path, path: &Path) -> Result<()> 
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 #[inline]
 fn normalize_path_cow(path: &Path) -> std::borrow::Cow<'_, Path> {
+    // Windows prefixes retain the existing PathBuf reconstruction semantics.
+    #[cfg(not(windows))]
     if !path
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
@@ -10494,6 +10550,8 @@ fn normalize_path_cow(path: &Path) -> std::borrow::Cow<'_, Path> {
 
 // Lightweight path normalization without filesystem calls
 fn normalize_path_components(path: impl AsRef<Path>) -> PathBuf {
+    #[cfg(test)]
+    read_path_tests::record_normalization();
     let path = path.as_ref();
     let mut result = PathBuf::new();
 
@@ -12006,6 +12064,17 @@ impl DiskAPI for LocalDisk {
             self.write_all(dst_volume, format!("{dst_path}.meta").as_str(), meta).await?;
         }
 
+        if src_is_dir {
+            self.io_backend.invalidate_cached_fds_under(src_volume, src_path);
+            self.io_backend.invalidate_cached_fds_under(dst_volume, dst_path);
+        } else {
+            self.io_backend.invalidate_cached_fd(src_volume, src_path).await;
+            self.io_backend.invalidate_cached_fd(dst_volume, dst_path).await;
+            self.io_backend
+                .invalidate_cached_fd(dst_volume, &format!("{dst_path}.meta"))
+                .await;
+        }
+
         if let Some(parent) = src_file_path.parent() {
             self.delete_file(&src_volume_dir, &parent.to_path_buf(), false, false).await?;
         }
@@ -12075,8 +12144,13 @@ impl DiskAPI for LocalDisk {
 
         // Both ends changed identity: the source path no longer exists and the
         // destination now resolves to a different inode (backlog#1145).
-        self.io_backend.invalidate_cached_fd(src_volume, src_path).await;
-        self.io_backend.invalidate_cached_fd(dst_volume, dst_path).await;
+        if src_is_dir {
+            self.io_backend.invalidate_cached_fds_under(src_volume, src_path);
+            self.io_backend.invalidate_cached_fds_under(dst_volume, dst_path);
+        } else {
+            self.io_backend.invalidate_cached_fd(src_volume, src_path).await;
+            self.io_backend.invalidate_cached_fd(dst_volume, dst_path).await;
+        }
 
         if let Some(parent) = src_file_path.parent() {
             let _ = self.delete_file(&src_volume_dir, &parent.to_path_buf(), false, false).await;
@@ -12327,10 +12401,7 @@ impl DiskAPI for LocalDisk {
             )
             .await?;
 
-        if let Some(flag) = opts.producer_limit_reached.as_ref() {
-            flag.store(limit_reached, std::sync::atomic::Ordering::Release);
-        }
-        out.close().await?;
+        out.close_with_limit_reached(limit_reached).await?;
         Ok(())
     }
 
@@ -13041,8 +13112,7 @@ impl LocalDisk {
             Some(io_permit) => Some(io_permit),
             None => acquire_context_disk_io_permit().await.map_err(DiskError::Io)?,
         };
-        let file_path = self.io_get_object_path(volume, path)?;
-        let volume_dir = self.io_get_bucket_path(volume)?;
+        let (volume_dir, file_path) = self.io_get_checked_read_paths(volume, path)?;
         let (data, _) = self
             .read_all_data_with_dmtime(volume, volume_dir, file_path, io_permit)
             .await?;
@@ -15814,6 +15884,60 @@ mod test {
 
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
+        }
+    }
+
+    // The producer's stop reason travels in the metacache stream trailer, so a
+    // consumer, local or across the walk_dir RPC, can tell a per-disk limit
+    // stop from the end of the namespace without a side channel.
+    #[tokio::test]
+    async fn walk_dir_reports_its_stop_reason_through_the_stream_trailer() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let bucket = "trailer-bucket";
+        for idx in 0..3 {
+            let object_dir = dir.path().join(bucket).join(format!("prefix/object-{idx}"));
+            fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta")
+                .await
+                .expect("object metadata should be written");
+        }
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        disk.wait_for_startup_cleanup().await;
+
+        for (limit, expected_limit_reached) in [(0, false), (1, true)] {
+            let mut stream = Vec::new();
+            disk.walk_dir(
+                WalkDirOptions {
+                    bucket: bucket.to_string(),
+                    base_dir: "prefix/".to_string(),
+                    recursive: true,
+                    limit,
+                    ..Default::default()
+                },
+                &mut stream,
+            )
+            .await
+            .expect("walk should succeed");
+
+            let mut reader = rustfs_filemeta::MetacacheReader::new(std::io::Cursor::new(stream));
+            let objects = reader
+                .read_all()
+                .await
+                .expect("walk stream should decode")
+                .into_iter()
+                .filter(MetaCacheEntry::is_object)
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>();
+            if limit == 0 {
+                assert_eq!(objects, ["prefix/object-0", "prefix/object-1", "prefix/object-2"]);
+            } else {
+                assert!(objects.len() < 3, "limit={limit} must stop the walk early, got {objects:?}");
+            }
+            assert_eq!(reader.limit_reached(), Some(expected_limit_reached), "limit={limit}");
         }
     }
 
@@ -25859,6 +25983,46 @@ mod test {
     }
 
     #[tokio::test]
+    async fn metadata_read_job_retains_resource_unit_until_native_completion() {
+        use crate::disk::with_background_resource_unit;
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+
+        let dir = tempfile::tempdir().expect("metadata root");
+        let queue = MetadataReadQueue::new(os::PublicationRoot::new(dir.path()).expect("publication root"));
+        let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        with_background_resource_unit(gate.acquire().await, async {
+            queue.enqueue(MetadataReadJob {
+                resource_unit: None,
+                path: PathBuf::new(),
+                io_permit: None,
+                op: MetadataReadOp::TestCustom {
+                    is_closed: Box::new(|| false),
+                    run: Box::new(move || {
+                        started_tx.send(()).expect("native metadata worker started");
+                        release_rx.blocking_recv().expect("release native metadata work");
+                    }),
+                },
+            });
+            started_rx.await.expect("worker owns queued job");
+        })
+        .await;
+        let held = gate.snapshot().active;
+        release_tx.send(()).expect("release native job after caller scope ends");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while gate.snapshot().active != 0 || queue.state.lock().active_workers != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native metadata job and worker retire");
+        assert_eq!(held, 1, "leaving the caller scope must not release a live metadata job's unit");
+        assert!(gate.try_acquire().is_some());
+    }
+
+    #[tokio::test]
     async fn metadata_read_queue_bounds_concurrency_skips_cancelled_and_recovers_from_panic() {
         let dir = tempfile::tempdir().expect("tempdir should be created");
         let root = os::PublicationRoot::new(dir.path()).expect("publication root should be created");
@@ -25878,6 +26042,7 @@ mod test {
             let entered_tx = entered_tx.clone();
             let release_rx = Arc::clone(&release_rx);
             queue.enqueue(MetadataReadJob {
+                resource_unit: None,
                 path: PathBuf::new(),
                 io_permit: None,
                 op: MetadataReadOp::TestCustom {
@@ -25905,12 +26070,14 @@ mod test {
         let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
         drop(cancelled_rx);
         queue.enqueue(MetadataReadJob {
+            resource_unit: None,
             path: dir.path().join("cancelled-never-opened"),
             io_permit: None,
             op: MetadataReadOp::ReadMetadataOnly { tx: cancelled_tx },
         });
         let executed_cancelled_clone = Arc::clone(&executed_cancelled);
         queue.enqueue(MetadataReadJob {
+            resource_unit: None,
             path: PathBuf::new(),
             io_permit: None,
             op: MetadataReadOp::TestCustom {
@@ -25923,6 +26090,7 @@ mod test {
 
         // Enqueue a panicking job followed by a normal completion job to verify panic respawn.
         queue.enqueue(MetadataReadJob {
+            resource_unit: None,
             path: PathBuf::new(),
             io_permit: None,
             op: MetadataReadOp::TestCustom {
@@ -25934,6 +26102,7 @@ mod test {
         let active_trailing = Arc::clone(&active);
         let max_active_trailing = Arc::clone(&max_active);
         queue.enqueue(MetadataReadJob {
+            resource_unit: None,
             path: PathBuf::new(),
             io_permit: None,
             op: MetadataReadOp::TestCustom {
@@ -30946,5 +31115,112 @@ mod test {
         assert_eq!(generation, before + 1);
         assert_eq!(ctx.namespace_commit_generation(), before + 2);
         assert!(!ctx.namespace_commits_pending());
+    }
+
+    #[tokio::test]
+    async fn fd_cache_invalidated_on_write_all_open_write_rename_part_and_dir_rename_file() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("utf8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let volume = "fd-cache-invalidation-test";
+        disk.make_volume(volume).await.expect("make_volume");
+
+        // 1. Seed FdCache via pread_bytes on an 8192-byte file, then overwrite in-place via write_all
+        // with a smaller 128-byte payload (truncating across a page boundary) and then a larger 12288-byte payload.
+        let initial = vec![b'A'; 8192];
+        disk.write_all(volume, "obj/data.bin", Bytes::from(initial.clone()))
+            .await
+            .expect("write initial");
+        let read_initial = disk
+            .io_backend
+            .pread_bytes(volume, "obj/data.bin", 0, 8192, None)
+            .await
+            .expect("pread initial");
+        assert_eq!(read_initial.as_ref(), initial.as_slice());
+
+        let shrunk = vec![b'B'; 128];
+        disk.write_all(volume, "obj/data.bin", Bytes::from(shrunk.clone()))
+            .await
+            .expect("write shrunk");
+        // Reading past the new 128-byte EOF must return FileCorrupt rather than mapping stale 8192 len (SIGBUS).
+        let oob = disk.io_backend.pread_bytes(volume, "obj/data.bin", 0, 8192, None).await;
+        assert!(matches!(oob, Err(DiskError::FileCorrupt)));
+        let read_shrunk = disk
+            .io_backend
+            .pread_bytes(volume, "obj/data.bin", 0, 128, None)
+            .await
+            .expect("pread shrunk");
+        assert_eq!(read_shrunk.as_ref(), shrunk.as_slice());
+
+        // Growing via append_file / open_write must also invalidate the cached 128-byte length.
+        let mut writer = disk.append_file(volume, "obj/data.bin").await.expect("append_file");
+        writer.write_all(&vec![b'C'; 256]).await.expect("append write");
+        writer.flush().await.expect("append flush");
+        drop(writer);
+        let read_grown = disk
+            .io_backend
+            .pread_bytes(volume, "obj/data.bin", 0, 384, None)
+            .await
+            .expect("pread grown");
+        assert_eq!(&read_grown[..128], shrunk.as_slice());
+        assert_eq!(&read_grown[128..], vec![b'C'; 256].as_slice());
+
+        // 2. rename_part must invalidate cached destination and source descriptors.
+        disk.write_all(volume, "mp/part.1", Bytes::from_static(b"old-part"))
+            .await
+            .expect("write old part");
+        let old_part = disk
+            .io_backend
+            .pread_bytes(volume, "mp/part.1", 0, 8, None)
+            .await
+            .expect("pread old part");
+        assert_eq!(old_part.as_ref(), b"old-part");
+
+        disk.write_all(volume, "tmp/staged-part", Bytes::from_static(b"new-part"))
+            .await
+            .expect("write staged part");
+        disk.rename_part(volume, "tmp/staged-part", volume, "mp/part.1", Bytes::from_static(b"meta"))
+            .await
+            .expect("rename_part");
+        let new_part = disk
+            .io_backend
+            .pread_bytes(volume, "mp/part.1", 0, 8, None)
+            .await
+            .expect("pread new part");
+        assert_eq!(new_part.as_ref(), b"new-part");
+
+        // 3. Directory rename_file ("src_dir/" -> "dst_dir/") must invalidate cached children under dst_dir/.
+        disk.write_all(volume, "dst_dir/child.bin", Bytes::from_static(b"old-child"))
+            .await
+            .expect("write old child");
+        let _ = disk
+            .io_backend
+            .pread_bytes(volume, "dst_dir/child.bin", 0, 9, None)
+            .await
+            .expect("cache old child");
+        disk.delete(volume, "dst_dir/child.bin", DeleteOptions::default())
+            .await
+            .expect("delete old child");
+        // Re-populate cache before directory rename
+        disk.write_all(volume, "src_dir/child.bin", Bytes::from_static(b"new-child"))
+            .await
+            .expect("write src child");
+        let _ = disk
+            .io_backend
+            .pread_bytes(volume, "src_dir/child.bin", 0, 9, None)
+            .await
+            .expect("cache src child");
+        disk.rename_file(volume, "src_dir/", volume, "dst_dir/")
+            .await
+            .expect("rename_file dir");
+        assert!(
+            disk.io_backend
+                .pread_bytes(volume, "src_dir/child.bin", 0, 9, None)
+                .await
+                .is_err(),
+            "cached child under renamed-from directory must be invalidated"
+        );
     }
 }

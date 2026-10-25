@@ -173,7 +173,7 @@ async fn legacy_unbound_generation_is_parked_and_requires_explicit_risk_acceptan
         assert!(
             matches!(
                 mrf_queue::refresh_legacy_responsibility(entry.responsibility_id, None).await,
-                Err(rustfs_heal::heal::mrf_queue::MrfLifecycleControlError::IncarnationChanged)
+                Err(rustfs_heal::heal::mrf_queue::MrfLifecycleControlError::BucketIdentityUnresolved)
             ),
             "an absent bucket is not retirement proof"
         );

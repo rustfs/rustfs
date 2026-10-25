@@ -31,8 +31,11 @@ pub mod os;
 
 #[cfg(test)]
 pub(crate) use io_admission::DiskIoClass;
-pub use io_admission::with_background_disk_io;
-pub(crate) use io_admission::{acquire_context_disk_io_permit, current_disk_io_context, with_optional_disk_io_context};
+pub(crate) use io_admission::{
+    acquire_context_disk_io_permit, current_disk_io_context, current_resource_unit, with_optional_disk_io_context,
+    with_optional_resource_unit,
+};
+pub use io_admission::{with_background_disk_io, with_background_resource_unit};
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
 pub const MIGRATING_META_BUCKET: &str = ".minio.sys";
@@ -79,12 +82,7 @@ use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_madmin::info_commands::DiskMetrics;
 use rustfs_rio::ChunkReaderBox;
 use serde::{Deserialize, Serialize};
-use std::{
-    fmt::Debug,
-    path::PathBuf,
-    sync::{Arc, atomic::AtomicBool},
-    time::Duration,
-};
+use std::{fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
@@ -1907,12 +1905,6 @@ pub struct WalkDirOptions {
     // Override the remote stream stall timeout for long background walks.
     #[serde(default)]
     pub stall_timeout_ms: Option<u64>,
-
-    /// In-process completion state for bounded local walks. This is skipped
-    /// from RPC serialization; remote peers retain the legacy natural-EOF
-    /// behavior until they support an explicit capability.
-    #[serde(skip)]
-    pub producer_limit_reached: Option<Arc<AtomicBool>>,
 }
 
 impl WalkDirOptions {
@@ -2757,7 +2749,6 @@ mod tests {
             skip_total_timeout: false,
             timeout_ms: Some(10_000),
             stall_timeout_ms: Some(20_000),
-            producer_limit_reached: None,
         };
 
         assert_eq!(opts.bucket, "test-bucket");
