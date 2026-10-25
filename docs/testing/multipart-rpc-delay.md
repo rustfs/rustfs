@@ -11,6 +11,10 @@ Before arming a window or checking recovery, every coordinator must report its o
 
 A short delay with every node healthy tests latency in the selected plane. Peer-loss cases first prove that a remote RPC reached the selected hook, then stop peers and release surviving calls. These are post-entry peer-loss checks: stopping a peer affects both its metadata and lock services, so the final failure cannot be attributed exclusively to one plane.
 
+Native Abort selects `delete_aborted_multipart_source`, the cleanup entry after every original participant durably closed the source. The broader `recover_multipart_source` selector also covers inspection and preparation, so it cannot substitute for that cleanup boundary. A lock-plane peer loss precedes closure and requires all four original participants to return before Abort can recover.
+
+A Create acknowledged on only quorum, or an interrupted Create, can lack an original upload head on the stopped peer. Readmission does not invent that witness. For those discovered uploads, the matrix requires Abort to return `storage_write_quorum`, compares every physical source head and absence slot before and after, and verifies that only those exact indeterminate uploads remain listed. Fully witnessed uploads still require successful cleanup and no remaining upload. The isolated cluster owns the retained test data until teardown.
+
 The erasure write quorum and the lifecycle shared-lock read quorum are different. The harness observes peers actually scheduled by bounded fanout; it must not require an unused client to start or expand production fanout to satisfy a marker count.
 
 ## Oracles

@@ -62,7 +62,7 @@ impl Operation {
             Self::Create => "write_metadata",
             Self::Part => "rename_part",
             Self::Complete => "rename_multipart_data",
-            Self::Abort => "delete",
+            Self::Abort => "delete_aborted_multipart_source",
         }
     }
 }
@@ -257,9 +257,71 @@ impl Session {
         json!({ "class": "multipart", "sha256": rustfs_utils::crypto::hex(digest) })
     }
 
-    async fn verify_and_cleanup(&self, run: &Run, operation: Operation, ack: Option<Ack>) -> TestResult {
+    async fn source_heads(&self, run: &Run, upload_id: &str) -> TestResult<Vec<Option<Vec<u8>>>> {
+        let decoded = String::from_utf8(base64_simd::URL_SAFE_NO_PAD.decode_to_vec(upload_id.as_bytes())?)?;
+        let (_, suffix) = decoded.split_once('.').ok_or("server upload ID lacks deployment delimiter")?;
+        let digest = rustfs_utils::crypto::hex(Sha256::digest(format!("{}/{}", self.bucket, self.key)));
+        let mut heads = Vec::new();
+        for node in &run.dist.cluster.nodes {
+            for root in &node.data_dirs {
+                let path = Path::new(root)
+                    .join(".rustfs.sys/multipart")
+                    .join(&digest)
+                    .join(suffix)
+                    .join("xl.meta");
+                heads.push(match tokio::fs::read(path).await {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                });
+            }
+        }
+        Ok(heads)
+    }
+
+    async fn abort_and_verify_source(&self, run: &Run, upload_id: &str, partial_create: bool) -> TestResult<bool> {
+        let before = if partial_create {
+            Some(self.source_heads(run, upload_id).await?)
+        } else {
+            None
+        };
+        let result = run
+            .client(0)?
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(upload_id)
+            .send()
+            .await;
+        if let Some(before) = before {
+            let present = before.iter().filter(|head| head.is_some()).count();
+            if (2..4).contains(&present) {
+                let failure = Failure::from_sdk(result.expect_err("missing original witnesses must prevent native Abort"));
+                failure.assert_unavailable();
+                assert_eq!(failure.cause.as_deref(), Some("storage_write_quorum"));
+                assert_eq!(
+                    self.source_heads(run, upload_id).await?,
+                    before,
+                    "refused Abort must preserve every original head and its absence slots"
+                );
+                atomic_json(
+                    &run.directory.join(format!("retained-source.{}.json", Uuid::new_v4())),
+                    &json!({ "bucket": self.bucket, "upload_id": upload_id, "original_heads": present,
+                        "required_originals": 4, "failure": failure }),
+                )
+                .await?;
+                return Ok(true);
+            }
+        }
+        result?;
+        Ok(false)
+    }
+
+    async fn verify_and_cleanup(&self, run: &Run, operation: Operation, scenario: Scenario, ack: Option<Ack>) -> TestResult {
         let client = run.client(0)?;
         let mut recovered = self.clone();
+        let partial_create = matches!(operation, Operation::Create) && !matches!(scenario, Scenario::BoundedDelay);
+        let mut retained = Vec::new();
         if ack.is_none() {
             match operation {
                 Operation::Part => {
@@ -314,13 +376,9 @@ impl Session {
         match operation {
             Operation::Create => {
                 let id = ack.upload_id.ok_or("successful CreateMultipartUpload omitted ID")?;
-                client
-                    .abort_multipart_upload()
-                    .bucket(&self.bucket)
-                    .key(&self.key)
-                    .upload_id(id)
-                    .send()
-                    .await?;
+                if self.abort_and_verify_source(run, &id, partial_create).await? {
+                    retained.push(id);
+                }
             }
             Operation::Part => {
                 let mut completed = recovered;
@@ -340,8 +398,8 @@ impl Session {
             }
             Operation::Abort => {}
         }
-        // An unacknowledged Create can leave a discoverable upload. Clean up
-        // every upload for this unique key and prove that none survives.
+        // An interrupted native Create can lack an original participant.
+        // Prove safe retention rather than inventing authority to erase it.
         let uploads = client
             .list_multipart_uploads()
             .bucket(&self.bucket)
@@ -349,13 +407,10 @@ impl Session {
             .send()
             .await?;
         for upload in uploads.uploads() {
-            client
-                .abort_multipart_upload()
-                .bucket(&self.bucket)
-                .key(&self.key)
-                .upload_id(upload.upload_id().ok_or("listed upload omitted ID")?)
-                .send()
-                .await?;
+            let id = upload.upload_id().ok_or("listed upload omitted ID")?;
+            if !retained.iter().any(|known| known == id) && self.abort_and_verify_source(run, id, partial_create).await? {
+                retained.push(id.to_owned());
+            }
         }
         let uploads = client
             .list_multipart_uploads()
@@ -363,7 +418,14 @@ impl Session {
             .prefix(&self.key)
             .send()
             .await?;
-        assert!(uploads.uploads().is_empty(), "upload metadata survived cleanup");
+        let mut remaining: Vec<_> = uploads
+            .uploads()
+            .iter()
+            .map(|upload| upload.upload_id().expect("listed upload ID"))
+            .collect();
+        remaining.sort_unstable();
+        retained.sort_unstable();
+        assert_eq!(remaining, retained, "only exact, byte-verified indeterminate sources may remain");
         if matches!(operation, Operation::Create | Operation::Abort) {
             let missing = client
                 .head_object()
@@ -711,10 +773,14 @@ async fn run_matrix(plane: Plane) -> TestResult {
                 "ack": result.as_ref().ok(), "failure": result.as_ref().err() }),
             )
             .await?;
-            let ack = if matches!(scenario, Scenario::PostEntryTwoPeers) {
+            let closure_unavailable = matches!(
+                (plane, operation, scenario),
+                (Plane::Lock, Operation::Abort, Scenario::PostEntryThreePeers)
+            );
+            let ack = if matches!(scenario, Scenario::PostEntryTwoPeers) || closure_unavailable {
                 result
                     .as_ref()
-                    .expect_err("two writable peers cannot acknowledge an EC:2 mutation")
+                    .expect_err("insufficient write quorum or missing native-close participant must not acknowledge")
                     .assert_unavailable();
                 None
             } else {
@@ -747,7 +813,7 @@ async fn run_matrix(plane: Plane) -> TestResult {
             if !killed.is_empty() {
                 run.fully_rejoined("restart", nonce).await?;
             }
-            session.verify_and_cleanup(&run, operation, ack).await?;
+            session.verify_and_cleanup(&run, operation, scenario, ack).await?;
             run.drained(&session.bucket, nonce).await?;
         }
     }
