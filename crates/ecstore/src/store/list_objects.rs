@@ -4640,7 +4640,7 @@ impl ECStore {
         let bucket = bucket.to_owned();
         // Not awaited: callers may drain `result` only after this returns, so
         // waiting on the forwarder here could stall them on the channel bound.
-        let _forwarder = spawn_walk_entry_forwarder(merge_rx, result, opts, bucket.clone());
+        let _forwarder = spawn_walk_entry_forwarder(rx.clone(), merge_rx, result, opts, bucket.clone());
 
         let merge_task = spawn_listing_merge(rx, inputs, merge_tx);
 
@@ -4677,16 +4677,25 @@ impl ECStore {
 /// Forwards merged raw entries to a walk consumer as `ObjectInfoOrErr`,
 /// applying the walk's version projection, sort order and filter. The first
 /// entry that fails to decode ends the stream with that error; a consumer that
-/// stopped reading ends it silently.
+/// stopped reading ends it silently. Either exit cancels the walk's producers.
 fn spawn_walk_entry_forwarder(
+    rx: CancellationToken,
     mut entries: Receiver<MetaCacheEntry>,
     result: Sender<ObjectInfoOrErr>,
     opts: WalkOptions,
     bucket: String,
 ) -> tokio::task::JoinHandle<()> {
+    // Capture before spawning so even an abort before the first poll cancels
+    // the producers. Callers pass a child token to isolate request cancellation.
+    let cancel_on_drop = rx.clone().drop_guard();
     tokio::spawn(
         async move {
-            let versioning = get_versioning_config(&bucket).await.ok().map(|(config, _)| config);
+            let _cancel_on_drop = cancel_on_drop;
+            let versioning = tokio::select! {
+                _ = rx.cancelled() => return,
+                _ = result.closed() => return,
+                versioning = get_versioning_config(&bucket) => versioning.ok().map(|(config, _)| config),
+            };
             let to_object_info = |fi: &rustfs_filemeta::FileInfo| {
                 let versioned = versioning.as_ref().is_some_and(|config| config.versioned(&fi.name));
                 ObjectInfo::from_file_info(fi, &bucket, &fi.name, versioned)
@@ -4697,23 +4706,39 @@ fn spawn_walk_entry_forwarder(
                 err: Some(err.into()),
             };
 
-            while let Some(entry) = entries.recv().await {
+            loop {
+                let entry = tokio::select! {
+                    _ = rx.cancelled() => return,
+                    _ = result.closed() => return,
+                    entry = entries.recv() => match entry {
+                        Some(entry) => entry,
+                        None => return,
+                    },
+                };
+                if entry.is_dir() {
+                    continue;
+                }
                 if opts.latest_only {
                     let fi = match entry.to_fileinfo(&bucket) {
                         Ok(fi) => fi,
                         Err(err) => {
-                            let _ = result.send(decode_failed(err)).await;
+                            let _ = send_or_cancel(&rx, &result, decode_failed(err)).await;
                             return;
                         }
                     };
                     if passes_filter(&fi)
-                        && result
-                            .send(ObjectInfoOrErr {
-                                item: Some(to_object_info(&fi)),
-                                err: None,
-                            })
-                            .await
-                            .is_err()
+                        && !matches!(
+                            send_or_cancel(
+                                &rx,
+                                &result,
+                                ObjectInfoOrErr {
+                                    item: Some(to_object_info(&fi)),
+                                    err: None,
+                                }
+                            )
+                            .await,
+                            Ok(true)
+                        )
                     {
                         return;
                     }
@@ -4727,7 +4752,7 @@ fn spawn_walk_entry_forwarder(
                 } {
                     Ok(versions) => versions,
                     Err(err) => {
-                        let _ = result.send(decode_failed(err)).await;
+                        let _ = send_or_cancel(&rx, &result, decode_failed(err)).await;
                         return;
                     }
                 };
@@ -4744,13 +4769,18 @@ fn spawn_walk_entry_forwarder(
                 };
                 for fi in versions.versions.iter().chain(free_versions) {
                     if passes_filter(fi)
-                        && result
-                            .send(ObjectInfoOrErr {
-                                item: Some(to_object_info(fi)),
-                                err: None,
-                            })
-                            .await
-                            .is_err()
+                        && !matches!(
+                            send_or_cancel(
+                                &rx,
+                                &result,
+                                ObjectInfoOrErr {
+                                    item: Some(to_object_info(fi)),
+                                    err: None,
+                                }
+                            )
+                            .await,
+                            Ok(true)
+                        )
                     {
                         return;
                     }
@@ -5143,7 +5173,7 @@ async fn poll_merge_head(rx: &CancellationToken, in_channels: &mut [Receiver<Met
     }
 }
 
-async fn send_or_cancel(rx: &CancellationToken, out_channel: &Sender<MetaCacheEntry>, entry: MetaCacheEntry) -> Result<bool> {
+async fn send_or_cancel<T: Send>(rx: &CancellationToken, out_channel: &Sender<T>, entry: T) -> Result<bool> {
     tokio::select! {
         result = out_channel.send(entry) => Ok(result.is_ok()),
         _ = rx.cancelled() => Ok(false),
@@ -5521,8 +5551,9 @@ impl SetDisks {
     ) -> Result<()> {
         check_list_objs_args(bucket, prefix, &None)?;
 
+        let rx = rx.child_token();
         let (entry_tx, entry_rx) = mpsc::channel::<MetaCacheEntry>(100);
-        let forwarder = spawn_walk_entry_forwarder(entry_rx, result, opts.clone(), bucket.to_owned());
+        let forwarder = spawn_walk_entry_forwarder(rx.clone(), entry_rx, result, opts.clone(), bucket.to_owned());
 
         let list_options = recursive_walk_list_path_options(bucket.to_owned(), prefix, &opts);
         let list_result = self.list_path(rx, list_options, entry_tx).await;
@@ -6194,6 +6225,169 @@ mod test {
             cached: Some(meta),
             reusable: false,
         }
+    }
+
+    #[tokio::test]
+    async fn walk_forwarder_skips_synthetic_directories_and_keeps_directory_objects() {
+        for latest_only in [true, false] {
+            let (entry_tx, entry_rx) = mpsc::channel(4);
+            entry_tx
+                .send(MetaCacheEntry {
+                    name: "synthetic/".to_owned(),
+                    ..Default::default()
+                })
+                .await
+                .expect("queue synthetic directory");
+            for name in ["marker/", "object"] {
+                entry_tx.send(test_object_meta_entry(name)).await.expect("queue real object");
+            }
+            drop(entry_tx);
+            let (result_tx, mut result_rx) = mpsc::channel(4);
+            let parent = CancellationToken::new();
+            let cancel = parent.child_token();
+            let forwarder = super::spawn_walk_entry_forwarder(
+                cancel.clone(),
+                entry_rx,
+                result_tx,
+                super::WalkOptions {
+                    latest_only,
+                    ..Default::default()
+                },
+                "bucket".to_owned(),
+            );
+            timeout(Duration::from_secs(5), forwarder)
+                .await
+                .expect("finite walk should finish")
+                .expect("forwarder should not panic");
+            let mut names = Vec::new();
+            while let Some(result) = result_rx.recv().await {
+                assert!(result.err.is_none(), "directory projection must not produce a decoding error");
+                names.push(result.item.expect("real object should be projected").name);
+            }
+            assert_eq!(names, ["marker/", "object"], "latest_only={latest_only}");
+            assert!(cancel.is_cancelled(), "finished forwarder must stop its producers");
+            assert!(!parent.is_cancelled(), "walk completion must not cancel its caller");
+        }
+    }
+
+    #[tokio::test]
+    async fn walk_forwarder_cancels_idle_producers_when_consumer_closes() {
+        let (entry_tx, entry_rx) = mpsc::channel(1);
+        let (result_tx, result_rx) = mpsc::channel(1);
+        let parent = CancellationToken::new();
+        let cancel = parent.child_token();
+        let forwarder = super::spawn_walk_entry_forwarder(
+            cancel.clone(),
+            entry_rx,
+            result_tx,
+            super::WalkOptions {
+                filter: Some(|_| false),
+                ..Default::default()
+            },
+            "bucket".to_owned(),
+        );
+        drop(result_rx);
+        timeout(Duration::from_secs(5), forwarder)
+            .await
+            .expect("consumer closure must stop the walk even without an emitted entry")
+            .expect("forwarder should not panic");
+        assert!(entry_tx.is_closed(), "producer channel must close without scanning more entries");
+        assert!(cancel.is_cancelled(), "consumer closure must cancel disk scans");
+        assert!(!parent.is_cancelled(), "consumer closure must not cancel its caller");
+    }
+
+    #[tokio::test]
+    async fn walk_forwarder_cancellation_interrupts_output_backpressure() {
+        let (entry_tx, entry_rx) = mpsc::channel(2);
+        entry_tx
+            .send(test_object_meta_entry("first"))
+            .await
+            .expect("queue first object");
+        entry_tx
+            .send(test_object_meta_entry("second"))
+            .await
+            .expect("queue second object");
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+        let parent = CancellationToken::new();
+        let cancel = parent.child_token();
+        let forwarder = super::spawn_walk_entry_forwarder(
+            cancel.clone(),
+            entry_rx,
+            result_tx,
+            super::WalkOptions::default(),
+            "bucket".to_owned(),
+        );
+        timeout(Duration::from_secs(5), async {
+            while entry_tx.capacity() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("forwarder should read the second entry while its output is full");
+        cancel.cancel();
+        timeout(Duration::from_secs(5), forwarder)
+            .await
+            .expect("cancellation must interrupt a blocked output send")
+            .expect("forwarder should not panic");
+        assert_eq!(result_rx.recv().await.expect("first output").item.expect("first object").name, "first");
+        assert!(
+            result_rx.recv().await.is_none(),
+            "second entry must not pass the full output after cancellation"
+        );
+        assert!(entry_tx.is_closed());
+        assert!(!parent.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn walk_forwarder_abort_before_poll_cancels_producers() {
+        let (entry_tx, entry_rx) = mpsc::channel(1);
+        let (result_tx, _result_rx) = mpsc::channel(1);
+        let parent = CancellationToken::new();
+        let cancel = parent.child_token();
+        let forwarder = super::spawn_walk_entry_forwarder(
+            cancel.clone(),
+            entry_rx,
+            result_tx,
+            super::WalkOptions::default(),
+            "bucket".to_owned(),
+        );
+        forwarder.abort();
+        assert!(forwarder.await.expect_err("task should be aborted").is_cancelled());
+        assert!(cancel.is_cancelled(), "unpolled task must retain the producer cancellation guard");
+        assert!(entry_tx.is_closed());
+        assert!(!parent.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn walk_forwarder_reports_corruption_before_cancelling_producers() {
+        let (entry_tx, entry_rx) = mpsc::channel(1);
+        entry_tx
+            .send(MetaCacheEntry {
+                name: "corrupt".to_owned(),
+                metadata: vec![0xff],
+                ..Default::default()
+            })
+            .await
+            .expect("queue corrupt metadata");
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let forwarder = super::spawn_walk_entry_forwarder(
+            cancel.clone(),
+            entry_rx,
+            result_tx,
+            super::WalkOptions::default(),
+            "bucket".to_owned(),
+        );
+        timeout(Duration::from_secs(5), forwarder)
+            .await
+            .expect("corruption must terminate the walk")
+            .expect("forwarder should not panic");
+        let result = result_rx.recv().await.expect("corruption must be reported");
+        assert!(result.item.is_none());
+        assert!(result.err.is_some(), "corruption must not become a successful end of stream");
+        assert!(result_rx.recv().await.is_none());
+        assert!(cancel.is_cancelled());
+        assert!(entry_tx.is_closed());
     }
 
     fn test_unversioned_object_meta_entry(

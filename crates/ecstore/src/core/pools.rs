@@ -19664,8 +19664,7 @@ impl ECStore {
                 tx,
                 StorageWalkOptions::<fn(&FileInfo) -> bool> {
                     latest_only: true,
-                    // Walks also emit synthetic directories, which have no modification time.
-                    filter: Some(|info| info.mod_time.is_some() && !info.deleted && info.version_purge_status().is_empty()),
+                    filter: Some(|info| !info.deleted && info.version_purge_status().is_empty()),
                     ..Default::default()
                 },
             );
