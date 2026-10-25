@@ -1453,6 +1453,18 @@ impl NodeService {
             request_id.as_deref(),
         )
         .await;
+        #[cfg(feature = "e2e-test-hooks")]
+        if matches!(&source.operation, MultipartSourceOperation::DeleteAborted { .. }) {
+            // This phase follows the all-participant source close. Delaying
+            // Inspect or PrepareAbort instead would test a different contract.
+            super::e2e_rpc_delay::disk(
+                super::e2e_rpc_delay::Method::DeleteAbortedMultipartSource,
+                RUSTFS_META_MULTIPART_BUCKET,
+                &source.path,
+                request_id.as_deref(),
+            )
+            .await;
+        }
         let result = target.recover_local_multipart_source(&request.disk, source).await;
         let result = result.and_then(|mut result| {
             result.prepare_wire()?;

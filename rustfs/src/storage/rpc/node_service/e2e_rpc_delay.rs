@@ -38,6 +38,7 @@ pub(super) enum Method {
     RenameData,
     RenameMultipartData,
     RecoverMultipartSource,
+    DeleteAbortedMultipartSource,
     Delete,
     Lock,
     LockBatch,
@@ -87,7 +88,11 @@ impl Arm {
                         && self.methods.iter().all(|method| {
                             matches!(
                                 method,
-                                Method::WriteMetadata | Method::RenamePart | Method::Delete | Method::RecoverMultipartSource
+                                Method::WriteMetadata
+                                    | Method::RenamePart
+                                    | Method::Delete
+                                    | Method::RecoverMultipartSource
+                                    | Method::DeleteAbortedMultipartSource
                             )
                         })
                 }
@@ -424,6 +429,16 @@ mod tests {
         assert!(!arm.matches(Method::RecoverMultipartSource, ".rustfs.sys", &format!("{hash}/upload")));
         assert!(!arm.matches(Method::RecoverMultipartSource, ".rustfs.sys/multipart", "other/upload"));
         assert!(!arm.matches(Method::Delete, ".rustfs.sys/multipart", &format!("{hash}/upload")));
+        let cleanup: Arm = serde_json::from_value(serde_json::json!({
+            "nonce": Uuid::new_v4(), "methods": ["delete_aborted_multipart_source"],
+            "scope": { "class": "multipart", "sha256": hash },
+            "delay": { "kind": "hold" }
+        }))
+        .expect("closed native source cleanup arm");
+        assert!(cleanup.validate());
+        assert!(cleanup.matches(Method::DeleteAbortedMultipartSource, ".rustfs.sys/multipart", &format!("{hash}/upload")));
+        assert!(!cleanup.matches(Method::RecoverMultipartSource, ".rustfs.sys/multipart", &format!("{hash}/upload")));
+        assert!(!cleanup.matches(Method::DeleteAbortedMultipartSource, ".rustfs.sys/multipart", "other/upload"));
     }
 
     #[test]
