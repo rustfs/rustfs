@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::core::pools::{POOL_META_NAME, load_pool_meta_identity_observing};
-use crate::disk::{self, error::DiskError};
+use crate::disk::{self, current_resource_unit, error::DiskError, with_optional_resource_unit};
 use crate::services::rebalance::{REBAL_META_NAME, RebalStatus};
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::heal::HealOperations as _;
@@ -301,12 +301,15 @@ impl ECStore {
         let opts = *opts;
         // Dropping a caller's cancellation/timeout waiter must not release the lifecycle
         // owner while a storage operation is still committing.
-        tokio::spawn(BUCKET_HEAL_SCOPE.scope(scope.clone(), async move {
-            scope.check().map_err(Error::from)?;
-            let result = operation(store, bucket, opts).await;
-            scope.check().map_err(Error::from)?;
-            result
-        }))
+        tokio::spawn(with_optional_resource_unit(
+            current_resource_unit(),
+            BUCKET_HEAL_SCOPE.scope(scope.clone(), async move {
+                scope.check().map_err(Error::from)?;
+                let result = operation(store, bucket, opts).await;
+                scope.check().map_err(Error::from)?;
+                result
+            }),
+        ))
         .await
         .map_err(|error| Error::other_with_context("bucket heal owner task failed", error))?
     }
@@ -1953,6 +1956,11 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn bucket_incarnation_heal_owner_survives_cancelled_waiter_and_queued_writer() {
+        use crate::disk::{current_resource_unit, with_background_resource_unit};
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+
+        let resources = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
         let (_root, store, shutdown) = multi_pool_heal_store().await;
         let bucket = format!("heal-owner-{}", Uuid::new_v4().simple());
         store
@@ -1965,14 +1973,16 @@ mod tests {
         let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
         let worker_store = store.clone();
         let worker_bucket = bucket.clone();
-        let waiter = tokio::spawn(async move {
+        let waiter = tokio::spawn(with_background_resource_unit(resources.acquire().await, async move {
             worker_store
                 .run_bucket_heal_at_incarnation(
                     &worker_bucket,
                     identity,
                     &HealOpts::default(),
                     move |store, bucket, opts| async move {
-                        started_tx.send(()).expect("announce held generation");
+                        started_tx
+                            .send(current_resource_unit().is_some())
+                            .expect("announce held generation");
                         release_rx.await.expect("release commit");
                         let result = store
                             .heal_object_with_proof(&bucket, "history.txt", &Uuid::new_v4().to_string(), &opts)
@@ -1985,10 +1995,11 @@ mod tests {
                     },
                 )
                 .await
-        });
-        started_rx.await.expect("operation acquired generation fence");
+        }));
+        let inherited = started_rx.await.expect("operation acquired generation fence");
         waiter.abort();
         assert!(waiter.await.expect_err("waiter aborted").is_cancelled());
+        let held = resources.snapshot().active;
         let writer_store = store.clone();
         let writer_bucket = bucket.clone();
         let mut writer = Box::pin(writer_store.acquire_bucket_lifecycle_write_lock(&writer_bucket));
@@ -2007,6 +2018,15 @@ mod tests {
             .expect("lifecycle writer");
         drop(guard);
         shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while resources.snapshot().active != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drained heal releases its resource unit");
+        assert!(inherited, "owned bucket heal must inherit resource ownership");
+        assert_eq!(held, 1, "cancelled waiter must not release a live heal's resource unit");
     }
 
     async fn minimal_heal_store() -> ECStore {

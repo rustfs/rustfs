@@ -645,6 +645,11 @@ impl FileMetaShallowVersion {
         write_quorum_from_header_and_meta(&self.header, self.meta.as_slice(), fallback_quorum)
     }
 
+    /// Quorum for listing this version without accepting an unreadable payload.
+    pub fn listing_quorum(&self, fallback_quorum: usize, unreachable_disks: usize) -> usize {
+        listing_quorum_from_header_and_meta(&self.header, &self.meta, fallback_quorum, unreachable_disks)
+    }
+
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfo> {
         FileMetaVersion::decode_fileinfo_from_slice(self.meta.as_slice(), volume, path, all_parts, true)
     }
@@ -661,6 +666,33 @@ pub(crate) fn write_quorum_from_header_and_meta(header: &FileMetaVersionHeader, 
         .ok()
         .and_then(|version| version.erasure_write_quorum())
         .unwrap_or(header_quorum)
+}
+
+pub(crate) fn listing_quorum_from_header_and_meta(
+    header: &FileMetaVersionHeader,
+    meta: &[u8],
+    fallback_quorum: usize,
+    unreachable_disks: usize,
+) -> usize {
+    let geometry = if header.version_type == VersionType::Object && header.has_ec() {
+        Some((usize::from(header.ec_m), usize::from(header.ec_n)))
+    } else if matches!(header.version_type, VersionType::Object | VersionType::Legacy) {
+        FileMetaVersion::try_from(meta)
+            .ok()
+            .and_then(|version| version.erasure_geometry())
+    } else {
+        None
+    };
+    let Some((data_blocks, parity_blocks)) = geometry else {
+        return fallback_quorum;
+    };
+    let Some(write_quorum) = write_quorum_from_erasure(data_blocks, parity_blocks) else {
+        return fallback_quorum;
+    };
+    write_quorum
+        .saturating_sub(unreachable_disks)
+        .max(data_blocks)
+        .max(fallback_quorum)
 }
 
 impl TryFrom<FileMetaVersion> for FileMetaShallowVersion {
@@ -705,8 +737,8 @@ pub(super) struct V2ObjectSliceSummary {
 }
 
 impl FileMetaVersion {
-    fn erasure_write_quorum(&self) -> Option<usize> {
-        let (data_blocks, parity_blocks) = match self.version_type {
+    fn erasure_geometry(&self) -> Option<(usize, usize)> {
+        Some(match self.version_type {
             VersionType::Object | VersionType::Legacy => {
                 if let Some(object) = &self.object {
                     (object.erasure_m, object.erasure_n)
@@ -717,8 +749,11 @@ impl FileMetaVersion {
                 }
             }
             _ => return None,
-        };
+        })
+    }
 
+    fn erasure_write_quorum(&self) -> Option<usize> {
+        let (data_blocks, parity_blocks) = self.erasure_geometry()?;
         write_quorum_from_erasure(data_blocks, parity_blocks)
     }
 
@@ -4163,11 +4198,7 @@ pub(crate) fn merge_file_meta_borrowed_streams(
 
         let required_quorum = streams[0]
             .first()
-            .map(|&(hdr, meta)| {
-                write_quorum_from_header_and_meta(hdr, meta, quorum)
-                    .saturating_sub(write_quorum_slack)
-                    .max(quorum)
-            })
+            .map(|&(hdr, meta)| listing_quorum_from_header_and_meta(hdr, meta, quorum, write_quorum_slack))
             .unwrap_or(quorum);
         if streams.len() >= required_quorum {
             return streams[0].iter().copied().map(to_shallow).collect();
@@ -4181,9 +4212,7 @@ pub(crate) fn merge_file_meta_borrowed_streams(
 
     let required_quorum = |(hdr, meta): (&FileMetaVersionHeader, &[u8])| {
         if enforce_write_quorum {
-            write_quorum_from_header_and_meta(hdr, meta, quorum)
-                .saturating_sub(write_quorum_slack)
-                .max(quorum)
+            listing_quorum_from_header_and_meta(hdr, meta, quorum, write_quorum_slack)
         } else {
             quorum
         }
@@ -5154,6 +5183,48 @@ mod tests {
 
         assert_eq!(version.header.write_quorum(5), 5);
         assert_eq!(version.write_quorum(5), 7);
+    }
+
+    #[test]
+    fn listing_quorum_uses_each_versions_data_floor() {
+        for (data, parity, offline, fallback, expected) in
+            [(8, 8, 0, 9, 9), (8, 8, 8, 8, 8), (12, 4, 8, 8, 12), (12, 4, 0, 9, 12)]
+        {
+            let version = FileMetaShallowVersion {
+                header: FileMetaVersionHeader {
+                    version_type: VersionType::Object,
+                    ec_m: data,
+                    ec_n: parity,
+                    ..Default::default()
+                },
+                // Modern headers must not decode the payload to decide quorum.
+                meta: vec![0xff],
+            };
+            assert_eq!(version.listing_quorum(fallback, offline), expected);
+        }
+        let marker = FileMetaShallowVersion {
+            header: FileMetaVersionHeader {
+                version_type: VersionType::Delete,
+                ..Default::default()
+            },
+            meta: Vec::new(),
+        };
+        assert_eq!(marker.listing_quorum(9, 0), 9, "healthy marker needs majority metadata");
+        assert_eq!(marker.listing_quorum(8, 8), 8, "degraded marker retains metadata floor");
+    }
+
+    #[test]
+    fn listing_quorum_preserves_legacy_and_zero_parity_data_floor() {
+        for (data, parity, fallback, expected) in [(12, 4, 8, 12), (8, 8, 8, 8), (4, 0, 2, 4)] {
+            let version = FileMetaShallowVersion {
+                header: FileMetaVersionHeader {
+                    version_type: VersionType::Object,
+                    ..Default::default()
+                },
+                meta: encode_legacy_v2_object_body(data, parity),
+            };
+            assert_eq!(version.listing_quorum(fallback, 8), expected);
+        }
     }
 
     #[test]

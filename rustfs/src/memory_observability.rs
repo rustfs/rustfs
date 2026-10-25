@@ -396,6 +396,50 @@ fn record_effective_memory(total_bytes: u64) {
     metrics::gauge!("rustfs_memory_effective_total_bytes", "basis" => basis).set(total_bytes as f64);
 }
 
+/// These are live process-cgroup observations, separate from the startup-only
+/// container gauges. Consumers must require availability and a fresh timestamp;
+/// a failed sample does not overwrite an unknown resource with zero.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn record_background_resource_sample(sample: Option<crate::cgroup_resources::live::ResourceSample>, observed_at: u64) {
+    let Some(sample) = sample else {
+        metrics::gauge!("rustfs_background_resource_sample_available").set(0.0);
+        return;
+    };
+    metrics::gauge!("rustfs_background_resource_cpu_millis").set(sample.cpu_millis as f64);
+    metrics::gauge!("rustfs_background_resource_memory_limit_bytes").set(sample.memory_limit as f64);
+    metrics::gauge!("rustfs_background_resource_memory_headroom_bytes").set(sample.memory_headroom as f64);
+    // Two exact 32-bit values preserve the generation identity in floating-point
+    // metrics without introducing a new label for every cgroup replacement.
+    metrics::gauge!("rustfs_background_resource_identity_high").set((sample.identity >> 32) as f64);
+    metrics::gauge!("rustfs_background_resource_identity_low").set((sample.identity & u64::from(u32::MAX)) as f64);
+    for (name, resource, value) in [
+        ("rustfs_background_resource_cpu_usage_microseconds", "cpu_usage", sample.cpu_usage_usec),
+        (
+            "rustfs_background_resource_cpu_throttled_microseconds",
+            "cpu_throttled",
+            sample.cpu_throttled_usec,
+        ),
+        ("rustfs_background_resource_cpu_stall_microseconds", "cpu_stall", sample.cpu_stall_usec),
+        (
+            "rustfs_background_resource_memory_stall_microseconds",
+            "memory_stall",
+            sample.memory_stall_usec,
+        ),
+        ("rustfs_background_resource_io_stall_microseconds", "io_stall", sample.io_stall_usec),
+    ] {
+        metrics::gauge!("rustfs_background_resource_counter_available", "resource" => resource).set(if value.is_some() {
+            1.0
+        } else {
+            0.0
+        });
+        if let Some(value) = value {
+            metrics::gauge!(name).set(value as f64);
+        }
+    }
+    metrics::gauge!("rustfs_background_resource_observed_timestamp_seconds").set(observed_at as f64);
+    metrics::gauge!("rustfs_background_resource_sample_available").set(1.0);
+}
+
 /// Record container resource detection results.
 fn record_container_resource_detection() {
     let res = crate::cgroup_resources::container_resources();
@@ -417,6 +461,17 @@ async fn record_memory_snapshot(process_sampler: Arc<Mutex<ProcessSampler>>) {
     match tokio::task::spawn_blocking(move || {
         let mut sampler = process_sampler.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (resource, process) = sampler.snapshot_resource_and_system();
+        #[cfg(any(target_os = "linux", all(test, unix)))]
+        {
+            // Reuse the existing blocking sampling worker. No filesystem reads
+            // or new tasks are added to object, scanner or heal execution paths.
+            let sample = crate::cgroup_resources::live::sample().ok();
+            if let Ok(observed_at) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                record_background_resource_sample(sample, observed_at.as_secs());
+            } else {
+                record_background_resource_sample(None, 0);
+            }
+        }
         let effective_memory = refresh_effective_memory();
         let cgroup = read_cgroup_memory_snapshot();
         let allocator = read_allocator_memory_snapshot();
@@ -488,6 +543,88 @@ mod tests {
     };
     use std::fs;
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    #[test]
+    fn live_resource_metrics_follow_shrink_and_preserve_unknown_observations() {
+        use crate::cgroup_resources::live::ResourceSample;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        // DebuggingRecorder snapshots drain every gauge. Use one snapshot per
+        // independent scenario so later assertions cannot observe that drain.
+        for stage in 0..3 {
+            let recorder = DebuggingRecorder::new();
+            let mut sample = ResourceSample {
+                cpu_millis: 2000,
+                memory_limit: 268435456,
+                memory_headroom: 134217728,
+                cpu_usage_usec: Some(123),
+                cpu_throttled_usec: Some(7),
+                cpu_stall_usec: Some(4),
+                memory_stall_usec: None,
+                io_stall_usec: Some(9),
+                identity: u64::MAX,
+            };
+            metrics::with_local_recorder(&recorder, || {
+                super::record_background_resource_sample(Some(sample), 100);
+                if stage > 0 {
+                    sample.cpu_millis = 1000;
+                    sample.memory_limit = 201326592;
+                    sample.memory_headroom = 0;
+                    sample.io_stall_usec = None;
+                    super::record_background_resource_sample(Some(sample), 101);
+                }
+                if stage > 1 {
+                    super::record_background_resource_sample(None, 102);
+                }
+            });
+            let values = recorder.snapshotter().snapshot().into_vec();
+            let gauge = |name: &str, resource: Option<&str>| {
+                values.iter().find_map(|(key, _, _, value)| {
+                    (key.key().name() == name
+                        && key
+                            .key()
+                            .labels()
+                            .find(|label| label.key() == "resource")
+                            .map(|label| label.value())
+                            == resource)
+                        .then(|| match value {
+                            DebugValue::Gauge(value) => value.into_inner(),
+                            _ => panic!("expected gauge {name}"),
+                        })
+                })
+            };
+            assert_eq!(gauge("rustfs_background_resource_identity_high", None), Some(f64::from(u32::MAX)));
+            assert_eq!(gauge("rustfs_background_resource_identity_low", None), Some(f64::from(u32::MAX)));
+            assert_eq!(gauge("rustfs_background_resource_counter_available", Some("memory_stall")), Some(0.0));
+            assert_eq!(gauge("rustfs_background_resource_memory_stall_microseconds", None), None);
+            assert_eq!(gauge("rustfs_background_resource_io_stall_microseconds", None), Some(9.0));
+            assert_eq!(
+                gauge("rustfs_background_resource_counter_available", Some("io_stall")),
+                Some(if stage == 0 { 1.0 } else { 0.0 })
+            );
+            assert_eq!(
+                gauge("rustfs_background_resource_cpu_millis", None),
+                Some(if stage == 0 { 2000.0 } else { 1000.0 })
+            );
+            assert_eq!(
+                gauge("rustfs_background_resource_memory_limit_bytes", None),
+                Some(if stage == 0 { 268435456.0 } else { 201326592.0 })
+            );
+            assert_eq!(
+                gauge("rustfs_background_resource_memory_headroom_bytes", None),
+                Some(if stage == 0 { 134217728.0 } else { 0.0 })
+            );
+            assert_eq!(
+                gauge("rustfs_background_resource_sample_available", None),
+                Some(if stage == 2 { 0.0 } else { 1.0 })
+            );
+            assert_eq!(
+                gauge("rustfs_background_resource_observed_timestamp_seconds", None),
+                Some(if stage == 0 { 100.0 } else { 101.0 })
+            );
+        }
+    }
 
     #[test]
     fn parse_cgroup_memory_stat_extracts_tracked_numeric_fields() {

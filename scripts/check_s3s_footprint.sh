@@ -65,7 +65,7 @@ cd "$(dirname "$0")/.."
 # other reductions. The merged tree measures 209 import files and 1586
 # invocation lines, tightening main's reviewed 1592-line baseline by six.
 S3S_IMPORT_FILES_BASELINE=209
-S3_ERROR_LINES_BASELINE=1572
+S3_ERROR_LINES_BASELINE=1571
 # ecstore-scoped ratchet (rustfs/backlog#1842): the storage engine must not
 # know S3 wire/DTO types (ARCHITECTURE.md invariant 4). The S3-*consuming*
 # client was extracted to crates/s3-client, where s3s usage is legitimate;

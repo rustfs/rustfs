@@ -53,8 +53,8 @@ pub struct MetadataResolutionParams {
     pub strict: bool,
     /// Number of set drives that were unreachable when the listing snapshot was
     /// taken. Write-quorum enforcement relaxes each version's required quorum by
-    /// this amount (never below `obj_quorum`): a version legally committed at
-    /// write quorum can have that many of its metadata copies on drives no
+    /// this amount, never below the version's data quorum or `obj_quorum`. A
+    /// version legally committed at write quorum can have metadata on drives no
     /// reader could consult, and must not be dropped for it.
     pub write_quorum_slack: usize,
     pub candidates: Vec<Vec<FileMetaShallowVersion>>,
@@ -139,14 +139,13 @@ impl MetaCacheEntry {
             return idx.is_none() || idx.unwrap() == self.name.len() - separator.len();
         }
 
-        let ext = self.name.trim_start_matches(dir);
+        // Strip `dir` exactly once: a repeated strip would treat `a/a/b` as a
+        // direct child of `a/`.
+        let Some(ext) = self.name.strip_prefix(dir) else {
+            return false;
+        };
 
-        if ext.len() != self.name.len() {
-            let idx = ext.find(separator);
-            return idx.is_none() || idx.unwrap() == ext.len() - separator.len();
-        }
-
-        false
+        ext.find(separator).is_none_or(|idx| idx == ext.len() - separator.len())
     }
 
     pub fn is_object(&self) -> bool {
@@ -159,10 +158,11 @@ impl MetaCacheEntry {
 
     pub fn is_latest_delete_marker(&mut self) -> bool {
         if let Some(cached) = &self.cached {
-            if cached.versions.is_empty() {
-                return true;
-            }
-            return cached.versions[0].header.version_type == VersionType::Delete;
+            return cached
+                .versions
+                .iter()
+                .find(|version| !version.header.free_version())
+                .is_none_or(|version| version.header.version_type == VersionType::Delete);
         }
 
         if !FileMeta::is_xl2_v1_format(&self.metadata) {
@@ -179,12 +179,11 @@ impl MetaCacheEntry {
         }
 
         match self.xl_meta() {
-            Ok(res) => {
-                if res.versions.is_empty() {
-                    return true;
-                }
-                res.versions[0].header.version_type == VersionType::Delete
-            }
+            Ok(res) => res
+                .versions
+                .iter()
+                .find(|version| !version.header.free_version())
+                .is_none_or(|version| version.header.version_type == VersionType::Delete),
             Err(_) => true,
         }
     }
@@ -275,6 +274,88 @@ impl MetaCacheEntry {
         // tier free-version records into `free_versions` without allocating an
         // intermediate `FileMeta`.
         FileMeta::decode_file_info_versions_from_buf(&self.metadata, bucket, self.name.as_str(), false)
+    }
+
+    fn borrow_metadata(&self) -> Result<crate::filemeta::BorrowedFileMeta<'_>> {
+        if self.is_dir() {
+            return Err(Error::FileNotFound);
+        }
+        match &self.cached {
+            Some(metadata) => Ok(metadata.borrow_cached()),
+            None => FileMeta::decode_borrowed(&self.metadata),
+        }
+    }
+
+    /// Compare a replica group after validating this history once.
+    pub fn headers_agree<'a>(&'a self, replicas: impl IntoIterator<Item = &'a Self>, strict: bool) -> bool {
+        if self.is_dir() {
+            return replicas.into_iter().all(|other| self.name == other.name && other.is_dir());
+        }
+        let Ok(metadata) = self.borrow_metadata() else {
+            return false;
+        };
+        replicas.into_iter().all(|other| {
+            if self.name != other.name || other.is_dir() {
+                return false;
+            }
+            if std::ptr::eq(self, other) {
+                return true;
+            }
+            if let Some(other) = &other.cached {
+                crate::filemeta::reconcile_headers(
+                    other.versions.iter().map(|version| &version.header),
+                    metadata.versions.as_slice().iter().map(|(header, _, _)| header),
+                    true,
+                    strict,
+                )
+                .is_some()
+            } else {
+                FileMeta::decode_borrowed_with_hint(&other.metadata, Some(&metadata)).is_ok_and(|candidate| {
+                    crate::filemeta::reconcile_headers(
+                        candidate.versions.as_slice().iter().map(|(header, _, _)| header),
+                        metadata.versions.as_slice().iter().map(|(header, _, _)| header),
+                        true,
+                        strict,
+                    )
+                    .is_some()
+                })
+            }
+        })
+    }
+
+    fn cached_latest_listing_quorum(&self, params: &MetadataResolutionParams) -> Option<usize> {
+        if params.requested_versions != 1 {
+            return None;
+        }
+        self.cached
+            .as_ref()?
+            .versions
+            .first()
+            .filter(|version| !version.header.free_version())
+            .map(|version| version.listing_quorum(params.obj_quorum, params.write_quorum_slack))
+    }
+
+    /// Whether the inspected versions need more independent replica votes.
+    pub fn needs_quorum_supplement(&self, replicas: usize, params: &MetadataResolutionParams) -> Result<bool> {
+        if let Some(required) = self.cached_latest_listing_quorum(params) {
+            return Ok(replicas < required);
+        }
+        let metadata = self.borrow_metadata()?;
+        let mut selected = 0;
+        for (header, _, meta) in metadata.versions.as_slice() {
+            let required =
+                crate::filemeta::listing_quorum_from_header_and_meta(header, meta, params.obj_quorum, params.write_quorum_slack);
+            if replicas < required && (params.requested_versions == 0 || selected < params.requested_versions) {
+                return Ok(true);
+            }
+            if !header.free_version() {
+                selected += 1;
+            }
+            if params.requested_versions > 0 && selected == params.requested_versions {
+                break;
+            }
+        }
+        Ok(false)
     }
 
     pub fn matches(&self, other: Option<&MetaCacheEntry>, strict: bool) -> (Option<MetaCacheEntry>, bool) {
@@ -408,6 +489,125 @@ impl MetaCacheEntry {
     }
 }
 
+/// Outcome of resolving one history observed identically by independent readers.
+pub enum MetaCacheEntryResolution {
+    Resolved(MetaCacheEntry),
+    NeedsSupplement(MetaCacheEntry),
+    Rejected,
+}
+
+/// Apply per-version listing quorum without materializing unchanged histories.
+#[inline]
+pub fn resolve_agreed_entry(
+    mut entry: MetaCacheEntry,
+    replicas: usize,
+    params: &MetadataResolutionParams,
+    enforce_write_quorum: bool,
+) -> MetaCacheEntryResolution {
+    use MetaCacheEntryResolution::{NeedsSupplement, Rejected, Resolved};
+    if !enforce_write_quorum {
+        return Resolved(entry);
+    }
+    if entry.is_dir() {
+        return if replicas >= params.dir_quorum {
+            Resolved(entry)
+        } else {
+            Rejected
+        };
+    }
+    if replicas < params.obj_quorum {
+        return Rejected;
+    }
+    if let Some(required) = entry.cached_latest_listing_quorum(params) {
+        return if replicas >= required {
+            Resolved(entry)
+        } else {
+            NeedsSupplement(entry)
+        };
+    }
+    let metadata = match entry.borrow_metadata() {
+        Ok(metadata) => metadata,
+        Err(_) if params.obj_quorum <= 1 => return Resolved(entry),
+        Err(_) => return Rejected,
+    };
+    let versions = metadata.versions.as_slice();
+    let mut selected = Vec::new();
+    let mut selected_objects = 0;
+    let mut needs_supplement = false;
+    for (index, (header, _, meta)) in versions.iter().enumerate() {
+        let required =
+            crate::filemeta::listing_quorum_from_header_and_meta(header, meta, params.obj_quorum, params.write_quorum_slack);
+        if replicas < required {
+            needs_supplement |= params.requested_versions == 0 || selected_objects < params.requested_versions;
+            continue;
+        }
+        // The common latest-user-version path keeps the original buffer and cache.
+        if index == 0 && params.requested_versions == 1 && !header.free_version() {
+            return Resolved(entry);
+        }
+        selected.push(index);
+        if !header.free_version() {
+            selected_objects += 1;
+        }
+        if params.requested_versions > 0 && selected_objects == params.requested_versions {
+            break;
+        }
+    }
+    if needs_supplement {
+        return NeedsSupplement(entry);
+    }
+    if selected.is_empty() {
+        return Rejected;
+    }
+    if selected.len() == versions.len() {
+        return Resolved(entry);
+    }
+    if entry.cached.is_some() {
+        drop(metadata);
+        let Some(cached) = entry.cached.as_mut() else {
+            return Rejected;
+        };
+        let mut selected = selected.into_iter().peekable();
+        let mut index = 0;
+        cached.versions.retain(|_| {
+            let keep = selected.peek() == Some(&index);
+            if keep {
+                selected.next();
+            }
+            index += 1;
+            keep
+        });
+        let Ok(metadata) = cached.marshal_msg() else {
+            return Rejected;
+        };
+        entry.metadata = metadata;
+    } else {
+        let mut filtered = FileMeta {
+            meta_ver: metadata.meta_ver,
+            ..Default::default()
+        };
+        if !metadata.inline_buf.is_empty() {
+            filtered.data.update(metadata.inline_buf);
+        }
+        filtered.versions = selected
+            .into_iter()
+            .map(|index| {
+                let (header, _, meta) = &versions[index];
+                FileMetaShallowVersion {
+                    header: header.clone(),
+                    meta: meta.to_vec(),
+                }
+            })
+            .collect();
+        let Ok(serialized) = filtered.marshal_msg() else {
+            return Rejected;
+        };
+        entry.metadata = serialized;
+        entry.cached = Some(filtered);
+    }
+    Resolved(entry)
+}
+
 #[derive(Debug, Default)]
 pub struct MetaCacheEntries(pub Vec<Option<MetaCacheEntry>>);
 
@@ -418,11 +618,23 @@ impl MetaCacheEntries {
     }
 
     pub fn resolve(&self, params: MetadataResolutionParams) -> Option<MetaCacheEntry> {
-        self.resolve_inner(params, false)
+        Self::resolve_inner(&self.0, params, false)
     }
 
     pub fn resolve_with_write_quorum(&self, params: MetadataResolutionParams) -> Option<MetaCacheEntry> {
-        self.resolve_inner(params, true)
+        Self::resolve_inner(&self.0, params, true)
+    }
+
+    /// Resolve independently observed replicas without copying their metadata.
+    ///
+    /// Each occupied slot represents one distinct reader. Repeated references
+    /// are valid only when the caller already established agreement among those
+    /// readers; pointer equality alone is not evidence of extra replicas.
+    pub fn resolve_borrowed_with_write_quorum(
+        entries: &[Option<&MetaCacheEntry>],
+        params: MetadataResolutionParams,
+    ) -> Option<MetaCacheEntry> {
+        Self::resolve_inner(entries, params, true)
     }
 
     /// Resolve the cross-disk UNION of every version present on ANY disk slot.
@@ -631,8 +843,12 @@ impl MetaCacheEntries {
         discovery
     }
 
-    fn resolve_inner(&self, mut params: MetadataResolutionParams, enforce_write_quorum: bool) -> Option<MetaCacheEntry> {
-        if self.0.is_empty() {
+    fn resolve_inner<T: std::borrow::Borrow<MetaCacheEntry>>(
+        entries: &[Option<T>],
+        mut params: MetadataResolutionParams,
+        enforce_write_quorum: bool,
+    ) -> Option<MetaCacheEntry> {
+        if entries.is_empty() {
             debug!(
                 bucket = %params.bucket,
                 dir_quorum = params.dir_quorum,
@@ -652,7 +868,7 @@ impl MetaCacheEntries {
         let mut objs_agree = 0;
         let mut objs_valid = 0;
 
-        for (entry_idx, entry) in self.0.iter().flatten().enumerate() {
+        for (entry_idx, entry) in entries.iter().flatten().map(std::borrow::Borrow::borrow).enumerate() {
             debug!(entry = %entry.name, "metacache resolve examining candidate entry");
             if entry.name.is_empty() {
                 continue;
@@ -688,7 +904,9 @@ impl MetaCacheEntries {
             };
 
             let same_name = entry.name == current_selected.name;
-            let outcome = if let Some(fm) = &entry.cached {
+            let outcome = if std::ptr::eq(entry, *current_selected) {
+                Some(true)
+            } else if let Some(fm) = &entry.cached {
                 let (res, maybe_prev) = selected_borrowed.compare_cached(fm, same_name, params.strict);
                 if let Some(prev) = maybe_prev {
                     fallback_borrowed.push((*current_selected_idx, prev));
@@ -753,16 +971,27 @@ impl MetaCacheEntries {
             return directory.cloned();
         }
 
-        if objs_agree == objs_valid {
+        if objs_agree == objs_valid
+            && (!enforce_write_quorum
+                || (params.requested_versions == 1
+                    && selected_borrowed
+                        .versions
+                        .as_slice()
+                        .first()
+                        .is_some_and(|(header, _, _)| !header.free_version())))
+        {
             let required_quorum = if enforce_write_quorum {
                 selected_borrowed
                     .versions
                     .as_slice()
                     .first()
                     .map(|(hdr, _, meta)| {
-                        crate::filemeta::write_quorum_from_header_and_meta(hdr, meta, params.obj_quorum)
-                            .saturating_sub(params.write_quorum_slack)
-                            .max(params.obj_quorum)
+                        crate::filemeta::listing_quorum_from_header_and_meta(
+                            hdr,
+                            meta,
+                            params.obj_quorum,
+                            params.write_quorum_slack,
+                        )
                     })
                     .unwrap_or(params.obj_quorum)
             } else {
@@ -791,7 +1020,7 @@ impl MetaCacheEntries {
 
         let selected_meta_ver = selected_borrowed.meta_ver;
         let mut streams: Vec<Vec<(&crate::FileMetaVersionHeader, &[u8])>> = Vec::with_capacity(objs_valid);
-        for (entry_idx, entry) in self.0.iter().flatten().enumerate() {
+        for (entry_idx, entry) in entries.iter().flatten().map(std::borrow::Borrow::borrow).enumerate() {
             if entry.name.is_empty() || entry.is_dir() || invalid_entries.contains(&entry_idx) {
                 continue;
             }
@@ -816,6 +1045,10 @@ impl MetaCacheEntries {
         }
         debug_assert_eq!(streams.len(), objs_valid);
 
+        let had_user_versions = enforce_write_quorum
+            && streams
+                .iter()
+                .any(|stream| stream.iter().any(|(header, _)| !header.free_version()));
         let versions = crate::filemeta::merge_file_meta_borrowed_streams(
             params.obj_quorum,
             params.strict,
@@ -824,7 +1057,7 @@ impl MetaCacheEntries {
             params.write_quorum_slack,
             streams,
         );
-        if versions.is_empty() {
+        if versions.is_empty() || (had_user_versions && versions.iter().all(|version| version.header.free_version())) {
             debug!(
                 selected = %selected_ref.name,
                 requested_versions = params.requested_versions,
@@ -902,12 +1135,6 @@ fn normalize_version_id(version_id: Option<Uuid>) -> Option<Uuid> {
 }
 
 #[derive(Debug, Default)]
-pub struct MetaCacheEntriesSortedResult {
-    pub entries: Option<MetaCacheEntriesSorted>,
-    pub err: Option<Error>,
-}
-
-#[derive(Debug, Default)]
 pub struct MetaCacheEntriesSorted {
     pub o: MetaCacheEntries,
     pub list_id: Option<String>,
@@ -921,17 +1148,35 @@ impl MetaCacheEntriesSorted {
         entries
     }
 
+    /// Drop every entry whose name is at or before `marker`.
+    ///
+    /// Entries are sorted by name, so this keeps the suffix starting at the
+    /// first name strictly after the marker; when no such entry exists the
+    /// page is empty. The split index is taken over the raw slots so that
+    /// `None` placeholders cannot shift it.
     pub fn forward_past(&mut self, marker: Option<String>) {
-        if let Some(val) = marker
-            && let Some(idx) = self.o.0.iter().flatten().position(|v| v.name > val)
-        {
-            self.o.0 = self.o.0.split_off(idx);
-        }
+        let Some(val) = marker else {
+            return;
+        };
+        let idx = self
+            .o
+            .0
+            .iter()
+            .position(|v| v.as_ref().is_some_and(|v| v.name > val))
+            .unwrap_or(self.o.0.len());
+        self.o.0 = self.o.0.split_off(idx);
     }
 }
 
 const METACACHE_STREAM_VERSION: u8 = 2;
 const METACACHE_READ_CHUNK_SIZE: usize = 64 << 10;
+/// msgpack `false`: the entry-stream terminator, and the only byte a legacy
+/// reader accepts after it (see `MetacacheWriter::close_with_limit_reached`).
+const METACACHE_TERMINATOR: u8 = 0xc2;
+/// Terminator markers a writer appends after the first one to carry the
+/// producer-stop trailer: one marks a stop at the per-disk limit, two mark
+/// the end of the namespace.
+const METACACHE_TRAILER_MAX_MARKERS: u8 = 2;
 
 #[derive(Debug)]
 pub struct MetacacheWriter<W> {
@@ -1006,8 +1251,29 @@ impl<W: AsyncWrite + Unpin> MetacacheWriter<W> {
     }
 
     pub async fn close(&mut self) -> Result<()> {
+        self.close_with_limit_reached(false).await
+    }
+
+    /// Terminates the stream and records whether the producer stopped at its
+    /// own limit instead of at the end of its namespace.
+    ///
+    /// The trailer is encoded as extra terminator markers after the usual
+    /// `false`: one more means "stopped at the limit", two more mean "reached
+    /// the end of the namespace". Repeating the terminator is the only
+    /// encoding every deployed reader already tolerates: a legacy
+    /// `MetacacheReader` keeps polling a stream after its first `false` and
+    /// reports a clean EOF for each repeated `false`, whereas any other
+    /// trailing byte would decode as a corrupt entry. A legacy writer emits a
+    /// single `false`, which a new reader reports as "no trailer". Rolling
+    /// upgrades are therefore safe in both directions. The exhausted stream
+    /// gets the longer trailer so that a trailer cut short by the transport
+    /// can only be misread as "may have more", never as "complete".
+    pub async fn close_with_limit_reached(&mut self, limit_reached: bool) -> Result<()> {
         self.init().await?;
-        rmp::encode::write_bool(&mut self.buf, false).map_err(|e| Error::other(format!("{e:?}")))?;
+        let markers = 2 + usize::from(!limit_reached);
+        for _ in 0..markers {
+            rmp::encode::write_bool(&mut self.buf, false).map_err(|e| Error::other(format!("{e:?}")))?;
+        }
         self.flush().await?;
         Ok(())
     }
@@ -1021,6 +1287,12 @@ pub struct MetacacheReader<R> {
     buf: Vec<u8>,
     pos: usize,
     has_current: bool,
+    /// The terminator has been consumed; later reads report EOF without
+    /// touching `rd`.
+    terminated: bool,
+    /// Trailer decoded after the terminator; `None` while the stream is open
+    /// and for streams written before the trailer existed.
+    limit_reached: Option<bool>,
 }
 
 impl<R: AsyncRead + Unpin> MetacacheReader<R> {
@@ -1033,6 +1305,66 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
             buf: Vec::new(),
             pos: 0,
             has_current: false,
+            terminated: false,
+            limit_reached: None,
+        }
+    }
+
+    /// Whether the producer stopped at its own limit, as recorded by
+    /// `MetacacheWriter::close_with_limit_reached`. `None` until the
+    /// terminator has been read, and for legacy streams without a trailer.
+    pub fn limit_reached(&self) -> Option<bool> {
+        self.limit_reached
+    }
+
+    /// Consumes the trailer that may follow the terminator just read.
+    ///
+    /// EOF is not an error here: it is how a legacy writer ends a stream. A
+    /// foreign byte ends the trailer too; nothing after the terminator is an
+    /// entry, so it is left unread.
+    async fn read_trailer(&mut self) -> Result<()> {
+        self.terminated = true;
+        let mut markers = 0u8;
+        while markers < METACACHE_TRAILER_MAX_MARKERS {
+            match self.peek_byte().await? {
+                Some(METACACHE_TERMINATOR) => {
+                    self.pos += 1;
+                    markers += 1;
+                }
+                _ => break,
+            }
+        }
+        self.limit_reached = match markers {
+            0 => None,
+            1 => Some(true),
+            _ => Some(false),
+        };
+        self.reset();
+        Ok(())
+    }
+
+    async fn peek_byte(&mut self) -> Result<Option<u8>> {
+        if self.pos < self.buf.len() {
+            return Ok(Some(self.buf[self.pos]));
+        }
+        self.buf.clear();
+        self.pos = 0;
+        let extra = usize::from(METACACHE_TRAILER_MAX_MARKERS);
+        if let Err(e) = self.buf.try_reserve(extra) {
+            let err = Error::other(format!("metacache stream: buffer allocation of {extra} bytes failed: {e}"));
+            self.err = Some(err.clone());
+            return Err(err);
+        }
+        let mut dst = bytes::BufMut::limit(&mut self.buf, extra);
+        match self.rd.read_buf(&mut dst).await {
+            Ok(0) => Ok(None),
+            Ok(_) => Ok(Some(self.buf[0])),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => {
+                let err = Error::from(e);
+                self.err = Some(err.clone());
+                Err(err)
+            }
         }
     }
 
@@ -1230,9 +1562,13 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
         }
 
         while n > 0 {
+            if self.terminated {
+                return Ok(());
+            }
             match rmp::decode::read_bool(&mut self.read_more(1).await?) {
                 Ok(res) => {
                     if !res {
+                        self.read_trailer().await?;
                         return Ok(());
                     }
                 }
@@ -1263,9 +1599,14 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
             return Err(err.clone());
         }
 
+        if self.terminated {
+            return Ok(None);
+        }
+
         match rmp::decode::read_bool(&mut self.read_more(1).await?) {
             Ok(res) => {
                 if !res {
+                    self.read_trailer().await?;
                     return Ok(None);
                 }
             }
@@ -1443,6 +1784,58 @@ mod tests {
     use tokio::sync::{Notify, oneshot};
     use uuid::Uuid;
 
+    fn named_entry(name: &str) -> MetaCacheEntry {
+        MetaCacheEntry {
+            name: name.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn is_in_dir_strips_the_directory_prefix_once() {
+        assert!(named_entry("a/b").is_in_dir("a/", "/"));
+        assert!(named_entry("a/b/").is_in_dir("a/", "/"));
+        assert!(named_entry("a/").is_in_dir("a/", "/"));
+        // `a/a/b` lives in `a/a/`, not directly in `a/`.
+        assert!(!named_entry("a/a/b").is_in_dir("a/", "/"));
+        assert!(!named_entry("b/c").is_in_dir("a/", "/"));
+        assert!(named_entry("top").is_in_dir("", "/"));
+        assert!(named_entry("top/").is_in_dir("", "/"));
+        assert!(!named_entry("top/leaf").is_in_dir("", "/"));
+    }
+
+    #[test]
+    fn forward_past_drops_every_entry_at_or_before_the_marker() {
+        let sorted = |names: &[&str]| MetaCacheEntriesSorted {
+            o: MetaCacheEntries(names.iter().map(|name| Some(named_entry(name))).collect()),
+            ..Default::default()
+        };
+
+        let mut entries = sorted(&["a", "b", "c"]);
+        entries.forward_past(Some("b".to_owned()));
+        assert_eq!(entries.entries().iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["c"]);
+
+        let mut entries = sorted(&["a", "b"]);
+        entries.forward_past(Some("b".to_owned()));
+        assert!(entries.entries().is_empty(), "nothing sorts after the marker");
+
+        let mut entries = sorted(&["a", "b"]);
+        entries.forward_past(Some("z".to_owned()));
+        assert!(entries.entries().is_empty(), "a marker past every entry empties the page");
+
+        let mut entries = sorted(&["a", "b"]);
+        entries.forward_past(None);
+        assert_eq!(entries.entries().len(), 2, "no marker keeps the page intact");
+
+        // A `None` slot before the split point must not shift the retained suffix.
+        let mut entries = MetaCacheEntriesSorted {
+            o: MetaCacheEntries(vec![None, Some(named_entry("a")), Some(named_entry("b")), Some(named_entry("c"))]),
+            ..Default::default()
+        };
+        entries.forward_past(Some("a".to_owned()));
+        assert_eq!(entries.entries().iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["b", "c"]);
+    }
+
     #[tokio::test]
     async fn test_writer() {
         let mut f = Cursor::new(Vec::new());
@@ -1555,7 +1948,10 @@ mod tests {
         for _ in 0..1000 {
             bytes.extend_from_slice(&[0xc3, 0xa1, b'x', 0xc4, 1, 0x42]);
         }
-        bytes.push(0xc2);
+        let mut legacy = bytes.clone();
+        legacy.push(METACACHE_TERMINATOR);
+        // A current writer that reached the end of its namespace.
+        bytes.extend_from_slice(&[METACACHE_TERMINATOR; 3]);
         let mut reader = MetacacheReader::new(FragmentedReader {
             data: &bytes,
             chunk: METACACHE_READ_CHUNK_SIZE,
@@ -1563,6 +1959,16 @@ mod tests {
         });
         assert_eq!(reader.read_all().await.expect("decode page").len(), 1000);
         assert_eq!(reader.rd.reads, 1, "a ready page smaller than 64 KiB needs one stream read");
+        assert_eq!(reader.limit_reached(), Some(false));
+
+        let mut reader = MetacacheReader::new(FragmentedReader {
+            data: &legacy,
+            chunk: METACACHE_READ_CHUNK_SIZE,
+            reads: 0,
+        });
+        assert_eq!(reader.read_all().await.expect("decode legacy page").len(), 1000);
+        assert_eq!(reader.rd.reads, 2, "a legacy stream needs one more read to learn that no trailer follows");
+        assert_eq!(reader.limit_reached(), None);
     }
 
     #[tokio::test]
@@ -1599,6 +2005,100 @@ mod tests {
         let mut reader = MetacacheReader::new(Cursor::new(stream));
         reader.skip(1).await.expect("complete entry must be skippable");
         assert_eq!(reader.peek().await.expect_err("skip must restore between-entry state"), Error::Unexpected);
+    }
+
+    #[tokio::test]
+    async fn trailer_round_trips_limit_reached_through_a_new_reader() {
+        for limit_reached in [false, true] {
+            let entries = (0..3)
+                .map(|i| MetaCacheEntry {
+                    name: format!("item{i}"),
+                    metadata: vec![i as u8, 7],
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            let mut output = Cursor::new(Vec::new());
+            let mut writer = MetacacheWriter::new(&mut output);
+            writer.write(&entries).await.expect("entries should be written");
+            writer
+                .close_with_limit_reached(limit_reached)
+                .await
+                .expect("stream should close with a trailer");
+            let bytes = output.into_inner();
+
+            let mut reader = MetacacheReader::new(Cursor::new(bytes.clone()));
+            assert_eq!(reader.limit_reached(), None, "the trailer is unknown until the terminator is read");
+            assert_eq!(reader.read_all().await.expect("stream should decode"), entries);
+            assert_eq!(reader.limit_reached(), Some(limit_reached));
+            // Polling past the terminator stays a clean EOF and never decodes
+            // the trailer as data.
+            assert!(reader.peek().await.expect("EOF must be idempotent").is_none());
+            reader.skip(1).await.expect("skipping past EOF must be a no-op");
+            assert_eq!(reader.limit_reached(), Some(limit_reached));
+
+            // Skipping through the terminator decodes the trailer as well.
+            let mut reader = MetacacheReader::new(Cursor::new(bytes));
+            reader.skip(10).await.expect("skip must stop at the terminator");
+            assert_eq!(reader.limit_reached(), Some(limit_reached));
+            assert!(reader.peek().await.expect("EOF after skip").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_stream_without_trailer_reads_as_no_trailer() {
+        // A pre-trailer writer: version, one entry, a single terminator.
+        let stream = vec![0xcc, 2, 0xc3, 0xa1, b'x', 0xc4, 1, 0x42, METACACHE_TERMINATOR];
+        let mut reader = MetacacheReader::new(Cursor::new(stream));
+        let entries = reader.read_all().await.expect("legacy stream must decode");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "x");
+        assert_eq!(reader.limit_reached(), None);
+        assert!(reader.peek().await.expect("legacy EOF must be idempotent").is_none());
+    }
+
+    #[tokio::test]
+    async fn trailer_stream_decodes_for_a_reader_that_stops_at_the_first_terminator() {
+        // Emulates the decoding loop of a reader that predates the trailer: it
+        // yields every entry, and whatever it can still read afterwards must
+        // decode as another clean terminator rather than as an entry.
+        let entries = (0..3)
+            .map(|i| MetaCacheEntry {
+                name: format!("item{i}"),
+                metadata: vec![i as u8],
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let mut output = Cursor::new(Vec::new());
+        let mut writer = MetacacheWriter::new(&mut output);
+        writer.write(&entries).await.expect("entries should be written");
+        writer
+            .close_with_limit_reached(true)
+            .await
+            .expect("stream should close at the limit");
+        let bytes = output.into_inner();
+
+        let mut cursor = &bytes[..];
+        assert_eq!(rmp::decode::read_u8(&mut cursor).expect("version"), METACACHE_STREAM_VERSION);
+        let mut decoded = Vec::new();
+        while rmp::decode::read_bool(&mut cursor).expect("entry marker") {
+            let len = rmp::decode::read_str_len(&mut cursor).expect("name length") as usize;
+            let name = from_utf8(&cursor[..len]).expect("name is utf8").to_owned();
+            cursor = &cursor[len..];
+            let len = rmp::decode::read_bin_len(&mut cursor).expect("metadata length") as usize;
+            let metadata = cursor[..len].to_vec();
+            cursor = &cursor[len..];
+            decoded.push(MetaCacheEntry {
+                name,
+                metadata,
+                ..Default::default()
+            });
+        }
+        assert_eq!(decoded, entries);
+        assert!(!cursor.is_empty(), "the trailer must follow the first terminator");
+        assert!(
+            cursor.iter().all(|byte| *byte == METACACHE_TERMINATOR),
+            "every trailer byte must be a terminator a legacy reader accepts: {cursor:?}"
+        );
     }
 
     #[tokio::test]
@@ -2859,6 +3359,171 @@ mod tests {
             .expect("resolved committed metadata should decode as file info");
         assert_eq!(info.mod_time, Some(old_mod_time));
         assert_eq!(info.metadata.get("etag").map(String::as_str), Some("old-etag"));
+    }
+
+    #[test]
+    fn borrowed_resolution_counts_reader_slots_and_preserves_owned_semantics() {
+        let time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("fixture time");
+        for cached in [false, true] {
+            for legacy in [false, true] {
+                let mut entry = metacache_entry_with_erasure(time, "etag", 8, 8);
+                if legacy {
+                    entry = metacache_entry_without_header_ec(entry);
+                }
+                if !cached {
+                    entry.cached = None;
+                }
+                for replicas in [0, 1, 7, 8, 9] {
+                    let mut slots = vec![Some(&entry); replicas];
+                    slots.extend([None, None]);
+                    let params = MetadataResolutionParams {
+                        dir_quorum: 8,
+                        obj_quorum: 8,
+                        requested_versions: 1,
+                        write_quorum_slack: 8,
+                        bucket: "bucket".to_owned(),
+                        ..Default::default()
+                    };
+                    let borrowed = MetaCacheEntries::resolve_borrowed_with_write_quorum(&slots, params.clone());
+                    let owned = MetaCacheEntries(slots.iter().map(|slot| slot.map(Clone::clone)).collect())
+                        .resolve_with_write_quorum(params);
+                    assert_eq!(borrowed.is_some(), replicas >= 8, "replicas={replicas}, cached={cached}, legacy={legacy}");
+                    assert_eq!(
+                        borrowed.map(|entry| (entry.name, entry.metadata)),
+                        owned.map(|entry| (entry.name, entry.metadata))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_header_agreement_matches_existing_strict_and_relaxed_contracts() {
+        let time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("fixture time");
+        let current = metacache_entry_with_erasure(time, "current", 8, 8);
+        let older = metacache_entry_with_erasure(time - time::Duration::seconds(1), "older", 8, 8);
+        let legacy = metacache_entry_without_header_ec(current.clone());
+        let mut changed_signature = current.clone();
+        changed_signature.cached.as_mut().expect("cached fixture").versions[0]
+            .header
+            .signature[0] ^= 1;
+        changed_signature.metadata = changed_signature
+            .cached
+            .as_ref()
+            .expect("cached fixture")
+            .marshal_msg()
+            .expect("changed header");
+        let corrupt = MetaCacheEntry {
+            name: "object".to_owned(),
+            metadata: vec![0xff],
+            ..Default::default()
+        };
+        let directory = metacache_dir_entry("object");
+        let cases = [current, older, legacy, changed_signature, corrupt, directory];
+        for strict in [false, true] {
+            for cached in [false, true] {
+                for left in &cases {
+                    for right in &cases {
+                        let mut left = left.clone();
+                        let mut right = right.clone();
+                        if !cached {
+                            left.cached = None;
+                            right.cached = None;
+                        }
+                        assert_eq!(
+                            left.headers_agree([&right], strict),
+                            left.matches(Some(&right), strict).1,
+                            "strict={strict}, cached={cached}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn header_groups_keep_the_original_geometry_baseline_across_legacy_wildcards() {
+        let time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("fixture time");
+        let original = metacache_entry_with_erasure(time, "etag", 8, 8);
+        let legacy = metacache_entry_without_header_ec(original.clone());
+        let mut conflict = original.clone();
+        let metadata = conflict.cached.as_mut().expect("fixture cache");
+        metadata.versions[0].header.ec_m = 12;
+        metadata.versions[0].header.ec_n = 4;
+        conflict.metadata = metadata.marshal_msg().expect("conflicting geometry header");
+        for strict in [false, true] {
+            for cache_mask in 0..8 {
+                let mut replicas = [original.clone(), legacy.clone(), conflict.clone()];
+                for (index, entry) in replicas.iter_mut().enumerate() {
+                    if cache_mask & (1 << index) == 0 {
+                        entry.cached = None;
+                    }
+                }
+                for base in &replicas {
+                    for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+                        let group = order.map(|index| &replicas[index]);
+                        let expected = group.iter().all(|candidate| base.matches(Some(candidate), strict).1);
+                        assert_eq!(
+                            base.headers_agree(group, strict),
+                            expected,
+                            "strict={strict}, mask={cache_mask}, order={order:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn agreed_resolution_preserves_buffers_without_materializing_unchanged_metadata() {
+        let time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("fixture time");
+        for cached in [false, true] {
+            let mut entry = metacache_entry_with_erasure(time, "etag", 8, 8);
+            if !cached {
+                entry.cached = None;
+            }
+            let metadata = entry.metadata.as_ptr();
+            let cached_version = entry.cached.as_ref().map(|meta| meta.versions[0].meta.as_ptr());
+            let MetaCacheEntryResolution::Resolved(entry) = resolve_agreed_entry(
+                entry,
+                8,
+                &MetadataResolutionParams {
+                    dir_quorum: 8,
+                    obj_quorum: 8,
+                    requested_versions: 1,
+                    write_quorum_slack: 8,
+                    ..Default::default()
+                },
+                true,
+            ) else {
+                panic!("eight independent EC8 readers must resolve");
+            };
+            assert_eq!(entry.metadata.as_ptr(), metadata, "unchanged serialized metadata must move");
+            assert_eq!(
+                entry.cached.as_ref().map(|meta| meta.versions[0].meta.as_ptr()),
+                cached_version,
+                "cold metadata stays borrowed and existing decoded buffers move"
+            );
+        }
+    }
+
+    #[test]
+    fn listing_quorum_never_relaxes_a_versions_read_quorum() {
+        let time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("fixture time");
+        for (data, parity, copies, expected) in [(8, 8, 8, true), (12, 4, 8, false), (12, 4, 11, false), (12, 4, 12, true)] {
+            let entry = metacache_entry_with_erasure(time, "etag", data, parity);
+            let entries = MetaCacheEntries(vec![Some(entry); copies]);
+            let resolved = entries.resolve_with_write_quorum(MetadataResolutionParams {
+                obj_quorum: 8,
+                dir_quorum: 8,
+                requested_versions: 1,
+                bucket: "bucket".to_string(),
+                strict: true,
+                write_quorum_slack: 16 - copies,
+                ..Default::default()
+            });
+            assert_eq!(resolved.is_some(), expected, "layout {data}+{parity}, {copies} copies");
+        }
     }
 
     #[test]

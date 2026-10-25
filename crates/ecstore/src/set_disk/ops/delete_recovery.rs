@@ -1784,6 +1784,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_recovery_set_replays_partial_gc_with_empty_transaction_directory() {
+        let bucket = "recover-empty-gc";
+        let (dirs, store, disks) = fixture(bucket).await;
+        put(&store, bucket, &[24; 4096], false).await;
+        let transaction = applied(&store, &disks, bucket, None, disks.len()).await;
+        for (index, disk) in disks.iter().enumerate() {
+            publish(disk, bucket, transaction).await;
+            let state = disk.inspect_delete_transaction(bucket, "object", transaction).await.unwrap();
+            let finished = disk
+                .settle_delete_transaction(bucket, "object", transaction, state.fingerprint, DeleteRecoveryAction::FinishCommit)
+                .await
+                .unwrap();
+            if index > 0 {
+                disk.settle_delete_transaction(
+                    bucket,
+                    "object",
+                    transaction,
+                    finished.fingerprint,
+                    DeleteRecoveryAction::FinalizeCommit,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        // A crash can persist proof removal before the final empty rmdir.
+        let empty = dirs[3].path().join(bucket).join("object").join(transaction.to_string());
+        tokio::fs::create_dir_all(&empty).await.unwrap();
+        for _ in 0..2 {
+            store
+                .recover_delete_transactions(bucket, &HealOpts::default())
+                .await
+                .expect("the remaining receipt must settle every participant without a fresh delete");
+            for disk in &disks {
+                assert!(discover(disk, bucket, Some("object")).await.unwrap().is_empty());
+                assert!(
+                    disk.inspect_delete_transaction(bucket, "object", transaction)
+                        .await
+                        .unwrap()
+                        .current_digest
+                        .is_none()
+                );
+            }
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("ordinary bucket removal must succeed after replay");
+    }
+
+    #[tokio::test]
     async fn delete_recovery_tracks_only_observed_removed_version() {
         let bucket = "recover-actual-removal";
         let (_dirs, store, disks) = fixture(bucket).await;

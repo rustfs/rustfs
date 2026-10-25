@@ -1990,15 +1990,25 @@ impl HealManager {
     pub(crate) async fn durable_mrf_repair_anchor(
         &self,
         intent: &rustfs_common::mrf_channel::MrfIntent,
-    ) -> Option<rustfs_common::mrf_channel::MrfDurableRepairAnchor> {
+    ) -> Result<Option<rustfs_common::mrf_channel::MrfDurableRepairAnchor>> {
         if let Some(purge) = intent.delete_marker_purge.as_ref() {
-            return rustfs_common::mrf_channel::MrfDurableRepairAnchor::from_intent(intent, purge.bucket_incarnation_id);
+            return Ok(rustfs_common::mrf_channel::MrfDurableRepairAnchor::from_intent(
+                intent,
+                purge.bucket_incarnation_id,
+            ));
         }
-        match self.storage.mrf_bucket_incarnation_id(intent.bucket.as_ref()).await {
-            Ok(Some(bucket_incarnation_id)) => {
+        Ok(match self.mrf_bucket_incarnation_id(intent.bucket.as_ref()).await? {
+            Some(bucket_incarnation_id) => {
                 rustfs_common::mrf_channel::MrfDurableRepairAnchor::from_intent(intent, bucket_incarnation_id)
             }
-            Ok(None) | Err(_) => None,
+            None => None,
+        })
+    }
+
+    pub(crate) async fn mrf_bucket_incarnation_id(&self, bucket: &str) -> Result<Option<Uuid>> {
+        match self.storage.mrf_bucket_incarnation_id(bucket).await? {
+            Some(incarnation) if incarnation.is_nil() => Err(Error::InvalidBucketIncarnation),
+            identity => Ok(identity),
         }
     }
 
