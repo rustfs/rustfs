@@ -1652,6 +1652,7 @@ pub(crate) async fn collect_scanner_runtime_metric_stats() -> Option<ScannerRunt
         last_cycle_bucket_drive_results: scanner_bucket_drive_result_stats(&runtime_details.last_cycle_bucket_drive_results),
         active_bucket_drive_scans: scanner_active_bucket_drive_stats(&runtime_details.active_bucket_drive_scans),
         stats: ScannerStats {
+            startup: metrics.startup,
             bucket_scans_finished,
             bucket_scans_started,
             bucket_scans_failed,
@@ -1777,6 +1778,29 @@ pub async fn collect_compression_cluster_stats() -> Option<CompressionClusterSta
 }
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn scanner_startup_snapshot_reaches_the_real_stats_mapping() {
+        use rustfs_scanner_metrics::startup::ScannerStartupPhase;
+        let metrics = rustfs_scanner_metrics::metrics::global_metrics();
+        let token = metrics.startup().begin();
+        metrics
+            .startup()
+            .record_wait(token, tokio::time::Instant::now() + std::time::Duration::from_secs(300));
+        let mapped = super::collect_scanner_runtime_metric_stats().await.expect("scanner stats");
+        assert_eq!(mapped.stats.startup.phase, ScannerStartupPhase::Waiting);
+        assert!(mapped.stats.startup.runtime_active);
+        assert!(mapped.stats.startup.planned_attempt_at_unix_secs.is_some());
+        assert!(mapped.stats.startup.wait_remaining_seconds > 0);
+        assert!(mapped.stats.startup.first_attempt_at_unix_secs.is_none());
+        metrics.startup().finish(token);
+        let stopped = super::collect_scanner_runtime_metric_stats()
+            .await
+            .expect("stopped scanner stats");
+        assert_eq!(stopped.stats.startup.phase, ScannerStartupPhase::Stopped);
+        assert!(!stopped.stats.startup.runtime_active);
+        assert!(stopped.stats.startup.planned_attempt_at_unix_secs.is_none());
+    }
+
     use super::*;
     use rustfs_scanner_metrics::metrics::ScannerSourceWorkSnapshot;
     use std::io::{Read, Write};

@@ -631,6 +631,17 @@ fn decode_cross_pool_fence_capability(expected_member: &str, result: &[u8]) -> R
     Ok((version, epoch))
 }
 
+fn decode_mrf_lifecycle_reader_capability(expected_member: &str, result: &[u8]) -> Result<(u8, Uuid)> {
+    let (&maximum_format_version, identity) = result
+        .split_first()
+        .ok_or_else(|| Error::other("peer returned a truncated MRF lifecycle reader capability"))?;
+    if maximum_format_version == 0 || expected_member.trim().is_empty() {
+        return Err(Error::other("peer returned an invalid MRF lifecycle reader capability"));
+    }
+    let epoch = decode_remote_version_state_capability(expected_member, identity)?;
+    Ok((maximum_format_version, epoch))
+}
+
 #[derive(Clone, Debug)]
 pub struct PeerLiveEventsBatch {
     pub events: Vec<u8>,
@@ -1962,6 +1973,16 @@ impl PeerRestClient {
             .await?;
         let (supported_version, epoch) = decode_cross_pool_fence_capability(&self.topology_member, &result)?;
         Ok((self.topology_member.clone(), supported_version, epoch))
+    }
+
+    /// Reports one peer's reader support without authorizing a lifecycle writer or rollback.
+    pub async fn probe_mrf_lifecycle_reader(&self, topology_fingerprint: String) -> Result<(String, u8, Uuid)> {
+        let probe = rustfs_protos::mrf_lifecycle_reader_capability_probe(Uuid::new_v4().as_bytes());
+        let result = self
+            .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, topology_fingerprint, probe)
+            .await?;
+        let (maximum_format_version, epoch) = decode_mrf_lifecycle_reader_capability(&self.topology_member, &result)?;
+        Ok((self.topology_member.clone(), maximum_format_version, epoch))
     }
 
     pub async fn probe_ilm_recovery_export(&self, topology_fingerprint: String) -> Result<(String, Uuid)> {
@@ -4331,6 +4352,49 @@ mod tests {
                 .expect_err("proof must not authenticate a different command or result");
             assert!(err.to_string().contains("invalid heal control response proof"));
         }
+    }
+
+    #[test]
+    fn mrf_lifecycle_reader_capability_decoder_preserves_the_advertised_version() {
+        let epoch = Uuid::new_v4();
+        for version in [1, 2, u8::MAX] {
+            let result = rustfs_protos::encode_mrf_lifecycle_reader_capability(version, "node-a:9000", epoch.as_bytes())
+                .expect("capability frame");
+            assert_eq!(
+                decode_mrf_lifecycle_reader_capability("node-a:9000", &result).expect("reported capability"),
+                (version, epoch)
+            );
+        }
+    }
+
+    #[test]
+    fn mrf_lifecycle_reader_capability_decoder_rejects_unbound_or_malformed_identity() {
+        let epoch = Uuid::new_v4();
+        let valid =
+            rustfs_protos::encode_mrf_lifecycle_reader_capability(2, "node-a:9000", epoch.as_bytes()).expect("capability frame");
+        let mut invalid = vec![Vec::new(), vec![2], valid[..valid.len() - 1].to_vec()];
+        let mut zero = valid.clone();
+        zero[0] = 0;
+        invalid.push(zero);
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        invalid.push(trailing);
+        let mut length_overflow = valid.clone();
+        length_overflow[1..9].copy_from_slice(&u64::MAX.to_be_bytes());
+        invalid.push(length_overflow);
+        let mut invalid_utf8 = valid.clone();
+        invalid_utf8[9] = 0xff;
+        invalid.push(invalid_utf8);
+        invalid.push(
+            rustfs_protos::encode_mrf_lifecycle_reader_capability(2, "node-a:9000", Uuid::nil().as_bytes())
+                .expect("nil epoch fixture"),
+        );
+        for result in invalid {
+            assert!(decode_mrf_lifecycle_reader_capability("node-a:9000", &result).is_err());
+        }
+        assert!(decode_mrf_lifecycle_reader_capability("node-b:9000", &valid).is_err());
+        let empty = rustfs_protos::encode_mrf_lifecycle_reader_capability(2, "", epoch.as_bytes()).expect("empty member fixture");
+        assert!(decode_mrf_lifecycle_reader_capability("", &empty).is_err());
     }
 
     #[test]
