@@ -49,6 +49,9 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub const HEALING_MARKER_PATH: &str = "healing.bin";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
+/// Original upload authority after it stops admitting active part mutations.
+pub(crate) const MULTIPART_RECOVERY_DIR: &str = ".abort-authority";
+pub(crate) const MULTIPART_COMMIT_METADATA_FILE: &str = "xl.meta.complete";
 pub const PART_TRANSACTION_NEW_META: &str = "new.meta";
 pub const PART_TRANSACTION_OLD_META: &str = "old.meta";
 pub const PART_TRANSACTION_ROLLBACK: &str = "rollback";
@@ -82,12 +85,7 @@ use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_madmin::info_commands::DiskMetrics;
 use rustfs_rio::ChunkReaderBox;
 use serde::{Deserialize, Serialize};
-use std::{
-    fmt::Debug,
-    path::PathBuf,
-    sync::{Arc, atomic::AtomicBool},
-    time::Duration,
-};
+use std::{fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
@@ -1910,12 +1908,6 @@ pub struct WalkDirOptions {
     // Override the remote stream stall timeout for long background walks.
     #[serde(default)]
     pub stall_timeout_ms: Option<u64>,
-
-    /// In-process completion state for bounded local walks. This is skipped
-    /// from RPC serialization; remote peers retain the legacy natural-EOF
-    /// behavior until they support an explicit capability.
-    #[serde(skip)]
-    pub producer_limit_reached: Option<Arc<AtomicBool>>,
 }
 
 impl WalkDirOptions {
@@ -2760,7 +2752,6 @@ mod tests {
             skip_total_timeout: false,
             timeout_ms: Some(10_000),
             stall_timeout_ms: Some(20_000),
-            producer_limit_reached: None,
         };
 
         assert_eq!(opts.bucket, "test-bucket");

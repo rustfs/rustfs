@@ -49,12 +49,28 @@ impl Workers {
 
     /// Acquire a worker slot, waiting until one becomes available.
     pub async fn take(&self) {
+        struct AcquireCancelGuard<'a> {
+            workers: &'a Workers,
+            completed: bool,
+        }
+        impl Drop for AcquireCancelGuard<'_> {
+            fn drop(&mut self) {
+                if !self.completed {
+                    self.workers.in_use.send_modify(|_| {});
+                }
+            }
+        }
+        let mut guard = AcquireCancelGuard {
+            workers: self,
+            completed: false,
+        };
         let permit = match self.semaphore.acquire().await {
             Ok(permit) => permit,
             // The semaphore is owned by `self` and never closed.
             Err(_) => unreachable!("worker semaphore is never closed"),
         };
         permit.forget(); // returned manually via give()
+        guard.completed = true;
         self.in_use.send_modify(|held| *held += 1);
         trace!(
             event = "worker_slot.acquire",
@@ -82,6 +98,7 @@ impl Workers {
         });
         if released {
             self.semaphore.add_permits(1);
+            self.in_use.send_modify(|_| {});
         }
         trace!(
             event = "worker_slot.release",
@@ -99,7 +116,9 @@ impl Workers {
     pub async fn wait(&self) {
         let mut rx = self.in_use.subscribe();
         // The sender is owned by `self`, so it outlives this borrow.
-        let _ = rx.wait_for(|&held| held == 0).await;
+        let _ = rx
+            .wait_for(|&held| held == 0 && self.semaphore.available_permits() == self.limit)
+            .await;
         debug!(
             event = "worker_slot.wait",
             component = "concurrency",
@@ -114,7 +133,9 @@ impl Workers {
 
     /// Return the current number of available worker slots.
     pub async fn available(&self) -> usize {
-        self.limit.saturating_sub(*self.in_use.borrow())
+        self.limit
+            .saturating_sub(*self.in_use.borrow())
+            .min(self.semaphore.available_permits())
     }
 }
 
@@ -216,5 +237,37 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(workers.available().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_wait_does_not_complete_while_permit_is_in_transit_to_queued_taker() {
+        use std::future::Future;
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+
+        let workers = Workers::new(1).unwrap();
+        workers.take().await;
+
+        let mut taker = pin!(workers.take());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(taker.as_mut().poll(&mut cx), Poll::Pending));
+
+        let mut waiter = pin!(workers.wait());
+        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
+
+        // Hand off the slot to the queued taker before `taker` is polled again.
+        workers.give().await;
+        assert_eq!(workers.available().await, 0);
+        assert!(
+            matches!(waiter.as_mut().poll(&mut cx), Poll::Pending),
+            "wait() must not complete while a permit is in transit to a woken taker"
+        );
+
+        assert!(matches!(taker.as_mut().poll(&mut cx), Poll::Ready(())));
+        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
+
+        workers.give().await;
+        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Ready(())));
+        assert_eq!(workers.available().await, 1);
     }
 }
