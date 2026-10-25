@@ -10678,8 +10678,10 @@ async fn read_file_exists(path: impl AsRef<Path>, root: &os::PublicationRoot) ->
 async fn read_file_all(path: impl AsRef<Path>, root: &os::PublicationRoot) -> Result<(Bytes, Metadata)> {
     let path = path.as_ref().to_path_buf();
     let root = root.clone();
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking_with_disk_io_permit(None, move || {
         let result = (|| {
+            #[cfg(test)]
+            run_owned_file_before_open(&path);
             let mut file = root.open_readonly(&path)?;
             let metadata = file.metadata()?;
             let mut data = Vec::new();
@@ -11768,7 +11770,13 @@ impl DiskAPI for LocalDisk {
             let file_path = self.io_get_object_path(volume, path)?;
             let path = path.to_string();
             let sync_metadata = effective_durability(volume).syncs_commit_metadata();
-            return Ok(tokio::task::spawn_blocking(move || {
+            #[cfg(target_os = "linux")]
+            let mount_lease = self.mount_lease.clone();
+            return Ok(spawn_blocking_with_disk_io_permit(None, move || {
+                #[cfg(target_os = "linux")]
+                let _mount_lease = mount_lease;
+                #[cfg(test)]
+                run_owned_file_before_open(&file_path);
                 // A persistent directory lock bounds metadata growth. Removing
                 // per-target lock files can split flock ownership across inodes.
                 let lock_path = file_path
@@ -11885,7 +11893,9 @@ impl DiskAPI for LocalDisk {
             let file_path = self.io_get_object_path(volume, path)?;
             let sync_metadata = effective_durability(volume).syncs_commit_metadata();
             let publication_root = self.publication_root.clone();
-            return Ok(tokio::task::spawn_blocking(move || {
+            return Ok(spawn_blocking_with_disk_io_permit(None, move || {
+                #[cfg(test)]
+                run_owned_file_before_open(&file_path);
                 os::compare_and_update_control_file(
                     &file_path,
                     expected.as_deref(),
@@ -28909,6 +28919,131 @@ mod test {
             .expect_err("invalid erasure metadata must fail before shard size calculation");
 
         assert_eq!(err, DiskError::FileCorrupt);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_whole_file_io_retains_only_its_native_device() {
+        use crate::disk::disk_store::LocalDiskWrapper;
+        use crate::disk::io_admission::{ResourceIoUnit, with_optional_resource_unit};
+        use rustfs_concurrency::adaptive::{
+            AdaptiveAdmission, FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure,
+            permit_set::AdaptivePermitSetOwner,
+        };
+        use std::num::NonZeroU16;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single whole-file reader worker");
+        runtime.block_on(async {
+            for conditional in [false, true] {
+                for admitted in [false, true] {
+                    let dir = tempfile::tempdir().expect("whole-file read fixture");
+                    let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("endpoint");
+                    let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+                    #[cfg(target_os = "linux")]
+                    let mut disk = disk;
+                    #[cfg(target_os = "linux")]
+                    {
+                        let exit = disk.exit_signal.take().expect("cleanup monitor exit sender");
+                        exit.send(()).expect("stop fixture cleanup monitor");
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            while exit.receiver_count() != 0 {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .expect("cleanup monitor stopped");
+                    }
+                    #[cfg(target_os = "linux")]
+                    let mount = Arc::downgrade(&disk.mount_lease);
+                    std::fs::create_dir(dir.path().join("bucket")).expect("bucket");
+                    const CONTENT: &[u8] = b"whole-file native work outlives the cancelled RPC";
+                    const REPLACEMENT: &[u8] = b"conditional write completes after caller cancellation";
+                    std::fs::write(dir.path().join("bucket/object"), CONTENT).expect("object");
+                    let path = disk.io_get_object_open_path("bucket", "object").expect("native path");
+                    let wrapper = LocalDiskWrapper::new(Arc::new(disk), false);
+                    let first = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+                    let second = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+                    let shared = AdaptivePermitSetOwner::new(NonZeroU16::MIN, vec![first.clone(), second.clone()])
+                        .expect("resource catalog");
+                    wrapper
+                        .physical_admission()
+                        .set_test_shared_capacity(shared.clone(), vec![first.clone()])
+                        .expect("selected device");
+                    let parent = admitted.then(|| {
+                        let a = first.try_acquire().expect("selected quota");
+                        let b = second.try_acquire().expect("unrelated quota");
+                        ResourceIoUnit::from(shared.capture(&[&a, &b]).expect("admitted parent"))
+                    });
+                    let node = NodeAdmission::new(NonZeroU16::MIN);
+                    node.update(
+                        &mut FeedbackController::new(),
+                        Some(FeedbackObservation {
+                            generation: 1,
+                            max_concurrency: 1,
+                            pressure: ResourcePressure::Unknown,
+                            completed_units: None,
+                        }),
+                    );
+                    let unit = admitted.then(|| node.try_acquire().expect("node admission"));
+                    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    set_owned_file_before_open(&path, move || {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.recv();
+                    });
+                    let mut read = Box::pin(with_optional_resource_unit(parent, async move {
+                        let _unit = unit;
+                        if conditional {
+                            wrapper
+                                .compare_and_update_file(
+                                    "bucket",
+                                    "object",
+                                    Some(Bytes::from_static(CONTENT)),
+                                    Some(Bytes::from_static(REPLACEMENT)),
+                                )
+                                .await
+                                .map(|_| ())
+                        } else {
+                            wrapper.read_all("bucket", "object").await.map(|_| ())
+                        }
+                    }));
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        tokio::select! {
+                            _ = read.as_mut() => panic!("read completed before the native hook"),
+                            entered = started_rx => entered.expect("native read started"),
+                        }
+                    })
+                    .await
+                    .expect("native read reached the fixture file");
+                    drop(read);
+                    let held = [node.snapshot().active, first.snapshot().active, second.snapshot().active];
+                    #[cfg(target_os = "linux")]
+                    let retained_mount = mount.strong_count() > 0;
+                    release_tx.send(()).expect("release native work before assertions");
+                    tokio::task::spawn_blocking(|| ()).await.expect("native read queue drained");
+                    assert_eq!([node.snapshot().active, first.snapshot().active, second.snapshot().active], [0, 0, 0]);
+                    assert_eq!(node.completed(), Some(0), "cancellation is not completed work");
+                    assert_eq!(
+                        std::fs::read(dir.path().join("bucket/object")).expect("read after cancellation"),
+                        if conditional { REPLACEMENT } else { CONTENT }
+                    );
+                    #[cfg(target_os = "linux")]
+                    if conditional {
+                        assert!(retained_mount, "conditional write retains its exact mount descriptor");
+                        assert_eq!(mount.strong_count(), 0, "native completion retires the mount");
+                    }
+                    assert_eq!(
+                        held,
+                        [0, u32::from(admitted), 0],
+                        "conditional={conditional}, admitted={admitted}: native work keeps only its device"
+                    );
+                }
+            }
+        });
     }
 
     #[cfg(unix)]
