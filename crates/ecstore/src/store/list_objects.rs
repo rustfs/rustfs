@@ -31,7 +31,6 @@ use crate::cache_value::metacache_set::{
     FallbackClaimTracker, ListPathRawOptions, ListPathRawOutcome, list_path_raw_with_claim_tracker,
     list_path_raw_with_partial_result,
 };
-use crate::core::sets::Sets;
 use crate::disk::error::DiskError;
 use crate::disk::{DiskAPI, DiskInfo, DiskStore, RUSTFS_META_BUCKET, WalkDirOptions};
 use crate::error::{
@@ -4637,160 +4636,11 @@ impl ECStore {
             }
         }
 
-        let (merge_tx, mut merge_rx) = mpsc::channel::<MetaCacheEntry>(100);
-
+        let (merge_tx, merge_rx) = mpsc::channel::<MetaCacheEntry>(100);
         let bucket = bucket.to_owned();
-        let bucket_clone = bucket.clone();
-
-        let vcf = match get_versioning_config(&bucket).await {
-            Ok((res, _)) => Some(res),
-            Err(_) => None,
-        };
-
-        tokio::spawn(
-            async move {
-                let mut sent_err = false;
-                while let Some(entry) = merge_rx.recv().await {
-                    if opts.latest_only {
-                        let fi = match entry.to_fileinfo(&bucket_clone) {
-                            Ok(res) => res,
-                            Err(err) => {
-                                if !sent_err {
-                                    let item = ObjectInfoOrErr {
-                                        item: None,
-                                        err: Some(err.into()),
-                                    };
-
-                                    if let Err(err) = result.send(item).await {
-                                        error!("walk result send err {:?}", err);
-                                    }
-
-                                    sent_err = true;
-
-                                    return;
-                                }
-
-                                continue;
-                            }
-                        };
-
-                        if let Some(filter) = opts.filter {
-                            if filter(&fi) {
-                                let item = ObjectInfoOrErr {
-                                    item: Some(ObjectInfo::from_file_info(&fi, &bucket_clone, &fi.name, {
-                                        if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                    })),
-                                    err: None,
-                                };
-
-                                if let Err(err) = result.send(item).await {
-                                    error!("walk result send err {:?}", err);
-                                }
-                            }
-                        } else {
-                            let item = ObjectInfoOrErr {
-                                item: Some(ObjectInfo::from_file_info(&fi, &bucket_clone, &fi.name, {
-                                    if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                })),
-                                err: None,
-                            };
-
-                            if let Err(err) = result.send(item).await {
-                                error!("walk result send err {:?}", err);
-                            }
-                        }
-                        continue;
-                    }
-
-                    let mut fvs = match if opts.include_free_versions {
-                        entry.file_info_versions_with_free_versions(&bucket_clone)
-                    } else {
-                        entry.file_info_versions(&bucket_clone)
-                    } {
-                        Ok(res) => res,
-                        Err(err) => {
-                            let item = ObjectInfoOrErr {
-                                item: None,
-                                err: Some(err.into()),
-                            };
-
-                            if let Err(err) = result.send(item).await {
-                                error!("walk result send err {:?}", err);
-                            }
-                            return;
-                        }
-                    };
-
-                    // `FileMeta` keeps versions newest-first (`sort_by_mod_time`
-                    // sorts descending), so ascending emission is the exact
-                    // reverse. Callers such as replication resync walk with the
-                    // default (ascending) order so that re-applied versions
-                    // preserve the original version-stack order.
-                    if opts.versions_sort == WalkVersionsSortOrder::Ascending {
-                        fvs.versions.reverse();
-                    }
-
-                    for fi in fvs.versions.iter() {
-                        if let Some(filter) = opts.filter {
-                            if filter(fi) {
-                                let item = ObjectInfoOrErr {
-                                    item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                        if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                    })),
-                                    err: None,
-                                };
-
-                                if let Err(err) = result.send(item).await {
-                                    error!("walk result send err {:?}", err);
-                                }
-                            }
-                        } else {
-                            let item = ObjectInfoOrErr {
-                                item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                    if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                })),
-                                err: None,
-                            };
-
-                            if let Err(err) = result.send(item).await {
-                                error!("walk result send err {:?}", err);
-                            }
-                        }
-                    }
-
-                    if opts.include_free_versions {
-                        for fi in fvs.free_versions.iter() {
-                            if let Some(filter) = opts.filter {
-                                if filter(fi) {
-                                    let item = ObjectInfoOrErr {
-                                        item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                            if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                        })),
-                                        err: None,
-                                    };
-
-                                    if let Err(err) = result.send(item).await {
-                                        error!("walk result send err {:?}", err);
-                                    }
-                                }
-                            } else {
-                                let item = ObjectInfoOrErr {
-                                    item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                        if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                    })),
-                                    err: None,
-                                };
-
-                                if let Err(err) = result.send(item).await {
-                                    error!("walk result send err {:?}", err);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
+        // Not awaited: callers may drain `result` only after this returns, so
+        // waiting on the forwarder here could stall them on the channel bound.
+        let _forwarder = spawn_walk_entry_forwarder(merge_rx, result, opts, bucket.clone());
 
         let merge_task = spawn_listing_merge(rx, inputs, merge_tx);
 
@@ -4822,6 +4672,93 @@ impl ECStore {
 
         result
     }
+}
+
+/// Forwards merged raw entries to a walk consumer as `ObjectInfoOrErr`,
+/// applying the walk's version projection, sort order and filter. The first
+/// entry that fails to decode ends the stream with that error; a consumer that
+/// stopped reading ends it silently.
+fn spawn_walk_entry_forwarder(
+    mut entries: Receiver<MetaCacheEntry>,
+    result: Sender<ObjectInfoOrErr>,
+    opts: WalkOptions,
+    bucket: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(
+        async move {
+            let versioning = get_versioning_config(&bucket).await.ok().map(|(config, _)| config);
+            let to_object_info = |fi: &rustfs_filemeta::FileInfo| {
+                let versioned = versioning.as_ref().is_some_and(|config| config.versioned(&fi.name));
+                ObjectInfo::from_file_info(fi, &bucket, &fi.name, versioned)
+            };
+            let passes_filter = |fi: &rustfs_filemeta::FileInfo| opts.filter.is_none_or(|filter| filter(fi));
+            let decode_failed = |err: rustfs_filemeta::Error| ObjectInfoOrErr {
+                item: None,
+                err: Some(err.into()),
+            };
+
+            while let Some(entry) = entries.recv().await {
+                if opts.latest_only {
+                    let fi = match entry.to_fileinfo(&bucket) {
+                        Ok(fi) => fi,
+                        Err(err) => {
+                            let _ = result.send(decode_failed(err)).await;
+                            return;
+                        }
+                    };
+                    if passes_filter(&fi)
+                        && result
+                            .send(ObjectInfoOrErr {
+                                item: Some(to_object_info(&fi)),
+                                err: None,
+                            })
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+
+                let mut versions = match if opts.include_free_versions {
+                    entry.file_info_versions_with_free_versions(&bucket)
+                } else {
+                    entry.file_info_versions(&bucket)
+                } {
+                    Ok(versions) => versions,
+                    Err(err) => {
+                        let _ = result.send(decode_failed(err)).await;
+                        return;
+                    }
+                };
+                // `FileMeta` keeps versions newest-first, so ascending emission is
+                // the exact reverse. Replication resync walks ascending so that
+                // re-applied versions keep the original version-stack order.
+                if opts.versions_sort == WalkVersionsSortOrder::Ascending {
+                    versions.versions.reverse();
+                }
+                let free_versions = if opts.include_free_versions {
+                    versions.free_versions.as_slice()
+                } else {
+                    &[]
+                };
+                for fi in versions.versions.iter().chain(free_versions) {
+                    if passes_filter(fi)
+                        && result
+                            .send(ObjectInfoOrErr {
+                                item: Some(to_object_info(fi)),
+                                err: None,
+                            })
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+        .instrument(tracing::Span::current()),
+    )
 }
 
 /// Own every page worker until completion, including when the request is dropped.
@@ -5505,692 +5442,6 @@ async fn merge_entry_channels(
     Ok(())
 }
 
-impl Sets {
-    #[allow(clippy::too_many_arguments)]
-    pub async fn inner_list_objects_v2(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        continuation_token: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-        _fetch_owner: bool,
-        start_after: Option<String>,
-        incl_deleted: bool,
-    ) -> Result<ListObjectsV2Info> {
-        let marker = if continuation_token.is_none() {
-            start_after
-        } else {
-            continuation_token.clone()
-        };
-
-        let loi = self
-            .list_objects_generic(bucket, prefix, marker, delimiter, max_keys, incl_deleted)
-            .await?;
-        Ok(ListObjectsV2Info {
-            is_truncated: loi.is_truncated,
-            continuation_token,
-            next_continuation_token: loi.next_marker,
-            objects: loi.objects,
-            prefixes: loi.prefixes,
-        })
-    }
-
-    pub async fn list_objects_generic(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        marker: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-        incl_deleted: bool,
-    ) -> Result<ListObjectsInfo> {
-        let max_keys = normalize_max_keys(max_keys);
-        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
-        let mut opts = ListPathOptions {
-            bucket: bucket.to_owned(),
-            prefix: prefix.to_owned(),
-            separator: delimiter.clone(),
-            limit: effective_max_keys,
-            marker,
-            incl_deleted,
-            ask_disks: list_objects_quorum_from_env(),
-            ..Default::default()
-        };
-        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
-        // (notably `forward_past`) — see backlog#1047.
-        opts.parse_marker();
-
-        let mut page = self
-            .list_path(&opts)
-            .await
-            .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
-        let next_cache_id = page.entries.list_id.clone();
-
-        let disk_has_more = !page.exhausted;
-
-        page.entries.forward_past(opts.marker);
-
-        // Last RAW scanned key, captured before folding (ECA-03 / #944).
-        let last_scanned_key = last_scanned_entry_name(&page.entries);
-
-        let get_objects =
-            ObjectInfo::from_meta_cache_entries_sorted_infos(&page.entries, bucket, prefix, delimiter.clone()).await;
-
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
-            get_objects,
-            &delimiter,
-            max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            false,
-            last_scanned_key.as_deref(),
-        );
-        let _ = next_version_idmarker;
-
-        Ok(ListObjectsInfo {
-            is_truncated,
-            next_marker,
-            objects,
-            prefixes,
-        })
-    }
-
-    pub async fn inner_list_object_versions(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        marker: Option<String>,
-        version_marker: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-    ) -> Result<ListObjectVersionsInfo> {
-        let max_keys = normalize_max_keys(max_keys);
-        if marker.is_none() && version_marker.is_some() {
-            return Err(StorageError::NotImplemented);
-        }
-
-        let has_version_marker = version_marker.is_some();
-        let version_marker = if let Some(marker) = version_marker {
-            Some(parse_version_marker(marker)?)
-        } else {
-            None
-        };
-
-        let effective_max_keys = list_versions_scan_limit(max_keys, has_version_marker);
-        let mut opts = ListPathOptions {
-            bucket: bucket.to_owned(),
-            prefix: prefix.to_owned(),
-            separator: delimiter.clone(),
-            limit: effective_max_keys,
-            marker,
-            incl_deleted: true,
-            ask_disks: list_objects_quorum_from_env(),
-            versioned: true,
-            include_marker: has_version_marker,
-            ..Default::default()
-        };
-        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
-        // (notably `forward_past`) — see backlog#1047.
-        opts.parse_marker();
-
-        let mut page = self
-            .list_path(&opts)
-            .await
-            .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
-        let next_cache_id = page.entries.list_id.clone();
-
-        let disk_has_more = !page.exhausted;
-
-        if !has_version_marker {
-            page.entries.forward_past(opts.marker.clone());
-        }
-
-        let version_marker = version_marker_for_entries(&page.entries, opts.marker.as_deref(), version_marker);
-
-        // Last RAW scanned key, captured before folding (ECA-03 / #944).
-        let last_scanned_key = last_scanned_entry_name(&page.entries);
-
-        let entries = page.entries;
-        let get_objects =
-            ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, bucket, prefix, delimiter.clone(), version_marker)
-                .await;
-
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate_versions(
-            get_objects,
-            VersionedListPagination {
-                delimiter: &delimiter,
-                max_keys,
-                disk_has_more,
-                cache_id: next_cache_id.as_deref(),
-                marker: opts.marker.as_deref(),
-                last_scanned_key: last_scanned_key.as_deref(),
-                raw_keys: entries.entries().iter().map(|entry| entry.name.as_str()),
-            },
-        );
-
-        Ok(ListObjectVersionsInfo {
-            is_truncated,
-            next_marker,
-            next_version_idmarker,
-            objects,
-            prefixes,
-        })
-    }
-
-    pub async fn list_path(self: Arc<Self>, o: &ListPathOptions) -> Result<ListPage> {
-        check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
-        let list_path_started = std::time::Instant::now();
-
-        let mut o = o.clone();
-        o.marker = o.marker.filter(|v| v >= &o.prefix);
-
-        // Nothing can match these requests; answer with an exhausted empty
-        // page instead of walking.
-        let marker_outside_prefix = o
-            .marker
-            .as_deref()
-            .is_some_and(|marker| !o.prefix.is_empty() && !marker.starts_with(&o.prefix));
-        if marker_outside_prefix || o.limit == 0 || o.prefix.starts_with(SLASH_SEPARATOR) {
-            return Ok(ListPage {
-                entries: MetaCacheEntriesSorted::default(),
-                exhausted: true,
-            });
-        }
-
-        let slash_separator = Some(SLASH_SEPARATOR.to_owned());
-        o.include_directories = o.separator == slash_separator;
-
-        if (o.separator == slash_separator || o.separator.is_none()) && !o.recursive {
-            o.recursive = o.separator != slash_separator;
-            o.separator = slash_separator;
-        } else {
-            o.recursive = true;
-        }
-
-        o.skip_hidden_prefix_check = can_skip_hidden_prefix_check(&o).await;
-
-        o.parse_marker();
-
-        if o.base_dir.is_empty() {
-            o.base_dir = base_dir_from_prefix(&o.prefix);
-        }
-
-        o.transient = o.transient || is_reserved_or_invalid_bucket(&o.bucket, false);
-        o.set_filter();
-        if o.transient {
-            o.create = false;
-        }
-        let log_context = ListPathLogContext::from_options(&o);
-
-        let cancel = CancellationToken::new();
-        let (sender, recv) = mpsc::channel(o.limit as usize);
-        let sets = self.clone();
-        let mut opts = o.clone();
-        opts.stop_disk_at_limit = true;
-        let producer_cancel = cancel.clone();
-        let producer = async move { sets.list_merged(producer_cancel, opts, sender).await };
-        let mut page = match collect_list_path_results("sets", &log_context, cancel, o.clone(), recv, producer).await {
-            Ok(page) => page,
-            Err(err) => {
-                log_list_path_finished("sets", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
-                return Err(err);
-            }
-        };
-
-        page.entries.reuse = true;
-        page.entries.o.0.truncate(o.limit as usize);
-        if !o.transient {
-            page.entries.list_id = Some(o.id.unwrap_or_else(|| Uuid::new_v4().to_string()));
-        }
-
-        log_list_path_finished(
-            "sets",
-            &log_context,
-            list_path_started.elapsed().as_secs_f64() * 1000.0,
-            page.entries.entries().len(),
-            false,
-        );
-
-        Ok(page)
-    }
-
-    async fn list_merged(
-        &self,
-        rx: CancellationToken,
-        opts: ListPathOptions,
-        sender: Sender<MetaCacheEntry>,
-    ) -> Result<ListPathRawOutcome> {
-        let merge_started = std::time::Instant::now();
-
-        debug!(
-            list_path_limit = opts.limit,
-            recursive = opts.recursive,
-            set_count = self.disk_set.len(),
-            requested_marker = %opts.marker.as_deref().unwrap_or(""),
-            "sets list_merged started"
-        );
-
-        let rx = rx.child_token();
-        let mut futures = Vec::new();
-        let mut inputs = Vec::new();
-
-        for set in &self.disk_set {
-            let (send, recv) = list_merged_entry_channel();
-            inputs.push(recv);
-            let opts = opts.clone();
-            let rx_clone = rx.clone();
-            let set = set.clone();
-            futures.push(async move { set.list_path(rx_clone, opts, send).await });
-        }
-
-        let merge_task = spawn_listing_merge(rx, inputs, sender);
-
-        let results = join_all(futures).await;
-        merge_task.await.map_err(Error::from)??;
-        let mut outcome = ListPathRawOutcome::default();
-        let mut errs = Vec::new();
-        for result in results {
-            match result {
-                Ok(set_outcome) => {
-                    outcome.limit_reached |= set_outcome.limit_reached;
-                    errs.push(None);
-                }
-                Err(err) => errs.push(Some(err)),
-            }
-        }
-
-        if is_all_not_found(&errs) {
-            return Ok(outcome);
-        }
-
-        if let Some(err) = errs.iter().flatten().next() {
-            return Err(err.clone());
-        }
-
-        rustfs_io_metrics::record_stage_duration("sets_list_objects_list_merged", merge_started.elapsed().as_secs_f64() * 1000.0);
-
-        debug!(
-            set_count = self.disk_set.len(),
-            limit_reached = outcome.limit_reached,
-            error_count = errs.iter().filter(|err| err.is_some()).count(),
-            "sets list_merged finished"
-        );
-
-        Ok(outcome)
-    }
-
-    #[allow(unused_assignments)]
-    pub async fn walk_internal(
-        self: Arc<Self>,
-        rx: CancellationToken,
-        bucket: &str,
-        prefix: &str,
-        result: Sender<ObjectInfoOrErr>,
-        opts: WalkOptions,
-    ) -> Result<()> {
-        check_list_objs_args(bucket, prefix, &None)?;
-
-        let rx = rx.child_token();
-        let mut futures = Vec::new();
-        let mut inputs = Vec::new();
-
-        for set in &self.disk_set {
-            let (mut disks, infos, _) = set.get_online_disks_with_healing_and_info(true).await;
-            // Captured before any quorum-based filtering: only genuinely
-            // unreachable drives may relax the write-quorum requirement.
-            let online_disks = disks.len();
-            let opts = opts.clone();
-            let (sender, list_out_rx) = mpsc::channel::<MetaCacheEntry>(1);
-            inputs.push(list_out_rx);
-            let rx_clone = rx.clone();
-            let set = set.clone();
-            futures.push(async move {
-                let mut ask_disks = get_list_quorum(&opts.ask_disks, set.set_drive_count as i32);
-                if ask_disks == -1 {
-                    let new_disks = get_quorum_disks(&disks, &infos, disks.len().div_ceil(2));
-                    if !new_disks.is_empty() {
-                        disks = new_disks;
-                    } else {
-                        ask_disks = get_list_quorum("strict", set.set_drive_count as i32);
-                    }
-                }
-
-                if set.set_drive_count == 4 {
-                    ask_disks = bounded_usize_to_i32(disks.len());
-                } else if ask_disks > bounded_usize_to_i32(disks.len()) {
-                    ask_disks = clamp_ask_disks_to_available(ask_disks, disks.len());
-                }
-
-                let listing_quorum = listing_quorum_from_ask_disks(ask_disks);
-                let enforce_write_quorum = enforce_latest_listing_write_quorum(opts.latest_only, &opts.ask_disks);
-                let write_quorum_slack =
-                    latest_listing_write_quorum_slack(enforce_write_quorum, set.set_drive_count, online_disks);
-                let required_obj_quorum =
-                    latest_listing_object_quorum(listing_quorum, set.set_drive_count, enforce_write_quorum, write_quorum_slack);
-                ask_disks = expand_ask_disks_for_object_quorum(
-                    ask_disks,
-                    disks.len(),
-                    preferred_listing_quorum(
-                        required_obj_quorum,
-                        set.set_drive_count,
-                        set.default_parity_count,
-                        enforce_write_quorum,
-                    ),
-                );
-                let fallback_disks = if let Some(asked_disks) = positive_ask_disks(ask_disks)
-                    && disks.len() > asked_disks
-                {
-                    let mut rand = rand::rng();
-                    disks.shuffle(&mut rand);
-                    disks.split_off(asked_disks)
-                } else {
-                    Vec::new()
-                };
-                let fallback_disks = Arc::new(fallback_disks);
-                let disks = Arc::new(disks);
-                let claim_tracker = FallbackClaimTracker::default();
-
-                let obj_quorum = required_obj_quorum;
-                let raw_min_disks = latest_listing_raw_min_disks(listing_quorum, obj_quorum, enforce_write_quorum);
-                let resolver = list_metadata_resolution_params(
-                    bucket.to_owned(),
-                    listing_quorum,
-                    obj_quorum,
-                    !opts.latest_only,
-                    write_quorum_slack,
-                );
-                let agreed_resolver = resolver.clone();
-                let partial_resolver = resolver.clone();
-                let reader_disks = disks.len();
-
-                let path = base_dir_from_prefix(prefix);
-                ensure_non_empty_listing_disks(bucket, &path, &disks).map_err(to_filemeta_err)?;
-
-                let mut filter_prefix = prefix
-                    .trim_start_matches(&path)
-                    .trim_start_matches(SLASH_SEPARATOR)
-                    .trim_end_matches(SLASH_SEPARATOR)
-                    .to_owned();
-                if filter_prefix == path {
-                    filter_prefix = "".to_owned();
-                }
-
-                let tx1 = sender.clone();
-                let tx2 = sender.clone();
-                let supplement = ListingSupplement::new_with_reconciler(
-                    ListingSupplementOptions {
-                        bucket: bucket.to_owned(),
-                        path: path.clone(),
-                        recursive: true,
-                        incl_deleted: !opts.latest_only,
-                        skip_hidden_prefix_check: false,
-                        filter_prefix: Some(filter_prefix.clone()),
-                        forward_to: opts.marker.clone(),
-                        per_disk_limit: bounded_usize_to_i32(opts.limit),
-                        skip_total_timeout: opts.walkdir_timeout.is_none(),
-                        walkdir_timeout: opts.walkdir_timeout,
-                        walkdir_stall_timeout: opts.walkdir_stall_timeout,
-                    },
-                    fallback_disks.clone(),
-                    claim_tracker.clone(),
-                    set.as_ref().clone(),
-                    disks.clone(),
-                );
-                let agreed_supplement = supplement.clone();
-                let partial_supplement = supplement;
-
-                list_path_raw_with_partial_result(
-                    rx_clone,
-                    ListPathRawOptions {
-                        disks: disks.iter().cloned().map(Some).collect(),
-                        fallback_disks: fallback_disks.iter().cloned().map(Some).collect(),
-                        bucket: bucket.to_owned(),
-                        path,
-                        recursive: true,
-                        incl_deleted: !opts.latest_only,
-                        filter_prefix: Some(filter_prefix),
-                        forward_to: opts.marker.clone(),
-                        min_disks: raw_min_disks,
-                        per_disk_limit: bounded_usize_to_i32(opts.limit),
-                        // Skip the total walkdir timeout for listing operations.
-                        // Large buckets (millions of objects) can take longer than
-                        // the default 5s walkdir timeout to produce the first page
-                        // of results. The stall timeout still protects against
-                        // drives that stop making forward progress.
-                        skip_walkdir_total_timeout: opts.walkdir_timeout.is_none(),
-                        walkdir_timeout: opts.walkdir_timeout,
-                        walkdir_stall_timeout: opts.walkdir_stall_timeout,
-                        agreed: Some(Box::new(move |entry: MetaCacheEntry| {
-                            Box::pin({
-                                let value = tx1.clone();
-                                let resolver = agreed_resolver.clone();
-                                let supplement = agreed_supplement.clone();
-                                async move {
-                                    let entry = match resolve_agreed_listing_entry(
-                                        entry,
-                                        reader_disks,
-                                        &resolver,
-                                        enforce_write_quorum,
-                                    ) {
-                                        ListingEntryResolution::Resolved(entry) => entry,
-                                        ListingEntryResolution::NeedsSupplement(entry) => {
-                                            let Some(entry) = resolve_agreed_listing_entry_with_supplement(
-                                                entry,
-                                                reader_disks,
-                                                resolver,
-                                                supplement,
-                                            )
-                                            .await?
-                                            else {
-                                                return Ok(());
-                                            };
-                                            entry
-                                        }
-                                        ListingEntryResolution::Rejected => return Ok(()),
-                                    };
-                                    if entry.is_dir() {
-                                        return Ok(());
-                                    }
-                                    if let Err(err) = value.send(entry).await {
-                                        error!("list_path send fail {:?}", err);
-                                    }
-                                    Ok(())
-                                }
-                            })
-                        })),
-                        finished: None,
-                        ..Default::default()
-                    },
-                    claim_tracker,
-                    Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
-                        Box::pin({
-                            let value = tx2.clone();
-                            let resolver = partial_resolver.clone();
-                            let supplement = partial_supplement.clone();
-                            async move {
-                                if let Some(entry) =
-                                    resolve_listing_entries_with_supplement(entries, resolver, enforce_write_quorum, supplement)
-                                        .await?
-                                    && let Err(err) = value.send(entry).await
-                                {
-                                    error!("list_path send fail {:?}", err);
-                                }
-                                Ok(())
-                            }
-                        })
-                    }),
-                )
-                .await
-            });
-        }
-
-        let (merge_tx, mut merge_rx) = mpsc::channel::<MetaCacheEntry>(100);
-        let bucket = bucket.to_owned();
-        let bucket_clone = bucket.clone();
-
-        let vcf = match get_versioning_config(&bucket).await {
-            Ok((res, _)) => Some(res),
-            Err(_) => None,
-        };
-
-        tokio::spawn(
-            async move {
-                let mut sent_err = false;
-                while let Some(entry) = merge_rx.recv().await {
-                    if opts.latest_only {
-                        let fi = match entry.to_fileinfo(&bucket_clone) {
-                            Ok(res) => res,
-                            Err(err) => {
-                                if !sent_err {
-                                    let item = ObjectInfoOrErr {
-                                        item: None,
-                                        err: Some(err.into()),
-                                    };
-                                    if let Err(err) = result.send(item).await {
-                                        error!("walk result send err {:?}", err);
-                                    }
-                                    sent_err = true;
-                                    return;
-                                }
-                                continue;
-                            }
-                        };
-
-                        if let Some(filter) = opts.filter {
-                            if filter(&fi) {
-                                let item = ObjectInfoOrErr {
-                                    item: Some(ObjectInfo::from_file_info(&fi, &bucket_clone, &fi.name, {
-                                        if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                    })),
-                                    err: None,
-                                };
-                                if let Err(err) = result.send(item).await {
-                                    error!("walk result send err {:?}", err);
-                                }
-                            }
-                        } else {
-                            let item = ObjectInfoOrErr {
-                                item: Some(ObjectInfo::from_file_info(&fi, &bucket_clone, &fi.name, {
-                                    if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                })),
-                                err: None,
-                            };
-                            if let Err(err) = result.send(item).await {
-                                error!("walk result send err {:?}", err);
-                            }
-                        }
-                        continue;
-                    }
-
-                    let fvs = match if opts.include_free_versions {
-                        entry.file_info_versions_with_free_versions(&bucket_clone)
-                    } else {
-                        entry.file_info_versions(&bucket_clone)
-                    } {
-                        Ok(res) => res,
-                        Err(err) => {
-                            let item = ObjectInfoOrErr {
-                                item: None,
-                                err: Some(err.into()),
-                            };
-                            if let Err(err) = result.send(item).await {
-                                error!("walk result send err {:?}", err);
-                            }
-                            return;
-                        }
-                    };
-
-                    for fi in &fvs.versions {
-                        if let Some(filter) = opts.filter {
-                            if filter(fi) {
-                                let item = ObjectInfoOrErr {
-                                    item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                        if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                    })),
-                                    err: None,
-                                };
-                                if let Err(err) = result.send(item).await {
-                                    error!("walk result send err {:?}", err);
-                                }
-                            }
-                        } else {
-                            let item = ObjectInfoOrErr {
-                                item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                    if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                })),
-                                err: None,
-                            };
-                            if let Err(err) = result.send(item).await {
-                                error!("walk result send err {:?}", err);
-                            }
-                        }
-                    }
-
-                    if opts.include_free_versions {
-                        for fi in &fvs.free_versions {
-                            if let Some(filter) = opts.filter {
-                                if filter(fi) {
-                                    let item = ObjectInfoOrErr {
-                                        item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                            if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                        })),
-                                        err: None,
-                                    };
-                                    if let Err(err) = result.send(item).await {
-                                        error!("walk result send err {:?}", err);
-                                    }
-                                }
-                            } else {
-                                let item = ObjectInfoOrErr {
-                                    item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                        if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                    })),
-                                    err: None,
-                                };
-                                if let Err(err) = result.send(item).await {
-                                    error!("walk result send err {:?}", err);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
-
-        let merge_task = spawn_listing_merge(rx, inputs, merge_tx);
-
-        let walk_started = std::time::Instant::now();
-        let walk_results = join_all(futures).await;
-        merge_task.await.map_err(Error::from)??;
-        let mut errs = Vec::new();
-        for walk_result in walk_results {
-            match walk_result {
-                Ok(_) => errs.push(None),
-                Err(err) => errs.push(Some(err.into())),
-            }
-        }
-        rustfs_io_metrics::record_stage_duration(
-            "sets_list_objects_walk_internal",
-            walk_started.elapsed().as_secs_f64() * 1000.0,
-        );
-
-        let result = walk_result_from_set_errors(&errs);
-        if let Err(err) = &result {
-            error!(
-                bucket = %bucket,
-                prefix = %prefix,
-                error = ?err,
-                set_errors = ?errs,
-                "walk_internal list_path_raw tasks failed"
-            );
-        }
-
-        result
-    }
-}
-
 impl SetDisks {
     pub(crate) async fn inner_list_object_versions_for_recursive_delete(
         self: Arc<Self>,
@@ -6260,176 +5511,6 @@ impl SetDisks {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn inner_list_objects_v2(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        continuation_token: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-        _fetch_owner: bool,
-        start_after: Option<String>,
-        incl_deleted: bool,
-    ) -> Result<ListObjectsV2Info> {
-        let marker = if continuation_token.is_none() {
-            start_after
-        } else {
-            continuation_token.clone()
-        };
-
-        let loi = self
-            .list_objects_generic(bucket, prefix, marker, delimiter, max_keys, incl_deleted)
-            .await?;
-        Ok(ListObjectsV2Info {
-            is_truncated: loi.is_truncated,
-            continuation_token,
-            next_continuation_token: loi.next_marker,
-            objects: loi.objects,
-            prefixes: loi.prefixes,
-        })
-    }
-
-    pub async fn list_objects_generic(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        marker: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-        incl_deleted: bool,
-    ) -> Result<ListObjectsInfo> {
-        let max_keys = normalize_max_keys(max_keys);
-        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
-        let mut opts = ListPathOptions {
-            bucket: bucket.to_owned(),
-            prefix: prefix.to_owned(),
-            separator: delimiter.clone(),
-            limit: effective_max_keys,
-            marker,
-            incl_deleted,
-            ask_disks: list_objects_quorum_from_env(),
-            ..Default::default()
-        };
-        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
-        // (notably `forward_past`) — see backlog#1047.
-        opts.parse_marker();
-
-        let mut page = self
-            .list_path_result(&opts)
-            .await
-            .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
-        let next_cache_id = page.entries.list_id.clone();
-
-        let disk_has_more = !page.exhausted;
-
-        page.entries.forward_past(opts.marker);
-
-        // Last RAW scanned key, captured before folding (ECA-03 / #944).
-        let last_scanned_key = last_scanned_entry_name(&page.entries);
-
-        let get_objects =
-            ObjectInfo::from_meta_cache_entries_sorted_infos(&page.entries, bucket, prefix, delimiter.clone()).await;
-
-        let (objects, prefixes, is_truncated, next_marker, _next_version_idmarker) = list_objects_paginate(
-            get_objects,
-            &delimiter,
-            max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            false,
-            last_scanned_key.as_deref(),
-        );
-
-        Ok(ListObjectsInfo {
-            is_truncated,
-            next_marker,
-            objects,
-            prefixes,
-        })
-    }
-
-    pub async fn inner_list_object_versions(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        marker: Option<String>,
-        version_marker: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-    ) -> Result<ListObjectVersionsInfo> {
-        let max_keys = normalize_max_keys(max_keys);
-        if marker.is_none() && version_marker.is_some() {
-            return Err(StorageError::NotImplemented);
-        }
-
-        let has_version_marker = version_marker.is_some();
-        let version_marker = if let Some(marker) = version_marker {
-            Some(parse_version_marker(marker)?)
-        } else {
-            None
-        };
-
-        let effective_max_keys = list_versions_scan_limit(max_keys, has_version_marker);
-        let mut opts = ListPathOptions {
-            bucket: bucket.to_owned(),
-            prefix: prefix.to_owned(),
-            separator: delimiter.clone(),
-            limit: effective_max_keys,
-            marker,
-            incl_deleted: true,
-            ask_disks: list_objects_quorum_from_env(),
-            versioned: true,
-            include_marker: has_version_marker,
-            ..Default::default()
-        };
-        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
-        // (notably `forward_past`) — see backlog#1047.
-        opts.parse_marker();
-
-        let mut page = self
-            .list_path_result(&opts)
-            .await
-            .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
-        let next_cache_id = page.entries.list_id.clone();
-
-        let disk_has_more = !page.exhausted;
-
-        if !has_version_marker {
-            page.entries.forward_past(opts.marker.clone());
-        }
-
-        let version_marker = version_marker_for_entries(&page.entries, opts.marker.as_deref(), version_marker);
-
-        // Last RAW scanned key, captured before folding (ECA-03 / #944).
-        let last_scanned_key = last_scanned_entry_name(&page.entries);
-
-        let entries = page.entries;
-        let get_objects =
-            ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, bucket, prefix, delimiter.clone(), version_marker)
-                .await;
-
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate_versions(
-            get_objects,
-            VersionedListPagination {
-                delimiter: &delimiter,
-                max_keys,
-                disk_has_more,
-                cache_id: next_cache_id.as_deref(),
-                marker: opts.marker.as_deref(),
-                last_scanned_key: last_scanned_key.as_deref(),
-                raw_keys: entries.entries().iter().map(|entry| entry.name.as_str()),
-            },
-        );
-
-        Ok(ListObjectVersionsInfo {
-            is_truncated,
-            next_marker,
-            next_version_idmarker,
-            objects,
-            prefixes,
-        })
-    }
-
     pub async fn walk_internal(
         self: Arc<Self>,
         rx: CancellationToken,
@@ -6440,117 +5521,13 @@ impl SetDisks {
     ) -> Result<()> {
         check_list_objs_args(bucket, prefix, &None)?;
 
-        let (entry_tx, mut entry_rx) = mpsc::channel::<MetaCacheEntry>(100);
-        let bucket_name = bucket.to_owned();
-        let bucket_name_for_list = bucket_name.clone();
+        let (entry_tx, entry_rx) = mpsc::channel::<MetaCacheEntry>(100);
+        let forwarder = spawn_walk_entry_forwarder(entry_rx, result, opts.clone(), bucket.to_owned());
 
-        let versioning_config = match get_versioning_config(&bucket_name).await {
-            Ok((res, _)) => Some(res),
-            Err(_) => None,
-        };
-
-        let result_task = tokio::spawn(
-            async move {
-                while let Some(entry) = entry_rx.recv().await {
-                    if opts.latest_only {
-                        let fi = match entry.to_fileinfo(&bucket_name) {
-                            Ok(res) => res,
-                            Err(err) => {
-                                let item = ObjectInfoOrErr {
-                                    item: None,
-                                    err: Some(err.into()),
-                                };
-                                let _ = result.send(item).await;
-                                return;
-                            }
-                        };
-
-                        if let Some(filter) = opts.filter
-                            && !filter(&fi)
-                        {
-                            continue;
-                        }
-
-                        let item = ObjectInfoOrErr {
-                            item: Some(ObjectInfo::from_file_info(&fi, &bucket_name, &fi.name, {
-                                if let Some(v) = &versioning_config {
-                                    v.versioned(&fi.name)
-                                } else {
-                                    false
-                                }
-                            })),
-                            err: None,
-                        };
-                        let _ = result.send(item).await;
-                        continue;
-                    }
-
-                    let versions = match if opts.include_free_versions {
-                        entry.file_info_versions_with_free_versions(&bucket_name)
-                    } else {
-                        entry.file_info_versions(&bucket_name)
-                    } {
-                        Ok(res) => res,
-                        Err(err) => {
-                            let item = ObjectInfoOrErr {
-                                item: None,
-                                err: Some(err.into()),
-                            };
-                            let _ = result.send(item).await;
-                            return;
-                        }
-                    };
-
-                    for fi in &versions.versions {
-                        if let Some(filter) = opts.filter
-                            && !filter(fi)
-                        {
-                            continue;
-                        }
-
-                        let item = ObjectInfoOrErr {
-                            item: Some(ObjectInfo::from_file_info(fi, &bucket_name, &fi.name, {
-                                if let Some(v) = &versioning_config {
-                                    v.versioned(&fi.name)
-                                } else {
-                                    false
-                                }
-                            })),
-                            err: None,
-                        };
-                        let _ = result.send(item).await;
-                    }
-
-                    if opts.include_free_versions {
-                        for fi in &versions.free_versions {
-                            if let Some(filter) = opts.filter
-                                && !filter(fi)
-                            {
-                                continue;
-                            }
-
-                            let item = ObjectInfoOrErr {
-                                item: Some(ObjectInfo::from_file_info(fi, &bucket_name, &fi.name, {
-                                    if let Some(v) = &versioning_config {
-                                        v.versioned(&fi.name)
-                                    } else {
-                                        false
-                                    }
-                                })),
-                                err: None,
-                            };
-                            let _ = result.send(item).await;
-                        }
-                    }
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
-
-        let list_options = recursive_walk_list_path_options(bucket_name_for_list, prefix, &opts);
+        let list_options = recursive_walk_list_path_options(bucket.to_owned(), prefix, &opts);
         let list_result = self.list_path(rx, list_options, entry_tx).await;
 
-        let _ = result_task.await;
+        let _ = forwarder.await;
 
         match list_result {
             Ok(_) => Ok(()),
@@ -7874,7 +6851,7 @@ mod test {
             let delimiter = (kind == "delimiter").then(|| "/".to_owned());
             // Exercise each public/internal entry point with the reported page size.
             // The store entry point also covers exact and one-over limit boundaries.
-            for (layer, max_keys) in [(0, 0), (0, 1), (0, 5), (0, 9), (0, 10), (0, 11), (1, 5), (2, 5), (3, 5)] {
+            for (layer, max_keys) in [(0, 0), (0, 1), (0, 5), (0, 9), (0, 10), (0, 11), (3, 5)] {
                 if layer == 3 && delimiter.is_some() {
                     continue;
                 }
@@ -7890,18 +6867,6 @@ mod test {
                     let result = match layer {
                         0 => {
                             store
-                                .clone()
-                                .inner_list_object_versions(bucket, &prefix, marker, version_marker, delimiter.clone(), max_keys)
-                                .await
-                        }
-                        1 => {
-                            store.pools[0]
-                                .clone()
-                                .inner_list_object_versions(bucket, &prefix, marker, version_marker, delimiter.clone(), max_keys)
-                                .await
-                        }
-                        2 => {
-                            store.pools[0].disk_set[0]
                                 .clone()
                                 .inner_list_object_versions(bucket, &prefix, marker, version_marker, delimiter.clone(), max_keys)
                                 .await
@@ -9982,43 +8947,25 @@ mod test {
             assert!(!info.delete_marker && info.version_purge_status.is_empty());
         }
 
-        for layer in 0..3 {
-            for (prefix, expected) in [("a", vec!["a", "ab"]), ("ab", vec!["ab"]), ("missing", vec![])] {
-                let mut marker = None;
-                for page in 0..expected.len().max(1) {
-                    let result = match layer {
-                        0 => {
-                            store
-                                .clone()
-                                .list_objects_generic(bucket, prefix, marker.clone(), None, 1, false)
-                                .await
-                        }
-                        1 => {
-                            store.pools[0]
-                                .clone()
-                                .list_objects_generic(bucket, prefix, marker.clone(), None, 1, false)
-                                .await
-                        }
-                        _ => {
-                            store.pools[0].disk_set[0]
-                                .clone()
-                                .list_objects_generic(bucket, prefix, marker.clone(), None, 1, false)
-                                .await
-                        }
-                    }
+        for (prefix, expected) in [("a", vec!["a", "ab"]), ("ab", vec!["ab"]), ("missing", vec![])] {
+            let mut marker = None;
+            for page in 0..expected.len().max(1) {
+                let result = store
+                    .clone()
+                    .list_objects_generic(bucket, prefix, marker.clone(), None, 1, false)
+                    .await
                     .expect("exact-prefix page should list successfully");
-                    let names: Vec<_> = result.objects.iter().map(|object| object.name.as_str()).collect();
-                    let expected_page: Vec<_> = expected.get(page).copied().into_iter().collect();
-                    assert_eq!(names, expected_page, "layer {layer}, prefix {prefix}, page {page}");
-                    assert!(result.prefixes.is_empty(), "recursive listing should not return common prefixes");
-                    let has_more = page + 1 < expected.len();
-                    assert_eq!(result.is_truncated, has_more, "layer {layer}, prefix {prefix}, page {page}");
-                    assert_eq!(result.next_marker.is_some(), has_more, "only non-final pages should carry a marker");
-                    if has_more {
-                        assert_ne!(result.next_marker, marker, "pagination marker must advance");
-                    }
-                    marker = result.next_marker;
+                let names: Vec<_> = result.objects.iter().map(|object| object.name.as_str()).collect();
+                let expected_page: Vec<_> = expected.get(page).copied().into_iter().collect();
+                assert_eq!(names, expected_page, "prefix {prefix}, page {page}");
+                assert!(result.prefixes.is_empty(), "recursive listing should not return common prefixes");
+                let has_more = page + 1 < expected.len();
+                assert_eq!(result.is_truncated, has_more, "prefix {prefix}, page {page}");
+                assert_eq!(result.next_marker.is_some(), has_more, "only non-final pages should carry a marker");
+                if has_more {
+                    assert_ne!(result.next_marker, marker, "pagination marker must advance");
                 }
+                marker = result.next_marker;
             }
         }
     }
