@@ -611,9 +611,7 @@ mod tests {
         .expect("valid replay request");
         assert!(valid_replay_run_input(&input));
         for raw in [
-            format!(
-                r#"{{"version":1,"origin_run_id":"00000000-0000-0000-0000-000000000000","idempotency_key":"k","deadline_unix_micros":123}}"#
-            ),
+            r#"{"version":1,"origin_run_id":"00000000-0000-0000-0000-000000000000","idempotency_key":"k","deadline_unix_micros":123}"#.to_string(),
             format!(r#"{{"version":1,"origin_run_id":"{run_id}","idempotency_key":"","deadline_unix_micros":123}}"#),
             format!(r#"{{"version":1,"origin_run_id":"{run_id}","idempotency_key":"k","deadline_unix_micros":0}}"#),
             format!(

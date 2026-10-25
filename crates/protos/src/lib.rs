@@ -1927,7 +1927,7 @@ mod disk_mutation_canonical_tests {
         );
         let signed = SealArtifactAttemptPutsResponse {
             response_proof: vec![9; 32].into(),
-            ..baseline.clone()
+            ..baseline
         };
         assert_eq!(
             canonical_seal_artifact_attempt_puts_response_body(&request, &signed).expect("proof exclusion"),
@@ -2063,7 +2063,7 @@ mod disk_mutation_canonical_tests {
         );
         let signed = SealArtifactAttemptPutsResponse {
             response_proof: vec![9; 32].into(),
-            ..baseline.clone()
+            ..baseline
         };
         assert_eq!(
             canonical_seal_artifact_attempt_repairs_response_body(&request, &signed).expect("proof exclusion"),

@@ -256,8 +256,7 @@ async fn artifact_inventory_remote_stream_requires_signed_completion() {
         let error = client
             .inventory_artifact_attempt(request)
             .await
-            .err()
-            .expect("body-unbound or tampered request rejected over real HMAC transport");
+            .expect_err("body-unbound or tampered request rejected over real HMAC transport");
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
     let (result, frames) = scan(&fixture, ArtifactInventoryPhase::ArtifactInventoryScan, Duration::from_secs(30)).await;

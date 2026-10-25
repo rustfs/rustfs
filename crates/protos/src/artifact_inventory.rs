@@ -236,9 +236,7 @@ mod tests {
         };
         let frame = ArtifactInventoryFrame {
             sequence: 0,
-            payload: Some(Payload::Entries(ArtifactInventoryEntries {
-                versions: vec![entry.clone()],
-            })),
+            payload: Some(Payload::Entries(ArtifactInventoryEntries { versions: vec![entry] })),
             response_proof: vec![1; 32].into(),
         };
         let canonical = canonical_frame(&baseline, &frame).expect("baseline frame");

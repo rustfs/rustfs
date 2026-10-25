@@ -4828,8 +4828,7 @@ mod legacy_artifact_tests {
             captured
                 .begin_legacy_local_path_delete(&disk_ref, "path-instance", LegacyPathDeleteOperation::Delete, None)
                 .await
-                .err()
-                .expect("captured bootstrap cannot upgrade"),
+                .expect_err("captured bootstrap cannot upgrade"),
             DiskError::FileAccessDenied
         );
     }
@@ -5790,8 +5789,7 @@ mod legacy_artifact_tests {
                 captured
                     .begin_legacy_local_part_mutation(&disk_ref, source, fixture.destination(), stage.operation())
                     .await
-                    .err()
-                    .expect("captured bootstrap cannot upgrade"),
+                    .expect_err("captured bootstrap cannot upgrade"),
                 DiskError::FileAccessDenied
             );
             let admitted = ready
@@ -6335,8 +6333,7 @@ mod legacy_artifact_tests {
             captured
                 .begin_legacy_local_rename_file(&disk_ref, source, destination, true)
                 .await
-                .err()
-                .expect("captured bootstrap cannot upgrade"),
+                .expect_err("captured bootstrap cannot upgrade"),
             DiskError::FileAccessDenied
         );
         let admitted = ready
@@ -6876,7 +6873,7 @@ mod legacy_artifact_tests {
         else {
             panic!("typed inspection reply");
         };
-        assert_eq!(serde_json::to_value(&state.state).expect("serialized recovery state"), "NewPrepared");
+        assert_eq!(serde_json::to_value(state.state).expect("serialized recovery state"), "NewPrepared");
         assert_eq!(state.current_digest, state.journal.as_ref().expect("durable journal").target_digest);
         assert!(!physical.join("xl.meta").exists(), "real selected version was removed");
         assert_ne!(path_delete_snapshot(physical), *before, "forward operation must change physical state");
@@ -6895,7 +6892,7 @@ mod legacy_artifact_tests {
         else {
             panic!("typed rollback reply");
         };
-        assert_eq!(serde_json::to_value(&restored.state).expect("serialized recovery state"), "Absent");
+        assert_eq!(serde_json::to_value(restored.state).expect("serialized recovery state"), "Absent");
         assert_eq!(
             path_delete_snapshot(physical),
             *before,
