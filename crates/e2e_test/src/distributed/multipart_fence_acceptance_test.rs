@@ -465,6 +465,7 @@ async fn wait_for_storage_peer_recovery(
 }
 
 async fn phase_quorum_matrix(
+    cluster: &RustFSTestClusterEnvironment,
     proxies: &[RpcFaultProxy],
     clients: &[Client],
     bucket: &str,
@@ -509,6 +510,19 @@ async fn phase_quorum_matrix(
                     abort_after_fault(&clients[0], bucket, &key, upload_id, false).await?;
                 }
             } else {
+                let committed = if !locks && phase == "abort" {
+                    let previous = payload_for(&format!("{key}-committed"), 4096);
+                    clients[0]
+                        .put_object()
+                        .bucket(bucket)
+                        .key(&key)
+                        .body(ByteStream::from(previous.clone()))
+                        .send()
+                        .await?;
+                    Some(previous)
+                } else {
+                    None
+                };
                 let upload = clients[0]
                     .create_multipart_upload()
                     .bucket(bucket)
@@ -538,6 +552,15 @@ async fn phase_quorum_matrix(
                 } else {
                     None
                 };
+                let mut abort_records = Vec::new();
+                if committed.is_some() {
+                    for directory in cluster.nodes.iter().flat_map(|node| &node.data_dirs) {
+                        let root = std::path::Path::new(directory).join(".rustfs.sys/multipart").join(&scope);
+                        let metadata = tokio::fs::read(root.join("xl.meta")).await?;
+                        abort_records.push((root, metadata));
+                    }
+                    assert_eq!(abort_records.len(), 4 * drives_per_node);
+                }
                 match phase {
                     "part" => {
                         let request = clients[0]
@@ -613,7 +636,56 @@ async fn phase_quorum_matrix(
                 // A rejected Complete must retain authority for ordinary
                 // Abort. NoSuchUpload must not hide partial staging loss.
                 let allow_missing = phase != "complete" || unavailable == unavailable_at_quorum;
-                abort_after_fault(&clients[0], bucket, &key, upload_id, allow_missing).await?;
+                if !abort_records.is_empty() {
+                    let retained = abort_records.iter().map(|(root, _)| root.exists()).collect::<Vec<_>>();
+                    let survivors = retained.iter().filter(|present| **present).count();
+                    assert_eq!(survivors, abort_records.len() - available_votes, "the scoped Delete fault must be real");
+                    for (root, metadata) in &abort_records {
+                        if root.exists() {
+                            assert_eq!(tokio::fs::read(root.join("xl.meta")).await?, *metadata);
+                        }
+                    }
+                    let identity_quorum = abort_records.len() / 2;
+                    if survivors < identity_quorum {
+                        // Even a successful quorum Abort can leave a minority
+                        // on an unavailable peer. Without identity quorum, a
+                        // later coordinator must refuse rather than infer GC.
+                        let observers = proxies
+                            .iter()
+                            .map(|proxy| proxy.pause(&["Delete"], usize::MAX, Some(&scope)))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let refused = clients[2]
+                            .abort_multipart_upload()
+                            .bucket(bucket)
+                            .key(&key)
+                            .upload_id(upload_id)
+                            .send()
+                            .await
+                            .expect_err("minority authority must not become cleanup success or NoSuchUpload");
+                        assert_unavailable(&refused, "storage_write_quorum", None);
+                        let delete_calls = observers.iter().map(RpcPause::hits).sum::<usize>();
+                        assert_eq!(delete_calls, 0, "uncertain authority cannot authorize further root deletion");
+                        drop(observers);
+                        for ((root, metadata), present) in abort_records.iter().zip(&retained) {
+                            assert_eq!(root.exists(), *present, "retry must preserve each surviving authority location");
+                            if *present {
+                                assert_eq!(tokio::fs::read(root.join("xl.meta")).await?, *metadata);
+                            }
+                        }
+                        eprintln!(
+                            "MPU Abort boundary: deleted={available_votes}, survivors={survivors}, identity_quorum={identity_quorum}, retry_delete_calls={delete_calls}"
+                        );
+                    } else {
+                        abort_after_fault(&clients[0], bucket, &key, upload_id, allow_missing).await?;
+                        assert!(abort_records.iter().all(|(root, _)| !root.exists()));
+                    }
+                    for reader in clients {
+                        assert_object_bytes(reader, bucket, &key, committed.as_ref().expect("Abort fixture has an old object"))
+                            .await?;
+                    }
+                } else {
+                    abort_after_fault(&clients[0], bucket, &key, upload_id, allow_missing).await?;
+                }
                 recover_after_fault(&format!("DeleteObject {key} after {phase}"), || {
                     clients[0].delete_object().bucket(bucket).key(&key).send()
                 })
@@ -629,14 +701,14 @@ async fn phase_quorum_matrix(
 
 #[tokio::test]
 async fn metadata_delay_preserves_write_quorum_and_rejects_quorum_minus_one() -> TestResult {
-    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
-    phase_quorum_matrix(&proxies, &clients, &bucket, false, 1).await
+    let (cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+    phase_quorum_matrix(&cluster, &proxies, &clients, &bucket, false, 1).await
 }
 
 #[tokio::test]
 async fn lock_delay_preserves_admission_quorum_and_reports_timeout() -> TestResult {
-    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
-    phase_quorum_matrix(&proxies, &clients, &bucket, true, 1).await
+    let (cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+    phase_quorum_matrix(&cluster, &proxies, &clients, &bucket, true, 1).await
 }
 
 #[tokio::test]
@@ -649,7 +721,7 @@ async fn sixteen_shard_multipart_metadata_requires_twelve_votes() -> TestResult 
     assert_eq!(storage.backend.total_sets, vec![1]);
     assert_eq!(storage.backend.drives_per_set, vec![16]);
     assert_eq!(storage.backend.standard_sc_parity, Some(4));
-    phase_quorum_matrix(&proxies, &clients, &bucket, false, 4).await
+    phase_quorum_matrix(&cluster, &proxies, &clients, &bucket, false, 4).await
 }
 
 #[tokio::test]
