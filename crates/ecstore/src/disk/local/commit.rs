@@ -713,7 +713,7 @@ impl LocalDisk {
 
         if preserve_upload_metadata {
             let source_object_path = self.get_object_path(src_volume, src_path)?;
-            let authority_owner: Arc<dyn Send + Sync> = if source_object_path == root_destination_object_path {
+            let authority_owner: Arc<dyn Send + Sync> = if source_object_path == self.get_object_path(dst_volume, dst_path)? {
                 commit.mutation_lease.clone()
             } else {
                 os::try_acquire_metadata_mutation_lease_with_owner(&source_object_path, commit.mutation_lease.clone())?
