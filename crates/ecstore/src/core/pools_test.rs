@@ -505,7 +505,10 @@ mod decommission_lock_order_tests {
                     .await
                     .expect("open the lease-loss node's independently owned native handle");
                     assert!(!Arc::ptr_eq(&disk, source_disks[slot].as_ref().expect("source fixture disk")));
-                    assert_eq!(disk.get_disk_id().await.unwrap(), Some(pool.format.erasure.sets[set.set_index][slot]));
+                    assert_eq!(
+                        crate::disk::DiskAPI::get_disk_id(disk.as_ref()).await.unwrap(),
+                        Some(pool.format.erasure.sets[set.set_index][slot])
+                    );
                     local_disk_map.insert(endpoint.to_string(), Some(disk.clone()));
                     disks.push(Some(disk));
                 }
