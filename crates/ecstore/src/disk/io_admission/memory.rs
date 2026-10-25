@@ -103,7 +103,6 @@ impl std::fmt::Display for BackgroundMemoryExhausted {
 
 impl std::error::Error for BackgroundMemoryExhausted {}
 
-#[cfg(target_os = "linux")]
 pub(crate) fn is_memory_pressure(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::OutOfMemory || error.get_ref().is_some_and(|inner| inner.is::<BackgroundMemoryExhausted>())
 }
@@ -114,6 +113,10 @@ pub(crate) struct Reservation {
 }
 
 impl Reservation {
+    pub(crate) fn belongs_to(&self, budget: &Arc<BackgroundMemoryBudget>) -> bool {
+        Arc::ptr_eq(&self.owner, budget)
+    }
+
     pub(crate) fn wrap(bytes: Bytes, reservation: Option<Self>) -> Bytes {
         if bytes.is_empty() {
             drop(bytes);
@@ -220,10 +223,15 @@ impl BackgroundBuffer {
                 Err(error) => return Err(error),
             }
         }
-        let Self { bytes, reservation, .. } = self;
+        Ok(self.take_bytes(filled))
+    }
+
+    pub(crate) fn take_bytes(&mut self, length: usize) -> Bytes {
+        let bytes = std::mem::take(&mut self.bytes);
+        let reservation = self.reservation.take();
         let mut bytes = Bytes::from(bytes.into_vec());
-        bytes.truncate(filled);
-        Ok(Reservation::wrap(bytes, reservation))
+        bytes.truncate(length);
+        Reservation::wrap(bytes, reservation)
     }
 
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {

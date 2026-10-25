@@ -98,6 +98,9 @@ pin_project! {
         // contiguous on-disk `[hash][data]` block so both are pulled in a single
         // pass; grown lazily and never shrunk.
         buf: Vec<u8>,
+        // Free scratch storage before refunding its allocation.
+        buf_memory: Option<crate::disk::background_memory::Reservation>,
+        memory_budget: Option<std::sync::Arc<crate::disk::BackgroundMemoryBudget>>,
         // Reused owned chunk vector for the remote HTTP fast path. Keeping the
         // allocation with the reader avoids allocating once per bitrot block.
         chunks: Vec<bytes::Bytes>,
@@ -118,6 +121,8 @@ where
             hash_algo: algo,
             shard_size,
             buf: Vec::new(),
+            buf_memory: None,
+            memory_budget: crate::disk::current_resource_unit().and_then(|unit| unit.memory_budget()),
             chunks: Vec::new(),
             skip_verify,
             last_verify_duration: Duration::ZERO,
@@ -209,6 +214,7 @@ where
     /// On `Ok` the block is `self.buf[..need]`; the caller re-borrows it so the
     /// verification can also borrow `self` immutably.
     async fn read_scratch_block(&mut self, need: usize, want: usize) -> std::io::Result<()> {
+        reserve_bitrot_scratch(&mut self.buf, &mut self.buf_memory, self.memory_budget.as_ref(), need)?;
         if self.buf.len() < need {
             self.buf.resize(need, 0);
         }
@@ -227,6 +233,28 @@ where
         }
         Ok(data_len)
     }
+}
+
+// Scratch growth happens only before a complete block or an empty chunk tail.
+// Old contents are consumed; keep both allocations charged until replacement.
+fn reserve_bitrot_scratch(
+    buf: &mut Vec<u8>,
+    reservation: &mut Option<crate::disk::background_memory::Reservation>,
+    budget: Option<&std::sync::Arc<crate::disk::BackgroundMemoryBudget>>,
+    capacity: usize,
+) -> std::io::Result<()> {
+    if let Some(budget) = budget
+        && buf.capacity() < capacity
+    {
+        let memory = budget.reserve(capacity)?;
+        let mut replacement = Vec::new();
+        replacement
+            .try_reserve_exact(capacity)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+        *buf = replacement;
+        *reservation = Some(memory);
+    }
+    Ok(())
 }
 
 /// A truncated shard is `UnexpectedEof`, not a short success (backlog#799 B2).
@@ -339,6 +367,8 @@ where
             let inner = &mut self.inner;
             let chunks = &mut self.chunks;
             let tail_buf = &mut self.buf;
+            let tail_memory = &mut self.buf_memory;
+            let memory_budget = self.memory_budget.as_ref();
             let mut received = 0usize;
             poll_fn(|cx| {
                 for _ in 0..MAX_CHUNK_POLLS_PER_YIELD {
@@ -381,7 +411,9 @@ where
 
                     if chunks.len() == MAX_RETAINED_CHUNKS_PER_BLOCK {
                         if tail_buf.is_empty() {
-                            tail_buf.reserve_exact(need - (received - chunk.len()));
+                            let tail_capacity = need - (received - chunk.len());
+                            reserve_bitrot_scratch(tail_buf, tail_memory, memory_budget, tail_capacity)?;
+                            tail_buf.reserve_exact(tail_capacity);
                         }
                         tail_buf.extend_from_slice(&chunk);
                     } else {
@@ -657,7 +689,12 @@ pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
     algo: HashAlgorithm,
     mut shard_size: usize,
 ) -> std::io::Result<()> {
-    let mut hash_buf = vec![0; algo.size()];
+    // Every supported digest fits on the stack; only shard payloads need leases.
+    let mut hash = [0; 64];
+    let hash_buf = &mut hash[..algo.size()];
+    let mut background_buffer = crate::disk::current_resource_unit()
+        .and_then(|unit| unit.memory_budget())
+        .map(|budget| crate::disk::background_memory::BackgroundBuffer::new(Some(budget)));
     let mut left = want_size;
 
     if left != bitrot_shard_file_size(part_size, shard_size, algo.clone()) {
@@ -665,21 +702,30 @@ pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
     }
 
     while left > 0 {
-        let n = r.read_exact(&mut hash_buf).await?;
+        let n = r.read_exact(hash_buf).await?;
         left -= n;
 
         if left < shard_size {
             shard_size = left;
         }
 
-        let mut buf = get_ec_buffer(shard_size);
-        buf.resize(shard_size, 0);
-        let read = r.read_exact(&mut buf).await?;
+        let mut pooled = None;
+        let buf = if let Some(buffer) = background_buffer.as_mut() {
+            buffer.ensure_len(shard_size)?;
+            &mut buffer.as_mut_slice()[..shard_size]
+        } else {
+            let buffer = pooled.insert(get_ec_buffer(shard_size));
+            buffer.resize(shard_size, 0);
+            buffer.as_mut_slice()
+        };
+        let read = r.read_exact(buf).await?;
 
-        let actual_hash = algo.hash_encode(&buf);
+        let actual_hash = algo.hash_encode(buf);
         let hash_ok = actual_hash.as_ref() == &hash_buf[0..n];
         drop(actual_hash); // 释放借用
-        return_ec_buffer(buf);
+        if let Some(buf) = pooled {
+            return_ec_buffer(buf);
+        }
         if !hash_ok {
             return Err(std::io::Error::other("bitrot hash mismatch"));
         }
@@ -1504,6 +1550,184 @@ mod tests {
 
         assert_eq!(n, data_size);
         assert_eq!(data, &out[..]);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_scratch_budget_preserves_growth_and_reuse() {
+        use crate::disk::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+
+        let algo = HashAlgorithm::HighwayHash256S;
+        let mut encoded = Vec::new();
+        for data in [&b"abcd"[..], &b"abcdefgh"[..], &b"ijklmnop"[..]] {
+            encoded.extend_from_slice(algo.hash_encode(data).as_ref());
+            encoded.extend_from_slice(data);
+        }
+        let memory = BackgroundMemoryBudget::new();
+        let (resources, _) = test_resource_units(1);
+        let mut reader = with_optional_resource_unit(Some(resources.with_memory_budget(memory.clone())), async {
+            BitrotReader::new(Cursor::new(encoded), 8, algo, false)
+        })
+        .await;
+        let mut first = [0; 4];
+        assert_eq!(
+            reader.read(&mut first).await.expect_err("closed scratch budget").kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(reader.inner.position(), 0, "allocation denial must not consume a frame");
+        memory.set_sampled_limit(36, Duration::from_secs(30));
+        reader.read(&mut first).await.expect("first scratch allocation fits");
+        assert_eq!(&first, b"abcd");
+        assert_eq!(memory.snapshot().used, 36);
+        memory.set_sampled_limit(75, Duration::from_secs(30));
+        let mut next = [0; 8];
+        assert_eq!(
+            reader
+                .read(&mut next)
+                .await
+                .expect_err("growth requires old36 plus new40")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(reader.inner.position(), 36);
+        assert_eq!(memory.snapshot().used, 36);
+        memory.set_sampled_limit(76, Duration::from_secs(30));
+        reader.read(&mut next).await.expect("growth now fits");
+        assert_eq!(&next, b"abcdefgh");
+        assert_eq!(memory.snapshot().used, 40);
+        memory.set_sampled_limit(0, Duration::ZERO);
+        reader.read(&mut next).await.expect("reuse after hot shrink");
+        assert_eq!(&next, b"ijklmnop");
+        assert_eq!(memory.snapshot().used, 40);
+        drop(reader);
+        assert_eq!(memory.snapshot().used, 0);
+    }
+
+    #[tokio::test]
+    async fn bitrot_chunk_tail_allocation_stays_charged_until_reader_drop() {
+        use crate::disk::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+
+        let algo = HashAlgorithm::HighwayHash256S;
+        let payload = vec![37; 256];
+        let encoded = encode_one_block(&payload, payload.len(), algo.clone()).await;
+        let tail_capacity = encoded.len() - MAX_RETAINED_CHUNKS_PER_BLOCK;
+        for fits in [false, true] {
+            let memory = BackgroundMemoryBudget::new();
+            memory.set_sampled_limit(if fits { tail_capacity as u64 } else { 0 }, Duration::from_secs(30));
+            let (resources, _) = test_resource_units(1);
+            let mut reader = with_optional_resource_unit(Some(resources.with_memory_budget(memory.clone())), async {
+                BitrotReader::new(GeneratedChunkSource::new(encoded.clone(), 1), payload.len(), algo.clone(), false)
+            })
+            .await;
+            let mut output = Vec::with_capacity(payload.len());
+            let result = reader.read_appending(&mut output, payload.len()).await;
+            if fits {
+                assert_eq!(result.expect("accounted tail fits"), payload.len());
+                assert_eq!(output, payload);
+                assert_eq!(memory.snapshot().used, tail_capacity as u64);
+                memory.set_sampled_limit(0, Duration::ZERO);
+                assert_eq!(memory.snapshot().used, tail_capacity as u64);
+            } else {
+                assert_eq!(result.expect_err("closed tail budget").kind(), io::ErrorKind::WouldBlock);
+                assert!(output.is_empty(), "an unverified fragment must not reach output");
+                assert_eq!(memory.snapshot().used, 0);
+            }
+            drop(reader);
+            assert_eq!(memory.snapshot().used, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn bitrot_verify_background_memory_is_bounded_and_reused() {
+        use crate::disk::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+
+        struct ShrinkingReader {
+            data: Cursor<Vec<u8>>,
+            memory: Arc<BackgroundMemoryBudget>,
+            first_block_end: u64,
+            peak: Arc<std::sync::atomic::AtomicU64>,
+        }
+        impl AsyncRead for ShrinkingReader {
+            fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, out: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+                self.peak.fetch_max(self.memory.snapshot().used, Ordering::SeqCst);
+                let result = Pin::new(&mut self.data).poll_read(cx, out);
+                if self.data.position() >= self.first_block_end {
+                    self.memory.set_sampled_limit(0, Duration::ZERO);
+                }
+                result
+            }
+        }
+
+        for algo in [
+            HashAlgorithm::None,
+            HashAlgorithm::HighwayHash256S,
+            HashAlgorithm::HighwayHash256SLegacy,
+        ] {
+            let payload = [37; 17];
+            let mut writer = BitrotWriter::new(Cursor::new(Vec::new()), 8, algo.clone());
+            for chunk in payload.chunks(8) {
+                writer.write(chunk).await.expect("encoded bitrot block");
+            }
+            writer.shutdown().await.expect("complete fixture");
+            let encoded = writer.into_inner().into_inner();
+            let memory = BackgroundMemoryBudget::new();
+            let (resources, _) = test_resource_units(1);
+            let error = with_optional_resource_unit(
+                Some(resources.with_memory_budget(memory.clone())),
+                bitrot_verify(Cursor::new(&encoded), encoded.len(), payload.len(), algo.clone(), 8),
+            )
+            .await
+            .expect_err("a closed background budget must reject bitrot payload allocation");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(memory.snapshot().used, 0);
+            memory.set_sampled_limit(8, Duration::from_secs(30));
+            let peak = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let reader = ShrinkingReader {
+                data: Cursor::new(encoded.clone()),
+                memory: memory.clone(),
+                first_block_end: (algo.size() + 8) as u64,
+                peak: peak.clone(),
+            };
+            let (resources, _) = test_resource_units(1);
+            with_optional_resource_unit(
+                Some(resources.with_memory_budget(memory.clone())),
+                bitrot_verify(reader, encoded.len(), payload.len(), algo, 8),
+            )
+            .await
+            .expect("reuse the same allocation after shrink, including the short tail");
+            assert_eq!(peak.load(Ordering::SeqCst), 8);
+            assert_eq!(memory.snapshot().limit, 0);
+            assert_eq!(
+                memory.snapshot().used,
+                0,
+                "the verifier frees its payload instead of retaining it in an uncharged pool"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bitrot_verify_cancelled_payload_read_refunds_memory() {
+        use crate::disk::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+
+        let algo = HashAlgorithm::HighwayHash256S;
+        let (mut sender, reader) = tokio::io::duplex(64);
+        sender
+            .write_all(algo.hash_encode(&[37; 8]).as_ref())
+            .await
+            .expect("send only hash");
+        let memory = BackgroundMemoryBudget::new();
+        memory.set_sampled_limit(8, Duration::from_secs(30));
+        let (resources, _) = test_resource_units(1);
+        let mut verify = Box::pin(with_optional_resource_unit(
+            Some(resources.with_memory_budget(memory.clone())),
+            bitrot_verify(reader, algo.size() + 8, 8, algo, 8),
+        ));
+        assert!(futures::poll!(&mut verify).is_pending(), "the payload read waits after the complete hash");
+        let retained = memory.snapshot().used;
+        memory.set_sampled_limit(0, Duration::ZERO);
+        drop(verify);
+        drop(sender);
+        assert_eq!(retained, 8, "pending verification owns its payload allocation");
+        assert_eq!(memory.snapshot().used, 0);
     }
 
     #[tokio::test]

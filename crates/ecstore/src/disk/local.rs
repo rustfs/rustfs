@@ -29445,6 +29445,48 @@ mod test {
     }
 
     #[test]
+    fn bitrot_verification_charges_native_and_verifier_storage_together() {
+        use crate::disk::io_admission::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+        use crate::erasure::coding::BitrotWriter;
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("bitrot memory runtime")
+            .block_on(async {
+                let dir = tempfile::tempdir().expect("bitrot memory fixture");
+                let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
+                let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+                let payload = [37; 17];
+                let algo = HashAlgorithm::HighwayHash256S;
+                let mut writer = BitrotWriter::new(io::Cursor::new(Vec::new()), 8, algo.clone());
+                for chunk in payload.chunks(8) {
+                    writer.write(chunk).await.expect("encoded block");
+                }
+                writer.shutdown().await.expect("complete frames");
+                let path = dir.path().join("part.1");
+                std::fs::write(&path, writer.into_inner().into_inner()).expect("encoded shard");
+                let memory = BackgroundMemoryBudget::new();
+                for (limit, fits) in [(32, false), (40, true)] {
+                    memory.set_sampled_limit(limit, Duration::from_secs(30));
+                    let (resources, gates) = test_resource_units(1);
+                    let result = with_optional_resource_unit(
+                        Some(resources.with_memory_budget(memory.clone())),
+                        disk.bitrot_verify(&path, payload.len(), algo.clone(), 8),
+                    )
+                    .await;
+                    if fits {
+                        result.expect("native32 plus verifier8 fits");
+                    } else {
+                        assert!(matches!(result, Err(DiskError::Io(error)) if error.kind() == ErrorKind::WouldBlock));
+                    }
+                    assert_eq!(memory.snapshot().used, 0);
+                    assert_eq!(gates[0].snapshot().active, 0);
+                }
+            });
+    }
+
+    #[test]
     fn cancelled_bitrot_verification_retains_native_resources() {
         use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
         use crate::erasure::coding::BitrotWriter;

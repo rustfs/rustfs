@@ -15,11 +15,12 @@
 use crate::server::RPC_PREFIX;
 use crate::storage::request_context::spawn_traced;
 use crate::storage::storage_api::rpc_consumer::http_service::{
-    DEFAULT_READ_BUFFER_SIZE, DeleteOptions, DiskStore, NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse,
-    PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, RemoteBackgroundIo,
-    StorageDiskRpcExt as _, WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, check_and_record_signed_rpc_nonce,
-    find_local_disk_by_ref_for_rpc, rpc_background_admission, sign_ns_scanner_capability_with_checkpoint_coverage,
-    sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io,
+    BackgroundReaderStream, DEFAULT_READ_BUFFER_SIZE, DeleteOptions, DiskStore, NS_SCANNER_PROTOCOL_VERSION,
+    NsScannerCapabilityResponse, PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_VERSION,
+    PutFileCapabilityResponse, RemoteBackgroundIo, StorageDiskRpcExt as _, WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions,
+    check_and_record_signed_rpc_nonce, find_local_disk_by_ref_for_rpc, rpc_background_admission,
+    sign_ns_scanner_capability_with_checkpoint_coverage, sign_put_file_capability, verify_put_file_auth_trailer,
+    verify_rpc_signature, with_remote_background_io,
 };
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::http_service::{
@@ -55,7 +56,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, oneshot};
-use tokio_util::{io::ReaderStream, sync::CancellationToken};
+use tokio_util::sync::CancellationToken;
 use tower::Service;
 use tracing::{error, warn};
 
@@ -743,7 +744,7 @@ where
     } else {
         u64::try_from(length).unwrap_or(u64::MAX)
     };
-    let mut reader = ReaderStream::with_capacity(reader.take(read_limit), read_buffer_size);
+    let mut reader = BackgroundReaderStream::with_capacity(reader.take(read_limit), read_buffer_size);
     let mut completion = RemoteBackgroundIo::take_current_completion();
     let mut remaining = (length != 0).then_some(length);
     stream::poll_fn(move |cx| {
@@ -1287,6 +1288,7 @@ where
     Fut: Future<Output = Result<(), DiskError>> + Send + 'static,
 {
     let (reader, writer) = tokio::io::duplex(DEFAULT_READ_BUFFER_SIZE);
+    let reader = BackgroundReaderStream::with_capacity(reader, DEFAULT_READ_BUFFER_SIZE);
     let (mut completion_tx, completion_rx) = oneshot::channel();
     let resource_context = RemoteBackgroundIo::take_current();
     spawn_traced(with_remote_background_io(resource_context, async move {
@@ -1303,7 +1305,7 @@ where
     }));
 
     let metrics = runtime_sources::current_internode_metrics();
-    let stream = ReaderStream::with_capacity(reader, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
+    let stream = reader.map_ok(move |bytes| {
         metrics.record_sent_bytes_for_operation_and_backend(
             INTERNODE_OPERATION_WALK_DIR,
             INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
@@ -1376,6 +1378,7 @@ where
     Fut: Future<Output = io::Result<()>> + Send + 'static,
 {
     let (reader, writer) = tokio::io::duplex(NS_SCANNER_STREAM_BUFFER_SIZE);
+    let reader = BackgroundReaderStream::with_capacity(reader, NS_SCANNER_STREAM_BUFFER_SIZE);
     let (mut completion_tx, completion_rx) = oneshot::channel();
     let disconnect = CancellationToken::new();
     // Scanner reacquires each operation outside its cache lease. Carrying the
@@ -1397,7 +1400,7 @@ where
     });
 
     let metrics = runtime_sources::current_internode_metrics();
-    let stream = ReaderStream::with_capacity(reader, NS_SCANNER_STREAM_BUFFER_SIZE).map_ok(move |bytes| {
+    let stream = reader.map_ok(move |bytes| {
         metrics.record_sent_bytes_for_operation_and_backend(
             INTERNODE_OPERATION_NS_SCANNER,
             INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,

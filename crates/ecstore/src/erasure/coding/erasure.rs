@@ -16,6 +16,8 @@
 //! Supports legacy (reed-solomon-simd) for reading/healing old-version files.
 //!
 
+use crate::disk::background_memory::{BackgroundBuffer, Reservation};
+use crate::disk::{BackgroundMemoryBudget, current_resource_unit};
 use bytes::{Bytes, BytesMut};
 use reed_solomon_simd;
 use rustfs_erasure_codec::galois_8::ReedSolomon;
@@ -144,12 +146,54 @@ pub fn calc_shard_size_legacy(block_size: usize, data_shards: usize) -> usize {
 
 /// Reed-Solomon encoder for legacy (main branch) format using reed-solomon-simd.
 /// Used when decoding/encoding files with uses_legacy_checksum == true.
+struct LegacyWorkspace<T> {
+    codec: T,
+    // The cached payload is freed before its reservation.
+    memory: Option<Reservation>,
+    payload_bound: usize,
+}
+
+impl<T> LegacyWorkspace<T> {
+    fn prepare(
+        cached: Option<Self>,
+        payload_bound: usize,
+        budget: Option<&Arc<BackgroundMemoryBudget>>,
+        create: impl FnOnce() -> io::Result<T>,
+        reset: impl FnOnce(&mut T) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        if let Some(mut cached) = cached {
+            let reusable = match (&cached.memory, budget) {
+                (None, None) => true,
+                (Some(memory), budget) => {
+                    payload_bound <= cached.payload_bound && budget.is_none_or(|budget| memory.belongs_to(budget))
+                }
+                // Uncharged foreground caches can have larger retained Vec
+                // capacities after reset; start a measured background workspace.
+                (None, Some(_)) => false,
+            };
+            if reusable && reset(&mut cached.codec).is_ok() {
+                return Ok(cached);
+            }
+            // A fresh allocation avoids hidden geometric Vec growth. No payload
+            // references escape codec calls, so dropping this cache is safe.
+            drop(cached);
+        }
+        let memory = budget.map(|budget| budget.reserve(payload_bound)).transpose()?;
+        let codec = create()?;
+        Ok(Self {
+            codec,
+            memory,
+            payload_bound,
+        })
+    }
+}
+
 struct LegacyReedSolomonEncoder {
     data_shards: usize,
     parity_shards: usize,
     cache_workspaces: bool,
-    encoder_cache: RwLock<Option<reed_solomon_simd::ReedSolomonEncoder>>,
-    decoder_cache: RwLock<Option<reed_solomon_simd::ReedSolomonDecoder>>,
+    encoder_cache: RwLock<Option<LegacyWorkspace<reed_solomon_simd::ReedSolomonEncoder>>>,
+    decoder_cache: RwLock<Option<LegacyWorkspace<reed_solomon_simd::ReedSolomonDecoder>>>,
 }
 
 impl LegacyReedSolomonEncoder {
@@ -199,20 +243,29 @@ impl LegacyReedSolomonEncoder {
             .write()
             .map_err(|_| io::Error::other("Failed to acquire encoder cache lock"))?
             .take();
-        let mut encoder = {
-            match cached_encoder {
-                Some(mut cached) => {
-                    if cached.reset(self.data_shards, self.parity_shards, shard_len).is_err() {
-                        reed_solomon_simd::ReedSolomonEncoder::new(self.data_shards, self.parity_shards, shard_len)
-                            .map_err(|e| io::Error::other(format!("Failed to create SIMD encoder: {e:?}")))?
-                    } else {
-                        cached
-                    }
-                }
-                None => reed_solomon_simd::ReedSolomonEncoder::new(self.data_shards, self.parity_shards, shard_len)
-                    .map_err(|e| io::Error::other(format!("Failed to create SIMD encoder: {e:?}")))?,
-            }
-        };
+        let budget = current_resource_unit().and_then(|resources| resources.memory_budget());
+        // reed-solomon-simd 3.1.0 Shards::resize allocates 64-byte units. A
+        // fresh Vec has at least four units; the decoder work-count bound also
+        // covers both encoder rate strategies.
+        let payload_bound = self
+            .logical_shard_bytes_upper_bound(shard_len)
+            .ok_or(io::ErrorKind::OutOfMemory)?
+            .max(256);
+        let mut workspace = LegacyWorkspace::prepare(
+            cached_encoder,
+            payload_bound,
+            budget.as_ref(),
+            || {
+                reed_solomon_simd::ReedSolomonEncoder::new(self.data_shards, self.parity_shards, shard_len)
+                    .map_err(|e| io::Error::other(format!("Failed to create SIMD encoder: {e:?}")))
+            },
+            |encoder| {
+                encoder
+                    .reset(self.data_shards, self.parity_shards, shard_len)
+                    .map_err(|e| io::Error::other(format!("Failed to reset SIMD encoder: {e:?}")))
+            },
+        )?;
+        let encoder = &mut workspace.codec;
         for (i, shard) in shards.iter().enumerate().take(self.data_shards) {
             encoder
                 .add_original_shard(shard)
@@ -233,7 +286,7 @@ impl LegacyReedSolomonEncoder {
                 .write()
                 .map_err(|_| io::Error::other("Failed to return encoder to cache"))?;
             if cache.is_none() {
-                *cache = Some(encoder);
+                *cache = Some(workspace);
             }
         }
         Ok(())
@@ -254,21 +307,26 @@ impl LegacyReedSolomonEncoder {
             .write()
             .map_err(|_| io::Error::other("Failed to acquire decoder cache lock"))?
             .take();
-        let mut decoder = {
-            match cached_decoder {
-                Some(mut cached_decoder) => {
-                    if let Err(e) = cached_decoder.reset(self.data_shards, self.parity_shards, shard_len) {
-                        warn!("Failed to reset SIMD decoder: {:?}, creating new one", e);
-                        reed_solomon_simd::ReedSolomonDecoder::new(self.data_shards, self.parity_shards, shard_len)
-                            .map_err(|e| io::Error::other(format!("Failed to create SIMD decoder: {e:?}")))?
-                    } else {
-                        cached_decoder
-                    }
-                }
-                None => reed_solomon_simd::ReedSolomonDecoder::new(self.data_shards, self.parity_shards, shard_len)
-                    .map_err(|e| io::Error::other(format!("Failed to create SIMD decoder: {e:?}")))?,
-            }
-        };
+        let budget = current_resource_unit().and_then(|resources| resources.memory_budget());
+        let payload_bound = self
+            .logical_shard_bytes_upper_bound(shard_len)
+            .ok_or(io::ErrorKind::OutOfMemory)?
+            .max(256);
+        let mut workspace = LegacyWorkspace::prepare(
+            cached_decoder,
+            payload_bound,
+            budget.as_ref(),
+            || {
+                reed_solomon_simd::ReedSolomonDecoder::new(self.data_shards, self.parity_shards, shard_len)
+                    .map_err(|e| io::Error::other(format!("Failed to create SIMD decoder: {e:?}")))
+            },
+            |decoder| {
+                decoder
+                    .reset(self.data_shards, self.parity_shards, shard_len)
+                    .map_err(|e| io::Error::other(format!("Failed to reset SIMD decoder: {e:?}")))
+            },
+        )?;
+        let decoder = &mut workspace.codec;
 
         for (i, shard_opt) in shards.iter().enumerate() {
             if let Some(shard) = shard_opt {
@@ -308,7 +366,7 @@ impl LegacyReedSolomonEncoder {
                 .write()
                 .map_err(|_| io::Error::other("Failed to return decoder to cache"))?;
             if cache.is_none() {
-                *cache = Some(decoder);
+                *cache = Some(workspace);
             }
         }
 
@@ -333,6 +391,13 @@ impl LegacyReedSolomonEncoder {
             return Ok(true);
         }
 
+        let expected_bytes = shards.iter().try_fold(0usize, |total, shard| {
+            total
+                .checked_add(shard.len())
+                .ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))
+        })?;
+        let memory = current_resource_unit().and_then(|resources| resources.memory_budget());
+        let _expected_memory = memory.as_ref().map(|memory| memory.reserve(expected_bytes)).transpose()?;
         let mut expected = shards.iter().map(|shard| Some(shard.to_vec())).collect::<Vec<_>>();
         self.encode_parity(&mut expected)?;
 
@@ -431,6 +496,17 @@ impl ReedSolomonEncoder {
         }
 
         if let Some(ref rs) = self.encoder {
+            if let Some(memory) = current_resource_unit().and_then(|resources| resources.memory_budget())
+                && let Some(shard_len) = shards.first().map(|shard| shard.len()).filter(|len| *len != 0)
+            {
+                let scratch_len = shard_len.checked_mul(self.parity_shards).ok_or(io::ErrorKind::OutOfMemory)?;
+                let mut scratch = BackgroundBuffer::new(Some(memory));
+                scratch.ensure_len(scratch_len)?;
+                let mut buffers: SmallVec<[&mut [u8]; 16]> = scratch.as_mut_slice().chunks_mut(shard_len).collect();
+                return rs
+                    .verify_with_buffer(shards, &mut buffers)
+                    .map_err(|e| io::Error::other(format!("Reed-Solomon verify failed: {e:?}")));
+            }
             rs.verify(shards)
                 .map_err(|e| io::Error::other(format!("Reed-Solomon verify failed: {e:?}")))
         } else {
@@ -1200,6 +1276,105 @@ impl Erasure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn background_legacy_workspaces_keep_their_memory_in_cache() {
+        use crate::disk::{test_resource_units, with_optional_resource_unit};
+        use std::time::Duration;
+
+        let codec = LegacyReedSolomonEncoder::with_workspace_cache(2, 1, true).expect("isolated cached codec");
+        let memory = BackgroundMemoryBudget::new();
+        memory.set_sampled_limit(512, Duration::from_secs(30));
+        let mut shards = vec![vec![7; 8], vec![9; 8], vec![0; 8]];
+        let (resources, _) = test_resource_units(1);
+        with_optional_resource_unit(Some(resources.with_memory_budget(memory.clone())), async {
+            codec
+                .encode(shards.iter_mut().map(Vec::as_mut_slice).collect())
+                .expect("accounted encoder");
+        })
+        .await;
+        assert_eq!(memory.snapshot().used, 256, "fresh SIMD work storage uses at most four 64-byte units");
+        memory.set_sampled_limit(0, Duration::ZERO);
+        let (resources, _) = test_resource_units(1);
+        with_optional_resource_unit(Some(resources.with_memory_budget(memory.clone())), async {
+            codec
+                .encode(shards.iter_mut().map(Vec::as_mut_slice).collect())
+                .expect("cached payload survives shrink");
+        })
+        .await;
+        assert_eq!(memory.snapshot().used, 256);
+
+        memory.set_sampled_limit(512, Duration::from_secs(30));
+        let mut decoded = vec![None, Some(shards[1].clone()), Some(shards[2].clone())];
+        let (resources, _) = test_resource_units(1);
+        with_optional_resource_unit(Some(resources.with_memory_budget(memory.clone())), async {
+            codec.reconstruct_data(&mut decoded).expect("accounted decoder");
+        })
+        .await;
+        assert_eq!(decoded[0].as_deref(), Some(shards[0].as_slice()));
+        assert_eq!(memory.snapshot().used, 512, "both cached codec payloads remain charged");
+        drop(codec);
+        assert_eq!(memory.snapshot().used, 0);
+    }
+
+    #[tokio::test]
+    async fn background_legacy_cache_cannot_reuse_a_different_memory_owner() {
+        use crate::disk::{test_resource_units, with_optional_resource_unit};
+        use std::time::Duration;
+
+        let codec = LegacyReedSolomonEncoder::with_workspace_cache(2, 1, true).expect("isolated cached codec");
+        let first = BackgroundMemoryBudget::new();
+        first.set_sampled_limit(256, Duration::from_secs(30));
+        let mut shards = vec![vec![7; 8], vec![9; 8], vec![0; 8]];
+        let (resources, _) = test_resource_units(1);
+        with_optional_resource_unit(Some(resources.with_memory_budget(first.clone())), async {
+            codec
+                .encode(shards.iter_mut().map(Vec::as_mut_slice).collect())
+                .expect("first owner");
+        })
+        .await;
+        let second = BackgroundMemoryBudget::new();
+        let (resources, _) = test_resource_units(1);
+        let error = with_optional_resource_unit(Some(resources.with_memory_budget(second.clone())), async {
+            codec.encode(shards.iter_mut().map(Vec::as_mut_slice).collect())
+        })
+        .await
+        .expect_err("a foreign cache must not bypass a closed owner");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(first.snapshot().used, 0);
+        assert_eq!(second.snapshot().used, 0);
+    }
+
+    #[tokio::test]
+    async fn background_modern_verification_charges_scratch_and_preserves_invalid_input_errors() {
+        use crate::disk::{test_resource_units, with_optional_resource_unit};
+        use std::time::Duration;
+
+        let codec = ReedSolomonEncoder::new(2, 1).expect("modern codec");
+        let mut shards = vec![vec![7; 8], vec![9; 8], vec![0; 8]];
+        codec
+            .encode(shards.iter_mut().map(Vec::as_mut_slice).collect())
+            .expect("valid parity");
+        let refs: Vec<_> = shards.iter().map(Vec::as_slice).collect();
+        let memory = BackgroundMemoryBudget::new();
+        let (resources, _) = test_resource_units(1);
+        let error =
+            with_optional_resource_unit(Some(resources.with_memory_budget(memory.clone())), async { codec.verify(&refs) })
+                .await
+                .expect_err("closed owner rejects verification scratch");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        memory.set_sampled_limit(8, Duration::from_secs(30));
+        let (resources, _) = test_resource_units(1);
+        with_optional_resource_unit(Some(resources.with_memory_budget(memory.clone())), async {
+            assert!(codec.verify(&refs).expect("exact parity scratch fits"));
+            assert!(
+                codec.verify(&[&[], &[9; 8], &[0; 8]]).is_err(),
+                "empty first shard remains an error instead of a panic"
+            );
+        })
+        .await;
+        assert_eq!(memory.snapshot().used, 0);
+    }
     use proptest::collection::{btree_set, vec};
     use proptest::prelude::*;
     use std::pin::Pin;

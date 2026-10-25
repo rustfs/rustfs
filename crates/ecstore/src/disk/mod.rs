@@ -29,14 +29,15 @@ pub(crate) mod lifecycle_test_io;
 pub mod local;
 pub mod os;
 
-#[cfg(test)]
-pub(crate) use io_admission::DiskIoClass;
+pub(crate) use io_admission::memory as background_memory;
 pub(crate) use io_admission::remote as remote_io_admission;
 pub use io_admission::{
     BackgroundMemoryBudget, PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler, PhysicalResourcePlan,
     RemoteBackgroundIo, spawn_blocking_with_resource_ownership, with_background_disk_io, with_background_resource_set,
     with_background_resource_unit, with_remote_background_io,
 };
+#[cfg(test)]
+pub(crate) use io_admission::{DiskIoClass, test_resource_units};
 pub(crate) use io_admission::{
     PhysicalHealBinding, acquire_context_disk_io_permit, current_disk_io_context, current_resource_unit, has_resource_io_scope,
     with_optional_disk_io_context, with_optional_resource_unit,
