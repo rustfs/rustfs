@@ -33877,6 +33877,124 @@ mod test {
         }
     }
 
+    async fn assert_multipart_prepared_complete_rejects_contended_authority(source_metadata: bool) {
+        use crate::disk::disk_store::LocalDiskWrapper;
+        use crate::disk::{MULTIPART_COMMIT_METADATA_FILE, MULTIPART_RECOVERY_DIR, RUSTFS_META_MULTIPART_BUCKET};
+        let root = tempfile::tempdir().expect("multipart authority contention root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let source = RUSTFS_META_MULTIPART_BUCKET;
+        let destination = "bucket";
+        let upload = "staging/upload";
+        let object = "object";
+        ensure_test_volume(&disk, source).await;
+        ensure_test_volume(&disk, destination).await;
+        let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+        let version = Uuid::new_v4();
+        let mut fi = test_file_info(object, version, None, Some(Bytes::from_static(b"completed payload")));
+        fi.set_inline_data();
+        let authority = disk
+            .io_get_object_path(source, &format!("{upload}/{STORAGE_FORMAT_FILE}"))
+            .expect("active authority");
+        let recovery = disk
+            .io_get_object_path(source, &format!("{upload}/{MULTIPART_RECOVERY_DIR}/{STORAGE_FORMAT_FILE}"))
+            .expect("recovery authority");
+        let staged = disk
+            .io_get_object_path(source, &format!("{upload}/{MULTIPART_COMMIT_METADATA_FILE}"))
+            .expect("staged completion");
+        let destination_meta = disk
+            .io_get_object_path(destination, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+            .expect("destination metadata");
+        let active_bytes = test_meta(fi.clone());
+        let previous_bytes = test_meta(test_file_info(
+            object,
+            Uuid::new_v4(),
+            None,
+            Some(Bytes::from_static(b"previous payload")),
+        ));
+        fs::create_dir_all(authority.parent().expect("active parent"))
+            .await
+            .expect("active directory");
+        fs::create_dir_all(destination_meta.parent().expect("destination parent"))
+            .await
+            .expect("destination directory");
+        fs::write(&authority, &active_bytes).await.expect("active upload authority");
+        fs::write(&destination_meta, &previous_bytes)
+            .await
+            .expect("previous destination");
+        let token = wrapper
+            .begin_legacy_rename_data((source, upload), &fi, (destination, object), None)
+            .await
+            .expect("prepared complete captures both volume READs");
+        let contender: Arc<dyn Send + Sync> = if source_metadata {
+            os::acquire_metadata_mutation_lease(&disk.get_object_path(source, upload).expect("source metadata key"), None).await
+        } else {
+            os::acquire_namespace_mutation_lease_with_owner(&recovery, None).await
+        };
+        let volume_lock = os::disk_volume_mutation_lock(&disk.root, source);
+        let mut writer = Box::pin(volume_lock.clone().write_owned());
+        assert!(
+            matches!(futures::poll!(writer.as_mut()), Poll::Pending),
+            "volume WRITE must queue behind the prepared complete"
+        );
+        let error = tokio::time::timeout(Duration::from_secs(5), token.commit())
+            .await
+            .expect("prepared complete must reject contention without waiting for either source key")
+            .expect_err("contended source authority must reject publication");
+        assert!(
+            matches!(error, DiskError::Io(ref inner) if inner.kind() == ErrorKind::WouldBlock),
+            "MPU_COMPLETE_CONTENDED_SOURCE: {error:?}"
+        );
+        assert_eq!(
+            fs::read(&authority).await.expect("active authority remains"),
+            active_bytes,
+            "failed complete must not retire active authority"
+        );
+        assert_eq!(
+            fs::read(&destination_meta).await.expect("destination remains"),
+            previous_bytes,
+            "failed complete must not publish destination metadata"
+        );
+        assert!(
+            !fs::try_exists(&recovery).await.expect("recovery absence"),
+            "failed complete must not publish recovery authority"
+        );
+        assert!(
+            !fs::try_exists(&staged).await.expect("staging absence"),
+            "failed complete must not write staged completion metadata"
+        );
+        let writer = tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("rejection releases captured volume READs");
+        drop(writer);
+        drop(contender);
+        wrapper
+            .begin_legacy_rename_data((source, upload), &fi, (destination, object), None)
+            .await
+            .expect("retry admission after competing key release")
+            .commit()
+            .await
+            .expect("uncontended prepared complete succeeds");
+        assert!(!fs::try_exists(&authority).await.expect("active authority retired"));
+        assert_eq!(fs::read(&recovery).await.expect("recovery authority survives complete"), active_bytes);
+        let published = FileMeta::load(&fs::read(&destination_meta).await.expect("published destination"))
+            .expect("valid committed metadata")
+            .into_fileinfo(destination, object, &version.to_string(), true, false, true)
+            .expect("committed destination version");
+        assert_eq!(published.version_id, Some(version));
+        assert_eq!(published.data.as_deref(), Some(b"completed payload".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn multipart_prepared_complete_rejects_contended_source_metadata() {
+        assert_multipart_prepared_complete_rejects_contended_authority(true).await;
+    }
+
+    #[tokio::test]
+    async fn multipart_prepared_complete_rejects_contended_recovery_namespace() {
+        assert_multipart_prepared_complete_rejects_contended_authority(false).await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn legacy_rename_data_admission_preparation_obeys_lock_deadline() {
         use crate::disk::disk_store::{LocalDiskWrapper, get_max_timeout_duration};

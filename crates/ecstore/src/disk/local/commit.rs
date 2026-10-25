@@ -716,7 +716,7 @@ impl LocalDisk {
             let authority_owner: Arc<dyn Send + Sync> = if source_object_path == root_destination_object_path {
                 commit.mutation_lease.clone()
             } else {
-                os::acquire_metadata_mutation_lease(&source_object_path, Some(commit.mutation_lease.clone())).await
+                os::try_acquire_metadata_mutation_lease_with_owner(&source_object_path, commit.mutation_lease.clone())?
             };
             let authority = self.io_get_object_path(src_volume, &format!("{src_path}/{STORAGE_FORMAT_FILE}"))?;
             let recovery = self.io_get_object_path(
@@ -724,14 +724,10 @@ impl LocalDisk {
                 &format!("{src_path}/{}/{STORAGE_FORMAT_FILE}", super::super::MULTIPART_RECOVERY_DIR),
             )?;
             check_path_length(recovery.to_string_lossy().as_ref())?;
-            os::rename_all_with_owner(
-                &authority,
-                &recovery,
-                &src_volume_dir,
-                commit.publication_root,
-                Some(authority_owner.clone()),
-            )
-            .await?;
+            // Both volume READs are already held. Neither source key may wait
+            // behind a competing owner that is queued behind a volume WRITE.
+            let recovery_lease = os::try_acquire_namespace_mutation_lease_with_owner(&recovery, authority_owner.clone())?;
+            os::rename_all_with_lease(&authority, &recovery, &src_volume_dir, commit.publication_root, recovery_lease).await?;
             // This is system metadata authority, so use its existing strict
             // durability policy even when the object payload is relaxed.
             if effective_durability(src_volume).syncs_commit_metadata() {
