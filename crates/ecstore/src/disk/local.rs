@@ -3634,6 +3634,171 @@ impl AsyncRead for FileCacheReclaimReader {
     }
 }
 
+// Tokio File hides its blocking jobs. Background writes need the physical
+// lease to travel with the file and staging buffer into those native jobs.
+struct ResourceWriteInner {
+    file: std::fs::File,
+    buffer: Vec<u8>,
+    _resource_unit: ResourceIoUnit,
+    #[cfg(test)]
+    before_write: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+enum ResourceWriteState {
+    Idle(Option<ResourceWriteInner>),
+    Busy(tokio::task::JoinHandle<(ResourceWriteInner, std::io::Result<()>)>),
+}
+
+struct ResourceFileWriter {
+    state: ResourceWriteState,
+    #[cfg(target_os = "linux")]
+    reclaim_len: usize,
+    #[cfg(target_os = "linux")]
+    reclaim_on_shutdown: bool,
+}
+
+impl ResourceFileWriter {
+    // Match Tokio File's maximum staging size; reuse the allocation per stream.
+    const MAX_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+
+    fn new(file: std::fs::File, resource_unit: ResourceIoUnit, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
+        #[cfg(target_os = "macos")]
+        if reclaim_on_shutdown {
+            let _ = set_std_fd_nocache(&file);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (reclaim_len, reclaim_on_shutdown);
+        Self {
+            state: ResourceWriteState::Idle(Some(ResourceWriteInner {
+                file,
+                buffer: Vec::new(),
+                _resource_unit: resource_unit,
+                #[cfg(test)]
+                before_write: None,
+            })),
+            #[cfg(target_os = "linux")]
+            reclaim_len,
+            #[cfg(target_os = "linux")]
+            reclaim_on_shutdown,
+        }
+    }
+
+    fn poll_complete(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match &mut self.state {
+            ResourceWriteState::Idle(Some(_)) => std::task::Poll::Ready(Ok(())),
+            ResourceWriteState::Idle(None) => std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "background file writer is closed after a native failure",
+            ))),
+            ResourceWriteState::Busy(task) => {
+                let result = std::task::ready!(std::pin::Pin::new(task).poll(cx));
+                self.state = ResourceWriteState::Idle(None);
+                match result {
+                    Ok((inner, Ok(()))) => {
+                        self.state = ResourceWriteState::Idle(Some(inner));
+                        std::task::Poll::Ready(Ok(()))
+                    }
+                    Ok((_, Err(error))) => std::task::Poll::Ready(Err(error)),
+                    Err(error) => std::task::Poll::Ready(Err(std::io::Error::other(error))),
+                }
+            }
+        }
+    }
+
+    fn poll_write_slices(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::ready!(self.poll_complete(cx))?;
+        let ResourceWriteState::Idle(inner) = &mut self.state else {
+            unreachable!("poll_complete leaves a completed writer idle");
+        };
+        let Some(mut inner) = inner.take() else {
+            unreachable!("poll_complete rejects closed writers");
+        };
+        for buf in bufs {
+            let len = buf.len().min(Self::MAX_BUFFER_SIZE - inner.buffer.len());
+            inner.buffer.extend_from_slice(&buf[..len]);
+            if inner.buffer.len() == Self::MAX_BUFFER_SIZE {
+                break;
+            }
+        }
+        let len = inner.buffer.len();
+        if len == 0 {
+            self.state = ResourceWriteState::Idle(Some(inner));
+        } else {
+            self.state = ResourceWriteState::Busy(tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some(hook) = inner.before_write.take() {
+                    hook();
+                }
+                let result = std::io::Write::write_all(&mut inner.file, &inner.buffer);
+                inner.buffer.clear();
+                (inner, result)
+            }));
+        }
+        std::task::Poll::Ready(Ok(len))
+    }
+}
+
+impl AsyncWrite for ResourceFileWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.poll_write_slices(cx, &[std::io::IoSlice::new(buf)])
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.poll_write_slices(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        self.poll_complete(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::ready!(self.poll_complete(cx))?;
+        #[cfg(target_os = "linux")]
+        if self.reclaim_on_shutdown {
+            if let ResourceWriteState::Idle(Some(inner)) = &self.state
+                && reclaim_write_file_cache(&inner.file, self.reclaim_len).is_err()
+            {
+                record_file_cache_reclaim_error("write");
+            }
+            self.reclaim_on_shutdown = false;
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reclaim_write_file_cache(file: &impl std::os::fd::AsFd, reclaim_len: usize) -> std::io::Result<()> {
+    use core::num::NonZeroU64;
+    use rustix::fs::{Advice, fadvise};
+
+    let Some(length) = NonZeroU64::new(reclaim_len as u64) else {
+        return Ok(());
+    };
+    let started = std::time::Instant::now();
+    fadvise(file, 0, Some(length), Advice::DontNeed).map_err(std::io::Error::from)?;
+    record_file_cache_reclaim_success("write", reclaim_len, started);
+    Ok(())
+}
+
 impl FileCacheReclaimWriter {
     fn new(inner: File, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
         #[cfg(target_os = "macos")]
@@ -3651,20 +3816,11 @@ impl FileCacheReclaimWriter {
 
     #[cfg(target_os = "linux")]
     fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
-        use core::num::NonZeroU64;
-        use rustix::fs::{Advice, fadvise};
-
         if !self.reclaim_on_shutdown || self.reclaimed || self.reclaim_len == 0 {
             return Ok(());
         }
-
-        let started = std::time::Instant::now();
-        let reclaim_len =
-            NonZeroU64::new(self.reclaim_len as u64).expect("reclaim_len is guaranteed non-zero by the early return");
-        fadvise(&self.inner, 0, Some(reclaim_len), Advice::DontNeed).map_err(std::io::Error::from)?;
-
+        reclaim_write_file_cache(&self.inner, self.reclaim_len)?;
         self.reclaimed = true;
-        record_file_cache_reclaim_success("write", self.reclaim_len, started);
         Ok(())
     }
 
@@ -3936,6 +4092,33 @@ impl StdBackend {
         let f = super::fs::open_file(path.as_ref(), mode).await.map_err(to_file_error)?;
 
         Ok(f)
+    }
+
+    async fn open_resource_writer(&self, path: PathBuf, mode: WriteMode, resources: ResourceIoUnit) -> Result<FileWriter> {
+        #[cfg(target_os = "linux")]
+        let mount_lease = self.mount_lease.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(target_os = "linux")]
+            let _mount_lease = mount_lease;
+            #[cfg(test)]
+            run_owned_file_write_before_open(&path);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true);
+            let (reclaim_len, reclaim_on_shutdown) = match mode {
+                WriteMode::Truncate { size_hint } => {
+                    options.truncate(true);
+                    (size_hint.max(0) as usize, should_reclaim_file_cache_after_write(size_hint))
+                }
+                WriteMode::Append => {
+                    options.append(true);
+                    (0, false)
+                }
+            };
+            let file = options.open(path).map_err(to_file_error)?;
+            Ok(Box::new(ResourceFileWriter::new(file, resources, reclaim_len, reclaim_on_shutdown)) as FileWriter)
+        })
+        .await
+        .map_err(DiskError::from)?
     }
 
     async fn open_file_read_only(&self, path: impl AsRef<Path>) -> Result<File> {
@@ -4575,6 +4758,10 @@ impl LocalIoBackend for StdBackend {
                     }
                 }
 
+                if let Some(resources) = current_resource_unit() {
+                    return self.open_resource_writer(file_path, mode, resources).await;
+                }
+
                 // O_TRUNC: if a file already exists at this path, stale trailing bytes past
                 // the new content would otherwise survive and mismatch the metadata size.
                 let f = super::fs::open_file(&file_path, O_CREATE | O_WRONLY | O_TRUNC)
@@ -4594,6 +4781,15 @@ impl LocalIoBackend for StdBackend {
 
                 let file_path = local_disk_object_path(self.io_root(), volume, path)?;
                 check_path_length(file_path.to_string_lossy().as_ref())?;
+
+                if let Some(resources) = current_resource_unit() {
+                    if let Some(parent) = file_path.parent()
+                        && parent != volume_dir
+                    {
+                        os::make_dir_all(parent, &volume_dir).await?;
+                    }
+                    return self.open_resource_writer(file_path, mode, resources).await;
+                }
 
                 let f = self.open_file(file_path, O_CREATE | O_APPEND | O_WRONLY, volume_dir).await?;
 
@@ -28723,6 +28919,303 @@ mod test {
             let got = disk.read_file_mmap_copy("test-volume", &path, 0, size).await.expect("read");
             assert_eq!(got.as_ref(), content.as_slice(), "round-trip mismatch at size={size}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn buffered_writer_cancelled_native_job_retains_physical_resources() {
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
+        use std::io::IoSlice;
+
+        temp_env::with_vars([(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, Some("false"))], || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .expect("one-thread native pool");
+            runtime.block_on(async {
+                let mut observations = Vec::new();
+                for count in [1, 2] {
+                    for append in [false, true] {
+                        for vectored in [false, true] {
+                            let dir = tempfile::tempdir().expect("buffered writer fixture");
+                            let volume = dir.path().join("test-volume");
+                            std::fs::create_dir(&volume).expect("test volume");
+                            let path = volume.join("shard");
+                            std::fs::write(&path, vec![9; 4096]).expect("seed existing file");
+                            let backend = StdBackend::new(dir.path().to_path_buf());
+                            let (resources, gates) = test_resource_units(count);
+                            let mode = if append {
+                                WriteMode::Append
+                            } else {
+                                WriteMode::Truncate { size_hint: 1024 }
+                            };
+                            let mut writer =
+                                with_optional_resource_unit(Some(resources), backend.open_write("test-volume", "shard", mode))
+                                    .await
+                                    .expect("open background writer");
+                            // Occupy the sole native worker after opening the file.
+                            // An accepted write stays queued while its async owner
+                            // is cancelled, including Tokio File's hidden jobs.
+                            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                            let blocker = tokio::task::spawn_blocking(move || {
+                                let _ = started_tx.send(());
+                                let _ = release_rx.recv();
+                            });
+                            started_rx.await.expect("native pool occupied");
+                            let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+                            let task = tokio::spawn(async move {
+                                let bytes = vec![37; 1024];
+                                if vectored {
+                                    assert_eq!(
+                                        writer
+                                            .write_vectored(&[IoSlice::new(&bytes[..17]), IoSlice::new(&bytes[17..])])
+                                            .await?,
+                                        1024
+                                    );
+                                } else {
+                                    writer.write_all(&bytes).await?;
+                                }
+                                accepted_tx.send(()).expect("write accepted");
+                                writer.flush().await
+                            });
+                            tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+                                .await
+                                .expect("write queues without waiting for its native job")
+                                .expect("queued write signal");
+                            task.abort();
+                            assert!(task.await.expect_err("cancel flush waiter").is_cancelled());
+                            let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
+                            release_tx.send(()).expect("release native pool before asserting");
+                            blocker.await.expect("blocking worker released");
+                            let bytes = fs::read(&path).await.expect("read completed native write");
+                            let mut expected = if append { vec![9; 4096] } else { Vec::new() };
+                            expected.extend_from_slice(&[37; 1024]);
+                            assert_eq!(bytes, expected, "queued native write must actually finish after cancellation");
+                            assert!(
+                                gates.iter().all(|gate| gate.snapshot().active == 0),
+                                "native completion returns all physical leaves"
+                            );
+                            observations.push((append, vectored, count, held));
+                        }
+                    }
+                }
+                for (append, vectored, count, held) in observations {
+                    assert_eq!(
+                        held,
+                        vec![1; count],
+                        "append={append}, vectored={vectored}: queued native write owns physical resources"
+                    );
+                }
+            });
+        });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn buffered_resource_writer_round_trips_boundaries_and_modes() {
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
+        use std::io::IoSlice;
+
+        temp_env::async_with_vars([(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, Some("false"))], async {
+            let dir = tempfile::tempdir().expect("buffered round trip fixture");
+            std::fs::create_dir(dir.path().join("test-volume")).expect("test volume");
+            let backend = StdBackend::new(dir.path().to_path_buf());
+            let limit = ResourceFileWriter::MAX_BUFFER_SIZE;
+            for size in [0, 1, 1024, limit - 1, limit, limit + 1, 2 * limit + 3] {
+                for append in [false, true] {
+                    for vectored in [false, true] {
+                        let name = format!("nested/{size}-{append}-{vectored}/shard");
+                        let path = dir.path().join("test-volume").join(&name);
+                        let (resources, gates) = test_resource_units(2);
+                        let mode = if append {
+                            WriteMode::Append
+                        } else {
+                            WriteMode::Truncate { size_hint: size as i64 }
+                        };
+                        let mut writer =
+                            with_optional_resource_unit(Some(resources), backend.open_write("test-volume", &name, mode))
+                                .await
+                                .expect("open writer creates nested parents");
+                        let content: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
+                        assert_eq!(writer.write(&[]).await.expect("empty scalar write"), 0);
+                        assert_eq!(
+                            writer
+                                .write_vectored(&[IoSlice::new(&[])])
+                                .await
+                                .expect("empty vectored write"),
+                            0
+                        );
+                        let mut offset = 0;
+                        while offset < size {
+                            let chunk = &content[offset..];
+                            let written = if vectored {
+                                let split = chunk.len().min(17);
+                                writer
+                                    .write_vectored(&[
+                                        IoSlice::new(&[]),
+                                        IoSlice::new(&chunk[..split]),
+                                        IoSlice::new(&chunk[split..]),
+                                    ])
+                                    .await
+                                    .expect("vectored write")
+                            } else {
+                                writer.write(chunk).await.expect("scalar write")
+                            };
+                            assert_eq!(written, chunk.len().min(limit), "bounded staging and complete iovecs");
+                            offset += written;
+                        }
+                        writer.flush().await.expect("drain native writes");
+                        assert_eq!(fs::read(&path).await.expect("read after flush"), content);
+                        writer.shutdown().await.expect("drain shutdown");
+                        writer.shutdown().await.expect("idempotent shutdown");
+                        assert!(gates.iter().all(|gate| gate.snapshot().active == 1), "open stream owns its resources");
+                        drop(writer);
+                        assert!(gates.iter().all(|gate| gate.snapshot().active == 0));
+                    }
+                }
+            }
+        })
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn buffered_resource_writer_surfaces_native_failure() {
+        use crate::disk::io_admission::test_resource_units;
+
+        for operation in ["flush", "shutdown", "write"] {
+            let file = tempfile::NamedTempFile::new().expect("read-only fixture");
+            let (resources, gates) = test_resource_units(1);
+            let mut writer =
+                ResourceFileWriter::new(std::fs::File::open(file.path()).expect("read-only descriptor"), resources, 0, false);
+            assert_eq!(writer.write(b"cannot write").await.expect("queued write"), 12);
+            let error = match operation {
+                "flush" => writer.flush().await.expect_err("native flush error"),
+                "shutdown" => writer.shutdown().await.expect_err("native shutdown error"),
+                _ => writer.write(b"more").await.expect_err("prior write error"),
+            };
+            assert_eq!(error.raw_os_error(), Some(libc::EBADF), "preserve the native write failure");
+            assert_eq!(
+                writer.flush().await.expect_err("failed stream remains failed").kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+            assert_eq!(std::fs::read(file.path()).expect("unchanged file"), b"");
+            assert_eq!(gates[0].snapshot().active, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn buffered_resource_writer_retains_running_job_after_runtime_shutdown() {
+        use crate::disk::io_admission::test_resource_units;
+
+        let dir = tempfile::tempdir().expect("runtime cancellation fixture");
+        let path = dir.path().join("shard");
+        let (resources, gates) = test_resource_units(2);
+        let mut writer = ResourceFileWriter::new(std::fs::File::create(&path).expect("shard file"), resources, 0, false);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let ResourceWriteState::Idle(Some(inner)) = &mut writer.state else { panic!("new writer is idle") };
+        inner.before_write = Some(Box::new(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.blocking_recv();
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("writer runtime");
+        runtime.block_on(async {
+            let task = tokio::spawn(async move {
+                writer.write_all(b"native write survives runtime").await?;
+                writer.flush().await
+            });
+            tokio::time::timeout(Duration::from_secs(5), started_rx)
+                .await
+                .expect("native write starts")
+                .expect("native start signal");
+            task.abort();
+            assert!(task.await.expect_err("cancel flush").is_cancelled());
+        });
+        runtime.shutdown_background();
+        let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
+        release_tx.send(()).expect("release native write before asserting");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while gates.iter().any(|gate| gate.snapshot().active != 0) {
+            assert!(std::time::Instant::now() < deadline, "native write finishes after shutdown");
+            std::thread::yield_now();
+        }
+        assert_eq!(held, vec![1, 1]);
+        assert_eq!(std::fs::read(path).expect("finished native bytes"), b"native write survives runtime");
+        assert!(gates.iter().all(|gate| gate.snapshot().active == 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn buffered_writer_cancelled_open_retains_resources_and_mount_lease() {
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
+
+        temp_env::async_with_vars([(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, Some("false"))], async {
+            for append in [false, true] {
+                let dir = tempfile::tempdir().expect("buffered open fixture");
+                let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
+                let mut disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+                disk.make_volume("test-volume").await.expect("test volume");
+                let exit = disk.exit_signal.take().expect("cleanup monitor exit sender");
+                exit.send(()).expect("stop fixture cleanup monitor");
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while exit.receiver_count() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("cleanup monitor stopped");
+                drop(exit);
+                let lease = Arc::downgrade(&disk.mount_lease);
+                let path = disk
+                    .io_get_object_path("test-volume", "nested/shard")
+                    .expect("pinned shard path");
+                let (resources, gates) = test_resource_units(2);
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                set_owned_file_write_before_open(&path, move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.blocking_recv();
+                });
+                let task = tokio::spawn(with_optional_resource_unit(Some(resources), async move {
+                    if append {
+                        disk.append_file("test-volume", "nested/shard").await
+                    } else {
+                        disk.create_file("", "test-volume", "nested/shard", 1024).await
+                    }
+                }));
+                tokio::time::timeout(Duration::from_secs(5), started_rx)
+                    .await
+                    .expect("native open starts")
+                    .expect("native open signal");
+                task.abort();
+                assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+                let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
+                let retained = lease.strong_count() > 0;
+                release_tx.send(()).expect("release native open before asserting");
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while lease.strong_count() != 0 || gates.iter().any(|gate| gate.snapshot().active != 0) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("native open releases ownership");
+                assert_eq!(held, vec![1, 1], "cancelled native open retains physical leaves");
+                assert!(retained, "proc-fd path stays pinned after retiring its disk");
+                assert!(
+                    dir.path().join("test-volume/nested/shard").is_file(),
+                    "native open completes after cancellation"
+                );
+            }
+        })
+        .await;
     }
 
     #[cfg(target_os = "linux")]
