@@ -69,6 +69,7 @@ pub mod sts;
 pub mod system;
 pub mod table_catalog;
 mod target_descriptor;
+mod target_read;
 pub mod tier;
 pub mod tls_certificate;
 pub mod tls_debug;

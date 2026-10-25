@@ -1793,6 +1793,141 @@ mod tests {
         fixture.assert_moved().await;
     }
 
+    /// An `ExpiredObjectAllVersions` expiry is a prefix delete that takes the
+    /// bucket lifecycle write lock, while the entry holds that lock for read
+    /// through its bucket incarnation fence. Applied inline, it waited out the
+    /// lock timeout, stalled every lifecycle read in the bucket behind it, and
+    /// failed the entry. The version moves instead and lifecycle expires it on
+    /// the target (rustfs/backlog#2873).
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_moves_a_version_expired_by_a_delete_all_rule() {
+        run_large_stack_async_test("rebalance-delete-all-expiry", run_delete_all_expiry_case);
+    }
+
+    async fn run_delete_all_expiry_case() {
+        const REBALANCE_ID: &str = "rebalance-delete-all-expiry";
+        let (_temp_dirs, store, _peer) = crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = "rebalance-delete-all";
+        let object = "expired.bin";
+        // An active run blocks the data-usage publication bucket creation needs.
+        Box::pin(store.make_bucket(
+            bucket,
+            &MakeBucketOptions {
+                versioning_enabled: true,
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("create bucket");
+        let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+        let rebalance_meta = active_rebalance_meta(REBALANCE_ID);
+        rebalance_meta
+            .save(Arc::clone(&store.pools[0]))
+            .await
+            .expect("persist the active rebalance run");
+        *store.rebalance_meta.write().await = Some(rebalance_meta);
+        let source_set = store.pools[0].get_disks_by_key(object);
+        let payload = b"expired by an all-versions rule".to_vec();
+        let written = Box::pin(source_set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(payload.clone()),
+            &ObjectOptions {
+                versioned: true,
+                mod_time: Some(OffsetDateTime::now_utc() - time::Duration::days(10)),
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("seed the expired source version");
+        let lifecycle = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(1),
+                    expired_object_all_versions: Some(true),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("delete-all".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+        let entry = metacache_entry_from_source(&source_set, bucket, object).await;
+
+        let lock_timeout = crate::set_disk::get_lock_acquire_timeout();
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            lock_timeout,
+            Box::pin(Arc::clone(&store).rebalance_entry(
+                RebalanceEntryTarget {
+                    bucket: bucket.to_string(),
+                    pool_index: 0,
+                },
+                entry,
+                Arc::clone(&source_set),
+                Arc::new(RebalanceBucketConfigs {
+                    bucket_incarnation_id: Some(incarnation),
+                    lifecycle_config: Some(lifecycle),
+                    ..Default::default()
+                }),
+                Arc::from(REBALANCE_ID),
+                CancellationToken::new(),
+            )),
+        )
+        .await
+        .expect("the entry must not wait out the bucket lifecycle lock timeout")
+        .expect("rebalance entry");
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, RebalanceEntryOutcome::Completed);
+        assert!(
+            elapsed < lock_timeout / 2,
+            "the entry must finish well under the {lock_timeout:?} lock timeout, took {elapsed:?}"
+        );
+
+        assert!(
+            source_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("read source versions")
+                .is_none(),
+            "the source entry must be removed once the version moved"
+        );
+        let target = store.pools[1]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("read target versions")
+            .expect("the version must reach the target pool");
+        assert_eq!(target.versions.len(), 1, "{:?}", target.versions);
+        assert_eq!(target.versions[0].version_id, written.version_id);
+        let mut reader = store.pools[1]
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: written.version_id.map(|version| version.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the moved version should be readable");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("drain the moved version");
+        assert_eq!(body, payload);
+    }
+
     /// Overwriting after versioning was enabled leaves a newer version above
     /// the null version. The old `None` read selected that newer version, the
     /// target accepted it as an equivalent copy, and cleanup then deleted the

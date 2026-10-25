@@ -1221,7 +1221,7 @@ impl LocalDisk {
         let journal = journal_bytes(journal)?;
         self.wait_for_startup_cleanup().await;
         let temporary = self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?;
-        let root = self.io_get_object_path(volume, object)?;
+        let (bucket, root) = self.io_get_bucket_and_object_path(volume, object)?;
         let destination = root.join(transaction.to_string());
         let original = original.map(<[u8]>::to_vec);
         let sync = effective_durability(volume).syncs_commit_metadata();
@@ -1232,7 +1232,7 @@ impl LocalDisk {
             Some(publication) => publication,
             None => os::acquire_namespace_mutation_lease_with_owner(&destination, owner.clone()).await,
         };
-        let (staged, target) = os::run_blocking_namespace_operation(lease.clone(), move || {
+        let (staged, target) = os::run_blocking_namespace_operation_with_sync(lease.clone(), sync, move || {
             std::fs::create_dir_all(&staging_root)?;
             let staged = Arc::new(
                 tempfile::Builder::new()
@@ -1289,25 +1289,27 @@ impl LocalDisk {
         // without replacing the prepared publication's sibling guards.
         let publication_owner: Arc<dyn Send + Sync> = Arc::new((lease, staged.clone()));
         let activation = os::try_acquire_namespace_mutation_lease_with_owner(staged.path(), publication_owner)?;
-        os::rename_all_with_lease(
-            staged.path(),
-            &destination,
-            &self.io_get_bucket_path(volume)?,
-            &self.publication_root,
-            activation,
-        )
-        .await?;
+        os::rename_all_with_lease(staged.path(), &destination, &bucket, &self.publication_root, activation).await?;
         if sync {
-            let bucket = self.io_get_bucket_path(volume)?;
+            let mut dirs_to_sync = Vec::new();
             let mut path = root.as_path();
             loop {
-                os::fsync_dir_with_owner(path, owner.clone()).await.map_err(to_file_error)?;
+                dirs_to_sync.push(path.to_path_buf());
                 if path == bucket {
                     break;
                 }
                 path = path.parent().ok_or(DiskError::InvalidPath)?;
             }
-            os::fsync_dir_with_owner(&temporary, owner.clone())
+            dirs_to_sync.push(temporary);
+            let sync_owner = owner.clone();
+            self.blocking_queue
+                .run_fsync_cancellable(move |_| {
+                    let _owner = sync_owner;
+                    for dir in dirs_to_sync {
+                        os::fsync_dir_std(&dir)?;
+                    }
+                    Ok(())
+                })
                 .await
                 .map_err(to_file_error)?;
         }
@@ -1818,26 +1820,16 @@ impl LocalDisk {
                     prepared_publication.clone(),
                 )
                 .await?;
-                for name in [STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE] {
-                    match async {
-                        if let Some(publication) = &prepared_publication {
-                            os::remove_file_with_lease(rollback.join(name), publication.clone()).await
-                        } else {
-                            os::remove_file_with_owner(rollback.join(name), owner.clone()).await
-                        }
-                    }
-                    .await
-                    {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == ErrorKind::NotFound => {}
-                        Err(err) => return Err(to_file_error(err).into()),
-                    }
-                }
-                if effective_durability(volume).syncs_commit_metadata() {
-                    os::fsync_dir_with_owner(&rollback, owner.clone())
-                        .await
-                        .map_err(to_file_error)?;
-                }
+                os::remove_files_and_fsync_with_owner(
+                    &rollback,
+                    &[STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE],
+                    effective_durability(volume).syncs_commit_metadata(),
+                    None,
+                    owner.clone(),
+                    prepared_publication.clone(),
+                )
+                .await
+                .map_err(to_file_error)?;
                 let (_, complete) = self
                     .finish_version_delete_with_prepared_publication(
                         volume,
@@ -1907,26 +1899,16 @@ impl LocalDisk {
                         Err(err) => return Err(to_file_error(err).into()),
                     }
                 }
-                write_delete_rollback_file_with_prepared_publication(
-                    self.io_root(),
-                    (volume, &root),
-                    transaction,
-                    FINISHED,
-                    &[],
-                    owner.clone(),
-                    prepared_publication.clone(),
-                )
-                .await?;
                 let receipt = CommitReceipt {
                     journal: journal.clone(),
                     finished: true,
                 };
-                write_delete_rollback_file_with_prepared_publication(
+                let receipt_bytes = serde_json::to_vec(&receipt)?;
+                write_delete_rollback_files_with_prepared_publication(
                     self.io_root(),
                     (volume, &root),
                     transaction,
-                    DELETE_QUORUM_COMMITTED_FILE,
-                    &serde_json::to_vec(&receipt)?,
+                    &[(FINISHED, &[]), (DELETE_QUORUM_COMMITTED_FILE, &receipt_bytes)],
                     owner.clone(),
                     prepared_publication.clone(),
                 )
@@ -1936,33 +1918,14 @@ impl LocalDisk {
                 if observed.state != DeleteRecoveryState::CommitFinished {
                     return Err(DiskError::DiskOngoingReq);
                 }
-                for name in [TARGET, PREPARED, FINISHED] {
-                    match async {
-                        if let Some(publication) = &prepared_publication {
-                            os::remove_file_with_lease(rollback.join(name), publication.clone()).await
-                        } else {
-                            os::remove_file_with_owner(rollback.join(name), owner.clone()).await
-                        }
-                    }
-                    .await
-                    {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == ErrorKind::NotFound => {}
-                        Err(err) => return Err(to_file_error(err).into()),
-                    }
-                }
-                if effective_durability(volume).syncs_commit_metadata() {
-                    os::fsync_dir_with_owner(&rollback, owner.clone())
-                        .await
-                        .map_err(to_file_error)?;
-                }
-                async {
-                    if let Some(publication) = &prepared_publication {
-                        os::remove_file_with_lease(rollback.join(DELETE_QUORUM_COMMITTED_FILE), publication.clone()).await
-                    } else {
-                        os::remove_file_with_owner(rollback.join(DELETE_QUORUM_COMMITTED_FILE), owner.clone()).await
-                    }
-                }
+                os::remove_files_and_fsync_with_owner(
+                    &rollback,
+                    &[TARGET, PREPARED, FINISHED],
+                    effective_durability(volume).syncs_commit_metadata(),
+                    Some(DELETE_QUORUM_COMMITTED_FILE),
+                    owner.clone(),
+                    prepared_publication.clone(),
+                )
                 .await
                 .map_err(to_file_error)?;
                 self.delete_unleased_with_namespace_owner(

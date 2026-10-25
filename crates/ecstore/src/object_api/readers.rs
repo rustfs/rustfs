@@ -4473,3 +4473,7 @@ mod tests {
             .expect_err("a lying frame-layout marker must fail closed, not serve plaintext");
     }
 }
+
+#[cfg(test)]
+#[path = "readers/compression_index_compatibility_tests.rs"]
+mod compression_index_compatibility_tests;

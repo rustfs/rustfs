@@ -235,6 +235,8 @@ impl QuotaChecker {
         Ok(updated_at)
     }
 
+    /// Return quota configuration with optional scanner usage, independently
+    /// of the usage requirements enforced by write admission.
     pub async fn get_quota_stats(&self, bucket: &str) -> Result<(BucketQuota, Option<u64>), QuotaError> {
         // If bucket doesn't exist, return ConfigNotFound error
         if !self.bucket_exists(bucket).await {
@@ -244,18 +246,13 @@ impl QuotaChecker {
         }
 
         let quota = self.get_quota_config(bucket).await?;
-        let current_usage = if quota.uses_durable_reservations() {
-            self.report_only_usage(bucket).await
-        } else {
-            Some(self.get_real_time_usage(bucket).await?)
-        };
+        let current_usage = self.report_only_usage(bucket).await;
 
         Ok((quota, current_usage))
     }
 
-    /// Scanner usage for a bucket the reservation ledger admits is reporting
-    /// input only, so unavailable memory usage is reported as "unknown" and counted
-    /// instead of becoming an error the write path would fail on.
+    /// Best-effort usage for statistics and durable admission reports.
+    /// Missing scanner coverage is unknown, not an error or a zero-sized bucket.
     async fn report_only_usage(&self, bucket: &str) -> Option<u64> {
         // The plain lookup: a report must not wait for an early snapshot reload.
         let usage = get_bucket_usage_memory(bucket).await;
@@ -267,7 +264,7 @@ impl QuotaChecker {
                 subsystem = LOG_SUBSYSTEM_QUOTA,
                 state = "usage_unknown",
                 bucket = %bucket,
-                "durable quota usage report degraded"
+                "quota usage report degraded"
             );
         }
         usage
@@ -742,8 +739,12 @@ mod tests {
             1,
             "fail-closed admission takes the early-reload lookup"
         );
-        assert!(matches!(checker.get_quota_stats(&legacy).await, Err(QuotaError::UsageUnavailable { .. })));
-        assert_eq!(crate::data_usage::reload_unknown_bucket_usage_calls_for_test(&legacy), 2);
+        let (_, usage) = checker
+            .get_quota_stats(&legacy)
+            .await
+            .expect("legacy quota statistics are reporting only");
+        assert_eq!(usage, None);
+        assert_eq!(crate::data_usage::reload_unknown_bucket_usage_calls_for_test(&legacy), 1);
         assert_eq!(
             crate::data_usage::reload_unknown_bucket_usage_calls_for_test(&bucket),
             0,

@@ -48,6 +48,7 @@ fn runtime() -> MrfRuntime {
         config,
         checkpoint_owner: Uuid::new_v4(),
         next_checkpoint_sequence: 1,
+        lifecycle_format_version: MRF_LIFECYCLE_FORMAT_VERSION,
         new_since_flush: 0,
         dirty: false,
         journal_on_disk: false,

@@ -216,7 +216,7 @@ pub async fn lookup_degraded_bucket_usage_baseline(store: Arc<ECStore>, bucket: 
     // Stale or empty cache: refresh through the TTL-bounded loader. A failed
     // refresh carries the previous baseline forward, so quota admission keeps
     // its last grounded values through a backend read outage.
-    let _ = load_data_usage_from_backend_cached(store).await;
+    let _ = project_data_usage_from_backend_cached(store, |_| ()).await;
     let cache = data_usage_snapshot_cache().read().await;
     cache
         .as_ref()
@@ -237,31 +237,34 @@ struct CachedDataUsageSnapshot {
 }
 
 impl CachedDataUsageSnapshot {
-    fn result(&self) -> Result<DataUsageInfo, Error> {
+    fn result<T>(&self, project: impl FnOnce(&DataUsageInfo) -> T) -> Result<T, Error> {
         self.info
-            .clone()
+            .as_ref()
+            .map(project)
             .ok_or_else(|| Error::other("data usage snapshot load recently failed"))
     }
 }
 
-fn fresh_cached_data_usage_snapshot(
+fn fresh_cached_data_usage_snapshot<T>(
     cache: &Option<CachedDataUsageSnapshot>,
     now: tokio::time::Instant,
     ttl: Duration,
-) -> Option<Result<DataUsageInfo, Error>> {
+    project: impl FnOnce(&DataUsageInfo) -> T,
+) -> Option<Result<T, Error>> {
     cache
         .as_ref()
         .filter(|cached| now.duration_since(cached.loaded_at) < ttl)
-        .map(CachedDataUsageSnapshot::result)
+        .map(|cached| cached.result(project))
 }
 
-fn cache_data_usage_snapshot_result(
+fn cache_data_usage_snapshot_result<T>(
     cache: &mut Option<CachedDataUsageSnapshot>,
     result: Result<LoadedUsageBaseline, Error>,
     loaded_at: tokio::time::Instant,
     refresh_generation: u64,
     current_generation: u64,
-) -> Option<Result<DataUsageInfo, Error>> {
+    project: impl FnOnce(&DataUsageInfo) -> T,
+) -> Option<Result<T, Error>> {
     if current_generation != refresh_generation {
         return None;
     }
@@ -280,12 +283,13 @@ fn cache_data_usage_snapshot_result(
                     degraded_baseline.entry(bucket.clone()).or_insert(*size);
                 }
             }
+            let projected = project(&info);
             *cache = Some(CachedDataUsageSnapshot {
-                info: Some(info.clone()),
+                info: Some(info),
                 loaded_at,
                 degraded_baseline,
             });
-            Ok(info)
+            Ok(projected)
         }
         Err(e) => {
             // Keep the previous baseline through a failed refresh: quota
@@ -1486,12 +1490,21 @@ async fn normalize_loaded_data_usage(
 /// `save_data_usage_in_backend` invalidates the cache so a fresh scanner save
 /// is visible immediately in the saving process.
 pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
+    project_data_usage_from_backend_cached(store, DataUsageInfo::clone).await
+}
+
+// Project under the cache guard so scalar readers never copy the snapshot's
+// bucket maps. The owned API shares the same TTL, refresh and invalidation path.
+async fn project_data_usage_from_backend_cached<T>(
+    store: Arc<ECStore>,
+    project: impl Fn(&DataUsageInfo) -> T,
+) -> Result<T, Error> {
     let ttl = Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS);
 
     loop {
         {
             let cache = data_usage_snapshot_cache().read().await;
-            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl) {
+            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl, &project) {
                 return result;
             }
         }
@@ -1503,7 +1516,7 @@ pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<
             .await;
         {
             let cache = data_usage_snapshot_cache().read().await;
-            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl) {
+            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl, &project) {
                 return result;
             }
         }
@@ -1512,9 +1525,14 @@ pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<
         let result = load_data_usage_from_backend_with_baseline(store.clone()).await;
         let loaded_at = tokio::time::Instant::now();
         let mut cache = data_usage_snapshot_cache().write().await;
-        if let Some(result) =
-            cache_data_usage_snapshot_result(&mut cache, result, loaded_at, refresh_generation, data_usage_snapshot_generation())
-        {
+        if let Some(result) = cache_data_usage_snapshot_result(
+            &mut cache,
+            result,
+            loaded_at,
+            refresh_generation,
+            data_usage_snapshot_generation(),
+            &project,
+        ) {
             return result;
         }
         drop(cache);
@@ -1532,7 +1550,8 @@ pub async fn load_admin_data_usage_from_backend_cached(store: Arc<ECStore>) -> R
     loop {
         {
             let cache = admin_data_usage_snapshot_cache().read().await;
-            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl) {
+            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl, DataUsageInfo::clone)
+            {
                 return result;
             }
         }
@@ -1543,7 +1562,8 @@ pub async fn load_admin_data_usage_from_backend_cached(store: Arc<ECStore>) -> R
             .await;
         {
             let cache = admin_data_usage_snapshot_cache().read().await;
-            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl) {
+            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl, DataUsageInfo::clone)
+            {
                 return result;
             }
         }
@@ -1564,6 +1584,7 @@ pub async fn load_admin_data_usage_from_backend_cached(store: Arc<ECStore>) -> R
             loaded_at,
             refresh_generation,
             admin_data_usage_snapshot_generation(),
+            DataUsageInfo::clone,
         ) {
             return result;
         }
@@ -2277,8 +2298,10 @@ async fn get_persisted_bucket_usage(bucket: &str) -> Option<u64> {
 }
 
 async fn persisted_bucket_usage(store: Arc<ECStore>, bucket: &str) -> Option<u64> {
-    let info = load_data_usage_from_backend_cached(store).await.ok()?;
-    info.buckets_usage.get(bucket).map(|usage| usage.size)
+    project_data_usage_from_backend_cached(store, |info| info.buckets_usage.get(bucket).map(|usage| usage.size))
+        .await
+        .ok()
+        .flatten()
 }
 
 async fn reload_persisted_bucket_usage(store: Arc<ECStore>, bucket: &str) -> Option<u64> {
@@ -2375,6 +2398,7 @@ where
         tokio::time::Instant::now(),
         refresh_generation,
         data_usage_snapshot_generation(),
+        |_| (),
     )
     .is_some()
 }
@@ -2891,6 +2915,8 @@ pub async fn init_compression_total_memory_from_backend(store: Arc<ECStore>) {
 
 #[cfg(test)]
 mod tests {
+    mod snapshot_projection;
+
     use super::*;
     use crate::layout::endpoints::EndpointServerPools;
     use crate::runtime::instance::InstanceContext;
@@ -4573,15 +4599,29 @@ mod tests {
             loaded_at,
             refresh_generation,
             data_usage_snapshot_generation(),
+            DataUsageInfo::clone,
         )
         .expect("an uninterrupted refresh should populate the cache");
         assert!(matches!(first, Err(Error::ErasureReadQuorum)));
 
-        let cached = fresh_cached_data_usage_snapshot(&cache, loaded_at + Duration::from_secs(1), Duration::from_secs(30))
-            .expect("the failed load must remain cached within the TTL");
+        let cached = fresh_cached_data_usage_snapshot(
+            &cache,
+            loaded_at + Duration::from_secs(1),
+            Duration::from_secs(30),
+            DataUsageInfo::clone,
+        )
+        .expect("the failed load must remain cached within the TTL");
         assert!(cached.is_err());
 
-        assert!(fresh_cached_data_usage_snapshot(&cache, loaded_at + Duration::from_secs(30), Duration::from_secs(30)).is_none());
+        assert!(
+            fresh_cached_data_usage_snapshot(
+                &cache,
+                loaded_at + Duration::from_secs(30),
+                Duration::from_secs(30),
+                DataUsageInfo::clone
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -4602,14 +4642,20 @@ mod tests {
             loaded_at,
             refresh_generation,
             data_usage_snapshot_generation(),
+            DataUsageInfo::clone,
         )
         .expect("an uninterrupted refresh should populate the cache")
         .expect("successful load must be returned");
         assert_snapshot_bucket(&first, "bucket");
 
-        let cached = fresh_cached_data_usage_snapshot(&cache, loaded_at + Duration::from_secs(1), Duration::from_secs(30))
-            .expect("successful load must remain cached within the TTL")
-            .expect("cached success must remain successful");
+        let cached = fresh_cached_data_usage_snapshot(
+            &cache,
+            loaded_at + Duration::from_secs(1),
+            Duration::from_secs(30),
+            DataUsageInfo::clone,
+        )
+        .expect("successful load must remain cached within the TTL")
+        .expect("cached success must remain successful");
         assert_snapshot_bucket(&cached, "bucket");
     }
 
@@ -4634,6 +4680,7 @@ mod tests {
             loaded_at,
             refresh_generation,
             data_usage_snapshot_generation(),
+            DataUsageInfo::clone,
         )
         .expect("an uninterrupted refresh should populate the cache")
         .expect("successful load must be returned");
@@ -4667,6 +4714,7 @@ mod tests {
             loaded_at,
             refresh_generation,
             data_usage_snapshot_generation(),
+            DataUsageInfo::clone,
         );
 
         assert!(stale_result.is_none());

@@ -58,7 +58,7 @@ use crate::diagnostics::get::{
 #[cfg(test)]
 use crate::disk::HEALING_MARKER_PATH;
 use crate::disk::disk_store::{get_drive_walkdir_stall_timeout, get_object_disk_read_timeout};
-use crate::disk::io_admission::{DiskIoPermit, current_resource_unit, spawn_blocking_with_disk_io_permit};
+use crate::disk::io_admission::{DiskIoPermit, spawn_blocking_with_disk_io_permit};
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, ConditionalFileUpdate, CurrentDeleteGeneration, DataDirDeleteStatus,
@@ -87,7 +87,6 @@ use metrics::counter;
 #[cfg(target_os = "linux")]
 use metrics::gauge;
 use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock};
-use rustfs_concurrency::adaptive::AdaptivePermit;
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
     ValidationMode, get_file_info, read_xl_meta_no_data_sync,
@@ -326,151 +325,6 @@ fn read_metadata_only_std(opened: std::io::Result<std::fs::File>) -> Result<(Vec
     };
 
     Ok((data, modtime))
-}
-
-const MAX_METADATA_READ_WORKERS_PER_DISK: usize = 2;
-
-type ReadAllDataResult = core::result::Result<(Vec<u8>, Option<OffsetDateTime>), ReadAllError>;
-type ReadMetadataOnlyResult = Result<(Vec<u8>, Option<OffsetDateTime>)>;
-
-enum MetadataReadOp {
-    ReadAll {
-        tx: tokio::sync::oneshot::Sender<ReadAllDataResult>,
-    },
-    ReadMetadataOnly {
-        tx: tokio::sync::oneshot::Sender<ReadMetadataOnlyResult>,
-    },
-    #[cfg(test)]
-    TestCustom {
-        is_closed: Box<dyn Fn() -> bool + Send>,
-        run: Box<dyn FnOnce() + Send>,
-    },
-}
-
-struct MetadataReadJob {
-    resource_unit: Option<AdaptivePermit>,
-    path: PathBuf,
-    io_permit: Option<DiskIoPermit>,
-    op: MetadataReadOp,
-}
-
-impl MetadataReadJob {
-    #[inline]
-    fn is_cancelled(&self) -> bool {
-        match &self.op {
-            MetadataReadOp::ReadAll { tx } => tx.is_closed(),
-            MetadataReadOp::ReadMetadataOnly { tx } => tx.is_closed(),
-            #[cfg(test)]
-            MetadataReadOp::TestCustom { is_closed, .. } => is_closed(),
-        }
-    }
-
-    #[inline]
-    fn execute(self, root: &os::PublicationRoot) {
-        if self.is_cancelled() {
-            return;
-        }
-        let _resource_unit = self.resource_unit;
-        let _io_permit = self.io_permit;
-        match self.op {
-            MetadataReadOp::ReadAll { tx } => {
-                let _ = tx.send(read_all_data_std(root.open_readonly(&self.path)));
-            }
-            MetadataReadOp::ReadMetadataOnly { tx } => {
-                let _ = tx.send(read_metadata_only_std(root.open_readonly(&self.path)));
-            }
-            #[cfg(test)]
-            MetadataReadOp::TestCustom { run, .. } => run(),
-        }
-    }
-}
-
-#[derive(Default)]
-struct MetadataReadQueueState {
-    jobs: std::collections::VecDeque<MetadataReadJob>,
-    active_workers: usize,
-}
-
-struct MetadataReadQueue {
-    root: os::PublicationRoot,
-    state: ParkingLotMutex<MetadataReadQueueState>,
-}
-
-struct MetadataReadWorkerGuard {
-    queue: Arc<MetadataReadQueue>,
-    disarmed: bool,
-}
-
-impl Drop for MetadataReadWorkerGuard {
-    fn drop(&mut self) {
-        if self.disarmed {
-            return;
-        }
-        let should_respawn = {
-            let mut state = self.queue.state.lock();
-            state.active_workers = state.active_workers.saturating_sub(1);
-            if !state.jobs.is_empty() && state.active_workers < MAX_METADATA_READ_WORKERS_PER_DISK {
-                state.active_workers += 1;
-                true
-            } else {
-                false
-            }
-        };
-        if should_respawn {
-            MetadataReadQueue::spawn_worker(Arc::clone(&self.queue));
-        }
-    }
-}
-
-impl MetadataReadQueue {
-    fn new(root: os::PublicationRoot) -> Arc<Self> {
-        Arc::new(Self {
-            root,
-            state: ParkingLotMutex::new(MetadataReadQueueState::default()),
-        })
-    }
-
-    fn enqueue(self: &Arc<Self>, mut job: MetadataReadJob) {
-        job.resource_unit = current_resource_unit();
-        let should_spawn = {
-            let mut state = self.state.lock();
-            state.jobs.push_back(job);
-            if state.active_workers < MAX_METADATA_READ_WORKERS_PER_DISK {
-                state.active_workers += 1;
-                true
-            } else {
-                false
-            }
-        };
-        if should_spawn {
-            Self::spawn_worker(Arc::clone(self));
-        }
-    }
-
-    fn spawn_worker(queue: Arc<Self>) {
-        drop(tokio::task::spawn_blocking(move || {
-            let mut guard = MetadataReadWorkerGuard {
-                queue: Arc::clone(&queue),
-                disarmed: false,
-            };
-            loop {
-                let Some(job) = ({
-                    let mut state = queue.state.lock();
-                    match state.jobs.pop_front() {
-                        Some(job) => Some(job),
-                        None => {
-                            state.active_workers = state.active_workers.saturating_sub(1);
-                            guard.disarmed = true;
-                            None
-                        }
-                    }
-                }) else {
-                    return;
-                };
-                job.execute(&queue.root);
-            }
-        }));
-    }
 }
 
 /// Reads the `xl.meta` header/metadata envelope and 5-byte CRC for directory
@@ -759,58 +613,87 @@ async fn write_delete_rollback_file_with_prepared_publication(
     io_root: &Path,
     target: (&str, &Path),
     rollback_dir: Uuid,
-    name: &str,
+    name: &'static str,
     data: &[u8],
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+    prepared: Option<Arc<os::NamespaceMutationLease>>,
+) -> Result<()> {
+    write_delete_rollback_files_with_prepared_publication(
+        io_root,
+        target,
+        rollback_dir,
+        &[(name, data)],
+        namespace_owner,
+        prepared,
+    )
+    .await
+}
+
+async fn write_delete_rollback_files_with_prepared_publication(
+    io_root: &Path,
+    target: (&str, &Path),
+    rollback_dir: Uuid,
+    files: &[(&'static str, &[u8])],
     namespace_owner: Option<Arc<dyn Send + Sync>>,
     prepared: Option<Arc<os::NamespaceMutationLease>>,
 ) -> Result<()> {
     let (volume, object_dir) = target;
     let backup_dir = object_dir.join(rollback_dir.to_string());
-    let path = backup_dir.join(name);
-    let lease = if let Some(prepared) = prepared {
-        prepared
-    } else {
-        os::acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await
+    let mut entries = Vec::with_capacity(files.len());
+    // Publication and cleanup both acquire FINISHED before the quorum receipt.
+    for &(name, data) in files {
+        let path = backup_dir.join(name);
+        let lease = match &prepared {
+            Some(publication) => publication.clone(),
+            None => os::acquire_namespace_mutation_lease_with_owner(&path, namespace_owner.clone()).await,
+        };
+        entries.push((name, path, data.to_vec(), lease));
+    }
+    let Some(first_lease) = entries.first().map(|(_, _, _, lease)| Arc::clone(lease)) else {
+        return Ok(());
     };
-    let data = data.to_vec();
     let sync = effective_durability(volume).syncs_commit_metadata();
     let staging_root = io_root.join(RUSTFS_META_TMP_BUCKET);
     let io_root = io_root.to_path_buf();
-    let name = name.to_owned();
-    os::run_blocking_namespace_operation(lease, move || {
-        reject_local_disk_symlink_components(&io_root, &path).map_err(std::io::Error::from)?;
+    os::run_blocking_namespace_operation_with_sync(first_lease, sync, move || {
+        for (_, path, _, _) in &entries {
+            reject_local_disk_symlink_components(&io_root, path).map_err(std::io::Error::from)?;
+        }
         reject_local_disk_symlink_components(&io_root, &staging_root).map_err(std::io::Error::from)?;
         std::fs::create_dir_all(&backup_dir)?;
         std::fs::create_dir_all(&staging_root)?;
-        #[cfg(test)]
-        run_owned_file_write_before_open(&path);
         // tempfile's Windows `persist` hands both the staged and the final path
         // straight to `MoveFileExW`, bypassing std's long-path handling, so a
         // deep object key failed every delete at MAX_PATH (rustfs#8545).
         let staging_root = rustfs_utils::extended_length_path(&staging_root)?;
-        let destination = rustfs_utils::extended_length_path(&path)?;
         // Private directory staging is reclaimed by existing tmp cleanup after
         // a crash and cannot leave a regular artifact in the user's bucket.
         let staging_dir = tempfile::Builder::new()
             .prefix(".delete-rollback-")
             .tempdir_in(&staging_root)?;
-        let staged_path = staging_dir.path().join(name);
-        let mut staged_options = std::fs::OpenOptions::new();
-        staged_options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            staged_options.mode(0o600);
+        for (name, path, data, lease) in entries {
+            let _lease = lease;
+            #[cfg(test)]
+            run_owned_file_write_before_open(&path);
+            let destination = rustfs_utils::extended_length_path(&path)?;
+            let staged_path = staging_dir.path().join(name);
+            let mut staged_options = std::fs::OpenOptions::new();
+            staged_options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                staged_options.mode(0o600);
+            }
+            let mut staged = staged_options.open(&staged_path)?;
+            std::io::Write::write_all(&mut staged, &data)?;
+            if sync {
+                staged.sync_all()?;
+            }
+            // Close the writer before publishing via std::fs::rename, which applies
+            // verbatim long-path normalization and POSIX-semantics replacement on Windows.
+            drop(staged);
+            std::fs::rename(&staged_path, &destination)?;
         }
-        let mut staged = staged_options.open(&staged_path)?;
-        std::io::Write::write_all(&mut staged, &data)?;
-        if sync {
-            staged.sync_all()?;
-        }
-        // Close the writer before publishing via std::fs::rename, which applies
-        // verbatim long-path normalization and POSIX-semantics replacement on Windows.
-        drop(staged);
-        std::fs::rename(&staged_path, &destination)?;
         if sync {
             os::fsync_dir_std(&backup_dir)?;
             if let Some(parent) = backup_dir.parent() {
@@ -3842,6 +3725,7 @@ fn run_owned_file_write_before_open(path: &Path) {
         .expect("test file write hook lock should not be poisoned")
         .remove(path);
     if let Some(hook) = hook {
+        let _pause = os::enter_blocking_test_hook();
         hook();
     }
 }
@@ -6678,8 +6562,7 @@ pub struct LocalDisk {
     exit_signal: Option<tokio::sync::broadcast::Sender<()>>,
     io_backend: Arc<dyn LocalIoBackend>,
     file_sync_permits: Arc<Semaphore>,
-    _blocking_queue: Arc<os::DiskBlockingQueue>,
-    metadata_read_queue: Arc<MetadataReadQueue>,
+    blocking_queue: Arc<os::DiskBlockingQueue>,
     snapshot_leases: Arc<ParkingLotMutex<SnapshotLeaseRegistry>>,
 }
 
@@ -8343,7 +8226,6 @@ impl LocalDisk {
 
         // TODO(backlog): add O_DIRECT I/O support for performance-critical paths
         // TODO(backlog): populate DiskInfo in constructor
-        let metadata_read_queue = MetadataReadQueue::new(publication_root.clone());
         let mut disk = Self {
             root: root.clone(),
             publication_root,
@@ -8376,8 +8258,7 @@ impl LocalDisk {
             exit_signal: None,
             io_backend: build_local_io_backend(io_root.clone()).await,
             file_sync_permits: os::disk_file_sync_limiter(&root),
-            _blocking_queue: os::register_disk_blocking_queue(&root, &io_root),
-            metadata_read_queue,
+            blocking_queue: os::register_disk_blocking_queue(&root, &io_root),
             snapshot_leases: Arc::new(ParkingLotMutex::new(SnapshotLeaseRegistry::default())),
         };
         let (info, _root) = get_disk_info(root.clone()).await.inspect_err(|err| {
@@ -9143,6 +9024,14 @@ impl LocalDisk {
         prepared_publication: Option<Arc<os::NamespaceMutationLease>>,
     ) -> Result<()> {
         crate::hp_guard!("LocalDisk::write_metadata");
+        if volume == super::RUSTFS_META_MULTIPART_BUCKET {
+            let recovery = self.io_get_object_path(volume, &format!("{path}/{}", super::MULTIPART_RECOVERY_DIR))?;
+            match fs::symlink_metadata(recovery).await {
+                Ok(_) => return Err(DiskError::FileNotFound),
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(to_file_error(error).into()),
+            }
+        }
         fi.validate_for_metadata_read()?;
         let p = self.io_get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
 
@@ -10603,7 +10492,7 @@ impl LocalDisk {
                 None => os::acquire_namespace_mutation_lease_with_owner(&receipt_path, namespace_owner.clone()).await,
             };
             let sync = effective_durability(volume).syncs_commit_metadata();
-            os::run_blocking_namespace_operation(lease, move || {
+            os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
                 let receipt = match std::fs::OpenOptions::new().write(true).create_new(true).open(&receipt_path) {
                     Ok(receipt) => receipt,
                     Err(err) if err.kind() == ErrorKind::AlreadyExists => {
@@ -10736,7 +10625,7 @@ impl LocalDisk {
                 None => os::acquire_namespace_mutation_lease_with_owner(&file_path, Some(owner)).await,
             };
             let sync = effective_durability(volume).syncs_commit_metadata();
-            let result = os::run_blocking_namespace_operation(lease, move || {
+            let result = os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
                 let bytes = std::fs::read(metadata_path)?;
                 let metadata = FileMeta::load(&bytes).map_err(|_| std::io::Error::from(ErrorKind::InvalidData))?;
                 if metadata
@@ -10797,7 +10686,7 @@ impl LocalDisk {
             let data_path = file_path.clone();
             let sync = effective_durability(volume).syncs_commit_metadata();
             let keep_rollback_witnesses = opt.recoverable_delete;
-            os::run_blocking_namespace_operation(lease, move || {
+            os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
                 let entries = match std::fs::read_dir(&data_path) {
                     Ok(entries) => entries,
                     Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
@@ -11171,17 +11060,30 @@ impl LocalDisk {
         //  - is_dir           -> Error::FileNotFound (NOT to_file_error(EISDIR))
         //  - metadata failure -> to_file_error
         //  - parse failure    -> propagated verbatim from read_xl_meta_no_data_sync (`?`)
-        let path = file_path.as_ref().to_path_buf();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.metadata_read_queue.enqueue(MetadataReadJob {
-            resource_unit: None,
-            path,
-            io_permit,
-            op: MetadataReadOp::ReadMetadataOnly { tx },
-        });
-        let (data, modtime) = rx.await.map_err(|_| DiskError::other("metadata read worker cancelled"))??;
+        let (data, modtime) = self
+            .run_metadata_read(io_permit, file_path.as_ref().to_path_buf(), read_metadata_only_std)
+            .await??;
 
         Ok((data, modtime))
+    }
+
+    async fn run_metadata_read<T: Send + 'static>(
+        &self,
+        io_permit: Option<DiskIoPermit>,
+        path: PathBuf,
+        read_fn: impl FnOnce(std::io::Result<std::fs::File>) -> T + Send + 'static,
+    ) -> Result<T> {
+        let root = self.publication_root.clone();
+        self.blocking_queue
+            .run_cancellable(move |is_cancelled| {
+                if is_cancelled() {
+                    return Err(std::io::Error::other("metadata read worker cancelled"));
+                }
+                let _io_permit = io_permit;
+                Ok(read_fn(root.open_readonly(&path)))
+            })
+            .await
+            .map_err(|err| DiskError::other(err.to_string()))
     }
 
     #[hotpath::measure(impl_type = "LocalDisk")]
@@ -11349,15 +11251,9 @@ impl LocalDisk {
         // succeeds the fd is valid, so fstat/read never return ENOENT. Hence
         // gating the volume fallback on the open error alone is equivalent to
         // the original code, where the fallback lived solely in the open match arm.
-        let path = file_path.as_ref().to_path_buf();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.metadata_read_queue.enqueue(MetadataReadJob {
-            resource_unit: None,
-            path,
-            io_permit,
-            op: MetadataReadOp::ReadAll { tx },
-        });
-        let res = rx.await.map_err(|_| DiskError::other("metadata read worker cancelled"))?;
+        let res = self
+            .run_metadata_read(io_permit, file_path.as_ref().to_path_buf(), read_all_data_std)
+            .await?;
 
         let (bytes, modtime) = self.resolve_read_all_result(volume, volume_dir.as_ref(), res).await?;
 
@@ -12503,31 +12399,38 @@ impl LocalDisk {
                 }
 
                 let root = self.publication_root.clone();
-                tokio::task::spawn_blocking(move || {
+                let operation = move |is_cancelled: &dyn Fn() -> bool| {
+                    if is_cancelled() {
+                        return Err(std::io::Error::other("blocking namespace operation cancelled"));
+                    }
                     let _owner = owner;
                     #[cfg(test)]
                     run_owned_file_write_before_open(&path);
 
                     let (mut file, parent_handle) = if sync == SyncMode::FileAndDir {
-                        root.create_truncate_with_parent(&path).map_err(to_file_error)?
+                        root.create_truncate_with_parent(&path)?
                     } else {
-                        (root.create_truncate(&path).map_err(to_file_error)?, None)
+                        (root.create_truncate(&path)?, None)
                     };
-                    std::io::Write::write_all(&mut file, buf.as_ref()).map_err(to_file_error)?;
+                    std::io::Write::write_all(&mut file, buf.as_ref())?;
                     if sync != SyncMode::None {
-                        file.sync_data().map_err(to_file_error)?;
+                        file.sync_data()?;
                         // FileOnly callers rename the file away, so the tmp
                         // directory entry never needs to become durable.
                         if sync == SyncMode::FileAndDir
                             && let Some(parent) = path.parent()
                         {
-                            os::fsync_directory_handle_std(parent, parent_handle.as_ref()).map_err(to_file_error)?;
+                            os::fsync_directory_handle_std(parent, parent_handle.as_ref())?;
                         }
                     }
-                    Ok::<_, std::io::Error>(())
-                })
-                .await
-                .map_err(DiskError::from)??;
+                    Ok(())
+                };
+                let result = if sync == SyncMode::None {
+                    self.blocking_queue.run_cancellable(operation).await
+                } else {
+                    self.blocking_queue.run_fsync_cancellable(operation).await
+                };
+                result.map_err(to_file_error)?;
             }
         }
 
@@ -12550,9 +12453,14 @@ impl LocalDisk {
             let path = path.as_ref().to_path_buf();
             let root = self.publication_root.clone();
             File::from_std(
-                tokio::task::spawn_blocking(move || root.create_truncate(&path))
+                self.blocking_queue
+                    .run_cancellable(move |is_cancelled| {
+                        if is_cancelled() {
+                            return Err(std::io::Error::other("blocking namespace operation cancelled"));
+                        }
+                        root.create_truncate(&path)
+                    })
                     .await
-                    .map_err(DiskError::from)?
                     .map_err(to_file_error)?,
             )
         } else {
@@ -13861,7 +13769,9 @@ impl LocalDisk {
                 os::acquire_namespace_mutation_lease_with_owner(&marker_path, namespace_owner.clone()).await
             };
             let volume = volume.to_string();
-            let sync = os::run_blocking_namespace_operation(lease, move || {
+            // This operation resolves durability inside the worker, so reserve
+            // the sync lane even if the current bucket override is relaxed.
+            let sync = os::run_blocking_namespace_operation_with_sync(lease, true, move || {
                 #[cfg(test)]
                 run_owned_file_write_before_open(&marker_path);
                 let marker = std::fs::File::create(marker_path)?;
@@ -13914,20 +13824,18 @@ impl LocalDisk {
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         prepared: Option<&DeleteRollbackPlan>,
     ) -> Result<()> {
-        let marker_paths;
-        let paths = if let Some(plan) = prepared {
-            &plan.marker_paths
-        } else {
-            marker_paths = version_delete_marker_paths(&self.io_get_object_path(volume, object)?, rollback_dir).await?;
-            &marker_paths
+        let Some(plan) = prepared else {
+            return self
+                .commit_reserved_version_delete_with_publication(volume, object, rollback_dir, namespace_owner, None)
+                .await;
         };
         self.commit_reserved_version_delete_marker_paths(
             volume,
             object,
             rollback_dir,
             namespace_owner,
-            paths,
-            prepared.and_then(|plan| plan.publication.clone()),
+            &plan.marker_paths,
+            plan.publication.clone(),
         )
         .await
     }
@@ -13940,7 +13848,47 @@ impl LocalDisk {
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         publication: Option<Arc<os::NamespaceMutationLease>>,
     ) -> Result<()> {
-        let paths = version_delete_marker_paths(&self.io_get_object_path(volume, object)?, rollback_dir).await?;
+        let object_path = self.io_get_object_path(volume, object)?;
+        let reserved_name = format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{rollback_dir}");
+        let committed_name = format!("{DELETE_DATA_DIR_MARKER_PREFIX}{rollback_dir}");
+        let recovery_name = format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{rollback_dir}");
+        let paths = self
+            .blocking_queue
+            .run_cancellable(move |is_cancelled| {
+                let entries = match std::fs::read_dir(&object_path) {
+                    Ok(entries) => entries,
+                    Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+                    Err(err) => return Err(err),
+                };
+                let mut paths = Vec::new();
+                for (idx, entry) in entries.enumerate() {
+                    if idx & 63 == 0 && is_cancelled() {
+                        return Err(std::io::Error::other("blocking namespace operation cancelled"));
+                    }
+                    let entry = entry?;
+                    if !entry.file_type()?.is_dir()
+                        || !entry.file_name().to_str().is_some_and(|name| Uuid::parse_str(name).is_ok())
+                    {
+                        continue;
+                    }
+                    let path = entry.path();
+                    match std::fs::symlink_metadata(path.join(&reserved_name)) {
+                        Ok(_) => {
+                            for name in [&reserved_name, &committed_name, &recovery_name] {
+                                paths.push(path.join(name));
+                            }
+                        }
+                        Err(err) if err.kind() == ErrorKind::NotFound => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                Ok(paths)
+            })
+            .await
+            .map_err(to_file_error)?;
+        if paths.is_empty() {
+            return Ok(());
+        }
         self.commit_reserved_version_delete_marker_paths(volume, object, rollback_dir, namespace_owner, &paths, publication)
             .await
     }
@@ -13954,10 +13902,12 @@ impl LocalDisk {
         paths: &[PathBuf],
         publication: Option<Arc<os::NamespaceMutationLease>>,
     ) -> Result<()> {
-        let recovery_owned =
-            fs::try_exists(self.io_get_object_path(volume, &format!("{object}/{rollback_dir}/{}", delete_recovery::PREPARED))?)
-                .await
-                .map_err(to_file_error)?;
+        let prepared_path = self.io_get_object_path(volume, &format!("{object}/{rollback_dir}/{}", delete_recovery::PREPARED))?;
+        let recovery_owned = self
+            .blocking_queue
+            .run_cancellable(move |_| std::fs::exists(prepared_path))
+            .await
+            .map_err(to_file_error)?;
         for paths in paths.as_chunks::<3>().0 {
             let reserved_path = &paths[0];
             let committed_path = &paths[if recovery_owned { 2 } else { 1 }];
@@ -14235,36 +14185,53 @@ impl LocalDisk {
         publication: Option<Arc<os::NamespaceMutationLease>>,
     ) -> Result<(bool, bool)> {
         let object_path = self.io_get_object_path(volume, object)?;
-        let mut entries = match fs::read_dir(object_path).await {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok((false, true)),
-            Err(err) => return Err(to_file_error(err).into()),
+        let prepared_path = if preserve_prefix_children {
+            Some(self.io_get_object_path(volume, &format!("{object}/{rollback_dir}/{}", delete_recovery::PREPARED))?)
+        } else {
+            None
         };
-        let recovery_owned = preserve_prefix_children
-            && fs::try_exists(
-                self.io_get_object_path(volume, &format!("{object}/{rollback_dir}/{}", delete_recovery::PREPARED))?,
-            )
+        let matching_data_dirs = self
+            .blocking_queue
+            .run_cancellable(move |is_cancelled| {
+                let entries = match std::fs::read_dir(&object_path) {
+                    Ok(entries) => entries,
+                    Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+                    Err(err) => return Err(err),
+                };
+                let recovery_owned = match prepared_path {
+                    Some(ref path) => std::fs::exists(path)?,
+                    None => false,
+                };
+                let prefix = if recovery_owned {
+                    RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX
+                } else {
+                    DELETE_DATA_DIR_MARKER_PREFIX
+                };
+                let marker_name = format!("{prefix}{rollback_dir}");
+                let mut matched = Vec::new();
+                for (idx, entry) in entries.enumerate() {
+                    if idx & 63 == 0 && is_cancelled() {
+                        return Err(std::io::Error::other("blocking namespace operation cancelled"));
+                    }
+                    let entry = entry?;
+                    let Some(data_dir) = entry.file_name().to_str().and_then(|data_dir| Uuid::parse_str(data_dir).ok()) else {
+                        continue;
+                    };
+                    match std::fs::metadata(entry.path().join(&marker_name)) {
+                        Ok(metadata) if metadata.is_file() => matched.push(data_dir),
+                        Ok(_) => continue,
+                        Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                        Err(err) => return Err(err),
+                    }
+                }
+                Ok(matched)
+            })
             .await
             .map_err(to_file_error)?;
-        let prefix = if recovery_owned {
-            RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX
-        } else {
-            DELETE_DATA_DIR_MARKER_PREFIX
-        };
-        let marker_name = format!("{prefix}{rollback_dir}");
         let mut first_err = None;
-        let mut found = false;
+        let found = !matching_data_dirs.is_empty();
         let mut deferred = false;
-        while let Some(entry) = entries.next_entry().await.map_err(to_file_error)? {
-            let Some(data_dir) = entry.file_name().to_str().and_then(|data_dir| Uuid::parse_str(data_dir).ok()) else {
-                continue;
-            };
-            match fs::metadata(entry.path().join(&marker_name)).await {
-                Ok(metadata) if metadata.is_file() => found = true,
-                Ok(_) => continue,
-                Err(err) if err.kind() == ErrorKind::NotFound => continue,
-                Err(err) => return Err(to_file_error(err).into()),
-            }
+        for data_dir in matching_data_dirs {
             let prepared = match publication.as_ref() {
                 Some(publication) => Some(PreparedPathDelete {
                     lease: os::try_acquire_namespace_mutation_lease_with_owner(
@@ -33430,41 +33397,93 @@ mod test {
     }
 
     #[tokio::test]
+    async fn durable_owned_write_leaves_metadata_reads_on_foreground_lane() {
+        let dir = tempfile::tempdir().expect("disk root");
+        let endpoint = Endpoint::try_from(dir.path().to_string_lossy().as_ref()).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let metadata = dir.path().join("existing-metadata");
+        fs::write(&metadata, b"existing").await.expect("metadata fixture");
+        for sync in [SyncMode::None, SyncMode::FileOnly, SyncMode::FileAndDir] {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let queue = Arc::clone(&disk.blocking_queue);
+            let blocker = tokio::spawn(async move {
+                queue
+                    .run_fsync_cancellable(move |_| {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.blocking_recv();
+                        Ok(())
+                    })
+                    .await
+            });
+            started_rx.await.expect("fsync lane blocked");
+            let path = dir.path().join("new-metadata");
+            let mut write =
+                std::pin::pin!(disk.write_all_internal(&path, InternalBuf::Owned(Bytes::from_static(b"new")), sync, dir.path(),));
+            assert!(futures::FutureExt::now_or_never(&mut write).is_none());
+            let read = tokio::time::timeout(
+                Duration::from_secs(5),
+                disk.run_metadata_read(None, metadata.clone(), |opened| {
+                    let mut file = opened?;
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+                    Ok::<_, std::io::Error>(bytes)
+                }),
+            )
+            .await;
+            let published_before_sync = path.exists();
+            release_tx.send(()).expect("release fsync lane");
+            blocker.await.expect("blocker joined").expect("blocker completed");
+            write.await.expect("write completed");
+            assert_eq!(
+                read.expect("metadata read must progress")
+                    .expect("queued read")
+                    .expect("read bytes"),
+                b"existing"
+            );
+            assert_eq!(
+                published_before_sync,
+                sync == SyncMode::None,
+                "durable writes wait on fsync, relaxed writes stay on foreground"
+            );
+            assert_eq!(fs::read(&path).await.expect("new metadata"), b"new");
+            fs::remove_file(&path).await.expect("remove fixture");
+        }
+    }
+
+    #[tokio::test]
     async fn metadata_read_job_retains_resource_unit_until_native_completion() {
         use crate::disk::with_background_resource_unit;
         use rustfs_concurrency::adaptive::AdaptiveAdmission;
         use std::num::NonZeroU16;
 
         let dir = tempfile::tempdir().expect("metadata root");
-        let queue = MetadataReadQueue::new(os::PublicationRoot::new(dir.path()).expect("publication root"));
+        let endpoint = Endpoint::try_from(dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let path = dir.path().join("metadata");
+        fs::write(&path, b"metadata").await.expect("write metadata fixture");
         let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         with_background_resource_unit(gate.acquire().await, async {
-            queue.enqueue(MetadataReadJob {
-                resource_unit: None,
-                path: PathBuf::new(),
-                io_permit: None,
-                op: MetadataReadOp::TestCustom {
-                    is_closed: Box::new(|| false),
-                    run: Box::new(move || {
-                        started_tx.send(()).expect("native metadata worker started");
-                        release_rx.blocking_recv().expect("release native metadata work");
-                    }),
-                },
-            });
+            let mut read = std::pin::pin!(disk.run_metadata_read(None, path, move |opened| {
+                let _file = opened.expect("metadata file opened");
+                started_tx.send(()).expect("native metadata worker started");
+                release_rx.blocking_recv().expect("release native metadata work");
+            }));
+            assert!(futures::FutureExt::now_or_never(&mut read).is_none());
             started_rx.await.expect("worker owns queued job");
         })
         .await;
         let held = gate.snapshot().active;
         release_tx.send(()).expect("release native job after caller scope ends");
         tokio::time::timeout(Duration::from_secs(5), async {
-            while gate.snapshot().active != 0 || queue.state.lock().active_workers != 0 {
+            while gate.snapshot().active != 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("native metadata job and worker retire");
+        .expect("native metadata job returns its resource unit");
         assert_eq!(held, 1, "leaving the caller scope must not release a live metadata job's unit");
         assert!(gate.try_acquire().is_some());
     }
@@ -33472,10 +33491,9 @@ mod test {
     #[tokio::test]
     async fn metadata_read_queue_bounds_concurrency_skips_cancelled_and_recovers_from_panic() {
         let dir = tempfile::tempdir().expect("tempdir should be created");
-        let root = os::PublicationRoot::new(dir.path()).expect("publication root should be created");
-        let queue = MetadataReadQueue::new(root);
+        let endpoint = Endpoint::try_from(dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
 
-        // 1. Concurrency bound + cancelled job skip:
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let executed_cancelled = Arc::new(AtomicBool::new(false));
@@ -33483,104 +33501,76 @@ mod test {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = Arc::new(ParkingLotMutex::new(release_rx));
 
-        for _ in 0..MAX_METADATA_READ_WORKERS_PER_DISK {
-            let active = Arc::clone(&active);
-            let max_active = Arc::clone(&max_active);
-            let entered_tx = entered_tx.clone();
-            let release_rx = Arc::clone(&release_rx);
-            queue.enqueue(MetadataReadJob {
-                resource_unit: None,
-                path: PathBuf::new(),
-                io_permit: None,
-                op: MetadataReadOp::TestCustom {
-                    is_closed: Box::new(|| false),
-                    run: Box::new(move || {
-                        let cur = active.fetch_add(1, Ordering::AcqRel) + 1;
-                        max_active.fetch_max(cur, Ordering::AcqRel);
+        let active_worker = Arc::clone(&active);
+        let max_active_worker = Arc::clone(&max_active);
+        let first_job = tokio::spawn({
+            let queue = Arc::clone(&disk.blocking_queue);
+            async move {
+                queue
+                    .run_cancellable(move |_| {
+                        let cur = active_worker.fetch_add(1, Ordering::AcqRel) + 1;
+                        max_active_worker.fetch_max(cur, Ordering::AcqRel);
                         let _ = entered_tx.send(());
                         let _ = release_rx.lock().recv();
-                        active.fetch_sub(1, Ordering::AcqRel);
-                    }),
-                },
-            });
-        }
-
-        for _ in 0..MAX_METADATA_READ_WORKERS_PER_DISK {
-            tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
-                .await
-                .expect("initial workers should enter")
-                .expect("channel should stay open");
-        }
-        assert_eq!(queue.state.lock().active_workers, MAX_METADATA_READ_WORKERS_PER_DISK);
-
-        // Enqueue a cancelled production ReadMetadataOnly job and a cancelled TestCustom job while workers are busy.
-        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
-        drop(cancelled_rx);
-        queue.enqueue(MetadataReadJob {
-            resource_unit: None,
-            path: dir.path().join("cancelled-never-opened"),
-            io_permit: None,
-            op: MetadataReadOp::ReadMetadataOnly { tx: cancelled_tx },
+                        active_worker.fetch_sub(1, Ordering::AcqRel);
+                        Ok(())
+                    })
+                    .await
+            }
         });
-        let executed_cancelled_clone = Arc::clone(&executed_cancelled);
-        queue.enqueue(MetadataReadJob {
-            resource_unit: None,
-            path: PathBuf::new(),
-            io_permit: None,
-            op: MetadataReadOp::TestCustom {
-                is_closed: Box::new(|| true),
-                run: Box::new(move || {
+
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("initial worker should enter")
+            .expect("channel should stay open");
+
+        // Poll both cancelled futures once inside an inner scope while the worker is
+        // blocked so they are enqueued and their receivers are dropped before release.
+        let saw_cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let mut cancelled_read =
+                std::pin::pin!(disk.run_metadata_read(None, dir.path().join("cancelled-never-opened"), read_metadata_only_std,));
+            assert!(futures::FutureExt::now_or_never(&mut cancelled_read).is_none());
+
+            let saw_cancelled_clone = Arc::clone(&saw_cancelled);
+            let executed_cancelled_clone = Arc::clone(&executed_cancelled);
+            let mut cancelled_custom = std::pin::pin!(disk.blocking_queue.run_cancellable(move |is_cancelled| {
+                if is_cancelled() {
+                    saw_cancelled_clone.store(true, Ordering::Release);
+                } else {
                     executed_cancelled_clone.store(true, Ordering::Release);
-                }),
-            },
-        });
+                }
+                Ok(())
+            }));
+            assert!(futures::FutureExt::now_or_never(&mut cancelled_custom).is_none());
+        }
 
-        // Enqueue a panicking job followed by a normal completion job to verify panic respawn.
-        queue.enqueue(MetadataReadJob {
-            resource_unit: None,
-            path: PathBuf::new(),
-            io_permit: None,
-            op: MetadataReadOp::TestCustom {
-                is_closed: Box::new(|| false),
-                run: Box::new(|| panic!("synthetic worker panic")),
-            },
-        });
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let mut panic_job = std::pin::pin!(
+            disk.blocking_queue
+                .run_cancellable::<()>(|_| panic!("synthetic worker panic"))
+        );
+        assert!(futures::FutureExt::now_or_never(&mut panic_job).is_none());
+
         let active_trailing = Arc::clone(&active);
         let max_active_trailing = Arc::clone(&max_active);
-        queue.enqueue(MetadataReadJob {
-            resource_unit: None,
-            path: PathBuf::new(),
-            io_permit: None,
-            op: MetadataReadOp::TestCustom {
-                is_closed: Box::new(|| false),
-                run: Box::new(move || {
-                    let cur = active_trailing.fetch_add(1, Ordering::AcqRel) + 1;
-                    max_active_trailing.fetch_max(cur, Ordering::AcqRel);
-                    active_trailing.fetch_sub(1, Ordering::AcqRel);
-                    let _ = done_tx.send(());
-                }),
-            },
-        });
+        let mut trailing_job = std::pin::pin!(disk.blocking_queue.run_cancellable(move |_| {
+            let cur = active_trailing.fetch_add(1, Ordering::AcqRel) + 1;
+            max_active_trailing.fetch_max(cur, Ordering::AcqRel);
+            active_trailing.fetch_sub(1, Ordering::AcqRel);
+            Ok(())
+        }));
+        assert!(futures::FutureExt::now_or_never(&mut trailing_job).is_none());
 
-        assert_eq!(
-            queue.state.lock().active_workers,
-            MAX_METADATA_READ_WORKERS_PER_DISK,
-            "extra queued jobs must not exceed per-disk worker cap"
-        );
-
-        // Release only one blocked worker so the panicking job must trigger a respawn
-        // to execute the trailing completion job while the other worker stays blocked.
-        release_tx.send(()).expect("release one blocked worker");
-        tokio::time::timeout(Duration::from_secs(5), done_rx)
+        release_tx.send(()).expect("release blocked worker");
+        first_job.await.expect("first job join").expect("first job ok");
+        assert!(panic_job.await.is_err());
+        tokio::time::timeout(Duration::from_secs(5), trailing_job)
             .await
             .expect("trailing job should finish after worker panic recovery")
-            .expect("trailing job sender should complete");
-        for _ in 1..MAX_METADATA_READ_WORKERS_PER_DISK {
-            release_tx.send(()).expect("release remaining blocked worker");
-        }
+            .expect("trailing job ok");
+        assert!(saw_cancelled.load(Ordering::Acquire), "queued job must observe cancellation");
         assert!(!executed_cancelled.load(Ordering::Acquire), "cancelled job must be skipped");
-        assert!(max_active.load(Ordering::Acquire) <= MAX_METADATA_READ_WORKERS_PER_DISK);
+        assert_eq!(max_active.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
