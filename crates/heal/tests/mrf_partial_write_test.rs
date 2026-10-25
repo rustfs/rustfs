@@ -24,17 +24,48 @@ use rustfs_heal::heal::{
     storage::ECStoreHealStorage,
 };
 use rustfs_test_utils::TestECStoreEnv;
-use std::{future::Future, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashSet, future::Future, path::Path, sync::Arc, time::Duration};
 use tokio::io::AsyncReadExt;
 
 mod storage_api;
-use storage_api::endpoint_index::{EndpointServerPools, Endpoints, init_local_disks};
+use storage_api::endpoint_index::local_disk_map_read;
 use storage_api::integration::{
     BucketOperations, DeleteBucketOptions, DiskAPI, DiskError, DiskStore, EcstoreStorageError, ObjectIO, ObjectOperations,
     ObjectOptions, PutObjReader, RUSTFS_META_BUCKET, ReadOptions,
 };
 
 const SNAPSHOT_LIMIT: usize = 64 * 1024 * 1024;
+
+async fn register_coordinator_journal_disks(env: &TestECStoreEnv) {
+    let endpoints = env.endpoint_pools.as_ref()[0].endpoints.as_ref();
+    assert_eq!(endpoints.len(), 16, "the fixture retains the complete EC12+4 topology");
+    assert!(
+        endpoints.iter().all(|endpoint| endpoint.is_local),
+        "I/O stand-ins remain genuine local members"
+    );
+    let coordinator: HashSet<_> = endpoints.iter().take(4).map(ToString::to_string).collect();
+    assert_eq!(coordinator.len(), 4);
+
+    // MRF reads this path map; source authority and reconnect slot vectors use
+    // the complete topology. Restrict journal visibility without relabeling it.
+    let registered = local_disk_map_read().await;
+    assert_eq!(registered.values().flatten().count(), 16, "all physical members start registered");
+    let map = Arc::clone(tokio::sync::OwnedRwLockReadGuard::rwlock(&registered));
+    drop(registered); // Release the read owner before acquiring the same map for write.
+    let mut registered = map.write().await;
+    registered.retain(|path, _| coordinator.contains(path));
+    assert_eq!(registered.len(), 4, "only the coordinator's journal disks are visible to MRF");
+    assert!(registered.values().all(Option::is_some), "all four journal members remain initialized");
+    drop(registered);
+
+    let set = env.ecstore.pools[0].get_disks(0);
+    let disks = set.disks.read().await;
+    assert_eq!(disks.len(), 16, "journal scoping must not shrink the data set");
+    assert!(
+        disks.iter().all(|disk| disk.as_ref().is_some_and(|disk| disk.is_local())),
+        "journal scoping must preserve every original local I/O handle"
+    );
+}
 
 #[tokio::test]
 async fn partial_write_persistence_failure_is_reported_and_retained_for_retry() {
@@ -265,15 +296,7 @@ async fn unversioned_deleted_partial_write_is_discharged_by_an_absence_proof_inn
         let root = tempfile::tempdir().expect("partial-write absence fixture directory");
         let env = TestECStoreEnv::builder().disk_count(16).base_dir(root.path()).build().await;
         env.make_bucket("partial-absence", false).await;
-        let mut coordinator_pool = env.endpoint_pools.as_ref()[0].clone();
-        let mut endpoints = coordinator_pool.endpoints.as_ref().to_vec();
-        for endpoint in endpoints.iter_mut().skip(4) {
-            endpoint.is_local = false;
-        }
-        coordinator_pool.endpoints = Endpoints::from(endpoints);
-        init_local_disks(EndpointServerPools::from(vec![coordinator_pool]))
-            .await
-            .expect("coordinator journal disks");
+        register_coordinator_journal_disks(&env).await;
 
         let manager = manager(&env);
         mrf_queue::spawn_mrf_consumer(manager.clone());
@@ -355,15 +378,7 @@ async fn degraded_deleted_partial_write_is_discharged_by_an_absence_proof_inner(
             assert_eq!(env.ecstore.pools[0].parity_count, 4, "fixture must be EC12+4");
             env.make_bucket("partial-absence", false).await;
             env.make_bucket("partial-absence-versioned", true).await;
-            let mut coordinator_pool = env.endpoint_pools.as_ref()[0].clone();
-            let mut endpoints = coordinator_pool.endpoints.as_ref().to_vec();
-            for endpoint in endpoints.iter_mut().skip(4) {
-                endpoint.is_local = false;
-            }
-            coordinator_pool.endpoints = Endpoints::from(endpoints);
-            init_local_disks(EndpointServerPools::from(vec![coordinator_pool]))
-                .await
-                .expect("coordinator journal disks");
+            register_coordinator_journal_disks(&env).await;
 
             let manager = manager(&env);
             mrf_queue::spawn_mrf_consumer(manager.clone());
@@ -661,15 +676,7 @@ async fn partial_write_ec12_4_ack_rejoin_repairs_versions_and_delete_marker_inne
             env.make_bucket("partial-versions", true).await;
             // The coordinator owns four journal disks; the other twelve
             // members are local I/O stand-ins for the other three nodes.
-            let mut coordinator_pool = env.endpoint_pools.as_ref()[0].clone();
-            let mut endpoints = coordinator_pool.endpoints.as_ref().to_vec();
-            for endpoint in endpoints.iter_mut().skip(4) {
-                endpoint.is_local = false;
-            }
-            coordinator_pool.endpoints = Endpoints::from(endpoints);
-            init_local_disks(EndpointServerPools::from(vec![coordinator_pool]))
-                .await
-                .expect("coordinator journal disks");
+            register_coordinator_journal_disks(&env).await;
             let manager = manager(&env);
             mrf_queue::spawn_mrf_consumer(manager.clone());
             let payload1 = b"first acknowledged generation".repeat(4096);

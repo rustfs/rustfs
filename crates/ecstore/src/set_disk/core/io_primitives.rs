@@ -11554,7 +11554,7 @@ mod tests {
                 let mut hooks = Vec::new();
                 let mut entered = Vec::new();
                 let mut releases = Vec::new();
-                let mut publication_paths = Vec::new();
+                let mut mutation_keys = Vec::new();
                 for (disk, info) in disks.iter().flatten().zip(&mut infos) {
                     disk.write_metadata(bucket, bucket, object, old.clone())
                         .await
@@ -11565,11 +11565,16 @@ mod tests {
                     let disk::Disk::Local(local) = disk.as_ref() else {
                         panic!("physical publication fixture requires local disks");
                     };
-                    // Linux IO paths use a mount FD, which is also the namespace lock key.
+                    // Hooks use pinned I/O paths; serialization uses the configured
+                    // object key shared by independently reopened disk handles.
                     let destination = local
                         .get_disk()
                         .get_object_path_for_io(bucket, object)
                         .expect("the publication path must resolve through the disk's mount lease");
+                    let mutation_key = local
+                        .get_disk()
+                        .get_object_path(bucket, object)
+                        .expect("the configured publication mutation key must resolve");
                     let (entered_tx, entered_rx) = oneshot::channel();
                     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
                     hooks.push(os::prepared_publication_test_hooks::install(
@@ -11582,7 +11587,7 @@ mod tests {
                     ));
                     entered.push(entered_rx);
                     releases.push(release_tx);
-                    publication_paths.push(destination);
+                    mutation_keys.push(mutation_key);
                 }
                 let namespace_owner = ctx.begin_namespace_commit();
                 let namespace_probe = Arc::downgrade(&namespace_owner);
@@ -11629,10 +11634,10 @@ mod tests {
                 let pending_before_release = ctx.namespace_commits_pending();
                 let owner_alive_before_release = namespace_probe.upgrade().is_some();
                 let old_snapshot_generation = ctx.namespace_commit_generation();
-                for (disk, destination) in disks.iter().flatten().zip(&publication_paths) {
+                for (disk, mutation_key) in disks.iter().flatten().zip(&mutation_keys) {
                     let root = disk.path();
                     assert!(
-                        os::acquire_rename_data_mutation_lease(&root, bucket, destination)
+                        os::acquire_rename_data_mutation_lease(&root, bucket, mutation_key)
                             .now_or_never()
                             .is_none(),
                         "the physical publication must still own object serialization after the async timeout"
@@ -11663,11 +11668,11 @@ mod tests {
 
                 // Drain real syscalls before checking the regression, including on the RED run.
                 drop(releases);
-                for (disk, destination) in disks.iter().flatten().zip(&publication_paths) {
+                for (disk, mutation_key) in disks.iter().flatten().zip(&mutation_keys) {
                     let root = disk.path();
                     let lease = tokio::time::timeout(
                         Duration::from_secs(5),
-                        os::acquire_rename_data_mutation_lease(&root, bucket, destination),
+                        os::acquire_rename_data_mutation_lease(&root, bucket, mutation_key),
                     )
                     .await
                     .expect("released physical publishers must drain");

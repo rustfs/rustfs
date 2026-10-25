@@ -18228,6 +18228,9 @@ mod test {
                 .get_object_path_for_io(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{STORAGE_FORMAT_FILE}"))
                 .expect("staged metadata path should resolve");
             let destination = disk.io_get_object_path(bucket, object).expect("destination should resolve");
+            let mutation_key = disk
+                .get_object_path(bucket, object)
+                .expect("configured mutation key should resolve");
             let (entered_tx, entered_rx) = mpsc::channel();
             let (release_tx, release_rx) = mpsc::channel();
             set_owned_file_write_before_open(&staged_metadata, move || {
@@ -18269,7 +18272,7 @@ mod test {
                 "the blocked syscall must retain its volume guard"
             );
             assert!(
-                os::acquire_rename_data_mutation_lease(&disk.root, bucket, &destination)
+                os::acquire_rename_data_mutation_lease(&disk.root, bucket, &mutation_key)
                     .now_or_never()
                     .is_none(),
                 "a same-object mutation must still wait for the blocked syscall"
@@ -18280,7 +18283,7 @@ mod test {
             release_tx.send(()).expect("release timed-out staged writer");
             let lease = tokio::time::timeout(
                 Duration::from_secs(5),
-                os::acquire_rename_data_mutation_lease(&disk.root, bucket, &destination),
+                os::acquire_rename_data_mutation_lease(&disk.root, bucket, &mutation_key),
             )
             .await
             .expect("the namespace lease must be released when the syscall drains");
