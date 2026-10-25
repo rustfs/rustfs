@@ -67,6 +67,27 @@ async fn register_coordinator_journal_disks(env: &TestECStoreEnv) {
     );
 }
 
+async fn assert_coordinator_journal_disks(env: &TestECStoreEnv) {
+    let endpoints = env.endpoint_pools.as_ref()[0].endpoints.as_ref();
+    assert_eq!(endpoints.len(), 16, "the native source topology must remain complete");
+    assert!(endpoints.iter().all(|endpoint| endpoint.is_local));
+    let expected: HashSet<_> = endpoints.iter().take(4).map(ToString::to_string).collect();
+    let registered = local_disk_map_read().await;
+    let actual: HashSet<_> = registered.keys().cloned().collect();
+    // Setup is the only retain. Reconnect can only insert/update afterwards,
+    // so an extra journal member cannot disappear before this assertion.
+    assert_eq!(actual, expected, "reconnect must not expand coordinator journal visibility");
+    assert!(
+        registered.values().all(Option::is_some),
+        "all four journal members must remain initialized"
+    );
+    drop(registered);
+    let set = env.ecstore.pools[0].get_disks(0);
+    let disks = set.disks.read().await;
+    assert_eq!(disks.len(), 16, "journal verification must preserve every data slot");
+    assert!(disks.iter().all(|disk| disk.as_ref().is_some_and(|disk| disk.is_local())));
+}
+
 #[tokio::test]
 async fn partial_write_persistence_failure_is_reported_and_retained_for_retry() {
     use rustfs_common::mrf_channel::{MrfDurableAdmissionError, MrfScope, persist_partial_write_intent};
@@ -340,6 +361,7 @@ async fn unversioned_deleted_partial_write_is_discharged_by_an_absence_proof_inn
             "discharged absence repair must leave no queued work"
         );
         manager.stop().await.expect("absence manager should stop");
+        assert_coordinator_journal_disks(&env).await;
     })
     .await;
 }
@@ -466,6 +488,7 @@ async fn degraded_deleted_partial_write_is_discharged_by_an_absence_proof_inner(
                 disk.reset_health_for_store_init_retry();
             }
             *set.disks.write().await = all.iter().cloned().map(Some).collect();
+            assert_coordinator_journal_disks(&env).await;
             assert!(
                 env.ecstore
                     .get_object_info("partial-absence", failed_object, &ObjectOptions::default())
@@ -546,6 +569,7 @@ async fn degraded_deleted_partial_write_is_discharged_by_an_absence_proof_inner(
                 "discharged absence repair must leave no queued work"
             );
             manager.stop().await.expect("absence manager should stop");
+            assert_coordinator_journal_disks(&env).await;
         },
     )
     .await;
@@ -760,6 +784,7 @@ async fn partial_write_ec12_4_ack_rejoin_repairs_versions_and_delete_marker_inne
                 disk.reset_health_for_store_init_retry();
             }
             *set.disks.write().await = all.iter().cloned().map(Some).collect();
+            assert_coordinator_journal_disks(&env).await;
             assert!(
                 wait_until(|| async {
                     replicas(&all, "partial-new", "new.bin", None, false).await == 16
@@ -847,6 +872,7 @@ async fn partial_write_ec12_4_ack_rejoin_repairs_versions_and_delete_marker_inne
                 disk.reset_health_for_store_init_retry();
             }
             *set.disks.write().await = all.iter().cloned().map(Some).collect();
+            assert_coordinator_journal_disks(&env).await;
             assert!(
                 wait_until(|| async {
                     let results = futures::future::join_all(all.iter().map(|disk| async {
@@ -864,6 +890,7 @@ async fn partial_write_ec12_4_ack_rejoin_repairs_versions_and_delete_marker_inne
             assert_payload(&env, "partial-versions", "versioned.bin", Some(&first), &payload1).await;
             assert_payload(&env, "partial-versions", "versioned.bin", Some(&second), &payload2).await;
             manager.stop().await.expect("test manager should stop");
+            assert_coordinator_journal_disks(&env).await;
         },
     )
     .await;
