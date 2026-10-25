@@ -1225,20 +1225,17 @@ mod tests {
             Ok(Duration::from_secs(259)),
         );
         assert_eq!(scanner_cycle_completion_budget(100, Some(1), 110, false), Ok(Duration::from_secs(60)));
+        // A newly elected leader can advertise a sleep before its first completed cycle.
+        assert_eq!(
+            scanner_cycle_completion_budget(0, Some(289), 1_792_913_211, false),
+            Ok(Duration::from_secs(349)),
+        );
     }
 
     #[test]
     fn scanner_cycle_completion_budget_does_not_grant_planned_sleep_to_active_cycle() {
         assert_eq!(scanner_cycle_completion_budget(100, Some(256), 110, true), Ok(Duration::from_secs(60)));
         assert_eq!(scanner_cycle_completion_budget(0, None, 110, true), Ok(Duration::from_secs(60)));
-    }
-
-    #[test]
-    fn scanner_cycle_completion_budget_accounts_for_new_leader_sleep() {
-        assert_eq!(
-            scanner_cycle_completion_budget(0, Some(289), 1_792_913_211, false),
-            Ok(Duration::from_secs(349)),
-        );
     }
 
     #[test]
