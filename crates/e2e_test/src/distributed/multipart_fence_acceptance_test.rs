@@ -53,14 +53,22 @@ async fn fixture_from_binary(
         for node in &mut cluster.nodes {
             let address: std::net::SocketAddr = node.address.parse()?;
             node.address = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, address.port())).to_string();
+            node.url = format!("http://{}", node.address);
         }
     }
-    for (name, value) in [
-        ("RUSTFS_STORAGE_CLASS_STANDARD", storage_class),
+    let fault_budgets = [
         ("RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT", "5"),
         ("RUSTFS_OBJECT_LOCK_RPC_TIMEOUT_MS", "3000"),
         ("RUSTFS_DRIVE_METADATA_TIMEOUT_SECS", "2"),
         ("RUSTFS_DRIVE_MAX_TIMEOUT_DURATION", "5"),
+    ];
+    if binary.is_none() {
+        for (name, value) in fault_budgets {
+            cluster.set_env(name, value);
+        }
+    }
+    for (name, value) in [
+        ("RUSTFS_STORAGE_CLASS_STANDARD", storage_class),
         // Keep disk-health ejection out of a method-specific quorum test.
         ("RUSTFS_DRIVE_SUSPECT_FAILURE_THRESHOLD", "1000"),
         ("RUSTFS_OBS_METRICS_EXPORT_ENABLED", "false"),
@@ -77,7 +85,12 @@ async fn fixture_from_binary(
     }
     configure_node_logs(&mut cluster, None)?;
     if let Some(binary) = binary {
+        // Bootstrap the old fleet with its normal budgets. Subsequent current
+        // replacements still receive the short method-fault budgets above.
         cluster.start_with_binary(binary).await?;
+        for (name, value) in fault_budgets {
+            cluster.set_env(name, value);
+        }
     } else {
         cluster.start().await?;
     }
