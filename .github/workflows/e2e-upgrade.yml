@@ -19,9 +19,11 @@ on:
     paths:
       - ".github/workflows/e2e-upgrade.yml"
       - "crates/e2e_test/src/common.rs"
+      - "crates/e2e_test/src/distributed/**"
       - "crates/e2e_test/src/fake_s3_target/**"
       - "crates/e2e_test/src/lib.rs"
       - "crates/e2e_test/src/replication_extension_test.rs"
+      - "crates/e2e_test/src/rpc_fault_proxy.rs"
       - "crates/e2e_test/src/upgrade_compatibility_test.rs"
       - "crates/ecstore/**"
       - "crates/filemeta/**"
@@ -128,6 +130,7 @@ jobs:
         run: chmod +x target/debug/rustfs
 
       - name: Verify and unpack pinned previous release
+        id: verify_source
         env:
           SOURCE_DIR: ${{ runner.temp }}/rustfs-upgrade-source
         run: |
@@ -184,6 +187,28 @@ jobs:
             echo "::endgroup::"
           done
           exit "$status"
+
+      - name: Run mixed-version MPU recovery
+        if: ${{ !cancelled() && steps.verify_source.outcome == 'success' }}
+        timeout-minutes: 15
+        env:
+          NO_PROXY: 127.0.0.1,localhost,::1
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          ALL_PROXY: ""
+          RUSTFS_E2E_LOG_FILTER: "warn,rustfs_ecstore::cluster::rpc::client=debug"
+        run: |
+          set -euo pipefail
+          export no_proxy="$NO_PROXY"
+          export RUSTFS_E2E_LOG_DIR="$RUNNER_TEMP/rustfs-upgrade-logs/mpu-mixed-recovery"
+          mkdir -p "$RUSTFS_E2E_LOG_DIR"
+          mpu_test='distributed::multipart_fence_acceptance_test::mixed_version_failed_complete_requires_current_coordinator_for_abort'
+          python3 scripts/e2e_binary.py run -- cargo test --locked -p e2e_test --lib \
+            "$mpu_test" -- --list --exact | tee "$RUSTFS_E2E_LOG_DIR/list.log"
+          test "$(grep -Fxc "${mpu_test}: test" "$RUSTFS_E2E_LOG_DIR/list.log")" -eq 1
+          python3 scripts/e2e_binary.py run -- cargo test --locked -p e2e_test --lib \
+            "$mpu_test" -- --exact --nocapture --test-threads=1 \
+            2>&1 | tee "$RUSTFS_E2E_LOG_DIR/test.log"
 
       - name: Upload scanner/heal G09 evidence
         if: always()

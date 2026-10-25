@@ -380,6 +380,7 @@ where
     }
 
     fn call(&mut self, mut request: HttpRequest<ReqBody>) -> Self::Future {
+        let rpc_method = request.extensions().get::<tonic::GrpcMethod<'_>>().cloned();
         let observe_rename_data = rustfs_io_metrics::put_stage_metrics_enabled() && rename_data_grpc_stage(request.uri().path());
         let request_scope_started = if observe_rename_data {
             rustfs_io_metrics::put_stage_timer()
@@ -448,13 +449,21 @@ where
                 let response_state = verify_tonic_peer_replay_capabilities_response(&audience, challenge, response.headers());
                 if let Err(error) = &response_state
                     && (response.headers().contains_key(RPC_REPLAY_CACHE_CAPABILITY_HEADER)
-                        || response.headers().contains_key(RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER))
+                        || response.headers().contains_key(RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER)
+                        || matches!(sent_state.cache_capability, Some(PeerReplayCapability::Capable { .. })))
                 {
                     debug!(
                         event = "internode_rpc_capability_proof_rejected",
                         component = "ecstore",
                         subsystem = "rpc_client",
                         result = "rejected",
+                        audience = audience.rsplit('@').next().unwrap_or("unknown"),
+                        rpc_service = rpc_method.as_ref().map(|method| method.service()).unwrap_or("unknown"),
+                        rpc_method = rpc_method.as_ref().map(|method| method.method()).unwrap_or("unknown"),
+                        http_status = response.status().as_u16(),
+                        grpc_status = response.headers().get("grpc-status").and_then(|value| value.to_str().ok()).unwrap_or("trailers"),
+                        capability_present = response.headers().contains_key(RPC_REPLAY_CACHE_CAPABILITY_HEADER),
+                        capability_proof_present = response.headers().contains_key(RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER),
                         error = %error,
                         "internode RPC capability proof rejected"
                     )

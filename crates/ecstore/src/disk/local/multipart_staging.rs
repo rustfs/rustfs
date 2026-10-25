@@ -375,7 +375,15 @@ impl LocalDisk {
             if cancelled() {
                 return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "multipart staging cancelled"));
             }
-            let raw = os::read_multipart_source_metadata(&canonical_metadata, &base, &publication_root)?;
+            let raw = os::read_multipart_source_metadata(&canonical_metadata, &base, &publication_root).map_err(|error| {
+                // A retired source has no authority for this delayed completion.
+                // Preserve confinement and other I/O failures as their real errors.
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    DiskError::FileNotFound.into()
+                } else {
+                    error
+                }
+            })?;
             let source = get_file_info(
                 &raw,
                 RUSTFS_META_MULTIPART_BUCKET,
