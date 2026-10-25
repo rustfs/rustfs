@@ -2046,6 +2046,12 @@ pub(crate) fn effective_durability(volume: &str) -> DurabilityMode {
     bucket_durability::lookup(volume).unwrap_or(global)
 }
 
+/// Read the cached process and effective volume modes without overriding either.
+#[cfg(feature = "test-util")]
+pub fn local_durability_modes(volume: &str) -> (&'static str, &'static str) {
+    (durability_mode().as_str(), effective_durability(volume).as_str())
+}
+
 cached_read_env! {
     /// Get the O_DIRECT read threshold size.
     #[allow(dead_code, reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)")]
@@ -2678,7 +2684,7 @@ fn mmap_page_size() -> Result<u64> {
 
 #[cfg(test)]
 static RENAME_DATA_FAIL_BEFORE_OLD_METADATA_BACKUP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 static RENAME_DATA_FAIL_AFTER_METADATA_COMMIT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 #[cfg(test)]
 static RENAME_DATA_FAIL_COMMIT_RENAME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -2725,12 +2731,18 @@ fn set_rename_data_fail_before_old_metadata_backup(dst_path: &str) {
         .expect("test failpoint lock should not be poisoned") = Some(dst_path.to_string());
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 fn set_rename_data_fail_after_metadata_commit(dst_path: &str) {
     RENAME_DATA_FAIL_AFTER_METADATA_COMMIT
         .lock()
-        .expect("test failpoint lock should not be poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(dst_path.to_string());
+}
+
+/// Fail one matching metadata publication after its rename, exercising rollback.
+#[cfg(feature = "test-util")]
+pub fn set_local_rename_data_fail_after_metadata_commit(dst_path: &str) {
+    set_rename_data_fail_after_metadata_commit(dst_path);
 }
 
 #[cfg(test)]
@@ -2831,11 +2843,11 @@ fn should_fail_before_old_metadata_backup(dst_path: &str) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 fn should_fail_after_metadata_commit(dst_path: &str) -> bool {
     let mut targets = RENAME_DATA_FAIL_AFTER_METADATA_COMMIT
         .lock()
-        .expect("test failpoint lock should not be poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(index) = targets.iter().position(|target| target == dst_path) {
         targets.remove(index);
         true
@@ -3018,7 +3030,7 @@ fn should_fail_before_old_metadata_backup(_dst_path: &str) -> bool {
     false
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-util")))]
 fn should_fail_after_metadata_commit(_dst_path: &str) -> bool {
     false
 }
