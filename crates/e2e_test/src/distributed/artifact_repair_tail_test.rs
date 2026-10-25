@@ -129,7 +129,7 @@ async fn four_node_artifact_repair_seal_waits_for_disconnected_physical_tail() -
     // An independent channel and direct receiver RPC take no coordinator attempt
     // lock. Dropping this task closes the client stream while rename is paused.
     let url = node.url.clone();
-    let rpc = tokio::spawn(async move {
+    let mut rpc = tokio::spawn(async move {
         timeout(Duration::from_secs(30), async move {
             let mut client = NodeServiceClient::connect(url).await?;
             client
@@ -139,7 +139,16 @@ async fn four_node_artifact_repair_seal_waits_for_disconnected_physical_tail() -
         })
         .await
     });
-    barrier.observed("arrived").await?;
+    tokio::select! {
+        result = &mut rpc => {
+            let response = result???.into_inner();
+            panic!(
+                "repair receiver completed before the physical barrier: success={}, error={:?}",
+                response.success, response.error
+            );
+        }
+        arrived = barrier.observed("arrived") => arrived?,
+    }
     assert!(!destination.exists(), "physical publication ran before its barrier");
     rpc.abort();
     assert!(rpc.await.expect_err("cancel the disconnected RPC waiter").is_cancelled());

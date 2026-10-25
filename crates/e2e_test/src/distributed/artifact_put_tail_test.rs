@@ -148,14 +148,23 @@ async fn four_node_artifact_put_seal_waits_for_disconnected_physical_tail() -> T
     let request = signed_put_request(put.clone(), &node.address)?;
     // Direct RPC takes no coordinator attempt lock and owns its own connection.
     let url = node.url.clone();
-    let rpc = tokio::spawn(async move {
+    let mut rpc = tokio::spawn(async move {
         timeout(Duration::from_secs(30), async move {
             let mut client = NodeServiceClient::connect(url).await?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(client.artifact_rename_data(request).await?)
         })
         .await
     });
-    barrier.observed("arrived").await?;
+    tokio::select! {
+        result = &mut rpc => {
+            let response = result???.into_inner();
+            panic!(
+                "ordinary PUT receiver completed before the physical barrier: success={}, error={:?}",
+                response.success, response.error
+            );
+        }
+        arrived = barrier.observed("arrived") => arrived?,
+    }
     assert!(!destination.exists(), "physical PUT escaped its barrier");
     rpc.abort();
     assert!(rpc.await.expect_err("disconnect the ordinary PUT waiter").is_cancelled());

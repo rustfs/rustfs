@@ -3185,9 +3185,13 @@ pub(crate) async fn rename_all_with_commit_guard(
     {
         let source = src_file_path.as_ref().to_path_buf();
         let destination = dst_file_path.as_ref().to_path_buf();
+        #[cfg(feature = "e2e-test-hooks")]
+        let mut physical_barrier = PhysicalRenameTestBarrier::selected(publication_root.path(), &destination, "waiter-dropped")?;
+        #[cfg(feature = "e2e-test-hooks")]
+        let physical_barrier_path = physical_barrier.as_ref().map(|barrier| barrier.path.clone());
         let guard = commit_guard.clone();
         let _ = (base_dir, publication_root);
-        run_blocking_namespace_operation(lease, move || {
+        let result = run_blocking_namespace_operation(lease, move || {
             guard.directories.prepare_destination()?;
             #[cfg(test)]
             prepared_publication_test_hooks::run_rename_destination(&source, &destination);
@@ -3196,11 +3200,20 @@ pub(crate) async fn rename_all_with_commit_guard(
                 prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &source);
                 prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &destination);
             }
+            #[cfg(feature = "e2e-test-hooks")]
+            if let Some(path) = physical_barrier_path.as_ref() {
+                PhysicalRenameTestBarrier::wait(path)?;
+            }
             guard.directories.rename(&source, &destination, None)
         })
         .await
         .map_err(to_file_error)
-        .map_err(DiskError::from)
+        .map_err(DiskError::from);
+        #[cfg(feature = "e2e-test-hooks")]
+        if let Some(observer) = physical_barrier.as_mut() {
+            observer.complete();
+        }
+        result
     }
     #[cfg(not(target_os = "linux"))]
     {
