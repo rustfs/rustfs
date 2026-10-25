@@ -1013,6 +1013,11 @@ mod tests {
         writer.write_all(b"data").await.expect("buffered bytes");
         writer.flush().await.expect("transfer charged allocation to queue");
         memory.set_sampled_limit(2 * 1024 * 1024, Duration::ZERO);
+        writer
+            .write_all(&vec![0x5a; 1024 * 1024 - 4])
+            .await
+            .expect("reuse the already charged tail after observation expiry");
+        assert_eq!(memory.snapshot().used, 1024 * 1024, "reuse must not allocate separate storage");
         let error = writer
             .write(b"rejected")
             .await
