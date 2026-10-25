@@ -398,6 +398,11 @@ mod unix {
                         if expected.insert(format!("part.{}", part.number)) {
                             *references += 1;
                         }
+                        if let Some(integrity) = &part.integrity
+                            && expected.insert(integrity.file_name())
+                        {
+                            *references += 1;
+                        }
                     }
                     if *references > MAX_REFERENCES {
                         return Err(DiskError::FileCorrupt);

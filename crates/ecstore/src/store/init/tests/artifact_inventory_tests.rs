@@ -4,7 +4,7 @@ use super::{build_isolated_test_store, run_large_stack_async_test, without_stora
 use crate::{
     bucket::metadata_sys,
     disk::{Disk, local::artifact_inventory::ArtifactInventoryFrame},
-    object_api::{ObjectOptions, PutObjReader, WriteCompletion},
+    object_api::{ObjectOptions, PutObjReader, ShardIntegrityWriteMode, WriteCompletion},
     storage_api_contracts::{
         bucket::{BucketOperations as _, MakeBucketOptions},
         object::ObjectIO as _,
@@ -16,7 +16,17 @@ use uuid::Uuid;
 #[test]
 #[serial_test::serial(storage_class_env)]
 fn artifact_inventory_managed_put_zero_and_versions_are_complete() {
-    run_large_stack_async_test("artifact-inventory-managed", || async {
+    assert_managed_put_inventory_is_complete(ShardIntegrityWriteMode::Legacy);
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_inventory_protected_managed_put_versions_are_complete() {
+    assert_managed_put_inventory_is_complete(ShardIntegrityWriteMode::Protected);
+}
+
+fn assert_managed_put_inventory_is_complete(mode: ShardIntegrityWriteMode) {
+    run_large_stack_async_test("artifact-inventory-managed", move || async move {
         let root = tempfile::tempdir().expect("managed inventory disk roots");
         let (_ctx, store, shutdown) =
             without_storage_class_env(build_isolated_test_store(root.path(), "inventory-managed", &[4])).await;
@@ -49,6 +59,7 @@ fn artifact_inventory_managed_put_zero_and_versions_are_complete() {
                     &mut PutObjReader::from_vec(data.clone()),
                     &ObjectOptions {
                         versioned: true,
+                        shard_integrity_write_mode: Some(mode),
                         write_completion: WriteCompletion::TailDrained,
                         ..Default::default()
                     },
