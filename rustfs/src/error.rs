@@ -190,13 +190,12 @@ pub(crate) fn slow_down_read_api_error(err: StorageError) -> ApiError {
     }
 }
 
-/// Normalize a read-quorum failure that escaped through a PutObject boundary.
+/// Normalize a storage read-quorum failure at PUT and LIST boundaries.
 ///
 /// Storage-level read quorum failures keep their `SlowDownRead` code for GET
-/// compatibility. A write request that encounters the same failure must expose
-/// the write-side retry contract instead, while retaining the typed source for
-/// diagnostics and audit consumers.
-pub(crate) fn normalize_put_read_quorum_error(mut err: S3Error) -> S3Error {
+/// compatibility. PUT and LIST expose storage unavailability instead of
+/// throttling, while retaining the typed source for diagnostics and audit consumers.
+pub(crate) fn normalize_read_quorum_error(mut err: S3Error) -> S3Error {
     let is_slow_down_read = matches!(
         err.code(),
         S3ErrorCode::Custom(code) if &**code == SLOW_DOWN_READ_CODE
@@ -2108,7 +2107,7 @@ mod tests {
                 headers.insert("retry-after", http::HeaderValue::from_static("2"));
                 err.set_headers(headers);
 
-                let err = normalize_put_read_quorum_error(normalize_put_read_quorum_error(err));
+                let err = normalize_read_quorum_error(normalize_read_quorum_error(err));
                 assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
                 assert_eq!(err.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
                 assert_eq!(err.message(), Some("The service is unavailable. Please retry."));
@@ -2139,7 +2138,7 @@ mod tests {
             let mut err = S3Error::with_message(code.clone(), "original message");
             err.set_source(Box::new(StorageError::ErasureReadQuorum));
             let original_status = err.status_code();
-            let err = normalize_put_read_quorum_error(err);
+            let err = normalize_read_quorum_error(err);
             assert_eq!(err.code(), &code);
             assert_eq!(err.message(), Some("original message"));
             assert_eq!(err.status_code(), original_status);
@@ -2153,7 +2152,7 @@ mod tests {
             if let Some(source) = source {
                 err.set_source(Box::new(source));
             }
-            let err = normalize_put_read_quorum_error(err);
+            let err = normalize_read_quorum_error(err);
             assert_eq!(err.code(), &S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
             assert_eq!(err.message(), Some("original message"));
         }

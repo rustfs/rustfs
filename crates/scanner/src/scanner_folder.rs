@@ -2707,6 +2707,7 @@ impl FolderScanner {
                                         "Scanner list_path_raw agreed callback failed"
                                     );
                                 }
+                                Ok(())
                             })
                         })),
                         partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {

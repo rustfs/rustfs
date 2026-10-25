@@ -525,6 +525,12 @@ impl RecoveryPass {
     }
 
     async fn discover(&mut self, store: &Arc<ECStore>, cancel: &CancellationToken) {
+        // ECStore starts before the bucket metadata system is published. Do
+        // not turn that bootstrap state into a deferred disk/bucket failure.
+        if store.ctx.bucket_metadata_sys().is_none() {
+            return;
+        }
+
         let hints = store.ctx.delete_recovery_hints();
         // Renew only this worker's bounded local cursors before any await.
         // Backpressure and a slow canonical rollback must not erase progress.
@@ -1030,6 +1036,26 @@ mod tests {
                     .expect("source incarnation"),
             ),
         });
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_waits_for_metadata_before_consuming_startup_discovery() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        store.background_cancel_token().expect("background token").cancel();
+        tokio::task::yield_now().await;
+        assert!(store.ctx.bucket_metadata_sys().is_none(), "metadata bootstrap has not completed");
+        let hints = store.ctx.delete_recovery_hints();
+        hints.request_rescan();
+        let generation = hints.rescan().expect("startup discovery obligation");
+        let mut pass = RecoveryPass::default();
+        pass.discover(&store, &CancellationToken::new()).await;
+        assert_eq!(hints.rescan(), Some(generation), "bootstrap cannot consume the discovery obligation");
+        assert!(pass.deferred.is_empty(), "bootstrap is not a failed disk scope");
+        assert!(pass.next_inventory.is_none(), "bootstrap must not delay the initial inventory");
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        pass.discover(&store, &CancellationToken::new()).await;
+        assert!(hints.rescan().is_none(), "the first ready pass fulfills the empty-store scan immediately");
+        assert!(pass.deferred.is_empty());
     }
 
     #[tokio::test]

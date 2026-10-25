@@ -85,6 +85,9 @@ pub enum Error {
     #[error("stale_bucket_incarnation: bucket {bucket} no longer belongs to this heal admission ({expected:?})")]
     StaleBucketIncarnation { bucket: String, expected: Option<uuid::Uuid> },
 
+    #[error("Bucket identity lookup returned a nil incarnation")]
+    InvalidBucketIncarnation,
+
     /// The current page already exhausted its local retry budget. Retrying
     /// the enclosing bucket would replay pages whose results were counted.
     #[error("Heal listing failed for bucket {bucket}: {source}")]
