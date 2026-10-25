@@ -16,7 +16,7 @@
 
 use std::collections::VecDeque;
 use std::fs;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -79,7 +79,7 @@ impl TestPki {
         server_params.not_after = now + time::Duration::days(2);
         server_params
             .subject_alt_names
-            .push(SanType::DnsName("localhost".try_into().expect("valid DNS name")));
+            .push(SanType::IpAddress(std::net::Ipv4Addr::LOCALHOST.into()));
         server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let server = server_params
             .signed_by(&server_key, &Issuer::from_params(&root_params, &root_key))
@@ -182,8 +182,25 @@ impl Reply {
 
 struct TestServer {
     endpoint: String,
-    seen: Arc<Mutex<Vec<Value>>>,
+    seen: watch::Sender<Vec<Value>>,
+    reject_next_connection: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
+}
+
+impl TestServer {
+    async fn first_request(&self) -> Value {
+        let mut seen = self.seen.subscribe();
+        tokio::time::timeout(INVENTORY_STATUS_WAIT_TIMEOUT, async {
+            seen.wait_for(|requests| !requests.is_empty())
+                .await
+                .expect("inventory request observer")
+                .first()
+                .expect("observed inventory request")
+                .clone()
+        })
+        .await
+        .expect("server must receive an inventory request")
+    }
 }
 
 impl Drop for TestServer {
@@ -197,10 +214,15 @@ async fn server(pki: &TestPki, replies: Vec<Reply>) -> TestServer {
     let address = listener.local_addr().expect("server address");
     let acceptor = TlsAcceptor::from(Arc::new(pki.server_config()));
     let replies = Arc::new(Mutex::new(VecDeque::from(replies)));
-    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (seen, _) = watch::channel(Vec::new());
     let captured = seen.clone();
+    let reject_next_connection = Arc::new(AtomicBool::new(false));
+    let reject = reject_next_connection.clone();
     let task = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
+            if reject.swap(false, Ordering::Relaxed) {
+                continue;
+            }
             let acceptor = acceptor.clone();
             let replies = replies.clone();
             let seen = captured.clone();
@@ -212,9 +234,8 @@ async fn server(pki: &TestPki, replies: Vec<Reply>) -> TestServer {
                     async move {
                         assert_eq!(request.uri().path(), format!("/agent/clusters/{CLUSTER_UID}/inventorySnapshots"));
                         let body = request.into_body().collect().await.expect("request body").to_bytes();
-                        seen.lock()
-                            .expect("seen lock")
-                            .push(serde_json::from_slice(&body).expect("request JSON"));
+                        let request = serde_json::from_slice(&body).expect("request JSON");
+                        seen.send_modify(|requests| requests.push(request));
                         let reply = replies
                             .lock()
                             .expect("reply lock")
@@ -240,8 +261,9 @@ async fn server(pki: &TestPki, replies: Vec<Reply>) -> TestServer {
         }
     });
     TestServer {
-        endpoint: format!("https://localhost:{}/agent/", address.port()),
+        endpoint: format!("https://{address}/agent/"),
         seen,
+        reject_next_connection,
         task,
     }
 }
@@ -470,7 +492,7 @@ async fn connect_inventory_rejects_deserialized_invalid_snapshots_before_state_o
         assert!(!temp.path().join("private-config-secret/inventory/state.json").exists());
         runtime.shutdown().await;
     }
-    assert!(server.seen.lock().expect("seen lock").is_empty());
+    assert!(server.seen.borrow().is_empty());
 }
 
 #[tokio::test]
@@ -478,6 +500,8 @@ async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_un
     let pki = TestPki::new();
     let content_hash = snapshot().content_hash().expect("content hash");
     let first_server = server(&pki, vec![Reply::error(StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE")]).await;
+    // A transport retry can happen before the server receives any HTTP request.
+    first_server.reject_next_connection.store(true, Ordering::Relaxed);
     let temp = safe_tempdir();
     let shutdown = CancellationToken::new();
     let samples = Arc::new(AtomicUsize::new(0));
@@ -488,14 +512,11 @@ async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_un
     })
     .expect("start inventory")
     .expect("configured inventory");
-    let mut status = runtime.status();
 
-    assert!(matches!(
-        wait_for(&mut status, |status| matches!(status, InventoryStatus::BackingOff { .. })).await,
-        InventoryStatus::BackingOff { delay } if delay == Duration::from_millis(20)
-    ));
+    // BackingOff also describes DNS, connect, and TLS failures. Observe the
+    // actual POST before shutting down with its persisted request still pending.
+    let original = first_server.first_request().await;
     assert_eq!(samples.load(Ordering::Relaxed), 1);
-    let original = first_server.seen.lock().expect("seen lock")[0].clone();
     let latest: Value = serde_json::from_slice(
         &fs::read(temp.path().join("private-config-secret/inventory/latest.json")).expect("latest inventory"),
     )
@@ -557,7 +578,7 @@ async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_un
     .expect("restored latest envelope");
     assert_eq!(restored_latest["snapshot"], serde_json::to_value(snapshot()).expect("snapshot JSON"));
     assert_eq!(restored_latest["capturedAt"], legacy_persisted_at);
-    let delivered = restart_server.seen.lock().expect("seen lock").clone();
+    let delivered = restart_server.seen.borrow().clone();
     assert_eq!(delivered, vec![original.clone(), original.clone()]);
     assert_eq!(original["sequence"], 0);
     let encoded = serde_json::to_string(&original).expect("request JSON");
@@ -597,7 +618,7 @@ async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_un
         InventoryStatus::Unchanged { content_hash: unchanged } if unchanged == content_hash
     ));
     assert_eq!(unchanged_samples.load(Ordering::Relaxed), 1);
-    assert_eq!(restart_server.seen.lock().expect("seen lock").len(), 2);
+    assert_eq!(restart_server.seen.borrow().len(), 2);
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt as _;
@@ -675,7 +696,7 @@ async fn connect_inventory_retries_an_incomplete_sample_before_delivery() {
         InventoryStatus::Online { content_hash: accepted, .. } if accepted == content_hash
     ));
     assert_eq!(samples.load(Ordering::Relaxed), 2);
-    assert_eq!(server.seen.lock().expect("seen lock").len(), 1);
+    assert_eq!(server.seen.borrow().len(), 1);
     runtime.shutdown().await;
 }
 
@@ -746,7 +767,7 @@ async fn connect_inventory_unchanged_sample_resets_incomplete_backoff() {
         InventoryStatus::BackingOff { delay } if delay == Duration::from_millis(20)
     ));
     assert_eq!(samples.load(Ordering::Relaxed), 4);
-    assert_eq!(server.seen.lock().expect("seen lock").len(), 1);
+    assert_eq!(server.seen.borrow().len(), 1);
     runtime.shutdown().await;
 }
 
@@ -770,7 +791,7 @@ async fn connect_inventory_revoked_device_stops_without_retrying() {
             reason: None
         }
     ));
-    assert_eq!(server.seen.lock().expect("seen lock").len(), 1);
+    assert_eq!(server.seen.borrow().len(), 1);
     runtime.shutdown().await;
 }
 
@@ -805,7 +826,7 @@ async fn connect_inventory_sequence_overflow_fails_before_sampling_or_network_de
         InventoryStatus::Failed { reason } if reason == "connect_inventory_sequence_exhausted"
     ));
     assert_eq!(samples.load(Ordering::Relaxed), 0);
-    assert!(server.seen.lock().expect("seen lock").is_empty());
+    assert!(server.seen.borrow().is_empty());
     runtime.shutdown().await;
 }
 
@@ -873,7 +894,7 @@ async fn connect_inventory_rejects_noncanonical_persisted_snapshots_before_deliv
         runtime.shutdown().await;
     }
 
-    assert!(server.seen.lock().expect("seen lock").is_empty());
+    assert!(server.seen.borrow().is_empty());
 }
 
 #[cfg(target_os = "linux")]

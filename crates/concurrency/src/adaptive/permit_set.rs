@@ -611,7 +611,7 @@ mod tests {
         let node = node(1);
         let topology = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("topology");
         let parent = topology
-            .select(&[a.clone()])
+            .select(std::slice::from_ref(&a))
             .expect("object device")
             .try_acquire_with_node(&node)
             .expect("object admission");
@@ -643,7 +643,7 @@ mod tests {
         let node = node(1);
         let topology = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone(), c.clone()]).expect("topology");
         let parent = topology
-            .select(&[a.clone()])
+            .select(std::slice::from_ref(&a))
             .expect("object device")
             .try_acquire_with_node(&node)
             .expect("object admission");
@@ -677,15 +677,15 @@ mod tests {
         let node = node(1);
         let topology = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("topology");
         let parent = topology
-            .select(&[a.clone()])
+            .select(std::slice::from_ref(&a))
             .expect("object device")
             .try_acquire_with_node(&node)
             .expect("object admission");
         let native = AdaptivePermitSetOwner::new(maximum(1), vec![b.clone()]).expect("auxiliary disk");
         let replacement = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("new topology");
         for attachment in [
-            replacement.select(&[b.clone()]).expect("new attachment"),
-            topology.select(&[a.clone()]).expect("wrong leaves"),
+            replacement.select(std::slice::from_ref(&b)).expect("new attachment"),
+            topology.select(std::slice::from_ref(&a)).expect("wrong leaves"),
         ] {
             assert_eq!(
                 native
@@ -695,7 +695,7 @@ mod tests {
             );
             assert_eq!([a.snapshot().active, b.snapshot().active], [1, 0]);
         }
-        let attachment = topology.select(&[b.clone()]).expect("correct attachment");
+        let attachment = topology.select(std::slice::from_ref(&b)).expect("correct attachment");
         let acquired = native
             .try_capture_or_acquire_from(parent.resources(), &attachment)
             .expect("new native unit");
@@ -719,7 +719,7 @@ mod tests {
         let node = node(1);
         let topology = AdaptivePermitSetOwner::new(maximum(2), vec![a.clone(), b.clone()]).expect("topology");
         let parent = topology
-            .select(&[a.clone()])
+            .select(std::slice::from_ref(&a))
             .expect("object device")
             .try_acquire_with_node(&node)
             .expect("object admission");
@@ -741,12 +741,12 @@ mod tests {
         let node = node(1);
         let topology = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("topology");
         let parent = topology
-            .select(&[a.clone()])
+            .select(std::slice::from_ref(&a))
             .expect("object device")
             .try_acquire_with_node(&node)
             .expect("object admission");
         let native = AdaptivePermitSetOwner::new(maximum(8), vec![b.clone()]).expect("auxiliary carrier");
-        let attachment = topology.select(&[b.clone()]).expect("attachment");
+        let attachment = topology.select(std::slice::from_ref(&b)).expect("attachment");
         topology.extending[parent.resources().slot].store(true, Ordering::Release);
         assert_eq!(
             native

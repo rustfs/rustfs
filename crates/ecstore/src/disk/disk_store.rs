@@ -4039,7 +4039,7 @@ mod tests {
             );
             let parent = if auxiliary {
                 shared
-                    .select(&[first.clone()])
+                    .select(std::slice::from_ref(&first))
                     .expect("initial object device")
                     .try_acquire_with_node(&node)
             } else {
@@ -4281,7 +4281,7 @@ mod tests {
             }),
         );
         let parent = shared
-            .select(&[a.clone()])
+            .select(std::slice::from_ref(&a))
             .expect("object on A")
             .try_acquire_with_node(&node)
             .expect("object admission");

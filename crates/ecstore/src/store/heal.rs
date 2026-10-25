@@ -602,10 +602,10 @@ impl ECStore {
     /// Snapshot only the object sets participating in this request. The sampler
     /// resolves their physical leaves before Heal enters namespace/cache locks.
     pub fn physical_heal_plan(&self, object: &str, opts: &HealOpts) -> Result<Option<crate::disk::PhysicalResourcePlan>> {
-        if let Some(index) = opts.pool {
-            if index >= self.pools.len() {
-                return Err(invalid_heal_pool_index(index, self.pools.len()));
-            }
+        if let Some(index) = opts.pool
+            && index >= self.pools.len()
+        {
+            return Err(invalid_heal_pool_index(index, self.pools.len()));
         }
         let object = rustfs_utils::path::encode_dir_object_ref(object);
         let mut selected: Option<crate::disk::PhysicalResourcePlan> = None;

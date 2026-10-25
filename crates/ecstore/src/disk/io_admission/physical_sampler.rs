@@ -308,6 +308,42 @@ impl Drop for PhysicalDiskSampler {
 }
 
 impl PhysicalDiskSample {
+    /// Supply one synthetic device for real-storage admission tests on any OS.
+    /// Publication, shared ownership and lease expiry still use the real sampler.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_test_single_device(mut self) -> Self {
+        assert!(!self.targets.is_empty(), "the fixture must contain local disks");
+        let now = Instant::now();
+        let identity = PhysicalDeviceIdentity {
+            major: 259,
+            minor: 0,
+            generation: 1,
+        };
+        self.resolved = std::mem::take(&mut self.targets)
+            .into_iter()
+            .map(|target| Resolved {
+                binding: target.binding,
+                identities: Some(vec![identity]),
+                began: now,
+                ended: now,
+            })
+            .collect();
+        self.devices = BTreeMap::from([(
+            identity,
+            Some(Observation {
+                began: now,
+                ended: now,
+                ios: 0,
+                ticks: 0,
+                queued_ticks: 0,
+                in_flight: 0,
+                maximum: 1,
+            }),
+        )]);
+        self.finished = Some(now);
+        self
+    }
+
     /// Snapshot current attachments before blocking sysfs reads. A busy set
     /// cannot hold the sampler indefinitely or renew stale capacity.
     pub fn collect(store: &ECStore) -> Self {
@@ -763,7 +799,7 @@ mod tests {
         sample.resolved[0].identities = None;
         sample.heal_sets = vec![HealSetSample {
             binding: first.clone(),
-            disks: Some(vec![a.clone()]),
+            disks: Some(vec![a]),
         }];
         sampler.publish(sample, ResourcePressure::Stable);
         assert!(first.plan().is_none(), "unknown local disks never become empty selections");
