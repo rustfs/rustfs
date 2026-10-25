@@ -6919,7 +6919,6 @@ mod decommission_lock_order_tests {
         };
         owner.apply_to(&mut abort_opts);
         let barrier = MultipartCommitBarrier::install(&bucket, object, MultipartCommitPause::AbortAfterDelete);
-        tokio::time::pause();
         let abort = tokio::spawn({
             let abort_store = Arc::clone(&lossy_store);
             let abort_bucket = bucket.clone();
@@ -6939,6 +6938,9 @@ mod decommission_lock_order_tests {
             }
         });
         barrier.wait_until_paused().await;
+        // Native cleanup performs real filesystem I/O. Pause time only after
+        // durable deletion, when the abort is blocked before its release save.
+        tokio::time::pause();
         tokio::task::yield_now().await;
         refresh_calls.arm();
         tokio::time::advance(Duration::from_secs(11)).await;
