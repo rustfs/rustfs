@@ -1052,6 +1052,154 @@ async fn cancelled_metadata_wait_releases_fence_for_bucket_recreation() -> TestR
     assert_no_uploads(&clients, &bucket).await
 }
 
+#[tokio::test]
+async fn part_resend_owner_serializes_complete_and_abort_after_client_cancellation() -> TestResult {
+    use md5::{Digest as _, Md5};
+
+    let (cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+    for cancel_waiter in [false, true] {
+        for complete in [false, true] {
+            let key = format!("resend-{cancel_waiter}-{complete}");
+            let previous = payload_for(&key, 4096);
+            clients[0]
+                .put_object()
+                .bucket(&bucket)
+                .key(&key)
+                .body(ByteStream::from(previous.clone()))
+                .send()
+                .await?;
+            let upload = clients[0].create_multipart_upload().bucket(&bucket).key(&key).send().await?;
+            let upload_id = upload.upload_id().ok_or("missing upload ID")?;
+            let original = clients[0]
+                .upload_part()
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(upload_id)
+                .part_number(1)
+                .body(ByteStream::from(vec![0x41; 9 * 1024 * 1024]))
+                .send()
+                .await?;
+            let replacement = vec![0x62; 9 * 1024 * 1024];
+            let replacement_etag = format!(
+                "\"{}\"",
+                hex_simd::encode_to_string(Md5::digest(&replacement), hex_simd::AsciiCase::Lower)
+            );
+            assert_ne!(original.e_tag(), Some(replacement_etag.as_str()));
+            let scope = upload_scope(upload_id)?;
+            let path = upload_path_scope(&bucket, &key, upload_id)?;
+            let roots = cluster
+                .nodes
+                .iter()
+                .flat_map(|node| &node.data_dirs)
+                .map(|root| std::path::Path::new(root).join(".rustfs.sys/multipart").join(&path))
+                .collect::<Vec<_>>();
+            let pauses = proxies[1..]
+                .iter()
+                .map(|proxy| proxy.pause(&["PreparePartTransaction"], usize::MAX, Some(&scope)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let resend = clients[0]
+                .upload_part()
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(upload_id)
+                .part_number(1)
+                .body(ByteStream::from(replacement.clone()));
+            let caller = tokio::spawn(async move { resend.send().await });
+            wait_for_faults(&pauses, &["PreparePartTransaction"]).await?;
+            let caller = if cancel_waiter {
+                caller.abort();
+                assert!(caller.await.expect_err("cancelled part response waiter").is_cancelled());
+                None
+            } else {
+                Some(caller)
+            };
+
+            // Observe a real upload-lock attempt on another coordinator, then
+            // release this observer while the part transaction remains paused.
+            let admission = proxies[0].pause(&["Lock", "LockBatch"], usize::MAX, Some(&scope))?;
+            let client = clients[1].clone();
+            let terminal_bucket = bucket.clone();
+            let terminal_key = key.clone();
+            let terminal_upload = upload_id.to_owned();
+            let terminal_etag = replacement_etag.clone();
+            let mut terminal = tokio::spawn(async move {
+                let result: TestResult = if complete {
+                    client
+                        .complete_multipart_upload()
+                        .bucket(terminal_bucket)
+                        .key(terminal_key)
+                        .upload_id(terminal_upload)
+                        .multipart_upload(
+                            CompletedMultipartUpload::builder()
+                                .parts(CompletedPart::builder().part_number(1).e_tag(terminal_etag).build())
+                                .build(),
+                        )
+                        .send()
+                        .await
+                        .map(|_| ())
+                        .map_err(Into::into)
+                } else {
+                    client
+                        .abort_multipart_upload()
+                        .bucket(terminal_bucket)
+                        .key(terminal_key)
+                        .upload_id(terminal_upload)
+                        .send()
+                        .await
+                        .map(|_| ())
+                        .map_err(Into::into)
+                };
+                result
+            });
+            admission.wait_for_hits(1).await?;
+            admission.release();
+            wait_until(
+                DEADLINE,
+                || async { Ok(admission.forwarded() > 0) },
+                "terminal upload-lock request forwarded",
+            )
+            .await?;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), &mut terminal).await.is_err(),
+                "finalization must wait for the admitted part owner: cancel_waiter={cancel_waiter}, complete={complete}"
+            );
+            drop(admission);
+            for pause in &pauses {
+                pause.release();
+            }
+            if let Some(caller) = caller {
+                let part = tokio::time::timeout(DEADLINE, caller).await???;
+                assert_eq!(part.e_tag(), Some(replacement_etag.as_str()));
+            }
+            tokio::time::timeout(DEADLINE, terminal).await???;
+            wait_until(
+                DEADLINE,
+                || async { Ok(roots.iter().all(|root| !root.exists())) },
+                "retired resend upload staging",
+            )
+            .await?;
+            let expected = if complete { &replacement } else { &previous };
+            for client in &clients {
+                assert_object_bytes(client, &bucket, &key, expected).await?;
+                let missing = client
+                    .list_parts()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .upload_id(upload_id)
+                    .send()
+                    .await
+                    .expect_err("a terminal upload must reject ListParts on every coordinator");
+                assert_eq!(missing.as_service_error().and_then(|error| error.meta().code()), Some("NoSuchUpload"));
+            }
+            assert_no_uploads(&clients, &bucket).await?;
+            eprintln!(
+                "MPU resend owner: cancel_waiter={cancel_waiter}, complete={complete}, prepared_peers=3, retired_roots=4, verified_readers=4"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Same logical geometry as the incident: one pool, four 16-shard sets,
 /// EC12+4, 45 MiB files, 8 MiB parts, two files and four parts in flight.
 #[tokio::test]
