@@ -12149,18 +12149,27 @@ mod tests {
     #[serial_test::serial(body_cache_hook)]
     async fn select_snapshot_rejects_identity_change_before_second_reader() {
         let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
-        let store = new_prepared_reader_test_store(&[Arc::clone(&set_disks)]).await;
+        let store = crate::bucket::metadata_sys::object_store_in(set_disks.instance_ctx())
+            .await
+            .expect("fixture metadata authority should be live");
         let bucket = "select-snapshot-identity-change";
         let object = "identity-change.bin";
-        let no_lock_opts = ObjectOptions {
+        let mut no_lock_opts = ObjectOptions {
             no_lock: true,
             ..Default::default()
         };
 
-        set_disks
+        store
             .make_bucket(bucket, &MakeBucketOptions::default())
             .await
             .expect("bucket should be created");
+        // Skip the object namespace lock for replacement, but retain real bucket ownership.
+        no_lock_opts.object_lock_config_snapshot = Some(
+            store
+                .object_lock_config_snapshot(bucket)
+                .await
+                .expect("PUT fixture should retain the bucket lifecycle and Object Lock snapshot"),
+        );
         let mut initial_reader = PutObjReader::from_vec(b"first generation".to_vec());
         set_disks
             .put_object(bucket, object, &mut initial_reader, &no_lock_opts)
