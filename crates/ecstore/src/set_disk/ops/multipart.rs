@@ -9220,7 +9220,9 @@ mod tests {
             }
         }
 
-        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60"))], async {
+        // Real disk callbacks and health probes must share wall-clock deadlines.
+        // Advancing Tokio time can expire unrelated healthy-drive probes.
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("2"))], async {
             let (dirs, store) = crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks().await;
             crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
             let bucket = "mpu-quorum-success-physical";
@@ -9286,9 +9288,6 @@ mod tests {
                         tokio::task::yield_now().await;
                     }
                 }).await.expect("three real native publication legs must return before the fourth deadline");
-                tokio::time::pause();
-                tokio::time::advance(Duration::from_secs(61)).await;
-                tokio::time::resume();
                 after_publication.as_ref().expect("publication barrier").wait_until_paused().await;
                 // Quorum has been validated and the parent released its object
                 // guard. The successful physical tail cannot retain a clone.
@@ -9310,7 +9309,7 @@ mod tests {
                 old.release();
                 drop(old);
                 after_cleanup = Some(MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::AfterRename));
-                // Advance a cleanup deadline only after its actual wrapper is
+                // Observe cleanup only after its actual wrapper is
                 // active. A drive already rejected as faulty can skip that wait.
                 let cleanup_waiting = tokio::time::timeout(Duration::from_secs(5), async {
                     tokio::select! {
@@ -9331,9 +9330,6 @@ mod tests {
                     panic!("actual part cleanup must start or reach its completed boundary: {err}; phase=part_cleanup, prior_calls={:?}, calls={:?}, waiting={}", metrics.api_calls, current.api_calls, current.total_waiting);
                 });
                 if cleanup_waiting {
-                    tokio::time::pause();
-                    tokio::time::advance(Duration::from_secs(61)).await;
-                    tokio::time::resume();
                     after_cleanup.as_ref().expect("cleanup barrier").wait_until_paused().await;
                 }
                 tokio::time::timeout(Duration::from_secs(5), cleanup_idle(paused_local))
@@ -9360,9 +9356,6 @@ mod tests {
                     panic!("actual root cleanup must start or completion must return: {err}; phase=root_cleanup, prior_calls={:?}, calls={:?}, waiting={}", metrics.api_calls, current.api_calls, current.total_waiting);
                 });
                 if root_waiting {
-                    tokio::time::pause();
-                    tokio::time::advance(Duration::from_secs(61)).await;
-                    tokio::time::resume();
                     let result = tokio::time::timeout(Duration::from_secs(5), &mut complete).await.expect("bounded cleanup cannot negate committed write quorum");
                     joined = true;
                     committed = Some(result.expect("completion task").expect("three verified native ACKs acknowledge the object"));
