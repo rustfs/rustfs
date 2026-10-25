@@ -948,6 +948,90 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::sync::{Barrier, Notify};
 
+    #[tokio::test]
+    async fn admitted_remote_reads_bind_receiver_admission_to_the_http_signature() {
+        use crate::disk::with_background_resource_unit;
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+
+        crate::runtime::sources::ensure_test_rpc_secret();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("remote admission listener");
+        let address = listener.local_addr().expect("remote admission address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("remote read connection");
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut chunk = [0; 1024];
+                let read = socket.read(&mut chunk).await.expect("remote read headers");
+                assert!(read > 0 && bytes.len() < 16 * 1024, "bounded complete request headers");
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            let request = std::str::from_utf8(&bytes).expect("HTTP request");
+            let mut lines = request.split("\r\n");
+            let target = lines
+                .next()
+                .expect("request line")
+                .split_whitespace()
+                .nth(1)
+                .expect("request target")
+                .to_owned();
+            let mut headers = HeaderMap::new();
+            for line in lines.take_while(|line| !line.is_empty()) {
+                let (name, value) = line.split_once(':').expect("header field");
+                headers.append(
+                    http::header::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                    HeaderValue::from_str(value.trim()).expect("header value"),
+                );
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello")
+                .await
+                .expect("remote read response");
+            (target, headers)
+        });
+        let gate = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let resource = gate.try_acquire().expect("sender device admission");
+        let mut reader = tokio::time::timeout(
+            Duration::from_secs(5),
+            with_background_resource_unit(
+                resource,
+                TcpHttpInternodeDataTransport.open_read(ReadStreamRequest {
+                    endpoint: format!("http://{address}"),
+                    disk: "disk-a".to_owned(),
+                    volume: "bucket".to_owned(),
+                    path: "part.1".to_owned(),
+                    offset: 0,
+                    length: 5,
+                    stall_timeout: Some(Duration::from_secs(5)),
+                }),
+            ),
+        )
+        .await
+        .expect("bounded remote request")
+        .expect("remote reader");
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).await.expect("complete remote body");
+        assert_eq!(body, b"hello");
+        let (target, headers) = server.await.expect("remote request capture");
+        assert_eq!(gate.snapshot().active, 0, "remote body does not retain the sender's device");
+        assert_eq!(
+            headers
+                .get("x-rustfs-rpc-background-admission")
+                .and_then(|value| value.to_str().ok()),
+            Some("v1"),
+            "resource-controlled remote work must request receiver-side admission"
+        );
+        crate::cluster::rpc::verify_rpc_signature(&target, &Method::GET, &headers).expect("bound request signature");
+        let mut stripped = headers;
+        stripped.remove("x-rustfs-rpc-background-admission");
+        assert!(
+            crate::cluster::rpc::verify_rpc_signature(&target, &Method::GET, &stripped).is_err(),
+            "removing background admission must invalidate the signature"
+        );
+    }
+
     async fn wait_for_capability_flight_waiters(entry: &PutFileCapabilityCacheEntry, waiters: usize) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {

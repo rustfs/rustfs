@@ -61,6 +61,9 @@ use uuid::Uuid;
 type HmacSha256 = Hmac<Sha256>;
 
 const SIGNATURE_HEADER: &str = "x-rustfs-signature";
+pub const RPC_BACKGROUND_ADMISSION_HEADER: &str = "x-rustfs-rpc-background-admission";
+const RPC_BACKGROUND_ADMISSION_V1: &str = "v1";
+const RPC_BACKGROUND_ADMISSION_DOMAIN: &[u8] = b"rustfs-rpc-background-admission-v1\0";
 pub(crate) const TIMESTAMP_HEADER: &str = "x-rustfs-timestamp";
 pub(crate) const RPC_AUTH_VERSION_HEADER: &str = "x-rustfs-rpc-auth-version";
 const RPC_SIGNATURE_V2_HEADER: &str = "x-rustfs-rpc-signature-v2";
@@ -77,6 +80,44 @@ pub(crate) const RPC_REPLAY_CACHE_CAPABILITY_HEADER: &str = "x-rustfs-rpc-replay
 pub(crate) const RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER: &str = "x-rustfs-rpc-replay-cache-capability-proof";
 const RPC_REPLAY_SCOPE_VERSION_V3: &str = "3";
 const RPC_RESPONSE_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-response-proof-v1\0";
+
+tokio::task_local! {
+    static RPC_BACKGROUND_REQUEST: bool;
+}
+
+pub(crate) fn current_rpc_background_request() -> bool {
+    RPC_BACKGROUND_REQUEST
+        .try_with(|background| *background)
+        .unwrap_or_else(|_| crate::disk::has_resource_io_scope())
+}
+
+pub(crate) async fn with_rpc_background_request<F: std::future::Future>(background: bool, operation: F) -> F::Output {
+    RPC_BACKGROUND_REQUEST.scope(background, operation).await
+}
+
+/// Parse the request class only; callers must verify the signature before using it.
+pub fn rpc_background_admission(headers: &HeaderMap) -> std::io::Result<bool> {
+    let mut values = headers.get_all(RPC_BACKGROUND_ADMISSION_HEADER).iter();
+    match (values.next(), values.next()) {
+        (None, None) => Ok(false),
+        (Some(value), None) if value == RPC_BACKGROUND_ADMISSION_V1 => Ok(true),
+        _ => Err(std::io::Error::other("Invalid RPC background admission version")),
+    }
+}
+
+fn bind_background_admission(mac: &mut HmacSha256, background: bool) {
+    if background {
+        // Every auth lane binds the class, so stripping the marker or falling
+        // back to an older signature cannot turn admitted work into foreground I/O.
+        mac.update(RPC_BACKGROUND_ADMISSION_DOMAIN);
+    }
+}
+
+fn insert_background_admission(headers: &mut HeaderMap, background: bool) {
+    if background {
+        headers.insert(RPC_BACKGROUND_ADMISSION_HEADER, HeaderValue::from_static(RPC_BACKGROUND_ADMISSION_V1));
+    }
+}
 const RPC_REPLAY_SCOPE_DOMAIN: &[u8] = b"rustfs-rpc-replay-scope-v3\0";
 const RPC_BOOT_EPOCH_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-boot-epoch-proof-v1\0";
 const RPC_REPLAY_CACHE_CAPABILITY_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-replay-cache-capability-proof-v1\0";
@@ -519,21 +560,23 @@ fn redacted_rpc_path(url: &str) -> String {
 }
 
 /// Generate HMAC-SHA256 signature for the given data
-fn generate_signature(secret: &str, url: &str, method: &Method, timestamp: i64) -> String {
+fn generate_signature(secret: &str, url: &str, method: &Method, timestamp: i64, background: bool) -> String {
     let data = signature_payload(url, method, timestamp);
     let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
+    bind_background_admission(&mut mac, background);
     mac.update(data.as_bytes());
     let result = mac.finalize();
     base64_simd::STANDARD.encode_to_string(result.into_bytes())
 }
 
-fn verify_signature(secret: &str, url: &str, method: &Method, timestamp: i64, signature: &str) -> bool {
+fn verify_signature(secret: &str, url: &str, method: &Method, timestamp: i64, signature: &str, background: bool) -> bool {
     let Ok(signature) = base64_simd::STANDARD.decode_to_vec(signature) else {
         return false;
     };
 
     let data = signature_payload(url, method, timestamp);
     let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
+    bind_background_admission(&mut mac, background);
     mac.update(data.as_bytes());
     mac.verify_slice(&signature).is_ok()
 }
@@ -771,6 +814,7 @@ pub fn verify_ns_scanner_capability_with_checkpoint_coverage(
 
 #[derive(Clone, Copy)]
 struct SignatureV2Scope<'a> {
+    background: bool,
     audience: &'a str,
     service: &'a str,
     rpc_method: &'a str,
@@ -780,6 +824,7 @@ struct SignatureV2Scope<'a> {
 }
 
 fn update_signature_v2(mac: &mut HmacSha256, scope: SignatureV2Scope<'_>) {
+    bind_background_admission(mac, scope.background);
     for part in [
         b"rustfs-rpc-auth-v2|".as_slice(),
         scope.audience.as_bytes(),
@@ -818,6 +863,7 @@ fn verify_signature_v2(secret: &str, scope: SignatureV2Scope<'_>, signature: &st
 
 #[derive(Clone, Copy)]
 struct ReplayScope<'a> {
+    background: bool,
     audience: &'a str,
     path: &'a str,
     timestamp: &'a str,
@@ -827,6 +873,7 @@ struct ReplayScope<'a> {
 }
 
 fn update_replay_scope(mac: &mut HmacSha256, scope: ReplayScope<'_>) {
+    bind_background_admission(mac, scope.background);
     mac.update(RPC_REPLAY_SCOPE_DOMAIN);
     for part in [
         scope.audience.as_bytes(),
@@ -971,6 +1018,24 @@ pub fn gen_tonic_replay_scope_headers(
     content_sha256: &str,
     boot_epoch: Uuid,
 ) -> std::io::Result<HeaderMap> {
+    gen_tonic_replay_scope_headers_with_admission(
+        audience,
+        path,
+        timestamp,
+        content_sha256,
+        boot_epoch,
+        current_rpc_background_request(),
+    )
+}
+
+pub(crate) fn gen_tonic_replay_scope_headers_with_admission(
+    audience: &str,
+    path: &str,
+    timestamp: &str,
+    content_sha256: &str,
+    boot_epoch: Uuid,
+    background: bool,
+) -> std::io::Result<HeaderMap> {
     if audience.is_empty() || !path.starts_with('/') || !valid_content_sha256(content_sha256) || boot_epoch.is_nil() {
         return Err(std::io::Error::other("Invalid replay-scoped RPC signing scope"));
     }
@@ -983,6 +1048,7 @@ pub fn gen_tonic_replay_scope_headers(
     let signature = generate_replay_scope_signature(
         &get_shared_secret()?,
         ReplayScope {
+            background,
             audience,
             path,
             timestamp,
@@ -992,6 +1058,7 @@ pub fn gen_tonic_replay_scope_headers(
         },
     )?;
     let mut headers = HeaderMap::new();
+    insert_background_admission(&mut headers, background);
     headers.insert(RPC_REPLAY_SCOPE_VERSION_HEADER, HeaderValue::from_static(RPC_REPLAY_SCOPE_VERSION_V3));
     headers.insert(
         RPC_REPLAY_SCOPE_SIGNATURE_HEADER,
@@ -1226,10 +1293,12 @@ pub fn build_auth_headers(url: &str, method: &Method, headers: &mut HeaderMap) -
 pub fn gen_signature_headers(url: &str, method: &Method) -> std::io::Result<HeaderMap> {
     let secret = get_shared_secret()?;
     let timestamp = OffsetDateTime::now_utc().unix_timestamp();
+    let background = current_rpc_background_request();
 
-    let signature = generate_signature(&secret, url, method, timestamp);
+    let signature = generate_signature(&secret, url, method, timestamp, background);
 
     let mut headers = HeaderMap::new();
+    insert_background_admission(&mut headers, background);
     headers.insert(SIGNATURE_HEADER, HeaderValue::from_str(&signature).expect("Invalid header value"));
     headers.insert(
         TIMESTAMP_HEADER,
@@ -1264,10 +1333,12 @@ pub fn gen_tonic_signature_headers(
     let timestamp_header = timestamp.to_string();
     let body_nonce = (content_sha256 != UNSIGNED_PAYLOAD).then(|| Uuid::new_v4().to_string());
     let nonce = body_nonce.as_deref().unwrap_or(UNSIGNED_PAYLOAD_NONCE);
-    let legacy_signature = generate_signature(&secret, TONIC_RPC_PREFIX, &Method::GET, timestamp);
+    let background = current_rpc_background_request();
+    let legacy_signature = generate_signature(&secret, TONIC_RPC_PREFIX, &Method::GET, timestamp, background);
     let signature_v2 = generate_signature_v2(
         &secret,
         SignatureV2Scope {
+            background,
             audience,
             service,
             rpc_method,
@@ -1278,6 +1349,7 @@ pub fn gen_tonic_signature_headers(
     )?;
 
     let mut headers = HeaderMap::new();
+    insert_background_admission(&mut headers, background);
     headers.insert(SIGNATURE_HEADER, header_value(&legacy_signature, SIGNATURE_HEADER)?);
     headers.insert(TIMESTAMP_HEADER, header_value(&timestamp_header, TIMESTAMP_HEADER)?);
     headers.insert(RPC_AUTH_VERSION_HEADER, HeaderValue::from_static(RPC_AUTH_VERSION_V2));
@@ -1501,6 +1573,7 @@ fn verify_tonic_replay_scope_signature(audience: &str, path: &str, headers: &Hea
     if !verify_replay_scope_signature(
         &secret,
         ReplayScope {
+            background: rpc_background_admission(headers)?,
             audience,
             path,
             timestamp,
@@ -1625,6 +1698,9 @@ fn verify_tonic_rpc_signature_with_strictness(
     strict: bool,
 ) -> std::io::Result<()> {
     if !has_v2_auth_headers(headers) {
+        if rpc_background_admission(headers)? {
+            return Err(std::io::Error::other("RPC background admission requires v2 authentication"));
+        }
         // RUSTFS_COMPAT_TODO(heal-rpc-auth-v2): accept old peers during rolling upgrades. Remove after the minimum
         // supported RustFS peer version sends v2 authentication on every internode gRPC request.
         if strict {
@@ -1696,6 +1772,7 @@ fn verify_tonic_rpc_signature_with_strictness(
     if !verify_signature_v2(
         &secret,
         SignatureV2Scope {
+            background: rpc_background_admission(headers)?,
             audience,
             service,
             rpc_method,
@@ -1736,7 +1813,7 @@ pub fn verify_rpc_signature(url: &str, method: &Method, headers: &HeaderMap) -> 
     // Verify signature with constant-time HMAC comparison.
     let secret = get_shared_secret()?;
 
-    if !verify_signature(&secret, url, method, timestamp, signature) {
+    if !verify_signature(&secret, url, method, timestamp, signature, rpc_background_admission(headers)?) {
         let rpc_path = redacted_rpc_path(url);
         error!(
             rpc_path = %rpc_path,
@@ -1826,6 +1903,98 @@ mod tests {
 
     fn ensure_test_rpc_secret() {
         runtime_sources::ensure_test_rpc_secret();
+    }
+
+    #[tokio::test]
+    async fn background_admission_is_bound_in_http_and_both_tonic_signature_lanes() {
+        ensure_test_rpc_secret();
+        let secret = get_shared_secret().expect("RPC secret");
+        let path = "/node_service.NodeService/ReadAll";
+        for background in [false, true] {
+            let (http, tonic) = with_rpc_background_request(background, async {
+                (
+                    gen_signature_headers("/rustfs/rpc/read?disk=a", &Method::GET).expect("HTTP signature"),
+                    gen_tonic_signature_headers("node-a:9000", "node_service.NodeService", "ReadAll", None)
+                        .expect("gRPC signature"),
+                )
+            })
+            .await;
+            assert_eq!(rpc_background_admission(&http).expect("HTTP class"), background);
+            assert_eq!(rpc_background_admission(&tonic).expect("gRPC class"), background);
+            verify_rpc_signature("/rustfs/rpc/read?disk=a", &Method::GET, &http).expect("HTTP authentication");
+            verify_tonic_rpc_signature_with_strictness("node-a:9000", path, &tonic, true).expect("v2 authentication");
+
+            let timestamp = tonic[TIMESTAMP_HEADER].to_str().expect("timestamp");
+            let content = tonic[RPC_CONTENT_SHA256_HEADER].to_str().expect("content digest");
+            assert_eq!(
+                verify_signature_v2(
+                    &secret,
+                    SignatureV2Scope {
+                        background: false,
+                        audience: "node-a:9000",
+                        service: "node_service.NodeService",
+                        rpc_method: "ReadAll",
+                        timestamp,
+                        nonce: tonic[RPC_NONCE_HEADER].to_str().expect("nonce"),
+                        content_sha256: content,
+                    },
+                    tonic[RPC_SIGNATURE_V2_HEADER].to_str().expect("signature"),
+                ),
+                !background,
+                "an old peer cannot authenticate a background request as foreground"
+            );
+
+            let mut replay = tonic.clone();
+            // The channel can run outside the caller's task-local scope.
+            replay.extend(
+                gen_tonic_replay_scope_headers_with_admission(
+                    "node-a:9000",
+                    path,
+                    timestamp,
+                    content,
+                    tonic_rpc_boot_epoch(),
+                    background,
+                )
+                .expect("v3 signature"),
+            );
+            for mutation in ["strip-or-add", "unknown", "duplicate"] {
+                let alter = |headers: &HeaderMap| {
+                    let mut changed = headers.clone();
+                    match mutation {
+                        "strip-or-add" if background => {
+                            changed.remove(RPC_BACKGROUND_ADMISSION_HEADER);
+                        }
+                        "strip-or-add" => insert_background_admission(&mut changed, true),
+                        "unknown" => {
+                            changed.insert(RPC_BACKGROUND_ADMISSION_HEADER, HeaderValue::from_static("v2"));
+                        }
+                        _ => {
+                            insert_background_admission(&mut changed, true);
+                            changed.append(RPC_BACKGROUND_ADMISSION_HEADER, HeaderValue::from_static("v1"));
+                        }
+                    }
+                    changed
+                };
+                assert!(verify_rpc_signature("/rustfs/rpc/read?disk=a", &Method::GET, &alter(&http)).is_err());
+                assert!(verify_tonic_rpc_signature_with_strictness("node-a:9000", path, &alter(&tonic), true).is_err());
+                assert!(verify_tonic_replay_scope_signature("node-a:9000", path, &alter(&replay)).is_err());
+            }
+            verify_tonic_replay_scope_signature("node-a:9000", path, &replay).expect("v3 authentication");
+            assert!(
+                verify_tonic_replay_scope_signature("node-a:9000", path, &replay).is_err(),
+                "replay rejected"
+            );
+
+            if background {
+                let mut downgraded = HeaderMap::new();
+                for name in [SIGNATURE_HEADER, TIMESTAMP_HEADER, RPC_BACKGROUND_ADMISSION_HEADER] {
+                    downgraded.insert(name, tonic[name].clone());
+                }
+                assert!(verify_tonic_rpc_signature_with_strictness("node-a:9000", path, &downgraded, false).is_err());
+                downgraded.remove(RPC_BACKGROUND_ADMISSION_HEADER);
+                assert!(verify_tonic_rpc_signature_with_strictness("node-a:9000", path, &downgraded, false).is_err());
+            }
+        }
     }
 
     #[test]
@@ -1965,8 +2134,8 @@ mod tests {
         let method = Method::GET;
         let timestamp = 1640995200; // Fixed timestamp
 
-        let signature1 = generate_signature(secret, url, &method, timestamp);
-        let signature2 = generate_signature(secret, url, &method, timestamp);
+        let signature1 = generate_signature(secret, url, &method, timestamp, false);
+        let signature2 = generate_signature(secret, url, &method, timestamp, false);
 
         assert_eq!(signature1, signature2, "Same inputs should produce same signature");
         assert!(!signature1.is_empty(), "Signature should not be empty");
@@ -1979,10 +2148,10 @@ mod tests {
         let method = Method::GET;
         let timestamp = 1640995200;
 
-        let signature1 = generate_signature(secret, url, &method, timestamp);
-        let signature2 = generate_signature(secret, "http://different.com/api/test2", &method, timestamp);
-        let signature3 = generate_signature(secret, url, &Method::POST, timestamp);
-        let signature4 = generate_signature(secret, url, &method, timestamp + 1);
+        let signature1 = generate_signature(secret, url, &method, timestamp, false);
+        let signature2 = generate_signature(secret, "http://different.com/api/test2", &method, timestamp, false);
+        let signature3 = generate_signature(secret, url, &Method::POST, timestamp, false);
+        let signature4 = generate_signature(secret, url, &method, timestamp + 1, false);
 
         assert_ne!(signature1, signature2, "Different URLs should produce different signatures");
         assert_ne!(signature1, signature3, "Different methods should produce different signatures");
@@ -2088,14 +2257,14 @@ mod tests {
         let url = "http://example.com/api/test";
         let method = Method::GET;
         let timestamp = 1640995200;
-        let signature = generate_signature(secret, url, &method, timestamp);
+        let signature = generate_signature(secret, url, &method, timestamp, false);
         let mut tampered = base64_simd::STANDARD.decode_to_vec(&signature).unwrap();
         tampered[0] ^= 1;
         let tampered_signature = base64_simd::STANDARD.encode_to_string(tampered);
 
-        assert!(verify_signature(secret, url, &method, timestamp, &signature));
-        assert!(!verify_signature(secret, url, &method, timestamp, &tampered_signature));
-        assert!(!verify_signature(secret, url, &method, timestamp, "invalid-signature"));
+        assert!(verify_signature(secret, url, &method, timestamp, &signature, false));
+        assert!(!verify_signature(secret, url, &method, timestamp, &tampered_signature, false));
+        assert!(!verify_signature(secret, url, &method, timestamp, "invalid-signature", false));
     }
 
     #[test]
@@ -2112,11 +2281,11 @@ mod tests {
         );
         let method = Method::GET;
         let timestamp = 1_640_995_200;
-        let signature = generate_signature(secret, signed_url, &method, timestamp);
+        let signature = generate_signature(secret, signed_url, &method, timestamp, false);
 
-        assert!(verify_signature(secret, signed_url, &method, timestamp, &signature));
-        assert!(!verify_signature(secret, downgraded_url, &method, timestamp, &signature));
-        assert!(!verify_signature(secret, tampered_body_digest, &method, timestamp, &signature));
+        assert!(verify_signature(secret, signed_url, &method, timestamp, &signature, false));
+        assert!(!verify_signature(secret, downgraded_url, &method, timestamp, &signature, false));
+        assert!(!verify_signature(secret, tampered_body_digest, &method, timestamp, &signature, false));
     }
 
     #[test]
@@ -2126,7 +2295,7 @@ mod tests {
         let method = Method::GET;
         let timestamp = OffsetDateTime::now_utc().unix_timestamp();
         let secret = get_shared_secret().expect("test RPC secret should resolve");
-        let expected_signature = generate_signature(&secret, url, &method, timestamp);
+        let expected_signature = generate_signature(&secret, url, &method, timestamp, false);
         let invalid_signature = "invalid-signature";
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
@@ -2164,7 +2333,7 @@ mod tests {
         // Set expired timestamp (older than SIGNATURE_VALID_DURATION)
         let expired_timestamp = OffsetDateTime::now_utc().unix_timestamp() - SIGNATURE_VALID_DURATION - 10;
         let secret = get_shared_secret().expect("test RPC secret should resolve");
-        let signature = generate_signature(&secret, url, &method, expired_timestamp);
+        let signature = generate_signature(&secret, url, &method, expired_timestamp, false);
 
         headers.insert(SIGNATURE_HEADER, HeaderValue::from_str(&signature).unwrap());
         headers.insert(TIMESTAMP_HEADER, HeaderValue::from_str(&expired_timestamp.to_string()).unwrap());
@@ -2186,7 +2355,7 @@ mod tests {
 
         let future_timestamp = OffsetDateTime::now_utc().unix_timestamp() + SIGNATURE_VALID_DURATION + 10;
         let secret = get_shared_secret().expect("test RPC secret should resolve");
-        let signature = generate_signature(&secret, url, &method, future_timestamp);
+        let signature = generate_signature(&secret, url, &method, future_timestamp, false);
 
         headers.insert(SIGNATURE_HEADER, HeaderValue::from_str(&signature).unwrap());
         headers.insert(TIMESTAMP_HEADER, HeaderValue::from_str(&future_timestamp.to_string()).unwrap());
@@ -2300,7 +2469,7 @@ mod tests {
         // Test timestamp just within valid duration
         let valid_timestamp = current_time - SIGNATURE_VALID_DURATION + 1;
 
-        let signature = generate_signature(&secret, url, &method, valid_timestamp);
+        let signature = generate_signature(&secret, url, &method, valid_timestamp, false);
 
         headers.insert(SIGNATURE_HEADER, HeaderValue::from_str(&signature).unwrap());
         headers.insert(TIMESTAMP_HEADER, HeaderValue::from_str(&valid_timestamp.to_string()).unwrap());
@@ -2311,7 +2480,7 @@ mod tests {
         // Test timestamp just outside valid duration
         let mut headers = HeaderMap::new();
         let invalid_timestamp = current_time - SIGNATURE_VALID_DURATION - 15;
-        let signature = generate_signature(&secret, url, &method, invalid_timestamp);
+        let signature = generate_signature(&secret, url, &method, invalid_timestamp, false);
 
         headers.insert(SIGNATURE_HEADER, HeaderValue::from_str(&signature).unwrap());
         headers.insert(TIMESTAMP_HEADER, HeaderValue::from_str(&invalid_timestamp.to_string()).unwrap());

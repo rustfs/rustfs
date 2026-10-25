@@ -41,6 +41,9 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+pub(crate) mod remote;
+pub use remote::{RemoteBackgroundIo, with_remote_background_io};
+
 const BACKGROUND_FOREGROUND_BURST: u32 = 8;
 const BACKGROUND_MAX_WAIT: Duration = Duration::from_millis(100);
 
@@ -180,12 +183,24 @@ pub async fn with_background_resource_set<F: Future>(units: AdaptivePermitSet, f
 }
 
 pub(crate) fn current_resource_unit() -> Option<ResourceIoUnit> {
-    RESOURCE_IO_UNIT.try_with(Clone::clone).ok().or_else(|| {
-        DISK_IO_CONTEXT
-            .try_with(|context| context.resource_unit.clone())
-            .ok()
-            .flatten()
-    })
+    RESOURCE_IO_UNIT
+        .try_with(Clone::clone)
+        .ok()
+        .or_else(|| {
+            DISK_IO_CONTEXT
+                .try_with(|context| context.resource_unit.clone())
+                .ok()
+                .flatten()
+        })
+        .or_else(remote::resources)
+}
+
+pub(crate) fn has_resource_io_scope() -> bool {
+    RESOURCE_IO_UNIT.try_with(|_| ()).is_ok()
+        || DISK_IO_CONTEXT
+            .try_with(|context| context.resource_unit.is_some())
+            .unwrap_or(false)
+        || remote::active()
 }
 
 /// Transfer only resource ownership into an existing spawned task. Disk

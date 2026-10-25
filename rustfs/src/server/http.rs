@@ -313,6 +313,9 @@ struct RpcRequestPathService<S> {
     inner: S,
 }
 
+#[derive(Clone, Copy)]
+struct RpcBackgroundAdmissionReady;
+
 struct RpcCompletionBody<B> {
     inner: B,
     started_at: Instant,
@@ -424,6 +427,14 @@ where
 
     fn call(&mut self, mut req: HttpRequest<B>) -> Self::Future {
         let started_at = Instant::now();
+        let background = storage::rpc_background_admission(req.headers()).ok() == Some(true);
+        let resource_context = background
+            .then(crate::startup_background::background_node_admission)
+            .flatten()
+            .map(storage::RemoteBackgroundIo::new);
+        if resource_context.is_some() {
+            req.extensions_mut().insert(RpcBackgroundAdmissionReady);
+        }
         let target = RpcRequestTarget {
             uri: req.uri().clone(),
             method: req.method().clone(),
@@ -439,7 +450,17 @@ where
             });
         let future = self.inner.call(req);
         Box::pin(async move {
-            let mut response = future.await?;
+            let mut response = storage::with_remote_background_io(resource_context, async move {
+                let result = future.await;
+                let succeeded = result.as_ref().is_ok_and(|response| {
+                    response.status().is_success() && response.headers().get("grpc-status").is_none_or(|status| status == "0")
+                });
+                if !succeeded {
+                    storage::RemoteBackgroundIo::discard_current_progress();
+                }
+                result
+            })
+            .await?;
             if let Some(headers) = response_headers {
                 response.headers_mut().extend(headers);
             }
@@ -2736,6 +2757,13 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
         }
     })?;
 
+    if storage::rpc_background_admission(req.metadata().as_ref())
+        .map_err(|_| Status::unauthenticated("Invalid background admission request"))?
+        && req.extensions().get::<RpcBackgroundAdmissionReady>().is_none()
+    {
+        return Err(Status::resource_exhausted("background resource admission is not enabled"));
+    }
+
     let parent_context =
         global::get_text_map_propagator(|propagator| propagator.extract(&MetadataMapCarrier::new(req.metadata())));
     if parent_context.has_active_span() {
@@ -4577,6 +4605,264 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn authenticated_background_rpc_enforces_receiver_capacity_on_http_and_grpc() {
+        use rustfs_concurrency::adaptive::{
+            AdaptiveAdmission, FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure,
+        };
+        use std::num::NonZeroU16;
+        use storage::DiskAPI;
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_INTERNODE_PREWARM", Some("false")),
+                ("RUSTFS_INTERNODE_IDEMPOTENT_READ_RETRIES", Some("0")),
+            ],
+            async {
+                let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+                assert!(
+                    crate::startup_background::background_node_admission().is_none(),
+                    "requires an unpublished owner"
+                );
+                let root = tempfile::tempdir().expect("receiver disk");
+                tokio::fs::create_dir(root.path().join("bucket"))
+                    .await
+                    .expect("fixture bucket");
+                const DATA: &[u8] = b"receiver-owned resource";
+                tokio::fs::write(root.path().join("bucket/object"), DATA)
+                    .await
+                    .expect("fixture object");
+                let listener = TcpListener::bind("127.0.0.1:0").await.expect("receiver listener");
+                let address = listener.local_addr().expect("receiver address");
+                let mut endpoint =
+                    Endpoint::try_from(format!("http://{address}{}", root.path().display()).as_str()).expect("receiver endpoint");
+                endpoint.is_local = true;
+                endpoint.set_pool_index(0);
+                endpoint.set_set_index(0);
+                endpoint.set_disk_index(0);
+                storage::init_local_disks(EndpointServerPools::from(vec![PoolEndpoints {
+                    legacy: false,
+                    set_count: 1,
+                    drives_per_set: 1,
+                    endpoints: Endpoints::from(vec![endpoint.clone()]),
+                    cmd_line: "receiver-admission-test".into(),
+                    platform: "test".into(),
+                }]))
+                .await
+                .expect("register receiver disk");
+                let disk = storage::find_local_disk_by_ref(&endpoint.to_string())
+                    .await
+                    .expect("registered local disk");
+                let physical = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+                let node_owner = NodeAdmission::new(NonZeroU16::MIN);
+                let sender_owner = NodeAdmission::new(NonZeroU16::MIN);
+                let previous_name = rustfs_common::get_global_local_node_name().await;
+                rustfs_common::set_global_local_node_name(&address.to_string()).await;
+                let node = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
+                let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) });
+                let service = hybrid(
+                    InternodeRpcService::new(fallback),
+                    RpcRequestPathService::new(Routes::new(node).prepare()),
+                );
+                let server = tokio::spawn(async move {
+                    let mut connections = tokio::task::JoinSet::new();
+                    loop {
+                        let (socket, _) = listener.accept().await.expect("receiver connection");
+                        let service = service.clone();
+                        connections.spawn(async move {
+                            let _ = ConnBuilder::new(TokioExecutor::new())
+                                .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                                .await;
+                        });
+                    }
+                });
+                let mut remote_endpoint = endpoint.clone();
+                remote_endpoint.is_local = false;
+                let remote = storage::new_disk(
+                    &remote_endpoint,
+                    &storage::DiskOption {
+                        cleanup: false,
+                        health_check: false,
+                    },
+                )
+                .await
+                .expect("production remote client");
+                let mut controller = FeedbackController::new();
+                for (generation, phase) in ["disabled", "physical_closed", "ready", "node_busy"].into_iter().enumerate() {
+                    if phase == "physical_closed" {
+                        let headers = storage::with_remote_background_io(
+                            Some(storage::RemoteBackgroundIo::new(sender_owner.clone())),
+                            async {
+                                storage::gen_tonic_signature_headers(
+                                    &address.to_string(),
+                                    "node_service.NodeService",
+                                    "ReadAll",
+                                    None,
+                                )
+                            },
+                        )
+                        .await
+                        .expect("early request signature");
+                        let mut request = HttpRequest::builder()
+                            .method(Method::POST)
+                            .uri(format!("http://{address}/node_service.NodeService/ReadAll"))
+                            .body(())
+                            .expect("early request");
+                        request.headers_mut().extend(headers);
+                        let mut early_service =
+                            RpcRequestPathService::new(tower::service_fn(|request: HttpRequest<()>| async move {
+                                let (parts, ()) = request.into_parts();
+                                let mut request = Request::new(());
+                                request.metadata_mut().as_mut().extend(parts.headers);
+                                *request.extensions_mut() = parts.extensions;
+                                assert_eq!(
+                                    check_auth(request)
+                                        .expect_err("request entered before admission was enabled")
+                                        .code(),
+                                    tonic::Code::ResourceExhausted
+                                );
+                                Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new()))
+                            }));
+                        let early_request = early_service.call(request);
+                        crate::startup_background::install_background_node_admission_for_test(node_owner.clone());
+                        early_request.await.expect("startup race must fail closed");
+                    }
+                    node_owner.update(
+                        &mut controller,
+                        Some(FeedbackObservation {
+                            generation: u64::try_from(generation + 1).expect("small generation"),
+                            max_concurrency: 1,
+                            pressure: ResourcePressure::Unknown,
+                            completed_units: None,
+                        }),
+                    );
+                    physical.set_limit(if phase == "physical_closed" { 0 } else { 1 });
+                    disk.physical_admission()
+                        .expect("physical binding")
+                        .set_test_capacity(vec![physical.clone()])
+                        .expect("renew receiver device plan");
+                    let held = (phase == "node_busy").then(|| node_owner.try_acquire().expect("occupy receiver node"));
+                    for background in [false, true] {
+                        for stream in [false, true] {
+                            let operation = async {
+                                if stream {
+                                    let mut reader = remote.read_file_stream("bucket", "object", 0, DATA.len()).await?;
+                                    let mut bytes = Vec::new();
+                                    reader.read_to_end(&mut bytes).await?;
+                                    Ok(bytes)
+                                } else {
+                                    remote.read_all("bucket", "object").await.map(|bytes| bytes.to_vec())
+                                }
+                            };
+                            let result = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                storage::with_remote_background_io(
+                                    background.then(|| storage::RemoteBackgroundIo::new(sender_owner.clone())),
+                                    operation,
+                                ),
+                            )
+                            .await
+                            .expect("receiver must defer without waiting under storage locks");
+                            if !background || phase == "ready" {
+                                assert_eq!(
+                                    result.unwrap_or_else(|error| panic!(
+                                        "{phase}, background={background}, stream={stream}: {error}"
+                                    )),
+                                    DATA,
+                                    "{phase}, background={background}, stream={stream}"
+                                );
+                            } else {
+                                assert!(
+                                    result.is_err(),
+                                    "{phase}, stream={stream}: background request bypassed receiver admission"
+                                );
+                            }
+                            assert_eq!(node_owner.snapshot().active, u32::from(held.is_some()));
+                            tokio::time::timeout(Duration::from_secs(1), async {
+                                while physical.snapshot().active != 0 {
+                                    tokio::task::yield_now().await;
+                                }
+                            })
+                            .await
+                            .expect("receiver native I/O and response body must drain");
+                            assert_eq!(physical.snapshot().active, 0, "completed response releases receiver device");
+                        }
+                    }
+                    drop(held);
+                }
+                assert_eq!(node_owner.completed(), Some(2), "only the two admitted background requests made progress");
+                assert_eq!(physical.completed(), Some(2));
+                let mut upload =
+                    reqwest::Url::parse(&format!("http://{address}/rustfs/rpc/put_file_stream")).expect("upload URL");
+                upload.query_pairs_mut().extend_pairs([
+                    ("disk", endpoint.to_string().as_str()),
+                    ("volume", "bucket"),
+                    ("path", "incomplete"),
+                    ("append", "false"),
+                    ("size", "4"),
+                ]);
+                let headers =
+                    storage::with_remote_background_io(Some(storage::RemoteBackgroundIo::new(sender_owner.clone())), async {
+                        storage::gen_signature_headers(upload.as_str(), &Method::PUT)
+                    })
+                    .await
+                    .expect("background upload signature");
+                let response = reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .expect("upload client")
+                    .put(upload)
+                    .headers(headers)
+                    .body("bad")
+                    .send()
+                    .await
+                    .expect("incomplete upload response");
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                let message = response.text().await.expect("upload error body");
+                assert!(message.contains("body size mismatch"), "unexpected upload failure: {message}");
+                assert!(root.path().join("bucket/incomplete").exists(), "file creation completed before failure");
+                assert_eq!(node_owner.completed(), Some(2), "failed upload must not count its successful preparation");
+                assert_eq!(physical.completed(), Some(2));
+                let large = tokio::fs::File::create(root.path().join("bucket/large"))
+                    .await
+                    .expect("large response fixture");
+                const LARGE_LENGTH: usize = 64 * 1024 * 1024;
+                large
+                    .set_len(u64::try_from(LARGE_LENGTH).expect("fixture length"))
+                    .await
+                    .expect("sparse response size");
+                drop(large);
+                let mut reader = storage::with_remote_background_io(
+                    Some(storage::RemoteBackgroundIo::new(sender_owner.clone())),
+                    remote.read_file_stream("bucket", "large", 0, LARGE_LENGTH),
+                )
+                .await
+                .expect("admitted streaming response");
+                let mut first_byte = [1];
+                reader.read_exact(&mut first_byte).await.expect("response body started");
+                assert_eq!(first_byte, [0]);
+                assert_eq!(node_owner.snapshot().active, 0, "stream body cannot retain the handler's node unit");
+                assert_eq!(physical.snapshot().active, 1, "escaped response keeps its receiver disk capacity");
+                drop(reader);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while physical.snapshot().active != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("disconnect must retire the receiver stream and native reads");
+                remote.close().await.expect("close remote client");
+                disk.close().await.expect("stop receiver disk monitors");
+                server.abort();
+                assert!(server.await.expect_err("stop fixture server").is_cancelled());
+                rustfs_common::set_global_local_node_name(&previous_name).await;
+            },
+        )
+        .await;
     }
 
     #[tokio::test]

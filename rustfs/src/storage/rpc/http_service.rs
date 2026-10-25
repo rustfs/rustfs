@@ -16,10 +16,10 @@ use crate::server::RPC_PREFIX;
 use crate::storage::request_context::spawn_traced;
 use crate::storage::storage_api::rpc_consumer::http_service::{
     DEFAULT_READ_BUFFER_SIZE, DeleteOptions, DiskStore, NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse,
-    PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, StorageDiskRpcExt as _,
-    WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, check_and_record_signed_rpc_nonce, find_local_disk_by_ref,
-    sign_ns_scanner_capability_with_checkpoint_coverage, sign_put_file_capability, verify_put_file_auth_trailer,
-    verify_rpc_signature,
+    PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, RemoteBackgroundIo,
+    StorageDiskRpcExt as _, WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, check_and_record_signed_rpc_nonce,
+    find_local_disk_by_ref_for_rpc, rpc_background_admission, sign_ns_scanner_capability_with_checkpoint_coverage,
+    sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io,
 };
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::http_service::{
@@ -424,39 +424,53 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
         return response;
     }
 
-    let method = req.method().clone();
-    let path = req.uri().path();
-
-    let response = match (method, path) {
-        (Method::GET, READ_FILE_STREAM_PATH) | (Method::HEAD, READ_FILE_STREAM_PATH) => handle_read_file(req).await,
-        (Method::GET, WALK_DIR_PATH) | (Method::HEAD, WALK_DIR_PATH) => handle_walk_dir(req).await,
-        (Method::GET, NS_SCANNER_PATH) => match parse_query::<NsScannerCapabilityQuery>(&req) {
-            Ok(query) if query.ns_scanner_protocol == Some(NS_SCANNER_PROTOCOL_VERSION) => match query.ns_scanner_challenge {
-                Some(challenge) if !challenge.is_nil() => ns_scanner_capability_response(
-                    challenge,
-                    query.ns_scanner_tier_registry_generation == Some(true),
-                    query.ns_scanner_checkpoint_coverage == Some(true),
-                ),
-                Some(_) | None => response_with_status(StatusCode::BAD_REQUEST, "namespace scanner challenge is invalid"),
-            },
-            Ok(_) => response_with_status(StatusCode::UPGRADE_REQUIRED, "namespace scanner protocol is unsupported"),
-            Err(response) => *response,
+    let resource_context = match rpc_background_admission(req.headers()) {
+        Ok(false) => None,
+        Ok(true) => match crate::startup_background::background_node_admission() {
+            Some(owner) => Some(RemoteBackgroundIo::new(owner)),
+            None => return response_with_status(StatusCode::SERVICE_UNAVAILABLE, "background resource admission is not enabled"),
         },
-        (Method::POST, NS_SCANNER_PATH) => handle_ns_scanner(req).await,
-        (Method::GET, PUT_FILE_CAPABILITY_PATH) => match parse_query::<PutFileCapabilityQuery>(&req) {
-            Ok(query) if query.put_file_capability == Some(PUT_FILE_CAPABILITY_VERSION) => {
-                match query.put_file_challenge.filter(|challenge| !challenge.is_nil()) {
-                    Some(challenge) => put_file_capability_response(challenge),
-                    None => response_with_status(StatusCode::BAD_REQUEST, "put_file capability challenge is invalid"),
-                }
-            }
-            Ok(_) => response_with_status(StatusCode::UPGRADE_REQUIRED, "put_file capability is unsupported"),
-            Err(response) => *response,
-        },
-        (Method::PUT, PUT_FILE_STREAM_PATH) => handle_put_file(req, false).await,
-        (Method::PUT, PUT_FILE_AUTH_STREAM_PATH) => handle_put_file(req, true).await,
-        _ => response_with_status(StatusCode::NOT_FOUND, "internode rpc route not found"),
+        Err(_) => return response_with_status(StatusCode::FORBIDDEN, "invalid background admission request"),
     };
+    let response = with_remote_background_io(resource_context, async move {
+        let method = req.method().clone();
+        let path = req.uri().path();
+        let response = match (method, path) {
+            (Method::GET, READ_FILE_STREAM_PATH) | (Method::HEAD, READ_FILE_STREAM_PATH) => handle_read_file(req).await,
+            (Method::GET, WALK_DIR_PATH) | (Method::HEAD, WALK_DIR_PATH) => handle_walk_dir(req).await,
+            (Method::GET, NS_SCANNER_PATH) => match parse_query::<NsScannerCapabilityQuery>(&req) {
+                Ok(query) if query.ns_scanner_protocol == Some(NS_SCANNER_PROTOCOL_VERSION) => match query.ns_scanner_challenge {
+                    Some(challenge) if !challenge.is_nil() => ns_scanner_capability_response(
+                        challenge,
+                        query.ns_scanner_tier_registry_generation == Some(true),
+                        query.ns_scanner_checkpoint_coverage == Some(true),
+                    ),
+                    Some(_) | None => response_with_status(StatusCode::BAD_REQUEST, "namespace scanner challenge is invalid"),
+                },
+                Ok(_) => response_with_status(StatusCode::UPGRADE_REQUIRED, "namespace scanner protocol is unsupported"),
+                Err(response) => *response,
+            },
+            (Method::POST, NS_SCANNER_PATH) => handle_ns_scanner(req).await,
+            (Method::GET, PUT_FILE_CAPABILITY_PATH) => match parse_query::<PutFileCapabilityQuery>(&req) {
+                Ok(query) if query.put_file_capability == Some(PUT_FILE_CAPABILITY_VERSION) => {
+                    match query.put_file_challenge.filter(|challenge| !challenge.is_nil()) {
+                        Some(challenge) => put_file_capability_response(challenge),
+                        None => response_with_status(StatusCode::BAD_REQUEST, "put_file capability challenge is invalid"),
+                    }
+                }
+                Ok(_) => response_with_status(StatusCode::UPGRADE_REQUIRED, "put_file capability is unsupported"),
+                Err(response) => *response,
+            },
+            (Method::PUT, PUT_FILE_STREAM_PATH) => handle_put_file(req, false).await,
+            (Method::PUT, PUT_FILE_AUTH_STREAM_PATH) => handle_put_file(req, true).await,
+            _ => response_with_status(StatusCode::NOT_FOUND, "internode rpc route not found"),
+        };
+        if !response.status().is_success() {
+            RemoteBackgroundIo::discard_current_progress();
+        }
+        response
+    })
+    .await;
 
     if !response.status().is_success() {
         record_internode_rpc_error(operation);
@@ -638,7 +652,11 @@ async fn handle_read_file(req: Request<Incoming>) -> Response<Body> {
         Err(response) => return *response,
     };
 
-    let Some(disk) = find_local_disk_by_ref(&query.disk).await else {
+    let disk = match find_local_disk_by_ref_for_rpc(&query.disk).await {
+        Ok(disk) => disk,
+        Err(_) => return response_with_status(StatusCode::SERVICE_UNAVAILABLE, "background storage admission deferred"),
+    };
+    let Some(disk) = disk else {
         warn!(
             event = EVENT_RPC_REQUEST_REJECTED,
             component = LOG_COMPONENT_INTERNODE_RPC,
@@ -748,7 +766,11 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
         Ok(query) => query,
         Err(response) => return *response,
     };
-    let Some(disk) = find_local_disk_by_ref(&query.disk).await else {
+    let disk = match find_local_disk_by_ref_for_rpc(&query.disk).await {
+        Ok(disk) => disk,
+        Err(_) => return response_with_status(StatusCode::SERVICE_UNAVAILABLE, "background storage admission deferred"),
+    };
+    let Some(disk) = disk else {
         warn!(
             event = EVENT_RPC_REQUEST_REJECTED,
             component = LOG_COMPONENT_INTERNODE_RPC,
@@ -950,7 +972,11 @@ async fn handle_ns_scanner(req: Request<Incoming>) -> Response<Body> {
         );
         return response_with_status(StatusCode::CONFLICT, "namespace scanner server epoch is stale");
     }
-    let Some(disk) = find_local_disk_by_ref(&query.disk).await else {
+    let disk = match find_local_disk_by_ref_for_rpc(&query.disk).await {
+        Ok(disk) => disk,
+        Err(_) => return response_with_status(StatusCode::SERVICE_UNAVAILABLE, "background storage admission deferred"),
+    };
+    let Some(disk) = disk else {
         warn!(
             event = EVENT_RPC_REQUEST_REJECTED,
             component = LOG_COMPONENT_INTERNODE_RPC,
@@ -1239,15 +1265,19 @@ where
 {
     let (reader, writer) = tokio::io::duplex(DEFAULT_READ_BUFFER_SIZE);
     let (mut completion_tx, completion_rx) = oneshot::channel();
-    spawn_traced(async move {
+    let resource_context = RemoteBackgroundIo::take_current();
+    spawn_traced(with_remote_background_io(resource_context, async move {
         tokio::select! {
             biased;
             result = producer(writer) => {
+                if result.is_err() {
+                    RemoteBackgroundIo::discard_current_progress();
+                }
                 let _ = completion_tx.send(result);
             }
-            _ = completion_tx.closed() => {}
+            _ = completion_tx.closed() => RemoteBackgroundIo::discard_current_progress(),
         }
-    });
+    }));
 
     let metrics = runtime_sources::current_internode_metrics();
     let stream = ReaderStream::with_capacity(reader, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
@@ -1325,6 +1355,9 @@ where
     let (reader, writer) = tokio::io::duplex(NS_SCANNER_STREAM_BUFFER_SIZE);
     let (mut completion_tx, completion_rx) = oneshot::channel();
     let disconnect = CancellationToken::new();
+    // Scanner reacquires each operation outside its cache lease. Carrying the
+    // preflight node unit into that scheduler would deadlock at capacity one.
+    drop(RemoteBackgroundIo::take_current());
     spawn_traced(async move {
         let producer = producer(writer, disconnect.clone());
         tokio::pin!(producer);
@@ -1514,7 +1547,11 @@ async fn handle_put_file(req: Request<Incoming>, require_auth: bool) -> Response
         return response_with_status(StatusCode::FORBIDDEN, format!("invalid put_file auth: {e}"));
     }
 
-    let Some(disk) = find_local_disk_by_ref(&query.disk).await else {
+    let disk = match find_local_disk_by_ref_for_rpc(&query.disk).await {
+        Ok(disk) => disk,
+        Err(_) => return response_with_status(StatusCode::SERVICE_UNAVAILABLE, "background storage admission deferred"),
+    };
+    let Some(disk) = disk else {
         log_internode_rpc_response_failure!(
             StatusCode::BAD_REQUEST,
             &path,

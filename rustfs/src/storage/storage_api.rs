@@ -269,9 +269,9 @@ pub(crate) mod rpc_consumer {
             PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, WALK_DIR_STREAM_COMPLETION_V1,
         };
         pub(crate) use super::super::{
-            DeleteOptions, DiskStore, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce,
-            find_local_disk_by_ref, sign_ns_scanner_capability_with_checkpoint_coverage, sign_put_file_capability,
-            verify_put_file_auth_trailer, verify_rpc_signature,
+            DeleteOptions, DiskStore, RemoteBackgroundIo, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce,
+            find_local_disk_by_ref_for_rpc, rpc_background_admission, sign_ns_scanner_capability_with_checkpoint_coverage,
+            sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io,
         };
     }
 
@@ -285,11 +285,11 @@ pub(crate) mod rpc_consumer {
             BatchReadVersionReq, BatchReadVersionResp, CollectMetricsOpts, ConditionalFileUpdate, DeleteOptions, DiskError,
             DiskInfoOptions, DiskStore, ECStore, Error, FileInfoVersions, GuardedDeleteVersionsPayload, KMS_SIGNAL_SUBSYSTEM,
             LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq,
-            ReadMultipleResp, ReadOptions, SCANNER_PUBLICATION_LEASE_TTL_MS, SERVICE_SIGNAL_REFRESH_CONFIG,
+            ReadMultipleResp, ReadOptions, RemoteBackgroundIo, SCANNER_PUBLICATION_LEASE_TTL_MS, SERVICE_SIGNAL_REFRESH_CONFIG,
             SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt, StoragePeerS3ClientExt, TierDailyStatsWire, UpdateMetadataOpts,
-            all_local_disk_path, collect_local_metrics, find_local_disk_by_ref, get_global_transition_state,
-            get_local_server_property, reload_bucket_metadata, reload_transition_tier_config, remove_bucket_metadata_if_absent,
-            validate_batch_read_version_item_count,
+            all_local_disk_path, collect_local_metrics, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc,
+            get_global_transition_state, get_local_server_property, reload_bucket_metadata, reload_transition_tier_config,
+            remove_bucket_metadata_if_absent, validate_batch_read_version_item_count, with_remote_background_io,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
@@ -498,8 +498,9 @@ pub(crate) mod ecstore_disk {
         DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo,
         DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload,
         GuardedFileInfoVersions, OldCurrentSize, PartTransactionAction, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
-        ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo,
-        WalkDirOptions, get_object_disk_read_timeout, is_quota_mutation_fence_path, validate_batch_read_version_item_count,
+        ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteBackgroundIo, RenameDataResp, SnapshotLeaseToken,
+        UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout, is_quota_mutation_fence_path,
+        validate_batch_read_version_item_count, with_remote_background_io,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::disk::{CurrentDeleteGeneration, DiskOption, new_disk};
@@ -580,9 +581,10 @@ pub(crate) mod ecstore_rpc {
         KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION, NetworkPeerProbeClient,
         NetworkPeerProbeError, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
         SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, check_and_record_signed_rpc_nonce,
-        decode_heal_bucket_rpc_options, normalize_tonic_rpc_audience, sign_ns_scanner_capability_with_checkpoint_coverage,
-        sign_put_file_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
-        tonic_rpc_auth_failure_reason, verify_put_file_auth_trailer, verify_rpc_signature, verify_tonic_canonical_body_digest,
+        decode_heal_bucket_rpc_options, normalize_tonic_rpc_audience, rpc_background_admission,
+        sign_ns_scanner_capability_with_checkpoint_coverage, sign_put_file_capability, sign_tonic_rpc_response_proof,
+        tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
+        verify_put_file_auth_trailer, verify_rpc_signature, verify_tonic_canonical_body_digest,
         verify_tonic_mutation_body_digest, verify_tonic_mutation_body_digest_reject_unsigned,
         verify_tonic_rpc_signature_with_bootstrap,
     };
@@ -641,8 +643,8 @@ pub(crate) mod ecstore_storage {
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
     pub(crate) use rustfs_ecstore::api::storage::{
         BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
-        all_local_disk_path, find_local_disk_by_ref, init_local_disks_with_instance_ctx, init_lock_clients,
-        prewarm_local_disk_id_map_with_instance_ctx,
+        all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc, init_local_disks_with_instance_ctx,
+        init_lock_clients, prewarm_local_disk_id_map_with_instance_ctx,
     };
 }
 
@@ -685,8 +687,10 @@ pub(crate) fn try_current_local_node_name() -> Option<String> {
     crate::storage::runtime_sources::try_current_local_node_name()
 }
 
+pub(crate) use ecstore_disk::{RemoteBackgroundIo, with_remote_background_io};
 #[cfg(test)]
 pub(crate) use ecstore_rpc::gen_signature_headers;
+pub(crate) use ecstore_rpc::rpc_background_admission;
 pub(crate) use ecstore_rpc::sign_tonic_rpc_response_proof;
 #[cfg(test)]
 pub(crate) use ecstore_rpc::verify_tonic_rpc_response_proof;
@@ -2409,8 +2413,10 @@ pub(crate) async fn all_local_disk_path() -> Vec<String> {
     ecstore_storage::all_local_disk_path().await
 }
 
-pub(crate) async fn find_local_disk_by_ref(disk_ref: &str) -> Option<DiskStore> {
-    ecstore_storage::find_local_disk_by_ref(disk_ref).await
+pub(crate) use ecstore_storage::find_local_disk_by_ref;
+
+pub(crate) async fn find_local_disk_by_ref_for_rpc(disk_ref: &str) -> std::result::Result<Option<DiskStore>, DiskError> {
+    ecstore_storage::find_local_disk_by_ref_for_rpc(disk_ref).await
 }
 
 pub(crate) trait StorageVersioningConfigExt {

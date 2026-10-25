@@ -456,8 +456,8 @@ pub(crate) mod utils;
 
 use peer::init_local_peer;
 pub use peer::{
-    BootstrapLocalTarget, all_local_disk, all_local_disk_path, find_local_disk_by_ref, get_disk_infos, init_local_disks,
-    init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
+    BootstrapLocalTarget, all_local_disk, all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc,
+    get_disk_infos, init_local_disks, init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
     prewarm_local_disk_id_map_with_instance_ctx,
 };
 

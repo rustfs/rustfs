@@ -1673,6 +1673,9 @@ impl LocalDiskWrapper {
         use crate::disk::io_admission::ResourceIoUnit;
 
         let Some(resources) = current_resource_unit() else {
+            if super::remote_io_admission::active() {
+                return Err(DiskError::Io(io::Error::from(io::ErrorKind::WouldBlock)));
+            }
             return Ok(operation.await);
         };
         let resources = if let Some(permits) = resources.as_set() {
@@ -2440,6 +2443,7 @@ impl LocalDiskWrapper {
             self.metrics.record_operation_latency(op, started.elapsed());
             self.record_result_error_metrics(&result);
             if result.is_ok() {
+                super::remote_io_admission::record_progress();
                 self.health.record_operation_success(&self.endpoint(), "operation_success");
                 self.metrics.record_mutation_success(mutation);
             }
@@ -2454,6 +2458,7 @@ impl LocalDiskWrapper {
                 self.record_result_error_metrics(&operation_result);
                 // Log success; the waiting guard balances every exit path.
                 if operation_result.is_ok() {
+                    super::remote_io_admission::record_progress();
                     self.health.record_operation_success(&self.endpoint(), "operation_success");
                     self.metrics.record_mutation_success(mutation);
                 }
@@ -3920,6 +3925,15 @@ mod tests {
 
     #[tokio::test]
     async fn local_disk_resource_identity_probes_keep_only_their_native_device_after_cancel() {
+        assert_native_identity_probe_cancellation(false).await;
+    }
+
+    #[tokio::test]
+    async fn remote_background_native_identity_cancellation_keeps_receiver_device() {
+        assert_native_identity_probe_cancellation(true).await;
+    }
+
+    async fn assert_native_identity_probe_cancellation(remote: bool) {
         use rustfs_concurrency::adaptive::{
             AdaptiveAdmission, FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure,
             permit_set::AdaptivePermitSetOwner,
@@ -3972,19 +3986,29 @@ mod tests {
                         completed_units: None,
                     }),
                 );
-                let parent = shared.try_acquire_with_node(&node).expect("planned devices");
+                let parent = (!remote).then(|| shared.try_acquire_with_node(&node).expect("planned devices"));
                 let task = tokio::spawn({
                     let wrapper = wrapper.clone();
+                    let node = node.clone();
                     async move {
-                        crate::disk::with_background_resource_set(parent.resources().clone(), async {
+                        let operation = async {
                             if online {
                                 assert!(wrapper.is_online().await);
                             } else {
                                 wrapper.get_disk_id().await.expect("disk identity");
                             }
-                        })
-                        .await;
-                        parent.complete();
+                        };
+                        if remote {
+                            crate::disk::with_remote_background_io(Some(crate::disk::RemoteBackgroundIo::new(node)), async {
+                                crate::disk::remote_io_admission::admit(&wrapper.physical_admission).expect("RPC disk admission");
+                                operation.await;
+                            })
+                            .await;
+                        } else {
+                            let parent = parent.expect("local operation admission");
+                            crate::disk::with_background_resource_set(parent.resources().clone(), operation).await;
+                            parent.complete();
+                        }
                     }
                 });
                 tokio::time::timeout(Duration::from_secs(5), started_rx)
