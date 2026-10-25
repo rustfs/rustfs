@@ -787,3 +787,75 @@ pub static SCANNER_PARTIAL_CYCLES_BY_REASON_MD: LazyLock<MetricDescriptor> = Laz
         subsystems::SCANNER,
     )
 });
+
+pub static SCANNER_RUNTIME_ACTIVE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("runtime_active".to_string()),
+        "Whether the latest local scanner runtime owns its lifecycle guard, not a health proof",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_STARTUP_PHASE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("startup_phase".to_string()),
+        "Local scanner startup phase: 0 unknown, 1 initializing, 2 usage inspection, 3 waiting, 4 attempted, 5 stopped",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_STARTUP_STARTED_UNIX_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("startup_started_unix_seconds".to_string()),
+        "Unix timestamp when the latest local scanner runtime was initialized, or zero if unknown",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_STARTUP_PHASE_AGE_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("startup_phase_age_seconds".to_string()),
+        "Seconds since the latest local scanner startup transition",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_STARTUP_PLANNED_ATTEMPT_UNIX_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("startup_planned_attempt_unix_seconds".to_string()),
+        "Estimated Unix timestamp of the sampled startup attempt deadline, not scan completion; zero if unavailable",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_STARTUP_WAIT_REMAINING_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("startup_wait_remaining_seconds".to_string()),
+        "Monotonic seconds remaining before the sampled startup attempt deadline",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_STARTUP_WAIT_OVERDUE_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("startup_wait_overdue_seconds".to_string()),
+        "Monotonic seconds past the sampled startup deadline while the runtime remains in startup waiting",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_STARTUP_FIRST_ATTEMPT_UNIX_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("startup_first_attempt_unix_seconds".to_string()),
+        "Unix timestamp of first normal scanner leadership/recovery attempt after startup recovery, not scan success; zero if unobserved",
+        &[],
+        subsystems::SCANNER,
+    )
+});
