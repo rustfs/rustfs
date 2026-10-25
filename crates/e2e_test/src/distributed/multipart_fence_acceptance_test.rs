@@ -81,7 +81,11 @@ async fn fixture_from_binary(
     }
     let mut proxies = Vec::new();
     for node in 0..4 {
-        proxies.push(cluster.start_rpc_proxy_for_node(node).await?);
+        let proxy = cluster.start_rpc_proxy_for_node(node).await?;
+        if binary.is_some() {
+            proxy.set_transport_passthrough(true);
+        }
+        proxies.push(proxy);
     }
     configure_node_logs(&mut cluster, None)?;
     if let Some(binary) = binary {
@@ -675,6 +679,9 @@ async fn mixed_version_failed_complete_requires_current_coordinator_for_abort() 
     let mut original = Vec::new();
     for root in &roots {
         original.push(tokio::fs::read(root.join("xl.meta")).await?);
+    }
+    for proxy in &proxies {
+        proxy.set_transport_passthrough(false);
     }
     cluster.stop_node(0)?;
     cluster.start_node(0).await?;

@@ -150,6 +150,7 @@ pub(crate) struct RpcFaultProxy {
     slot: PauseSlot,
     task: JoinHandle<()>,
     late_requests: LateRequests,
+    transport_passthrough: watch::Sender<bool>,
 }
 
 impl RpcFaultProxy {
@@ -160,6 +161,7 @@ impl RpcFaultProxy {
         let active = slot.clone();
         let late_requests: LateRequests = Arc::new(Mutex::new(Some(Vec::new())));
         let late = late_requests.clone();
+        let (transport_passthrough, transport_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
             let h1: ProxyClient = Client::builder(TokioExecutor::new()).build_http();
             let h2: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(true).build_http();
@@ -167,12 +169,26 @@ impl RpcFaultProxy {
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
-                        let Ok((socket, _)) = accepted else { break };
+                        let Ok((mut socket, _)) = accepted else { break };
                         let h1 = h1.clone();
                         let h2 = h2.clone();
                         let active = active.clone();
                         let late = late.clone();
+                        let mut transport = transport_rx.clone();
                         connections.spawn(async move {
+                            if *transport.borrow_and_update() {
+                                // Seed legacy streaming traffic without HTTP adaptation.
+                                // Switching to method faults retires every raw connection.
+                                tokio::select! {
+                                    _ = transport.changed() => {},
+                                    _ = async {
+                                        let mut server = tokio::net::TcpStream::connect(target).await?;
+                                        tokio::io::copy_bidirectional(&mut socket, &mut server).await?;
+                                        Ok::<_, io::Error>(())
+                                    } => {},
+                                }
+                                return;
+                            }
                             let service = service_fn(move |request: Request<Incoming>| {
                                 let client = if request.version() == http::Version::HTTP_2 { h2.clone() } else { h1.clone() };
                                 let pause = active.lock().expect("RPC pause slot").clone();
@@ -214,7 +230,12 @@ impl RpcFaultProxy {
             slot,
             task,
             late_requests,
+            transport_passthrough,
         })
+    }
+
+    pub(crate) fn set_transport_passthrough(&self, enabled: bool) {
+        self.transport_passthrough.send_replace(enabled);
     }
 
     pub(crate) fn local_addr(&self) -> SocketAddr {
@@ -455,7 +476,11 @@ mod tests {
                                 let received = received.clone();
                                 async move {
                                 received.fetch_add(1, Ordering::SeqCst);
-                                let authority = request.headers().get(http::header::HOST).cloned();
+                                let authority = request.headers().get(http::header::HOST).cloned().or_else(|| {
+                                    request.uri().authority().map(|authority| {
+                                        http::HeaderValue::from_str(authority.as_str()).expect("valid HTTP authority")
+                                    })
+                                });
                                 let body = request.into_body().collect().await?.to_bytes();
                                 let mut trailers = http::HeaderMap::new();
                                 trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
@@ -506,18 +531,21 @@ mod tests {
             let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback address"), backend.address)
                 .await
                 .expect("proxy");
-            for h2 in [false, true] {
-                let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(h2).build_http();
-                let response = call(&client, proxy.local_addr(), "ReadVersion")
-                    .await
-                    .expect("transparent request");
-                assert_eq!(response.version(), if h2 { http::Version::HTTP_2 } else { http::Version::HTTP_11 });
-                assert_eq!(response.headers()["x-original-authority"], proxy.local_addr().to_string());
-                let collected = response.into_body().collect().await.expect("complete body and trailers");
-                let trailers = collected.trailers().expect("gRPC trailers must survive both proxy hops");
-                assert_eq!(trailers["grpc-status"], "0");
-                assert_eq!(trailers["x-proof"], "unchanged-proof");
-                assert_eq!(collected.to_bytes(), Bytes::from_static(b"opaque signed protobuf"));
+            for transport in [true, false] {
+                proxy.set_transport_passthrough(transport);
+                for h2 in [false, true] {
+                    let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(h2).build_http();
+                    let response = call(&client, proxy.local_addr(), "ReadVersion")
+                        .await
+                        .expect("transparent request");
+                    assert_eq!(response.version(), if h2 { http::Version::HTTP_2 } else { http::Version::HTTP_11 });
+                    assert_eq!(response.headers()["x-original-authority"], proxy.local_addr().to_string());
+                    let collected = response.into_body().collect().await.expect("complete body and trailers");
+                    let trailers = collected.trailers().expect("gRPC trailers must survive both proxy hops");
+                    assert_eq!(trailers["grpc-status"], "0");
+                    assert_eq!(trailers["x-proof"], "unchanged-proof");
+                    assert_eq!(collected.to_bytes(), Bytes::from_static(b"opaque signed protobuf"));
+                }
             }
         })
         .await
