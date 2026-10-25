@@ -5756,10 +5756,16 @@ struct SnapshotLeaseKey {
     path: String,
 }
 
+#[derive(Clone)]
+enum SnapshotPendingDelete {
+    Ordinary(DeleteOptions),
+    OwnedMultipart(Arc<multipart_source_state::OwnedMultipartReclaim>),
+}
+
 #[derive(Default)]
 struct SnapshotLeaseEntry {
     tokens: HashSet<SnapshotLeaseToken>,
-    pending_delete: Option<DeleteOptions>,
+    pending_delete: Option<SnapshotPendingDelete>,
     deleting: bool,
     mutation_fence: Option<Arc<QuotaMutationFenceState>>,
 }
@@ -5791,17 +5797,17 @@ struct SnapshotLeaseRegistry {
 /// runs. A delete future dropped before it finishes (a timeout or a cancelled
 /// caller) clears the flag, so a later lease release or volume settle retries
 /// the pending delete instead of skipping the entry forever.
-struct SnapshotLeaseDeleteClaim<'a> {
-    registry: &'a ParkingLotMutex<SnapshotLeaseRegistry>,
+struct SnapshotLeaseDeleteClaim {
+    registry: Arc<ParkingLotMutex<SnapshotLeaseRegistry>>,
     key: SnapshotLeaseKey,
     finished: bool,
 }
 
-impl<'a> SnapshotLeaseDeleteClaim<'a> {
+impl SnapshotLeaseDeleteClaim {
     /// The caller must have set `deleting` on `key` under the registry lock.
-    fn new(registry: &'a ParkingLotMutex<SnapshotLeaseRegistry>, key: SnapshotLeaseKey) -> Self {
+    fn new(registry: &Arc<ParkingLotMutex<SnapshotLeaseRegistry>>, key: SnapshotLeaseKey) -> Self {
         Self {
-            registry,
+            registry: registry.clone(),
             key,
             finished: false,
         }
@@ -5818,7 +5824,7 @@ impl<'a> SnapshotLeaseDeleteClaim<'a> {
     }
 }
 
-impl Drop for SnapshotLeaseDeleteClaim<'_> {
+impl Drop for SnapshotLeaseDeleteClaim {
     fn drop(&mut self) {
         if !self.finished
             && let Some(entry) = self.registry.lock().entries.get_mut(&self.key)
@@ -7094,37 +7100,50 @@ impl LocalDisk {
             volume: volume.to_string(),
             path: path.to_string(),
         };
-        {
-            let mut registry = self.snapshot_leases.lock();
-            if let Some(entry) = registry.entries.get_mut(&key) {
-                if !entry.tokens.is_empty() {
-                    entry.pending_delete.get_or_insert_with(|| opts.clone());
-                    return Ok(DataDirDeleteStatus::Deferred);
-                }
-                if entry.deleting {
-                    entry.pending_delete.get_or_insert_with(|| opts.clone());
-                    return Ok(DataDirDeleteStatus::Deferred);
-                }
-                entry.deleting = true;
-                entry.pending_delete.get_or_insert_with(|| opts.clone());
-            } else {
-                registry.entries.insert(
-                    key.clone(),
-                    SnapshotLeaseEntry {
-                        pending_delete: Some(opts.clone()),
-                        deleting: true,
-                        ..Default::default()
-                    },
-                );
-            }
-        }
-        let claim = SnapshotLeaseDeleteClaim::new(&self.snapshot_leases, key);
+        let Some(claim) = self.claim_snapshot_delete(key, SnapshotPendingDelete::Ordinary(opts.clone())) else {
+            return Ok(DataDirDeleteStatus::Deferred);
+        };
 
         let result = self
             .delete_unleased_with_source_owner(volume, path, &opts, source_owner.chain(namespace_owner), None)
             .await;
         claim.finish(result.is_ok());
         result.map(|()| DataDirDeleteStatus::Deleted)
+    }
+
+    fn claim_snapshot_delete(&self, key: SnapshotLeaseKey, pending: SnapshotPendingDelete) -> Option<SnapshotLeaseDeleteClaim> {
+        {
+            let mut registry = self.snapshot_leases.lock();
+            let entry = registry.entries.entry(key.clone()).or_default();
+            // Generic requests cannot downgrade an owned Undo. Only its
+            // runtime-only proof may upgrade an earlier ordinary orphan request.
+            if entry.pending_delete.is_none()
+                || matches!(
+                    (&entry.pending_delete, &pending),
+                    (Some(SnapshotPendingDelete::Ordinary(_)), SnapshotPendingDelete::OwnedMultipart(_))
+                )
+            {
+                entry.pending_delete = Some(pending);
+            }
+            if !entry.tokens.is_empty() || entry.deleting {
+                return None;
+            }
+            entry.deleting = true;
+        }
+        Some(SnapshotLeaseDeleteClaim::new(&self.snapshot_leases, key))
+    }
+
+    async fn run_pending_snapshot_delete(&self, claim: SnapshotLeaseDeleteClaim, pending: &SnapshotPendingDelete) -> Result<()> {
+        match pending {
+            SnapshotPendingDelete::Ordinary(opts) => {
+                let result = self.delete_unleased(&claim.key.volume, &claim.key.path, opts).await;
+                claim.finish(result.is_ok());
+                result
+            }
+            SnapshotPendingDelete::OwnedMultipart(proof) => {
+                self.reclaim_owned_multipart_data_dir(proof.clone(), None, claim).await
+            }
+        }
     }
 
     pub(crate) async fn is_plain_orphan_data_dir(&self, volume: &str, path: &str) -> Result<bool> {
@@ -11259,7 +11278,7 @@ impl LocalDisk {
     /// logically empty. The still-active readers keep their open descriptors;
     /// only path-based reopens observe the removal.
     async fn settle_pending_snapshot_deletes(&self, volume: &str) {
-        let pending: Vec<(SnapshotLeaseKey, DeleteOptions)> = {
+        let pending: Vec<(SnapshotLeaseKey, SnapshotPendingDelete)> = {
             let mut registry = self.snapshot_leases.lock();
             registry
                 .entries
@@ -11271,22 +11290,22 @@ impl LocalDisk {
                 })
                 .collect()
         };
-        let pending: Vec<(SnapshotLeaseDeleteClaim<'_>, DeleteOptions)> = pending
+        let pending: Vec<(SnapshotLeaseDeleteClaim, SnapshotPendingDelete)> = pending
             .into_iter()
             .map(|(key, opts)| (SnapshotLeaseDeleteClaim::new(&self.snapshot_leases, key), opts))
             .collect();
 
         for (claim, opts) in pending {
-            let result = self.delete_unleased(&claim.key.volume, &claim.key.path, &opts).await;
+            let key = claim.key.clone();
+            let result = self.run_pending_snapshot_delete(claim, &opts).await;
             if let Err(err) = &result {
                 warn!(
-                    volume = %claim.key.volume,
-                    path = %claim.key.path,
+                    volume = %key.volume,
+                    path = %key.path,
                     error = %err,
                     "failed to settle deferred data-dir deletion before volume removal"
                 );
             }
-            claim.finish(result.is_ok());
         }
     }
 }
@@ -13015,15 +13034,13 @@ impl DiskAPI for LocalDisk {
         // retains pending_delete (and its on-disk receipt) for a later retry.
         // Do not wait for execution while a releasing reader may own locks.
         let claim = SnapshotLeaseDeleteClaim::new(&self.snapshot_leases, key);
-        let result = match super::cleanup_runtime::try_disk_execution() {
+        match super::cleanup_runtime::try_disk_execution() {
             Ok(permit) => {
                 let _permit = permit;
-                self.delete_unleased(volume, path, &opts).await
+                self.run_pending_snapshot_delete(claim, &opts).await
             }
             Err(err) => Err(err.into()),
-        };
-        claim.finish(result.is_ok());
-        result
+        }
     }
 
     async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {

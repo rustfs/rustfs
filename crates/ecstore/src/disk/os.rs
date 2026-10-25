@@ -6469,6 +6469,41 @@ pub(crate) fn read_multipart_source_metadata(
     base: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<Vec<u8>> {
+    read_multipart_metadata(path, base, publication_root, Some(16 * 1024 * 1024))
+}
+
+/// Target FI histories have no source-control size limit. Keep the same
+/// pinned-parent and no-follow checks when inspecting every referenced DD.
+pub(crate) fn read_multipart_reclaim_target_metadata(
+    path: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<Vec<u8>> {
+    read_multipart_metadata(path, base, publication_root, None)
+}
+
+fn read_multipart_metadata_bytes(mut reader: impl std::io::Read, maximum: Option<u64>) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    match maximum {
+        Some(maximum) => {
+            std::io::Read::read_to_end(&mut reader.take(maximum.saturating_add(1)), &mut bytes)?;
+            if bytes.len() as u64 > maximum {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata exceeds its size limit"));
+            }
+        }
+        None => {
+            std::io::Read::read_to_end(&mut reader, &mut bytes)?;
+        }
+    }
+    Ok(bytes)
+}
+
+fn read_multipart_metadata(
+    path: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+    maximum: Option<u64>,
+) -> io::Result<Vec<u8>> {
     #[cfg(unix)]
     {
         use rustix::fs::{Mode, OFlags, openat};
@@ -6491,12 +6526,7 @@ pub(crate) fn read_multipart_source_metadata(
         if !file.metadata()?.is_file() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata is not a regular file"));
         }
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, 16 * 1024 * 1024 + 1), &mut bytes)?;
-        if bytes.len() > 16 * 1024 * 1024 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata exceeds its size limit"));
-        }
-        Ok(bytes)
+        read_multipart_metadata_bytes(&mut file, maximum)
     }
     #[cfg(windows)]
     {
@@ -6527,16 +6557,11 @@ pub(crate) fn read_multipart_source_metadata(
         if windows_file_attribute_tag(&file)?.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata is not a regular file"));
         }
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::Read::take(file.as_file_mut(), 16 * 1024 * 1024 + 1), &mut bytes)?;
-        if bytes.len() > 16 * 1024 * 1024 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata exceeds its size limit"));
-        }
-        Ok(bytes)
+        read_multipart_metadata_bytes(file.as_file_mut(), maximum)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (path, base, publication_root);
+        let _ = (path, base, publication_root, maximum);
         Err(io::Error::new(io::ErrorKind::Unsupported, "multipart source preservation is unsupported"))
     }
 }

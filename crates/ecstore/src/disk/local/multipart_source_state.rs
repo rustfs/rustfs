@@ -973,6 +973,218 @@ struct NativeRetirementAnchor {
     source_validation_receipt_id: Uuid,
 }
 
+/// Runtime-only authority from a durable, exact owned Undo. Neither callers nor
+/// serialized DeleteOptions can create the missing-FI reclamation exception.
+pub(super) struct OwnedMultipartReclaim {
+    root: PathBuf,
+    base: PathBuf,
+    publication_root: os::PublicationRoot,
+    disk_id: Uuid,
+    physical_slot: usize,
+    disk_ids: Vec<Uuid>,
+    publication: PublicationIdentity,
+    source_original_sha256: [u8; 32],
+    source_validation_receipt_id: Uuid,
+}
+
+fn validate_retirement_anchor(
+    bytes: &[u8],
+    disk_id: Uuid,
+    physical_slot: usize,
+    publication: &PublicationIdentity,
+) -> Result<NativeRetirementAnchor> {
+    let anchor: NativeRetirementAnchor = decode(bytes)?;
+    if anchor.protocol_version != MULTIPART_SOURCE_PROTOCOL_VERSION
+        || anchor.disk_id != disk_id
+        || anchor.physical_slot != physical_slot
+        || anchor.publication != *publication
+        || anchor.source_validation_receipt_id.is_nil()
+    {
+        return Err(DiskError::ConditionalDeleteConflict);
+    }
+    Ok(anchor)
+}
+
+impl SourceStore {
+    pub async fn owned_undo_reclaim(&self, state: &SourceState) -> Result<Arc<OwnedMultipartReclaim>> {
+        let loaded = self.load().await?;
+        let current = loaded.state.as_ref().ok_or(DiskError::ConditionalDeleteConflict)?;
+        let publication = state.publication.as_ref().ok_or(DiskError::ConditionalDeleteConflict)?;
+        let claim = state.negative_claim.as_ref().ok_or(DiskError::ConditionalDeleteConflict)?;
+        let undo = state.undo.as_ref().ok_or(DiskError::ConditionalDeleteConflict)?;
+        if encode(current)? != encode(state)?
+            || state.phase != MultipartSourcePhase::Recovering
+            || !loaded.head_matches_state
+            || state.capability_sha256.is_some()
+            || !claim.owned_undo
+            || !undo.target_undone
+            || undo.from != claim.from
+            || undo.round != claim.round
+            || state.recovery.as_ref() != Some(&claim.round)
+            || state.generation != claim.round.generation
+            || state.lineage != claim.round.lineage
+            || publication.lineage != state.lineage
+            || publication.source_generation != claim.round.from_generation
+            || publication.attempt != claim.round.old_attempt
+            || claim.from.disk_id != self.disk_id
+            || claim.from.physical_slot != self.physical_slot
+            || claim.from.lineage != state.lineage
+            || claim.from.generation != publication.source_generation
+            || claim.from.publication.as_ref() != Some(publication)
+            || claim.from.head_sha256.is_some()
+            || claim.from.capability_sha256 != Some(undo.capability_sha256)
+            || !matches!(claim.from.phase, MultipartSourcePhase::Prepared | MultipartSourcePhase::ConsumedUnsealed)
+            || claim.from.revision.checked_add(2) != Some(state.revision)
+        {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
+        Ok(Arc::new(OwnedMultipartReclaim {
+            root: self.root.clone(),
+            base: self.base.clone(),
+            publication_root: self.publication_root.clone(),
+            disk_id: self.disk_id,
+            physical_slot: self.physical_slot,
+            disk_ids: self.disk_ids.clone(),
+            publication: publication.clone(),
+            source_original_sha256: state.original_sha256,
+            source_validation_receipt_id: state.backup_owner,
+        }))
+    }
+}
+
+impl LocalDisk {
+    pub(super) async fn reclaim_owned_multipart_attempt(&self, store: &SourceStore, state: &SourceState) -> Result<()> {
+        let proof = store.owned_undo_reclaim(state).await?;
+        let key = super::SnapshotLeaseKey {
+            volume: proof.publication.lineage.bucket.clone(),
+            path: format!("{}/{}", proof.publication.lineage.object, proof.publication.final_data_dir),
+        };
+        let Some(claim) = self.claim_snapshot_delete(key, super::SnapshotPendingDelete::OwnedMultipart(proof.clone())) else {
+            return Ok(());
+        };
+        self.reclaim_owned_multipart_data_dir(proof, store.owner.clone(), claim).await
+    }
+
+    pub(super) async fn reclaim_owned_multipart_data_dir(
+        &self,
+        proof: Arc<OwnedMultipartReclaim>,
+        owner: Option<Arc<dyn Send + Sync>>,
+        claim: super::SnapshotLeaseDeleteClaim,
+    ) -> Result<()> {
+        if self.root != proof.root || self.io_root() != proof.base || self.get_disk_id().await? != Some(proof.disk_id) {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
+        let format = self.format_info.read().await.data.clone();
+        let format = crate::disk::format::FormatV3::try_from(format.as_ref()).map_err(|_| DiskError::CorruptedBackend)?;
+        let (set, slot) = format.find_disk_index_by_disk_id(proof.disk_id)?;
+        if slot != proof.physical_slot || format.erasure.sets.get(set) != Some(&proof.disk_ids) {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
+        let volume = proof.publication.lineage.bucket.clone();
+        let object = proof.publication.lineage.object.clone();
+        let path = format!("{object}/{}", proof.publication.final_data_dir);
+        if claim.key.volume != volume || claim.key.path != path {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
+        // Snapshot admission precedes fresh metadata -> DD namespace ownership.
+        // The private proof retains the pinned root, never the old upload lock.
+        let metadata_owner = os::acquire_metadata_mutation_lease(&self.get_object_path(&volume, &object)?, owner).await;
+        if self.has_delete_transaction_evidence(&volume, &object).await? {
+            return Err(DiskError::DiskOngoingReq);
+        }
+        let object_path = self.io_get_object_path(&volume, &object)?;
+        let directory = object_path.join(proof.publication.final_data_dir.to_string());
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&directory, Some(metadata_owner)).await;
+        let sync = super::effective_durability(&volume).syncs_commit_metadata();
+        let result = os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
+            let result = (|| {
+                let base = &proof.base;
+                let root = &proof.publication_root;
+                let _parent = match os::pin_multipart_source_directory(&object_path, base, root) {
+                    Ok(parent) => parent,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+                match os::read_multipart_reclaim_target_metadata(&object_path.join(STORAGE_FORMAT_FILE), base, root) {
+                    Ok(bytes) => {
+                        let metadata = FileMeta::load(&bytes).map_err(IoError::other)?;
+                        if metadata
+                            .get_data_dirs()
+                            .map_err(IoError::other)?
+                            .into_iter()
+                            .flatten()
+                            .any(|referenced| referenced == proof.publication.final_data_dir)
+                        {
+                            return Err(DiskError::ConditionalDeleteConflict.into());
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                let parts = match super::orphan_data_dir_parts(&directory) {
+                    Ok(parts) => parts,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return if sync { os::fsync_dir_std(&object_path) } else { Ok(()) };
+                    }
+                    Err(error) => return Err(error),
+                };
+                let _directory = os::pin_multipart_source_directory(&directory, base, root)?;
+                if !parts.is_empty() {
+                    let anchor_path = directory.join(RETIREMENT_ANCHOR);
+                    let bytes = os::read_multipart_source_metadata(&anchor_path, base, root)?;
+                    let anchor = validate_retirement_anchor(&bytes, proof.disk_id, proof.physical_slot, &proof.publication)?;
+                    if anchor.source_original_sha256 != proof.source_original_sha256
+                        || anchor.source_validation_receipt_id != proof.source_validation_receipt_id
+                    {
+                        return Err(DiskError::ConditionalDeleteConflict.into());
+                    }
+                    // Keep the exact owner anchor through every payload unlink and
+                    // its barrier so a failed or cancelled reclaim remains retryable.
+                    for part in parts.into_iter().filter(|part| part != &anchor_path) {
+                        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                        os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &part);
+                        match std::fs::remove_file(part) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    if sync {
+                        os::fsync_dir_std(&directory)?;
+                    }
+                    #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                    os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &anchor_path);
+                    std::fs::remove_file(anchor_path)?;
+                    if sync {
+                        os::fsync_dir_std(&directory)?;
+                    }
+                }
+                // An anchor-less empty DD is only rmdir'ed. A new child makes
+                // this fail closed; no recursive removal can consume its bytes.
+                std::fs::remove_dir(&directory)?;
+                if sync {
+                    os::fsync_dir_std(&object_path)?;
+                }
+                Ok(())
+            })();
+            // The actual callback owns this registry claim even if its async
+            // waiter is cancelled while the physical unlink is still running.
+            claim.finish(result.is_ok());
+            result
+        })
+        .await
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidData {
+                DiskError::FileCorrupt
+            } else {
+                super::to_file_error(error).into()
+            }
+        });
+        self.io_backend.invalidate_cached_fds_under(&volume, &path);
+        result
+    }
+}
+
 impl SourceStore {
     /// Only native source validation may create provenance. Ordinary TMP/heal
     /// publication can retain a valid old local anchor, never issue/rebind one.
@@ -1044,15 +1256,7 @@ impl SourceStore {
             os::read_multipart_source_metadata(&anchor_path, &base, &root)
         })
         .await?;
-        let anchor: NativeRetirementAnchor = decode(&bytes)?;
-        if anchor.protocol_version != MULTIPART_SOURCE_PROTOCOL_VERSION
-            || anchor.disk_id != self.disk_id
-            || anchor.physical_slot != self.physical_slot
-            || anchor.publication != *publication
-            || anchor.source_validation_receipt_id.is_nil()
-        {
-            return Err(DiskError::ConditionalDeleteConflict);
-        }
+        validate_retirement_anchor(&bytes, self.disk_id, self.physical_slot, publication)?;
         self.sync_target(publication).await
     }
     /// No absent-source operation creates a head, record, capability or anchor.
@@ -1088,15 +1292,7 @@ impl SourceStore {
             os::read_multipart_source_metadata(&anchor_path, &base, &root)
         })
         .await?;
-        let anchor: NativeRetirementAnchor = decode(&bytes)?;
-        if anchor.protocol_version != MULTIPART_SOURCE_PROTOCOL_VERSION
-            || anchor.disk_id != self.disk_id
-            || anchor.physical_slot != self.physical_slot
-            || anchor.publication != *publication
-            || anchor.source_validation_receipt_id.is_nil()
-        {
-            return Err(DiskError::ConditionalDeleteConflict);
-        }
+        validate_retirement_anchor(&bytes, self.disk_id, self.physical_slot, publication)?;
         self.sync_target(publication).await?;
         self.sync_source_absence().await?;
         let anchor_sha = raw_sha(&bytes);

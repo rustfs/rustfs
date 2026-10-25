@@ -8,7 +8,6 @@ use super::{
     multipart_source_state::{LoadedSource, NativeNegativeClaim, NativeUndoIntent, SourceState, SourceStore},
 };
 use crate::disk::{
-    DeleteOptions,
     error::{DiskError, Result},
     multipart_source::{
         MultipartCertificate, MultipartProofKind, MultipartRecoveryRound, MultipartSourceInspection, MultipartSourceOperation,
@@ -291,9 +290,9 @@ impl LocalDisk {
                         }
                         store.restore_original(&mut state, true, None).await?;
                     }
-                    return Ok(MultipartSourceResponse::Claimed(
-                        present_proof(&store, MultipartProofKind::Claimed, &round).await?,
-                    ));
+                    let proof = present_proof(&store, MultipartProofKind::Claimed, &round).await?;
+                    self.reclaim_failed_multipart_attempt(&store, &state).await?;
+                    return Ok(MultipartSourceResponse::Claimed(proof));
                 }
                 let resuming = state.phase == MultipartSourcePhase::UndoIntent
                     && state.undo.as_ref().is_some_and(|undo| {
@@ -346,7 +345,7 @@ impl LocalDisk {
                 store.restore_original(&mut state, true, None).await?;
                 let proof = present_proof(&store, MultipartProofKind::Claimed, &round).await?;
                 drop(target_owner);
-                self.reclaim_failed_multipart_attempt(&store, &publication).await?;
+                self.reclaim_failed_multipart_attempt(&store, &state).await?;
                 Ok(MultipartSourceResponse::Claimed(proof))
             }
             MultipartSourceOperation::Restore { expected, certificate } => {
@@ -498,24 +497,9 @@ impl LocalDisk {
         }
     }
 
-    async fn reclaim_failed_multipart_attempt(&self, store: &SourceStore, publication: &PublicationIdentity) -> Result<()> {
-        let path = format!("{}/{}", publication.lineage.object, publication.final_data_dir);
-        // A deferred snapshot reclaim can run after a heal adopted this DD.
-        // The existing orphan path rechecks metadata and protected children
-        // under a fresh metadata lease; never queue bare recursive deletion.
-        match self
-            .delete_data_dir_with_namespace_owner(
-                &publication.lineage.bucket,
-                &path,
-                DeleteOptions {
-                    orphan_data_dir: true,
-                    ..Default::default()
-                },
-                store.owner.clone(),
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
+    async fn reclaim_failed_multipart_attempt(&self, store: &SourceStore, state: &SourceState) -> Result<()> {
+        match self.reclaim_owned_multipart_attempt(store, state).await {
+            Ok(()) => Ok(()),
             Err(DiskError::FileNotFound | DiskError::VolumeNotFound | DiskError::DiskOngoingReq | DiskError::FileCorrupt) => {
                 Ok(())
             }
@@ -615,7 +599,7 @@ mod tests {
     use super::*;
     use crate::{
         disk::{
-            DiskAPI, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
+            DeleteOptions, DiskAPI, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
             multipart_source::{MULTIPART_SOURCE_PROTOCOL_VERSION, ProofVerificationContext, SourceGeneration},
         },
         layout::{
@@ -630,6 +614,10 @@ mod tests {
 
     mod abort_tests {
         include!("multipart_source_abort_tests.rs");
+    }
+
+    mod owned_reclaim_tests {
+        include!("multipart_owned_reclaim_tests.rs");
     }
 
     #[cfg(unix)]
@@ -1501,111 +1489,142 @@ mod tests {
 
     #[tokio::test]
     async fn native_multipart_owned_undo_preserves_snapshot_then_reclaims_only_its_attempt() {
-        let fixture = Fixture::new().await;
-        for volume in ["bucket", RUSTFS_META_TMP_BUCKET] {
-            match fixture.disks[0].make_volume(volume).await {
-                Ok(()) | Err(DiskError::VolumeExists) => {}
-                Err(error) => panic!("prepare predecessor volume: {error}"),
+        for (with_predecessor, with_snapshot) in [(false, false), (false, true), (true, true)] {
+            let fixture = Fixture::new().await;
+            for volume in ["bucket", RUSTFS_META_TMP_BUCKET] {
+                match fixture.disks[0].make_volume(volume).await {
+                    Ok(()) | Err(DiskError::VolumeExists) => {}
+                    Err(error) => panic!("prepare predecessor volume: {error}"),
+                }
             }
-        }
-        let predecessor =
-            super::super::test::test_file_info("object", Uuid::nil(), None, Some(bytes::Bytes::from_static(b"predecessor")));
-        fixture.disks[0]
-            .rename_data(RUSTFS_META_TMP_BUCKET, "real-predecessor", predecessor, "bucket", "object")
-            .await
-            .expect("actual predecessor PUT before failed multipart publication");
-        let predecessor = std::fs::read(fixture.disks[0].root.join("bucket/object/xl.meta")).expect("native predecessor FI");
-        let result = fixture
-            .publish_zero_on(&[0])
-            .await
-            .pop()
-            .expect("one actual failed-operation publication")
-            .1;
-        let publication = result.publication.clone();
-        let round = Fixture::round_for(&publication);
-        let data_path = format!("object/{}", publication.final_data_dir);
-        let data = fixture.disks[0].root.join("bucket").join(&data_path);
-        let anchor = data.join(".mpu-source-retirement");
-        let anchor_bytes = std::fs::read(&anchor).expect("actual target anchor before Undo");
-        let token = fixture.disks[0]
-            .acquire_snapshot_lease("bucket", &data_path)
-            .await
-            .expect("actual snapshot protects failed attempt DD");
-        let capability_wire = rmp_serde::to_vec_named(&result.undo_capability).expect("same owner's opaque retry token");
-        let expected = result.proof.snapshot.clone();
-        let response = fixture.disks[0]
-            .recover_multipart_source_native(fixture.request(MultipartSourceOperation::UndoAndClaim {
-                expected: Box::new(expected.clone()),
-                publication: publication.clone(),
-                capability: result.undo_capability,
-                round: round.clone(),
-            }))
-            .await
-            .expect("owned conditional target Undo and new-generation source claim");
-        let MultipartSourceResponse::Claimed(owned_claim) = response else {
-            panic!("owned Undo returns durable negative proof");
-        };
-        assert_eq!(owned_claim.snapshot.generation, round.generation);
-        assert!(owned_claim.snapshot.head_sha256.is_some());
-        assert_eq!(
-            std::fs::read(fixture.disks[0].root.join("bucket/object/xl.meta")).expect("predecessor after exact target Undo"),
-            predecessor
-        );
-        assert_eq!(std::fs::read(&anchor).expect("snapshot retains attempt anchor"), anchor_bytes);
-        fixture.disks[0]
-            .release_snapshot_lease("bucket", &data_path, token)
-            .await
-            .expect("real snapshot release completes pending reclaim");
-        assert!(!data.exists(), "snapshot release must reclaim the exact failed DD and anchor");
-        let duplicate = rmp_serde::from_slice(&capability_wire).expect("same owned opaque request retry");
-        let response = fixture.disks[0]
-            .recover_multipart_source_native(fixture.request(MultipartSourceOperation::UndoAndClaim {
-                expected: Box::new(expected.clone()),
-                publication: publication.clone(),
-                capability: duplicate,
-                round: round.clone(),
-            }))
-            .await
-            .expect("unchanged owned claim result is idempotent");
-        let MultipartSourceResponse::Claimed(duplicate_claim) = response else {
-            panic!("idempotent owned claim proof");
-        };
-        assert_eq!(duplicate_claim.snapshot, owned_claim.snapshot);
-        let mut negative = fixture.negative_on(&round, &[1]).await;
-        negative.proofs.push(owned_claim);
-        let ready = fixture.restore_all(&negative).await;
-        for slot in 0..4 {
-            fixture.disks[slot]
-                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Activate {
-                    expected: fixture.snapshot(slot).await,
-                    certificate: ready.clone(),
-                }))
+            let predecessor = if with_predecessor {
+                let predecessor = super::super::test::test_file_info(
+                    "object",
+                    Uuid::nil(),
+                    None,
+                    Some(bytes::Bytes::from_static(b"predecessor")),
+                );
+                fixture.disks[0]
+                    .rename_data(RUSTFS_META_TMP_BUCKET, "real-predecessor", predecessor, "bucket", "object")
+                    .await
+                    .expect("actual predecessor PUT before failed multipart publication");
+                Some(std::fs::read(fixture.disks[0].root.join("bucket/object/xl.meta")).expect("native predecessor FI"))
+            } else {
+                None
+            };
+            let result = fixture
+                .publish_zero_on(&[0])
                 .await
-                .expect("activate from actual mixed owned/present H proof");
-        }
-        let successor = fixture.publish_zero_on(&[0]).await.pop().expect("later actual publication").1;
-        let current = fixture.snapshot(0).await;
-        let target = std::fs::read(fixture.disks[0].root.join("bucket/object/xl.meta")).expect("later target before stale Undo");
-        let duplicate = rmp_serde::from_slice(&capability_wire).expect("old opaque capability replay");
-        assert!(
-            fixture.disks[0]
+                .pop()
+                .expect("one actual failed-operation publication")
+                .1;
+            let publication = result.publication.clone();
+            let round = Fixture::round_for(&publication);
+            let data_path = format!("object/{}", publication.final_data_dir);
+            let data = fixture.disks[0].root.join("bucket").join(&data_path);
+            let anchor = data.join(".mpu-source-retirement");
+            let anchor_bytes = std::fs::read(&anchor).expect("actual target anchor before Undo");
+            let token = if with_snapshot {
+                Some(
+                    fixture.disks[0]
+                        .acquire_snapshot_lease("bucket", &data_path)
+                        .await
+                        .expect("actual snapshot protects failed attempt DD"),
+                )
+            } else {
+                None
+            };
+            let capability_wire = rmp_serde::to_vec_named(&result.undo_capability).expect("same owner's opaque retry token");
+            let expected = result.proof.snapshot.clone();
+            let response = fixture.disks[0]
                 .recover_multipart_source_native(fixture.request(MultipartSourceOperation::UndoAndClaim {
-                    expected: Box::new(expected),
-                    publication,
-                    capability: duplicate,
-                    round,
+                    expected: Box::new(expected.clone()),
+                    publication: publication.clone(),
+                    capability: result.undo_capability,
+                    round: round.clone(),
                 }))
                 .await
-                .is_err(),
-            "old capability cannot roll back a later attempt or recreate its consumed source"
-        );
-        assert_eq!(fixture.snapshot(0).await, current);
-        assert!(!fixture.head(0).exists());
-        assert_eq!(
-            std::fs::read(fixture.disks[0].root.join("bucket/object/xl.meta")).expect("successor after stale Undo"),
-            target
-        );
-        drop(successor);
+                .expect("owned conditional target Undo and new-generation source claim");
+            let MultipartSourceResponse::Claimed(owned_claim) = response else {
+                panic!("owned Undo returns durable negative proof");
+            };
+            assert_eq!(owned_claim.snapshot.generation, round.generation);
+            assert!(owned_claim.snapshot.head_sha256.is_some());
+            let restored = match std::fs::read(fixture.disks[0].root.join("bucket/object/xl.meta")) {
+                Ok(raw) => Some(raw),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("read actual predecessor after owned Undo: {error}"),
+            };
+            assert_eq!(restored, predecessor);
+            if let Some(token) = token {
+                assert_eq!(std::fs::read(&anchor).expect("snapshot retains attempt anchor"), anchor_bytes);
+                fixture.disks[0]
+                    .release_snapshot_lease("bucket", &data_path, token)
+                    .await
+                    .expect("real snapshot release completes pending reclaim");
+            }
+            assert!(!data.exists(), "snapshot release must reclaim the exact failed DD and anchor");
+            if !with_predecessor {
+                fixture.disks[0]
+                    .delete_volume("bucket", false)
+                    .await
+                    .expect("the absent target's reclaimed DD cannot keep an empty bucket nonempty");
+                fixture.disks[0]
+                    .make_volume("bucket")
+                    .await
+                    .expect("recreate the empty bucket for the next publication");
+            }
+            let duplicate = rmp_serde::from_slice(&capability_wire).expect("same owned opaque request retry");
+            let response = fixture.disks[0]
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::UndoAndClaim {
+                    expected: Box::new(expected.clone()),
+                    publication: publication.clone(),
+                    capability: duplicate,
+                    round: round.clone(),
+                }))
+                .await
+                .expect("unchanged owned claim result is idempotent");
+            let MultipartSourceResponse::Claimed(duplicate_claim) = response else {
+                panic!("idempotent owned claim proof");
+            };
+            assert_eq!(duplicate_claim.snapshot, owned_claim.snapshot);
+            let mut negative = fixture.negative_on(&round, &[1]).await;
+            negative.proofs.push(owned_claim);
+            let ready = fixture.restore_all(&negative).await;
+            for slot in 0..4 {
+                fixture.disks[slot]
+                    .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Activate {
+                        expected: fixture.snapshot(slot).await,
+                        certificate: ready.clone(),
+                    }))
+                    .await
+                    .expect("activate from actual mixed owned/present H proof");
+            }
+            let successor = fixture.publish_zero_on(&[0]).await.pop().expect("later actual publication").1;
+            let current = fixture.snapshot(0).await;
+            let target =
+                std::fs::read(fixture.disks[0].root.join("bucket/object/xl.meta")).expect("later target before stale Undo");
+            let duplicate = rmp_serde::from_slice(&capability_wire).expect("old opaque capability replay");
+            assert!(
+                fixture.disks[0]
+                    .recover_multipart_source_native(fixture.request(MultipartSourceOperation::UndoAndClaim {
+                        expected: Box::new(expected),
+                        publication,
+                        capability: duplicate,
+                        round,
+                    }))
+                    .await
+                    .is_err(),
+                "old capability cannot roll back a later attempt or recreate its consumed source"
+            );
+            assert_eq!(fixture.snapshot(0).await, current);
+            assert!(!fixture.head(0).exists());
+            assert_eq!(
+                std::fs::read(fixture.disks[0].root.join("bucket/object/xl.meta")).expect("successor after stale Undo"),
+                target
+            );
+            drop(successor);
+        }
     }
 
     #[tokio::test]
