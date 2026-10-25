@@ -549,7 +549,8 @@ pub(crate) mod ecstore_notification {
     pub(crate) use rustfs_ecstore::api::notification::{
         ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
         configured_fleet_topology_fingerprint, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
-        ilm_recovery_export_local_process_epoch, new_global_notification_sys, start_remote_version_state_fleet_probe,
+        ilm_recovery_export_local_process_epoch, mrf_lifecycle_reader_local_process_epoch, new_global_notification_sys,
+        start_remote_version_state_fleet_probe,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::notification::{
@@ -1332,6 +1333,10 @@ pub(crate) fn start_remote_version_state_fleet_probe(topology_fingerprint: Strin
 
 pub(crate) fn ilm_recovery_export_local_process_epoch() -> uuid::Uuid {
     ecstore_notification::ilm_recovery_export_local_process_epoch()
+}
+
+pub(crate) fn mrf_lifecycle_reader_local_process_epoch() -> uuid::Uuid {
+    ecstore_notification::mrf_lifecycle_reader_local_process_epoch()
 }
 
 pub(crate) async fn read_config(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>> {

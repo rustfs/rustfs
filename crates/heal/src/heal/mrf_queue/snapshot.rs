@@ -61,6 +61,8 @@ pub enum SnapshotError {
     Conflict,
     #[error("MRF checkpoint has no writable replica")]
     NoWritableReplica,
+    #[error("MRF lifecycle writer capability is unavailable")]
+    WriterCapabilityUnavailable,
     #[error("MRF checkpoint storage is unavailable")]
     Disk(#[source] EcstoreDiskError),
     #[error("MRF checkpoint body could not be read")]
@@ -373,6 +375,37 @@ pub async fn publish_committed_snapshot_with_companion(
     limit: usize,
     companion: Option<(&[&str; 2], &[u8], usize)>,
 ) -> Result<SnapshotPublication, SnapshotError> {
+    publish_committed_snapshot_with_companion_guarded(disks, owner, sequence, payload, limit, companion, |_| {
+        std::future::ready(true)
+    })
+    .await
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum SnapshotPublicationStage {
+    Staging,
+    Manifest,
+}
+
+/// Revalidate format authority before staging and before each manifest CAS.
+/// The caller must retain that authority until all admitted disk I/O finishes,
+/// including when its own waiter is cancelled.
+pub(super) async fn publish_committed_snapshot_with_companion_guarded<G, F>(
+    disks: &[EcstoreDiskStore],
+    owner: Uuid,
+    sequence: u64,
+    payload: &[u8],
+    limit: usize,
+    companion: Option<(&[&str; 2], &[u8], usize)>,
+    commit_allowed: G,
+) -> Result<SnapshotPublication, SnapshotError>
+where
+    G: Fn(SnapshotPublicationStage) -> F + Sync,
+    F: std::future::Future<Output = bool>,
+{
+    if !commit_allowed(SnapshotPublicationStage::Staging).await {
+        return Err(SnapshotError::WriterCapabilityUnavailable);
+    }
     if disks.is_empty() {
         return Err(SnapshotError::NoWritableReplica);
     }
@@ -400,6 +433,7 @@ pub async fn publish_committed_snapshot_with_companion(
     let manifest = &manifest;
     let payload = &payload;
     let companion = &companion;
+    let commit_allowed = &commit_allowed;
     let results = journal_disk_io(disks.into_iter().map(|disk| async move {
         let mut payload_written = false;
         let manifest_written: Result<bool, SnapshotError> = async {
@@ -414,6 +448,9 @@ pub async fn publish_committed_snapshot_with_companion(
                     EcstoreConditionalFileUpdate::Updated => {}
                     EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch => return Ok(false),
                 }
+            }
+            if !commit_allowed(SnapshotPublicationStage::Manifest).await {
+                return Err(SnapshotError::WriterCapabilityUnavailable);
             }
             Ok(matches!(
                 cas_replace_expected(
@@ -1557,6 +1594,122 @@ mod tests {
             .expect("read old anchor")
             .expect("snapshot");
         assert_eq!(recovered.manifest.sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_writer_revocation_before_staging_or_manifest_retains_the_old_commit() {
+        const COMPANIONS: [&str; 2] = ["writer-lifecycle.0", "writer-lifecycle.1"];
+        for allowed_checks in [0, 1] {
+            let root = TempDir::new().expect("test directory");
+            let store = disk(&root, "disk").await;
+            let owner = Uuid::new_v4();
+            let old = payload("old");
+            let next = payload("next");
+            publish_committed_snapshot_with_companion(
+                std::slice::from_ref(&store),
+                owner,
+                1,
+                &old,
+                4096,
+                Some((&COMPANIONS, b"old-state", 4096)),
+            )
+            .await
+            .expect("old complete checkpoint");
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let result = publish_committed_snapshot_with_companion_guarded(
+                std::slice::from_ref(&store),
+                owner,
+                2,
+                &next,
+                4096,
+                Some((&COMPANIONS, b"new-state", 4096)),
+                |_| std::future::ready(calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < allowed_checks),
+            )
+            .await;
+            assert!(matches!(result, Err(SnapshotError::WriterCapabilityUnavailable)));
+            let reopened = disk(&root, "disk").await;
+            let recovered = read_committed(std::slice::from_ref(&reopened), 4096)
+                .await
+                .expect("read after interruption")
+                .expect("old commit survives");
+            assert_eq!(recovered.sequence(), 1);
+            assert_eq!(recovered.payload(), old.as_slice());
+            assert_eq!(
+                read_committed_companion(std::slice::from_ref(&reopened), owner, 1, &COMPANIONS, 4096, 4096,)
+                    .await
+                    .expect("old matching companion"),
+                Some(b"old-state".to_vec())
+            );
+            assert!(
+                EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[1])
+                    .await
+                    .is_err()
+            );
+            if allowed_checks == 1 {
+                assert_eq!(
+                    EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, COMPANIONS[1])
+                        .await
+                        .expect("staged companion remains evidence")
+                        .as_ref(),
+                    b"new-state"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_writer_partial_manifest_success_reports_only_committed_replicas() {
+        const COMPANIONS: [&str; 2] = ["writer-lifecycle.0", "writer-lifecycle.1"];
+        let root = TempDir::new().expect("test directory");
+        let disks = [disk(&root, "first").await, disk(&root, "second").await];
+        let owner = Uuid::new_v4();
+        let old = payload("old");
+        let next = payload("next");
+        publish_committed_snapshot_with_companion(&disks, owner, 1, &old, 4096, Some((&COMPANIONS, b"old-state", 4096)))
+            .await
+            .expect("old replicated checkpoint");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let published = publish_committed_snapshot_with_companion_guarded(
+            &disks,
+            owner,
+            2,
+            &next,
+            4096,
+            Some((&COMPANIONS, b"new-state", 4096)),
+            |_| std::future::ready(calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2),
+        )
+        .await
+        .expect("one complete replica preserves the owner's established contract");
+        assert_eq!(published.payload_replicas, 2);
+        assert_eq!(published.manifest_replicas, 1);
+        let mut actual_manifests = 0;
+        for store in &disks {
+            actual_manifests += usize::from(
+                EcstoreDiskAPI::read_all(store.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[1])
+                    .await
+                    .is_ok(),
+            );
+            assert_eq!(
+                EcstoreDiskAPI::read_all(store.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[0])
+                    .await
+                    .expect("predecessor retained")
+                    .as_ref(),
+                manifest(owner, 1, &old)
+            );
+        }
+        assert_eq!(actual_manifests, 1);
+        let recovered = read_committed(&disks, 4096)
+            .await
+            .expect("recover partial publication")
+            .expect("complete successor");
+        assert_eq!(recovered.sequence(), 2);
+        assert_eq!(recovered.payload(), next.as_slice());
+        assert_eq!(
+            read_committed_companion(&disks, owner, 2, &COMPANIONS, 4096, 4096)
+                .await
+                .expect("companion from the committed replica"),
+            Some(b"new-state".to_vec())
+        );
     }
 
     #[tokio::test]
