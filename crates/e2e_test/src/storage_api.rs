@@ -66,6 +66,11 @@ pub(crate) mod multipart_rpc_delay {
 }
 
 #[cfg(test)]
+pub(crate) mod multipart_fence_acceptance {
+    pub(crate) use super::RUSTFS_META_MULTIPART_BUCKET;
+}
+
+#[cfg(test)]
 pub(crate) mod multipart_source_rpc {
     pub(crate) use rustfs_ecstore::api::disk::{
         MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartAbortCertificate, MultipartAbortProof, MultipartAbortProofKind,

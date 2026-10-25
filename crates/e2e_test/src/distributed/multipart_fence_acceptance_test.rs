@@ -18,6 +18,7 @@ use super::harness::{
 };
 use crate::common::{ClusterTopology, RustFSTestClusterEnvironment};
 use crate::rpc_fault_proxy::{RpcFaultProxy, RpcPause};
+use crate::storage_api::multipart_fence_acceptance::RUSTFS_META_MULTIPART_BUCKET;
 use aws_sdk_s3::{
     Client,
     config::retry::RetryConfig,
@@ -27,6 +28,8 @@ use aws_sdk_s3::{
     types::{CompletedMultipartUpload, CompletedPart},
 };
 use futures::{StreamExt as _, TryStreamExt as _, stream};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
@@ -418,13 +421,433 @@ async fn wait_for_storage_peer_recovery(
     .map_err(|_| "storage route recovery deadline exceeded".to_string())?
 }
 
+#[derive(Eq, PartialEq)]
+struct CreateSource {
+    participant: (usize, usize),
+    directories: BTreeSet<PathBuf>,
+    files: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+type CreateSources = BTreeMap<PathBuf, CreateSource>;
+type ListedUploads = BTreeSet<(String, String)>;
+
+struct RetainedCreate {
+    key: String,
+    sources: CreateSources,
+    listing: Option<ListedUploads>,
+}
+
+fn multipart_sources(cluster: &RustFSTestClusterEnvironment, only_hash: Option<&str>) -> TestResult<CreateSources> {
+    let mut sources = CreateSources::new();
+    let mut volumes = BTreeSet::new();
+    for (node, participant) in cluster.nodes.iter().enumerate() {
+        for (drive, volume) in participant.data_dirs.iter().enumerate() {
+            let volume = std::fs::canonicalize(volume)?;
+            assert!(volumes.insert(volume.clone()), "a configured volume alias cannot be another participant");
+            let multipart_root = volume.join(RUSTFS_META_MULTIPART_BUCKET);
+            let hash_roots = if let Some(hash) = only_hash {
+                vec![multipart_root.join(hash)]
+            } else {
+                match std::fs::read_dir(&multipart_root) {
+                    Ok(entries) => entries
+                        .map(|entry| {
+                            let entry = entry?;
+                            assert!(entry.file_type()?.is_dir(), "fixture MPI contains an unexpected non-SHA artifact");
+                            let name = entry.file_name();
+                            let name = name.to_str().ok_or("fixture SHA directory is not UTF-8")?;
+                            assert!(name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                            Ok(entry.path())
+                        })
+                        .collect::<TestResult<Vec<_>>>()?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            for hash_root in hash_roots {
+                let entries = match std::fs::read_dir(hash_root) {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                for entry in entries {
+                    let entry = entry?;
+                    assert!(entry.file_type()?.is_dir(), "fixture SHA contains an unexpected non-upload artifact");
+                    let root = entry.path();
+                    let mut source = CreateSource {
+                        participant: (node, drive),
+                        directories: BTreeSet::new(),
+                        files: BTreeMap::new(),
+                    };
+                    for child in walkdir::WalkDir::new(&root).sort_by_file_name() {
+                        let child = child?;
+                        let relative = child.path().strip_prefix(&root)?.to_owned();
+                        if child.file_type().is_dir() {
+                            source.directories.insert(relative);
+                        } else {
+                            assert!(child.file_type().is_file(), "fixture source contains a non-regular artifact");
+                            source.files.insert(relative, std::fs::read(child.path())?);
+                        }
+                    }
+                    assert!(sources.insert(root, source).is_none());
+                }
+            }
+        }
+    }
+    Ok(sources)
+}
+
+fn create_sources(cluster: &RustFSTestClusterEnvironment, bucket: &str, key: &str) -> TestResult<CreateSources> {
+    multipart_sources(cluster, Some(&sha256_hex(format!("{bucket}/{key}").as_bytes())))
+}
+
+fn source_heads(sources: &CreateSources, raw_upload: Option<&str>) -> BTreeSet<(usize, usize)> {
+    let mut heads = BTreeSet::new();
+    for (root, source) in sources {
+        if raw_upload.is_none_or(|raw| root.file_name().and_then(|name| name.to_str()) == Some(raw))
+            && source.files.contains_key(Path::new("xl.meta"))
+        {
+            assert!(
+                heads.insert(source.participant),
+                "one physical drive cannot provide duplicate source heads"
+            );
+        }
+    }
+    heads
+}
+
+fn unchanged_create_sources(
+    cluster: &RustFSTestClusterEnvironment,
+    bucket: &str,
+    key: &str,
+    expected: &CreateSources,
+) -> TestResult {
+    assert!(
+        create_sources(cluster, bucket, key)? == *expected,
+        "native Abort changed original bytes, directories or a missing physical participant"
+    );
+    Ok(())
+}
+
+async fn no_created_target(clients: &[Client], bucket: &str, key: &str) -> TestResult {
+    for client in clients {
+        let error = recover_after_fault(&format!("GetObject absent Create target {key}"), || {
+            client.get_object().bucket(bucket).key(key).send()
+        })
+        .await?
+        .expect_err("Create or a rejected Abort cannot publish a target");
+        assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(404));
+        assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
+    }
+    Ok(())
+}
+
+async fn create_listing(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+    evidenced_sub_read_quorum: bool,
+) -> TestResult<Option<ListedUploads>> {
+    let output = recover_after_fault("ListMultipartUploads with actual source evidence", || async {
+        match client.list_multipart_uploads().bucket(bucket).prefix(prefix).send().await {
+            Err(error)
+                if evidenced_sub_read_quorum
+                    && error.raw_response().is_some_and(|response| {
+                        response.status().as_u16() == 503
+                            && response.headers().get("x-rustfs-error-cause") == Some("storage_read_quorum")
+                    }) =>
+            {
+                assert_unavailable(&error, "storage_read_quorum", None);
+                // This is an explicit unavailable observation, never an empty
+                // successful listing. Other classified faults keep the old budget.
+                Ok(None)
+            }
+            result => result.map(|output| Some(Box::new(output))),
+        }
+    })
+    .await??;
+    let Some(output) = output else { return Ok(None) };
+    assert_ne!(output.is_truncated(), Some(true));
+    let mut uploads = ListedUploads::new();
+    for upload in output.uploads() {
+        let key = upload.key().ok_or("actual listed upload omitted key")?;
+        let id = upload.upload_id().ok_or("actual listed upload omitted ID")?;
+        assert!(uploads.insert((key.to_owned(), id.to_owned())), "listing duplicated an upload");
+    }
+    Ok(Some(uploads))
+}
+
+async fn verify_create_after_fault(
+    cluster: &RustFSTestClusterEnvironment,
+    clients: &[Client],
+    bucket: &str,
+    key: &str,
+    acknowledged: Option<&CreateMultipartUploadOutput>,
+    write_quorum: usize,
+) -> TestResult<Option<RetainedCreate>> {
+    let participants: usize = cluster.nodes.iter().map(|node| node.data_dirs.len()).sum();
+    let sources = create_sources(cluster, bucket, key)?;
+    let heads = source_heads(&sources, None);
+    no_created_target(clients, bucket, key).await?;
+    if let Some(created) = acknowledged {
+        let upload = created.upload_id().ok_or("acknowledged Create omitted upload ID")?;
+        let raw = upload_scope(upload)?;
+        assert!(
+            sources
+                .keys()
+                .all(|root| root.file_name().and_then(|name| name.to_str()) == Some(raw.as_str())),
+            "isolated acknowledged Create must bind its one actual upload"
+        );
+        assert!(
+            heads.len() >= write_quorum && heads.len() <= participants,
+            "acknowledged Create must have real source write quorum, independent of proxy vote counters"
+        );
+        if heads.len() == participants {
+            abort_after_fault(&clients[0], bucket, key, upload, false).await?;
+            no_created_target(clients, bucket, key).await?;
+            return Ok(None);
+        }
+        let error = clients[0]
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload)
+            .send()
+            .await
+            .expect_err("transport recovery cannot create missing all-N Abort witnesses");
+        assert_unavailable(&error, "storage_write_quorum", None);
+        unchanged_create_sources(cluster, bucket, key, &sources)?;
+        no_created_target(clients, bucket, key).await?;
+        let body = payload_for(key, if participants == 16 { 9 * 1024 * 1024 } else { 1024 * 1024 });
+        let part = recover_after_fault(&format!("UploadPart same admitted Create {key}"), || {
+            clients[0]
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload)
+                .part_number(1)
+                .body(ByteStream::from(body.clone()))
+                .send()
+        })
+        .await??;
+        assert_eq!(
+            source_heads(&create_sources(cluster, bucket, key)?, Some(&raw)),
+            heads,
+            "Part must not initialize a missing original participant"
+        );
+        let complete = clients[0]
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .part_number(1)
+                            .e_tag(part.e_tag().ok_or("same-upload part omitted ETag")?)
+                            .build(),
+                    )
+                    .build(),
+            );
+        let completed =
+            recover_after_fault(&format!("Complete same admitted Create {key}"), || complete.clone().send()).await??;
+        let etag = completed
+            .e_tag()
+            .filter(|etag| !etag.is_empty())
+            .ok_or("same-upload completion omitted a nonempty ETag")?;
+        for client in clients {
+            let output = recover_after_fault(&format!("GetObject settled Create {key}"), || {
+                client
+                    .get_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .set_version_id(completed.version_id().map(str::to_owned))
+                    .send()
+            })
+            .await??;
+            assert_eq!(output.e_tag(), Some(etag));
+            if let Some(version) = completed.version_id() {
+                assert_eq!(output.version_id(), Some(version));
+            }
+            assert_eq!(
+                output.body.collect().await?.into_bytes().as_ref(),
+                body.as_slice(),
+                "same admitted upload must retain all acknowledged bytes"
+            );
+        }
+        let missing = clients[0]
+            .list_parts()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload)
+            .send()
+            .await
+            .expect_err("successful same-upload completion must retire its upload");
+        assert_eq!(missing.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchUpload"));
+        recover_after_fault(&format!("DeleteObject settled Create {key}"), || {
+            clients[0].delete_object().bucket(bucket).key(key).send()
+        })
+        .await??;
+        no_created_target(clients, bucket, key).await?;
+        return Ok(None);
+    }
+    assert!(
+        heads.len() < write_quorum,
+        "unacknowledged Create cannot be treated as source write quorum"
+    );
+    let read_quorum = if participants == 16 { 12 } else { 2 };
+    let sub_read_quorum = heads.len() >= participants / 2 && heads.len() < read_quorum;
+    let listing = create_listing(&clients[0], bucket, key, sub_read_quorum).await?;
+    assert!(
+        !sub_read_quorum || listing.is_none(),
+        "physically qualified sub-read-quorum originals must return typed 503, never a swallowed 200 listing"
+    );
+    if let Some(uploads) = &listing {
+        for (listed_key, upload) in uploads {
+            assert_eq!(listed_key, key);
+            let raw = upload_scope(upload)?;
+            assert!(
+                sources
+                    .keys()
+                    .any(|root| root.file_name().and_then(|name| name.to_str()) == Some(raw.as_str())),
+                "only an ID actually listed for real source bytes can be probed"
+            );
+            let error = clients[0]
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload)
+                .send()
+                .await
+                .expect_err("sub-Q originals cannot authorize native Abort");
+            assert_unavailable(&error, "storage_write_quorum", None);
+        }
+    }
+    unchanged_create_sources(cluster, bucket, key, &sources)?;
+    // A fresh admission owns a distinct original; it is never a replacement
+    // witness or a fabricated ID for the failed producer.
+    let fresh = recover_after_fault(&format!("fresh Create beside retained orphan {key}"), || {
+        clients[0].create_multipart_upload().bucket(bucket).key(key).send()
+    })
+    .await??;
+    let fresh_id = fresh.upload_id().ok_or("fresh admission omitted upload ID")?;
+    let fresh_raw = upload_scope(fresh_id)?;
+    assert!(
+        !sources
+            .keys()
+            .any(|root| root.file_name().and_then(|name| name.to_str()) == Some(fresh_raw.as_str()))
+    );
+    assert_eq!(
+        source_heads(&create_sources(cluster, bucket, key)?, Some(&fresh_raw)).len(),
+        participants,
+        "fresh native Abort must use all actual configured disks, not one vote per node"
+    );
+    abort_after_fault(&clients[0], bucket, key, fresh_id, false).await?;
+    unchanged_create_sources(cluster, bucket, key, &sources)?;
+    assert_eq!(
+        create_listing(&clients[0], bucket, key, sub_read_quorum).await?,
+        listing,
+        "fresh cleanup must preserve the exact retained visibility or explicit read-quorum unavailability"
+    );
+    no_created_target(clients, bucket, key).await?;
+    eprintln!(
+        "MPU retained failed Create: key={key}, actual_heads={}, configured_disks={participants}, write_quorum={write_quorum}, listing={}",
+        heads.len(),
+        if listing.is_none() {
+            "storage_read_quorum_503"
+        } else {
+            "exact_actual_ids"
+        }
+    );
+    Ok(Some(RetainedCreate {
+        key: key.to_owned(),
+        sources,
+        listing,
+    }))
+}
+
+async fn verify_retained_creates(
+    cluster: &RustFSTestClusterEnvironment,
+    clients: &[Client],
+    bucket: &str,
+    retained: &[RetainedCreate],
+) -> TestResult {
+    let mut expected = ListedUploads::new();
+    let mut unavailable = false;
+    for upload in retained {
+        unchanged_create_sources(cluster, bucket, &upload.key, &upload.sources)?;
+        match &upload.listing {
+            Some(listed) => expected.extend(listed.iter().cloned()),
+            None => unavailable = true,
+        }
+    }
+    // A set-wide listing 503 could hide unrelated leaks. Compare the complete
+    // fixture MPI (every disk/hash/upload), including headless control roots.
+    // No completed/control-root exception is accepted; empty SHA parents alone
+    // are harmless. This physical gate is independent of S3 listing success.
+    let expected_roots: BTreeSet<_> = retained.iter().flat_map(|upload| upload.sources.keys().cloned()).collect();
+    wait_until(
+        DEADLINE,
+        || async {
+            let actual = match multipart_sources(cluster, None) {
+                Ok(actual) => actual,
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                        || error
+                            .downcast_ref::<walkdir::Error>()
+                            .and_then(walkdir::Error::io_error)
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
+            let roots: BTreeSet<_> = actual.keys().cloned().collect();
+            Ok(roots == expected_roots
+                && retained.iter().all(|upload| {
+                    upload
+                        .sources
+                        .iter()
+                        .all(|(root, expected)| actual.get(root) == Some(expected))
+                }))
+        },
+        "all configured MPI hashes and roots contain only exact retained failed-Create bytes",
+    )
+    .await?;
+    if retained.is_empty() {
+        return assert_no_uploads_after_fault(clients, bucket).await;
+    }
+    for client in clients {
+        let listed = create_listing(client, bucket, "", unavailable).await?;
+        if unavailable {
+            assert!(
+                listed.is_none(),
+                "the evidenced sub-read-Q orphan must remain explicitly indeterminate, not empty/successful"
+            );
+        } else {
+            assert_eq!(
+                listed,
+                Some(expected.clone()),
+                "only byte-verified failed-Create uploads may remain listed"
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn phase_quorum_matrix(
+    cluster: &RustFSTestClusterEnvironment,
     proxies: &[RpcFaultProxy],
     clients: &[Client],
     bucket: &str,
     locks: bool,
     drives_per_node: usize,
+    write_quorum: usize,
 ) -> TestResult {
+    let mut retained_creates = Vec::new();
+    let mut route_probe_upload = None;
     for phase in ["create", "part", "complete", "abort"] {
         // Ordinary Create holds only the shared bucket lifecycle fence.
         // Four-node read quorum is two; commit/write quorum is three.
@@ -454,6 +877,9 @@ async fn phase_quorum_matrix(
                         "RenameDataAtIncarnation",
                         "RenameDataWithQuotaFence",
                     ],
+                    // The proxy strictly decodes RecoverMultipartSource and
+                    // matches only DeleteAborted at the exact root below.
+                    // Inspect/Prepare/Commit pass before this all-N-closed cut.
                     "abort" => &["Delete", "RecoverMultipartSource"],
                     _ => unreachable!(),
                 }
@@ -462,10 +888,34 @@ async fn phase_quorum_matrix(
             if phase == "create" {
                 let request = clients[0].create_multipart_upload().bucket(bucket).key(&key);
                 let result = with_paused_peers(proxies, methods, &limits, bucket, async move { request.send().await }).await?;
-                if let Some(upload) = quorum_outcome(result, unavailable == unavailable_at_quorum, locks)? {
-                    let upload_id = upload.upload_id().ok_or("missing upload ID")?;
-                    wait_for_storage_peer_recovery(proxies, &clients[0], bucket, upload_id, drives_per_node).await?;
-                    abort_after_fault(&clients[0], bucket, &key, upload_id, false).await?;
+                let acknowledged = quorum_outcome(result, unavailable == unavailable_at_quorum, locks)?;
+                if let Some(upload) = &acknowledged {
+                    route_probe_upload = Some(upload.upload_id().ok_or("missing upload ID")?.to_owned());
+                }
+                // The positive row always precedes its failed row. Reuse its
+                // genuine ID only for the existing read-only absent-key probe,
+                // never to authorize an unknown orphan or supply a witness.
+                wait_for_storage_peer_recovery(
+                    proxies,
+                    &clients[0],
+                    bucket,
+                    route_probe_upload
+                        .as_deref()
+                        .ok_or("matrix lacks its genuine route-probe upload ID")?,
+                    drives_per_node,
+                )
+                .await?;
+                if let Some(retained) = Box::pin(verify_create_after_fault(
+                    cluster,
+                    clients,
+                    bucket,
+                    &key,
+                    acknowledged.as_ref(),
+                    write_quorum,
+                ))
+                .await?
+                {
+                    retained_creates.push(retained);
                 }
             } else {
                 let upload = clients[0]
@@ -580,7 +1030,7 @@ async fn phase_quorum_matrix(
             }
             wait_for_lock_peer_recovery(proxies, &clients[0], bucket).await?;
             round_trip(clients, bucket, "recovered", 9 * 1024 * 1024).await?;
-            assert_no_uploads_after_fault(clients, bucket).await?;
+            verify_retained_creates(cluster, clients, bucket, &retained_creates).await?;
         }
     }
     Ok(())
@@ -588,14 +1038,14 @@ async fn phase_quorum_matrix(
 
 #[tokio::test]
 async fn metadata_delay_preserves_write_quorum_and_rejects_quorum_minus_one() -> TestResult {
-    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
-    phase_quorum_matrix(&proxies, &clients, &bucket, false, 1).await
+    let (cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+    phase_quorum_matrix(&cluster, &proxies, &clients, &bucket, false, 1, 3).await
 }
 
 #[tokio::test]
 async fn lock_delay_preserves_admission_quorum_and_reports_timeout() -> TestResult {
-    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
-    phase_quorum_matrix(&proxies, &clients, &bucket, true, 1).await
+    let (cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+    phase_quorum_matrix(&cluster, &proxies, &clients, &bucket, true, 1, 3).await
 }
 
 #[tokio::test]
@@ -608,7 +1058,7 @@ async fn sixteen_shard_multipart_metadata_requires_twelve_votes() -> TestResult 
     assert_eq!(storage.backend.total_sets, vec![1]);
     assert_eq!(storage.backend.drives_per_set, vec![16]);
     assert_eq!(storage.backend.standard_sc_parity, Some(4));
-    phase_quorum_matrix(&proxies, &clients, &bucket, false, 4).await
+    phase_quorum_matrix(&cluster, &proxies, &clients, &bucket, false, 4, 12).await
 }
 
 #[tokio::test]
