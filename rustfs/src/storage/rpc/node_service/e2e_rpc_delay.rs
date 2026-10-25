@@ -48,6 +48,7 @@ pub(super) enum Method {
 #[serde(tag = "class", rename_all = "snake_case", deny_unknown_fields)]
 enum Scope {
     Multipart { sha256: String },
+    MultipartUpload { path: String },
     Object { bucket: String, key: String },
     Incarnation { bucket: String },
     Lifecycle { bucket: String },
@@ -73,6 +74,20 @@ fn user_bucket(bucket: &str) -> bool {
     !bucket.is_empty() && bucket.len() <= 63 && !bucket.starts_with('.') && !bucket.contains('/')
 }
 
+fn multipart_upload_root(path: &str) -> bool {
+    let Some((hash, upload)) = path.split_once('/') else { return false };
+    let Some((id, timestamp)) = upload.split_once('x') else { return false };
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && upload.len() <= 128
+        && Uuid::parse_str(id).is_ok_and(|parsed| !parsed.is_nil() && parsed.to_string() == id)
+        && timestamp
+            .parse::<i128>()
+            .is_ok_and(|parsed| parsed > 0 && parsed.to_string() == timestamp)
+}
+
 impl Arm {
     fn validate(&self) -> bool {
         !self.nonce.is_nil()
@@ -95,6 +110,13 @@ impl Arm {
                                     | Method::DeleteAbortedMultipartSource
                             )
                         })
+                }
+                Scope::MultipartUpload { path } => {
+                    multipart_upload_root(path)
+                        && self
+                            .methods
+                            .iter()
+                            .all(|method| *method == Method::DeleteAbortedMultipartSource)
                 }
                 Scope::Object { bucket, key } => {
                     user_bucket(bucket)
@@ -124,6 +146,7 @@ impl Arm {
                 Scope::Multipart { sha256 } => {
                     volume == ".rustfs.sys/multipart" && path.strip_prefix(sha256).is_some_and(|tail| tail.starts_with('/'))
                 }
+                Scope::MultipartUpload { path: expected } => volume == ".rustfs.sys/multipart" && path == expected,
                 Scope::Object { bucket, key } => volume == bucket && path == key,
                 Scope::Incarnation { bucket } => {
                     volume == ".rustfs.sys" && path == format!("buckets/{bucket}/.bucket-incarnation")
@@ -439,6 +462,38 @@ mod tests {
         assert!(cleanup.matches(Method::DeleteAbortedMultipartSource, ".rustfs.sys/multipart", &format!("{hash}/upload")));
         assert!(!cleanup.matches(Method::RecoverMultipartSource, ".rustfs.sys/multipart", &format!("{hash}/upload")));
         assert!(!cleanup.matches(Method::DeleteAbortedMultipartSource, ".rustfs.sys/multipart", "other/upload"));
+    }
+
+    #[test]
+    fn rpc_delay_native_abort_matches_only_its_exact_upload_root() {
+        let hash = "a".repeat(64);
+        let path = format!("{hash}/{}x123", Uuid::new_v4());
+        let valid = serde_json::json!({ "nonce": Uuid::new_v4(), "methods": ["delete_aborted_multipart_source"],
+            "scope": { "class": "multipart_upload", "path": path }, "delay": { "kind": "hold" } });
+        let arm: Arm = serde_json::from_value(valid.clone()).expect("native cleanup arm");
+        assert!(arm.validate());
+        assert!(arm.matches(Method::DeleteAbortedMultipartSource, ".rustfs.sys/multipart", &path));
+        for wrong in [format!("{path}/xl.meta"), format!("{path}-other"), format!("{hash}/other")] {
+            assert!(!arm.matches(Method::DeleteAbortedMultipartSource, ".rustfs.sys/multipart", &wrong));
+        }
+        assert!(!arm.matches(Method::DeleteAbortedMultipartSource, ".rustfs.sys", &path));
+        assert!(!arm.matches(Method::RecoverMultipartSource, ".rustfs.sys/multipart", &path));
+        assert!(!arm.matches(Method::Delete, ".rustfs.sys/multipart", &path));
+        for wrong in ["recover_multipart_source", "write_metadata", "delete"] {
+            let mut invalid = valid.clone();
+            invalid["methods"] = serde_json::json!([wrong]);
+            assert!(!serde_json::from_value::<Arm>(invalid).expect("known method").validate());
+        }
+        for wrong in [
+            format!("{path}/child"),
+            format!("{hash}/.."),
+            format!("{hash}/"),
+            format!("other/upload"),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["scope"]["path"] = serde_json::json!(wrong);
+            assert!(!serde_json::from_value::<Arm>(invalid).expect("strict scope").validate());
+        }
     }
 
     #[test]

@@ -14,9 +14,16 @@
 
 //! Method-selective delay and post-entry peer-loss coverage. Four nodes with
 //! EC:2 require three write acknowledgements. The lifecycle shared lock needs
-//! two grants, so the three/two-survivor cases straddle the MPU write quorum,
-//! not the lifecycle read quorum. Losing peers affects both RPC planes; these
+//! two grants, so three/two-survivor Create/Part/Complete straddle the ordinary
+//! write quorum. Initial Abort closure still requires all four participants;
+//! its metadata hook selects deletion only after that closure. Losing peers
+//! affects both RPC planes; these
 //! cases do not attribute their final error solely to metadata latency.
+//!
+//! Ordinary Create/Part/Complete keep write quorum three. Initial native Abort
+//! needs every original participant: a Q-only Create is settled by completing
+//! that same upload, while an unacknowledged sub-Q orphan retains its bytes.
+//! Peer restart supplies availability, not a missing original or cleanup vote.
 //!
 //! RPC entry owner IDs and real lock-table snapshots are recorded. Full owner
 //! lifetime intervals and exported lock counters remain separate acceptance
@@ -26,6 +33,7 @@ use super::harness::{
     DistCluster, DistLayout, TestResult, assert_object_bytes, put_object, s3_probe_client, unique_bucket, wait_until,
 };
 use crate::common::{admin_request, init_logging, local_http_client, rustfs_binary_path_with_features};
+use crate::storage_api::multipart_rpc_delay::RUSTFS_META_MULTIPART_BUCKET;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
@@ -34,6 +42,7 @@ use http::Method;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -124,7 +133,7 @@ impl Failure {
     }
 
     fn assert_unavailable(&self) {
-        assert_eq!(self.status, Some(503), "post-entry two-peer loss must fail closed: {self:?}");
+        assert_eq!(self.status, Some(503), "native quorum failure must fail closed: {self:?}");
         assert_eq!(self.code.as_deref(), Some("ServiceUnavailable"), "{self:?}");
         assert!(
             self.request_id.as_ref().is_some_and(|id| !id.is_empty()),
@@ -246,82 +255,47 @@ impl Session {
         }
     }
 
-    fn scope(&self, operation: Operation, plane: Plane) -> Value {
+    fn multipart_hash(&self) -> String {
+        rustfs_utils::crypto::hex(Sha256::digest(format!("{}/{}", self.bucket, self.key)))
+    }
+
+    fn upload_path(&self, upload_id: &str) -> TestResult<String> {
+        let decoded = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(upload_id.as_bytes())?;
+        let decoded = std::str::from_utf8(&decoded)?;
+        let (_, raw) = decoded.split_once('.').ok_or("actual MPU ID omitted its deployment prefix")?;
+        let (id, timestamp) = raw.split_once('x').ok_or("actual MPU ID omitted its timestamp")?;
+        let parsed = Uuid::parse_str(id)?;
+        assert!(!parsed.is_nil() && parsed.to_string() == id);
+        assert_eq!(timestamp.parse::<i128>()?.to_string(), timestamp);
+        Ok(format!("{}/{raw}", self.multipart_hash()))
+    }
+
+    fn scope(&self, operation: Operation, plane: Plane) -> TestResult<Value> {
         if matches!(plane, Plane::Lock) {
-            return json!({ "class": "lifecycle", "bucket": self.bucket });
+            return Ok(json!({ "class": "lifecycle", "bucket": self.bucket }));
         }
         if matches!(operation, Operation::Complete) {
-            return json!({ "class": "object", "bucket": self.bucket, "key": self.key });
+            return Ok(json!({ "class": "object", "bucket": self.bucket, "key": self.key }));
         }
-        let digest = Sha256::digest(format!("{}/{}", self.bucket, self.key));
-        json!({ "class": "multipart", "sha256": rustfs_utils::crypto::hex(digest) })
+        if matches!(operation, Operation::Abort) {
+            let path = self.upload_path(self.upload_id.as_deref().ok_or("Abort session omitted upload ID")?)?;
+            return Ok(json!({ "class": "multipart_upload", "path": path }));
+        }
+        Ok(json!({ "class": "multipart", "sha256": self.multipart_hash() }))
     }
 
-    async fn source_heads(&self, run: &Run, upload_id: &str) -> TestResult<Vec<Option<Vec<u8>>>> {
-        let decoded = String::from_utf8(base64_simd::URL_SAFE_NO_PAD.decode_to_vec(upload_id.as_bytes())?)?;
-        let (_, suffix) = decoded.split_once('.').ok_or("server upload ID lacks deployment delimiter")?;
-        let digest = rustfs_utils::crypto::hex(Sha256::digest(format!("{}/{}", self.bucket, self.key)));
-        let mut heads = Vec::new();
-        for node in &run.dist.cluster.nodes {
-            for root in &node.data_dirs {
-                let path = Path::new(root)
-                    .join(".rustfs.sys/multipart")
-                    .join(&digest)
-                    .join(suffix)
-                    .join("xl.meta");
-                heads.push(match tokio::fs::read(path).await {
-                    Ok(bytes) => Some(bytes),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(error) => return Err(error.into()),
-                });
-            }
+    async fn verify_and_cleanup(
+        &self,
+        run: &Run,
+        operation: Operation,
+        ack: Option<Ack>,
+        available_at_create: usize,
+    ) -> TestResult {
+        if matches!(operation, Operation::Create) {
+            return Box::pin(self.verify_created_upload(run, ack, available_at_create)).await;
         }
-        Ok(heads)
-    }
-
-    async fn abort_and_verify_source(&self, run: &Run, upload_id: &str, partial_create: bool) -> TestResult<bool> {
-        let before = if partial_create {
-            Some(self.source_heads(run, upload_id).await?)
-        } else {
-            None
-        };
-        let result = run
-            .client(0)?
-            .abort_multipart_upload()
-            .bucket(&self.bucket)
-            .key(&self.key)
-            .upload_id(upload_id)
-            .send()
-            .await;
-        if let Some(before) = before {
-            let present = before.iter().filter(|head| head.is_some()).count();
-            if (2..4).contains(&present) {
-                let failure = Failure::from_sdk(result.expect_err("missing original witnesses must prevent native Abort"));
-                failure.assert_unavailable();
-                assert_eq!(failure.cause.as_deref(), Some("storage_write_quorum"));
-                assert_eq!(
-                    self.source_heads(run, upload_id).await?,
-                    before,
-                    "refused Abort must preserve every original head and its absence slots"
-                );
-                atomic_json(
-                    &run.directory.join(format!("retained-source.{}.json", Uuid::new_v4())),
-                    &json!({ "bucket": self.bucket, "upload_id": upload_id, "original_heads": present,
-                        "required_originals": 4, "failure": failure }),
-                )
-                .await?;
-                return Ok(true);
-            }
-        }
-        result?;
-        Ok(false)
-    }
-
-    async fn verify_and_cleanup(&self, run: &Run, operation: Operation, scenario: Scenario, ack: Option<Ack>) -> TestResult {
         let client = run.client(0)?;
         let mut recovered = self.clone();
-        let partial_create = matches!(operation, Operation::Create) && !matches!(scenario, Scenario::BoundedDelay);
-        let mut retained = Vec::new();
         if ack.is_none() {
             match operation {
                 Operation::Part => {
@@ -374,12 +348,7 @@ impl Session {
             },
         };
         match operation {
-            Operation::Create => {
-                let id = ack.upload_id.ok_or("successful CreateMultipartUpload omitted ID")?;
-                if self.abort_and_verify_source(run, &id, partial_create).await? {
-                    retained.push(id);
-                }
-            }
+            Operation::Create => unreachable!("Create uses its actual-source admission verifier"),
             Operation::Part => {
                 let mut completed = recovered;
                 completed.etag = Some(ack.etag.ok_or("successful UploadPart omitted ETag")?);
@@ -396,10 +365,19 @@ impl Session {
                     assert_object_bytes(&run.client(node)?, &self.bucket, &self.key, OLD_PART).await?;
                 }
             }
-            Operation::Abort => {}
+            Operation::Abort => {
+                // A Q delete ACK can precede the last participant's cleanup.
+                // Resume the same already all-N-closed upload directly; a
+                // remaining single root need not appear in a read-Q listing.
+                match self.execute(&client, Operation::Abort).await {
+                    Ok(_) => {}
+                    Err(failure) if failure.status == Some(404) && failure.code.as_deref() == Some("NoSuchUpload") => {}
+                    Err(failure) => return Err(format!("resume closed native Abort cleanup: {failure:?}").into()),
+                }
+            }
         }
-        // An interrupted native Create can lack an original participant.
-        // Prove safe retention rather than inventing authority to erase it.
+        // These sessions began with all original participants. Preserve the
+        // strict cleanup oracle; Q-only Create is verified separately.
         let uploads = client
             .list_multipart_uploads()
             .bucket(&self.bucket)
@@ -407,10 +385,13 @@ impl Session {
             .send()
             .await?;
         for upload in uploads.uploads() {
-            let id = upload.upload_id().ok_or("listed upload omitted ID")?;
-            if !retained.iter().any(|known| known == id) && self.abort_and_verify_source(run, id, partial_create).await? {
-                retained.push(id.to_owned());
-            }
+            client
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .upload_id(upload.upload_id().ok_or("listed upload omitted ID")?)
+                .send()
+                .await?;
         }
         let uploads = client
             .list_multipart_uploads()
@@ -418,15 +399,8 @@ impl Session {
             .prefix(&self.key)
             .send()
             .await?;
-        let mut remaining: Vec<_> = uploads
-            .uploads()
-            .iter()
-            .map(|upload| upload.upload_id().expect("listed upload ID"))
-            .collect();
-        remaining.sort_unstable();
-        retained.sort_unstable();
-        assert_eq!(remaining, retained, "only exact, byte-verified indeterminate sources may remain");
-        if matches!(operation, Operation::Create | Operation::Abort) {
+        assert!(uploads.uploads().is_empty(), "upload metadata survived cleanup");
+        if matches!(operation, Operation::Abort) {
             let missing = client
                 .head_object()
                 .bucket(&self.bucket)
@@ -436,6 +410,302 @@ impl Session {
                 .expect_err("unpublished MPU must not expose an object");
             assert_eq!(missing.raw_response().map(|response| response.status().as_u16()), Some(404));
         }
+        Ok(())
+    }
+}
+
+#[derive(Eq, PartialEq)]
+struct PhysicalUpload {
+    node: usize,
+    root: PathBuf,
+    directories: BTreeSet<PathBuf>,
+    files: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+type UploadSources = BTreeMap<String, Vec<PhysicalUpload>>;
+
+fn actual_upload_sources(run: &Run, session: &Session) -> TestResult<UploadSources> {
+    let mut uploads = UploadSources::new();
+    for (node, participant) in run.dist.cluster.nodes.iter().enumerate() {
+        for volume in &participant.data_dirs {
+            let hash_root = Path::new(volume)
+                .join(RUSTFS_META_MULTIPART_BUCKET)
+                .join(session.multipart_hash());
+            let entries = match std::fs::read_dir(&hash_root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            for entry in entries {
+                let entry = entry?;
+                assert!(
+                    entry.file_type()?.is_dir(),
+                    "unique fixture SHA contains an unexpected non-upload artifact"
+                );
+                let root = entry.path();
+                let raw = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| "physical upload ID is not UTF-8")?;
+                let mut source = PhysicalUpload {
+                    node,
+                    root: root.clone(),
+                    directories: BTreeSet::new(),
+                    files: BTreeMap::new(),
+                };
+                for child in walkdir::WalkDir::new(&root).sort_by_file_name() {
+                    let child = child?;
+                    let relative = child.path().strip_prefix(&root)?.to_owned();
+                    if child.file_type().is_dir() {
+                        source.directories.insert(relative);
+                    } else {
+                        assert!(child.file_type().is_file(), "physical source contains a non-regular artifact");
+                        source.files.insert(relative, std::fs::read(child.path())?);
+                    }
+                }
+                let copies = uploads.entry(raw).or_default();
+                assert!(
+                    !copies.iter().any(|copy| copy.node == node),
+                    "one actual physical participant cannot supply two heads"
+                );
+                copies.push(source);
+            }
+        }
+    }
+    Ok(uploads)
+}
+
+fn actual_head_count(copies: &[PhysicalUpload]) -> usize {
+    copies
+        .iter()
+        .filter(|copy| copy.files.contains_key(Path::new("xl.meta")))
+        .count()
+}
+
+fn assert_sources_unchanged(run: &Run, session: &Session, expected: &UploadSources) -> TestResult {
+    let actual = actual_upload_sources(run, session)?;
+    assert!(
+        actual == *expected,
+        "native cleanup changed retained physical source bytes or directory inventory"
+    );
+    Ok(())
+}
+
+impl Session {
+    async fn assert_no_target(&self, run: &Run) -> TestResult {
+        for node in 0..4 {
+            let missing = run
+                .client(node)?
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .send()
+                .await
+                .expect_err("unpublished Create must retain target absence");
+            assert_eq!(missing.raw_response().map(|response| response.status().as_u16()), Some(404));
+            assert_eq!(missing.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
+        }
+        Ok(())
+    }
+
+    async fn listed_upload_ids(&self, client: &Client) -> TestResult<Vec<String>> {
+        let uploads = client
+            .list_multipart_uploads()
+            .bucket(&self.bucket)
+            .prefix(&self.key)
+            .send()
+            .await?;
+        assert_ne!(uploads.is_truncated(), Some(true));
+        let mut ids = uploads
+            .uploads()
+            .iter()
+            .map(|upload| {
+                assert_eq!(upload.key(), Some(self.key.as_str()), "the fixture key is isolated");
+                upload.upload_id().map(str::to_owned).ok_or("listed actual upload omitted ID")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.sort();
+        Ok(ids)
+    }
+
+    async fn settle_admitted_create(&self, run: &Run, upload_id: String) -> TestResult {
+        let client = run.client(0)?;
+        // This is the same acknowledged Q-only upload, with its genuine
+        // original heads. Part cannot initialize the missing participant.
+        let part = client
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from_static(NEW_PART))
+            .send()
+            .await?;
+        let path = self.upload_path(&upload_id)?;
+        let raw = path.split_once('/').ok_or("admitted upload path missing root")?.1;
+        let sources = actual_upload_sources(run, self)?;
+        assert_eq!(
+            actual_head_count(sources.get(raw).ok_or("admitted source disappeared after Part")?),
+            3,
+            "Part must use ordinary Q3 without initializing the missing original"
+        );
+        let completed = client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .part_number(1)
+                            .e_tag(part.e_tag().ok_or("admitted upload's part omitted ETag")?)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await?;
+        let etag = completed.e_tag().ok_or("admitted upload completion omitted ETag")?;
+        for node in 0..4 {
+            let response = run
+                .client(node)?
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .set_version_id(completed.version_id().map(str::to_owned))
+                .send()
+                .await?;
+            assert_eq!(response.e_tag(), Some(etag), "same-upload completion identity through node {node}");
+            if let Some(version) = completed.version_id() {
+                assert_eq!(response.version_id(), Some(version), "same-upload version through node {node}");
+            }
+            assert_eq!(
+                response.body.collect().await?.into_bytes().as_ref(),
+                NEW_PART,
+                "same admitted upload must retain its complete acknowledged payload through node {node}"
+            );
+        }
+        assert!(
+            self.listed_upload_ids(&client).await?.is_empty(),
+            "same-upload completion must settle its upload"
+        );
+        Ok(())
+    }
+
+    async fn verify_created_upload(&self, run: &Run, ack: Option<Ack>, available_at_create: usize) -> TestResult {
+        // A returned HTTP response does not itself prove ownership drain.
+        run.drained(&self.bucket, Uuid::new_v4()).await?;
+        let client = run.client(0)?;
+        let sources = actual_upload_sources(run, self)?;
+        self.assert_no_target(run).await?;
+        if let Some(ack) = ack {
+            let upload_id = ack.upload_id.ok_or("acknowledged Create omitted ID")?;
+            let path = self.upload_path(&upload_id)?;
+            let raw = path.split_once('/').ok_or("actual upload path missing root")?.1;
+            let copies = sources.get(raw).ok_or("acknowledged Create has no actual source")?;
+            assert_eq!(sources.len(), 1, "the isolated Create must not invent another upload");
+            assert_eq!(
+                actual_head_count(copies),
+                available_at_create,
+                "count actual initialized physical participants"
+            );
+            assert!(available_at_create >= 3, "an acknowledgement still needs ordinary write quorum three");
+            let abort = client
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            if available_at_create == 4 {
+                abort?;
+                assert!(
+                    self.listed_upload_ids(&client).await?.is_empty(),
+                    "all-N native Abort must clean its upload"
+                );
+                self.assert_no_target(run).await?;
+            } else {
+                let failure =
+                    Failure::from_sdk(abort.expect_err("a rejoined peer cannot supply an original it never initialized"));
+                failure.assert_unavailable();
+                assert_eq!(failure.cause.as_deref(), Some("storage_write_quorum"));
+                assert_sources_unchanged(run, self, &sources)?;
+                self.assert_no_target(run).await?;
+                atomic_json(
+                    &run.directory.join(format!("create-q-only.{}.json", Uuid::new_v4())),
+                    &json!({"physical_originals": available_at_create, "native_abort": "retryable_503",
+                        "original_bytes_unchanged": true, "settlement": "same_upload_part_and_complete", "write_quorum": 3}),
+                )
+                .await?;
+                self.settle_admitted_create(run, upload_id).await?;
+            }
+            return Ok(());
+        }
+
+        let heads: usize = sources.values().map(|copies| actual_head_count(copies)).sum();
+        assert!(
+            heads <= available_at_create && heads < 3,
+            "failed Create cannot become an acknowledged source quorum"
+        );
+        let retained_ids = self.listed_upload_ids(&client).await?;
+        for upload_id in &retained_ids {
+            let path = self.upload_path(upload_id)?;
+            let raw = path.split_once('/').ok_or("listed path omitted upload root")?.1;
+            assert!(sources.contains_key(raw), "listed orphan must have actual physical source bytes");
+            let error = client
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .upload_id(upload_id)
+                .send()
+                .await
+                .expect_err("sub-quorum originals cannot authorize native all-participant cleanup");
+            let failure = Failure::from_sdk(error);
+            failure.assert_unavailable();
+            assert_eq!(failure.cause.as_deref(), Some("storage_write_quorum"));
+        }
+        assert_sources_unchanged(run, self, &sources)?;
+        self.assert_no_target(run).await?;
+        // A genuinely new admission proves recovery without manufacturing the
+        // failed upload's missing originals or laundering it through a donor.
+        let fresh = self
+            .execute(&client, Operation::Create)
+            .await
+            .map_err(|error| format!("fresh Create after peers rejoin: {error:?}"))?;
+        let fresh_id = fresh.upload_id.ok_or("fresh Create omitted ID")?;
+        let fresh_path = self.upload_path(&fresh_id)?;
+        let fresh_raw = fresh_path.split_once('/').ok_or("fresh path omitted upload root")?.1;
+        assert!(!sources.contains_key(fresh_raw), "fresh admission must use another upload ID");
+        run.drained(&self.bucket, Uuid::new_v4()).await?;
+        let fresh_sources = actual_upload_sources(run, self)?;
+        assert_eq!(
+            actual_head_count(fresh_sources.get(fresh_raw).ok_or("fresh Create has no actual source")?),
+            4,
+            "fresh recovery uses its own actual all-participant originals"
+        );
+        client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&fresh_id)
+            .send()
+            .await?;
+        assert_sources_unchanged(run, self, &sources)?;
+        assert_eq!(
+            self.listed_upload_ids(&client).await?,
+            retained_ids,
+            "cleanup removes only the fresh admission; retained orphan listing must stay exact"
+        );
+        self.assert_no_target(run).await?;
+        atomic_json(
+            &run.directory.join(format!("create-sub-quorum.{}.json", Uuid::new_v4())),
+            &json!({"physical_originals": heads, "physical_upload_roots": sources.len(),
+                "discoverable_retained_uploads": retained_ids, "orphan_cleanup": "not_authorized",
+                "retained_bytes_unchanged": true, "fresh_all_n_admission_cleaned": true,
+                "fixture_removal": "only_after_server_stop"}),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -733,7 +1003,7 @@ async fn run_matrix(plane: Plane) -> TestResult {
             run.arm(
                 nonce,
                 &methods,
-                session.scope(operation, plane),
+                session.scope(operation, plane)?,
                 matches!(scenario, Scenario::BoundedDelay),
             )
             .await?;
@@ -770,6 +1040,8 @@ async fn run_matrix(plane: Plane) -> TestResult {
                 "scenario": format!("{scenario:?}"), "reached_remote_peers": reached, "killed_peers": killed,
                 "mpu_write_quorum": { "required": 3, "available_peers": 4 - killed.len(), "acknowledged": result.is_ok() },
                 "lifecycle_read_quorum": { "required": 2, "available_peers": 4 - killed.len() },
+                "native_abort_initial_closure": { "required": 4,
+                    "closed_before_fault": matches!(operation, Operation::Abort) && matches!(plane, Plane::Metadata) },
                 "ack": result.as_ref().ok(), "failure": result.as_ref().err() }),
             )
             .await?;
@@ -813,7 +1085,7 @@ async fn run_matrix(plane: Plane) -> TestResult {
             if !killed.is_empty() {
                 run.fully_rejoined("restart", nonce).await?;
             }
-            session.verify_and_cleanup(&run, operation, scenario, ack).await?;
+            session.verify_and_cleanup(&run, operation, ack, 4 - killed.len()).await?;
             run.drained(&session.bucket, nonce).await?;
         }
     }

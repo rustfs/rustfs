@@ -21,6 +21,7 @@ use crate::on_demand_migration::common::{ODM_SERVER_ENV, OdmTestEnv, SeedObject,
 use crate::replication_extension_test::{
     LOOPBACK_REPLICATION_TARGET_ENV, ReplicationTargetOptions, put_bucket_replication, set_replication_target_with_options,
 };
+use crate::storage_api::upgrade_compatibility::RUSTFS_META_MULTIPART_BUCKET;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -492,9 +493,7 @@ fn pending_source_bytes(
         rustfs_utils::hex_sha256(format!("{PENDING_MULTIPART_BUCKET}/{PENDING_MULTIPART_KEY}").as_bytes(), str::to_owned);
     let mut sources = Vec::new();
     for volume in cluster.nodes.iter().flat_map(|node| &node.data_dirs) {
-        let hash_root = Path::new(volume)
-            .join(rustfs_ecstore::api::disk::RUSTFS_META_MULTIPART_BUCKET)
-            .join(&source_hash);
+        let hash_root = Path::new(volume).join(RUSTFS_META_MULTIPART_BUCKET).join(&source_hash);
         let roots = std::fs::read_dir(&hash_root)?
             .map(|entry| {
                 let entry = entry?;
@@ -697,7 +696,7 @@ async fn wait_for_multipart_quiescence(cluster: &RustFSTestClusterEnvironment, s
         let mut native_controls = 0;
         let mut remaining_upload_roots = 0;
         for volume in cluster.nodes.iter().flat_map(|node| &node.data_dirs) {
-            let root = Path::new(volume).join(rustfs_ecstore::api::disk::RUSTFS_META_MULTIPART_BUCKET);
+            let root = Path::new(volume).join(RUSTFS_META_MULTIPART_BUCKET);
             if !root.exists() {
                 continue;
             }
