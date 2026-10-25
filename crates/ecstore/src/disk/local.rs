@@ -14,6 +14,10 @@
 
 pub(in crate::disk) use self::commit::LocalRenamePreflightRejection;
 #[cfg(test)]
+#[path = "local/read_path_tests.rs"]
+mod read_path_tests;
+
+#[cfg(test)]
 use self::commit::lock_rename_commit_directories;
 
 mod commit;
@@ -6788,8 +6792,19 @@ impl LocalDisk {
         self.local_disk_bucket_and_object_path(self.io_root(), bucket, key)
     }
 
+    fn io_get_checked_read_paths(&self, bucket: &str, key: &str) -> Result<(PathBuf, PathBuf)> {
+        let (bucket_path, path) = self.io_get_bucket_and_object_path(bucket, key)?;
+        #[cfg(test)]
+        read_path_tests::before_bucket_recheck();
+        // Reuse the buffer, not the validation result: retain the bucket
+        // recheck after the full object-path check and before queued IO.
+        self.check_valid_path(&bucket_path)?;
+        Ok((bucket_path, path))
+    }
+
     /// Only for operations that open through PublicationRoot or a commit guard:
-    /// containment and symlink checks happen with the actual open, off the runtime.
+    /// Linux checks containment and symlinks at the actual open, off the runtime;
+    /// other platforms retain their preflight checks.
     fn io_get_object_open_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
         #[cfg(target_os = "linux")]
         {
@@ -6802,7 +6817,8 @@ impl LocalDisk {
     }
 
     /// Only for operations that open through PublicationRoot or a commit guard:
-    /// containment and symlink checks happen with the actual open, off the runtime.
+    /// Linux checks containment and symlinks at the actual open, off the runtime;
+    /// other platforms retain their preflight checks.
     fn io_get_bucket_and_object_open_path(&self, bucket: &str, key: &str) -> Result<(PathBuf, PathBuf)> {
         #[cfg(target_os = "linux")]
         {
@@ -6814,11 +6830,7 @@ impl LocalDisk {
             Ok((bucket_path, path))
         }
         #[cfg(not(target_os = "linux"))]
-        {
-            let path = self.io_get_object_path(bucket, key)?;
-            let bucket_path = self.io_get_bucket_path(bucket)?;
-            Ok((bucket_path, path))
-        }
+        self.io_get_checked_read_paths(bucket, key)
     }
 
     fn io_get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
@@ -6892,10 +6904,6 @@ impl LocalDisk {
     }
 
     // Check if a path is valid
-    #[allow(
-        dead_code,
-        reason = "method wrapper over the live free function check_local_disk_valid_path; no caller in this port (backlog#1823)"
-    )]
     fn check_valid_path<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -10393,6 +10401,8 @@ fn local_disk_bucket_path(root: &Path, bucket: &str) -> Result<PathBuf> {
 }
 
 fn build_local_disk_bucket_path(root: &Path, bucket: &str) -> PathBuf {
+    #[cfg(test)]
+    read_path_tests::record_bucket_rebuild();
     #[cfg(windows)]
     let bucket_path = root.join(bucket.replace('/', "\\"));
     #[cfg(not(windows))]
@@ -10402,8 +10412,8 @@ fn build_local_disk_bucket_path(root: &Path, bucket: &str) -> PathBuf {
 }
 
 fn check_local_disk_valid_object_path(root: &Path, bucket_path: &Path, path: &Path) -> Result<()> {
-    let bucket_path = normalize_path_components(bucket_path);
-    let path = normalize_path_components(path);
+    let bucket_path = normalize_path_cow(bucket_path);
+    let path = normalize_path_cow(path);
     if !bucket_path.starts_with(root) || !path.starts_with(&bucket_path) {
         return Err(DiskError::InvalidPath);
     }
@@ -10412,7 +10422,7 @@ fn check_local_disk_valid_object_path(root: &Path, bucket_path: &Path, path: &Pa
 }
 
 fn check_local_disk_valid_path(root: &Path, path: impl AsRef<Path>) -> Result<()> {
-    let path = normalize_path_components(path);
+    let path = normalize_path_cow(path.as_ref());
     if !path.starts_with(root) {
         return Err(DiskError::InvalidPath);
     }
@@ -10443,7 +10453,7 @@ fn check_local_disk_object_path_components<'a>(
 
 #[cfg(target_os = "linux")]
 fn check_local_disk_valid_path_at(root: &Path, root_fd: &std::fs::File, path: impl AsRef<Path>) -> Result<()> {
-    let path = normalize_path_components(path);
+    let path = normalize_path_cow(path.as_ref());
     if !path.starts_with(root) {
         return Err(DiskError::InvalidPath);
     }
@@ -10525,9 +10535,10 @@ fn reject_local_disk_symlink_components(root: &Path, path: &Path) -> Result<()> 
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 #[inline]
 fn normalize_path_cow(path: &Path) -> std::borrow::Cow<'_, Path> {
+    // Windows prefixes retain the existing PathBuf reconstruction semantics.
+    #[cfg(not(windows))]
     if !path
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
@@ -10539,6 +10550,8 @@ fn normalize_path_cow(path: &Path) -> std::borrow::Cow<'_, Path> {
 
 // Lightweight path normalization without filesystem calls
 fn normalize_path_components(path: impl AsRef<Path>) -> PathBuf {
+    #[cfg(test)]
+    read_path_tests::record_normalization();
     let path = path.as_ref();
     let mut result = PathBuf::new();
 
@@ -13106,8 +13119,7 @@ impl LocalDisk {
             Some(io_permit) => Some(io_permit),
             None => acquire_context_disk_io_permit().await.map_err(DiskError::Io)?,
         };
-        let file_path = self.io_get_object_path(volume, path)?;
-        let volume_dir = self.io_get_bucket_path(volume)?;
+        let (volume_dir, file_path) = self.io_get_checked_read_paths(volume, path)?;
         let (data, _) = self
             .read_all_data_with_dmtime(volume, volume_dir, file_path, io_permit)
             .await?;
