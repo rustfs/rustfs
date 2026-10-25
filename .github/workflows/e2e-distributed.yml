@@ -62,7 +62,7 @@ on:
   workflow_dispatch:
     inputs:
       filter:
-        description: "Optional nextest -E filter (default: the whole e2e-distributed profile)"
+        description: "Optional e2e-full diagnostic filter (default: the whole e2e-distributed profile)"
         required: false
         default: ""
   schedule:
@@ -168,13 +168,14 @@ jobs:
           FILTER: ${{ inputs.filter }}
         run: |
           set -euo pipefail
-          rm -f target/nextest/e2e-distributed/junit.xml
+          rm -f target/nextest/e2e-distributed/junit.xml target/nextest/e2e-full/junit.xml
           if [ -n "${FILTER}" ]; then
-            python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test -E "${FILTER}"
+            python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-full -p e2e_test -E "${FILTER}" --no-tests=fail
+            test -s target/nextest/e2e-full/junit.xml
           else
             python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test --no-tests=fail
+            test -s target/nextest/e2e-distributed/junit.xml
           fi
-          test -s target/nextest/e2e-distributed/junit.xml
 
       - name: Upload distributed e2e diagnostics
         if: always()
@@ -183,6 +184,7 @@ jobs:
           name: e2e-distributed-${{ github.run_number }}
           path: |
             target/nextest/e2e-distributed/junit.xml
+            target/nextest/e2e-full/junit.xml
             ${{ runner.temp }}/rustfs-e2e-distributed-list.json
             ${{ runner.temp }}/rustfs-e2e-distributed-logs/
           retention-days: 7
