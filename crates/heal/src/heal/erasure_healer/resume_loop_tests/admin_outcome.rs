@@ -318,7 +318,9 @@ async fn admin_erasure_recreated_bucket_cannot_rebind_checkpoint() {
     assert_eq!(restarted.get_outcome().await.counters.healed, 1);
 }
 
-#[tokio::test(start_paused = true)]
+// Durable checkpoints use an independent fsync runtime, so this path needs real
+// time. The in-memory admin_object tests cover retry timing with a paused clock.
+#[tokio::test]
 async fn admin_erasure_dispositions_do_not_invent_success_and_retries_count_once() {
     let (_temp, storage) = fixture().await;
     objects(&storage, "a", &["healthy", "absent", "unproven", "gone", "offline"]);
@@ -330,12 +332,17 @@ async fn admin_erasure_dispositions_do_not_invent_success_and_retries_count_once
     storage.set_outcome("gone", Some("null"), HealOutcome::VersionNotFound);
     storage.set_outcome("offline", Some("null"), HealOutcome::Transient);
     let task = HealTask::from_request(request(), storage.clone());
-    task.execute()
+    let error = task
+        .execute()
         .await
         .expect_err("unhealed objects must retain the failed task status");
     let outcome = task.get_outcome().await;
     let c = &outcome.counters;
-    assert_eq!((c.processed, c.healed, c.unchanged, c.failed, c.skipped, c.unknown), (5, 0, 2, 0, 3, 1));
+    assert_eq!(
+        (c.processed, c.healed, c.unchanged, c.failed, c.skipped, c.unknown),
+        (5, 0, 2, 0, 3, 1),
+        "unexpected task error: {error:?}"
+    );
     assert_eq!(c.attempt_failures, 8);
     assert_eq!(storage.calls().iter().filter(|(name, _)| name == "gone").count(), 4);
     assert_eq!(storage.calls().iter().filter(|(name, _)| name == "offline").count(), 4);

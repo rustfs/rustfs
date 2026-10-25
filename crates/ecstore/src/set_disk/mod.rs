@@ -12753,7 +12753,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn test_get_disks_info_probes_drives_concurrently() {
         use crate::disk::disk_store::DISK_INFO_PROBE_DELAY_FOR_TEST;
 
@@ -12768,6 +12768,8 @@ mod tests {
             disks.push(Some(disk));
         }
 
+        // Complete real filesystem setup before measuring virtual probe delays.
+        tokio::time::pause();
         let probe_delay = std::time::Duration::from_secs(2);
         let started = tokio::time::Instant::now();
         let info = DISK_INFO_PROBE_DELAY_FOR_TEST
