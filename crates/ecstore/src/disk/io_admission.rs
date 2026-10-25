@@ -123,8 +123,10 @@ pub async fn with_background_resource_unit<F: Future>(unit: AdaptivePermit, futu
 }
 
 /// Retain only the previously admitted physical leaves touched by this I/O.
-/// Capture the subset before storage locks. Do not pass the complete parent
-/// operation's resource set to a native job that touches only some of its disks.
+/// Projection of owned units never waits and may run under storage locks.
+/// Acquire the planned resources before locking; auxiliary leaves discovered
+/// later must use nonblocking admission. Do not pass unrelated parent resources
+/// to a native job that touches only some of its disks.
 #[doc(hidden)]
 pub async fn with_background_resource_set<F: Future>(units: AdaptivePermitSet, future: F) -> F::Output {
     RESOURCE_IO_UNIT.scope(ResourceIoUnit::Set(units), future).await

@@ -129,6 +129,13 @@ impl PhysicalDiskPlan {
         self.owner.capture_from(admitted)
     }
 
+    /// Auxiliary metadata may route outside the object's original disk set.
+    /// Add those physical leaves to the same parent without waiting under its
+    /// storage locks; native work still retains only this attachment's subset.
+    pub(crate) fn capture_or_acquire_native(&self, admitted: &AdaptivePermitSet) -> Result<AdaptivePermitSet, CaptureError> {
+        self.owner.try_capture_or_acquire_from(admitted, &self.selected)
+    }
+
     /// Never wait under a storage lock. A refresh during acquisition rejects
     /// the old plan before its future can issue I/O.
     pub fn try_acquire(&self, node: &Arc<NodeAdmission>) -> Option<NodeResourcePermit> {

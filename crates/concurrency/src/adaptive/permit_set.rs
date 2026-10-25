@@ -6,7 +6,7 @@
 use std::io;
 use std::num::NonZeroU16;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::{AdaptiveAdmission, AdaptivePermit, MAX_PERMIT_REFERENCES, NodeAdmission, NodePermit};
 
@@ -15,7 +15,7 @@ use super::{AdaptiveAdmission, AdaptivePermit, MAX_PERMIT_REFERENCES, NodeAdmiss
 const MAX_OWNERS: usize = 256;
 const NO_UNIT: usize = usize::MAX;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct ResourceMask([u64; MAX_OWNERS / 64]);
 
 impl ResourceMask {
@@ -40,6 +40,7 @@ pub struct AdaptivePermitSetOwner {
     turn_order: Box<[usize]>,
     capacity: Arc<AdaptiveAdmission>,
     units: Box<[AtomicUsize]>,
+    extending: Box<[AtomicBool]>,
     all: ResourceMask,
 }
 
@@ -87,6 +88,8 @@ pub enum CaptureError {
     ResourceOwner,
     /// All preallocated subset slots are still retained.
     Full,
+    /// A physical resource has no immediately available capacity.
+    Unavailable,
     /// Another owner cannot be retained without overflowing its reference count.
     ReferenceOverflow,
 }
@@ -97,6 +100,7 @@ impl std::fmt::Display for CaptureError {
             Self::ResourceCount => "resource unit count does not match the subset",
             Self::ResourceOwner => "resource unit owner does not match the subset",
             Self::Full => "resource subset slots are exhausted",
+            Self::Unavailable => "physical resource capacity is unavailable",
             Self::ReferenceOverflow => "resource unit reference count overflow",
         })
     }
@@ -132,7 +136,7 @@ impl NodeResourcePermit {
         let Self { resources, node } = self;
         let first_unit = resources.slot * resources.owner.owners.len();
         for (index, owner) in resources.owner.owners.iter().enumerate() {
-            if resources.owner.units[first_unit + index].load(Ordering::Relaxed) == NO_UNIT {
+            if resources.owner.units[first_unit + index].load(Ordering::Acquire) == NO_UNIT {
                 continue;
             }
             let _ = owner
@@ -141,6 +145,14 @@ impl NodeResourcePermit {
         }
         drop(resources);
         node.complete();
+    }
+}
+
+struct ResourceExtension<'a>(&'a AtomicBool);
+
+impl Drop for ResourceExtension<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -198,6 +210,7 @@ impl AdaptivePermitSetOwner {
             turn_order: turn_order.into_boxed_slice(),
             capacity: AdaptiveAdmission::new(maximum, u32::from(maximum.get())),
             units: units.into_boxed_slice(),
+            extending: (0..count).map(|_| AtomicBool::new(false)).collect(),
             all,
         }))
     }
@@ -269,7 +282,7 @@ impl AdaptivePermitSetOwner {
             let first_unit = source.slot * self.owners.len();
             if self.units[first_unit..first_unit + self.owners.len()]
                 .iter()
-                .any(|unit| unit.load(Ordering::Relaxed) == NO_UNIT)
+                .any(|unit| unit.load(Ordering::Acquire) == NO_UNIT)
             {
                 return Err(CaptureError::ResourceOwner);
             }
@@ -287,7 +300,7 @@ impl AdaptivePermitSetOwner {
             };
             // The borrowed source keeps every referenced unit alive throughout
             // projection, even if other carriers release their references.
-            let unit_slot = source.owner.units[source_first + source_index].load(Ordering::Relaxed);
+            let unit_slot = source.owner.units[source_first + source_index].load(Ordering::Acquire);
             if unit_slot == NO_UNIT {
                 self.release_units(slot.slot, index);
                 return Err(CaptureError::ResourceOwner);
@@ -302,6 +315,87 @@ impl AdaptivePermitSetOwner {
                 return Err(CaptureError::ReferenceOverflow);
             }
             self.units[first_unit + index].store(unit_slot, Ordering::Relaxed);
+        }
+        Ok(self.finish_capture(slot.slot))
+    }
+
+    /// Project native ownership, adding any missing leaves to the parent with
+    /// a nonblocking attempt. Additional leaves must come from the same topology
+    /// and attachment selection. Parent completion credits each physical owner
+    /// once; its native projections retain only the devices they actually use.
+    pub fn try_capture_or_acquire_from(
+        self: &Arc<Self>,
+        source: &AdaptivePermitSet,
+        attachment: &AdaptiveResourceSelection,
+    ) -> Result<AdaptivePermitSet, CaptureError> {
+        match self.capture_from(source) {
+            Ok(native) => return Ok(native),
+            Err(CaptureError::ResourceOwner) => {}
+            Err(error) => return Err(error),
+        }
+        if !Arc::ptr_eq(&source.owner, &attachment.owner) {
+            return Err(CaptureError::ResourceOwner);
+        }
+        // Serialize only row extension. Never queue or wait under storage locks.
+        // The source borrow keeps the row alive until this guard is released.
+        let extending = &source.owner.extending[source.slot];
+        extending
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| CaptureError::Unavailable)?;
+        let _extension = ResourceExtension(extending);
+        let slot = self.capacity.try_acquire().ok_or(CaptureError::Full)?;
+        let first_unit = slot.slot * self.owners.len();
+        let source_first = source.slot * source.owner.owners.len();
+        let mut acquired = ResourceMask::empty();
+        for (index, expected) in self.owners.iter().enumerate() {
+            let source_index = source.owner.owners.iter().position(|owner| Arc::ptr_eq(owner, expected));
+            let Some(source_index) = source_index.filter(|index| attachment.selected.contains(*index)) else {
+                self.release_units(slot.slot, index);
+                return Err(CaptureError::ResourceOwner);
+            };
+            let mut unit_slot = source.owner.units[source_first + source_index].load(Ordering::Acquire);
+            let additional = if unit_slot == NO_UNIT {
+                let Some(unit) = expected.try_acquire() else {
+                    self.release_units(slot.slot, index);
+                    return Err(CaptureError::Unavailable);
+                };
+                unit_slot = unit.slot;
+                acquired.insert(index);
+                Some(unit)
+            } else {
+                None
+            };
+            // Either the source or this private local permit keeps the unit
+            // alive until the native carrier owns its reference.
+            if expected.slots[unit_slot / 64].references[unit_slot % 64]
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |references| {
+                    (references < MAX_PERMIT_REFERENCES).then(|| references + 1)
+                })
+                .is_err()
+            {
+                self.release_units(slot.slot, index);
+                return Err(CaptureError::ReferenceOverflow);
+            }
+            self.units[first_unit + index].store(unit_slot, Ordering::Relaxed);
+            drop(additional);
+        }
+        // All fallible acquisition is complete. These new units are private to
+        // this row, so retaining one parent reference cannot overflow. Publish
+        // only after the whole native subset succeeds; failures above leave the
+        // parent untouched and return every partial grant.
+        for (index, expected) in self.owners.iter().enumerate() {
+            if !acquired.contains(index) {
+                continue;
+            }
+            let source_index = source
+                .owner
+                .owners
+                .iter()
+                .position(|owner| Arc::ptr_eq(owner, expected))
+                .expect("attachment membership was checked before acquisition");
+            let unit_slot = self.units[first_unit + index].load(Ordering::Relaxed);
+            expected.slots[unit_slot / 64].references[unit_slot % 64].fetch_add(1, Ordering::Relaxed);
+            source.owner.units[source_first + source_index].store(unit_slot, Ordering::Release);
         }
         Ok(self.finish_capture(slot.slot))
     }
@@ -502,6 +596,189 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_resources_join_parent_completion_without_double_charging() {
+        let a = gate(1);
+        let b = gate(1);
+        let node = node(1);
+        let topology = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("topology");
+        let parent = topology
+            .select(&[a.clone()])
+            .expect("object device")
+            .try_acquire_with_node(&node)
+            .expect("object admission");
+        let native = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("layered metadata disk");
+        let attachment = topology.select(&[a.clone(), b.clone()]).expect("metadata attachment");
+        let acquired = native
+            .try_capture_or_acquire_from(parent.resources(), &attachment)
+            .expect("nonblocking auxiliary I/O");
+        assert_eq!([a.snapshot().active, b.snapshot().active, node.snapshot().active], [1, 1, 1]);
+        let nested = native
+            .try_capture_or_acquire_from(&acquired, &attachment)
+            .expect("reuse full native row");
+        assert_eq!([a.completed(), b.completed(), node.completed()], [Some(0), Some(0), Some(0)]);
+        let tail = acquired.clone();
+        drop((acquired, nested));
+        parent.complete();
+        assert_eq!([a.completed(), b.completed(), node.completed()], [Some(1), Some(1), Some(1)]);
+        assert_eq!(node.snapshot().active, 0, "native work never owns node scheduling capacity");
+        assert_eq!([a.snapshot().active, b.snapshot().active], [1, 1]);
+        drop(tail);
+        assert_eq!([a.snapshot().active, b.snapshot().active], [0, 0]);
+    }
+
+    #[test]
+    fn auxiliary_resource_failure_rolls_back_partial_acquisition_and_cancellation_is_not_progress() {
+        let a = gate(1);
+        let b = gate(1);
+        let c = gate(1);
+        let node = node(1);
+        let topology = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone(), c.clone()]).expect("topology");
+        let parent = topology
+            .select(&[a.clone()])
+            .expect("object device")
+            .try_acquire_with_node(&node)
+            .expect("object admission");
+        let native = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone(), c.clone()]).expect("native carrier");
+        let attachment = topology.select(&[a.clone(), b.clone(), c.clone()]).expect("attachment");
+        c.set_limit(0);
+        assert_eq!(
+            native
+                .try_capture_or_acquire_from(parent.resources(), &attachment)
+                .expect_err("last leaf unavailable"),
+            CaptureError::Unavailable
+        );
+        assert_eq!([a.snapshot().active, b.snapshot().active, c.snapshot().active], [1, 0, 0]);
+        c.set_limit(1);
+        let acquired = native
+            .try_capture_or_acquire_from(parent.resources(), &attachment)
+            .expect("rollback returns the carrier");
+        let tail = acquired.clone();
+        drop((parent, acquired));
+        assert_eq!([a.completed(), b.completed(), c.completed()], [Some(0), Some(0), Some(0)]);
+        b.set_limit(0);
+        drop(tail);
+        assert_eq!([a.snapshot().active, b.snapshot().active, c.snapshot().active], [0, 0, 0]);
+        assert!(b.try_acquire().is_none(), "old native completion cannot undo shrink");
+    }
+
+    #[test]
+    fn auxiliary_resource_acquisition_rejects_foreign_topology_and_wrong_attachment() {
+        let a = gate(1);
+        let b = gate(1);
+        let node = node(1);
+        let topology = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("topology");
+        let parent = topology
+            .select(&[a.clone()])
+            .expect("object device")
+            .try_acquire_with_node(&node)
+            .expect("object admission");
+        let native = AdaptivePermitSetOwner::new(maximum(1), vec![b.clone()]).expect("auxiliary disk");
+        let replacement = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("new topology");
+        for attachment in [
+            replacement.select(&[b.clone()]).expect("new attachment"),
+            topology.select(&[a.clone()]).expect("wrong leaves"),
+        ] {
+            assert_eq!(
+                native
+                    .try_capture_or_acquire_from(parent.resources(), &attachment)
+                    .expect_err("foreign source"),
+                CaptureError::ResourceOwner
+            );
+            assert_eq!([a.snapshot().active, b.snapshot().active], [1, 0]);
+        }
+        let attachment = topology.select(&[b.clone()]).expect("correct attachment");
+        let acquired = native
+            .try_capture_or_acquire_from(parent.resources(), &attachment)
+            .expect("new native unit");
+        assert_eq!(
+            native
+                .try_capture_or_acquire_from(parent.resources(), &attachment)
+                .expect_err("full carrier"),
+            CaptureError::Full
+        );
+        drop(acquired);
+        assert_eq!(b.snapshot().active, 1, "the parent retains its expanded physical plan");
+        parent.complete();
+        assert_eq!([a.completed(), b.completed()], [Some(1), Some(1)]);
+        assert_eq!(b.snapshot().active, 0);
+    }
+
+    #[test]
+    fn auxiliary_acquisition_can_extend_a_partial_row_from_its_own_carrier() {
+        let a = gate(1);
+        let b = gate(1);
+        let node = node(1);
+        let topology = AdaptivePermitSetOwner::new(maximum(2), vec![a.clone(), b.clone()]).expect("topology");
+        let parent = topology
+            .select(&[a.clone()])
+            .expect("object device")
+            .try_acquire_with_node(&node)
+            .expect("object admission");
+        let attachment = topology.select(&[a.clone(), b.clone()]).expect("full layered disk");
+        let acquired = topology
+            .try_capture_or_acquire_from(parent.resources(), &attachment)
+            .expect("additional carrier row");
+        assert_eq!([a.snapshot().active, b.snapshot().active], [1, 1]);
+        parent.complete();
+        assert_eq!([a.completed(), b.completed(), node.completed()], [Some(1), Some(1), Some(1)]);
+        drop(acquired);
+        assert_eq!([a.snapshot().active, b.snapshot().active], [0, 0]);
+    }
+
+    #[test]
+    fn auxiliary_extension_never_waits_and_concurrent_borrowers_share_one_added_unit() {
+        let a = gate(1);
+        let b = gate(1);
+        let node = node(1);
+        let topology = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("topology");
+        let parent = topology
+            .select(&[a.clone()])
+            .expect("object device")
+            .try_acquire_with_node(&node)
+            .expect("object admission");
+        let native = AdaptivePermitSetOwner::new(maximum(8), vec![b.clone()]).expect("auxiliary carrier");
+        let attachment = topology.select(&[b.clone()]).expect("attachment");
+        topology.extending[parent.resources().slot].store(true, Ordering::Release);
+        assert_eq!(
+            native
+                .try_capture_or_acquire_from(parent.resources(), &attachment)
+                .expect_err("busy row"),
+            CaptureError::Unavailable
+        );
+        assert_eq!(b.snapshot().active, 0);
+        topology.extending[parent.resources().slot].store(false, Ordering::Release);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let source = parent.resources().clone();
+                let native = native.clone();
+                let attachment = attachment.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    native.try_capture_or_acquire_from(&source, &attachment)
+                })
+            })
+            .collect();
+        let mut retained = Vec::new();
+        for thread in threads {
+            match thread.join().expect("concurrent extension") {
+                Ok(unit) => retained.push(unit),
+                Err(CaptureError::Unavailable) => {}
+                Err(error) => panic!("unexpected extension failure: {error}"),
+            }
+        }
+        assert!(!retained.is_empty());
+        assert_eq!([a.snapshot().active, b.snapshot().active], [1, 1]);
+        parent.complete();
+        assert_eq!([a.completed(), b.completed()], [Some(1), Some(1)]);
+        assert_eq!(a.snapshot().active, 0);
+        assert_eq!(b.snapshot().active, 1, "only auxiliary native work remains");
+        drop(retained);
+        assert_eq!(b.snapshot().active, 0);
+    }
+
+    #[test]
     fn selected_union_deduplicates_aliases_and_does_not_charge_an_unselected_device() {
         let a = gate(1);
         let b = gate(1);
@@ -536,7 +813,7 @@ mod tests {
         assert_eq!(unrelated.completed(), Some(0), "completion must not credit an unselected device");
         drop(retained);
         assert_eq!(b.snapshot().active, 0);
-        assert!(group.units.iter().all(|unit| unit.load(Ordering::Relaxed) == NO_UNIT));
+        assert!(group.units.iter().all(|unit| unit.load(Ordering::Acquire) == NO_UNIT));
     }
 
     #[test]
@@ -693,7 +970,7 @@ mod tests {
         for (index, gate) in gates.iter().enumerate() {
             assert_eq!(gate.completed(), Some(if boundaries.contains(&index) || index == 1 { 128 } else { 0 }));
         }
-        assert!(group.units.iter().all(|unit| unit.load(Ordering::Relaxed) == NO_UNIT));
+        assert!(group.units.iter().all(|unit| unit.load(Ordering::Acquire) == NO_UNIT));
     }
 
     #[tokio::test]

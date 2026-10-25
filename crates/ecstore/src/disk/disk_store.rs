@@ -1678,7 +1678,7 @@ impl LocalDiskWrapper {
         let unavailable = || DiskError::Io(io::Error::from(io::ErrorKind::WouldBlock));
         let plan = self.physical_admission.plan().ok_or_else(unavailable)?;
         let native = plan
-            .capture_native(&resources)
+            .capture_or_acquire_native(&resources)
             .map_err(|error| DiskError::Io(io::Error::new(io::ErrorKind::WouldBlock, error)))?;
         if !plan.is_current() {
             return Err(unavailable());
@@ -3920,74 +3920,93 @@ mod tests {
         };
         use std::num::NonZeroU16;
 
-        let dir = tempfile::tempdir().expect("local disk fixture");
-        let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
-        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
-        let wrapper = LocalDiskWrapper::new(disk, false);
-        let first = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
-        let second = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
-        let shared = AdaptivePermitSetOwner::new(NonZeroU16::MIN, vec![first.clone(), second.clone()])
-            .expect("shared operation resources");
-        wrapper
-            .physical_admission
-            .set_test_shared_capacity(shared.clone(), vec![first.clone()])
-            .expect("only the first device backs this wrapper");
-        let node = NodeAdmission::new(NonZeroU16::MIN);
-        node.update(
-            &mut FeedbackController::new(),
-            Some(FeedbackObservation {
-                generation: 1,
-                max_concurrency: 1,
-                pressure: ResourcePressure::Unknown,
-                completed_units: None,
-            }),
-        );
-        let parent = shared.try_acquire_with_node(&node).expect("parent admits both devices");
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            crate::disk::with_background_resource_set(parent.resources().clone(), async {
-                wrapper
-                    .track_disk_health_with_op_timeout_action_and_mutation_with_io_permit(
-                        "read_all",
-                        move |permit| async move {
-                            spawn_blocking_with_disk_io_permit(permit, move || {
-                                started_tx.send(()).expect("signal native start");
-                                release_rx.blocking_recv().expect("release native I/O");
-                            })
-                            .await
-                            .expect("native I/O joined");
-                            Ok(())
-                        },
-                        Duration::ZERO,
-                        TimeoutHealthAction::MarkFailure,
-                        DiskMetricMutation::None,
-                    )
-                    .await
-                    .expect("wrapped I/O");
-            })
-            .await;
-            parent.complete();
-        });
-        tokio::time::timeout(Duration::from_secs(5), started_rx)
-            .await
-            .expect("native work starts")
-            .expect("start notification");
-        task.abort();
-        assert!(task.await.expect_err("cancel waiter").is_cancelled());
-        let held = [node.snapshot().active, first.snapshot().active, second.snapshot().active];
-        let healthy_available = second.try_acquire().is_some();
-        release_tx.send(()).expect("finish native work before asserting");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while first.snapshot().active != 0 || second.snapshot().active != 0 {
-                tokio::task::yield_now().await;
+        for auxiliary in [false, true] {
+            let dir = tempfile::tempdir().expect("local disk fixture");
+            let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+            let wrapper = LocalDiskWrapper::new(disk, false);
+            let first = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+            let second = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+            let shared = AdaptivePermitSetOwner::new(NonZeroU16::MIN, vec![first.clone(), second.clone()])
+                .expect("shared operation resources");
+            wrapper
+                .physical_admission
+                .set_test_shared_capacity(shared.clone(), vec![if auxiliary { second.clone() } else { first.clone() }])
+                .expect("only the first device backs this wrapper");
+            let node = NodeAdmission::new(NonZeroU16::MIN);
+            node.update(
+                &mut FeedbackController::new(),
+                Some(FeedbackObservation {
+                    generation: 1,
+                    max_concurrency: 1,
+                    pressure: ResourcePressure::Unknown,
+                    completed_units: None,
+                }),
+            );
+            let parent = if auxiliary {
+                shared
+                    .select(&[first.clone()])
+                    .expect("initial object device")
+                    .try_acquire_with_node(&node)
+            } else {
+                shared.try_acquire_with_node(&node)
             }
-        })
-        .await
-        .expect("native resource return");
-        assert_eq!(held, [0, 1, 0], "only the actual native device remains charged");
-        assert!(healthy_available, "healthy work must resume before native I/O finishes");
-        assert_eq!(node.completed(), Some(0), "cancelled work is not progress");
+            .expect("initial object admission");
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                crate::disk::with_background_resource_set(parent.resources().clone(), async {
+                    wrapper
+                        .track_disk_health_with_op_timeout_action_and_mutation_with_io_permit(
+                            "read_all",
+                            move |permit| async move {
+                                spawn_blocking_with_disk_io_permit(permit, move || {
+                                    started_tx.send(()).expect("signal native start");
+                                    release_rx.blocking_recv().expect("release native I/O");
+                                })
+                                .await
+                                .expect("native I/O joined");
+                                Ok(())
+                            },
+                            Duration::ZERO,
+                            TimeoutHealthAction::MarkFailure,
+                            DiskMetricMutation::None,
+                        )
+                        .await
+                        .expect("wrapped I/O");
+                })
+                .await;
+                parent.complete();
+            });
+            tokio::time::timeout(Duration::from_secs(5), started_rx)
+                .await
+                .expect("native work starts")
+                .expect("start notification");
+            task.abort();
+            assert!(task.await.expect_err("cancel waiter").is_cancelled());
+            let held = [node.snapshot().active, first.snapshot().active, second.snapshot().active];
+            let healthy_available = if auxiliary {
+                first.try_acquire().is_some()
+            } else {
+                second.try_acquire().is_some()
+            };
+            release_tx.send(()).expect("finish native work before asserting");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while first.snapshot().active != 0 || second.snapshot().active != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("native resource return");
+            assert_eq!(
+                held,
+                if auxiliary { [0, 0, 1] } else { [0, 1, 0] },
+                "only the actual native device remains charged"
+            );
+            assert!(healthy_available, "healthy work must resume before native I/O finishes");
+            assert_eq!(node.completed(), Some(0), "cancelled work is not progress");
+            assert_eq!([first.completed(), second.completed()], [Some(0), Some(0)]);
+        }
     }
 
     #[tokio::test]
@@ -4037,6 +4056,73 @@ mod tests {
             drop(reader);
             assert_eq!(first.snapshot().active, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn local_disk_resource_projection_auxiliary_metadata_retries_without_parking_or_false_progress() {
+        use rustfs_concurrency::adaptive::{
+            AdaptiveAdmission, FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure,
+            permit_set::AdaptivePermitSetOwner,
+        };
+        use std::num::NonZeroU16;
+
+        let dir = tempfile::tempdir().expect("metadata fixture");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+        tokio::fs::create_dir_all(dir.path().join("bucket"))
+            .await
+            .expect("metadata bucket");
+        tokio::fs::write(dir.path().join("bucket/metadata"), b"auxiliary metadata")
+            .await
+            .expect("metadata bytes");
+        let a = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let b = AdaptiveAdmission::new(NonZeroU16::MIN, 0);
+        let shared = AdaptivePermitSetOwner::new(NonZeroU16::MIN, vec![a.clone(), b.clone()]).expect("topology");
+        wrapper
+            .physical_admission
+            .set_test_shared_capacity(shared.clone(), vec![b.clone()])
+            .expect("metadata on B");
+        let node = NodeAdmission::new(NonZeroU16::MIN);
+        node.update(
+            &mut FeedbackController::new(),
+            Some(FeedbackObservation {
+                generation: 1,
+                max_concurrency: 1,
+                pressure: ResourcePressure::Unknown,
+                completed_units: None,
+            }),
+        );
+        let parent = shared
+            .select(&[a.clone()])
+            .expect("object on A")
+            .try_acquire_with_node(&node)
+            .expect("object admission");
+        crate::disk::with_background_resource_set(parent.resources().clone(), async {
+            let mut read = Box::pin(wrapper.read_all("bucket", "metadata"));
+            let rejected = std::future::poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+            assert!(
+                matches!(rejected, Poll::Ready(Err(DiskError::Io(error))) if error.kind() == io::ErrorKind::WouldBlock),
+                "auxiliary admission must return immediately under storage locks"
+            );
+            drop(read);
+            assert_eq!([a.snapshot().active, b.snapshot().active, node.snapshot().active], [1, 0, 1]);
+            assert_eq!([a.completed(), b.completed(), node.completed()], [Some(0), Some(0), Some(0)]);
+            b.set_limit(1);
+            for _ in 0..2 {
+                assert_eq!(
+                    wrapper.read_all("bucket", "metadata").await.expect("retry metadata read"),
+                    Bytes::from_static(b"auxiliary metadata")
+                );
+                assert_eq!(b.snapshot().active, 1, "repeated I/O reuses the parent's physical unit");
+            }
+        })
+        .await;
+        assert_eq!(wrapper.metrics_snapshot().total_errors_availability, 0);
+        assert_eq!([a.completed(), b.completed(), node.completed()], [Some(0), Some(0), Some(0)]);
+        parent.complete();
+        assert_eq!([a.completed(), b.completed(), node.completed()], [Some(1), Some(1), Some(1)]);
+        assert_eq!([a.snapshot().active, b.snapshot().active, node.snapshot().active], [0, 0, 0]);
     }
 
     #[tokio::test]
