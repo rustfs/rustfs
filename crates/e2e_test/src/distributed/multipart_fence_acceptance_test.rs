@@ -1269,6 +1269,170 @@ async fn part_resend_owner_serializes_complete_and_abort_after_client_cancellati
             );
         }
     }
+    simultaneous_resend_complete_and_abort(&cluster, &proxies, &clients, &bucket).await
+}
+
+async fn simultaneous_resend_complete_and_abort(
+    cluster: &RustFSTestClusterEnvironment,
+    proxies: &[RpcFaultProxy],
+    clients: &[Client],
+    bucket: &str,
+) -> TestResult {
+    use md5::{Digest as _, Md5};
+
+    for cancel_waiter in [false, true] {
+        let key = format!("three-way-resend-{cancel_waiter}");
+        let previous = payload_for(&key, 4096);
+        clients[0]
+            .put_object()
+            .bucket(bucket)
+            .key(&key)
+            .body(ByteStream::from(previous.clone()))
+            .send()
+            .await?;
+        let upload = clients[0].create_multipart_upload().bucket(bucket).key(&key).send().await?;
+        let upload_id = upload.upload_id().ok_or("missing three-way upload ID")?;
+        let original = clients[0]
+            .upload_part()
+            .bucket(bucket)
+            .key(&key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(vec![0x41; 9 * 1024 * 1024]))
+            .send()
+            .await?;
+        let replacement = vec![0x63; 9 * 1024 * 1024];
+        let replacement_etag = format!(
+            "\"{}\"",
+            hex_simd::encode_to_string(Md5::digest(&replacement), hex_simd::AsciiCase::Lower)
+        );
+        assert_ne!(original.e_tag(), Some(replacement_etag.as_str()));
+        let scope = upload_scope(upload_id)?;
+        let path = upload_path_scope(bucket, &key, upload_id)?;
+        let roots = cluster
+            .nodes
+            .iter()
+            .flat_map(|node| &node.data_dirs)
+            .map(|root| std::path::Path::new(root).join(".rustfs.sys/multipart").join(&path))
+            .collect::<Vec<_>>();
+        let pauses = proxies[1..]
+            .iter()
+            .map(|proxy| proxy.pause(&["PreparePartTransaction"], usize::MAX, Some(&scope)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let resend = clients[0]
+            .upload_part()
+            .bucket(bucket)
+            .key(&key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(replacement.clone()));
+        let caller = tokio::spawn(async move { resend.send().await });
+        wait_for_faults(&pauses, &["PreparePartTransaction"]).await?;
+        let caller = if cancel_waiter {
+            caller.abort();
+            assert!(
+                caller
+                    .await
+                    .expect_err("cancelled three-way part response waiter")
+                    .is_cancelled()
+            );
+            None
+        } else {
+            Some(caller)
+        };
+
+        // The part already owns the upload lock. Distinct forwarded owners
+        // prove that both other coordinators contend, rather than one retrying.
+        let admission = proxies[0].pause_upload_locks(&scope)?;
+        admission.release();
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let complete_request = clients[1]
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(&key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(CompletedPart::builder().part_number(1).e_tag(&replacement_etag).build())
+                    .build(),
+            );
+        let complete_start = start.clone();
+        let mut complete = tokio::spawn(async move {
+            complete_start.wait().await;
+            complete_request.send().await
+        });
+        let abort_request = clients[2]
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(&key)
+            .upload_id(upload_id);
+        let abort_start = start.clone();
+        let mut abort = tokio::spawn(async move {
+            abort_start.wait().await;
+            abort_request.send().await
+        });
+        start.wait().await;
+        wait_until(
+            DEADLINE,
+            || async { Ok(admission.forwarded_lock_owners() == 2) },
+            "Complete and Abort from distinct upload-lock owners reach the peer",
+        )
+        .await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut complete).await.is_err(),
+            "Complete must wait while the resent part is prepared: cancel_waiter={cancel_waiter}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut abort).await.is_err(),
+            "Abort must wait while the resent part is prepared: cancel_waiter={cancel_waiter}"
+        );
+        for pause in &pauses {
+            pause.release();
+        }
+        if let Some(caller) = caller {
+            let part = tokio::time::timeout(DEADLINE, caller).await???;
+            assert_eq!(part.e_tag(), Some(replacement_etag.as_str()));
+        }
+        let completed = match tokio::time::timeout(DEADLINE, complete).await?? {
+            Ok(_) => true,
+            Err(error) => {
+                assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(404), "{error:?}");
+                assert_eq!(error.as_service_error().and_then(|error| error.meta().code()), Some("NoSuchUpload"));
+                false
+            }
+        };
+        let aborted = tokio::time::timeout(DEADLINE, abort).await??;
+        if !completed {
+            aborted?;
+        } else if let Err(error) = aborted {
+            assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(404), "{error:?}");
+            assert_eq!(error.as_service_error().and_then(|error| error.meta().code()), Some("NoSuchUpload"));
+        }
+        wait_until(
+            DEADLINE,
+            || async { Ok(roots.iter().all(|root| !root.exists())) },
+            "three-way terminal operation retires every staging root",
+        )
+        .await?;
+        let expected = if completed { &replacement } else { &previous };
+        for client in clients {
+            assert_object_bytes(client, bucket, &key, expected).await?;
+            let missing = client
+                .list_parts()
+                .bucket(bucket)
+                .key(&key)
+                .upload_id(upload_id)
+                .send()
+                .await
+                .expect_err("three-way terminal upload must reject ListParts");
+            assert_eq!(missing.as_service_error().and_then(|error| error.meta().code()), Some("NoSuchUpload"));
+        }
+        assert_no_uploads(clients, bucket).await?;
+        eprintln!(
+            "MPU three-way owner: cancel_waiter={cancel_waiter}, complete_won={completed}, forwarded_terminal_owners={}, prepared_peers=3, retired_roots=4, verified_readers=4",
+            admission.forwarded_lock_owners()
+        );
+    }
     Ok(())
 }
 

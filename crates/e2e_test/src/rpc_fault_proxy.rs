@@ -23,7 +23,9 @@ use hyper_util::{
     server::conn::auto,
 };
 use prost::Message as _;
-use rustfs_protos::proto_gen::node_service::{DeleteRequest, ReadVersionRequest, RenameDataResponse};
+use rustfs_protos::proto_gen::node_service::{
+    BatchGenerallyLockRequest, DeleteRequest, GenerallyLockRequest, ReadVersionRequest, RenameDataResponse,
+};
 use std::{
     collections::HashSet,
     io,
@@ -61,6 +63,8 @@ struct PauseState {
     blocked: AtomicUsize,
     forwarded: AtomicUsize,
     forwarded_routes: Mutex<HashSet<String>>,
+    record_lock_owners: bool,
+    forwarded_lock_owners: Mutex<HashSet<String>>,
     reached: Notify,
     release: watch::Sender<Disposition>,
 }
@@ -85,6 +89,14 @@ impl RpcPause {
 
     pub(crate) fn forwarded_routes(&self) -> usize {
         self.state.forwarded_routes.lock().expect("RPC route observations").len()
+    }
+
+    pub(crate) fn forwarded_lock_owners(&self) -> usize {
+        self.state
+            .forwarded_lock_owners
+            .lock()
+            .expect("RPC lock owner observations")
+            .len()
     }
 
     pub(crate) fn responses(&self) -> usize {
@@ -245,7 +257,12 @@ impl RpcFaultProxy {
     /// Pause at most limit requests to the named unary methods; other streams
     /// on the same HTTP/2 connection continue forwarding.
     pub(crate) fn pause(&self, methods: &[&'static str], limit: usize, scope: Option<&str>) -> io::Result<RpcPause> {
-        self.pause_with_lifetime(methods, limit, scope, false)
+        self.pause_with_lifetime(methods, limit, scope, false, false)
+    }
+
+    /// Distinguish contenders by owner rather than counting lock retries.
+    pub(crate) fn pause_upload_locks(&self, scope: &str) -> io::Result<RpcPause> {
+        self.pause_with_lifetime(&["Lock", "LockBatch"], usize::MAX, Some(scope), false, true)
     }
 
     /// Retain bounded control packets until explicit delivery after caller retirement.
@@ -256,7 +273,7 @@ impl RpcFaultProxy {
                 "late RPC limit exceeds control-packet budget",
             ));
         }
-        self.pause_with_lifetime(methods, limit, Some(scope), true)
+        self.pause_with_lifetime(methods, limit, Some(scope), true, false)
     }
 
     fn pause_with_lifetime(
@@ -265,6 +282,7 @@ impl RpcFaultProxy {
         limit: usize,
         scope: Option<&str>,
         retain_after_disconnect: bool,
+        record_lock_owners: bool,
     ) -> io::Result<RpcPause> {
         let mut slot = self.slot.lock().expect("RPC pause slot");
         if slot.is_some() || methods.is_empty() || limit == 0 || scope.is_some_and(str::is_empty) {
@@ -285,6 +303,8 @@ impl RpcFaultProxy {
             blocked: AtomicUsize::new(0),
             forwarded: AtomicUsize::new(0),
             forwarded_routes: Mutex::new(HashSet::new()),
+            record_lock_owners,
+            forwarded_lock_owners: Mutex::new(HashSet::new()),
             reached: Notify::new(),
             release,
         });
@@ -319,6 +339,26 @@ fn scope_matches(method: &str, body: &[u8], scope: &[u8]) -> io::Result<bool> {
         && options.get("recursive").and_then(serde_json::Value::as_bool) == Some(true))
 }
 
+fn scoped_lock_owners(method: &str, body: &[u8], scope: &[u8]) -> io::Result<Vec<String>> {
+    let payload = unary_payload(body)?;
+    let args = match method {
+        "Lock" => vec![GenerallyLockRequest::decode(payload).map_err(io::Error::other)?.args],
+        "LockBatch" => BatchGenerallyLockRequest::decode(payload).map_err(io::Error::other)?.args,
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "lock observer requires a lock method")),
+    };
+    args.into_iter()
+        .filter(|args| args.as_bytes().windows(scope.len()).any(|window| window == scope))
+        .map(|args| {
+            let request: serde_json::Value = serde_json::from_str(&args).map_err(io::Error::other)?;
+            request["owner"]
+                .as_str()
+                .filter(|owner| !owner.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "scoped lock needs an owner"))
+        })
+        .collect()
+}
+
 async fn forward_request(
     request: Request<Incoming>,
     client: ProxyClient,
@@ -332,6 +372,7 @@ async fn forward_request(
         let method = parts.uri.path().strip_prefix("/node_service.NodeService/");
         if let Some(method) = method.filter(|name| pause.methods.contains(name)) {
             let mut route = None;
+            let mut lock_owners = Vec::new();
             let matches = if let Some(scope) = pause.scope.as_deref() {
                 // Inspect bounded control routing while preserving the exact
                 // signed bytes and trailers forwarded to the backend.
@@ -339,6 +380,9 @@ async fn forward_request(
                 let trailers = collected.trailers().cloned();
                 let bytes = collected.to_bytes();
                 let matches = scope_matches(method, &bytes, scope)?;
+                if matches && pause.record_lock_owners {
+                    lock_owners = scoped_lock_owners(method, &bytes, scope)?;
+                }
                 if matches && method == "ReadVersion" {
                     let disk = ReadVersionRequest::decode(unary_payload(&bytes)?)
                         .map_err(io::Error::other)?
@@ -374,6 +418,7 @@ async fn forward_request(
                 observed = Some((
                     pause,
                     route,
+                    lock_owners,
                     matches!(method, "RenameData" | "RenameDataAtIncarnation" | "RenameDataWithQuotaFence"),
                 ));
             }
@@ -397,13 +442,18 @@ async fn forward_request(
         .request(Request::from_parts(parts, body))
         .await
         .map_err(io::Error::other)?;
-    if let Some((pause, route, rename)) = observed {
+    if let Some((pause, route, lock_owners, rename)) = observed {
         pause.responses.fetch_add(1, Ordering::SeqCst);
         if response.status().is_success() && response.headers().get("grpc-status").is_none_or(|status| status == "0") {
             pause.forwarded.fetch_add(1, Ordering::SeqCst);
             if let Some(route) = route {
                 pause.forwarded_routes.lock().expect("RPC route observations").insert(route);
             }
+            pause
+                .forwarded_lock_owners
+                .lock()
+                .expect("RPC lock owner observations")
+                .extend(lock_owners);
         }
         if pause.retain_after_disconnect {
             let (parts, body) = response.into_parts();
@@ -661,6 +711,57 @@ mod tests {
         })
         .await
         .expect("passive observer deadline");
+        assert_upload_lock_owner_observations().await;
+    }
+
+    async fn assert_upload_lock_owner_observations() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let backend = backend().await.expect("lock observation backend");
+            let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback"), backend.address)
+                .await
+                .expect("lock observation proxy");
+            let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(true).build_http();
+            let observer = proxy.pause_upload_locks("target-upload").expect("typed lock observer");
+            observer.release();
+            let args = |owner: &str, resource: &str| serde_json::json!({"owner": owner, "resource": resource}).to_string();
+            for (method, requests, expected) in [
+                ("Lock", vec![args("a", "target-upload")], 1),
+                ("Lock", vec![args("a", "target-upload")], 1),
+                ("Lock", vec![args("b", "other-upload")], 1),
+                ("LockBatch", vec![args("a", "target-upload"), args("b", "target-upload")], 2),
+                ("LockBatch", vec![args("c", "other-upload"), args("b", "target-upload")], 2),
+                ("Lock", vec![args("c", "target-upload")], 3),
+            ] {
+                let payload = if method == "Lock" {
+                    GenerallyLockRequest {
+                        args: requests[0].clone(),
+                    }
+                    .encode_to_vec()
+                } else {
+                    BatchGenerallyLockRequest { args: requests }.encode_to_vec()
+                };
+                let mut frame = vec![0];
+                frame.extend_from_slice(&u32::try_from(payload.len()).expect("small lock frame").to_be_bytes());
+                frame.extend_from_slice(&payload);
+                let frame = Bytes::from(frame);
+                let body = call_body(&client, proxy.local_addr(), method, frame.clone())
+                    .await
+                    .expect("observed lock reaches backend")
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("observed lock response");
+                assert_eq!(body.trailers().expect("preserved lock trailers")["x-proof"], "unchanged-proof");
+                assert_eq!(body.to_bytes(), frame, "signed packet bytes must remain unchanged");
+                assert_eq!(
+                    observer.forwarded_lock_owners(),
+                    expected,
+                    "retries and other resources are not new contenders"
+                );
+            }
+        })
+        .await
+        .expect("lock owner observation deadline");
     }
 
     #[tokio::test]
