@@ -250,7 +250,7 @@ impl ECStore {
         }
 
         let bucket_incarnation_fence = match bucket_configs.bucket_incarnation_id {
-            Some(expected) => Some(self.acquire_bucket_incarnation_fence(&bucket, expected).await?),
+            Some(expected) => Some(Arc::new(self.acquire_bucket_incarnation_fence(&bucket, expected).await?)),
             None => None,
         };
 
@@ -533,9 +533,8 @@ impl ECStore {
                         &cleanup_transferred_tier_versions,
                         data_movement::SourceCleanupBucketFence {
                             expected_incarnation_id: bucket_configs.bucket_incarnation_id,
-                            lifecycle_guard: bucket_incarnation_fence
-                                .as_ref()
-                                .and_then(|guard| guard.namespace_lock_guard()),
+                            lifecycle_owner: bucket_incarnation_fence.as_ref(),
+                            lifecycle_guard: None,
                             namespace_lock_lost_signal: lock_lost_signal.clone(),
                             ..Default::default()
                         },
@@ -1729,6 +1728,8 @@ mod tests {
         /// Both versions are on the target with their identities, the null
         /// version's content and SHA-256 are intact, and the source is gone.
         async fn assert_moved(&self) {
+            use crate::disk::DiskAPI as _;
+
             let target = self.store.pools[1]
                 .get_disks_by_key(self.object)
                 .load_file_info_versions_exact(self.bucket, self.object)
@@ -1769,6 +1770,16 @@ mod tests {
                 self.source_versions().await.is_none(),
                 "the source entry must be removed only after both versions moved"
             );
+            let source_disks = self.source_set.disk_inventory().await;
+            assert_eq!(source_disks.iter().flatten().count(), 2, "both source disks must be online");
+            for disk in source_disks.into_iter().flatten() {
+                assert!(
+                    !tokio::fs::try_exists(disk.path().join(self.bucket).join(self.object))
+                        .await
+                        .expect("inspect the physical rebalance source path"),
+                    "rebalance must remove source metadata and shards from every disk"
+                );
+            }
         }
     }
 

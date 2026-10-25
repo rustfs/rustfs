@@ -31,7 +31,7 @@ use crate::storage_api_contracts::{
     namespace::NamespaceLocking as _,
     object::{HTTPPreconditions, ObjectOperations as _},
 };
-use crate::store::{DecommissionFixedReadAnchor, ECStore, SourceCleanupMutationFence};
+use crate::store::{BucketIncarnationFenceGuard, DecommissionFixedReadAnchor, ECStore, SourceCleanupMutationFence};
 use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, FileInfoVersions, ObjectPartInfo};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
@@ -1278,6 +1278,7 @@ pub(crate) enum SourceCleanupError {
 #[derive(Clone, Default)]
 pub(crate) struct SourceCleanupBucketFence<'a> {
     pub(crate) expected_incarnation_id: Option<uuid::Uuid>,
+    pub(crate) lifecycle_owner: Option<&'a Arc<BucketIncarnationFenceGuard>>,
     pub(crate) lifecycle_guard: Option<&'a rustfs_lock::NamespaceLockGuard>,
     pub(crate) namespace_lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
     pub(crate) object_mutation_fence: Option<&'a SourceCleanupMutationFence>,
@@ -1486,9 +1487,10 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
         )
     };
 
-    if bucket_fence
-        .lifecycle_guard
-        .is_some_and(rustfs_lock::NamespaceLockGuard::is_lock_lost)
+    if bucket_fence.lifecycle_owner.is_some_and(|owner| owner.is_lock_lost())
+        || bucket_fence
+            .lifecycle_guard
+            .is_some_and(rustfs_lock::NamespaceLockGuard::is_lock_lost)
     {
         return Err(SourceCleanupError::Storage(Error::other(format!(
             "{op_label}: bucket incarnation fence was lost before source cleanup"
@@ -1526,6 +1528,9 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
     }
     if let Some(object_mutation_fence) = bucket_fence.object_mutation_fence {
         object_mutation_fence.add_namespace_lock_fence(&mut opts);
+    }
+    if let Some(owner) = bucket_fence.lifecycle_owner {
+        owner.attach_owner(&mut opts);
     }
     if let Some(bucket_lifecycle_guard) = bucket_fence.lifecycle_guard {
         opts.add_bucket_lifecycle_lock_guard(bucket_lifecycle_guard);

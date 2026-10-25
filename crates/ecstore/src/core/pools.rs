@@ -17046,6 +17046,7 @@ impl ECStore {
             &[],
             data_movement::SourceCleanupBucketFence {
                 expected_incarnation_id: None,
+                lifecycle_owner: None,
                 lifecycle_guard: None,
                 namespace_lock_lost_signal: pool_meta_guard.lock_lost_signal(),
                 object_mutation_fence: Some(&object_fence),
@@ -17314,7 +17315,7 @@ impl ECStore {
         let operation_gate = self.ctx.data_movement_operation_gate();
 
         let bucket_incarnation_fence = match expected_bucket_incarnation_id {
-            Some(expected) => Some(self.acquire_bucket_incarnation_fence(&bucket, expected).await?),
+            Some(expected) => Some(Arc::new(self.acquire_bucket_incarnation_fence(&bucket, expected).await?)),
             None => None,
         };
 
@@ -18250,9 +18251,8 @@ impl ECStore {
                         &cleanup_transferred_tier_versions,
                         data_movement::SourceCleanupBucketFence {
                             expected_incarnation_id: expected_bucket_incarnation_id,
-                            lifecycle_guard: bucket_incarnation_fence
-                                .as_ref()
-                                .and_then(|guard| guard.namespace_lock_guard()),
+                            lifecycle_owner: bucket_incarnation_fence.as_ref(),
+                            lifecycle_guard: None,
                             namespace_lock_lost_signal: None,
                             object_mutation_fence: Some(&source_cleanup_mutation_fence),
                         },

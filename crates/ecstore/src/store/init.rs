@@ -7794,6 +7794,103 @@ mod tests {
             .expect_err("suspended delete must remove the requested UUID version");
     }
 
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn decommission_entry_retains_lifecycle_owner_through_source_cleanup() {
+        use crate::disk::DiskAPI as _;
+
+        let temp_dir = tempfile::tempdir().expect("create decommission lifecycle-owner store");
+        let (_ctx, store, shutdown) = Box::pin(without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "decommission-lifecycle-owner",
+            &[4, 4],
+        )))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = format!("decom-lifecycle-owner-{}", uuid::Uuid::new_v4());
+        let object = "source.bin";
+        let payload = vec![b'o'; 1_300_000];
+        Box::pin(store.make_bucket(&bucket, &MakeBucketOptions::default()))
+            .await
+            .expect("create ordinary source bucket");
+        let incarnation = store.bucket_incarnation_id(&bucket).await.expect("source bucket incarnation");
+        let opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        Box::pin(seed_decommission_source(&store, &bucket, object, payload.clone(), &opts)).await;
+        let source_set = store.pools[0].get_disks_by_key(object);
+        let expected = source_set
+            .load_file_info_versions_exact(&bucket, object)
+            .await
+            .expect("load the exact cleanup snapshot")
+            .expect("source object must exist");
+        let source_disks = source_set.disk_inventory().await;
+        assert_eq!(source_disks.iter().flatten().count(), 4, "all source disks must be online");
+        let owner = store
+            .acquire_bucket_incarnation_fence(&bucket, incarnation)
+            .await
+            .expect("hold source bucket lifecycle");
+        let rejected = Box::pin(crate::data_movement::cleanup_source_entry_if_unchanged(
+            Arc::clone(&source_set),
+            &bucket,
+            object,
+            &expected,
+            &[],
+            &[],
+            crate::data_movement::SourceCleanupBucketFence {
+                expected_incarnation_id: Some(incarnation),
+                lifecycle_guard: owner.namespace_lock_guard(),
+                ..Default::default()
+            },
+            "test_unowned_source_cleanup",
+        ))
+        .await
+        .expect_err("a bare lifecycle signal must not authorize source cleanup");
+        assert!(
+            rejected
+                .to_string()
+                .contains("write requires an owned bucket lifecycle fence"),
+            "cleanup must reject the missing owner: {rejected}"
+        );
+        let mut source = source_set
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("rejected cleanup must preserve the readable source");
+        let mut remaining = Vec::new();
+        source
+            .stream
+            .read_to_end(&mut remaining)
+            .await
+            .expect("drain preserved source");
+        assert_eq!(remaining, payload);
+        drop(source);
+        drop(owner);
+
+        mark_test_pool_decommissioning(&store, 0).await;
+        Box::pin(run_decommission_entry_retry_test(
+            &store,
+            CancellationToken::new(),
+            &bucket,
+            object,
+            Some(incarnation),
+            Arc::new(AtomicUsize::new(0)),
+        ))
+        .await
+        .expect("decommission must copy and clean the ordinary bucket entry with its real owner");
+        assert_eq!(read_decommission_target_body(&store, &bucket, object, &opts).await, payload);
+        assert_decommission_source_absent(&store, &bucket, object, &opts).await;
+        for disk in source_disks.into_iter().flatten() {
+            assert!(
+                !tokio::fs::try_exists(disk.path().join(&bucket).join(object))
+                    .await
+                    .expect("inspect the physical source path"),
+                "source metadata and shards must be removed from every disk"
+            );
+        }
+        shutdown.cancel();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
     async fn decommission_entry_carries_migration_and_cleanup_mutation_fences() {
