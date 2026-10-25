@@ -85,7 +85,7 @@ async fn historical_index_preserves_ranges_across_compression_blocks() {
         let plan = ReadPlan::build(Some(range.clone()), &info, &ObjectOptions::default(), &HeaderMap::new())
             .await
             .expect("plan historical compressed range");
-        let physical = usize::try_from(plan.storage_offset).expect("storage offset is nonnegative");
+        let physical = plan.storage_offset;
         let input = STREAM.get(physical..).expect("planned offset stays within the fixed stream");
         let (mut reader, _, _) = GetObjectReader::new(
             Box::new(Cursor::new(input.to_vec())),
@@ -116,7 +116,7 @@ async fn current_index_selects_a_fixed_compressed_block_for_a_range() {
         .await
         .expect("plan range with fixed current index");
     assert_eq!(plan.storage_offset, 34_663, "use the recorded second block boundary");
-    let physical = usize::try_from(plan.storage_offset).expect("positive fixture offset");
+    let physical = plan.storage_offset;
     let (mut reader, _, _) = GetObjectReader::new(
         Box::new(Cursor::new(STREAM[physical..].to_vec())),
         Some(range),
