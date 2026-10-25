@@ -47,6 +47,8 @@ async fn fixture_from_binary(
     let mut cluster =
         RustFSTestClusterEnvironment::with_topology(ClusterTopology::single_pool_multidrive(4, drives_per_node)).await?;
     if binary.is_some() {
+        cluster.set_env("TOKIO_WORKER_THREADS", "2");
+        cluster.set_env("RAYON_NUM_THREADS", "2");
         // The pinned release passes host_str() directly to TCP resolution,
         // which rejects bracketed IPv6. A loopback hostname retains direct
         // IPv4 S3 listeners and the same signed RPC port. Scoped hit counts

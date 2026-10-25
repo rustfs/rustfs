@@ -130,4 +130,6 @@ python3 scripts/e2e_binary.py run --features e2e-test-hooks -- \
   cargo test -p e2e_test distributed::multipart_fence_acceptance_test -- --test-threads=1 --nocapture
 ```
 
+`RUSTFS_E2E_LOG_FILTER` optionally overrides node log filtering for distributed fixtures; its absence preserves each fixture's existing filter. Use a narrow module filter when diagnosing RPC responses and keep logs with the matching server provenance.
+
 `RUSTFS_E2E_MPU_LOAD_ROUNDS` accepts 1–256 and defaults to three rounds. Allocate a private target directory and bounded CPU/memory resources before running the eight-process case. Temporary drive directories follow `TMPDIR`; use a task-owned directory on the intended filesystem. These are plaintext loopback processes and logical drives on one host, so passing them does not establish physical-drive independence, TLS behavior, the original incident cause, or a throughput improvement. Performance comparisons require a separate controlled baseline and drift-checked measurement.
