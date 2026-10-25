@@ -1219,7 +1219,7 @@ impl LocalDisk {
         let journal = journal_bytes(journal)?;
         self.wait_for_startup_cleanup().await;
         let temporary = self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?;
-        let root = self.io_get_object_path(volume, object)?;
+        let (bucket, root) = self.io_get_bucket_and_object_path(volume, object)?;
         let destination = root.join(transaction.to_string());
         let original = original.map(<[u8]>::to_vec);
         let sync = effective_durability(volume).syncs_commit_metadata();
@@ -1227,7 +1227,7 @@ impl LocalDisk {
         let record_destination = destination.clone();
         let staging_root = temporary.clone();
         let lease = os::acquire_namespace_mutation_lease_with_owner(&destination, owner.clone()).await;
-        let (staged, target) = os::run_blocking_namespace_operation(lease, move || {
+        let (staged, target) = os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
             std::fs::create_dir_all(&staging_root)?;
             let staged = Arc::new(
                 tempfile::Builder::new()
@@ -1280,25 +1280,27 @@ impl LocalDisk {
         // The directory owner accompanies the blocking rename, so cancelling
         // its waiter cannot delete staged files while activation is running.
         let publication_owner: Option<Arc<dyn Send + Sync>> = Some(Arc::new((owner.clone(), staged.clone())));
-        os::rename_all_with_owner(
-            staged.path(),
-            &destination,
-            &self.io_get_bucket_path(volume)?,
-            &self.publication_root,
-            publication_owner,
-        )
-        .await?;
+        os::rename_all_with_owner(staged.path(), &destination, &bucket, &self.publication_root, publication_owner).await?;
         if sync {
-            let bucket = self.io_get_bucket_path(volume)?;
+            let mut dirs_to_sync = Vec::new();
             let mut path = root.as_path();
             loop {
-                os::fsync_dir_with_owner(path, owner.clone()).await.map_err(to_file_error)?;
+                dirs_to_sync.push(path.to_path_buf());
                 if path == bucket {
                     break;
                 }
                 path = path.parent().ok_or(DiskError::InvalidPath)?;
             }
-            os::fsync_dir_with_owner(&temporary, owner.clone())
+            dirs_to_sync.push(temporary);
+            let sync_owner = owner.clone();
+            self.blocking_queue
+                .run_fsync_cancellable(move |_| {
+                    let _owner = sync_owner;
+                    for dir in dirs_to_sync {
+                        os::fsync_dir_std(&dir)?;
+                    }
+                    Ok(())
+                })
                 .await
                 .map_err(to_file_error)?;
         }
@@ -1733,18 +1735,15 @@ impl LocalDisk {
                 }
                 self.commit_reserved_version_delete_with_namespace_owner(volume, object, transaction, owner.clone())
                     .await?;
-                for name in [STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE] {
-                    match os::remove_file_with_owner(rollback.join(name), owner.clone()).await {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == ErrorKind::NotFound => {}
-                        Err(err) => return Err(to_file_error(err).into()),
-                    }
-                }
-                if effective_durability(volume).syncs_commit_metadata() {
-                    os::fsync_dir_with_owner(&rollback, owner.clone())
-                        .await
-                        .map_err(to_file_error)?;
-                }
+                os::remove_files_and_fsync_with_owner(
+                    &rollback,
+                    &[STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE],
+                    effective_durability(volume).syncs_commit_metadata(),
+                    None,
+                    owner.clone(),
+                )
+                .await
+                .map_err(to_file_error)?;
                 let (_, complete) = self
                     .finish_version_delete(volume, object, transaction, true, owner.clone())
                     .await?;
@@ -1798,18 +1797,17 @@ impl LocalDisk {
                         Err(err) => return Err(to_file_error(err).into()),
                     }
                 }
-                write_delete_rollback_file(self.io_root(), volume, &root, transaction, FINISHED, &[], owner.clone()).await?;
                 let receipt = CommitReceipt {
                     journal: journal.clone(),
                     finished: true,
                 };
-                write_delete_rollback_file(
+                let receipt_bytes = serde_json::to_vec(&receipt)?;
+                write_delete_rollback_files(
                     self.io_root(),
                     volume,
                     &root,
                     transaction,
-                    DELETE_QUORUM_COMMITTED_FILE,
-                    &serde_json::to_vec(&receipt)?,
+                    &[(FINISHED, &[]), (DELETE_QUORUM_COMMITTED_FILE, &receipt_bytes)],
                     owner.clone(),
                 )
                 .await?;
@@ -1818,21 +1816,15 @@ impl LocalDisk {
                 if observed.state != DeleteRecoveryState::CommitFinished {
                     return Err(DiskError::DiskOngoingReq);
                 }
-                for name in [TARGET, PREPARED, FINISHED] {
-                    match os::remove_file_with_owner(rollback.join(name), owner.clone()).await {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == ErrorKind::NotFound => {}
-                        Err(err) => return Err(to_file_error(err).into()),
-                    }
-                }
-                if effective_durability(volume).syncs_commit_metadata() {
-                    os::fsync_dir_with_owner(&rollback, owner.clone())
-                        .await
-                        .map_err(to_file_error)?;
-                }
-                os::remove_file_with_owner(rollback.join(DELETE_QUORUM_COMMITTED_FILE), owner.clone())
-                    .await
-                    .map_err(to_file_error)?;
+                os::remove_files_and_fsync_with_owner(
+                    &rollback,
+                    &[TARGET, PREPARED, FINISHED],
+                    effective_durability(volume).syncs_commit_metadata(),
+                    Some(DELETE_QUORUM_COMMITTED_FILE),
+                    owner.clone(),
+                )
+                .await
+                .map_err(to_file_error)?;
                 self.delete_unleased_with_namespace_owner(
                     volume,
                     &format!("{object}/{transaction}"),
