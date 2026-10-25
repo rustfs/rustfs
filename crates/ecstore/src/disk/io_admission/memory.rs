@@ -80,9 +80,9 @@ impl BackgroundMemoryBudget {
         let used = state
             .used
             .checked_add(bytes)
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, BackgroundMemoryExhausted))?;
         if bytes != 0 && (Instant::now() >= state.valid_until || used > state.limit) {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "background buffer memory budget exhausted"));
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, BackgroundMemoryExhausted));
         }
         state.used = used;
         Ok(Reservation {
@@ -90,6 +90,22 @@ impl BackgroundMemoryBudget {
             bytes,
         })
     }
+}
+
+#[derive(Debug)]
+struct BackgroundMemoryExhausted;
+
+impl std::fmt::Display for BackgroundMemoryExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("background buffer memory budget exhausted")
+    }
+}
+
+impl std::error::Error for BackgroundMemoryExhausted {}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn is_memory_pressure(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::OutOfMemory || error.get_ref().is_some_and(|inner| inner.is::<BackgroundMemoryExhausted>())
 }
 
 pub(crate) struct Reservation {

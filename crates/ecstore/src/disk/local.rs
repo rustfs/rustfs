@@ -5205,6 +5205,32 @@ impl FdCache {
 struct UringReadOwner {
     _resource_unit: Option<ResourceIoUnit>,
     _mount_lease: Option<Arc<std::fs::File>>,
+    _memory: Option<Arc<super::io_admission::memory::Reservation>>,
+}
+
+#[cfg(target_os = "linux")]
+struct UringReadBuffer {
+    // Free the entire native allocation before refunding its shared receipt.
+    bytes: Vec<u8>,
+    memory: Option<Arc<super::io_admission::memory::Reservation>>,
+}
+
+#[cfg(target_os = "linux")]
+impl UringReadBuffer {
+    fn into_bytes(self) -> Bytes {
+        if self.memory.is_some() {
+            Bytes::from_owner(self)
+        } else {
+            Bytes::from(self.bytes)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AsRef<[u8]> for UringReadBuffer {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -5652,13 +5678,47 @@ impl UringBackend {
         }
     }
 
-    fn native_read_owner(&self) -> UringReadOwner {
+    async fn read_native(
+        &self,
+        file: Arc<std::fs::File>,
+        offset: u64,
+        length: usize,
+        direct_alignment: Option<usize>,
+    ) -> std::io::Result<UringReadBuffer> {
+        let memory = current_resource_unit()
+            .and_then(|resources| resources.memory_budget())
+            .map(|budget| {
+                // The pinned driver returns its original Vec, retaining both
+                // the aligned region and address-alignment padding after CQE.
+                let align = direct_alignment.unwrap_or(1);
+                if !align.is_power_of_two() {
+                    return Err(std::io::Error::from(ErrorKind::InvalidInput));
+                }
+                let align_u64 = u64::try_from(align).map_err(|_| ErrorKind::InvalidInput)?;
+                let head = usize::try_from(offset % align_u64).map_err(|_| ErrorKind::InvalidInput)?;
+                let capacity = head
+                    .checked_add(length)
+                    .and_then(|size| size.checked_next_multiple_of(align))
+                    .and_then(|size| size.checked_add(align - 1))
+                    .ok_or(ErrorKind::InvalidInput)?;
+                budget.reserve(capacity).map(Arc::new)
+            })
+            .transpose()?;
         // Only the submitted read owns these leases; the descriptor cache and
         // returned bytes must not retain a physical I/O slot.
-        UringReadOwner {
+        let owner = UringReadOwner {
             _resource_unit: current_resource_unit(),
             _mount_lease: self.inner.mount_lease.clone(),
-        }
+            _memory: memory.clone(),
+        };
+        // Declare the handle after its memory receipt so cancellation frees a
+        // queued result before refunding the caller's share of the allocation.
+        let read = match direct_alignment {
+            Some(align) => self.driver.read_at_direct_with_owner(file, offset, length, align, owner),
+            None => self.driver.read_at_with_owner(file, offset, length, owner),
+        };
+        let bytes = read.await?;
+        Ok(UringReadBuffer { bytes, memory })
     }
 
     /// Positioned read via io_uring. Mirrors `StdBackend::pread_bytes`'s
@@ -5746,12 +5806,8 @@ impl UringBackend {
         let file_for_reclaim = Arc::clone(&file);
         let bytes = if length <= self.read_chunk_size.get() {
             // Fast path: one op. The driver's Vec becomes the result with no copy.
-            match self
-                .driver
-                .read_at_with_owner(file, offset_u64, length, self.native_read_owner())
-                .await
-            {
-                Ok(bytes) => bytes,
+            match self.read_native(file, offset_u64, length, None).await {
+                Ok(buffer) => buffer.into_bytes(),
                 Err(io_err) => {
                     // Latch io_uring off for this disk if the errno says the
                     // subsystem is unusable (backlog#1101); the caller falls back
@@ -5766,16 +5822,19 @@ impl UringBackend {
             // Sequential chunks cap each driver operation's logical length.
             // The full assembled result below is a separate allocation and is
             // not bounded by the per-operation cap.
-            let mut assembled = Vec::with_capacity(length);
+            let memory = current_resource_unit()
+                .and_then(|resources| resources.memory_budget())
+                .map(|budget| budget.reserve(length))
+                .transpose()?;
+            let mut assembled = Vec::new();
+            assembled
+                .try_reserve_exact(length)
+                .map_err(|_| std::io::Error::from(ErrorKind::OutOfMemory))?;
             let mut done = 0usize;
             while done < length {
                 let chunk = (length - done).min(self.read_chunk_size.get());
                 let chunk_off = offset_u64 + done as u64;
-                let part = match self
-                    .driver
-                    .read_at_with_owner(Arc::clone(&file), chunk_off, chunk, self.native_read_owner())
-                    .await
-                {
+                let part = match self.read_native(Arc::clone(&file), chunk_off, chunk, None).await {
                     Ok(part) => part,
                     Err(io_err) => {
                         if is_io_uring_unsupported(&io_err) {
@@ -5784,15 +5843,15 @@ impl UringBackend {
                         return Err(DiskError::from(io_err));
                     }
                 };
-                if part.len() != chunk {
+                if part.bytes.len() != chunk {
                     // A short chunk before the end means EOF: the file is shorter
                     // than offset + length, same as the miss path's meta check.
                     return Err(DiskError::FileCorrupt);
                 }
-                assembled.extend_from_slice(&part);
+                assembled.extend_from_slice(&part.bytes);
                 done += chunk;
             }
-            assembled
+            super::io_admission::memory::Reservation::wrap(Bytes::from(assembled), memory)
         };
         if bytes.len() != length {
             // The driver resubmits short reads, so a short result means EOF: the
@@ -5806,7 +5865,7 @@ impl UringBackend {
         if should_reclaim_file_cache_after_read(length) {
             reclaim_read_range(&file_for_reclaim, offset_u64, length)?;
         }
-        Ok(Bytes::from(bytes))
+        Ok(bytes)
     }
 
     /// Native O_DIRECT positioned read through io_uring (backlog#1102): open the
@@ -5927,12 +5986,8 @@ impl UringBackend {
         let file_for_reclaim = Arc::clone(&file);
         let bytes = if length <= self.read_chunk_size.get() {
             // Fast path: one op. The driver's Vec becomes the result with no copy.
-            match self
-                .driver
-                .read_at_direct_with_owner(Arc::clone(&file), offset_u64, length, align, self.native_read_owner())
-                .await
-            {
-                Ok(bytes) => bytes,
+            match self.read_native(Arc::clone(&file), offset_u64, length, Some(align)).await {
+                Ok(buffer) => buffer.into_bytes(),
                 Err(io_err) => {
                     self.classify_direct_read_error(&io_err);
                     return Err(DiskError::from(io_err));
@@ -5943,29 +5998,32 @@ impl UringBackend {
             // A configured cap need not be block-aligned; adjacent chunks may
             // re-read a boundary block. Padding and the full assembled result
             // are not limited by this cap.
-            let mut assembled = Vec::with_capacity(length);
+            let memory = current_resource_unit()
+                .and_then(|resources| resources.memory_budget())
+                .map(|budget| budget.reserve(length))
+                .transpose()?;
+            let mut assembled = Vec::new();
+            assembled
+                .try_reserve_exact(length)
+                .map_err(|_| std::io::Error::from(ErrorKind::OutOfMemory))?;
             let mut done = 0usize;
             while done < length {
                 let chunk = (length - done).min(self.read_chunk_size.get());
                 let chunk_off = offset_u64 + done as u64;
-                let part = match self
-                    .driver
-                    .read_at_direct_with_owner(Arc::clone(&file), chunk_off, chunk, align, self.native_read_owner())
-                    .await
-                {
+                let part = match self.read_native(Arc::clone(&file), chunk_off, chunk, Some(align)).await {
                     Ok(part) => part,
                     Err(io_err) => {
                         self.classify_direct_read_error(&io_err);
                         return Err(DiskError::from(io_err));
                     }
                 };
-                if part.len() != chunk {
+                if part.bytes.len() != chunk {
                     return Err(DiskError::other("io_uring O_DIRECT returned a short read"));
                 }
-                assembled.extend_from_slice(&part);
+                assembled.extend_from_slice(&part.bytes);
                 done += chunk;
             }
-            assembled
+            super::io_admission::memory::Reservation::wrap(Bytes::from(assembled), memory)
         };
         if bytes.len() != length {
             return Err(DiskError::other("io_uring O_DIRECT returned a short read"));
@@ -5979,7 +6037,7 @@ impl UringBackend {
         // record it so callers/tests can distinguish this path from the
         // StdBackend fallback, which never reaches here.
         self.native_direct_reads.fetch_add(1, Ordering::Relaxed);
-        Ok(Bytes::from(bytes))
+        Ok(bytes)
     }
 }
 
@@ -6036,6 +6094,9 @@ impl LocalIoBackend for UringBackend {
                 // relevant per-disk latch inside `pread_uring_direct`.
                 match self.pread_uring_direct(volume, path, offset, length).await {
                     Ok(bytes) => return Ok(self.wrap_result_bytes(bytes, result_reservation)),
+                    Err(DiskError::Io(error)) if super::io_admission::memory::is_memory_pressure(&error) => {
+                        return Err(DiskError::Io(error));
+                    }
                     Err(err) => {
                         if !self.fallback_logged.swap(true, Ordering::Relaxed) {
                             debug!(
@@ -6063,6 +6124,7 @@ impl LocalIoBackend for UringBackend {
         // per-read error.
         match self.pread_uring(volume, path, offset, length).await {
             Ok(bytes) => Ok(self.wrap_result_bytes(bytes, result_reservation)),
+            Err(DiskError::Io(error)) if super::io_admission::memory::is_memory_pressure(&error) => Err(DiskError::Io(error)),
             Err(err) => {
                 if !self.fallback_logged.swap(true, Ordering::Relaxed) {
                     let latched = !self.active.load(Ordering::Relaxed);
@@ -30779,7 +30841,7 @@ mod test {
     #[test]
     fn uring_native_reads_retain_only_their_device_and_mount() {
         use crate::disk::disk_store::LocalDiskWrapper;
-        use crate::disk::io_admission::{ResourceIoUnit, with_optional_resource_unit};
+        use crate::disk::io_admission::{BackgroundMemoryBudget, ResourceIoUnit, with_optional_resource_unit};
         use rustfs_concurrency::adaptive::{AdaptiveAdmission, permit_set::AdaptivePermitSetOwner};
         use std::num::NonZeroU16;
         use std::os::unix::fs::OpenOptionsExt;
@@ -30878,6 +30940,13 @@ mod test {
                                 )
                                 .await;
                         }
+                        let native_capacity = if direct {
+                            let file = std::fs::File::open(dir.path().join("bucket/part.1")).expect("alignment probe file");
+                            let align = probe_direct_io_align(&file);
+                            (17 + 8192usize.min(chunk_size)).next_multiple_of(align) + align - 1
+                        } else {
+                            8192usize.min(chunk_size)
+                        };
                         let driver = Arc::clone(&backend.driver);
                         disk.io_backend = Arc::new(backend);
                         let wrapper = LocalDiskWrapper::new(Arc::new(disk), false);
@@ -30889,10 +30958,13 @@ mod test {
                             .physical_admission()
                             .set_test_shared_capacity(shared.clone(), vec![first.clone()])
                             .expect("selected device");
+                        let memory = BackgroundMemoryBudget::new();
+                        memory.set_sampled_limit(65536, Duration::from_secs(30));
                         let parent = admitted.then(|| {
                             let a = first.try_acquire().expect("selected quota");
                             let b = second.try_acquire().expect("unrelated quota");
                             ResourceIoUnit::from(shared.capture(&[&a, &b]).expect("parent resources"))
+                                .with_memory_budget(memory.clone())
                         });
                         let mut future = Box::pin(with_optional_resource_unit(parent, async move {
                             wrapper.read_file_mmap_copy("bucket", "part.1", 17, 8192).await
@@ -30912,6 +30984,8 @@ mod test {
                         .await
                         .expect("read reached native pending table");
                         drop(future);
+                        memory.set_sampled_limit(0, Duration::ZERO);
+                        let retained = memory.snapshot().used;
                         let held = [first.snapshot().active, second.snapshot().active];
                         let mount_held = mount.strong_count() > 0;
                         driver.request_shutdown();
@@ -30924,6 +30998,16 @@ mod test {
                         .expect("bounded driver shutdown");
                         assert_eq!(driver.stats().in_flight, 1, "withheld completion remains unresolved");
                         drop(driver);
+                        assert_eq!(memory.snapshot().used, retained, "unresolved native storage remains allocated");
+                        assert_eq!(
+                            retained,
+                            if admitted {
+                                u64::try_from(native_capacity).expect("test capacity")
+                            } else {
+                                0
+                            },
+                            "cancellation drops assembled storage but keeps the native chunk"
+                        );
                         assert_eq!(
                             [first.snapshot().active, second.snapshot().active],
                             held,
@@ -30942,6 +31026,192 @@ mod test {
                 assert!(mount_held, "native completion owns the selected mount generation");
             }
             println!("URING_RESOURCE_OWNER_OK cases=8");
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uring_background_results_retain_native_capacity_through_the_last_slice() {
+        use crate::disk::io_admission::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+
+        let dir = tempfile::tempdir().expect("native memory fixture");
+        std::fs::create_dir(dir.path().join("bucket")).expect("bucket");
+        let content: Vec<u8> = (0..16384)
+            .map(|index| u8::try_from(index % 251).expect("fixture byte"))
+            .collect();
+        std::fs::write(dir.path().join("bucket/part.1"), &content).expect("shard");
+        for direct in [false, true] {
+            for chunk_size in [4096, 16384] {
+                let chunks =
+                    uring_read_chunks::ReadChunkSize::from_env_value(Some(std::ffi::OsStr::new(&chunk_size.to_string())))
+                        .expect("read chunk size");
+                let Some(mut backend) = UringBackend::try_new_with_read_chunk_size(dir.path().to_path_buf(), chunks).await else {
+                    assert!(!direct && chunk_size == 4096, "native capability was already established");
+                    uring_test_skip("uring_background_results_retain_native_capacity_through_the_last_slice");
+                    return;
+                };
+                backend.fd_cache = Some(FdCache::new());
+                if direct {
+                    let probe = backend.pread_uring_direct("bucket", "part.1", 0, 4096).await;
+                    if probe.is_err() && !backend.direct_uring.supported.load(Ordering::Relaxed) {
+                        uring_test_skip("uring background memory O_DIRECT preflight");
+                        return;
+                    }
+                    assert_eq!(probe.expect("native direct preflight").as_ref(), &content[..4096]);
+                }
+                let memory = BackgroundMemoryBudget::new();
+                let read = || async {
+                    let (resources, _) = test_resource_units(1);
+                    with_optional_resource_unit(Some(resources.with_memory_budget(memory.clone())), async {
+                        if direct {
+                            backend.pread_uring_direct("bucket", "part.1", 17, 8192).await
+                        } else {
+                            backend.pread_uring("bucket", "part.1", 17, 8192).await
+                        }
+                    })
+                    .await
+                };
+                assert!(
+                    matches!(read().await, Err(DiskError::Io(error)) if error.kind() == ErrorKind::WouldBlock),
+                    "closed memory budget must reject native reads: direct={direct}, chunk_size={chunk_size}"
+                );
+                assert_eq!(memory.snapshot().used, 0);
+                memory.set_sampled_limit(65536, Duration::from_secs(30));
+                let bytes = read().await.expect("native allocation fits");
+                assert_eq!(bytes.as_ref(), &content[17..17 + 8192]);
+                let expected = if direct && chunk_size >= 8192 {
+                    let align = *backend.direct_uring.align.get().expect("probed alignment");
+                    (17 + 8192usize).next_multiple_of(align) + align - 1
+                } else {
+                    8192
+                };
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while backend.driver.stats().in_flight != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("native completion retired");
+                let expected = u64::try_from(expected).expect("test capacity");
+                assert_eq!(memory.snapshot().used, expected, "padding remains in the returned allocation");
+                let slice = bytes.slice(3..7);
+                drop(bytes);
+                memory.set_sampled_limit(0, Duration::ZERO);
+                assert_eq!(slice.as_ref(), &content[20..24]);
+                assert_eq!(memory.snapshot().used, expected);
+                drop(slice);
+                assert_eq!(memory.snapshot().used, 0);
+
+                // The descriptor cache still reports the original length, so
+                // this failure reaches the native read and returns short data.
+                memory.set_sampled_limit(65536, Duration::from_secs(30));
+                let submitted = backend.driver.stats().submitted;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(dir.path().join("bucket/part.1"))
+                    .expect("truncate handle")
+                    .set_len(20)
+                    .expect("truncate behind cached descriptor");
+                assert!(read().await.is_err(), "native short data must not be accepted");
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while backend.driver.stats().in_flight != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("failed native read retired");
+                assert!(backend.driver.stats().submitted > submitted, "short read must reach the native driver");
+                assert_eq!(memory.snapshot().used, 0, "errors free native and assembled storage");
+                std::fs::write(dir.path().join("bucket/part.1"), &content).expect("restore fixture");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uring_background_memory_denial_preserves_the_native_backend() {
+        use crate::disk::io_admission::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+
+        const CHILD: &str = "RUSTFS_URING_MEMORY_DENIAL_CHILD";
+        const TEST: &str = "disk::local::test::uring_background_memory_denial_preserves_the_native_backend";
+        if std::env::var_os(CHILD).is_none() {
+            for direct in ["false", "true"] {
+                let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, "1")
+                    .env(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, direct)
+                    .env(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, "1")
+                    .output()
+                    .expect("memory-denial subprocess");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(output.status.success(), "direct={direct}: {stdout}{stderr}");
+                if stderr.contains("SKIP ") {
+                    uring_test_skip(TEST);
+                    return;
+                }
+                assert!(stdout.contains("URING_MEMORY_DENIAL_OK"), "missing native execution: {stdout}");
+            }
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("memory-denial fixture");
+            std::fs::create_dir(dir.path().join("bucket")).expect("bucket");
+            std::fs::write(dir.path().join("bucket/part.1"), vec![41; 16384]).expect("shard");
+            let chunks =
+                uring_read_chunks::ReadChunkSize::from_env_value(Some(std::ffi::OsStr::new("4096"))).expect("read chunk size");
+            let Some(backend) = UringBackend::try_new_with_read_chunk_size(dir.path().to_path_buf(), chunks).await else {
+                uring_test_skip(TEST);
+                return;
+            };
+            if is_direct_io_read_enabled() {
+                let probe = backend.pread_uring_direct("bucket", "part.1", 0, 4096).await;
+                if probe.is_err() && !backend.direct_uring.supported.load(Ordering::Relaxed) {
+                    uring_test_skip(TEST);
+                    return;
+                }
+                assert_eq!(probe.expect("direct preflight").as_ref(), &[41; 4096]);
+            }
+            let memory = BackgroundMemoryBudget::new();
+            let read = || async {
+                let (resources, _) = test_resource_units(1);
+                with_optional_resource_unit(
+                    Some(resources.with_memory_budget(memory.clone())),
+                    backend.pread_bytes("bucket", "part.1", 17, 8192, None),
+                )
+                .await
+            };
+            // The assembled result fits, but its simultaneous native chunk does
+            // not. A buffered std fallback would otherwise bypass this refusal.
+            memory.set_sampled_limit(8192, Duration::from_secs(30));
+            let submitted = backend.driver.stats().submitted;
+            assert!(matches!(read().await, Err(DiskError::Io(error)) if error.kind() == ErrorKind::WouldBlock));
+            assert_eq!(memory.snapshot().used, 0);
+            assert_eq!(backend.driver.stats().submitted, submitted);
+            assert!(
+                !backend.fallback_logged.load(Ordering::Relaxed),
+                "memory pressure must not choose std fallback"
+            );
+            assert!(backend.active.load(Ordering::Relaxed));
+            assert!(backend.direct_uring.supported.load(Ordering::Relaxed));
+            memory.set_sampled_limit(65536, Duration::from_secs(30));
+            let bytes = read().await.expect("native chunks fit after recovery");
+            assert_eq!(bytes.as_ref(), &[41; 8192]);
+            assert_eq!(backend.driver.stats().submitted, submitted + 2);
+            drop(bytes);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while backend.driver.stats().in_flight != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("native completion retired");
+            assert_eq!(memory.snapshot().used, 0);
+            println!("URING_MEMORY_DENIAL_OK");
         });
     }
 
