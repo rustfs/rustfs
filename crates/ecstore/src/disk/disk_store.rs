@@ -2613,7 +2613,7 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn is_online(&self) -> bool {
-        let Ok(Some(disk_id)) = self.disk.get_disk_id().await else {
+        let Ok(Some(disk_id)) = self.get_disk_id().await else {
             return false;
         };
 
@@ -2646,7 +2646,7 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
-        self.disk.get_disk_id().await
+        self.with_native_resources(self.disk.get_disk_id()).await?
     }
 
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
@@ -3912,6 +3912,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_disk_resource_identity_probes_keep_only_their_native_device_after_cancel() {
+        use rustfs_concurrency::adaptive::{
+            AdaptiveAdmission, FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure,
+            permit_set::AdaptivePermitSetOwner,
+        };
+        use std::num::NonZeroU16;
+
+        for read in [false, true] {
+            for online in [false, true] {
+                let dir = tempfile::tempdir().expect("format probe fixture");
+                let mut endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
+                endpoint.set_pool_index(0);
+                endpoint.set_set_index(0);
+                endpoint.set_disk_index(0);
+                let meta = dir.path().join(RUSTFS_META_BUCKET);
+                tokio::fs::create_dir_all(&meta).await.expect("metadata directory");
+                let mut format = FormatV3::new(1, 1);
+                format.erasure.this = format.erasure.sets[0][0];
+                tokio::fs::write(meta.join(FORMAT_CONFIG_FILE), format.to_json().expect("format bytes"))
+                    .await
+                    .expect("write format");
+                let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("formatted disk"));
+                {
+                    let mut cache = disk.format_info.write().await;
+                    cache.last_check = None;
+                    if read {
+                        cache.file_info = None;
+                    }
+                }
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                disk.install_format_probe_hook(read, move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.blocking_recv();
+                });
+                let wrapper = Arc::new(LocalDiskWrapper::new(disk, false));
+                let a = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+                let b = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+                let shared = AdaptivePermitSetOwner::new(NonZeroU16::MIN, vec![a.clone(), b.clone()]).expect("catalog");
+                wrapper
+                    .physical_admission
+                    .set_test_shared_capacity(shared.clone(), vec![a.clone()])
+                    .expect("native device A");
+                let node = NodeAdmission::new(NonZeroU16::MIN);
+                node.update(
+                    &mut FeedbackController::new(),
+                    Some(FeedbackObservation {
+                        generation: 1,
+                        max_concurrency: 1,
+                        pressure: ResourcePressure::Unknown,
+                        completed_units: None,
+                    }),
+                );
+                let parent = shared.try_acquire_with_node(&node).expect("planned devices");
+                let task = tokio::spawn({
+                    let wrapper = wrapper.clone();
+                    async move {
+                        crate::disk::with_background_resource_set(parent.resources().clone(), async {
+                            if online {
+                                assert!(wrapper.is_online().await);
+                            } else {
+                                wrapper.get_disk_id().await.expect("disk identity");
+                            }
+                        })
+                        .await;
+                        parent.complete();
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(5), started_rx)
+                    .await
+                    .expect("native probe starts")
+                    .expect("native signal");
+                task.abort();
+                assert!(task.await.expect_err("cancel waiter").is_cancelled());
+                let held = [node.snapshot().active, a.snapshot().active, b.snapshot().active];
+                let healthy_available = b.try_acquire().is_some();
+                release_tx.send(()).expect("release native probe before assertions");
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while a.snapshot().active != 0 || b.snapshot().active != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("native probe releases its device");
+                assert_eq!(held, [0, 1, 0], "read={read}, online={online}");
+                assert!(healthy_available);
+                assert_eq!([node.completed(), a.completed(), b.completed()], [Some(0), Some(0), Some(0)]);
+                assert_eq!(wrapper.get_disk_id().await.expect("format remains readable"), Some(format.erasure.this));
+                assert!(wrapper.is_online().await);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn local_disk_resource_projection_releases_unrelated_devices_after_native_cancellation() {
         use crate::disk::io_admission::spawn_blocking_with_disk_io_permit;
         use rustfs_concurrency::adaptive::{
@@ -4106,6 +4200,10 @@ mod tests {
                 "auxiliary admission must return immediately under storage locks"
             );
             drop(read);
+            assert!(
+                matches!(wrapper.get_disk_id().await, Err(DiskError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+            assert!(!wrapper.is_online().await, "identity checks cannot bypass closed physical capacity");
             assert_eq!([a.snapshot().active, b.snapshot().active, node.snapshot().active], [1, 0, 1]);
             assert_eq!([a.completed(), b.completed(), node.completed()], [Some(0), Some(0), Some(0)]);
             b.set_limit(1);

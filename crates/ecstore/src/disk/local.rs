@@ -3224,6 +3224,20 @@ fn log_startup_disk_error(stage: &str, path: &Path, err: &DiskError) {
     );
 }
 
+#[cfg(test)]
+type FormatProbeHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+static FORMAT_PROBE_HOOKS: std::sync::LazyLock<ParkingLotMutex<HashMap<(PathBuf, bool), FormatProbeHook>>> =
+    std::sync::LazyLock::new(|| ParkingLotMutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn run_format_probe_hook(path: &Path, read: bool) {
+    let hook = FORMAT_PROBE_HOOKS.lock().remove(&(path.to_path_buf(), read));
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FormatInfo {
     pub id: Option<Uuid>,
@@ -6050,6 +6064,13 @@ fn mount_id_from_mountinfo_contents(mountinfo: &str, path: &Path) -> Option<u64>
 }
 
 impl LocalDisk {
+    #[cfg(test)]
+    pub(crate) fn install_format_probe_hook(&self, read: bool, hook: impl FnOnce() + Send + 'static) {
+        FORMAT_PROBE_HOOKS
+            .lock()
+            .insert((self.io_format_path.clone(), read), Box::new(hook));
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn open_mount_lease(root: &Path) -> Result<PathBuf> {
         Ok(root.to_path_buf())
@@ -6689,9 +6710,39 @@ impl LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn check_format_json(&self) -> Result<Metadata> {
-        let md = fs::metadata(&self.io_format_path).await.map_err(to_unformatted_disk_error)?;
-        Ok(md)
+        let path = self.io_format_path.clone();
+        #[cfg(target_os = "linux")]
+        let mount_lease = self.mount_lease.clone();
+        Ok(spawn_blocking_with_disk_io_permit(None, move || {
+            // The proc-fd path must survive cancellation and disk retirement.
+            #[cfg(target_os = "linux")]
+            let _mount_lease = mount_lease;
+            #[cfg(test)]
+            run_format_probe_hook(&path, false);
+            std::fs::metadata(path)
+        })
+        .await
+        .map_err(DiskError::from)?
+        .map_err(to_unformatted_disk_error)?)
     }
+
+    async fn read_format_json(&self) -> Result<Vec<u8>> {
+        let path = self.io_format_path.clone();
+        #[cfg(target_os = "linux")]
+        let mount_lease = self.mount_lease.clone();
+        Ok(spawn_blocking_with_disk_io_permit(None, move || {
+            // The proc-fd path must survive cancellation and disk retirement.
+            #[cfg(target_os = "linux")]
+            let _mount_lease = mount_lease;
+            #[cfg(test)]
+            run_format_probe_hook(&path, true);
+            std::fs::read(path)
+        })
+        .await
+        .map_err(DiskError::from)?
+        .map_err(to_unformatted_disk_error)?)
+    }
+
     async fn make_meta_volumes(&self) -> Result<()> {
         let buckets = format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}");
         let multipart = format!("{}/{}", RUSTFS_META_BUCKET, "multipart");
@@ -11282,7 +11333,7 @@ impl DiskAPI for LocalDisk {
 
         debug!("get_disk_id: read format.json");
 
-        let b = fs::read(&self.io_format_path).await.map_err(to_unformatted_disk_error)?;
+        let b = self.read_format_json().await?;
 
         let fm = FormatV3::try_from(b.as_slice()).map_err(|e| {
             warn!(
@@ -22807,6 +22858,58 @@ mod test {
         let result = timeout(Duration::from_millis(10), reader.read(&mut buf)).await;
 
         assert!(result.is_err(), "zero timeout must leave stalled reads pending instead of failing");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn resource_format_probe_retains_mount_lease_after_disk_retirement() {
+        for read in [false, true] {
+            let dir = tempfile::tempdir().expect("retired format probe fixture");
+            let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
+            let mut disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+            // The cleanup monitor owns the same lease. Wait for its receiver to
+            // close so it cannot mask an unowned native probe after disk drop.
+            let exit = disk.exit_signal.take().expect("cleanup monitor exit sender");
+            exit.send(()).expect("stop this fixture's cleanup monitor");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while exit.receiver_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cleanup monitor stopped");
+            drop(exit);
+            let lease = Arc::downgrade(&disk.mount_lease);
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            disk.install_format_probe_hook(read, move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.blocking_recv();
+            });
+            let task = tokio::spawn(async move {
+                if read {
+                    disk.read_format_json().await.map(|_| ())
+                } else {
+                    disk.check_format_json().await.map(|_| ())
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), started_rx)
+                .await
+                .expect("native probe starts")
+                .expect("native signal");
+            task.abort();
+            assert!(task.await.expect_err("retire disk with cancelled probe").is_cancelled());
+            let retained = lease.strong_count() > 0;
+            release_tx.send(()).expect("release probe before asserting");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while lease.strong_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("native probe releases the mount lease");
+            assert!(retained, "read={read}: the proc-fd path must stay pinned until native I/O returns");
+        }
     }
 
     #[tokio::test]
