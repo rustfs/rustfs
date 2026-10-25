@@ -9762,6 +9762,7 @@ mod tests {
             pool_meta_save_gate: Mutex::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
+            ordinary_classification: Default::default(),
         }
     }
 
@@ -9871,6 +9872,7 @@ mod tests {
             pool_meta_save_gate: Mutex::default(),
             ctx,
             bucket_fence_registry: std::sync::Arc::default(),
+            ordinary_classification: Default::default(),
         }
     }
 

@@ -3334,6 +3334,7 @@ mod tests {
             pool_meta_save_gate: TokioMutex::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
+            ordinary_classification: Default::default(),
         })
     }
 

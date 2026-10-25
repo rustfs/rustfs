@@ -620,6 +620,7 @@ impl ECStore {
             // this point) and later reads share one cell.
             ctx: instance_ctx.clone(),
             bucket_fence_registry: std::sync::Arc::default(),
+            ordinary_classification: Default::default(),
         });
 
         // Only set it when this instance's deployment ID is not yet configured

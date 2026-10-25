@@ -18,8 +18,10 @@
 mod backup_retention;
 mod delete;
 pub mod inventory;
+mod ordinary_classification;
 #[doc(hidden)]
 pub use delete::ArtifactDeleteTarget;
+pub(crate) use ordinary_classification::OrdinaryClassificationRegistry;
 
 use super::versioning::VersioningApi as _;
 use super::{metadata::BucketMetadata, metadata_sys};
@@ -437,10 +439,16 @@ impl ECStore {
         }
         // Receiver classification must not migrate a legacy incarnation or
         // reacquire the bucket namespace lock held by a DeleteBucket caller.
-        let (metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket)
-            .await
-            .map_err(|_| DiskError::FileAccessDenied)?;
-        if !persisted || metadata.artifact_base_prefix.is_some() {
+        let allowed = self
+            .ordinary_classification
+            .classify(bucket, async {
+                match metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await {
+                    Ok((metadata, persisted)) => persisted && metadata.artifact_base_prefix.is_none(),
+                    Err(_) => false,
+                }
+            })
+            .await;
+        if !allowed {
             return Err(DiskError::FileAccessDenied);
         }
         Ok(())

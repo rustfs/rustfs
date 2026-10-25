@@ -494,6 +494,7 @@ pub struct ECStore {
     /// Memoizes bucket-incarnation validation under continuous lifecycle
     /// read-lock coverage (see [`bucket_fence`]).
     pub(crate) bucket_fence_registry: Arc<bucket_fence::BucketFenceRegistry>,
+    pub(crate) ordinary_classification: crate::bucket::artifact::OrdinaryClassificationRegistry,
 }
 
 const METRIC_SCANNER_DATA_MOVEMENT_PAUSED: &str = "rustfs_scanner_data_movement_paused";
@@ -1904,6 +1905,7 @@ mod tests {
             pool_meta_save_gate: Mutex::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
+            ordinary_classification: Default::default(),
         };
 
         let rendered = format!("{store:?}");
@@ -1992,6 +1994,7 @@ mod tests {
             pool_meta_save_gate: Mutex::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
+            ordinary_classification: Default::default(),
         })
     }
 

@@ -88,6 +88,7 @@ pub async fn test_store_with_persisted_rebalance_meta(
         pool_meta_save_gate: tokio::sync::Mutex::default(),
         ctx,
         bucket_fence_registry: std::sync::Arc::default(),
+        ordinary_classification: Default::default(),
     });
     (temp_dirs, store)
 }
@@ -266,6 +267,7 @@ async fn test_pool_stores_with_contexts(
             pool_meta_save_gate: tokio::sync::Mutex::new(pool_meta_write_state.independent_clone_for_test()),
             ctx: store_ctx,
             bucket_fence_registry: std::sync::Arc::default(),
+            ordinary_classification: Default::default(),
         })
     };
     let store = make_store(ctx);

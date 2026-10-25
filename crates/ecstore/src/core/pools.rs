@@ -29378,6 +29378,7 @@ mod pools_tests {
             pool_meta_save_gate: tokio::sync::Mutex::new(super::PoolMetaWriteState::for_test_bootstrap()),
             ctx,
             bucket_fence_registry: Arc::default(),
+            ordinary_classification: Default::default(),
         })
     }
 

@@ -499,6 +499,7 @@ mod decommission_lock_order_tests {
             ),
             ctx,
             bucket_fence_registry: Arc::default(),
+            ordinary_classification: Default::default(),
         });
         crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
         (store, refresh_calls)

@@ -13071,6 +13071,7 @@ pub(crate) mod hermetic_set_disks_support {
             pool_meta_save_gate: tokio::sync::Mutex::default(),
             ctx: Arc::clone(&instance_ctx),
             bucket_fence_registry: Arc::default(),
+            ordinary_classification: Default::default(),
         });
         let shutdown = tokio_util::sync::CancellationToken::new();
         instance_ctx
