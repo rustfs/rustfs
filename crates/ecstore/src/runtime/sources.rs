@@ -467,6 +467,24 @@ pub(crate) async fn reconcile_local_disk_ids(
 }
 
 pub(crate) async fn quarantine_local_disks(instance_ctx: &InstanceContext, endpoints: &[Endpoint]) -> Result<()> {
+    quarantine_local_disks_preserving_bootstrap_routes(instance_ctx, endpoints, &[]).await
+}
+
+/// Keep an already registered path available to its in-flight format writer.
+/// All runtime voting slots are still cleared; no route is admitted or revived.
+/// Only the format loader's explicit local unformatted observations may use it.
+pub(crate) async fn quarantine_local_disks_preserving_bootstrap_routes(
+    instance_ctx: &InstanceContext,
+    endpoints: &[Endpoint],
+    unformatted_bootstrap_routes: &[Endpoint],
+) -> Result<()> {
+    if unformatted_bootstrap_routes
+        .iter()
+        .any(|route| !route.is_local || !endpoints.contains(route))
+    {
+        return Err(Error::CorruptedFormat);
+    }
+    let bootstrap_routes = unformatted_bootstrap_routes.iter().collect::<HashSet<_>>();
     let slots = endpoints
         .iter()
         .map(|endpoint| {
@@ -481,7 +499,9 @@ pub(crate) async fn quarantine_local_disks(instance_ctx: &InstanceContext, endpo
     let local_disk_map = instance_ctx.local_disk_map();
     let mut local_disks = local_disk_map.write().await;
     for endpoint in endpoints {
-        local_disks.insert(endpoint.to_string(), None);
+        if !bootstrap_routes.contains(endpoint) {
+            local_disks.insert(endpoint.to_string(), None);
+        }
     }
     drop(local_disks);
 
