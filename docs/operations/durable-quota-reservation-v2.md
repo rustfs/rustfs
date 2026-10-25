@@ -177,8 +177,26 @@ For a bucket on protocol v1 or v2 the request-path quota check and the admin
 quota endpoints read scanner usage for reporting only. When no usage is
 available, `GET /rustfs/admin/v3/quota-stats/{bucket}` and
 `POST /rustfs/admin/v3/quota-check/{bucket}` answer `200` with
-`current_usage: null` (and no `remaining_quota` or `usage_percentage`) instead
-of `503`, and object writes are admitted by the ledger alone. Each such
+`current_usage: null` and `remaining_quota: null` instead of `503`;
+quota statistics also return `usage_percentage: null`. Object writes are
+admitted by the ledger alone. Each such
 lookup logs a `quota_usage_report` event at debug level and increments
 `rustfs_quota_usage_report_unavailable_total`. A bucket without
-`reservation_protocol` keeps the previous behaviour until it is migrated.
+`reservation_protocol` keeps the previous admission behaviour until it is migrated.
+
+Read-only `GET /rustfs/admin/v3/quota/{bucket}` and
+`GET /rustfs/admin/v3/quota-stats/{bucket}` use optional usage reporting for
+all buckets, including buckets without a quota and snapshot-protocol quotas.
+They return the configured limit while a full scan is still pending:
+`size: null` on the quota response, or `current_usage: null`,
+`remaining_quota: null` and `usage_percentage: null` on statistics when no
+usage is available. Known usage, including zero, remains numeric. Missing
+buckets and configuration errors remain errors. The MinIO-compatible
+`GET /rustfs/admin/v3/get-bucket-quota?bucket=...` continues returning the
+configured quota in its existing format.
+
+These reads do not force an early scanner reload or consult a degraded floor;
+the shared usage lookup retains its normal cache/backend refresh behavior.
+They do not publish intermediate bucket-scan results, so finishing a bucket
+walk does not guarantee immediately updated usage. Legacy write admission
+and quota-check previews retain their existing usage requirements.

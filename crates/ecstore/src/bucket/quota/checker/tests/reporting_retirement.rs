@@ -245,3 +245,86 @@ async fn quota_without_limit_keeps_the_zero_usage_io_fast_path() {
     assert_eq!(crate::data_usage::reload_unknown_bucket_usage_calls_for_test(&bucket), 0);
     stop_reporting_fixture(&store).await;
 }
+
+#[tokio::test]
+#[serial]
+async fn quota_statistics_remain_available_without_a_complete_scanner_snapshot() {
+    use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+
+    for configuration in ["unconfigured", "unlimited", "snapshot"] {
+        for source in ["missing", "legacy", "incomplete", "observed", "complete", "empty"] {
+            let (_dirs, store, _) = isolated_durable_quota_store().await;
+            let bucket = format!("quota-statistics-{}", Uuid::new_v4().simple());
+            match configuration {
+                "unconfigured" => store
+                    .make_bucket(&bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("create bucket without a quota configuration"),
+                "unlimited" => {
+                    create_bucket_with_quota_json(
+                        &store,
+                        &bucket,
+                        serde_json::to_vec(&BucketQuota::new(None)).expect("unlimited quota encoding"),
+                    )
+                    .await;
+                }
+                "snapshot" => create_bucket_with_quota_json(&store, &bucket, legacy_quota_json(4096)).await,
+                _ => unreachable!(),
+            }
+            // An unregistered checker keeps legacy migration out of the
+            // assertion: reporting must work before a protocol upgrade.
+            let metadata_sys = BucketMetadataSys::new(store.clone());
+            let (metadata, _) = metadata_sys.get_config(&bucket).await.expect("load existing bucket metadata");
+            metadata_sys.set(bucket.clone(), metadata).await;
+            let checker = QuotaChecker::new(Arc::new(RwLock::new(metadata_sys)));
+            let (snapshot_source, size) = if source == "empty" { ("complete", 0) } else { (source, 1000) };
+            install_reporting_snapshot(store.clone(), &bucket, snapshot_source, size).await;
+            crate::data_usage::invalidate_data_usage_snapshot_cache().await;
+
+            let statistics = checker.get_quota_stats(&bucket).await;
+            let early_reloads = crate::data_usage::reload_unknown_bucket_usage_calls_for_test(&bucket);
+            let missing_bucket = format!("missing-{}", Uuid::new_v4().simple());
+            let missing_statistics = checker.get_quota_stats(&missing_bucket).await;
+            crate::data_usage::prepare_bucket_usage_for_namespace_change(&bucket, None)
+                .await
+                .expect("fixture cache cleanup");
+            crate::data_usage::invalidate_data_usage_snapshot_cache().await;
+            stop_reporting_fixture(&store).await;
+
+            let (quota, usage) = statistics.unwrap_or_else(|error| {
+                panic!("configuration={configuration}, source={source}: quota statistics must remain available: {error}")
+            });
+            assert_eq!(quota.quota, (configuration == "snapshot").then_some(4096));
+            assert_eq!(
+                usage,
+                (snapshot_source == "complete").then_some(size),
+                "configuration={configuration}, source={source}: only known usage is numeric"
+            );
+            assert_eq!(early_reloads, 0, "read-only statistics must not force an early snapshot reload");
+            assert!(
+                matches!(missing_statistics, Err(QuotaError::ConfigNotFound { bucket }) if bucket == missing_bucket),
+                "reporting must still reject a missing bucket"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn quota_statistics_preserve_configuration_errors() {
+    let (_dirs, store, _) = isolated_durable_quota_store().await;
+    let bucket = format!("quota-invalid-{}", Uuid::new_v4().simple());
+    create_bucket_with_quota_json(&store, &bucket, legacy_quota_json(4096)).await;
+    let metadata_sys = BucketMetadataSys::new(store.clone());
+    let (mut metadata, _) = metadata_sys.get_config(&bucket).await.expect("load existing bucket metadata");
+    Arc::make_mut(&mut metadata).quota_config_json = b"{not-json".to_vec();
+    metadata_sys.set(bucket.clone(), metadata).await;
+    let checker = QuotaChecker::new(Arc::new(RwLock::new(metadata_sys)));
+
+    let statistics = checker.get_quota_stats(&bucket).await;
+    stop_reporting_fixture(&store).await;
+
+    assert!(
+        matches!(statistics, Err(QuotaError::InvalidConfig { .. })),
+        "unavailable reporting must not hide malformed quota configuration"
+    );
+}
