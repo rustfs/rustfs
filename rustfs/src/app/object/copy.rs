@@ -326,9 +326,13 @@ impl DefaultObjectUsecase {
 
         // warn!("copy_object {}/{}, to {}/{}", &src_bucket, &src_key, &bucket, &key);
 
+        let src_versioned_enabled = BucketVersioningSys::prefix_enabled(&src_bucket, &src_key).await;
+        let src_version_suspended = BucketVersioningSys::prefix_suspended(&src_bucket, &src_key).await;
         let mut src_opts = copy_src_opts(&src_bucket, &src_key, &req.headers).map_err(ApiError::from)?;
 
         src_opts.version_id = version_id.clone();
+        src_opts.versioned = src_versioned_enabled;
+        src_opts.version_suspended = src_version_suspended;
 
         let mut src_get_opts = ObjectOptions {
             version_id: src_opts.version_id.clone(),
@@ -864,15 +868,11 @@ impl DefaultObjectUsecase {
         // AWS/MinIO return this whenever the source bucket carries versioning (enabled or
         // suspended); render the null version as "null" like GET/HEAD do. This is the exact source
         // version, kept distinct from the destination version_id above.
-        let src_versioned = BucketVersioningSys::prefix_enabled(&src_bucket, &src_key).await
-            || BucketVersioningSys::prefix_suspended(&src_bucket, &src_key).await;
+        let src_versioned = src_versioned_enabled || src_version_suspended;
         let copy_source_version_id = if src_versioned {
-            src_resolved_version_id.map(|vid| {
-                if vid == Uuid::nil() {
-                    "null".to_string()
-                } else {
-                    vid.to_string()
-                }
+            Some(match src_resolved_version_id {
+                Some(vid) if vid != Uuid::nil() => vid.to_string(),
+                _ => "null".to_string(),
             })
         } else {
             None
