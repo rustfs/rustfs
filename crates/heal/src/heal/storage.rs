@@ -1289,11 +1289,13 @@ impl HealStorageAPI for ECStoreHealStorage {
     }
 
     async fn mrf_bucket_incarnation_id(&self, bucket: &str) -> Result<Option<Uuid>> {
-        self.ecstore
-            .bucket_incarnation_id(bucket)
-            .await
-            .map(Some)
-            .map_err(Error::Storage)
+        match self.ecstore.bucket_incarnation_id(bucket).await {
+            Ok(incarnation) => Ok(Some(incarnation)),
+            // A missing bucket leaves the current identity unresolved. It is
+            // not a retirement receipt for an unknown source generation.
+            Err(StorageError::BucketNotFound(_)) => Ok(None),
+            Err(error) => Err(Error::Storage(error)),
+        }
     }
 
     async fn mrf_bucket_incarnation_retired(&self, bucket: &str, expected: Uuid) -> Result<bool> {

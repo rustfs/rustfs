@@ -1264,9 +1264,8 @@ impl SetDisks {
         upload_id_path: &str,
         write: bool,
     ) -> Result<(FileInfo, Vec<FileInfo>)> {
-        let disks = self.disks.read().await;
-
-        let disks = disks.clone();
+        // Slow metadata I/O must not hold the topology registry's read lock.
+        let disks = self.get_disks_internal().await;
 
         let (parts_metadata, errs) =
             Self::read_all_fileinfo(&disks, bucket, RUSTFS_META_MULTIPART_BUCKET, upload_id_path, "", false, false, false)
@@ -2656,8 +2655,11 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let _upload_guard = self
             .acquire_multipart_upload_write_lock("abort_multipart_upload", bucket, object, upload_id, opts)
             .await?;
+        // A failed completion can consume staging metadata on some disks.
+        // Identify the upload with read quorum; deletion below still requires
+        // its full write quorum and the upload's incarnation/lifecycle fences.
         let (fi, _) = self
-            .check_upload_id_exists_with_opts(bucket, object, upload_id, true, opts)
+            .check_upload_id_exists_with_opts(bucket, object, upload_id, false, opts)
             .await?;
         ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
@@ -7597,6 +7599,101 @@ mod tests {
             assert_abort_first_linearizes("multipart-abort-first-legacy", "object", encrypted_opts).await;
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn multipart_metadata_io_does_not_block_disk_registry_updates() {
+        use crate::set_disk::core::io_primitives::rename_fanout_barrier::{self, PHASE_READ_VERSION};
+
+        let (_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-metadata-registry";
+        let object = "object";
+        make_bucket_on_all(&disks, bucket).await;
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create upload for metadata lookup");
+        let path = SetDisks::get_upload_id_dir(bucket, object, &upload.upload_id);
+        for write in [false, true] {
+            let barrier = rename_fanout_barrier::arm(&path, 0, PHASE_READ_VERSION);
+            let lookup_set = set_disks.clone();
+            let upload_id = upload.upload_id.clone();
+            let lookup = tokio::spawn(async move { lookup_set.check_upload_id_exists(bucket, object, &upload_id, write).await });
+            tokio::time::timeout(Duration::from_secs(5), barrier.wait_until_paused())
+                .await
+                .expect("metadata I/O reaches its deterministic barrier");
+            assert!(!lookup.is_finished(), "metadata lookup must still be waiting on disk I/O");
+            let registry_writable = tokio::time::timeout(Duration::from_secs(2), set_disks.disks.write())
+                .await
+                .is_ok();
+            barrier.release();
+            lookup
+                .await
+                .expect("metadata lookup task")
+                .expect("metadata quorum remains valid");
+            assert!(
+                registry_writable,
+                "disk registry writes must proceed while metadata I/O is paused, write={write}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_recovers_read_quorum_staging_metadata() {
+        for remaining in [2, 1] {
+            let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "multipart-abort-partial-commit";
+            let object = "object";
+            make_bucket_on_all(&disk_stores, bucket).await;
+            let upload = set_disks
+                .new_multipart_upload(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("create upload before partial commit");
+            put_test_part(&set_disks, bucket, object, &upload.upload_id, 1, &[0x42; 4096], 4096).await;
+            let upload_path = SetDisks::get_upload_id_dir(bucket, object, &upload.upload_id);
+            // A failed completion can consume staging metadata on the disks
+            // whose rename succeeded while the remaining disks retain it.
+            for directory in &temp_dirs[remaining..] {
+                tokio::fs::remove_file(
+                    directory
+                        .path()
+                        .join(RUSTFS_META_MULTIPART_BUCKET)
+                        .join(&upload_path)
+                        .join("xl.meta"),
+                )
+                .await
+                .expect("consume staging metadata without deleting residual parts");
+            }
+
+            let result = set_disks
+                .abort_multipart_upload(bucket, object, &upload.upload_id, &ObjectOptions::default())
+                .await;
+            if remaining == 2 {
+                result.expect("read quorum identifies the upload; delete still requires write quorum");
+                for directory in &temp_dirs {
+                    assert!(
+                        !directory
+                            .path()
+                            .join(RUSTFS_META_MULTIPART_BUCKET)
+                            .join(&upload_path)
+                            .exists(),
+                        "abort must reclaim staging on every available disk"
+                    );
+                }
+            } else {
+                assert!(matches!(result, Err(StorageError::InvalidUploadID(..))), "{result:?}");
+                for directory in &temp_dirs {
+                    assert!(
+                        directory
+                            .path()
+                            .join(RUSTFS_META_MULTIPART_BUCKET)
+                            .join(&upload_path)
+                            .exists(),
+                        "metadata below read quorum must not authorize deletion"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

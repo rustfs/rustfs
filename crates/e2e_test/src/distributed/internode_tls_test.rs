@@ -4,12 +4,13 @@
 use super::harness::{DistCluster, DistLayout, TestResult, unique_bucket};
 use crate::tls_gen;
 use aws_sdk_s3::{Client, config::retry::RetryConfig, primitives::ByteStream};
-use futures::future::try_join_all;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::task::JoinSet;
 
 const MIB: u64 = 1024 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(180);
@@ -85,8 +86,10 @@ async fn verified_get(
     expected: &ExpectedRead,
     concurrent: bool,
 ) -> TestResult<serde_json::Value> {
+    let started = Instant::now();
+    let mut received = 0u64;
+    let mut stage = "response headers";
     tokio::time::timeout(READ_TIMEOUT, async {
-        let started = Instant::now();
         let mut request = client.get_object().bucket(bucket).key(&object.key);
         if let Some((start, end)) = expected.range {
             request = request.range(format!("bytes={start}-{end}"));
@@ -98,24 +101,37 @@ async fn verified_get(
         } else {
             assert_eq!(output.content_range(), None);
         }
-        let mut count = 0u64;
+        stage = "response body";
         let mut digest = Sha256::new();
         while let Some(chunk) = output.body.next().await {
             let chunk = chunk?;
-            count += u64::try_from(chunk.len())?;
-            assert!(count <= expected.length, "node {node}: GET exceeded the requested length");
+            received += u64::try_from(chunk.len())?;
+            assert!(received <= expected.length, "node {node}: GET exceeded the requested length");
             digest.update(&chunk);
         }
         let actual_sha256 = hex_simd::encode_to_string(digest.finalize(), hex_simd::AsciiCase::Lower);
-        assert_eq!(count, expected.length, "node {node}: truncated GET {}", object.key);
+        assert_eq!(received, expected.length, "node {node}: truncated GET {}", object.key);
         assert_eq!(actual_sha256, expected.sha256, "node {node}: corrupt GET {}", object.key);
+        eprintln!(
+            "TLS acceptance: GET node={node}, key={}, range={:?}, concurrent={concurrent}, bytes={received}, elapsed={:?}",
+            object.key, expected.range, started.elapsed()
+        );
         Ok(serde_json::json!({
             "operation": "get", "node": node, "key": object.key,
-            "range": expected.range, "bytes": count, "sha256": actual_sha256,
+            "range": expected.range, "bytes": received, "sha256": actual_sha256,
             "concurrent": concurrent, "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
         }))
     })
-    .await?
+    .await
+    .map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "TLS GET timed out: node={node}, key={}, range={:?}, concurrent={concurrent}, stage={stage}, received={received}/{}, elapsed={:?}: {error}",
+                object.key, expected.range, expected.length, started.elapsed()
+            ),
+        )
+    })?
 }
 
 /// This case always exercises the full acceptance sizes; do not substitute
@@ -157,9 +173,13 @@ async fn four_node_tls_large_and_range_gets_preserve_bytes() -> TestResult {
     {
         return Err("acceptance report paths must be unused".into());
     }
-    let log_directory = report_path
-        .as_ref()
-        .map_or_else(|| directory.join("logs"), |path| path.with_extension("logs"));
+    let log_directory = report_path.as_ref().map_or_else(
+        || {
+            std::env::var_os("RUSTFS_E2E_LOG_DIR")
+                .map_or_else(|| directory.join("logs"), |root| PathBuf::from(root).join(unique_bucket("internode-tls")))
+        },
+        |path| path.with_extension("logs"),
+    );
     std::fs::create_dir(&log_directory)?;
     dist.capture_logs_under(&log_directory)?;
     dist.cluster.start().await?;
@@ -183,7 +203,8 @@ async fn four_node_tls_large_and_range_gets_preserve_bytes() -> TestResult {
     let mut results = Vec::new();
     for length in [32 * 1024, 100 * MIB, 1024 * MIB] {
         let fixture_directory = directory.clone();
-        let object = tokio::task::spawn_blocking(move || fixture(&fixture_directory, length)).await??;
+        let object = Arc::new(tokio::task::spawn_blocking(move || fixture(&fixture_directory, length)).await??);
+        eprintln!("TLS acceptance: fixture key={}, bytes={length}", object.key);
         let started = Instant::now();
         tokio::time::timeout(
             READ_TIMEOUT,
@@ -194,7 +215,18 @@ async fn four_node_tls_large_and_range_gets_preserve_bytes() -> TestResult {
                 .body(ByteStream::from_path(&object.path).await?)
                 .send(),
         )
-        .await??;
+        .await
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "TLS PUT timed out: key={}, bytes={length}, elapsed={:?}: {error}",
+                    object.key,
+                    started.elapsed()
+                ),
+            )
+        })??;
+        eprintln!("TLS acceptance: PUT key={}, bytes={length}, elapsed={:?}", object.key, started.elapsed());
         results.push(
             serde_json::json!({"operation": "put", "bytes": length, "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0}),
         );
@@ -216,15 +248,19 @@ async fn four_node_tls_large_and_range_gets_preserve_bytes() -> TestResult {
                 results.push(verified_get(client, node, &bucket, &object, expected, false).await?);
             }
         }
-        results.extend(
-            try_join_all(
-                clients
-                    .iter()
-                    .enumerate()
-                    .map(|(node, client)| verified_get(client, node, &bucket, &object, &object.reads[0], true)),
-            )
-            .await?,
-        );
+        // Each reader owns a Tokio task and its cooperative budget. Polling
+        // every body and synchronous digest in one parent task can let an
+        // always-ready reader starve its siblings and their deadlines.
+        let mut readers = JoinSet::new();
+        for (node, client) in clients.iter().enumerate() {
+            let client = client.clone();
+            let bucket = bucket.clone();
+            let object = Arc::clone(&object);
+            readers.spawn(async move { verified_get(&client, node, &bucket, &object, &object.reads[0], true).await });
+        }
+        while let Some(result) = readers.join_next().await {
+            results.push(result??);
+        }
         tokio::fs::remove_file(&object.path).await?;
     }
     for node in 0..clients.len() {

@@ -1357,14 +1357,20 @@ impl S3 for FS {
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
         record_s3_op(S3Operation::ListObjectVersions);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_list_object_versions(req).await
+        usecase
+            .execute_list_object_versions(req)
+            .await
+            .map_err(crate::error::normalize_read_quorum_error)
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         record_s3_op(S3Operation::ListObjects);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_list_objects(req).await
+        usecase
+            .execute_list_objects(req)
+            .await
+            .map_err(crate::error::normalize_read_quorum_error)
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -1372,7 +1378,10 @@ impl S3 for FS {
         crate::hp_guard!("S3::list_objects_v2");
         record_s3_op(S3Operation::ListObjectsV2);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_list_objects_v2(req).await
+        usecase
+            .execute_list_objects_v2(req)
+            .await
+            .map_err(crate::error::normalize_read_quorum_error)
     }
 
     #[instrument(level = "debug", skip(self, req))]
