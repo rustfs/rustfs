@@ -2284,17 +2284,20 @@ impl NodeService {
             _ => {}
         }
         let target = self.local_mutation_target();
-        if matches!(
-            operation,
+        let mutates = matches!(
+            &operation,
             DeleteRecoveryRpcOperation::ApplyVersion { .. }
                 | DeleteRecoveryRpcOperation::ApplyVersions { .. }
                 | DeleteRecoveryRpcOperation::Settle { .. }
-        ) {
-            target.reject_legacy_artifact_mutation(&request.volume).await?;
-        }
+        );
         let result = target
             .recover_local_delete_transaction(&request.disk, &request.volume, operation)
             .await;
+        // Physical receivers classify after admission and before mutation.
+        // Retain the RPC denial response without rereading authority on success.
+        if mutates && result.is_err() {
+            target.reject_legacy_artifact_mutation(&request.volume).await?;
+        }
         match result {
             Ok(reply) => {
                 let result = encode_msgpack_named(&reply, "delete recovery reply")
@@ -6926,6 +6929,35 @@ mod legacy_artifact_tests {
             force_del_marker: false,
             opts: fixture.opts.clone(),
         };
+        {
+            let instance = crate::storage::storage_api::bootstrap_instance_ctx();
+            assert!(super::super::BootstrapLocalTarget::new(instance.clone()).is_for_store(&fixture._env.ecstore));
+            let bootstrap = super::super::make_server_for_slot(super::super::ServerContextSlot::with_instance_context(instance));
+            let unbound = super::super::make_server_for_slot(super::super::ServerContextSlot::new());
+            assert!(matches!(bootstrap.local_mutation_target(), LocalMutationTarget::Bootstrap(_)));
+            assert!(matches!(unbound.local_mutation_target(), LocalMutationTarget::Unbound));
+            for receiver in [&bootstrap, &unbound] {
+                let mut request = Request::new(RecoverDeleteTransactionRequest {
+                    disk: fixture.disk_ref.clone(),
+                    volume: fixture.bucket.to_owned(),
+                    protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+                    operation: rmp_serde::to_vec_named(&operation)
+                        .expect("ordinary recovery operation")
+                        .into(),
+                });
+                let body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref())
+                    .expect("ordinary recovery body");
+                sign_legacy_rpc_request(&mut request, &body, "RecoverDeleteTransaction");
+                verify_legacy_rpc_request(&request, "RecoverDeleteTransaction").expect("real recovery HMAC and replay scope");
+                let denied =
+                    tokio::time::timeout(std::time::Duration::from_secs(30), receiver.handle_recover_delete_transaction(request))
+                        .await
+                        .expect("bounded unavailable recovery operation")
+                        .expect_err("a listener without Ready authority cannot mutate a globally available ordinary object");
+                assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+                assert_eq!(path_delete_snapshot(&fixture.physical), fixture.before);
+            }
+        }
         match recover_ordinary_delete_transaction(&fixture.service, &fixture.disk_ref, fixture.bucket, operation).await {
             DeleteRecoveryRpcReply::AppliedVersion => {}
             reply => panic!("unexpected apply reply: {reply:?}"),
