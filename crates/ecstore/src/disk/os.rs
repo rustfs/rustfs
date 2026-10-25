@@ -1756,7 +1756,7 @@ impl DiskBlockingLane {
 struct DiskBlockingQueueState {
     jobs: VecDeque<Box<dyn FnOnce() + Send>>,
     active_workers: usize,
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(any(test, feature = "test-util", feature = "e2e-test-hooks"))]
     paused_workers: usize,
 }
 
@@ -1786,7 +1786,7 @@ struct DiskBlockingWorkerGuard {
 
 impl Drop for DiskBlockingWorkerGuard {
     fn drop(&mut self) {
-        #[cfg(any(test, feature = "test-util"))]
+        #[cfg(any(test, feature = "test-util", feature = "e2e-test-hooks"))]
         if self.state != DiskBlockingWorkerState::Submitted {
             CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
                 let _ = slot.borrow_mut().take();
@@ -1845,11 +1845,11 @@ impl DiskBlockingQueue {
 
     #[inline]
     fn effective_max_workers(&self, state: &DiskBlockingQueueState) -> usize {
-        #[cfg(any(test, feature = "test-util"))]
+        #[cfg(any(test, feature = "test-util", feature = "e2e-test-hooks"))]
         {
             MAX_NAMESPACE_WORKERS_PER_DISK.saturating_add(state.paused_workers)
         }
-        #[cfg(not(any(test, feature = "test-util")))]
+        #[cfg(not(any(test, feature = "test-util", feature = "e2e-test-hooks")))]
         {
             let _ = state;
             MAX_NAMESPACE_WORKERS_PER_DISK
@@ -1901,7 +1901,7 @@ impl DiskBlockingQueue {
         };
         let worker = move || {
             let mut guard = guard;
-            #[cfg(any(test, feature = "test-util"))]
+            #[cfg(any(test, feature = "test-util", feature = "e2e-test-hooks"))]
             CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
                 *slot.borrow_mut() = Some((Arc::clone(&queue), lane));
             });
@@ -1998,18 +1998,18 @@ impl DiskBlockingQueue {
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(any(test, feature = "test-util", feature = "e2e-test-hooks"))]
 thread_local! {
     static CURRENT_DISK_BLOCKING_QUEUE: std::cell::RefCell<Option<(Arc<DiskBlockingQueue>, DiskBlockingLane)>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(any(test, feature = "test-util", feature = "e2e-test-hooks"))]
 pub(crate) struct BlockingTestHookGuard {
     queue: Option<(Arc<DiskBlockingQueue>, DiskBlockingLane)>,
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(any(test, feature = "test-util", feature = "e2e-test-hooks"))]
 impl Drop for BlockingTestHookGuard {
     fn drop(&mut self) {
         if let Some((queue, lane)) = self.queue.take() {
@@ -2019,7 +2019,7 @@ impl Drop for BlockingTestHookGuard {
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(any(test, feature = "test-util", feature = "e2e-test-hooks"))]
 pub(crate) fn enter_blocking_test_hook() -> BlockingTestHookGuard {
     let queue = CURRENT_DISK_BLOCKING_QUEUE.with(|slot| slot.borrow().clone());
     if let Some((ref queue, lane)) = queue {
@@ -3588,6 +3588,8 @@ impl PhysicalRenameTestBarrier {
     }
 
     fn wait(path: &Path) -> io::Result<()> {
+        // The synthetic pause retains physical ownership while unrelated disk work progresses.
+        let _pause = enter_blocking_test_hook();
         std::fs::write(path.with_extension("arrived"), b"physical worker entered")?;
         let deadline = Instant::now() + Duration::from_secs(120);
         while !path.with_extension("release").try_exists()? {
@@ -6080,6 +6082,84 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[cfg(feature = "e2e-test-hooks")]
+    #[tokio::test]
+    async fn physical_rename_barrier_allows_control_work_without_releasing_cancelled_owner() {
+        struct ReleaseBarrier(PathBuf);
+
+        impl Drop for ReleaseBarrier {
+            fn drop(&mut self) {
+                let _ = std::fs::write(self.0.with_extension("release"), b"release physical worker");
+            }
+        }
+
+        let temp = tempdir().expect("physical barrier fixture");
+        let root = temp.path().canonicalize().expect("canonical disk root");
+        let queue = register_disk_blocking_queue(&root, &root);
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::write(&source, b"physical payload").expect("staged payload");
+        let metadata = root.join("control-metadata");
+        std::fs::write(&metadata, b"control").expect("existing control metadata");
+        let barrier = root.join(".rustfs.sys/e2e-physical-rename-barrier");
+        std::fs::create_dir_all(barrier.parent().expect("barrier parent")).expect("barrier directory");
+        std::fs::write(&barrier, destination.to_str().expect("destination path")).expect("arm physical barrier");
+        let release = ReleaseBarrier(barrier.clone());
+        let lease = acquire_namespace_mutation_lease(&destination).await;
+        assert!(
+            Arc::ptr_eq(&lease.blocking_queue, &queue),
+            "control and physical work share the disk queue"
+        );
+        let owner = Arc::downgrade(&lease);
+        let publication_root = PublicationRoot::new(&root).expect("pinned disk root");
+        let worker_destination = destination.clone();
+        let waiter = tokio::spawn(async move {
+            reliable_rename_inner_with_lease(source, worker_destination, root, publication_root, false, lease).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !barrier.with_extension("arrived").exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("physical worker enters the real E2E barrier");
+        waiter.abort();
+        assert!(waiter.await.expect_err("cancel async rename waiter").is_cancelled());
+        assert!(barrier.with_extension("waiter-dropped").exists(), "receiver observes waiter cancellation");
+
+        let control_owner = owner.clone();
+        let control_destination = destination.clone();
+        let control = tokio::time::timeout(
+            Duration::from_secs(5),
+            queue.run(move || {
+                Ok((
+                    std::fs::read(metadata)?,
+                    control_owner.upgrade().is_some(),
+                    disk_namespace_mutation_lock(&control_destination).try_write_owned().is_err(),
+                    control_destination.exists(),
+                ))
+            }),
+        )
+        .await;
+        // Drain even when the progress oracle fails, so a regression does not strand a worker.
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while owner.upgrade().is_some() || !destination.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("physical completion releases the namespace owner");
+        let (bytes, retained, locked, published) = control
+            .expect("control work progresses during the pause")
+            .expect("control read");
+        assert_eq!(bytes, b"control");
+        assert!(retained && locked, "cancelled waiter must leave the physical namespace lease owned");
+        assert!(!published, "control work must run before physical publication");
+        assert!(disk_namespace_mutation_lock(&destination).try_write_owned().is_ok());
+        assert_eq!(std::fs::read(destination).expect("completed physical publication"), b"physical payload");
+    }
 
     #[tokio::test]
     async fn rename_staging_leases_are_ordered_and_deduplicated() {
