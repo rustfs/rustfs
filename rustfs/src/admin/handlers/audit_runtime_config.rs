@@ -17,29 +17,14 @@ use crate::admin::handlers::target_descriptor::AdminTargetSpec;
 use crate::admin::runtime_sources::{AppContext, current_app_context, current_object_store_handle_for_context};
 use crate::admin::service::config::with_runtime_config_reload_lock;
 use crate::admin::storage_api::config::{
-    read_admin_config_without_migrate, read_admin_server_config_snapshot, read_existing_admin_server_config_no_lock,
-    save_admin_server_config_snapshot, with_admin_server_config_read_lock,
+    read_admin_server_config_snapshot, read_existing_admin_server_config_no_lock, save_admin_server_config_snapshot,
+    with_admin_server_config_read_lock,
 };
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_config::server_config::Config;
 use s3s::{S3Error, S3Result, s3_error};
 use tracing::warn;
-
-pub(crate) async fn load_server_config_from_store_for_context(context: Option<&AppContext>) -> S3Result<Config> {
-    let Some(store) = current_object_store_handle_for_context(context) else {
-        return Ok(Config::new());
-    };
-
-    read_admin_config_without_migrate(store)
-        .await
-        .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))
-}
-
-pub(crate) async fn load_server_config_from_store() -> S3Result<Config> {
-    let context = current_app_context();
-    load_server_config_from_store_for_context(context.as_deref()).await
-}
 
 fn has_any_audit_targets(specs: &[AdminTargetSpec], config: &Config) -> bool {
     specs.iter().any(|spec| {
@@ -188,7 +173,7 @@ mod tests {
     use super::*;
     use crate::admin::handlers::target_descriptor::admin_target_spec_from_builtin;
     use crate::admin::runtime_sources::{IamInterface, KmsInterface};
-    use crate::admin::storage_api::config::save_admin_server_config;
+    use crate::admin::storage_api::config::{read_admin_config_without_migrate, save_admin_server_config};
     use crate::admin::storage_api::error::StorageError;
     use rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS;
     use rustfs_config::server_config::KVS;
