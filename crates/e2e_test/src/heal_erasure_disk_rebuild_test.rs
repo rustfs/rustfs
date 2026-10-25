@@ -1304,14 +1304,20 @@ mod tests {
                     let active = metrics["current_cycle_active"]
                         .as_bool()
                         .ok_or("scanner status is missing its active-cycle flag")?;
-                    if !active && schedule["effective_interval_available"].as_bool() == Some(true) {
-                        let interval = schedule["effective_interval_seconds"]
-                            .as_u64()
-                            .ok_or("scanner schedule is missing its effective interval")?;
+                    if active || schedule["effective_interval_available"].as_bool() == Some(true) {
+                        let interval = if active {
+                            None
+                        } else {
+                            Some(
+                                schedule["effective_interval_seconds"]
+                                    .as_u64()
+                                    .ok_or("scanner schedule is missing its effective interval")?,
+                            )
+                        };
                         // Reconsider a changed leader or retry plan, but never renew
                         // the deadline on repeated observations of the same sleep.
                         if accounted_schedules.insert((node_index, cycle_end, interval)) {
-                            let budget = scanner_cycle_completion_budget(cycle_end, Some(interval), now, false)?;
+                            let budget = scanner_cycle_completion_budget(cycle_end, interval, now, active)?;
                             let scheduled_deadline = Instant::now().checked_add(budget).ok_or("scanner deadline overflows")?;
                             deadline = deadline.max(scheduled_deadline);
                         }
