@@ -27,11 +27,17 @@ async fn scanner_physical_native_tail_releases_node_and_allows_unrelated_disk() 
     use crate::storage_api::owner::{PhysicalDiskBinding, ecstore_spawn_blocking_with_resource_ownership};
     use crate::workload_admission::with_scanner_physical_disk;
     use rustfs_concurrency::adaptive::AdaptiveAdmission;
+    use rustfs_concurrency::adaptive::permit_set::AdaptivePermitSetOwner;
 
     let node = owner(true);
     let disk = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+    let other_disk = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+    let shared = AdaptivePermitSetOwner::new(NonZeroU16::MIN, vec![disk.clone(), other_disk.clone()])
+        .expect("one shared carrier for both devices");
     let binding = Arc::new(PhysicalDiskBinding::default());
-    binding.set_test_capacity(vec![disk.clone()]).expect("physical fixture");
+    binding
+        .set_test_shared_capacity(shared.clone(), vec![disk.clone()])
+        .expect("physical fixture");
     let (entered, started) = tokio::sync::oneshot::channel();
     let (finish, blocked) = std::sync::mpsc::channel();
     let cancel = CancellationToken::new();
@@ -57,8 +63,8 @@ async fn scanner_physical_native_tail_releases_node_and_allows_unrelated_disk() 
     assert_eq!(disk.snapshot().active, 1, "native tail still owns its physical capacity");
     let other = Arc::new(PhysicalDiskBinding::default());
     other
-        .set_test_capacity(vec![AdaptiveAdmission::new(NonZeroU16::MIN, 1)])
-        .expect("independent disk");
+        .set_test_shared_capacity(shared, vec![other_disk])
+        .expect("independent disk using the same carrier pool");
     with_scanner_physical_disk(
         Some(other),
         run_scanner_node_operation(Some(&node), &cancel, async { Ok::<_, std::io::Error>(()) }),

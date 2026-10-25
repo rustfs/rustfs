@@ -188,10 +188,13 @@ async fn run_scanner_operation<T, E>(
             if !plan.is_current() {
                 return Err(ScannerError::ResourceDeferred);
             }
+            let native = plan
+                .capture_native(permit.resources())
+                .map_err(|_| ScannerError::ResourceDeferred)?;
             if metadata {
-                SCANNER_METADATA_UNITS.scope(permit.resources().clone(), operation).await
+                SCANNER_METADATA_UNITS.scope(native, operation).await
             } else {
-                ecstore_with_background_resource_set(permit.resources().clone(), operation).await
+                ecstore_with_background_resource_set(native, operation).await
             }
         }
     };

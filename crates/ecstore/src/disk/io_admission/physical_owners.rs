@@ -5,7 +5,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::num::NonZeroU16;
 use std::sync::{Arc, Weak};
-#[cfg(test)]
 use std::time::Duration;
 
 use rustfs_concurrency::adaptive::AdaptiveAdmission;
@@ -38,6 +37,22 @@ impl PhysicalOwnerRegistry {
             maximum,
             owners: BTreeMap::new(),
         }
+    }
+
+    /// Old topology descriptors may still reference an unused gate. Close it
+    /// before reclaiming its registry slot; only admitted I/O keeps an absent
+    /// incarnation alive, and its final release still reaches the same owner.
+    pub(super) fn retire_absent(&mut self, current: &BTreeSet<PhysicalDeviceIdentity>) {
+        self.owners.retain(|identity, owner| {
+            let Some(gate) = owner.upgrade() else {
+                return false;
+            };
+            if current.contains(identity) {
+                return true;
+            }
+            gate.set_sampled_limit(0, Duration::ZERO);
+            gate.snapshot().active != 0
+        });
     }
 
     pub(super) fn bind(&mut self, identities: &[PhysicalDeviceIdentity]) -> io::Result<Vec<PhysicalDeviceAdmission>> {
@@ -217,5 +232,37 @@ mod tests {
         assert!(!registry.publish(extra, 1, Duration::from_secs(60)), "a dead owner cannot be refreshed");
         assert!(registry.bind(&[]).is_err());
         assert!(registry.bind(&[device(1, 0)]).is_err());
+    }
+
+    #[test]
+    fn retirement_reclaims_idle_descriptors_but_keeps_active_native_incarnations() {
+        let mut registry = registry();
+        let ids = (0..MAX_PHYSICAL_OWNERS)
+            .map(|minor| device(u32::try_from(minor).expect("bounded minor"), 1))
+            .collect::<Vec<_>>();
+        let descriptors = registry.bind(&ids).expect("full registry");
+        assert!(registry.publish(ids[0], 1, Duration::from_secs(60)));
+        let native = descriptors[0].try_acquire().expect("active old incarnation");
+        let mut current = ids[2..].iter().copied().collect::<BTreeSet<_>>();
+        registry.retire_absent(&current);
+        assert_eq!(registry.owners.len(), MAX_PHYSICAL_OWNERS - 1);
+        assert_eq!(descriptors[0].snapshot().active, 1);
+        assert!(descriptors[0].try_acquire().is_none());
+        assert!(descriptors[1].try_acquire().is_none());
+        let first = device(0, 2);
+        let second = device(1, 2);
+        let replacement = registry.bind(&[first]).expect("idle descriptor was reclaimed");
+        current.insert(first);
+        assert!(matches!(registry.bind(&[second]), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        drop(native);
+        registry.retire_absent(&current);
+        let next = registry.bind(&[second]).expect("final native release permits reclamation");
+        assert_eq!(replacement[0].snapshot().active, 0);
+        assert_eq!(next[0].snapshot().active, 0);
+        assert_eq!(descriptors[0].snapshot().active, 0);
+        assert!(
+            !registry.publish(ids[0], 1, Duration::from_secs(60)),
+            "retired identity cannot be refreshed"
+        );
     }
 }

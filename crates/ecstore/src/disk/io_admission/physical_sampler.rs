@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
-use rustfs_concurrency::adaptive::permit_set::{AdaptivePermitSetOwner, NodeResourcePermit};
+use rustfs_concurrency::adaptive::permit_set::{
+    AdaptivePermitSet, AdaptivePermitSetOwner, AdaptiveResourceSelection, CaptureError, NodeResourcePermit,
+};
 use rustfs_concurrency::adaptive::{AdaptiveAdmission, FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure};
 
 use super::physical_identity::{PhysicalDeviceIdentity, resolve_physical_devices};
@@ -41,15 +43,27 @@ impl PhysicalDiskBinding {
     /// Explicit synthetic ownership for cross-crate admission regressions.
     #[cfg(any(test, feature = "test-util"))]
     pub fn set_test_capacity(&self, gates: Vec<Arc<AdaptiveAdmission>>) -> std::io::Result<()> {
+        let shared = AdaptivePermitSetOwner::new(MAXIMUM, gates.clone())?;
+        self.set_test_shared_capacity(shared, gates)
+    }
+
+    /// Synthetic shared carriers with a separate native pool for this disk.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_test_shared_capacity(
+        &self,
+        shared: Arc<AdaptivePermitSetOwner>,
+        gates: Vec<Arc<AdaptiveAdmission>>,
+    ) -> std::io::Result<()> {
+        let selected = shared.select(&gates).map_err(std::io::Error::other)?;
         let owner = AdaptivePermitSetOwner::new(MAXIMUM, gates)?;
         self.invalidate();
         let plan = Arc::new(PhysicalDiskPlan {
             identities: Vec::new(),
             owner,
-            origin: Instant::now(),
-            valid_until_millis: AtomicU64::new(0),
+            selected,
+            topology: Arc::new(PhysicalTopology::new()),
         });
-        plan.renew();
+        plan.topology.renew();
         self.0.store(Some(plan));
         Ok(())
     }
@@ -61,23 +75,35 @@ impl PhysicalDiskBinding {
 
     fn invalidate(&self) {
         if let Some(plan) = self.0.swap(None) {
-            plan.valid_until_millis.store(0, Ordering::Release);
+            plan.topology.invalidate();
         }
     }
 }
 
-/// Preallocated admission for the actual leaves of one local disk. The binding
-/// lease is independent of each physical gate: a healthy alias cannot renew a
-/// removed attachment's topology.
+/// Preallocated admission for the actual leaves of one local disk. A changed
+/// attachment invalidates its topology generation before new plans are visible;
+/// healthy aliases cannot renew a removed attachment's old plan.
 pub struct PhysicalDiskPlan {
     identities: Vec<PhysicalDeviceIdentity>,
     owner: Arc<AdaptivePermitSetOwner>,
+    selected: AdaptiveResourceSelection,
+    topology: Arc<PhysicalTopology>,
+}
+
+struct PhysicalTopology {
     origin: Instant,
     valid_until_millis: AtomicU64,
 }
 
-impl PhysicalDiskPlan {
-    pub fn is_current(&self) -> bool {
+impl PhysicalTopology {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            valid_until_millis: AtomicU64::new(0),
+        }
+    }
+
+    fn is_current(&self) -> bool {
         self.origin.elapsed().as_millis() < u128::from(self.valid_until_millis.load(Ordering::Acquire))
     }
 
@@ -87,13 +113,29 @@ impl PhysicalDiskPlan {
             .store(u64::try_from(deadline).unwrap_or(u64::MAX), Ordering::Release);
     }
 
+    fn invalidate(&self) {
+        self.valid_until_millis.store(0, Ordering::Release);
+    }
+}
+
+impl PhysicalDiskPlan {
+    pub fn is_current(&self) -> bool {
+        self.topology.is_current()
+    }
+
+    /// Native work retains only this attachment's leaves and carrier pool.
+    /// Project before polling storage work; this never waits or admits more I/O.
+    pub fn capture_native(&self, admitted: &AdaptivePermitSet) -> Result<AdaptivePermitSet, CaptureError> {
+        self.owner.capture_from(admitted)
+    }
+
     /// Never wait under a storage lock. A refresh during acquisition rejects
     /// the old plan before its future can issue I/O.
     pub fn try_acquire(&self, node: &Arc<NodeAdmission>) -> Option<NodeResourcePermit> {
         if !self.is_current() {
             return None;
         }
-        let permit = self.owner.try_acquire_with_node(node)?;
+        let permit = self.selected.try_acquire_with_node(node)?;
         self.is_current().then_some(permit)
     }
 
@@ -103,7 +145,7 @@ impl PhysicalDiskPlan {
         if !self.is_current() {
             return None;
         }
-        let acquisition = self.owner.acquire_with_node(node);
+        let acquisition = self.selected.acquire_with_node(node);
         tokio::pin!(acquisition);
         loop {
             tokio::select! {
@@ -161,6 +203,7 @@ pub struct PhysicalDiskSampler {
     registry: PhysicalOwnerRegistry,
     devices: BTreeMap<PhysicalDeviceIdentity, Device>,
     bindings: Vec<Arc<PhysicalDiskBinding>>,
+    topology: Option<Arc<PhysicalTopology>>,
     probe: usize,
 }
 
@@ -170,6 +213,7 @@ impl Default for PhysicalDiskSampler {
             registry: PhysicalOwnerRegistry::new(MAXIMUM),
             devices: BTreeMap::new(),
             bindings: Vec::new(),
+            topology: None,
             probe: 0,
         }
     }
@@ -258,22 +302,38 @@ impl PhysicalDiskSampler {
         let fresh = sample
             .finished
             .is_some_and(|at| now.saturating_duration_since(at) <= Duration::from_secs(1));
+        let resolved = sample
+            .resolved
+            .iter()
+            .filter_map(|resolved| {
+                let identities = resolved.identities.as_ref().filter(|_| {
+                    fresh
+                        && now
+                            .checked_duration_since(resolved.began)
+                            .is_some_and(|age| age <= Duration::from_secs(1))
+                        && resolved
+                            .ended
+                            .checked_duration_since(resolved.began)
+                            .is_some_and(|width| width <= Duration::from_millis(20))
+                });
+                match identities {
+                    Some(identities) => Some((&resolved.binding, identities)),
+                    None => {
+                        resolved.binding.invalidate();
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        self.registry.retire_absent(
+            &resolved
+                .iter()
+                .flat_map(|(_, identities)| identities.iter().copied())
+                .collect(),
+        );
         let mut live = BTreeSet::new();
-        for resolved in &sample.resolved {
-            let binding = &resolved.binding;
-            let Some(identities) = resolved.identities.as_ref().filter(|_| {
-                fresh
-                    && now
-                        .checked_duration_since(resolved.began)
-                        .is_some_and(|age| age <= Duration::from_secs(1))
-                    && resolved
-                        .ended
-                        .checked_duration_since(resolved.began)
-                        .is_some_and(|width| width <= Duration::from_millis(20))
-            }) else {
-                binding.invalidate();
-                continue;
-            };
+        let mut prepared = Vec::new();
+        for (binding, identities) in resolved {
             let Ok(owners) = self.registry.bind(identities) else {
                 binding.invalidate();
                 continue;
@@ -286,24 +346,7 @@ impl PhysicalDiskSampler {
                     previous: None,
                 });
             }
-            let previous = binding.0.load_full();
-            if let Some(plan) = previous.filter(|plan| plan.identities == *identities) {
-                plan.renew();
-            } else {
-                binding.invalidate();
-                let Ok(owner) = AdaptivePermitSetOwner::new(MAXIMUM, owners.iter().map(|owner| owner.gate().clone()).collect())
-                else {
-                    continue;
-                };
-                let plan = Arc::new(PhysicalDiskPlan {
-                    identities: identities.clone(),
-                    owner,
-                    origin: now,
-                    valid_until_millis: AtomicU64::new(0),
-                });
-                plan.renew();
-                binding.0.store(Some(plan));
-            }
+            prepared.push((binding, identities, owners));
         }
         let attached = sample
             .resolved
@@ -315,7 +358,6 @@ impl PhysicalDiskSampler {
                 binding.invalidate();
             }
         }
-        self.bindings = sample.resolved.into_iter().map(|resolved| resolved.binding).collect();
         self.devices.retain(|id, device| {
             if live.contains(id) {
                 true
@@ -324,6 +366,64 @@ impl PhysicalDiskSampler {
                 false
             }
         });
+        let unchanged = self.bindings.len() == prepared.len()
+            && self.topology.as_ref().is_some_and(|topology| {
+                topology.valid_until_millis.load(Ordering::Acquire) != 0
+                    && prepared.iter().all(|(binding, identities, _)| {
+                        binding
+                            .0
+                            .load()
+                            .as_ref()
+                            .is_some_and(|plan| Arc::ptr_eq(&plan.topology, topology) && plan.identities == **identities)
+                    })
+            });
+        if !unchanged {
+            if let Some(topology) = self.topology.take() {
+                topology.invalidate();
+            }
+            for binding in &self.bindings {
+                binding.invalidate();
+            }
+            self.bindings.clear();
+            // Build the whole generation before publishing any live plan.
+            // Object work combines fixed selections from this common owner;
+            // native tails project into each attachment's separate pool.
+            let next = (|| {
+                let all = AdaptivePermitSetOwner::new(MAXIMUM, self.devices.values().map(|device| device.gate.clone()).collect())
+                    .ok()?;
+                let topology = Arc::new(PhysicalTopology::new());
+                let mut plans = Vec::with_capacity(prepared.len());
+                for (binding, identities, owners) in &prepared {
+                    let gates = owners.iter().map(|owner| owner.gate().clone()).collect::<Vec<_>>();
+                    let selected = all.select(&gates).ok()?;
+                    let owner = if gates.len() == self.devices.len() {
+                        all.clone()
+                    } else {
+                        AdaptivePermitSetOwner::new(MAXIMUM, gates).ok()?
+                    };
+                    plans.push((
+                        (*binding).clone(),
+                        Arc::new(PhysicalDiskPlan {
+                            identities: (*identities).clone(),
+                            owner,
+                            selected,
+                            topology: topology.clone(),
+                        }),
+                    ));
+                }
+                Some((topology, plans))
+            })();
+            if let Some((topology, plans)) = next {
+                for (binding, plan) in plans {
+                    binding.0.store(Some(plan));
+                    self.bindings.push(binding);
+                }
+                self.topology = Some(topology);
+            }
+        }
+        if let Some(topology) = &self.topology {
+            topology.renew();
+        }
         for (index, (identity, device)) in self.devices.iter_mut().enumerate() {
             let observation = sample.devices.get(identity).copied().flatten().filter(|sample| {
                 fresh
@@ -476,6 +576,146 @@ mod tests {
             }),
         );
         node
+    }
+
+    fn two_disks(first: &Arc<PhysicalDiskBinding>, second: &Arc<PhysicalDiskBinding>) -> PhysicalDiskSample {
+        let mut sample = sample(&[first.clone(), second.clone()], identity(1));
+        let second_id = PhysicalDeviceIdentity { minor: 1, ..identity(1) };
+        sample.resolved[1].identities = Some(vec![second_id]);
+        sample.devices.insert(second_id, Some(observation(Instant::now())));
+        sample
+    }
+
+    #[test]
+    fn native_tails_cannot_exhaust_shared_carriers_needed_by_another_disk() {
+        let a = Arc::new(PhysicalDiskBinding::default());
+        let b = Arc::new(PhysicalDiskBinding::default());
+        let mut sampler = PhysicalDiskSampler::default();
+        sampler.publish(two_disks(&a, &b), ResourcePressure::Stable);
+        let a = a.plan().expect("first disk");
+        let b = b.plan().expect("second disk");
+        let node = node();
+        let mut both = a.selected.clone();
+        both.union_with(&b.selected)
+            .expect("attachments use one selection generation");
+        let parent = both.try_acquire_with_node(&node).expect("both devices");
+        let native = a.capture_native(parent.resources()).expect("first disk only");
+        drop(parent);
+        assert_eq!(sampler.devices[&identity(1)].gate.snapshot().active, 1);
+        assert!(b.try_acquire(&node).is_some(), "projection releases the other device");
+        drop(native);
+
+        sampler.devices[&identity(1)].gate.set_limit(u32::from(MAXIMUM.get()));
+        let mut tails = Vec::new();
+        for _ in 0..MAXIMUM.get() {
+            let parent = a.try_acquire(&node).expect("first disk still has physical capacity");
+            tails.push(a.capture_native(parent.resources()).expect("native tail"));
+            drop(parent);
+        }
+        assert!(a.try_acquire(&node).is_none(), "all first-device units are held");
+        b.try_acquire(&node)
+            .expect("native tails do not retain the common carrier pool")
+            .complete();
+        assert_eq!(node.snapshot().active, 0);
+        assert_eq!(sampler.devices[&identity(1)].gate.snapshot().active, u32::from(MAXIMUM.get()));
+        drop(tails);
+        assert_eq!(sampler.devices[&identity(1)].gate.snapshot().active, 0);
+    }
+
+    #[test]
+    fn removed_attachment_invalidates_its_generation_without_refunding_native_work() {
+        let a = Arc::new(PhysicalDiskBinding::default());
+        let b = Arc::new(PhysicalDiskBinding::default());
+        let alias = Arc::new(PhysicalDiskBinding::default());
+        let mut sampler = PhysicalDiskSampler::default();
+        let mut initial = two_disks(&a, &b);
+        let now = Instant::now();
+        initial.resolved.push(Resolved {
+            binding: alias.clone(),
+            identities: Some(vec![identity(1)]),
+            began: now,
+            ended: now,
+        });
+        sampler.publish(initial, ResourcePressure::Stable);
+        let old_a = a.plan().expect("old attachment");
+        let old_b = b.plan().expect("same generation");
+        let node = node();
+        let parent = old_a.try_acquire(&node).expect("old work");
+        let native = old_a.capture_native(parent.resources()).expect("native work");
+        drop(parent);
+        for _ in 0..2 {
+            sampler.publish(two_disks(&alias, &b), ResourcePressure::Stable);
+            assert!(a.plan().is_none());
+            assert!(!old_a.is_current());
+            assert!(!old_b.is_current());
+            let healthy = b.plan().expect("fresh healthy attachment");
+            assert!(healthy.try_acquire(&node).is_some());
+            assert_eq!(old_a.selected.clone().union_with(&healthy.selected), Err(CaptureError::ResourceOwner));
+            assert!(alias.plan().expect("fresh alias").try_acquire(&node).is_none());
+        }
+        drop(native);
+        assert!(alias.plan().expect("alias").try_acquire(&node).is_some());
+    }
+
+    #[test]
+    fn missing_device_observation_preserves_other_disks_and_the_selection_generation() {
+        let a = Arc::new(PhysicalDiskBinding::default());
+        let b = Arc::new(PhysicalDiskBinding::default());
+        let mut sampler = PhysicalDiskSampler::default();
+        sampler.publish(two_disks(&a, &b), ResourcePressure::Stable);
+        let old_a = a.plan().expect("first plan");
+        let old_b = b.plan().expect("second plan");
+        let mut next = two_disks(&a, &b);
+        next.devices.insert(identity(1), None);
+        sampler.publish(next, ResourcePressure::Stable);
+        assert!(Arc::ptr_eq(&old_a, &a.plan().expect("topology is still known")));
+        assert!(Arc::ptr_eq(&old_b, &b.plan().expect("healthy plan")));
+        let node = node();
+        assert!(old_a.try_acquire(&node).is_none(), "missing pressure telemetry closes that device");
+        assert!(old_b.try_acquire(&node).is_some(), "the other device keeps its current plan");
+    }
+
+    #[test]
+    fn full_topology_replacement_reclaims_an_idle_device_referenced_by_another_old_plan() {
+        let bindings = (0..MAXIMUM.get())
+            .map(|_| Arc::new(PhysicalDiskBinding::default()))
+            .collect::<Vec<_>>();
+        let make_sample = |generation| {
+            let mut sample = sample(&bindings, identity(1));
+            sample.devices.clear();
+            for (index, resolved) in sample.resolved.iter_mut().enumerate() {
+                let id = PhysicalDeviceIdentity {
+                    minor: u32::try_from(index).expect("bounded device count"),
+                    generation: if index == 0 { generation } else { 1 },
+                    ..identity(1)
+                };
+                resolved.identities = Some(vec![id]);
+                sample.devices.insert(id, Some(observation(Instant::now())));
+            }
+            sample
+        };
+        let mut sampler = PhysicalDiskSampler::default();
+        sampler.publish(make_sample(1), ResourcePressure::Stable);
+        let old_first = bindings[0].plan().expect("original device");
+        let other = bindings[1].plan().expect("other device in the same generation");
+        let node = node();
+        let ongoing = other.try_acquire(&node).expect("unrelated in-flight operation");
+        sampler.publish(make_sample(2), ResourcePressure::Stable);
+        let replacement = bindings[0]
+            .plan()
+            .expect("an idle old device reference cannot fill the registry and exclude its replacement");
+        assert!(!old_first.is_current());
+        assert_eq!(sampler.devices.len(), usize::from(MAXIMUM.get()));
+        let other_id = PhysicalDeviceIdentity { minor: 1, ..identity(1) };
+        assert_eq!(sampler.devices[&other_id].gate.snapshot().active, 1);
+        drop(ongoing);
+        drop(
+            replacement
+                .try_acquire(&node)
+                .expect("replacement can run after node release"),
+        );
+        assert_eq!(sampler.devices[&other_id].gate.snapshot().active, 0);
+        assert!(old_first.selected.try_acquire_with_node(&node).is_none(), "retired gates stay closed");
     }
 
     #[test]
