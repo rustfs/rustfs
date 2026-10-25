@@ -488,7 +488,7 @@ mod tests {
             format!("{path}/child"),
             format!("{hash}/.."),
             format!("{hash}/"),
-            format!("other/upload"),
+            String::from("other/upload"),
         ] {
             let mut invalid = valid.clone();
             invalid["scope"]["path"] = serde_json::json!(wrong);
