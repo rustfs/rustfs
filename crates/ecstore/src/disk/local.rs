@@ -7133,14 +7133,15 @@ impl LocalDisk {
         paths.push(self.io_get_object_path(destination.0, &format!("{}.meta", destination.1))?);
         paths.extend(part_transaction_child_paths(&transaction));
         paths.push(transaction);
-        // Missing destination parents may be created by prepare or rename.
+        // Parent creation is idempotent; only replacement must exclude siblings.
+        let mut parents = Vec::new();
         let base = self.io_get_bucket_path(destination.0)?;
         for ancestor in dst
             .ancestors()
             .skip(1)
             .take_while(|path| *path != base.as_path() && path.starts_with(&base))
         {
-            paths.push(ancestor.to_path_buf());
+            parents.push(ancestor.to_path_buf());
         }
         if let Some((volume, path)) = source {
             let src = self.io_get_object_path(volume, path)?;
@@ -7151,11 +7152,21 @@ impl LocalDisk {
                 .skip(1)
                 .take_while(|path| *path != base.as_path() && path.starts_with(&base))
             {
+                // Rename prunes empty source parents, so they remain exclusive.
                 paths.push(ancestor.to_path_buf());
             }
         }
         paths.sort();
         paths.dedup();
+        parents.sort();
+        parents.dedup();
+        let mut parent_guards = Vec::with_capacity(parents.len());
+        for parent in parents {
+            check_path_length(parent.to_string_lossy().as_ref())?;
+            if parent != dst && paths.binary_search(&parent).is_err() {
+                parent_guards.push(os::try_acquire_namespace_parent_read(&parent)?);
+            }
+        }
         let mut leases = Vec::with_capacity(paths.len());
         for path in paths {
             check_path_length(path.to_string_lossy().as_ref())?;
@@ -7164,9 +7175,10 @@ impl LocalDisk {
             }
         }
         Ok(if let Some(last) = leases.pop() {
-            last.attach_external_guard(Arc::new(leases));
+            last.attach_external_guard(Arc::new((leases, parent_guards)));
             last
         } else {
+            publication.attach_external_guard(Arc::new(parent_guards));
             publication
         })
     }
@@ -20604,6 +20616,107 @@ mod test {
         }
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_part_mutation_siblings_publish_while_another_part_is_paused() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        let f = PartMutationFixture::new("source", "destination", true).await;
+        let second_meta = Bytes::from(
+            ObjectPartInfo {
+                number: 2,
+                size: 4,
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("second metadata"),
+        );
+        f.disk
+            .write_all("source", "upload-second/part.2", Bytes::from_static(b"cccc"))
+            .await
+            .expect("second source");
+        let token = f.token(LegacyPartOperation::Prepare, None).await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = hooks::install_at(hooks::Stage::PartPrepare, &f.transaction(), move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let first = tokio::spawn(token.prepare(f.new_meta.clone()));
+        timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("first prepare starts")
+            .expect("first worker entered");
+        for (volume, directory) in [("source", "upload"), ("destination", "object")] {
+            let parent = f.disk.io_get_object_path(volume, directory).expect("parent");
+            assert!(
+                matches!(
+                    os::try_acquire_namespace_mutation_lease_with_owner(&parent, Arc::new(())),
+                    Err(DiskError::Io(ref error)) if error.kind() == ErrorKind::WouldBlock
+                ),
+                "a physical worker must still exclude parent replacement"
+            );
+        }
+        let source_parent = f.disk.io_get_object_path("source", "upload").expect("source parent");
+        assert!(
+            matches!(
+                os::try_acquire_namespace_parent_read(&source_parent),
+                Err(DiskError::Io(ref error)) if error.kind() == ErrorKind::WouldBlock
+            ),
+            "source pruning retains exclusive ownership"
+        );
+        timeout(Duration::from_secs(10), async {
+            f.wrapper
+                .prepare_part_transaction("source", "upload-second/part.2", "destination", "object/part.2", second_meta.clone())
+                .await
+                .expect("a sibling prepares while the first worker is paused");
+            f.wrapper
+                .rename_part("source", "upload-second/part.2", "destination", "object/part.2", second_meta.clone())
+                .await
+                .expect("a sibling publishes while the first worker is paused");
+            f.wrapper
+                .settle_part_transaction("destination", "object/part.2", PartTransactionAction::Commit)
+                .await
+                .expect("a sibling settles while the first worker is paused");
+        })
+        .await
+        .expect("sibling progress does not wait for the first worker");
+        let second = f
+            .disk
+            .io_get_object_path("destination", "object/part.2")
+            .expect("second path");
+        assert_eq!(fs::read(&second).await.expect("second data"), b"cccc");
+        assert_eq!(fs::read(second.with_extension("2.meta")).await.expect("second metadata"), second_meta);
+        assert!(
+            !f.disk
+                .io_get_object_path("source", "upload-second/part.2")
+                .expect("source path")
+                .exists()
+        );
+        assert!(
+            !f.disk
+                .io_get_object_path("destination", &crate::disk::part_transaction_path("object/part.2"))
+                .expect("second transaction")
+                .exists()
+        );
+        drop(release_tx);
+        first.await.expect("first task").expect("first prepare completes");
+        f.publish().await;
+        f.token(LegacyPartOperation::Settle, None)
+            .await
+            .settle(PartTransactionAction::Commit)
+            .await
+            .expect("first settles");
+        assert_eq!(fs::read(f.destination()).await.expect("first data"), b"bbbb");
+        assert_eq!(
+            fs::read(f.destination().with_extension("1.meta"))
+                .await
+                .expect("first metadata"),
+            f.new_meta
+        );
+        assert!(!f.transaction().exists());
+    }
+
     #[tokio::test]
     #[serial_test::serial(capacity_dirty_scope)]
     async fn legacy_part_mutation_core_namespace_contention_is_atomic() {
@@ -20793,6 +20906,11 @@ mod test {
         let destination_held = os::disk_volume_mutation_lock(&f.disk.root, "destination")
             .try_write_owned()
             .is_err();
+        let parent = f.destination().parent().expect("destination parent").to_path_buf();
+        let parent_held = matches!(
+            os::try_acquire_namespace_mutation_lease_with_owner(&parent, Arc::new(())),
+            Err(DiskError::Io(ref error)) if error.kind() == ErrorKind::WouldBlock
+        );
         let instance_held = weak.upgrade().is_some();
         let mut delete = Box::pin(f.disk.delete_volume("destination", true));
         let delete_waits = matches!(futures::poll!(delete.as_mut()), Poll::Pending);
@@ -20806,6 +20924,7 @@ mod test {
             .expect("actual worker drains D"),
         );
         assert!(source_held && destination_held, "{stage}: real worker retains every volume READ");
+        assert!(parent_held, "{stage}: real worker excludes destination parent replacement");
         assert!(instance_held, "{stage}: real worker retains receiving instance");
         assert!(delete_waits, "{stage}: real DeleteVolume waits for tail");
         timeout(Duration::from_secs(10), delete)

@@ -29,7 +29,8 @@ use std::{
 };
 use tokio::fs;
 use tokio::sync::{
-    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore, SemaphorePermit, oneshot,
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock, Semaphore,
+    SemaphorePermit, oneshot,
 };
 use tracing::warn;
 
@@ -1688,7 +1689,7 @@ fn fsync_spawn_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'stati
 }
 static DISK_VOLUME_MUTATION_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-type NamespaceMutationLock = AsyncMutex<()>;
+type NamespaceMutationLock = RwLock<()>;
 type NamespaceMutationLockRegistry = HashMap<PathBuf, Weak<NamespaceMutationLock>>;
 static DISK_NAMESPACE_MUTATION_LOCKS: LazyLock<Mutex<NamespaceMutationLockRegistry>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -1978,12 +1979,12 @@ fn disk_namespace_mutation_lock(path: &Path) -> Arc<NamespaceMutationLock> {
         return lock;
     }
 
-    let lock = Arc::new(AsyncMutex::new(()));
+    let lock = Arc::new(RwLock::new(()));
     locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
     lock
 }
 
-static DISK_METADATA_MUTATION_LOCKS: LazyLock<Mutex<NamespaceMutationLockRegistry>> =
+static DISK_METADATA_MUTATION_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Serializes the complete xl.meta read/modify/commit transaction. This domain
@@ -2033,8 +2034,8 @@ pub(crate) async fn acquire_metadata_mutation_lease(
 /// Keeps a namespace transaction serialized even when its async waiter is
 /// cancelled while a blocking filesystem call is still running.
 pub(crate) struct NamespaceMutationLease {
-    _namespace_guard: OwnedMutexGuard<()>,
-    _staging_guard: Option<OwnedMutexGuard<()>>,
+    _namespace_guard: OwnedRwLockWriteGuard<()>,
+    _staging_guard: Option<OwnedRwLockWriteGuard<()>>,
     _volume_guard: Option<OwnedRwLockReadGuard<()>>,
     _secondary_volume_guard: Option<OwnedRwLockReadGuard<()>>,
     external_guard: Mutex<Option<Arc<dyn Send + Sync>>>,
@@ -2059,7 +2060,7 @@ pub(in crate::disk) async fn acquire_namespace_mutation_lease_with_owner(
 ) -> Arc<NamespaceMutationLease> {
     let blocking_queue = disk_blocking_queue_for_path(path);
     Arc::new(NamespaceMutationLease {
-        _namespace_guard: disk_namespace_mutation_lock(path).lock_owned().await,
+        _namespace_guard: disk_namespace_mutation_lock(path).write_owned().await,
         _staging_guard: None,
         _volume_guard: None,
         _secondary_volume_guard: None,
@@ -2076,7 +2077,7 @@ pub(in crate::disk) fn try_acquire_namespace_mutation_lease_with_owner(
     namespace_owner: Arc<dyn Send + Sync>,
 ) -> Result<Arc<NamespaceMutationLease>> {
     let guard = disk_namespace_mutation_lock(path)
-        .try_lock_owned()
+        .try_write_owned()
         .map_err(|_| DiskError::Io(io::Error::from(io::ErrorKind::WouldBlock)))?;
     Ok(Arc::new(NamespaceMutationLease {
         _namespace_guard: guard,
@@ -2087,6 +2088,14 @@ pub(in crate::disk) fn try_acquire_namespace_mutation_lease_with_owner(
         _namespace_owner: Some(namespace_owner),
         blocking_queue: disk_blocking_queue_for_path(path),
     }))
+}
+
+/// Protect a parent directory against replacement while sibling parts publish.
+/// Like exact-path acquisition, this must not wait while holding a volume READ.
+pub(in crate::disk) fn try_acquire_namespace_parent_read(path: &Path) -> Result<OwnedRwLockReadGuard<()>> {
+    disk_namespace_mutation_lock(path)
+        .try_read_owned()
+        .map_err(|_| DiskError::Io(io::Error::from(io::ErrorKind::WouldBlock)))
 }
 
 /// Acquire object serialization before the volume read lock. Bucket deletion
@@ -2111,14 +2120,14 @@ pub(crate) async fn acquire_rename_data_mutation_lease_with_owner(
     let destination_lock = disk_namespace_mutation_lock(destination_object);
     let (namespace_guard, staging_guard) = match staging_prefix {
         Some(source) if source < destination_object => {
-            let staging = disk_namespace_mutation_lock(source).lock_owned().await;
-            (destination_lock.lock_owned().await, Some(staging))
+            let staging = disk_namespace_mutation_lock(source).write_owned().await;
+            (destination_lock.write_owned().await, Some(staging))
         }
         Some(source) if source > destination_object => {
-            let destination = destination_lock.lock_owned().await;
-            (destination, Some(disk_namespace_mutation_lock(source).lock_owned().await))
+            let destination = destination_lock.write_owned().await;
+            (destination, Some(disk_namespace_mutation_lock(source).write_owned().await))
         }
-        _ => (destination_lock.lock_owned().await, None),
+        _ => (destination_lock.write_owned().await, None),
     };
     let volume_guard = disk_volume_mutation_lock(root, volume).read_owned().await;
     let blocking_queue = disk_blocking_queue_for_root(root);
@@ -2144,13 +2153,13 @@ pub(in crate::disk) async fn acquire_rename_data_mutation_lease_for_volumes(
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Arc<NamespaceMutationLease> {
     let staging_guard = match staging_prefix {
-        Some(source) if source < destination_object => Some(disk_namespace_mutation_lock(source).lock_owned().await),
+        Some(source) if source < destination_object => Some(disk_namespace_mutation_lock(source).write_owned().await),
         _ => None,
     };
-    let namespace = disk_namespace_mutation_lock(destination_object).lock_owned();
+    let namespace = disk_namespace_mutation_lock(destination_object).write_owned();
     #[cfg(all(test, not(windows)))]
     let namespace_guard = {
-        // Observe actual mutex contention, not a cooperative-budget yield.
+        // Observe actual namespace contention, not a cooperative-budget yield.
         let mut namespace = std::pin::pin!(tokio::task::unconstrained(namespace));
         std::future::poll_fn(|cx| {
             let poll = std::future::Future::poll(namespace.as_mut(), cx);
@@ -2167,7 +2176,7 @@ pub(in crate::disk) async fn acquire_rename_data_mutation_lease_for_volumes(
     #[cfg(not(all(test, not(windows))))]
     let namespace_guard = namespace.await;
     let staging_guard = match staging_prefix {
-        Some(source) if source > destination_object => Some(disk_namespace_mutation_lock(source).lock_owned().await),
+        Some(source) if source > destination_object => Some(disk_namespace_mutation_lock(source).write_owned().await),
         _ => staging_guard,
     };
     let source_key = root.join(source_volume);
@@ -5857,7 +5866,7 @@ mod tests {
             );
         });
         tokio::time::timeout(Duration::from_secs(10), async {
-            while disk_namespace_mutation_lock(&early).try_lock_owned().is_ok() {
+            while disk_namespace_mutation_lock(&early).try_write_owned().is_ok() {
                 tokio::task::yield_now().await;
             }
         })
