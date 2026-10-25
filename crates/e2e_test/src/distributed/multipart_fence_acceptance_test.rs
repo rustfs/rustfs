@@ -1386,6 +1386,9 @@ async fn simultaneous_resend_complete_and_abort(
             tokio::time::timeout(Duration::from_millis(150), &mut abort).await.is_err(),
             "Abort must wait while the resent part is prepared: cancel_waiter={cancel_waiter}"
         );
+        let terminal_owners = admission.forwarded_lock_owners();
+        assert_eq!(terminal_owners, 2, "only the two terminal coordinators contend before part release");
+        drop(admission);
         for pause in &pauses {
             pause.release();
         }
@@ -1429,8 +1432,7 @@ async fn simultaneous_resend_complete_and_abort(
         }
         assert_no_uploads(clients, bucket).await?;
         eprintln!(
-            "MPU three-way owner: cancel_waiter={cancel_waiter}, complete_won={completed}, forwarded_terminal_owners={}, prepared_peers=3, retired_roots=4, verified_readers=4",
-            admission.forwarded_lock_owners()
+            "MPU three-way owner: cancel_waiter={cancel_waiter}, complete_won={completed}, forwarded_terminal_owners={terminal_owners}, prepared_peers=3, retired_roots=4, verified_readers=4"
         );
     }
     Ok(())
