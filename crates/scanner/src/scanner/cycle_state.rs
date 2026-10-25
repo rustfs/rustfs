@@ -939,6 +939,7 @@ pub(super) async fn scanner_usage_recovery_intents_for_startup(
                                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                                     .push(entry.name);
                             }
+                            Ok(())
                         })
                     })),
                     ..Default::default()

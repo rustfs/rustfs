@@ -327,7 +327,7 @@ s3s-sigv4 = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fc
 serial_test = "4.0.1"
 shadow-rs = { default-features = false, version = "2.0.0" }
 siphasher = "1.0.4"
-smallvec = { version = "1.16.3" }
+smallvec = { version = "1.16.4" }
 compact_str = "0.10.0"
 snap = "1.1.2"
 starshard = { version = "2.4.0" }
@@ -354,7 +354,7 @@ winapi-util = "0.1.11"
 windows = { version = "0.62.2" }
 windows-sys = "0.61.2"
 xxhash-rust = { version = "0.8.19" }
-zip = "9.0.5"
+zip = "9.1.0"
 zstd = "0.14.3"
 
 # Observability and Metrics
@@ -382,9 +382,9 @@ russh-sftp = "3.0.1"
 dav-server = "0.11.0"
 
 # Performance Analysis and Memory Profiling
-rustfs-mimalloc = { version = "0.7.1" }
+rustfs-mimalloc = { version = "0.7.2" }
 # Preserve Unicode focus filters until rustfs/backlog#2302 is resolved.
-hotpath = { version = "0.29.0", default-features = false }
+hotpath = { version = "0.29.1", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.49" }
 
