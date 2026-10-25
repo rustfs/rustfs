@@ -215,6 +215,15 @@ impl AdaptivePermitSetOwner {
         }))
     }
 
+    /// Start a node-scoped operation with no planned local leaves. Auxiliary
+    /// local I/O may still extend it through this immutable resource catalog.
+    pub fn empty_selection(self: &Arc<Self>) -> AdaptiveResourceSelection {
+        AdaptiveResourceSelection {
+            owner: self.clone(),
+            selected: ResourceMask::empty(),
+        }
+    }
+
     /// Resolve an attachment's leaves against this immutable owner outside the
     /// object path. Repeated aliases select the same unit; foreign owners fail.
     pub fn select(self: &Arc<Self>, owners: &[Arc<AdaptiveAdmission>]) -> Result<AdaptiveResourceSelection, CaptureError> {

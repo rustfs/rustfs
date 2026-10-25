@@ -4466,6 +4466,7 @@ fn resolve_tiered_decommission_write_quorum_result(
 pub struct SetDisks {
     pub locker_owner: String,
     pub disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
+    pub(crate) physical_heal_admission: Arc<crate::disk::PhysicalHealBinding>,
     pub set_endpoints: Vec<Endpoint>,
     pub set_drive_count: usize,
     pub default_parity_count: usize,
@@ -5427,6 +5428,7 @@ impl SetDisks {
         Arc::new(SetDisks {
             locker_owner,
             disks,
+            physical_heal_admission: Arc::default(),
             set_drive_count,
             default_parity_count,
             set_index,

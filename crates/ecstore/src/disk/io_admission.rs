@@ -18,7 +18,10 @@ mod physical_identity;
 mod physical_owners;
 mod physical_sampler;
 
-pub use physical_sampler::{PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler};
+pub(crate) use physical_sampler::PhysicalHealBinding;
+pub use physical_sampler::{
+    PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler, PhysicalResourcePlan,
+};
 
 use std::collections::VecDeque;
 use std::future::Future;

@@ -61,7 +61,7 @@ impl PhysicalDiskBinding {
             identities: Vec::new(),
             owner,
             selected,
-            topology: Arc::new(PhysicalTopology::new()),
+            topology: Arc::new(PhysicalTopology::new(shared)),
         });
         plan.topology.renew();
         self.0.store(Some(plan));
@@ -91,13 +91,15 @@ pub struct PhysicalDiskPlan {
 }
 
 struct PhysicalTopology {
+    catalog: Arc<AdaptivePermitSetOwner>,
     origin: Instant,
     valid_until_millis: AtomicU64,
 }
 
 impl PhysicalTopology {
-    fn new() -> Self {
+    fn new(catalog: Arc<AdaptivePermitSetOwner>) -> Self {
         Self {
+            catalog,
             origin: Instant::now(),
             valid_until_millis: AtomicU64::new(0),
         }
@@ -136,6 +138,42 @@ impl PhysicalDiskPlan {
         self.owner.try_capture_or_acquire_from(admitted, &self.selected)
     }
 
+    pub fn resource_plan(&self) -> PhysicalResourcePlan {
+        PhysicalResourcePlan {
+            selected: self.selected.clone(),
+            topology: self.topology.clone(),
+        }
+    }
+
+    pub fn try_acquire(&self, node: &Arc<NodeAdmission>) -> Option<NodeResourcePermit> {
+        self.resource_plan().try_acquire(node)
+    }
+
+    pub async fn acquire(&self, node: &Arc<NodeAdmission>) -> Option<NodeResourcePermit> {
+        self.resource_plan().acquire(node).await
+    }
+}
+
+/// Cached local participation in a Heal operation. Combining plans is bounded
+/// and allocation-free; sysfs discovery and disk locks stay in the sampler.
+#[derive(Clone)]
+pub struct PhysicalResourcePlan {
+    selected: AdaptiveResourceSelection,
+    topology: Arc<PhysicalTopology>,
+}
+
+impl PhysicalResourcePlan {
+    pub fn is_current(&self) -> bool {
+        self.topology.is_current()
+    }
+
+    pub(crate) fn union_with(&mut self, other: &Self) -> Result<(), CaptureError> {
+        if !Arc::ptr_eq(&self.topology, &other.topology) || !other.is_current() {
+            return Err(CaptureError::ResourceOwner);
+        }
+        self.selected.union_with(&other.selected)
+    }
+
     /// Never wait under a storage lock. A refresh during acquisition rejects
     /// the old plan before its future can issue I/O.
     pub fn try_acquire(&self, node: &Arc<NodeAdmission>) -> Option<NodeResourcePermit> {
@@ -167,6 +205,37 @@ impl PhysicalDiskPlan {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct PhysicalHealBinding(ArcSwapOption<PhysicalResourcePlan>);
+
+impl std::fmt::Debug for PhysicalHealBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhysicalHealBinding")
+            .field("ready", &self.plan().is_some())
+            .finish()
+    }
+}
+
+impl PhysicalHealBinding {
+    #[cfg(test)]
+    pub(crate) fn set_test_plan(&self, plan: PhysicalResourcePlan) {
+        self.0.store(Some(Arc::new(plan)));
+    }
+
+    pub(crate) fn plan(&self) -> Option<PhysicalResourcePlan> {
+        self.0
+            .load()
+            .as_ref()
+            .filter(|plan| plan.is_current())
+            .map(|plan| (**plan).clone())
+    }
+}
+
+struct HealSetSample {
+    binding: Arc<PhysicalHealBinding>,
+    disks: Option<Vec<Arc<PhysicalDiskBinding>>>,
+}
+
 struct Target {
     disk: Arc<LocalDisk>,
     binding: Arc<PhysicalDiskBinding>,
@@ -175,6 +244,7 @@ struct Target {
 /// Collected handles contain no storage locks. Move this snapshot into the
 /// existing blocking sampler; only `publish` may renew admission leases.
 pub struct PhysicalDiskSample {
+    heal_sets: Vec<HealSetSample>,
     targets: Vec<Target>,
     resolved: Vec<Resolved>,
     devices: BTreeMap<PhysicalDeviceIdentity, Option<Observation>>,
@@ -242,13 +312,23 @@ impl PhysicalDiskSample {
     /// cannot hold the sampler indefinitely or renew stale capacity.
     pub fn collect(store: &ECStore) -> Self {
         let mut targets = Vec::new();
+        let mut heal_sets = Vec::new();
         let mut seen = BTreeSet::new();
         for pool in &store.pools {
             for set in &pool.disk_set {
-                let Ok(disks) = set.disks.try_read() else { continue };
+                let mut heal_set = HealSetSample {
+                    binding: set.physical_heal_admission.clone(),
+                    disks: None,
+                };
+                let Ok(disks) = set.disks.try_read() else {
+                    heal_sets.push(heal_set);
+                    continue;
+                };
+                let mut bindings = Vec::new();
                 for disk in disks.iter().flatten() {
                     let Disk::Local(local) = disk.as_ref() else { continue };
                     let binding = local.physical_admission();
+                    bindings.push(binding.clone());
                     if targets.len() < MAX_LOGICAL_DISKS && seen.insert(Arc::as_ptr(&binding)) {
                         targets.push(Target {
                             disk: local.get_disk(),
@@ -256,9 +336,12 @@ impl PhysicalDiskSample {
                         });
                     }
                 }
+                heal_set.disks = Some(bindings);
+                heal_sets.push(heal_set);
             }
         }
         Self {
+            heal_sets,
             targets,
             resolved: Vec::new(),
             devices: BTreeMap::new(),
@@ -398,7 +481,7 @@ impl PhysicalDiskSampler {
             let next = (|| {
                 let all = AdaptivePermitSetOwner::new(MAXIMUM, self.devices.values().map(|device| device.gate.clone()).collect())
                     .ok()?;
-                let topology = Arc::new(PhysicalTopology::new());
+                let topology = Arc::new(PhysicalTopology::new(all.clone()));
                 let mut plans = Vec::with_capacity(prepared.len());
                 for (binding, identities, owners) in &prepared {
                     let gates = owners.iter().map(|owner| owner.gate().clone()).collect::<Vec<_>>();
@@ -430,6 +513,20 @@ impl PhysicalDiskSampler {
         }
         if let Some(topology) = &self.topology {
             topology.renew();
+        }
+        for set in sample.heal_sets {
+            let plan = (|| {
+                let topology = self.topology.as_ref().filter(|topology| topology.is_current())?;
+                let mut plan = PhysicalResourcePlan {
+                    selected: topology.catalog.empty_selection(),
+                    topology: topology.clone(),
+                };
+                for binding in set.disks? {
+                    plan.union_with(&binding.plan()?.resource_plan()).ok()?;
+                }
+                Some(Arc::new(plan))
+            })();
+            set.binding.0.store(plan);
         }
         for (index, (identity, device)) in self.devices.iter_mut().enumerate() {
             let observation = sample.devices.get(identity).copied().flatten().filter(|sample| {
@@ -556,6 +653,7 @@ mod tests {
     fn sample(bindings: &[Arc<PhysicalDiskBinding>], id: PhysicalDeviceIdentity) -> PhysicalDiskSample {
         let now = Instant::now();
         PhysicalDiskSample {
+            heal_sets: Vec::new(),
             targets: Vec::new(),
             resolved: bindings
                 .iter()
@@ -591,6 +689,85 @@ mod tests {
         sample.resolved[1].identities = Some(vec![second_id]);
         sample.devices.insert(second_id, Some(observation(Instant::now())));
         sample
+    }
+
+    #[test]
+    fn heal_plans_select_only_participating_sets_and_reject_unknown_members() {
+        let a = Arc::new(PhysicalDiskBinding::default());
+        let b = Arc::new(PhysicalDiskBinding::default());
+        let first = Arc::new(PhysicalHealBinding::default());
+        let second = Arc::new(PhysicalHealBinding::default());
+        let remote_only = Arc::new(PhysicalHealBinding::default());
+        let mut sampler = PhysicalDiskSampler::default();
+        let mut sample = two_disks(&a, &b);
+        sample.heal_sets = vec![
+            HealSetSample {
+                binding: first.clone(),
+                disks: Some(vec![a.clone(), a.clone()]),
+            },
+            HealSetSample {
+                binding: second.clone(),
+                disks: Some(vec![b.clone()]),
+            },
+            HealSetSample {
+                binding: remote_only.clone(),
+                disks: Some(Vec::new()),
+            },
+        ];
+        sampler.publish(sample, ResourcePressure::Stable);
+        let node = node();
+        let a_gate = sampler.devices.get(&identity(1)).expect("A owner").gate.clone();
+        let b_gate = sampler
+            .devices
+            .get(&PhysicalDeviceIdentity { minor: 1, ..identity(1) })
+            .expect("B owner")
+            .gate
+            .clone();
+        let first_plan = first.plan().expect("set A");
+        let a_permit = first_plan.try_acquire(&node).expect("A admitted");
+        assert_eq!((a_gate.snapshot().active, b_gate.snapshot().active), (1, 0));
+        let a_native = a
+            .plan()
+            .expect("A binding")
+            .capture_native(a_permit.resources())
+            .expect("A native tail");
+        drop(a_permit);
+        let b_permit = second
+            .plan()
+            .expect("set B")
+            .try_acquire(&node)
+            .expect("B independent of full A");
+        assert_eq!((a_gate.snapshot().active, b_gate.snapshot().active), (1, 1));
+        drop((a_native, b_permit));
+        let empty = remote_only
+            .plan()
+            .expect("known remote-only set")
+            .try_acquire(&node)
+            .expect("node scope");
+        assert_eq!((a_gate.snapshot().active, b_gate.snapshot().active), (0, 0));
+        empty.complete();
+        let mut both = first_plan.clone();
+        both.union_with(&second.plan().expect("B plan")).expect("common catalog");
+        let permit = both.try_acquire(&node).expect("union");
+        assert_eq!((a_gate.snapshot().active, b_gate.snapshot().active), (1, 1));
+        permit.complete();
+        assert_eq!((node.completed(), a_gate.completed(), b_gate.completed()), (Some(2), Some(1), Some(1)));
+        let mut sample = two_disks(&a, &b);
+        sample.heal_sets = vec![HealSetSample {
+            binding: first.clone(),
+            disks: None,
+        }];
+        sampler.publish(sample, ResourcePressure::Stable);
+        assert!(first.plan().is_none(), "a busy set cannot reuse its prior membership");
+        let mut sample = two_disks(&a, &b);
+        sample.resolved[0].identities = None;
+        sample.heal_sets = vec![HealSetSample {
+            binding: first.clone(),
+            disks: Some(vec![a.clone()]),
+        }];
+        sampler.publish(sample, ResourcePressure::Stable);
+        assert!(first.plan().is_none(), "unknown local disks never become empty selections");
+        assert!(first_plan.try_acquire(&node).is_none(), "old plans reject a changed generation");
     }
 
     #[test]

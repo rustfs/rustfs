@@ -32,12 +32,12 @@ pub mod os;
 #[cfg(test)]
 pub(crate) use io_admission::DiskIoClass;
 pub use io_admission::{
-    PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler, spawn_blocking_with_resource_ownership,
-    with_background_disk_io, with_background_resource_set, with_background_resource_unit,
+    PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler, PhysicalResourcePlan,
+    spawn_blocking_with_resource_ownership, with_background_disk_io, with_background_resource_set, with_background_resource_unit,
 };
 pub(crate) use io_admission::{
-    acquire_context_disk_io_permit, current_disk_io_context, current_resource_unit, with_optional_disk_io_context,
-    with_optional_resource_unit,
+    PhysicalHealBinding, acquire_context_disk_io_permit, current_disk_io_context, current_resource_unit,
+    with_optional_disk_io_context, with_optional_resource_unit,
 };
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";

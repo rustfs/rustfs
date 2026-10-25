@@ -27,7 +27,10 @@ use uuid::Uuid;
 use super::outcome::{HealObjectDisposition, HealObjectIdentity, HealObjectKind, HealObjectReceipt};
 use super::progress::stable_generation;
 pub use super::replacement_execution::ReplacementExecution;
-use super::storage_api::owner::{EcstoreHealLifecycleExpiryContext, ecstore_load_admin_data_usage_from_backend_cached};
+use super::storage_api::owner::{
+    EcstoreHealLifecycleExpiryContext, PhysicalResourcePlan, ecstore_load_admin_data_usage_from_backend_cached,
+    ecstore_with_background_resource_set,
+};
 use super::storage_api::storage::{
     BucketInfo, BucketOperations, DiskSetSelector, EcstoreHealObjectStorageResult, HealOperations as _, ListOperations as _,
     ObjectIO as _, ObjectOperations as _, StorageAdminApi,
@@ -753,6 +756,7 @@ pub trait HealStorageAPI: Send + Sync {
 // locks. No-lock callers may already own a namespace lock: never park them.
 async fn run_background_object<T>(
     admission: Option<&Arc<NodeAdmission>>,
+    physical_plan: impl FnOnce() -> Result<Option<PhysicalResourcePlan>>,
     opts: &HealOpts,
     completed: impl FnOnce(&T) -> bool,
     operation: impl std::future::Future<Output = Result<T>>,
@@ -760,15 +764,17 @@ async fn run_background_object<T>(
     let Some(admission) = admission else {
         return operation.await;
     };
+    let plan = physical_plan()?.ok_or_else(|| Error::transient_skip("physical resource discovery unavailable"))?;
     let permit = if opts.no_lock {
-        admission.try_acquire()
+        plan.try_acquire(admission)
     } else {
-        tokio::time::timeout(std::time::Duration::from_millis(250), admission.acquire())
+        tokio::time::timeout(std::time::Duration::from_millis(250), plan.acquire(admission))
             .await
             .ok()
+            .flatten()
     }
-    .ok_or_else(|| Error::transient_skip("node resource admission deferred"))?;
-    let result = operation.await;
+    .ok_or_else(|| Error::transient_skip("node or physical resource admission deferred"))?;
+    let result = ecstore_with_background_resource_set(permit.resources().clone(), operation).await;
     if !opts.dry_run && result.as_ref().is_ok_and(completed) {
         permit.complete();
     }
@@ -1079,6 +1085,7 @@ impl HealStorageAPI for ECStoreHealStorage {
     ) -> Result<HealStorageObjectResult> {
         run_background_object(
             self.admission.as_ref(),
+            || self.ecstore.physical_heal_plan(object, opts).map_err(Error::Storage),
             opts,
             |result: &HealStorageObjectResult| result.error.is_none(),
             async {
@@ -1105,6 +1112,7 @@ impl HealStorageAPI for ECStoreHealStorage {
     ) -> Result<HealStorageObjectResult> {
         run_background_object(
             self.admission.as_ref(),
+            || self.ecstore.physical_heal_plan(object, opts).map_err(Error::Storage),
             opts,
             |result: &HealStorageObjectResult| result.error.is_none(),
             async {
@@ -1549,6 +1557,7 @@ impl HealStorageAPI for ECStoreHealStorage {
     ) -> Result<(HealResultItem, Option<Error>)> {
         run_background_object(
             self.admission.as_ref(),
+            || self.ecstore.physical_heal_plan(object, opts).map_err(Error::Storage),
             opts,
             |result: &(HealResultItem, Option<Error>)| result.1.is_none(),
             async {
@@ -1590,6 +1599,7 @@ impl HealStorageAPI for ECStoreHealStorage {
     ) -> Result<HealStorageObjectResult> {
         run_background_object(
             self.admission.as_ref(),
+            || self.ecstore.physical_heal_plan(object, opts).map_err(Error::Storage),
             opts,
             |result: &HealStorageObjectResult| result.error.is_none(),
             async {
@@ -2228,6 +2238,79 @@ mod tests {
         gate
     }
 
+    fn physical_plan() -> crate::Result<Option<super::PhysicalResourcePlan>> {
+        let binding = super::super::storage_api::owner::PhysicalDiskBinding::default();
+        binding
+            .set_test_capacity(vec![rustfs_concurrency::adaptive::AdaptiveAdmission::new(NonZeroU16::MIN, 1)])
+            .expect("synthetic physical capacity");
+        Ok(Some(binding.plan().expect("live physical binding").resource_plan()))
+    }
+
+    #[tokio::test]
+    async fn object_admission_releases_node_and_retains_only_a_running_native_disk() {
+        use super::super::storage_api::owner::{PhysicalDiskBinding, ecstore_spawn_blocking_with_resource_ownership};
+        let node = admission(true);
+        let disk = rustfs_concurrency::adaptive::AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let binding = PhysicalDiskBinding::default();
+        binding.set_test_capacity(vec![disk.clone()]).expect("physical binding");
+        let plan = binding.plan().expect("physical plan").resource_plan();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let handle = tokio::spawn({
+            let node = node.clone();
+            async move {
+                super::run_background_object(Some(&node), || Ok(Some(plan)), &super::HealOpts::default(), |_: &()| true, async {
+                    ecstore_spawn_blocking_with_resource_ownership(move || {
+                        started_tx.send(()).expect("native started");
+                        release_rx.recv().expect("release native");
+                    })
+                    .await
+                    .expect("native job");
+                    Ok(())
+                })
+                .await
+            }
+        });
+        started_rx.await.expect("native dispatched");
+        assert_eq!((node.snapshot().active, disk.snapshot().active), (1, 1));
+        handle.abort();
+        assert!(handle.await.expect_err("waiter aborted").is_cancelled());
+        assert_eq!((node.snapshot().active, disk.snapshot().active), (0, 1));
+        assert_eq!((node.completed(), disk.completed()), (Some(0), Some(0)));
+        release_tx.send(()).expect("release native");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while disk.snapshot().active != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native releases physical resource");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn object_admission_closed_physical_capacity_defers_before_storage_locks() {
+        use super::super::storage_api::owner::PhysicalDiskBinding;
+        let node = admission(true);
+        let disk = rustfs_concurrency::adaptive::AdaptiveAdmission::new(NonZeroU16::MIN, 0);
+        let binding = PhysicalDiskBinding::default();
+        binding.set_test_capacity(vec![disk.clone()]).expect("physical binding");
+        let plan = binding.plan().expect("physical plan").resource_plan();
+        for no_lock in [false, true] {
+            let began = tokio::time::Instant::now();
+            let opts = super::HealOpts {
+                no_lock,
+                ..Default::default()
+            };
+            let result = super::run_background_object(Some(&node), || Ok(Some(plan.clone())), &opts, |_: &()| true, async {
+                panic!("closed disk must prevent storage polling");
+            })
+            .await;
+            assert!(matches!(result, Err(super::Error::TransientSkip { .. })));
+            assert_eq!(began.elapsed(), if no_lock { Duration::ZERO } else { Duration::from_millis(250) });
+            assert_eq!((node.snapshot().active, disk.snapshot().active), (0, 0));
+        }
+    }
+
     #[tokio::test]
     async fn object_admission_is_wired_to_all_four_real_storage_entry_points() {
         use super::{ECStoreHealStorage, Error, HealOpts, HealStorageAPI};
@@ -2236,7 +2319,7 @@ mod tests {
             .base_dir(root.path())
             .build()
             .await;
-        let gate = admission(false);
+        let gate = admission(true);
         let storage = ECStoreHealStorage::new(env.ecstore.clone()).with_admission(Some(gate.clone()));
         let opts = HealOpts {
             no_lock: true,
@@ -2261,7 +2344,7 @@ mod tests {
         for result in results {
             assert!(
                 matches!(result, Err(Error::TransientSkip { .. })),
-                "closed admission precedes even bucket validation: {result:?}"
+                "unknown physical ownership precedes even bucket validation: {result:?}"
             );
         }
         assert_eq!(gate.completed(), Some(0));
@@ -2285,11 +2368,12 @@ mod tests {
         let gate = admission(false);
         let polled = std::cell::Cell::new(false);
         let began = tokio::time::Instant::now();
-        let result = super::run_background_object(Some(&gate), &super::HealOpts::default(), |_: &()| true, async {
-            polled.set(true);
-            Ok(())
-        })
-        .await;
+        let result =
+            super::run_background_object(Some(&gate), physical_plan, &super::HealOpts::default(), |_: &()| true, async {
+                polled.set(true);
+                Ok(())
+            })
+            .await;
         assert!(matches!(result, Err(super::Error::TransientSkip { .. })));
         assert!(!polled.get(), "no locks or storage mutation before admission");
         assert_eq!(began.elapsed(), Duration::from_millis(250));
@@ -2304,9 +2388,10 @@ mod tests {
             ..Default::default()
         };
         let began = tokio::time::Instant::now();
-        let result =
-            super::run_background_object(Some(&gate), &opts, |_: &()| true, async { panic!("storage must remain unpolled") })
-                .await;
+        let result = super::run_background_object(Some(&gate), physical_plan, &opts, |_: &()| true, async {
+            panic!("storage must remain unpolled")
+        })
+        .await;
         assert!(matches!(result, Err(super::Error::TransientSkip { .. })));
         assert_eq!(began.elapsed(), Duration::ZERO);
     }
@@ -2316,15 +2401,17 @@ mod tests {
         use std::task::{Context, Poll, Waker};
         let gate = admission(true);
         let opts = super::HealOpts::default();
-        let future = super::run_background_object(Some(&gate), &opts, |_: &()| true, std::future::pending());
+        let future = super::run_background_object(Some(&gate), physical_plan, &opts, |_: &()| true, std::future::pending());
         let mut future = Box::pin(future);
         assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
         assert_eq!(gate.snapshot().active, 1);
         drop(future);
         assert_eq!(gate.snapshot().active, 0);
         assert_eq!(gate.completed(), Some(0));
-        let result =
-            super::run_background_object(Some(&gate), &opts, |_: &()| true, async { Err(super::Error::TaskCancelled) }).await;
+        let result = super::run_background_object(Some(&gate), physical_plan, &opts, |_: &()| true, async {
+            Err(super::Error::TaskCancelled)
+        })
+        .await;
         assert!(matches!(result, Err(super::Error::TaskCancelled)));
         assert_eq!(gate.completed(), Some(0));
         assert_eq!(gate.snapshot().active, 0);
@@ -2337,7 +2424,7 @@ mod tests {
             read_repair: true,
             ..Default::default()
         };
-        let result = super::run_background_object(Some(&gate), &opts, |_: &()| true, async {
+        let result = super::run_background_object(Some(&gate), physical_plan, &opts, |_: &()| true, async {
             panic!("queued read repair must not bypass the closed node gate");
         })
         .await;
@@ -2355,7 +2442,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                super::run_background_object(Some(&gate), &opts, |ok: &bool| *ok, async { Ok(successful) })
+                super::run_background_object(Some(&gate), physical_plan, &opts, |ok: &bool| *ok, async { Ok(successful) })
                     .await
                     .expect("operation"),
                 successful
@@ -2365,9 +2452,15 @@ mod tests {
         }
         gate.update(&mut FeedbackController::new(), None);
         assert_eq!(gate.completed(), Some(1));
-        super::run_background_object(None, &super::HealOpts::default(), |_: &()| true, async { Ok(()) })
-            .await
-            .expect("default path stays available");
+        super::run_background_object(
+            None,
+            || panic!("disabled admission must not read discovery"),
+            &super::HealOpts::default(),
+            |_: &()| true,
+            async { Ok(()) },
+        )
+        .await
+        .expect("default path stays available");
     }
 
     #[test]

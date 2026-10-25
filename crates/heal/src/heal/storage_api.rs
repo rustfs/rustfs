@@ -41,6 +41,13 @@ pub(crate) use rustfs_ecstore::api::storage::{
 use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod owner {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::disk::PhysicalDiskBinding;
+    pub(crate) use rustfs_ecstore::api::disk::PhysicalResourcePlan;
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::spawn_blocking_with_resource_ownership as ecstore_spawn_blocking_with_resource_ownership;
+    pub(crate) use rustfs_ecstore::with_background_resource_set as ecstore_with_background_resource_set;
+
     pub(crate) use super::storage_contracts::{ObjectIO, ObjectOperations};
 
     pub(crate) use super::{
