@@ -214,6 +214,9 @@ const MRF_LIFECYCLE_MAGIC: &[u8; 8] = b"RFMFLC01";
 const MRF_LIFECYCLE_FORMAT_VERSION: u8 = 1;
 const MRF_LIFECYCLE_FORMAT_VERSION_V2: u8 = 2;
 
+/// Highest supported lifecycle format; every format from 1 through this value is readable.
+pub const MRF_LIFECYCLE_READER_MAX_FORMAT_VERSION: u8 = MRF_LIFECYCLE_FORMAT_VERSION_V2;
+
 /// Record format tag.
 const MRF_JOURNAL_FORMAT: u8 = 1;
 /// Record layout version.

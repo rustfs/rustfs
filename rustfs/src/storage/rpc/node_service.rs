@@ -1230,11 +1230,13 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
         }
         let remote_version_state_probe = rustfs_protos::is_remote_version_state_capability_probe(&request.get_ref().command);
         let cross_pool_fence_probe = rustfs_protos::is_cross_pool_fence_capability_probe(&request.get_ref().command);
+        let mrf_lifecycle_reader_probe = rustfs_protos::is_mrf_lifecycle_reader_capability_probe(&request.get_ref().command);
         let recovery_export_probe = rustfs_protos::is_ilm_recovery_export_capability_probe(&request.get_ref().command);
         let transition_transaction_compaction_probe =
             rustfs_protos::is_transition_transaction_compaction_capability_probe(&request.get_ref().command);
         if remote_version_state_probe
             || cross_pool_fence_probe
+            || mrf_lifecycle_reader_probe
             || recovery_export_probe
             || transition_transaction_compaction_probe
         {
@@ -1247,12 +1249,21 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
             if topology_member.is_empty() {
                 return Err(Status::failed_precondition("local topology member identity is unavailable"));
             }
-            let result = encode_heal_capability_response(
-                &topology_member,
-                remote_version_state_probe,
-                recovery_export_probe,
-                transition_transaction_compaction_probe,
-            )?;
+            let result = if mrf_lifecycle_reader_probe {
+                rustfs_protos::encode_mrf_lifecycle_reader_capability(
+                    rustfs_heal::heal::mrf_queue::MRF_LIFECYCLE_READER_MAX_FORMAT_VERSION,
+                    &topology_member,
+                    NODE_CAPABILITY_SERVER_EPOCH.as_bytes(),
+                )
+                .map_err(|_| Status::internal("MRF lifecycle reader capability length cannot be represented"))?
+            } else {
+                encode_heal_capability_response(
+                    &topology_member,
+                    remote_version_state_probe,
+                    recovery_export_probe,
+                    transition_transaction_compaction_probe,
+                )?
+            };
             let canonical_response = rustfs_protos::canonical_heal_control_response_body(
                 request.get_ref().version,
                 &request.get_ref().topology_fingerprint,
@@ -5844,6 +5855,155 @@ mod tests {
             .await
             .expect_err("commands must be rejected by a non-coordinator node");
         assert_eq!(non_coordinator.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn mrf_lifecycle_reader_probe_authenticates_supported_format_and_identity() {
+        let _ = rustfs_credentials::set_global_rpc_secret("mrf-lifecycle-reader-test-secret".to_string());
+        let endpoints = heal_control_test_endpoints_with_coordinator("node-0", true);
+        assert!(
+            !super::heal::heal_control_coordinator(&endpoints)
+                .expect("test coordinator")
+                .is_local
+        );
+        let fingerprint = heal_topology_fingerprint(&endpoints).expect("test topology");
+        let (service, source) = super::make_heal_control_server_for_source();
+        *source.write().await = Some(endpoints);
+        let mut command = b"rustfs-mrf-lifecycle-reader-capability-v1\0".to_vec();
+        command.extend_from_slice(&[7; 16]);
+        let mut request = Request::new(HealControlRequest {
+            version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            topology_fingerprint: fingerprint.clone(),
+            command: Bytes::from(command.clone()),
+        });
+        let body = rustfs_protos::canonical_heal_control_request_body(
+            request.get_ref().version,
+            &request.get_ref().topology_fingerprint,
+            &request.get_ref().command,
+        )
+        .expect("probe body");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("request digest");
+        mark_v2_authenticated(&mut request);
+        let response = service
+            .heal_control(request)
+            .await
+            .expect("every topology member must report its MRF reader capability")
+            .into_inner();
+        assert!(response.success);
+        assert_eq!(response.error_info, None);
+        assert_eq!(response.result[0], 2);
+        let (member, epoch) =
+            rustfs_protos::decode_remote_version_state_capability(&response.result[1..]).expect("reader capability identity");
+        assert_eq!(member, "node-a:9000");
+        assert!(!Uuid::from_slice(epoch).expect("process epoch").is_nil());
+        let canonical = rustfs_protos::canonical_heal_control_response_body(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            &fingerprint,
+            &command,
+            &response.result,
+        )
+        .expect("signed response");
+        crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical, &response.response_proof)
+            .expect("proof must bind the advertised reader and process identity");
+        let mut altered_version = response.result.to_vec();
+        altered_version[0] = 1;
+        let mut altered_member = response.result.to_vec();
+        altered_member[9] ^= 1;
+        let mut altered_epoch = response.result.to_vec();
+        *altered_epoch.last_mut().expect("epoch byte") ^= 1;
+        for result in [altered_version, altered_member, altered_epoch] {
+            let changed = rustfs_protos::canonical_heal_control_response_body(
+                rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+                &fingerprint,
+                &command,
+                &result,
+            )
+            .expect("changed response");
+            assert!(crate::storage::storage_api::verify_tonic_rpc_response_proof(&changed, &response.response_proof).is_err());
+        }
+        for (version, topology, challenge) in [
+            (rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION + 1, fingerprint.clone(), command.clone()),
+            (rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, "other-topology".to_owned(), command),
+            (
+                rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+                fingerprint,
+                rustfs_protos::mrf_lifecycle_reader_capability_probe(&[8; 16]),
+            ),
+        ] {
+            let changed = rustfs_protos::canonical_heal_control_response_body(version, &topology, &challenge, &response.result)
+                .expect("different request");
+            assert!(crate::storage::storage_api::verify_tonic_rpc_response_proof(&changed, &response.response_proof).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn mrf_lifecycle_reader_probe_rejects_missing_auth_wrong_topology_and_malformed_command() {
+        let _ = rustfs_credentials::set_global_rpc_secret("mrf-lifecycle-reader-boundary-test-secret".to_string());
+        let endpoints = heal_control_test_endpoints_with_coordinator("node-0", true);
+        assert!(
+            !super::heal::heal_control_coordinator(&endpoints)
+                .expect("coordinator")
+                .is_local
+        );
+        let fingerprint = heal_topology_fingerprint(&endpoints).expect("topology");
+        let (service, source) = super::make_heal_control_server_for_source();
+        *source.write().await = Some(endpoints);
+        let command = rustfs_protos::mrf_lifecycle_reader_capability_probe(&[7; 16]);
+        let request = |topology: &str, command: Vec<u8>, authenticated: bool| {
+            let mut request = Request::new(HealControlRequest {
+                version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+                topology_fingerprint: topology.to_owned(),
+                command: Bytes::from(command),
+            });
+            if authenticated {
+                let body = rustfs_protos::canonical_heal_control_request_body(
+                    request.get_ref().version,
+                    &request.get_ref().topology_fingerprint,
+                    &request.get_ref().command,
+                )
+                .expect("request body");
+                set_tonic_canonical_body_digest(&mut request, &body).expect("body digest");
+                mark_v2_authenticated(&mut request);
+            }
+            request
+        };
+        let unauthenticated = service
+            .heal_control(request(&fingerprint, command.clone(), false))
+            .await
+            .expect_err("unsigned probe must fail");
+        assert_eq!(unauthenticated.code(), tonic::Code::PermissionDenied);
+        let divergent = service
+            .heal_control(request("other-topology", command.clone(), true))
+            .await
+            .expect_err("divergent topology must fail");
+        assert_eq!(divergent.code(), tonic::Code::FailedPrecondition);
+        let mut tampered = request(&fingerprint, command.clone(), true);
+        let mut changed_command = command.clone();
+        changed_command[0] ^= 1;
+        tampered.get_mut().command = Bytes::from(changed_command);
+        assert_eq!(
+            service
+                .heal_control(tampered)
+                .await
+                .expect_err("body tampering must fail")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut malformed = command.clone();
+        malformed.push(0);
+        assert!(
+            service.heal_control(request(&fingerprint, malformed, true)).await.is_err(),
+            "a malformed probe must never receive a capability acknowledgement"
+        );
+        let (uninitialized, _) = super::make_heal_control_server_for_source();
+        assert_eq!(
+            uninitialized
+                .heal_control(request(&fingerprint, command, true))
+                .await
+                .expect_err("missing topology must fail")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
     }
 
     #[tokio::test]
