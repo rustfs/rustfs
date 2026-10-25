@@ -123,14 +123,62 @@ fn validate_certificate_shape(
 }
 
 impl LocalDisk {
-    // Construct the large recovery state machine outside the caller's poll
-    // frame, including when several native operations share one async frame.
+    // Give readonly inspection its own future layout while retaining one
+    // selected Box per request and constructing it outside caller poll frames.
     #[inline(never)]
     pub(super) fn recover_multipart_source_native(
         &self,
         request: MultipartSourceRequest,
     ) -> impl std::future::Future<Output = Result<MultipartSourceResponse>> + Send + '_ {
-        Box::pin(self.recover_multipart_source_native_inner(request))
+        if matches!(&request.operation, MultipartSourceOperation::Inspect { .. }) {
+            futures::future::Either::Left(Box::pin(self.inspect_multipart_source_native(request)))
+        } else {
+            futures::future::Either::Right(Box::pin(self.recover_multipart_source_native_inner(request)))
+        }
+    }
+
+    async fn inspect_multipart_source_native(&self, request: MultipartSourceRequest) -> Result<MultipartSourceResponse> {
+        request.validate()?;
+        // Preserve source ownership before reading any source state or proof.
+        let store = self.open_multipart_source_store(&request.path, None).await?;
+        let MultipartSourceOperation::Inspect { lineage } = request.operation else {
+            return Err(DiskError::UnsupportedDisk);
+        };
+        let loaded = store.load().await?;
+        if let (Some(expected), Some(snapshot)) = (lineage.as_ref(), loaded.snapshot.as_ref())
+            && expected != &snapshot.lineage
+        {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
+        let mut negative_certificate = None;
+        let mut ready_certificate = None;
+        if let Some(state) = loaded.state.as_ref()
+            && state.phase != MultipartSourcePhase::Aborting
+            && let Some(round) = state.recovery.as_ref()
+        {
+            if state.negative_certificate_sha256.is_some() {
+                negative_certificate = Some(store.read_certificate(round.round, false).await?);
+            }
+            if state.ready_certificate_sha256.is_some() {
+                ready_certificate = Some(store.read_certificate(round.round, true).await?);
+            }
+        }
+        let abort_certificate = store.read_abort_certificate(&loaded).await?;
+        Ok(MultipartSourceResponse::Inspected(MultipartSourceInspection {
+            disk_id: store.disk_id,
+            snapshot: loaded.snapshot,
+            original: loaded.original,
+            recovery: loaded.state.as_ref().and_then(|state| state.recovery.clone()),
+            negative_certificate,
+            ready_certificate,
+            root_missing: store.root_missing().await?,
+            abort_round: loaded
+                .state
+                .as_ref()
+                .and_then(|state| state.abort.as_ref().map(|abort| abort.round.clone())),
+            abort_certificate,
+            terminal_certificate: loaded.state.map_or_else(Vec::new, |state| state.terminal_certificate),
+        }))
     }
 
     async fn recover_multipart_source_native_inner(&self, request: MultipartSourceRequest) -> Result<MultipartSourceResponse> {
@@ -146,43 +194,7 @@ impl LocalDisk {
             | MultipartSourceOperation::ConfirmCleanupTarget { .. }) => {
                 self.recover_multipart_abort_owned(store, operation).await
             }
-            MultipartSourceOperation::Inspect { lineage } => {
-                let loaded = store.load().await?;
-                if let (Some(expected), Some(snapshot)) = (lineage.as_ref(), loaded.snapshot.as_ref())
-                    && expected != &snapshot.lineage
-                {
-                    return Err(DiskError::ConditionalDeleteConflict);
-                }
-                let mut negative_certificate = None;
-                let mut ready_certificate = None;
-                if let Some(state) = loaded.state.as_ref()
-                    && state.phase != MultipartSourcePhase::Aborting
-                    && let Some(round) = state.recovery.as_ref()
-                {
-                    if state.negative_certificate_sha256.is_some() {
-                        negative_certificate = Some(store.read_certificate(round.round, false).await?);
-                    }
-                    if state.ready_certificate_sha256.is_some() {
-                        ready_certificate = Some(store.read_certificate(round.round, true).await?);
-                    }
-                }
-                let abort_certificate = store.read_abort_certificate(&loaded).await?;
-                Ok(MultipartSourceResponse::Inspected(MultipartSourceInspection {
-                    disk_id: store.disk_id,
-                    snapshot: loaded.snapshot,
-                    original: loaded.original,
-                    recovery: loaded.state.as_ref().and_then(|state| state.recovery.clone()),
-                    negative_certificate,
-                    ready_certificate,
-                    root_missing: store.root_missing().await?,
-                    abort_round: loaded
-                        .state
-                        .as_ref()
-                        .and_then(|state| state.abort.as_ref().map(|abort| abort.round.clone())),
-                    abort_certificate,
-                    terminal_certificate: loaded.state.map_or_else(Vec::new, |state| state.terminal_certificate),
-                }))
-            }
+            MultipartSourceOperation::Inspect { .. } => Err(DiskError::UnsupportedDisk),
             MultipartSourceOperation::Claim { expected, round } => {
                 let loaded = store.load().await?;
                 require_expected(&loaded, &expected)?;
@@ -946,6 +958,33 @@ mod tests {
                 .join(&self.path)
                 .join("xl.meta")
         }
+    }
+
+    #[tokio::test]
+    async fn native_multipart_inspect_dispatch_preserves_source_and_rejects_a_mutation_request() {
+        let fixture = Fixture::new().await;
+        let head = fixture.head(0);
+        let before = std::fs::read(&head).expect("actual native source before inspection");
+        let inventory = || {
+            let mut entries = std::fs::read_dir(head.parent().expect("actual source root"))
+                .expect("source directory inventory")
+                .map(|entry| entry.expect("source entry").file_name())
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        };
+        let before_entries = inventory();
+        let inspected = fixture.inspect(0).await;
+        let expected = inspected.snapshot.expect("actual inspected active snapshot");
+        assert_eq!(expected.phase, MultipartSourcePhase::Active);
+        let round = fixture.start_round().await;
+        let error = fixture.disks[0]
+            .inspect_multipart_source_native(fixture.request(MultipartSourceOperation::Claim { expected, round }))
+            .await
+            .expect_err("readonly inspection cannot execute a misrouted mutation");
+        assert!(matches!(error, DiskError::UnsupportedDisk));
+        assert_eq!(std::fs::read(&head).expect("source after inspection and rejected mutation"), before);
+        assert_eq!(inventory(), before_entries, "readonly routing cannot create state or proof records");
     }
 
     #[tokio::test]
