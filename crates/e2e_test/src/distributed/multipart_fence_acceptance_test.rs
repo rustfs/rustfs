@@ -1162,7 +1162,7 @@ async fn mixed_version_failed_complete_requires_current_coordinator_for_abort() 
     for node in 0..cluster.nodes.len() {
         proxies.push(cluster.start_rpc_proxy_for_node(node).await?);
     }
-    cluster.stop_node(0)?;
+    cluster.stop_node_gracefully(0).await?;
     cluster.start_node(0).await?;
     crate::upgrade_compatibility_test::wait_for_upgrade_write_readiness(&clients, &bucket, "mixed-mpu-current-writer", DEADLINE)
         .await?;
@@ -1242,9 +1242,10 @@ async fn mixed_version_failed_complete_requires_current_coordinator_for_abort() 
     assert_object_bytes_after_fault(&clients[1], &bucket, "unrelated", &unrelated).await?;
 
     // Do not send MPU mutations through an old coordinator after rollout
-    // starts. Resume this exact upload only after every peer is current.
+    // starts. Let each planned replacement run normal shutdown hooks, and
+    // resume this exact upload only after every peer is current.
     for node in 1..cluster.nodes.len() {
-        cluster.stop_node(node)?;
+        cluster.stop_node_gracefully(node).await?;
         cluster.start_node(node).await?;
         crate::upgrade_compatibility_test::wait_for_upgrade_write_readiness(
             &clients,

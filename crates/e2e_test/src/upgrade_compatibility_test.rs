@@ -1158,7 +1158,8 @@ pub(crate) async fn prepare_release_baseline(
     // rc.5 can latch a non-elected node's write fence while its first startup
     // waits for pool metadata (#7473). First prove the elected writer can
     // persist data, then restart each old process once with three peers still
-    // readable. The same preparation is reused only after a quiescent homogeneous rollback.
+    // readable. These planned restarts use the normal shutdown hooks; the same
+    // preparation is reused only after a quiescent homogeneous rollback.
     wait_for_upgrade_write_readiness(&clients[..1], bucket, &format!("{prefix}-seed"), LISTING_CONVERGENCE_TIMEOUT).await?;
     // A node that just came back is still replaying its startup traffic against
     // every peer. Killing the next node during that burst gives the fresh node
@@ -1167,7 +1168,7 @@ pub(crate) async fn prepare_release_baseline(
     // re-admit every drive before the next kill. Nodes still awaiting their
     // restart may retain the startup write fence and cannot coordinate a PUT.
     for node in [1, 2, 3, 0] {
-        cluster.stop_node(node)?;
+        cluster.stop_node_gracefully(node).await?;
         cluster.start_node_from_binary(node, previous_binary).await?;
         let context = format!("{prefix}-restart-{node}");
         wait_for_upgrade_write_readiness(std::slice::from_ref(&clients[node]), bucket, &context, LISTING_CONVERGENCE_TIMEOUT)
