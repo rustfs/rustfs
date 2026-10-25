@@ -148,6 +148,7 @@ async fn issue_8297_contended_follower_clears_only_transient_cycle_recovery() {
                 false,
             ));
         }
+        let runtime = ScannerRuntimeGuard::new();
         for (status, clear) in cases {
             let expected = serde_json::to_value(&status).expect("expected recovery status");
             publish_scanner_cleanup_status(status, None).expect("seed local recovery status");
@@ -158,6 +159,7 @@ async fn issue_8297_contended_follower_clears_only_transient_cycle_recovery() {
                     store.clone(),
                     ScannerMaintenanceFeatures::default(),
                     None,
+                    runtime.startup_token(),
                 ),
             )
             .await

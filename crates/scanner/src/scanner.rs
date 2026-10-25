@@ -57,6 +57,7 @@ use rustfs_scanner_metrics::metrics::{
     ScannerUsagePublicationObservation, ScannerUsageSaveResult, ScannerWorkSource, emit_scan_cycle_complete,
     emit_scan_cycle_deferred, emit_scan_cycle_partial_with_source, emit_scan_cycle_superseded, global_metrics,
 };
+use rustfs_scanner_metrics::startup::ScannerStartupToken;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{Notify, mpsc};
@@ -565,6 +566,7 @@ async fn wait_for_scanner_runtime_wake(
 }
 
 async fn wait_for_scanner_startup<F, J>(
+    startup: ScannerStartupToken,
     ctx: &CancellationToken,
     inspection: F,
     replication_active: bool,
@@ -582,6 +584,7 @@ where
     if scanner_maintenance_generation() != maintenance_generation {
         return true;
     }
+    global_metrics().startup().record_usage_inspection(startup);
     let (usage_cache_is_cold, has_buckets) = tokio::select! {
         biased;
         _ = ctx.cancelled() => return false,
@@ -620,6 +623,9 @@ where
         );
     }
     let mut deadline = started + delay;
+    if policy.is_some() {
+        global_metrics().startup().record_wait(startup, deadline);
+    }
     loop {
         let wake = wait_for_scanner_runtime_wake(ctx, deadline, runtime_generation, maintenance_generation).await;
         if wake != ScannerCycleWakeReason::RuntimeConfig {
@@ -636,6 +642,7 @@ where
             // Equivalent policies retain their deadline and jitter sample.
             policy = updated;
             deadline = started + policy.map(&mut sample_delay).unwrap_or_default();
+            global_metrics().startup().record_wait(startup, deadline);
         }
     }
 }
@@ -1126,6 +1133,8 @@ async fn init_data_scanner_with_storage<S>(ctx: CancellationToken, storeapi: Arc
 where
     S: ScannerStorage,
 {
+    let mut runtime_guard = ScannerRuntimeGuard::new();
+    let startup = runtime_guard.startup_token();
     let (startup_features, startup_maintenance_generation) = configure_scanner_defaults(&ctx, &storeapi).await;
     // Force init global sleeper so config is read once at startup.
     let _ = &*SCANNER_SLEEPER;
@@ -1141,13 +1150,14 @@ where
         );
     }
 
+    runtime_guard.mark_initialized();
     let replication_active = startup_features.replication;
     let ctx_clone = ctx;
     let storeapi_clone = storeapi;
-    let runtime_guard = ScannerRuntimeGuard::new();
     tokio::spawn(async move {
         let _runtime_guard = runtime_guard;
         if !wait_for_scanner_startup(
+            startup,
             &ctx_clone,
             initial_scanner_startup_usage_state(&storeapi_clone, replication_active),
             replication_active,
@@ -1173,6 +1183,7 @@ where
                 storeapi_clone.clone(),
                 startup_features,
                 startup_maintenance_generation,
+                startup,
             )
             .await;
             if let Err(e) = &run_result {
@@ -2769,8 +2780,16 @@ async fn run_data_scanner_with_storage<S>(ctx: CancellationToken, storeapi: Arc<
 where
     S: ScannerStorage,
 {
+    let runtime_guard = ScannerRuntimeGuard::new();
     let (maintenance_features, maintenance_generation) = configure_scanner_defaults(&ctx, &storeapi).await;
-    run_data_scanner_with_maintenance_state(ctx, storeapi, maintenance_features, maintenance_generation).await
+    run_data_scanner_with_maintenance_state(
+        ctx,
+        storeapi,
+        maintenance_features,
+        maintenance_generation,
+        runtime_guard.startup_token(),
+    )
+    .await
 }
 
 async fn current_scanner_pause_backlog_observation<S>(storeapi: &Arc<S>) -> ScannerPauseBacklogObservation
@@ -2854,11 +2873,14 @@ async fn run_data_scanner_with_maintenance_state<S>(
     storeapi: Arc<S>,
     mut maintenance_features: ScannerMaintenanceFeatures,
     mut maintenance_generation_seen: Option<u64>,
+    startup: ScannerStartupToken,
 ) -> Result<(), ScannerError>
 where
     S: ScannerStorage,
 {
     reset_scanner_cycle_schedule();
+    // Entry is an attempt, not evidence of leadership, coverage, or publication.
+    global_metrics().startup().record_attempt(startup);
     // Acquire leader lock (write lock) to ensure only one scanner runs
     let mut guard = match storeapi.new_ns_lock(RUSTFS_META_BUCKET, "leader.lock").await {
         Ok(ns_lock) => match ns_lock.get_write_lock_quiet(get_lock_acquire_timeout()).await {
