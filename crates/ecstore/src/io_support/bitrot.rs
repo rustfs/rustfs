@@ -1536,7 +1536,7 @@ mod tests {
             writer.write(chunk).await.expect("write chunk");
         }
 
-        let inline_data = Bytes::from(writer.into_inline_data().expect("inline buffer"));
+        let inline_data = writer.into_inline_data().expect("inline buffer");
         let mut reader = create_bitrot_reader_from_bytes(
             Some(inline_data),
             None,
@@ -1584,7 +1584,7 @@ mod tests {
 
         let inline_data = writer.into_inline_data().expect("inline buffer");
         let mut reader = create_deferred_bitrot_reader(
-            Some(inline_data.into()),
+            Some(inline_data),
             None,
             "test-bucket",
             "test-path",
@@ -1626,7 +1626,7 @@ mod tests {
 
             for stripe in 0..payload.len() / shard_size {
                 let (mut reader, handle) = create_deferred_bitrot_reader_with_stripe_handle(
-                    Some(inline_data.clone().into()),
+                    Some(inline_data.clone()),
                     None,
                     "test-bucket",
                     "test-path",
@@ -1671,7 +1671,7 @@ mod tests {
         for chunk in payload.chunks(shard_size) {
             writer.write(chunk).await.expect("write chunk");
         }
-        let mut inline_data = writer.into_inline_data().expect("inline buffer");
+        let mut inline_data = writer.into_inline_data().expect("inline buffer").to_vec();
 
         // Corrupt one payload byte of block 2 (blocks are hash + data).
         let block_len = algo.size() + shard_size;
@@ -1844,5 +1844,123 @@ mod tests {
             .expect("fragmented remote shard should verify after multiple polls");
 
         assert_eq!(output, data);
+    }
+
+    mod inline_memory_regressions {
+        use super::*;
+        use crate::disk::background_memory::Reservation;
+        use crate::disk::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+        use std::time::Duration;
+
+        #[tokio::test]
+        async fn owned_inline_reader_retains_existing_receipt_without_a_new_grant() {
+            let memory = BackgroundMemoryBudget::new();
+            memory.set_sampled_limit(64, Duration::from_secs(30));
+            let receipt = memory.reserve(64).expect("existing metadata payload grant");
+            let bytes = Reservation::wrap(Bytes::from(vec![7; 64]), Some(receipt));
+            memory.set_sampled_limit(0, Duration::ZERO);
+            let (resources, _) = test_resource_units(1);
+            let mut reader = with_optional_resource_unit(
+                Some(resources.with_memory_budget(memory.clone())),
+                create_bitrot_reader_from_bytes(
+                    Some(bytes.clone()),
+                    None,
+                    "bucket",
+                    "inline",
+                    0,
+                    64,
+                    64,
+                    HashAlgorithm::None,
+                    false,
+                    false,
+                ),
+            )
+            .await
+            .expect("owned data requires no allocation")
+            .expect("inline reader");
+            drop(bytes);
+            assert_eq!(memory.snapshot().used, 64, "the source owner must remain attached to the reader");
+            let mut output = [0; 64];
+            assert_eq!(reader.read(&mut output).await.expect("read existing payload"), 64);
+            assert_eq!(output, [7; 64]);
+            assert_eq!(memory.snapshot().used, 64);
+            drop(reader);
+            assert_eq!(memory.snapshot().used, 0);
+        }
+
+        #[tokio::test]
+        async fn accounted_inline_writer_round_trips_bitrot_and_preserves_export_lifetime() {
+            let memory = BackgroundMemoryBudget::new();
+            memory.set_sampled_limit(192, Duration::from_secs(30));
+            let (resources, _) = test_resource_units(1);
+            let bytes = with_optional_resource_unit(Some(resources.with_memory_budget(memory.clone())), async {
+                let mut writer = create_bitrot_writer(true, None, "bucket", "inline", 64, 64, HashAlgorithm::HighwayHash256S)
+                    .await
+                    .expect("inline writer");
+                assert_eq!(writer.write(&[19; 64]).await.expect("complete shard"), 64);
+                writer.shutdown().await.expect("shutdown");
+                writer.into_inline_data().expect("bitrot bytes")
+            })
+            .await;
+            assert_eq!(bytes.len(), 96);
+            assert_eq!(memory.snapshot().used, 96, "exported [hash][shard] remains charged");
+            let (resources, _) = test_resource_units(1);
+            let mut reader = with_optional_resource_unit(
+                Some(resources.with_memory_budget(memory.clone())),
+                create_bitrot_reader_from_bytes(
+                    Some(bytes.clone()),
+                    None,
+                    "bucket",
+                    "inline",
+                    0,
+                    64,
+                    64,
+                    HashAlgorithm::HighwayHash256S,
+                    false,
+                    false,
+                ),
+            )
+            .await
+            .expect("reader")
+            .expect("inline reader");
+            let mut output = [0; 64];
+            assert_eq!(reader.read(&mut output).await.expect("bitrot remains verified"), 64);
+            assert_eq!(output, [19; 64]);
+            assert_eq!(memory.snapshot().used, 192, "input owner and verification scratch are both live");
+            drop(reader);
+            assert_eq!(memory.snapshot().used, 96);
+            let slice = bytes.slice(32..36);
+            drop(bytes);
+            assert_eq!(memory.snapshot().used, 96);
+            drop(slice);
+            assert_eq!(memory.snapshot().used, 0);
+        }
+
+        #[tokio::test]
+        async fn inline_heal_writer_memory_denial_is_retryable_after_read_and_verify_fit() {
+            use crate::erasure::coding::Erasure;
+            let erasure = Erasure::new(2, 1, 16);
+            let encoded = erasure.encode_data(&[37; 16]).expect("foreground test fixture");
+            let readers = encoded
+                .into_iter()
+                .map(|shard| Some(BitrotReader::new(Cursor::new(shard), 8, HashAlgorithm::None, false)))
+                .collect();
+            let memory = BackgroundMemoryBudget::new();
+            // Read shards: 24 bytes; source parity: 8; verify scratch: 8.
+            // After verification, input shards still use 24. The target needs a
+            // new 40-byte [hash][shard] allocation and must fail before copying.
+            memory.set_sampled_limit(40, Duration::from_secs(30));
+            let (resources, _) = test_resource_units(1);
+            let result = with_optional_resource_unit(Some(resources.with_memory_budget(memory.clone())), async {
+                let writer = create_bitrot_writer(true, None, "bucket", "inline", 8, 8, HashAlgorithm::HighwayHash256S)
+                    .await
+                    .expect("writer setup does not allocate payload");
+                let mut writers = vec![Some(writer), None, None];
+                erasure.heal(&mut writers, readers, 16, &[]).await
+            })
+            .await;
+            assert!(matches!(result, Err(DiskError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock));
+            assert_eq!(memory.snapshot().used, 0);
+        }
     }
 }

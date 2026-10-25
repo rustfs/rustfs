@@ -179,7 +179,9 @@ impl BackgroundBuffer {
         self.grow(length, 0)
     }
 
-    fn grow(&mut self, length: usize, preserve: usize) -> io::Result<()> {
+    /// Preserve an initialized prefix when replacing storage. Callers keep
+    /// `preserve` within both the existing allocation and the requested length.
+    pub(crate) fn grow(&mut self, length: usize, preserve: usize) -> io::Result<()> {
         if self.bytes.len() >= length {
             return Ok(());
         }
@@ -286,6 +288,37 @@ mod tests {
             .expect("file shrank to empty");
         assert!(bytes.is_empty());
         assert_eq!(owner.snapshot().used, 0, "empty results free unused storage before refund");
+    }
+
+    #[test]
+    fn preserving_growth_keeps_existing_payload_on_denial_and_reuse() {
+        let owner = BackgroundMemoryBudget::new();
+        owner.set_sampled_limit(11, Duration::from_secs(30));
+        let mut buffer = BackgroundBuffer::new(Some(owner.clone()));
+        buffer.ensure_len(4).expect("allocate initial payload");
+        buffer.as_mut_slice().copy_from_slice(b"data");
+
+        let error = buffer
+            .grow(8, 4)
+            .expect_err("old and replacement allocations need twelve bytes");
+        assert!(is_memory_pressure(&error));
+        assert_eq!(buffer.as_slice(), b"data");
+        assert_eq!(owner.snapshot().used, 4);
+
+        owner.set_sampled_limit(12, Duration::from_secs(30));
+        buffer.grow(8, 4).expect("preserve the payload after admission");
+        assert_eq!(buffer.as_slice(), b"data\0\0\0\0");
+        assert_eq!(owner.snapshot().used, 8);
+        owner.set_sampled_limit(0, Duration::ZERO);
+        buffer.grow(8, 4).expect("reuse retained storage after expiry");
+        assert_eq!(buffer.as_slice(), b"data\0\0\0\0");
+
+        let bytes = buffer.take_bytes(4);
+        drop(buffer);
+        assert_eq!(bytes.as_ref(), b"data");
+        assert_eq!(owner.snapshot().used, 8);
+        drop(bytes);
+        assert_eq!(owner.snapshot().used, 0);
     }
 
     #[test]

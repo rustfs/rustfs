@@ -4926,6 +4926,85 @@ mod tests {
                     assert_eq!(physical.completed(), Some(3));
                     assert_eq!(memory.snapshot().used, 0);
                 }
+                let warm_writer = remote
+                    .create_file("bucket", "bucket", "writer-capability", 0)
+                    .await
+                    .expect("negotiate writer authentication before testing payload admission");
+                drop(warm_writer);
+                let source_disk = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+                memory.set_sampled_limit(0, Duration::ZERO);
+                let denied = storage::with_background_resource_unit(
+                    source_disk.try_acquire().expect("sender disk admission"),
+                    storage::with_remote_background_io(
+                        Some(storage::RemoteBackgroundIo::new(sender_owner.clone())),
+                        remote.create_file("bucket", "bucket", "client-memory-closed", i64::try_from(DATA.len()).expect("size")),
+                    ),
+                )
+                .await;
+                let error = match denied {
+                    Ok(_) => panic!("closed sender memory budget must reject the HTTP writer"),
+                    Err(error) => error,
+                };
+                let error = std::io::Error::from(error);
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "sender memory denial remains retryable: {error}"
+                );
+                assert_eq!(source_disk.snapshot().active, 0);
+                assert_eq!(memory.snapshot().used, 0);
+                assert!(!root.path().join("bucket/client-memory-closed").exists());
+                assert_eq!(node_owner.completed(), Some(3));
+
+                memory.set_sampled_limit(4 * 1024 * 1024, Duration::from_secs(30));
+                node_owner.update(
+                    &mut controller,
+                    Some(FeedbackObservation {
+                        generation: 6,
+                        max_concurrency: 1,
+                        pressure: ResourcePressure::Unknown,
+                        completed_units: None,
+                    }),
+                );
+                disk.physical_admission()
+                    .expect("physical binding")
+                    .set_test_capacity(vec![physical.clone()])
+                    .expect("renew upload receiver device plan");
+                let mut writer = storage::with_background_resource_unit(
+                    source_disk.try_acquire().expect("sender disk admission"),
+                    storage::with_remote_background_io(
+                        Some(storage::RemoteBackgroundIo::new(sender_owner.clone())),
+                        remote.create_file("bucket", "bucket", "accounted-upload", i64::try_from(DATA.len()).expect("size")),
+                    ),
+                )
+                .await
+                .expect("admitted production HTTP writer");
+                assert_eq!(source_disk.snapshot().active, 0, "escaped HTTP writer retains only memory ownership");
+                assert_eq!(memory.snapshot().used, 1024 * 1024, "sender reserves the whole pending chunk");
+                writer
+                    .write_all(DATA)
+                    .await
+                    .expect("write authenticated body after leaving sender scope");
+                tokio::time::timeout(Duration::from_secs(5), writer.shutdown())
+                    .await
+                    .expect("bounded authenticated upload")
+                    .expect("authenticated upload completes");
+                drop(writer);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while memory.snapshot().used != 0 || physical.snapshot().active != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("sender frames and receiver native writes release their storage");
+                assert_eq!(
+                    tokio::fs::read(root.path().join("bucket/accounted-upload"))
+                        .await
+                        .expect("uploaded bytes"),
+                    DATA
+                );
+                assert_eq!(node_owner.completed(), Some(4), "complete authenticated upload earns one completion");
+                assert_eq!(physical.completed(), Some(4));
                 remote.close().await.expect("close remote client");
                 disk.close().await.expect("stop receiver disk monitors");
                 server.abort();

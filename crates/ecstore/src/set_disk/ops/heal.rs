@@ -13,14 +13,14 @@
 // limitations under the License.
 
 use super::super::{
-    Bytes, CHECK_PART_FILE_CORRUPT, CHECK_PART_SUCCESS, DeleteOptions, DiskError, DiskStore, DriveState, EVENT_SET_DISK_HEAL,
-    Error, FileInfo, HashAlgorithm, HashMap, HealDriveInfo, HealItemType, HealOpts, HealResultItem, HealScanMode, Infos,
+    CHECK_PART_FILE_CORRUPT, CHECK_PART_SUCCESS, DeleteOptions, DiskError, DiskStore, DriveState, EVENT_SET_DISK_HEAL, Error,
+    FileInfo, HashAlgorithm, HashMap, HealDriveInfo, HealItemType, HealOpts, HealResultItem, HealScanMode, Infos,
     LOG_SUBSYSTEM_SET_DISK, ObjectInfo, ObjectOptions, ObjectPartInfo, Path, RUSTFS_META_TMP_BUCKET, ReadOptions, Result,
-    SLASH_SEPARATOR, SetDisks, StorageError, Uuid, coding, count_errs, count_part_not_success, create_bitrot_reader,
-    create_bitrot_writer, debug, disk, disks_with_all_parts, encode_dir_object, error, file_info_is_valid_for_metadata,
-    formats_match_reference_slots, get_format_erasure_in_quorum, get_lock_acquire_timeout, has_suffix,
-    heal_bucket_local_on_disks, is_object_dir_dangling, join_all, load_format_erasure_all, path_join_buf, save_format_file,
-    should_heal_object_on_disk, stat_all_dirs, to_object_err, warn,
+    SLASH_SEPARATOR, SetDisks, StorageError, Uuid, coding, count_errs, count_part_not_success, create_bitrot_writer, debug, disk,
+    disks_with_all_parts, encode_dir_object, error, file_info_is_valid_for_metadata, formats_match_reference_slots,
+    get_format_erasure_in_quorum, get_lock_acquire_timeout, has_suffix, heal_bucket_local_on_disks, is_object_dir_dangling,
+    join_all, load_format_erasure_all, path_join_buf, save_format_file, should_heal_object_on_disk, stat_all_dirs, to_object_err,
+    warn,
 };
 use crate::bucket::retirement::MarkerRetirementContext;
 use crate::diagnostics::object_lock::ObjectLockAttempt;
@@ -44,7 +44,7 @@ struct ExplicitVersionHeal<'a> {
 use crate::disk::DataDirDeleteStatus;
 use crate::disk::DiskAPI;
 use crate::disk::local::{DELETE_DATA_DIR_MARKER_PREFIX, metadata_less_part_file};
-use crate::io_support::bitrot::object_mmap_read_enabled;
+use crate::io_support::bitrot::{create_bitrot_reader_from_bytes, object_mmap_read_enabled};
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit};
@@ -1793,8 +1793,8 @@ impl SetDisks {
                                                 checksum_info.algorithm
                                             };
 
-                                            match create_bitrot_reader(
-                                                metadata.data.as_deref(),
+                                            match create_bitrot_reader_from_bytes(
+                                                metadata.data.clone(),
                                                 Some(disk),
                                                 bucket,
                                                 &path_join_buf(&[object, &src_data_dir, &format!("part.{}", part.number)]),
@@ -1891,8 +1891,7 @@ impl SetDisks {
                                                 // if let Some(w) = writer.as_any().downcast_ref::<BitrotFileWriter>() {
                                                 //     parts_metadata[index].data = Some(w.inline_data().to_vec());
                                                 // }
-                                                parts_metadata[index].data =
-                                                    Some(writer.into_inline_data().map(Bytes::from).unwrap_or_default());
+                                                parts_metadata[index].data = Some(writer.into_inline_data().unwrap_or_default());
                                             }
                                             parts_metadata[index].set_inline_data();
                                         } else {

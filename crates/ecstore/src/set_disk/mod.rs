@@ -14519,7 +14519,7 @@ mod tests {
             file.erasure.index = files.len() + 1;
             file.erasure.block_size = erasure.block_size;
             file.uses_legacy_checksum = uses_legacy;
-            file.data = Some(Bytes::from(data));
+            file.data = Some(data);
             files.push(file);
         }
 
@@ -14980,7 +14980,7 @@ mod tests {
         }
 
         let encoded = bitrot_writer.into_inline_data().expect("bitrot encoded data should exist");
-        disk.write_all(bucket, &shard_path, Bytes::from(encoded))
+        disk.write_all(bucket, &shard_path, encoded)
             .await
             .expect("encoded shard should be stored");
 
@@ -15064,7 +15064,7 @@ mod tests {
         }
 
         let encoded = bitrot_writer.into_inline_data().expect("bitrot encoded data should exist");
-        disk.write_all(bucket, &shard_path, Bytes::from(encoded))
+        disk.write_all(bucket, &shard_path, encoded)
             .await
             .expect("encoded shard should be stored");
 
@@ -15177,7 +15177,7 @@ mod tests {
             }
 
             let encoded = bitrot_writer.into_inline_data().expect("bitrot encoded data should exist");
-            disk.write_all(bucket, &shard_path, Bytes::from(encoded))
+            disk.write_all(bucket, &shard_path, encoded)
                 .await
                 .expect("encoded shard should be stored");
         }

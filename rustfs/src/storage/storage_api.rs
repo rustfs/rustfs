@@ -506,7 +506,7 @@ pub(crate) mod ecstore_disk {
         validate_batch_read_version_item_count, with_remote_background_io,
     };
     #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::disk::{CurrentDeleteGeneration, DiskOption, new_disk};
+    pub(crate) use rustfs_ecstore::api::disk::{CurrentDeleteGeneration, DiskOption, new_disk, with_background_resource_unit};
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
 }
 

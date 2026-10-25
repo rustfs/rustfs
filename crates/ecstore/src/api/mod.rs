@@ -445,7 +445,7 @@ pub mod disk {
     };
     pub use crate::disk::{
         BackgroundMemoryBudget, PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler,
-        PhysicalResourcePlan, RemoteBackgroundIo, with_remote_background_io,
+        PhysicalResourcePlan, RemoteBackgroundIo, with_background_resource_unit, with_remote_background_io,
     };
     pub use bytes::Bytes;
     pub use endpoint::Endpoint;

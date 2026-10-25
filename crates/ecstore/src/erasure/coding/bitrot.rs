@@ -744,15 +744,74 @@ pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
 /// Custom writer enum that supports inline buffer storage
 pub enum CustomWriter {
     /// Inline buffer writer - stores data in memory
-    InlineBuffer(Vec<u8>),
+    InlineBuffer(InlineBuffer),
     /// Disk-based writer using tokio file
     Other(Box<dyn AsyncWrite + Unpin + Send + Sync>),
+}
+
+/// Inline payload storage retains its background allocation through export.
+pub struct InlineBuffer {
+    foreground: Vec<u8>,
+    background: Option<crate::disk::background_memory::BackgroundBuffer>,
+    filled: usize,
+}
+
+impl InlineBuffer {
+    fn new() -> Self {
+        let background = crate::disk::current_resource_unit()
+            .and_then(|unit| unit.memory_budget())
+            .map(|budget| crate::disk::background_memory::BackgroundBuffer::new(Some(budget)));
+        Self {
+            foreground: Vec::new(),
+            background,
+            filled: 0,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match &self.background {
+            Some(buffer) => &buffer.as_slice()[..self.filled],
+            None => &self.foreground,
+        }
+    }
+
+    fn append(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        let total = bufs
+            .iter()
+            .try_fold(0usize, |length, buf| length.checked_add(buf.len()).ok_or(std::io::ErrorKind::OutOfMemory))?;
+        if let Some(buffer) = &mut self.background {
+            let length = self.filled.checked_add(total).ok_or(std::io::ErrorKind::OutOfMemory)?;
+            if length > buffer.as_slice().len() {
+                let capacity = buffer.as_slice().len().checked_mul(2).unwrap_or(length).max(length);
+                // Admission includes both allocations until the prefix has been copied.
+                buffer.grow(capacity, self.filled)?;
+            }
+            let mut offset = self.filled;
+            for buf in bufs {
+                buffer.as_mut_slice()[offset..offset + buf.len()].copy_from_slice(buf);
+                offset += buf.len();
+            }
+            self.filled = length;
+        } else {
+            for buf in bufs {
+                self.foreground.extend_from_slice(buf);
+            }
+        }
+        Ok(total)
+    }
+
+    fn into_bytes(self) -> bytes::Bytes {
+        match self.background {
+            Some(mut buffer) => buffer.take_bytes(self.filled),
+            None => bytes::Bytes::from(self.foreground),
+        }
+    }
 }
 
 impl CustomWriter {
     /// Create a new inline buffer writer
     pub fn new_inline_buffer() -> Self {
-        Self::InlineBuffer(Vec::new())
+        Self::InlineBuffer(InlineBuffer::new())
     }
 
     /// Create a new disk writer from any AsyncWrite implementation
@@ -766,15 +825,15 @@ impl CustomWriter {
     /// Get the inline buffer data if this is an inline buffer writer
     pub fn get_inline_data(&self) -> Option<&[u8]> {
         match self {
-            Self::InlineBuffer(data) => Some(data),
+            Self::InlineBuffer(data) => Some(data.as_slice()),
             Self::Other(_) => None,
         }
     }
 
     /// Extract the inline buffer data, consuming the writer
-    pub fn into_inline_data(self) -> Option<Vec<u8>> {
+    pub fn into_inline_data(self) -> Option<bytes::Bytes> {
         match self {
-            Self::InlineBuffer(data) => Some(data),
+            Self::InlineBuffer(data) => Some(data.into_bytes()),
             Self::Other(_) => None,
         }
     }
@@ -787,10 +846,7 @@ impl AsyncWrite for CustomWriter {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         match self.get_mut() {
-            Self::InlineBuffer(data) => {
-                data.extend_from_slice(buf);
-                std::task::Poll::Ready(Ok(buf.len()))
-            }
+            Self::InlineBuffer(data) => std::task::Poll::Ready(data.append(&[IoSlice::new(buf)])),
             Self::Other(writer) => {
                 let pinned_writer = std::pin::Pin::new(writer.as_mut());
                 pinned_writer.poll_write(cx, buf)
@@ -824,13 +880,7 @@ impl AsyncWrite for CustomWriter {
         bufs: &[IoSlice<'_>],
     ) -> std::task::Poll<std::io::Result<usize>> {
         match self.get_mut() {
-            Self::InlineBuffer(data) => {
-                let total = bufs.iter().map(|buf| buf.len()).sum::<usize>();
-                for buf in bufs {
-                    data.extend_from_slice(buf);
-                }
-                std::task::Poll::Ready(Ok(total))
-            }
+            Self::InlineBuffer(data) => std::task::Poll::Ready(data.append(bufs)),
             Self::Other(writer) => {
                 let pinned_writer = std::pin::Pin::new(writer.as_mut());
                 pinned_writer.poll_write_vectored(cx, bufs)
@@ -905,7 +955,7 @@ impl BitrotWriterWrapper {
     }
 
     /// Extract the inline buffer data, consuming the wrapper
-    pub fn into_inline_data(self) -> Option<Vec<u8>> {
+    pub fn into_inline_data(self) -> Option<bytes::Bytes> {
         match self.writer_type {
             WriterType::InlineBuffer => {
                 let writer = self.bitrot_writer.into_inner();
@@ -2625,6 +2675,130 @@ mod tests {
 
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             assert_eq!(output, vec![9u8]);
+        }
+    }
+
+    mod inline_memory_regressions {
+        use super::*;
+        use crate::disk::background_memory::is_memory_pressure;
+        use crate::disk::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        async fn writer_for(memory: Arc<BackgroundMemoryBudget>) -> CustomWriter {
+            let (resources, _) = test_resource_units(1);
+            with_optional_resource_unit(Some(resources.with_memory_budget(memory)), async { CustomWriter::new_inline_buffer() })
+                .await
+        }
+
+        #[tokio::test]
+        async fn inline_writer_rejects_closed_and_expired_owners_before_first_allocation() {
+            for expired in [false, true] {
+                let memory = BackgroundMemoryBudget::new();
+                if expired {
+                    memory.set_sampled_limit(128, Duration::ZERO);
+                }
+                let mut writer = writer_for(memory.clone()).await;
+                let error = writer.write_all(&[7; 64]).await.expect_err("no live grant");
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                assert!(is_memory_pressure(&error));
+                assert_eq!(writer.get_inline_data(), Some(&[][..]));
+                assert_eq!(memory.snapshot().used, 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn inline_writer_growth_charges_old_plus_new_and_is_atomic_for_vectored_writes() {
+            let memory = BackgroundMemoryBudget::new();
+            memory.set_sampled_limit(128, Duration::from_secs(30));
+            let mut writer = writer_for(memory.clone()).await;
+            writer.write_all(&[1; 64]).await.expect("first allocation");
+            assert_eq!(memory.snapshot().used, 64);
+            let second = [2; 32];
+            let third = [3; 32];
+            let chunks = [IoSlice::new(&second), IoSlice::new(&third)];
+            let error = writer.write_vectored(&chunks).await.expect_err("64 old + 128 new exceed 128");
+            assert!(is_memory_pressure(&error));
+            assert_eq!(writer.get_inline_data(), Some(&[1; 64][..]));
+            assert_eq!(memory.snapshot().used, 64);
+            memory.set_sampled_limit(192, Duration::from_secs(30));
+            assert_eq!(writer.write_vectored(&chunks).await.expect("old and new both fit"), 64);
+            assert_eq!(memory.snapshot().used, 128);
+            let data = writer.get_inline_data().expect("inline payload");
+            assert_eq!(&data[..64], &[1; 64]);
+            assert_eq!(&data[64..96], &second);
+            assert_eq!(&data[96..], &third);
+            drop(writer);
+            assert_eq!(memory.snapshot().used, 0);
+        }
+
+        #[tokio::test]
+        async fn inline_writer_expiry_preserves_charged_storage_but_blocks_growth() {
+            let memory = BackgroundMemoryBudget::new();
+            memory.set_sampled_limit(192, Duration::from_secs(30));
+            let mut writer = writer_for(memory.clone()).await;
+            writer.write_all(&[5; 64]).await.expect("existing storage");
+            memory.set_sampled_limit(192, Duration::ZERO);
+            let error = writer
+                .write_all(&[9])
+                .await
+                .expect_err("expired sample cannot authorize replacement");
+            assert!(is_memory_pressure(&error));
+            assert_eq!(writer.get_inline_data(), Some(&[5; 64][..]));
+            assert_eq!(memory.snapshot().used, 64);
+            writer.write_all(&[]).await.expect("empty write needs no allocation");
+            writer.flush().await.expect("flush does not revoke storage");
+            writer.shutdown().await.expect("shutdown does not revoke storage");
+            let bytes = writer.into_inline_data().expect("export after expiry");
+            assert_eq!(bytes.as_ref(), &[5; 64]);
+            assert_eq!(memory.snapshot().used, 64);
+            drop(bytes);
+            assert_eq!(memory.snapshot().used, 0);
+        }
+
+        #[tokio::test]
+        async fn inline_writer_export_keeps_receipt_through_clones_and_the_last_slice() {
+            let memory = BackgroundMemoryBudget::new();
+            memory.set_sampled_limit(64, Duration::from_secs(30));
+            let mut writer = writer_for(memory.clone()).await;
+            writer.write_all(&[11; 64]).await.expect("allocate payload");
+            let bytes = writer.into_inline_data().expect("export bytes");
+            let clone = bytes.clone();
+            let slice = bytes.slice(3..7);
+            memory.set_sampled_limit(0, Duration::ZERO);
+            drop(bytes);
+            drop(clone);
+            assert_eq!(slice.as_ref(), &[11; 4]);
+            assert_eq!(memory.snapshot().used, 64);
+            drop(slice);
+            assert_eq!(memory.snapshot().used, 0);
+        }
+
+        #[tokio::test]
+        async fn inline_writer_keeps_the_constructing_owner_after_leaving_its_scope() {
+            let first = BackgroundMemoryBudget::new();
+            first.set_sampled_limit(64, Duration::from_secs(30));
+            let mut writer = writer_for(first.clone()).await;
+            let second = BackgroundMemoryBudget::new();
+            let (resources, _) = test_resource_units(1);
+            with_optional_resource_unit(Some(resources.with_memory_budget(second.clone())), async {
+                writer.write_all(&[13; 64]).await.expect("writer still owns the first grant");
+            })
+            .await;
+            assert_eq!(first.snapshot().used, 64);
+            assert_eq!(second.snapshot().used, 0);
+            drop(writer);
+            assert_eq!(first.snapshot().used, 0);
+        }
+
+        #[tokio::test]
+        async fn foreground_inline_writer_preserves_payload_and_empty_writes() {
+            let mut writer = CustomWriter::new_inline_buffer();
+            writer.write_all(&[]).await.expect("empty foreground write");
+            writer.write_all(b"inline body").await.expect("foreground write");
+            let bytes = writer.into_inline_data().expect("foreground export");
+            assert_eq!(bytes.as_ref(), b"inline body");
         }
     }
 }
