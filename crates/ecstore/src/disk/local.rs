@@ -3503,7 +3503,7 @@ const RESOURCE_FILE_MAX_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
 struct ResourceReadInner {
     file: std::fs::File,
-    buffer: Vec<u8>,
+    buffer: super::io_admission::memory::BackgroundBuffer,
     position: usize,
     filled: usize,
     _resource_unit: ResourceIoUnit,
@@ -3544,7 +3544,7 @@ impl ResourceFileReader {
         Self {
             state: ResourceReadState::Idle(Some(ResourceReadInner {
                 file,
-                buffer: Vec::new(),
+                buffer: super::io_admission::memory::BackgroundBuffer::new(resources.memory_budget()),
                 position: 0,
                 filled: 0,
                 _resource_unit: resources,
@@ -3577,7 +3577,7 @@ impl AsyncRead for ResourceFileReader {
                     };
                     if inner.position < inner.filled {
                         let len = buf.remaining().min(inner.filled - inner.position);
-                        buf.put_slice(&inner.buffer[inner.position..inner.position + len]);
+                        buf.put_slice(&inner.buffer.as_slice()[inner.position..inner.position + len]);
                         inner.position += len;
                         return std::task::Poll::Ready(Ok(()));
                     }
@@ -3586,19 +3586,19 @@ impl AsyncRead for ResourceFileReader {
                     };
                     let length = buf.remaining().min(RESOURCE_FILE_MAX_BUFFER_SIZE);
                     self.state = ResourceReadState::Busy(tokio::task::spawn_blocking(move || {
+                        // Reserve before allocation and retain it with this job.
+                        // Denied growth preserves the file position and buffer.
+                        if let Err(error) = inner.buffer.ensure_len(length) {
+                            return (inner, Err(error));
+                        }
                         #[cfg(test)]
                         if let Some(hook) = inner.before_read.take() {
                             hook();
                         }
-                        // Keep initialized storage between reads, so only growth
-                        // zeroes memory and partial reads never expose stale bytes.
-                        if inner.buffer.len() < length {
-                            inner.buffer.resize(length, 0);
-                        }
                         inner.position = 0;
                         inner.filled = 0;
                         let result = loop {
-                            match std::io::Read::read(&mut inner.file, &mut inner.buffer[..length]) {
+                            match std::io::Read::read(&mut inner.file, &mut inner.buffer.as_mut_slice()[..length]) {
                                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                                 result => break result,
                             }
@@ -3633,7 +3633,7 @@ impl AsyncRead for ResourceFileReader {
 // lease to travel with the file and staging buffer into those native jobs.
 struct ResourceWriteInner {
     file: std::fs::File,
-    buffer: Vec<u8>,
+    buffer: super::io_admission::memory::BackgroundBuffer,
     _resource_unit: ResourceIoUnit,
     #[cfg(test)]
     before_write: Option<Box<dyn FnOnce() + Send + Sync>>,
@@ -3663,7 +3663,7 @@ impl ResourceFileWriter {
         Self {
             state: ResourceWriteState::Idle(Some(ResourceWriteInner {
                 file,
-                buffer: Vec::new(),
+                buffer: super::io_admission::memory::BackgroundBuffer::new(resource_unit.memory_budget()),
                 _resource_unit: resource_unit,
                 #[cfg(test)]
                 before_write: None,
@@ -3706,17 +3706,30 @@ impl ResourceFileWriter {
         let ResourceWriteState::Idle(inner) = &mut self.state else {
             unreachable!("poll_complete leaves a completed writer idle");
         };
-        let Some(mut inner) = inner.take() else {
+        let Some(state) = inner.as_mut() else {
             unreachable!("poll_complete rejects closed writers");
         };
+        let mut length = 0;
         for buf in bufs {
-            let len = buf.len().min(RESOURCE_FILE_MAX_BUFFER_SIZE - inner.buffer.len());
-            inner.buffer.extend_from_slice(&buf[..len]);
-            if inner.buffer.len() == RESOURCE_FILE_MAX_BUFFER_SIZE {
+            length += buf.len().min(RESOURCE_FILE_MAX_BUFFER_SIZE - length);
+            if length == RESOURCE_FILE_MAX_BUFFER_SIZE {
                 break;
             }
         }
-        let len = inner.buffer.len();
+        // Failure happens before accepting bytes or moving the stream state.
+        state.buffer.ensure_len(length)?;
+        let Some(mut inner) = inner.take() else {
+            unreachable!("the writer was checked above");
+        };
+        let mut len = 0;
+        for buf in bufs {
+            let count = buf.len().min(length - len);
+            inner.buffer.as_mut_slice()[len..len + count].copy_from_slice(&buf[..count]);
+            len += count;
+            if len == length {
+                break;
+            }
+        }
         if len == 0 {
             self.state = ResourceWriteState::Idle(Some(inner));
         } else {
@@ -3725,8 +3738,7 @@ impl ResourceFileWriter {
                 if let Some(hook) = inner.before_write.take() {
                     hook();
                 }
-                let result = std::io::Write::write_all(&mut inner.file, &inner.buffer);
-                inner.buffer.clear();
+                let result = std::io::Write::write_all(&mut inner.file, &inner.buffer.as_slice()[..len]);
                 (inner, result)
             }));
         }
@@ -29647,7 +29659,7 @@ mod test {
             panic!("completed reader is idle")
         };
         assert_eq!(
-            inner.buffer.len(),
+            inner.buffer.as_slice().len(),
             RESOURCE_FILE_MAX_BUFFER_SIZE,
             "bounded initialized storage survives short reads"
         );
@@ -29679,11 +29691,14 @@ mod test {
     #[cfg(unix)]
     #[test]
     fn resource_reader_keeps_running_native_job_after_runtime_shutdown() {
-        use crate::disk::io_admission::test_resource_units;
+        use crate::disk::io_admission::{BackgroundMemoryBudget, test_resource_units};
 
         let file = tempfile::NamedTempFile::new().expect("read shutdown fixture");
         std::fs::write(file.path(), b"native read").expect("seed reader bytes");
         let (resources, gates) = test_resource_units(2);
+        let memory = BackgroundMemoryBudget::new();
+        memory.set_sampled_limit(11, Duration::from_secs(30));
+        let resources = resources.with_memory_budget(memory.clone());
         let mut reader = ResourceFileReader::new(std::fs::File::open(file.path()).expect("read descriptor"), resources, None);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -29707,6 +29722,7 @@ mod test {
         });
         runtime.shutdown_background();
         let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
+        let retained_bytes = memory.snapshot().used;
         release_tx.send(()).expect("release native read before asserting");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while gates.iter().any(|gate| gate.snapshot().active != 0) {
@@ -29714,6 +29730,8 @@ mod test {
             std::thread::yield_now();
         }
         assert_eq!(held, vec![1, 1]);
+        assert_eq!(retained_bytes, 11, "native read storage survives async runtime shutdown");
+        assert_eq!(memory.snapshot().used, 0, "completed native read releases its storage");
     }
 
     #[cfg(target_os = "linux")]
@@ -29852,7 +29870,7 @@ mod test {
     #[cfg(unix)]
     #[test]
     fn buffered_writer_cancelled_native_job_retains_physical_resources() {
-        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
+        use crate::disk::io_admission::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
         use std::io::IoSlice;
 
         temp_env::with_vars([(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, Some("false"))], || {
@@ -29873,6 +29891,9 @@ mod test {
                             std::fs::write(&path, vec![9; 4096]).expect("seed existing file");
                             let backend = StdBackend::new(dir.path().to_path_buf());
                             let (resources, gates) = test_resource_units(count);
+                            let memory = BackgroundMemoryBudget::new();
+                            memory.set_sampled_limit(1024, Duration::from_secs(30));
+                            let resources = resources.with_memory_budget(memory.clone());
                             let mode = if append {
                                 WriteMode::Append
                             } else {
@@ -29915,21 +29936,24 @@ mod test {
                             task.abort();
                             assert!(task.await.expect_err("cancel flush waiter").is_cancelled());
                             let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
+                            let retained_bytes = memory.snapshot().used;
                             release_tx.send(()).expect("release native pool before asserting");
                             blocker.await.expect("blocking worker released");
                             let bytes = fs::read(&path).await.expect("read completed native write");
                             let mut expected = if append { vec![9; 4096] } else { Vec::new() };
                             expected.extend_from_slice(&[37; 1024]);
                             assert_eq!(bytes, expected, "queued native write must actually finish after cancellation");
+                            assert_eq!(memory.snapshot().used, 0, "native completion returns retained buffer bytes");
                             assert!(
                                 gates.iter().all(|gate| gate.snapshot().active == 0),
                                 "native completion returns all physical leaves"
                             );
-                            observations.push((append, vectored, count, held));
+                            observations.push((append, vectored, count, held, retained_bytes));
                         }
                     }
                 }
-                for (append, vectored, count, held) in observations {
+                for (append, vectored, count, held, retained_bytes) in observations {
+                    assert_eq!(retained_bytes, 1024, "cancelled writer keeps its native buffer charged");
                     assert_eq!(
                         held,
                         vec![1; count],
@@ -30035,13 +30059,61 @@ mod test {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn buffered_writer_memory_denial_accepts_no_bytes_and_preserves_retry() {
+        use crate::disk::io_admission::{BackgroundMemoryBudget, test_resource_units};
+        use std::io::IoSlice;
+
+        let file = tempfile::NamedTempFile::new().expect("writer memory fixture");
+        let memory = BackgroundMemoryBudget::new();
+        memory.set_sampled_limit(4, Duration::from_secs(30));
+        let (resources, gates) = test_resource_units(1);
+        let mut writer = ResourceFileWriter::new(
+            file.reopen().expect("write descriptor"),
+            resources.with_memory_budget(memory.clone()),
+            0,
+            false,
+        );
+        writer.write_all(b"abcd").await.expect("initial write");
+        writer.flush().await.expect("initial native completion");
+        assert_eq!(memory.snapshot().used, 4, "idle stream retains its reusable storage");
+        memory.set_sampled_limit(0, Duration::ZERO);
+        writer.write_all(b"ef").await.expect("reuse retained storage after shrink");
+        writer.flush().await.expect("reuse completes");
+        let error = writer
+            .write_vectored(&[IoSlice::new(b"ghij"), IoSlice::new(b"klmn")])
+            .await
+            .expect_err("growth denied before accepting bytes");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(std::fs::read(file.path()).expect("bytes after denial"), b"abcdef");
+        assert_eq!(memory.snapshot().used, 4);
+        memory.set_sampled_limit(12, Duration::from_secs(30));
+        assert_eq!(
+            writer
+                .write_vectored(&[IoSlice::new(b"ghij"), IoSlice::new(b"klmn")])
+                .await
+                .expect("retry after recovery"),
+            8
+        );
+        writer.shutdown().await.expect("flush accepted bytes");
+        assert_eq!(std::fs::read(file.path()).expect("all accepted bytes"), b"abcdefghijklmn");
+        assert_eq!(memory.snapshot().used, 8);
+        drop(writer);
+        assert_eq!(memory.snapshot().used, 0);
+        assert_eq!(gates[0].snapshot().active, 0);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn buffered_resource_writer_retains_running_job_after_runtime_shutdown() {
-        use crate::disk::io_admission::test_resource_units;
+        use crate::disk::io_admission::{BackgroundMemoryBudget, test_resource_units};
 
         let dir = tempfile::tempdir().expect("runtime cancellation fixture");
         let path = dir.path().join("shard");
         let (resources, gates) = test_resource_units(2);
+        let memory = BackgroundMemoryBudget::new();
+        memory.set_sampled_limit(29, Duration::from_secs(30));
+        let resources = resources.with_memory_budget(memory.clone());
         let mut writer = ResourceFileWriter::new(std::fs::File::create(&path).expect("shard file"), resources, 0, false);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -30069,6 +30141,7 @@ mod test {
         });
         runtime.shutdown_background();
         let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
+        let retained_bytes = memory.snapshot().used;
         release_tx.send(()).expect("release native write before asserting");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while gates.iter().any(|gate| gate.snapshot().active != 0) {
@@ -30077,6 +30150,8 @@ mod test {
         }
         assert_eq!(held, vec![1, 1]);
         assert_eq!(std::fs::read(path).expect("finished native bytes"), b"native write survives runtime");
+        assert_eq!(retained_bytes, 29, "running native write retains its buffer after runtime shutdown");
+        assert_eq!(memory.snapshot().used, 0, "native write completion releases buffer storage");
         assert!(gates.iter().all(|gate| gate.snapshot().active == 0));
     }
 

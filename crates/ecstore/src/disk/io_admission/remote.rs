@@ -2,7 +2,10 @@
 // Licensed under the Apache License, Version 2.0.
 
 use super::{PhysicalDiskBinding, ResourceIoUnit};
-use rustfs_concurrency::adaptive::{NodeAdmission, permit_set::NodeResourcePermit};
+use rustfs_concurrency::adaptive::{
+    NodeAdmission,
+    permit_set::{NodeResourceCompletion, NodeResourcePermit},
+};
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::io;
@@ -42,6 +45,22 @@ impl RemoteBackgroundIo {
                 finished: Cell::new(false),
             })
             .ok()
+    }
+
+    /// Defer a response's progress without keeping async admission alive while
+    /// its body streams. The reader retains its own native resource ownership.
+    pub fn take_current_completion() -> Option<NodeResourceCompletion> {
+        REMOTE_RESOURCES
+            .try_with(|context| {
+                let admitted = context.admitted.take();
+                if context.progressed.replace(false) {
+                    admitted.map(NodeResourcePermit::into_completion)
+                } else {
+                    None
+                }
+            })
+            .ok()
+            .flatten()
     }
 
     /// A failed response or cancelled producer must not credit earlier phases.
@@ -204,6 +223,39 @@ mod tests {
         assert_eq!([node.completed(), gate.completed()], [Some(0), Some(0)]);
         drop(native);
         assert_eq!(gate.snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn receiver_defers_stream_progress_without_retaining_node_capacity() {
+        for (progressed, succeeds) in [(false, true), (true, false), (true, true)] {
+            let node = node();
+            let gate = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+            let binding = PhysicalDiskBinding::default();
+            binding.set_test_capacity(vec![gate.clone()]).expect("device plan");
+            let completion = with_remote_background_io(Some(RemoteBackgroundIo::new(node.clone())), async {
+                admit(&binding).expect("receiver admission");
+                if progressed {
+                    record_progress();
+                }
+                let completion = RemoteBackgroundIo::take_current_completion();
+                assert!(RemoteBackgroundIo::take_current_completion().is_none(), "single progress owner");
+                assert!(resources().is_none());
+                completion
+            })
+            .await;
+            assert_eq!([node.snapshot().active, gate.snapshot().active], [0, 0]);
+            assert_eq!([node.completed(), gate.completed()], [Some(0), Some(0)]);
+            assert_eq!(completion.is_some(), progressed);
+            if succeeds && let Some(completion) = completion {
+                completion.complete();
+            }
+            let expected = u64::from(progressed && succeeds);
+            assert_eq!([node.completed(), gate.completed()], [Some(expected), Some(expected)]);
+        }
+        assert!(
+            RemoteBackgroundIo::take_current_completion().is_none(),
+            "foreground has no progress owner"
+        );
     }
 
     #[tokio::test]

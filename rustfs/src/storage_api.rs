@@ -362,6 +362,8 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod background {
+        #[cfg(any(target_os = "linux", test))]
+        pub(crate) use crate::storage::storage_api::BackgroundMemoryBudget;
         pub(crate) use crate::storage::storage_api::{
             BitrotSelfTestError, ECStore, bitrot_self_test, set_workload_admission_snapshot_provider,
         };

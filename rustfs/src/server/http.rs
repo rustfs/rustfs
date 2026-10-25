@@ -4616,6 +4616,26 @@ mod tests {
         use std::num::NonZeroU16;
         use storage::DiskAPI;
 
+        const CHILD: &str = "RUSTFS_BACKGROUND_MEMORY_RPC_TEST_CHILD";
+        const TEST: &str = "server::http::tests::authenticated_background_rpc_enforces_receiver_capacity_on_http_and_grpc";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .expect("isolated process-wide memory owner test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "receiver memory integration: {stdout}{stderr}");
+            assert!(
+                stdout.contains("BACKGROUND_MEMORY_RPC_OK"),
+                "missing transport execution evidence: {stdout}"
+            );
+            return;
+        }
+        let memory = crate::storage_api::startup::background::BackgroundMemoryBudget::new();
+        assert!(memory.install(), "isolated test installs the production process owner once");
+
         temp_env::async_with_vars(
             [
                 ("RUSTFS_INTERNODE_PREWARM", Some("false")),
@@ -4691,7 +4711,11 @@ mod tests {
                 .await
                 .expect("production remote client");
                 let mut controller = FeedbackController::new();
-                for (generation, phase) in ["disabled", "physical_closed", "ready", "node_busy"].into_iter().enumerate() {
+                for (generation, phase) in ["disabled", "physical_closed", "memory_closed", "ready", "node_busy"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    memory.set_sampled_limit(if phase == "memory_closed" { 0 } else { 4 * 1024 * 1024 }, Duration::from_secs(30));
                     if phase == "physical_closed" {
                         let headers = storage::with_remote_background_io(
                             Some(storage::RemoteBackgroundIo::new(sender_owner.clone())),
@@ -4766,7 +4790,7 @@ mod tests {
                             )
                             .await
                             .expect("receiver must defer without waiting under storage locks");
-                            if !background || phase == "ready" {
+                            if !background || phase == "ready" || (phase == "memory_closed" && !stream) {
                                 assert_eq!(
                                     result.unwrap_or_else(|error| panic!(
                                         "{phase}, background={background}, stream={stream}: {error}"
@@ -4789,12 +4813,13 @@ mod tests {
                             .await
                             .expect("receiver native I/O and response body must drain");
                             assert_eq!(physical.snapshot().active, 0, "completed response releases receiver device");
+                            assert_eq!(memory.snapshot().used, 0, "completed response releases native buffer storage");
                         }
                     }
                     drop(held);
                 }
-                assert_eq!(node_owner.completed(), Some(2), "only the two admitted background requests made progress");
-                assert_eq!(physical.completed(), Some(2));
+                assert_eq!(node_owner.completed(), Some(3), "failed response bodies do not count completed work");
+                assert_eq!(physical.completed(), Some(3));
                 let mut upload =
                     reqwest::Url::parse(&format!("http://{address}/rustfs/rpc/put_file_stream")).expect("upload URL");
                 upload.query_pairs_mut().extend_pairs([
@@ -4825,8 +4850,8 @@ mod tests {
                 let message = response.text().await.expect("upload error body");
                 assert!(message.contains("body size mismatch"), "unexpected upload failure: {message}");
                 assert!(root.path().join("bucket/incomplete").exists(), "file creation completed before failure");
-                assert_eq!(node_owner.completed(), Some(2), "failed upload must not count its successful preparation");
-                assert_eq!(physical.completed(), Some(2));
+                assert_eq!(node_owner.completed(), Some(3), "failed upload must not count its successful preparation");
+                assert_eq!(physical.completed(), Some(3));
                 let large = tokio::fs::File::create(root.path().join("bucket/large"))
                     .await
                     .expect("large response fixture");
@@ -4847,6 +4872,11 @@ mod tests {
                 assert_eq!(first_byte, [0]);
                 assert_eq!(node_owner.snapshot().active, 0, "stream body cannot retain the handler's node unit");
                 assert_eq!(physical.snapshot().active, 1, "escaped response keeps its receiver disk capacity");
+                let retained = memory.snapshot().used;
+                assert!(
+                    retained > 0 && retained <= memory.snapshot().limit,
+                    "live response retains bounded receiver storage"
+                );
                 drop(reader);
                 tokio::time::timeout(Duration::from_secs(5), async {
                     while physical.snapshot().active != 0 {
@@ -4855,6 +4885,47 @@ mod tests {
                 })
                 .await
                 .expect("disconnect must retire the receiver stream and native reads");
+                assert_eq!(memory.snapshot().used, 0, "disconnect releases the actual receiver buffer");
+                assert_eq!(node_owner.completed(), Some(3), "disconnected body must not count as completed work");
+                assert_eq!(physical.completed(), Some(3));
+                for (path, length) in [("object", 0), ("large", LARGE_LENGTH)] {
+                    let mut reader = storage::with_remote_background_io(
+                        Some(storage::RemoteBackgroundIo::new(sender_owner.clone())),
+                        remote.read_file_stream("bucket", path, 0, length),
+                    )
+                    .await
+                    .expect("open valid stream before injecting truncation");
+                    if length != 0 {
+                        reader.read_exact(&mut first_byte).await.expect("bounded body started");
+                        let file = tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .open(root.path().join("bucket/large"))
+                            .await
+                            .expect("open truncation fixture");
+                        file.set_len(1)
+                            .await
+                            .expect("inject short source after valid response headers");
+                    }
+                    let mut bytes = Vec::new();
+                    let result = reader.read_to_end(&mut bytes).await;
+                    if length == 0 {
+                        result.expect("unbounded stream reaches EOF");
+                        assert_eq!(bytes, DATA);
+                    } else {
+                        assert!(result.is_err(), "short response must fail its declared Content-Length");
+                    }
+                    drop(reader);
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while physical.snapshot().active != 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("finished stream releases physical ownership");
+                    assert_eq!(node_owner.completed(), Some(4), "only a complete body credits progress");
+                    assert_eq!(physical.completed(), Some(4));
+                    assert_eq!(memory.snapshot().used, 0);
+                }
                 remote.close().await.expect("close remote client");
                 disk.close().await.expect("stop receiver disk monitors");
                 server.abort();
@@ -4863,6 +4934,7 @@ mod tests {
             },
         )
         .await;
+        println!("BACKGROUND_MEMORY_RPC_OK");
     }
 
     #[tokio::test]

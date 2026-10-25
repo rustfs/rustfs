@@ -743,9 +743,32 @@ where
     } else {
         u64::try_from(length).unwrap_or(u64::MAX)
     };
-    ReaderStream::with_capacity(reader.take(read_limit), read_buffer_size).map_ok(move |bytes| {
-        metrics.record_sent_bytes_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, bytes.len());
-        bytes
+    let mut reader = ReaderStream::with_capacity(reader.take(read_limit), read_buffer_size);
+    let mut completion = RemoteBackgroundIo::take_current_completion();
+    let mut remaining = (length != 0).then_some(length);
+    stream::poll_fn(move |cx| {
+        let chunk = std::task::ready!(Pin::new(&mut reader).poll_next(cx));
+        match &chunk {
+            Some(Ok(bytes)) => {
+                metrics.record_sent_bytes_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, bytes.len());
+                if let Some(remaining) = &mut remaining {
+                    *remaining -= bytes.len();
+                    // A Content-Length response may never poll the source EOF.
+                    if *remaining == 0
+                        && let Some(completion) = completion.take()
+                    {
+                        completion.complete();
+                    }
+                }
+            }
+            None if remaining.is_none() => {
+                if let Some(completion) = completion.take() {
+                    completion.complete();
+                }
+            }
+            Some(Err(_)) | None => drop(completion.take()),
+        }
+        Poll::Ready(chunk)
     })
 }
 

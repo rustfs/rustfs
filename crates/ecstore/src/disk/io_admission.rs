@@ -14,9 +14,12 @@
 
 //! Per-local-disk foreground-priority admission for scanner I/O.
 
+pub(crate) mod memory;
 mod physical_identity;
 mod physical_owners;
 mod physical_sampler;
+
+pub use memory::BackgroundMemoryBudget;
 
 pub(crate) use physical_sampler::PhysicalHealBinding;
 pub use physical_sampler::{
@@ -57,6 +60,7 @@ tokio::task_local! {
 #[derive(Clone, Debug)]
 pub(crate) struct ResourceIoUnit {
     permits: ResourceIoPermits,
+    memory_budget: Option<Arc<BackgroundMemoryBudget>>,
     #[cfg(target_os = "linux")]
     _mount_lease: Option<Arc<std::fs::File>>,
 }
@@ -80,6 +84,7 @@ impl From<AdaptivePermit> for ResourceIoUnit {
     fn from(permit: AdaptivePermit) -> Self {
         Self {
             permits: ResourceIoPermits::Single(permit),
+            memory_budget: BackgroundMemoryBudget::current(),
             #[cfg(target_os = "linux")]
             _mount_lease: None,
         }
@@ -90,6 +95,7 @@ impl From<AdaptivePermitSet> for ResourceIoUnit {
     fn from(permits: AdaptivePermitSet) -> Self {
         Self {
             permits: ResourceIoPermits::Set(permits),
+            memory_budget: BackgroundMemoryBudget::current(),
             #[cfg(target_os = "linux")]
             _mount_lease: None,
         }
@@ -97,6 +103,21 @@ impl From<AdaptivePermitSet> for ResourceIoUnit {
 }
 
 impl ResourceIoUnit {
+    pub(crate) fn memory_budget(&self) -> Option<Arc<BackgroundMemoryBudget>> {
+        self.memory_budget.clone()
+    }
+
+    pub(crate) fn with_permits(mut self, permits: AdaptivePermitSet) -> Self {
+        self.permits = ResourceIoPermits::Set(permits);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_memory_budget(mut self, budget: Arc<BackgroundMemoryBudget>) -> Self {
+        self.memory_budget = Some(budget);
+        self
+    }
+
     pub(crate) fn as_set(&self) -> Option<&AdaptivePermitSet> {
         match &self.permits {
             ResourceIoPermits::Single(_) => None,

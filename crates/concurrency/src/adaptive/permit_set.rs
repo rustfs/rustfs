@@ -125,10 +125,59 @@ pub struct NodeResourcePermit {
     node: NodePermit,
 }
 
+/// Deferred progress for an escaped response. This retains counter identities,
+/// not node capacity, physical units, or reusable carrier slots.
+#[must_use = "complete only after the response finishes successfully"]
+pub struct NodeResourceCompletion {
+    resources: Arc<AdaptivePermitSetOwner>,
+    selected: ResourceMask,
+    node: Arc<NodeAdmission>,
+}
+
+impl NodeResourceCompletion {
+    /// Record a successful response once. Dropping a failed or cancelled
+    /// response leaves all progress counters unchanged.
+    pub fn complete(self) {
+        for (index, owner) in self.resources.owners.iter().enumerate() {
+            if self.selected.contains(index) {
+                let _ = owner
+                    .completed
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1));
+            }
+        }
+        let _ = self
+            .node
+            .completed
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1));
+    }
+}
+
 impl NodeResourcePermit {
     /// Admitted physical units, available for per-disk native ownership.
     pub fn resources(&self) -> &AdaptivePermitSet {
         &self.resources
+    }
+
+    /// Release async admission now and defer progress until a streamed response
+    /// finishes. Native work must retain its own selected physical units.
+    pub fn into_completion(self) -> NodeResourceCompletion {
+        let Self { resources, node } = self;
+        let first_unit = resources.slot * resources.owner.owners.len();
+        let mut selected = ResourceMask::empty();
+        for index in 0..resources.owner.owners.len() {
+            if resources.owner.units[first_unit + index].load(Ordering::Acquire) != NO_UNIT {
+                selected.insert(index);
+            }
+        }
+        let owner = resources.owner.clone();
+        drop(resources);
+        let NodePermit { _capacity, owner: node } = node;
+        drop(_capacity);
+        NodeResourceCompletion {
+            resources: owner,
+            selected,
+            node,
+        }
     }
 
     /// Return physical ownership before recording and releasing node progress.
@@ -602,6 +651,53 @@ mod tests {
 
     fn assert_pending<T>(future: Pin<&mut impl Future<Output = T>>) {
         assert!(future.poll(&mut Context::from_waker(Waker::noop())).is_pending());
+    }
+
+    #[test]
+    fn deferred_completion_releases_admission_but_preserves_native_ownership() {
+        let a = gate(1);
+        let b = gate(1);
+        let node = node(1);
+        let group = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("group");
+        let parent = group.try_acquire_with_node(&node).expect("parent admission");
+        let native = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone()])
+            .expect("native subset")
+            .capture_from(parent.resources())
+            .expect("native read");
+        let completion = parent.into_completion();
+        assert_eq!([node.snapshot().active, a.snapshot().active, b.snapshot().active], [0, 1, 0]);
+        assert_eq!([node.completed(), a.completed(), b.completed()], [Some(0), Some(0), Some(0)]);
+        drop(node.try_acquire().expect("response cannot retain scheduling capacity"));
+        completion.complete();
+        assert_eq!([node.completed(), a.completed(), b.completed()], [Some(1), Some(1), Some(1)]);
+        assert_eq!(a.snapshot().active, 1, "recording progress cannot return native capacity");
+        drop(native);
+        assert_eq!(a.snapshot().active, 0);
+    }
+
+    #[test]
+    fn deferred_completion_keeps_counter_identity_after_carrier_reuse() {
+        let a = gate(1);
+        let b = gate(1);
+        let node = node(1);
+        let group = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("group");
+        let selected = group.select(std::slice::from_ref(&a)).expect("first selection");
+        let parent = selected.try_acquire_with_node(&node).expect("first admission");
+        let slot = parent.resources.slot;
+        let completion = parent.into_completion();
+        let next = group.select(std::slice::from_ref(&b)).expect("different selection");
+        // Force reuse even if the carrier rotates through all spare bit slots.
+        let mut reused = false;
+        for _ in 0..64 {
+            let parent = next.try_acquire_with_node(&node).expect("released carrier capacity");
+            reused |= parent.resources.slot == slot;
+            drop(parent.into_completion());
+        }
+        assert!(reused, "the old row must have held another selection");
+        assert_eq!([node.completed(), a.completed(), b.completed()], [Some(0), Some(0), Some(0)]);
+        completion.complete();
+        assert_eq!([node.completed(), a.completed(), b.completed()], [Some(1), Some(1), Some(0)]);
+        assert_eq!([node.snapshot().active, a.snapshot().active, b.snapshot().active], [0, 0, 0]);
     }
 
     #[test]

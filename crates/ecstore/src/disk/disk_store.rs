@@ -1670,8 +1670,6 @@ impl LocalDiskWrapper {
     // Projection cannot wait: callers may already hold namespace or cache locks.
     // Enter before identity probes, disk permits, or owned native jobs are created.
     async fn with_native_resources<F: std::future::Future>(&self, operation: F) -> Result<F::Output> {
-        use crate::disk::io_admission::ResourceIoUnit;
-
         let Some(resources) = current_resource_unit() else {
             if super::remote_io_admission::active() {
                 return Err(DiskError::Io(io::Error::from(io::ErrorKind::WouldBlock)));
@@ -1687,7 +1685,7 @@ impl LocalDiskWrapper {
             if !plan.is_current() {
                 return Err(unavailable());
             }
-            ResourceIoUnit::from(native)
+            resources.with_permits(native)
         } else {
             resources
         };
@@ -4274,6 +4272,79 @@ mod tests {
                 assert_eq!(held, [1, 0], "stream={stream}: only the pending native read's device stays charged");
             }
         });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn projected_stream_memory_survives_scope_exit_and_hot_shrink() {
+        use crate::disk::io_admission::{BackgroundMemoryBudget, ResourceIoUnit, with_optional_resource_unit};
+        use rustfs_concurrency::adaptive::{AdaptiveAdmission, permit_set::AdaptivePermitSetOwner};
+        use std::num::NonZeroU16;
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().expect("memory admission fixture");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+        std::fs::create_dir(dir.path().join("bucket")).expect("bucket directory");
+        let bytes = b"0123456789abcdefghijklmnopqrstuv";
+        std::fs::write(dir.path().join("bucket/object"), bytes).expect("reader bytes");
+        let first = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let second = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let shared = AdaptivePermitSetOwner::new(NonZeroU16::MIN, vec![first.clone(), second.clone()]).expect("parent resources");
+        wrapper
+            .physical_admission
+            .set_test_shared_capacity(shared.clone(), vec![first.clone()])
+            .expect("selected device");
+        let memory = BackgroundMemoryBudget::new();
+
+        for stream in [false, true] {
+            memory.set_sampled_limit(4, Duration::from_secs(30));
+            let a = first.try_acquire().expect("first device");
+            let b = second.try_acquire().expect("second device");
+            let parent =
+                ResourceIoUnit::from(shared.capture(&[&a, &b]).expect("admitted parent")).with_memory_budget(memory.clone());
+            drop((a, b));
+            let mut reader = with_optional_resource_unit(Some(parent), async {
+                if stream {
+                    wrapper.read_file_stream("bucket", "object", 0, bytes.len()).await
+                } else {
+                    wrapper.read_file("bucket", "object").await
+                }
+            })
+            .await
+            .expect("reader escapes its resource scope");
+            assert_eq!(memory.snapshot().used, 0, "opening does not allocate a read buffer");
+            let mut prefix = [0; 4];
+            reader.read_exact(&mut prefix).await.expect("initial read");
+            assert_eq!(&prefix, &bytes[..4]);
+            assert_eq!(memory.snapshot().used, 4, "projection retains the same memory owner");
+            assert_eq!([first.snapshot().active, second.snapshot().active], [1, 0]);
+
+            memory.set_sampled_limit(0, Duration::ZERO);
+            let mut reused = [0; 2];
+            reader
+                .read_exact(&mut reused)
+                .await
+                .expect("already allocated storage remains usable");
+            assert_eq!(&reused, &bytes[4..6]);
+            let mut next = [99; 8];
+            let error = reader.read(&mut next).await.expect_err("new storage is blocked after shrink");
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+            assert_eq!(next, [99; 8], "denied allocation exposes no stale bytes");
+            assert_eq!(memory.snapshot().used, 4);
+
+            memory.set_sampled_limit(12, Duration::from_secs(30));
+            reader
+                .read_exact(&mut next)
+                .await
+                .expect("growth includes old and replacement storage");
+            assert_eq!(&next, &bytes[6..14], "denial did not advance the file");
+            assert_eq!(memory.snapshot().used, 8);
+            drop(reader);
+            assert_eq!(memory.snapshot().used, 0);
+            assert_eq!([first.snapshot().active, second.snapshot().active], [0, 0]);
+        }
     }
 
     #[tokio::test]

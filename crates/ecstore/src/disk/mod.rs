@@ -33,9 +33,9 @@ pub mod os;
 pub(crate) use io_admission::DiskIoClass;
 pub(crate) use io_admission::remote as remote_io_admission;
 pub use io_admission::{
-    PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler, PhysicalResourcePlan, RemoteBackgroundIo,
-    spawn_blocking_with_resource_ownership, with_background_disk_io, with_background_resource_set, with_background_resource_unit,
-    with_remote_background_io,
+    BackgroundMemoryBudget, PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler, PhysicalResourcePlan,
+    RemoteBackgroundIo, spawn_blocking_with_resource_ownership, with_background_disk_io, with_background_resource_set,
+    with_background_resource_unit, with_remote_background_io,
 };
 pub(crate) use io_admission::{
     PhysicalHealBinding, acquire_context_disk_io_permit, current_disk_io_context, current_resource_unit, has_resource_io_scope,

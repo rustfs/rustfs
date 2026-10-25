@@ -443,8 +443,8 @@ pub mod disk {
         is_quota_mutation_fence_path, new_disk, validate_batch_read_version_item_count,
     };
     pub use crate::disk::{
-        PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler, PhysicalResourcePlan, RemoteBackgroundIo,
-        with_remote_background_io,
+        BackgroundMemoryBudget, PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler,
+        PhysicalResourcePlan, RemoteBackgroundIo, with_remote_background_io,
     };
     pub use bytes::Bytes;
     pub use endpoint::Endpoint;
