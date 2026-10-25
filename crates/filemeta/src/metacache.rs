@@ -1135,12 +1135,6 @@ fn normalize_version_id(version_id: Option<Uuid>) -> Option<Uuid> {
 }
 
 #[derive(Debug, Default)]
-pub struct MetaCacheEntriesSortedResult {
-    pub entries: Option<MetaCacheEntriesSorted>,
-    pub err: Option<Error>,
-}
-
-#[derive(Debug, Default)]
 pub struct MetaCacheEntriesSorted {
     pub o: MetaCacheEntries,
     pub list_id: Option<String>,
@@ -1176,6 +1170,13 @@ impl MetaCacheEntriesSorted {
 
 const METACACHE_STREAM_VERSION: u8 = 2;
 const METACACHE_READ_CHUNK_SIZE: usize = 64 << 10;
+/// msgpack `false`: the entry-stream terminator, and the only byte a legacy
+/// reader accepts after it (see `MetacacheWriter::close_with_limit_reached`).
+const METACACHE_TERMINATOR: u8 = 0xc2;
+/// Terminator markers a writer appends after the first one to carry the
+/// producer-stop trailer: one marks a stop at the per-disk limit, two mark
+/// the end of the namespace.
+const METACACHE_TRAILER_MAX_MARKERS: u8 = 2;
 
 #[derive(Debug)]
 pub struct MetacacheWriter<W> {
@@ -1250,8 +1251,29 @@ impl<W: AsyncWrite + Unpin> MetacacheWriter<W> {
     }
 
     pub async fn close(&mut self) -> Result<()> {
+        self.close_with_limit_reached(false).await
+    }
+
+    /// Terminates the stream and records whether the producer stopped at its
+    /// own limit instead of at the end of its namespace.
+    ///
+    /// The trailer is encoded as extra terminator markers after the usual
+    /// `false`: one more means "stopped at the limit", two more mean "reached
+    /// the end of the namespace". Repeating the terminator is the only
+    /// encoding every deployed reader already tolerates: a legacy
+    /// `MetacacheReader` keeps polling a stream after its first `false` and
+    /// reports a clean EOF for each repeated `false`, whereas any other
+    /// trailing byte would decode as a corrupt entry. A legacy writer emits a
+    /// single `false`, which a new reader reports as "no trailer". Rolling
+    /// upgrades are therefore safe in both directions. The exhausted stream
+    /// gets the longer trailer so that a trailer cut short by the transport
+    /// can only be misread as "may have more", never as "complete".
+    pub async fn close_with_limit_reached(&mut self, limit_reached: bool) -> Result<()> {
         self.init().await?;
-        rmp::encode::write_bool(&mut self.buf, false).map_err(|e| Error::other(format!("{e:?}")))?;
+        let markers = 2 + usize::from(!limit_reached);
+        for _ in 0..markers {
+            rmp::encode::write_bool(&mut self.buf, false).map_err(|e| Error::other(format!("{e:?}")))?;
+        }
         self.flush().await?;
         Ok(())
     }
@@ -1265,6 +1287,12 @@ pub struct MetacacheReader<R> {
     buf: Vec<u8>,
     pos: usize,
     has_current: bool,
+    /// The terminator has been consumed; later reads report EOF without
+    /// touching `rd`.
+    terminated: bool,
+    /// Trailer decoded after the terminator; `None` while the stream is open
+    /// and for streams written before the trailer existed.
+    limit_reached: Option<bool>,
 }
 
 impl<R: AsyncRead + Unpin> MetacacheReader<R> {
@@ -1277,6 +1305,66 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
             buf: Vec::new(),
             pos: 0,
             has_current: false,
+            terminated: false,
+            limit_reached: None,
+        }
+    }
+
+    /// Whether the producer stopped at its own limit, as recorded by
+    /// `MetacacheWriter::close_with_limit_reached`. `None` until the
+    /// terminator has been read, and for legacy streams without a trailer.
+    pub fn limit_reached(&self) -> Option<bool> {
+        self.limit_reached
+    }
+
+    /// Consumes the trailer that may follow the terminator just read.
+    ///
+    /// EOF is not an error here: it is how a legacy writer ends a stream. A
+    /// foreign byte ends the trailer too; nothing after the terminator is an
+    /// entry, so it is left unread.
+    async fn read_trailer(&mut self) -> Result<()> {
+        self.terminated = true;
+        let mut markers = 0u8;
+        while markers < METACACHE_TRAILER_MAX_MARKERS {
+            match self.peek_byte().await? {
+                Some(METACACHE_TERMINATOR) => {
+                    self.pos += 1;
+                    markers += 1;
+                }
+                _ => break,
+            }
+        }
+        self.limit_reached = match markers {
+            0 => None,
+            1 => Some(true),
+            _ => Some(false),
+        };
+        self.reset();
+        Ok(())
+    }
+
+    async fn peek_byte(&mut self) -> Result<Option<u8>> {
+        if self.pos < self.buf.len() {
+            return Ok(Some(self.buf[self.pos]));
+        }
+        self.buf.clear();
+        self.pos = 0;
+        let extra = usize::from(METACACHE_TRAILER_MAX_MARKERS);
+        if let Err(e) = self.buf.try_reserve(extra) {
+            let err = Error::other(format!("metacache stream: buffer allocation of {extra} bytes failed: {e}"));
+            self.err = Some(err.clone());
+            return Err(err);
+        }
+        let mut dst = bytes::BufMut::limit(&mut self.buf, extra);
+        match self.rd.read_buf(&mut dst).await {
+            Ok(0) => Ok(None),
+            Ok(_) => Ok(Some(self.buf[0])),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => {
+                let err = Error::from(e);
+                self.err = Some(err.clone());
+                Err(err)
+            }
         }
     }
 
@@ -1474,9 +1562,13 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
         }
 
         while n > 0 {
+            if self.terminated {
+                return Ok(());
+            }
             match rmp::decode::read_bool(&mut self.read_more(1).await?) {
                 Ok(res) => {
                     if !res {
+                        self.read_trailer().await?;
                         return Ok(());
                     }
                 }
@@ -1507,9 +1599,14 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
             return Err(err.clone());
         }
 
+        if self.terminated {
+            return Ok(None);
+        }
+
         match rmp::decode::read_bool(&mut self.read_more(1).await?) {
             Ok(res) => {
                 if !res {
+                    self.read_trailer().await?;
                     return Ok(None);
                 }
             }
@@ -1851,7 +1948,10 @@ mod tests {
         for _ in 0..1000 {
             bytes.extend_from_slice(&[0xc3, 0xa1, b'x', 0xc4, 1, 0x42]);
         }
-        bytes.push(0xc2);
+        let mut legacy = bytes.clone();
+        legacy.push(METACACHE_TERMINATOR);
+        // A current writer that reached the end of its namespace.
+        bytes.extend_from_slice(&[METACACHE_TERMINATOR; 3]);
         let mut reader = MetacacheReader::new(FragmentedReader {
             data: &bytes,
             chunk: METACACHE_READ_CHUNK_SIZE,
@@ -1859,6 +1959,16 @@ mod tests {
         });
         assert_eq!(reader.read_all().await.expect("decode page").len(), 1000);
         assert_eq!(reader.rd.reads, 1, "a ready page smaller than 64 KiB needs one stream read");
+        assert_eq!(reader.limit_reached(), Some(false));
+
+        let mut reader = MetacacheReader::new(FragmentedReader {
+            data: &legacy,
+            chunk: METACACHE_READ_CHUNK_SIZE,
+            reads: 0,
+        });
+        assert_eq!(reader.read_all().await.expect("decode legacy page").len(), 1000);
+        assert_eq!(reader.rd.reads, 2, "a legacy stream needs one more read to learn that no trailer follows");
+        assert_eq!(reader.limit_reached(), None);
     }
 
     #[tokio::test]
@@ -1895,6 +2005,100 @@ mod tests {
         let mut reader = MetacacheReader::new(Cursor::new(stream));
         reader.skip(1).await.expect("complete entry must be skippable");
         assert_eq!(reader.peek().await.expect_err("skip must restore between-entry state"), Error::Unexpected);
+    }
+
+    #[tokio::test]
+    async fn trailer_round_trips_limit_reached_through_a_new_reader() {
+        for limit_reached in [false, true] {
+            let entries = (0..3)
+                .map(|i| MetaCacheEntry {
+                    name: format!("item{i}"),
+                    metadata: vec![i as u8, 7],
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            let mut output = Cursor::new(Vec::new());
+            let mut writer = MetacacheWriter::new(&mut output);
+            writer.write(&entries).await.expect("entries should be written");
+            writer
+                .close_with_limit_reached(limit_reached)
+                .await
+                .expect("stream should close with a trailer");
+            let bytes = output.into_inner();
+
+            let mut reader = MetacacheReader::new(Cursor::new(bytes.clone()));
+            assert_eq!(reader.limit_reached(), None, "the trailer is unknown until the terminator is read");
+            assert_eq!(reader.read_all().await.expect("stream should decode"), entries);
+            assert_eq!(reader.limit_reached(), Some(limit_reached));
+            // Polling past the terminator stays a clean EOF and never decodes
+            // the trailer as data.
+            assert!(reader.peek().await.expect("EOF must be idempotent").is_none());
+            reader.skip(1).await.expect("skipping past EOF must be a no-op");
+            assert_eq!(reader.limit_reached(), Some(limit_reached));
+
+            // Skipping through the terminator decodes the trailer as well.
+            let mut reader = MetacacheReader::new(Cursor::new(bytes));
+            reader.skip(10).await.expect("skip must stop at the terminator");
+            assert_eq!(reader.limit_reached(), Some(limit_reached));
+            assert!(reader.peek().await.expect("EOF after skip").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_stream_without_trailer_reads_as_no_trailer() {
+        // A pre-trailer writer: version, one entry, a single terminator.
+        let stream = vec![0xcc, 2, 0xc3, 0xa1, b'x', 0xc4, 1, 0x42, METACACHE_TERMINATOR];
+        let mut reader = MetacacheReader::new(Cursor::new(stream));
+        let entries = reader.read_all().await.expect("legacy stream must decode");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "x");
+        assert_eq!(reader.limit_reached(), None);
+        assert!(reader.peek().await.expect("legacy EOF must be idempotent").is_none());
+    }
+
+    #[tokio::test]
+    async fn trailer_stream_decodes_for_a_reader_that_stops_at_the_first_terminator() {
+        // Emulates the decoding loop of a reader that predates the trailer: it
+        // yields every entry, and whatever it can still read afterwards must
+        // decode as another clean terminator rather than as an entry.
+        let entries = (0..3)
+            .map(|i| MetaCacheEntry {
+                name: format!("item{i}"),
+                metadata: vec![i as u8],
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let mut output = Cursor::new(Vec::new());
+        let mut writer = MetacacheWriter::new(&mut output);
+        writer.write(&entries).await.expect("entries should be written");
+        writer
+            .close_with_limit_reached(true)
+            .await
+            .expect("stream should close at the limit");
+        let bytes = output.into_inner();
+
+        let mut cursor = &bytes[..];
+        assert_eq!(rmp::decode::read_u8(&mut cursor).expect("version"), METACACHE_STREAM_VERSION);
+        let mut decoded = Vec::new();
+        while rmp::decode::read_bool(&mut cursor).expect("entry marker") {
+            let len = rmp::decode::read_str_len(&mut cursor).expect("name length") as usize;
+            let name = from_utf8(&cursor[..len]).expect("name is utf8").to_owned();
+            cursor = &cursor[len..];
+            let len = rmp::decode::read_bin_len(&mut cursor).expect("metadata length") as usize;
+            let metadata = cursor[..len].to_vec();
+            cursor = &cursor[len..];
+            decoded.push(MetaCacheEntry {
+                name,
+                metadata,
+                ..Default::default()
+            });
+        }
+        assert_eq!(decoded, entries);
+        assert!(!cursor.is_empty(), "the trailer must follow the first terminator");
+        assert!(
+            cursor.iter().all(|byte| *byte == METACACHE_TERMINATOR),
+            "every trailer byte must be a terminator a legacy reader accepts: {cursor:?}"
+        );
     }
 
     #[tokio::test]
