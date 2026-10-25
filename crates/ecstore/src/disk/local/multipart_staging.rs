@@ -3,7 +3,7 @@
 
 //! A completion consumes its own hardlinks, never the authoritative upload.
 
-use super::{LocalDisk, effective_durability, tmp_staging_mutation_path};
+use super::{LocalDisk, effective_durability, tmp_staging_mutation_path, to_file_error};
 use crate::disk::{
     RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
     error::{DiskError, Result},
@@ -451,6 +451,7 @@ impl LocalDisk {
             Ok(())
         })
         .await
+        .map_err(to_file_error)
         .map_err(DiskError::from)?;
         Ok(staging)
     }

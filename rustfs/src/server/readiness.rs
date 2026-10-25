@@ -85,7 +85,7 @@ pub use crate::shared_types::{
 };
 
 /// ReadinessGateLayer ensures that the system components (IAM, Storage)
-/// are fully initialized before allowing any request to proceed.
+/// are fully initialized before allowing S3 data-plane requests to proceed.
 #[derive(Clone)]
 pub struct ReadinessGateLayer {
     readiness: Arc<GlobalReadiness>,
@@ -218,10 +218,13 @@ where
         Box::pin(async move {
             let path = req.uri().path();
             debug!("ReadinessGateService: Received request for path: {}", path);
-            if readiness_gate_blocks_path(path, &readiness) {
+            // Control services must reach the authenticated gRPC router while
+            // their storage owners are still initializing.
+            let grpc_request = crate::server::hybrid::is_grpc_request(&req);
+            if !grpc_request && readiness_gate_blocks_path(path, &readiness) {
                 return Ok(service_not_ready_response(readiness.current_stage()));
             }
-            if !is_probe_path(path) && readiness.is_ready() {
+            if !grpc_request && !is_probe_path(path) && readiness.is_ready() {
                 mark_get_metadata_read_version_coalescing_service_ready();
             }
             let resp = inner.call(req).await?;
@@ -1998,6 +2001,68 @@ mod tests {
 
         readiness.mark_stage(rustfs_common::SystemStage::FullReady);
         assert!(!readiness_gate_blocks_path("/bucket/object", &readiness));
+    }
+
+    #[tokio::test]
+    async fn grpc_bootstrap_follows_protocol_routing_without_opening_rest() {
+        let readiness = Arc::new(GlobalReadiness::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let inner = tower::service_fn(move |_: HttpRequest<Full<Bytes>>| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::new()))) }
+        });
+        let mut service = ReadinessGateLayer::new(readiness).layer(inner);
+        for path in [
+            "/node_service.HealControlService/HealControl",
+            "/node_service.ScannerControlService/ScannerScopedDirtyUsageAck",
+            "/node_service.TierMutationControlService/PrepareTierMutation",
+        ] {
+            let response = service
+                .call(
+                    HttpRequest::builder()
+                        .method(http::Method::POST)
+                        .version(http::Version::HTTP_2)
+                        .uri(path)
+                        .header(http::header::CONTENT_TYPE, "application/grpc")
+                        .body(Full::new(Bytes::new()))
+                        .expect("control request"),
+                )
+                .await
+                .expect("control routing");
+            assert_eq!(response.status(), StatusCode::OK, "gRPC bootstrap must reach the authenticated router");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        for (version, content_type, path) in [
+            (
+                http::Version::HTTP_11,
+                Some("application/grpc"),
+                "/node_service.HealControlService/HealControl",
+            ),
+            (
+                http::Version::HTTP_2,
+                Some("application/json"),
+                "/node_service.ScannerControlService/ScannerScopedDirtyUsageAck",
+            ),
+            (http::Version::HTTP_2, None, "/bucket/object"),
+        ] {
+            let mut request = HttpRequest::builder().version(version).uri(path);
+            if let Some(content_type) = content_type {
+                request = request.header(http::header::CONTENT_TYPE, content_type);
+            }
+            let response = service
+                .call(request.body(Full::new(Bytes::new())).expect("REST request"))
+                .await
+                .expect("REST readiness response");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[http::header::RETRY_AFTER], "5");
+            assert_eq!(response.headers()[READINESS_PENDING_HEADER], "storage_quorum");
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "REST requests must remain outside their handlers"
+        );
     }
 
     #[tokio::test]
