@@ -275,7 +275,7 @@ async fn quota_statistics_remain_available_without_a_complete_scanner_snapshot()
             // assertion: reporting must work before a protocol upgrade.
             let metadata_sys = BucketMetadataSys::new(store.clone());
             let (metadata, _) = metadata_sys.get_config(&bucket).await.expect("load existing bucket metadata");
-            metadata_sys.set(bucket.clone(), metadata).await;
+            metadata_sys.set_for_test(bucket.clone(), metadata).await;
             let checker = QuotaChecker::new(Arc::new(RwLock::new(metadata_sys)));
             let (snapshot_source, size) = if source == "empty" { ("complete", 0) } else { (source, 1000) };
             install_reporting_snapshot(store.clone(), &bucket, snapshot_source, size).await;
@@ -317,7 +317,7 @@ async fn quota_statistics_preserve_configuration_errors() {
     let metadata_sys = BucketMetadataSys::new(store.clone());
     let (mut metadata, _) = metadata_sys.get_config(&bucket).await.expect("load existing bucket metadata");
     Arc::make_mut(&mut metadata).quota_config_json = b"{not-json".to_vec();
-    metadata_sys.set(bucket.clone(), metadata).await;
+    metadata_sys.set_for_test(bucket.clone(), metadata).await;
     let checker = QuotaChecker::new(Arc::new(RwLock::new(metadata_sys)));
 
     let statistics = checker.get_quota_stats(&bucket).await;
