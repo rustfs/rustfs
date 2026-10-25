@@ -2472,6 +2472,10 @@ struct DirectWriteInner {
     write_offset: u64,
     align: usize,
     direct_cleared: bool,
+    // Moves with the file and bounce buffer into every native flush.
+    _resource_unit: Option<ResourceIoUnit>,
+    #[cfg(test)]
+    before_write: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -2481,6 +2485,10 @@ impl DirectWriteInner {
     fn flush_batch(&mut self) -> std::io::Result<()> {
         if self.filled == 0 {
             return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.before_write.take() {
+            hook();
         }
         debug_assert_eq!(self.filled % self.align, 0, "batch flush must be alignment-sized");
         pwrite_all(&self.file, &self.buf.as_slice()[..self.filled], self.write_offset).map_err(sanitize_direct_write_error)?;
@@ -2494,6 +2502,10 @@ impl DirectWriteInner {
     /// tail is not separately fsynced — the commit-point `sync_dir_files`
     /// fdatasync covers the whole file, issue correction #5).
     fn finish(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = self.before_write.take() {
+            hook();
+        }
         let (aligned, remainder) = direct_write_tail_split(self.filled, self.align);
         if aligned > 0 {
             pwrite_all(&self.file, &self.buf.as_slice()[..aligned], self.write_offset).map_err(sanitize_direct_write_error)?;
@@ -2553,12 +2565,23 @@ struct DirectWriter {
 
 #[cfg(target_os = "linux")]
 impl DirectWriter {
-    fn new(inner: DirectWriteInner) -> Self {
-        Self {
+    fn new(file: std::fs::File, align: usize, capacity: usize, resource_unit: Option<ResourceIoUnit>) -> std::io::Result<Self> {
+        let inner = DirectWriteInner {
+            file,
+            buf: AlignedBuf::new(capacity, align)?,
+            filled: 0,
+            write_offset: 0,
+            align,
+            direct_cleared: false,
+            _resource_unit: resource_unit,
+            #[cfg(test)]
+            before_write: None,
+        };
+        Ok(Self {
             state: DirectWriteState::Idle(Some(inner)),
             shutdown_started: false,
             shutdown_done: false,
-        }
+        })
     }
 
     /// Build a writer over an already-open plain file with a caller-chosen
@@ -2569,15 +2592,7 @@ impl DirectWriter {
     #[cfg(test)]
     fn from_std_file_for_test(file: std::fs::File, align: usize, capacity: usize) -> Self {
         assert_eq!(capacity % align, 0, "test capacity must be an alignment multiple");
-        let buf = AlignedBuf::new(capacity, align).expect("aligned buffer allocation");
-        Self::new(DirectWriteInner {
-            file,
-            buf,
-            filled: 0,
-            write_offset: 0,
-            align,
-            direct_cleared: false,
-        })
+        Self::new(file, align, capacity, current_resource_unit()).expect("aligned buffer allocation")
     }
 
     /// Drive an in-flight flush to completion, returning the recovered inner
@@ -2731,8 +2746,15 @@ impl AsyncWrite for DirectWriter {
 /// a one-time warning) when the filesystem rejects O_DIRECT, so the caller can
 /// fall back to the buffered writer without ever surfacing EINVAL.
 #[cfg(target_os = "linux")]
-fn open_direct_writer(file_path: &Path, state: &DirectIoWriteState) -> Result<Option<DirectWriter>> {
+fn open_direct_writer(
+    file_path: &Path,
+    state: &DirectIoWriteState,
+    resource_unit: Option<ResourceIoUnit>,
+) -> Result<Option<DirectWriter>> {
     use std::os::unix::fs::OpenOptionsExt;
+
+    #[cfg(test)]
+    run_owned_file_write_before_open(file_path);
 
     let open_result = std::fs::OpenOptions::new()
         .create(true)
@@ -2766,19 +2788,7 @@ fn open_direct_writer(file_path: &Path, state: &DirectIoWriteState) -> Result<Op
 
     let align = *state.align.get_or_init(|| probe_direct_io_align(&file));
     let capacity = direct_write_staging_capacity(align);
-    let buf = match AlignedBuf::new(capacity, align) {
-        Ok(buf) => buf,
-        Err(err) => return Err(to_file_error(err).into()),
-    };
-
-    Ok(Some(DirectWriter::new(DirectWriteInner {
-        file,
-        buf,
-        filled: 0,
-        write_offset: 0,
-        align,
-        direct_cleared: false,
-    })))
+    Ok(Some(DirectWriter::new(file, align, capacity, resource_unit).map_err(to_file_error)?))
 }
 
 #[cfg(unix)]
@@ -3825,6 +3835,9 @@ pub(crate) trait LocalIoBackend: Send + Sync + Debug + 'static {
 /// former `DiskAPI` method bodies on `LocalDisk`.
 pub(crate) struct StdBackend {
     root: PathBuf,
+    /// Keep proc-fd paths valid through cancelled native opens.
+    #[cfg(target_os = "linux")]
+    mount_lease: Option<Arc<std::fs::File>>,
     #[cfg(target_os = "linux")]
     direct_io: Arc<DirectIoReadState>,
     #[cfg(target_os = "linux")]
@@ -3893,6 +3906,8 @@ impl StdBackend {
         let _ = build_fd_cache;
         Self {
             root,
+            #[cfg(target_os = "linux")]
+            mount_lease: None,
             #[cfg(target_os = "linux")]
             direct_io: Arc::new(DirectIoReadState::new()),
             #[cfg(target_os = "linux")]
@@ -4547,9 +4562,14 @@ impl LocalIoBackend for StdBackend {
                 if is_direct_io_write_enabled() && self.direct_io_write.supported.load(Ordering::Relaxed) {
                     let write_state = self.direct_io_write.clone();
                     let direct_path = file_path.clone();
-                    let direct = tokio::task::spawn_blocking(move || open_direct_writer(&direct_path, &write_state))
-                        .await
-                        .map_err(|err| DiskError::other(format!("O_DIRECT open task failed: {err}")))??;
+                    let resource_unit = current_resource_unit();
+                    let mount_lease = self.mount_lease.clone();
+                    let direct = tokio::task::spawn_blocking(move || {
+                        let _mount_lease = mount_lease;
+                        open_direct_writer(&direct_path, &write_state, resource_unit)
+                    })
+                    .await
+                    .map_err(|err| DiskError::other(format!("O_DIRECT open task failed: {err}")))??;
                     if let Some(writer) = direct {
                         return Ok(Box::new(writer));
                     }
@@ -5782,13 +5802,23 @@ impl LocalIoBackend for UringBackend {
 /// enabled and the per-disk probe succeeds, otherwise the default
 /// [`StdBackend`] (backlog#1104). Enabling io_uring is opt-in and falls back
 /// byte-for-byte, so the default build is unchanged.
-async fn build_local_io_backend(root: PathBuf) -> Arc<dyn LocalIoBackend> {
+async fn build_local_io_backend(
+    root: PathBuf,
+    #[cfg(target_os = "linux")] mount_lease: Arc<std::fs::File>,
+) -> Arc<dyn LocalIoBackend> {
     #[cfg(target_os = "linux")]
-    if is_io_uring_read_enabled()
-        && let Some(backend) = UringBackend::try_new(root.clone()).await
     {
-        return Arc::new(backend);
+        if is_io_uring_read_enabled()
+            && let Some(mut backend) = UringBackend::try_new(root.clone()).await
+        {
+            backend.inner.mount_lease = Some(mount_lease);
+            return Arc::new(backend);
+        }
+        let mut backend = StdBackend::new(root);
+        backend.mount_lease = Some(mount_lease);
+        Arc::new(backend)
     }
+    #[cfg(not(target_os = "linux"))]
     Arc::new(StdBackend::new(root))
 }
 
@@ -6303,7 +6333,7 @@ impl LocalDisk {
             publication_root,
             io_root: io_root.clone(),
             #[cfg(target_os = "linux")]
-            mount_lease,
+            mount_lease: mount_lease.clone(),
             #[cfg(target_os = "linux")]
             mount_lease_mount_id,
             endpoint: ep.clone(),
@@ -6326,7 +6356,12 @@ impl LocalDisk {
             startup_cleanup_ready,
             startup_cleanup_notify,
             exit_signal: None,
-            io_backend: build_local_io_backend(io_root.clone()).await,
+            io_backend: build_local_io_backend(
+                io_root.clone(),
+                #[cfg(target_os = "linux")]
+                mount_lease,
+            )
+            .await,
             file_sync_permits: os::disk_file_sync_limiter(&root),
             _blocking_queue: os::register_disk_blocking_queue(&root, &io_root),
             metadata_read_queue,
@@ -28688,6 +28723,121 @@ mod test {
             let got = disk.read_file_mmap_copy("test-volume", &path, 0, size).await.expect("read");
             assert_eq!(got.as_ref(), content.as_slice(), "round-trip mismatch at size={size}");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn direct_writer_cancelled_flush_retains_physical_resources() {
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
+        use std::io::IoSlice;
+
+        for count in [1, 2] {
+            for operation in ["write", "vectored", "shutdown"] {
+                let dir = tempfile::tempdir().expect("direct writer fixture");
+                let path = dir.path().join("shard");
+                let file = std::fs::File::create(&path).expect("plain shard file");
+                let (resources, gates) = test_resource_units(count);
+                let mut writer =
+                    with_optional_resource_unit(Some(resources), async { DirectWriter::from_std_file_for_test(file, 512, 1024) })
+                        .await;
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                let DirectWriteState::Idle(Some(inner)) = &mut writer.state else {
+                    panic!("new writer must be idle");
+                };
+                inner.before_write = Some(Box::new(move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.blocking_recv();
+                }));
+                let size = if operation == "shutdown" { 513 } else { 1024 };
+                let task = tokio::spawn(async move {
+                    let bytes = vec![37; size];
+                    if operation == "vectored" {
+                        assert_eq!(
+                            writer
+                                .write_vectored(&[IoSlice::new(&bytes[..17]), IoSlice::new(&bytes[17..])])
+                                .await?,
+                            size,
+                        );
+                    } else {
+                        writer.write_all(&bytes).await?;
+                    }
+                    writer.shutdown().await
+                });
+                tokio::time::timeout(Duration::from_secs(5), started_rx)
+                    .await
+                    .expect("native write starts")
+                    .expect("native write signal");
+                task.abort();
+                assert!(task.await.expect_err("cancel writer").is_cancelled());
+                let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
+                release_tx.send(()).expect("release native write before asserting");
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while gates.iter().any(|gate| gate.snapshot().active != 0) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("completed native write returns resources");
+                assert_eq!(held, vec![1; count], "{operation}: native write owns every physical leaf");
+                assert_eq!(std::fs::read(&path).expect("read completed native write"), vec![37; size]);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn direct_writer_cancelled_open_retains_resources_and_mount_lease() {
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
+
+        let dir = tempfile::tempdir().expect("direct open fixture");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
+        let mut disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        disk.make_volume("test-volume").await.expect("test volume");
+        let exit = disk.exit_signal.take().expect("cleanup monitor exit sender");
+        exit.send(()).expect("stop fixture cleanup monitor");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while exit.receiver_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup monitor stopped");
+        drop(exit);
+        let lease = Arc::downgrade(&disk.mount_lease);
+        let path = disk.io_get_object_path("test-volume", "shard").expect("pinned shard path");
+        let (resources, gates) = test_resource_units(2);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        set_owned_file_write_before_open(&path, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.blocking_recv();
+        });
+        let (held, retained) = temp_env::async_with_vars([(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, Some("true"))], async {
+            let task = tokio::spawn(with_optional_resource_unit(Some(resources), async move {
+                disk.create_file("", "test-volume", "shard", 1024).await
+            }));
+            tokio::time::timeout(Duration::from_secs(5), started_rx)
+                .await
+                .expect("native open starts")
+                .expect("native open signal");
+            task.abort();
+            assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+            let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
+            let retained = lease.strong_count() > 0;
+            release_tx.send(()).expect("release native open before asserting");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while lease.strong_count() != 0 || gates.iter().any(|gate| gate.snapshot().active != 0) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("native open releases ownership");
+            (held, retained)
+        })
+        .await;
+        assert_eq!(held, vec![1, 1], "cancelled native open retains physical leaves");
+        assert!(retained, "proc-fd path stays pinned after retiring its disk");
     }
 
     /// Deterministic coverage of the O_DIRECT writer's aligned-batch + tail
