@@ -101,8 +101,8 @@ async fn fixture_from_binary(
     }
     configure_node_logs(&mut cluster, None)?;
     if let Some(binary) = binary {
-        // Homogeneous release preparation and seeding retain normal budgets.
-        // The mixed case installs fault budgets only before current replacements.
+        // Release compatibility keeps normal component budgets throughout.
+        // Method-fault scenarios install their separate profile in the None branch.
         cluster.start_with_binary(binary).await?;
     } else {
         cluster.start().await?;
@@ -1157,9 +1157,6 @@ async fn mixed_version_failed_complete_requires_current_coordinator_for_abort() 
     )
     .await?;
     let original = create_sources(&cluster, &bucket, key)?;
-    for (name, value) in FAULT_BUDGETS {
-        cluster.set_env(name, value);
-    }
     // Keep every old source byte and the advertised localhost authority.
     // Only the new coordinator's fresh channels enter the method observers.
     for node in 0..cluster.nodes.len() {
