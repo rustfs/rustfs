@@ -12609,10 +12609,16 @@ impl DiskAPI for LocalDisk {
             return Err(DiskError::FileAccessDenied);
         }
         if durability.syncs_data_shards() {
-            tokio::task::spawn_blocking(move || os::sync_file(&source))
-                .await
-                .map_err(DiskError::from)?
-                .map_err(to_file_error)?;
+            #[cfg(target_os = "linux")]
+            let mount_lease = self.mount_lease.clone();
+            spawn_blocking_with_disk_io_permit(None, move || {
+                #[cfg(target_os = "linux")]
+                let _mount_lease = mount_lease;
+                os::sync_file(&source)
+            })
+            .await
+            .map_err(DiskError::from)?
+            .map_err(to_file_error)?;
         }
         self.rename_file(src_volume, src_path, dst_volume, dst_path).await?;
         if durability.syncs_commit_metadata() {
@@ -28923,6 +28929,7 @@ mod test {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(file_sync_probe)]
     fn cancelled_whole_file_io_retains_only_its_native_device() {
         use crate::disk::disk_store::LocalDiskWrapper;
         use crate::disk::io_admission::{ResourceIoUnit, with_optional_resource_unit};
@@ -28932,13 +28939,14 @@ mod test {
         };
         use std::num::NonZeroU16;
 
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(1)
             .build()
             .expect("single whole-file reader worker");
         runtime.block_on(async {
-            for conditional in [false, true] {
+            for (conditional, durable_rename) in [(false, false), (true, false), (false, true)] {
                 for admitted in [false, true] {
                     let dir = tempfile::tempdir().expect("whole-file read fixture");
                     let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("endpoint");
@@ -28964,6 +28972,7 @@ mod test {
                     const REPLACEMENT: &[u8] = b"conditional write completes after caller cancellation";
                     std::fs::write(dir.path().join("bucket/object"), CONTENT).expect("object");
                     let path = disk.io_get_object_open_path("bucket", "object").expect("native path");
+                    let _sync_probe = durable_rename.then(|| os::file_sync_probe::set_blocking(&disk.root));
                     let wrapper = LocalDiskWrapper::new(Arc::new(disk), false);
                     let first = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
                     let second = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
@@ -28991,13 +29000,17 @@ mod test {
                     let unit = admitted.then(|| node.try_acquire().expect("node admission"));
                     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
                     let (release_tx, release_rx) = std::sync::mpsc::channel();
-                    set_owned_file_before_open(&path, move || {
-                        let _ = started_tx.send(());
-                        let _ = release_rx.recv();
-                    });
+                    if !durable_rename {
+                        set_owned_file_before_open(&path, move || {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.recv();
+                        });
+                    }
                     let mut read = Box::pin(with_optional_resource_unit(parent, async move {
                         let _unit = unit;
-                        if conditional {
+                        if durable_rename {
+                            wrapper.rename_file_durable("bucket", "object", "bucket", "published").await
+                        } else if conditional {
                             wrapper
                                 .compare_and_update_file(
                                     "bucket",
@@ -29014,7 +29027,13 @@ mod test {
                     tokio::time::timeout(Duration::from_secs(5), async {
                         tokio::select! {
                             _ = read.as_mut() => panic!("read completed before the native hook"),
-                            entered = started_rx => entered.expect("native read started"),
+                            _ = async {
+                                if durable_rename {
+                                    os::file_sync_probe::wait_for_active(1).await;
+                                } else {
+                                    started_rx.await.expect("native read started");
+                                }
+                            } => {},
                         }
                     })
                     .await
@@ -29023,7 +29042,11 @@ mod test {
                     let held = [node.snapshot().active, first.snapshot().active, second.snapshot().active];
                     #[cfg(target_os = "linux")]
                     let retained_mount = mount.strong_count() > 0;
-                    release_tx.send(()).expect("release native work before assertions");
+                    if durable_rename {
+                        os::file_sync_probe::release();
+                    } else {
+                        release_tx.send(()).expect("release native work before assertions");
+                    }
                     tokio::task::spawn_blocking(|| ()).await.expect("native read queue drained");
                     assert_eq!([node.snapshot().active, first.snapshot().active, second.snapshot().active], [0, 0, 0]);
                     assert_eq!(node.completed(), Some(0), "cancellation is not completed work");
@@ -29031,15 +29054,16 @@ mod test {
                         std::fs::read(dir.path().join("bucket/object")).expect("read after cancellation"),
                         if conditional { REPLACEMENT } else { CONTENT }
                     );
+                    assert!(!dir.path().join("bucket/published").exists(), "cancellation before sync completion cannot publish");
                     #[cfg(target_os = "linux")]
-                    if conditional {
-                        assert!(retained_mount, "conditional write retains its exact mount descriptor");
+                    if conditional || durable_rename {
+                        assert!(retained_mount, "native file mutation retains its exact mount descriptor");
                         assert_eq!(mount.strong_count(), 0, "native completion retires the mount");
                     }
                     assert_eq!(
                         held,
                         [0, u32::from(admitted), 0],
-                        "conditional={conditional}, admitted={admitted}: native work keeps only its device"
+                        "conditional={conditional}, durable_rename={durable_rename}, admitted={admitted}: native work keeps only its device"
                     );
                 }
             }
