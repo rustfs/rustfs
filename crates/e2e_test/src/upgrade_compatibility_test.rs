@@ -74,7 +74,7 @@ const LISTING_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
 // four-drive set needs all four drives (`write_quorum = data_drives`), so a
 // PUT with that class succeeds only once the serving node writes through every
 // one of its own drive handles. Standard-class objects keep the default layout.
-pub(crate) const ALL_DRIVES_STORAGE_CLASS_ENV: (&str, &str) = ("RUSTFS_STORAGE_CLASS_RRS", "EC:0");
+const ALL_DRIVES_STORAGE_CLASS_ENV: (&str, &str) = ("RUSTFS_STORAGE_CLASS_RRS", "EC:0");
 // A peer drops a restarted node's drive to Offline after two failed
 // operations and only re-admits it through probe_interval (2s) x
 // success_threshold (3) once the node answers again. The budget covers that
@@ -1145,22 +1145,20 @@ fn previous_baseline_writers(clients: &[Client], restarted_node: usize) -> &[Cli
 }
 
 async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnvironment, previous_binary: &Path) -> TestResult {
-    prepare_release_baseline(cluster, previous_binary, MIXED_BUCKET, "previous").await
+    prepare_release_baseline(cluster, previous_binary, "previous").await
 }
 
-pub(crate) async fn prepare_release_baseline(
+async fn prepare_release_baseline(
     cluster: &mut RustFSTestClusterEnvironment,
     previous_binary: &Path,
-    bucket: &str,
     prefix: &str,
 ) -> TestResult {
     let clients: Vec<_> = cluster.create_all_clients()?.iter().map(upgrade_probe_client).collect();
     // rc.5 can latch a non-elected node's write fence while its first startup
     // waits for pool metadata (#7473). First prove the elected writer can
     // persist data, then restart each old process once with three peers still
-    // readable. These planned restarts use the normal shutdown hooks; the same
-    // preparation is reused only after a quiescent homogeneous rollback.
-    wait_for_upgrade_write_readiness(&clients[..1], bucket, &format!("{prefix}-seed"), LISTING_CONVERGENCE_TIMEOUT).await?;
+    // readable. The same preparation is reused only after a quiescent homogeneous rollback.
+    wait_for_upgrade_write_readiness(&clients[..1], MIXED_BUCKET, &format!("{prefix}-seed"), LISTING_CONVERGENCE_TIMEOUT).await?;
     // A node that just came back is still replaying its startup traffic against
     // every peer. Killing the next node during that burst gives the fresh node
     // two failures in a row and it drops that peer's drive to Offline, where
@@ -1168,19 +1166,29 @@ pub(crate) async fn prepare_release_baseline(
     // re-admit every drive before the next kill. Nodes still awaiting their
     // restart may retain the startup write fence and cannot coordinate a PUT.
     for node in [1, 2, 3, 0] {
-        cluster.stop_node_gracefully(node).await?;
+        cluster.stop_node(node)?;
         cluster.start_node_from_binary(node, previous_binary).await?;
         let context = format!("{prefix}-restart-{node}");
-        wait_for_upgrade_write_readiness(std::slice::from_ref(&clients[node]), bucket, &context, LISTING_CONVERGENCE_TIMEOUT)
-            .await?;
-        wait_for_drive_readmission(previous_baseline_writers(&clients, node), bucket, &context, DRIVE_READMISSION_TIMEOUT)
-            .await?;
+        wait_for_upgrade_write_readiness(
+            std::slice::from_ref(&clients[node]),
+            MIXED_BUCKET,
+            &context,
+            LISTING_CONVERGENCE_TIMEOUT,
+        )
+        .await?;
+        wait_for_drive_readmission(
+            previous_baseline_writers(&clients, node),
+            MIXED_BUCKET,
+            &context,
+            DRIVE_READMISSION_TIMEOUT,
+        )
+        .await?;
     }
 
-    wait_for_upgrade_write_readiness(&clients, bucket, &format!("{prefix}-baseline"), LISTING_CONVERGENCE_TIMEOUT).await?;
+    wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, &format!("{prefix}-baseline"), LISTING_CONVERGENCE_TIMEOUT).await?;
     for (reader, client) in clients.iter().enumerate() {
         assert_eq!(
-            read_object(client, bucket, &format!(".upgrade-readiness/{prefix}-seed/node-0"), None)
+            read_object(client, MIXED_BUCKET, &format!(".upgrade-readiness/{prefix}-seed/node-0"), None)
                 .await?
                 .1,
             UPGRADE_READINESS_BODY,
@@ -1189,7 +1197,7 @@ pub(crate) async fn prepare_release_baseline(
         for writer in 0..clients.len() {
             let key = format!(".upgrade-readiness/{prefix}-baseline/node-{writer}");
             assert_eq!(
-                read_object(client, bucket, &key, None).await?.1,
+                read_object(client, MIXED_BUCKET, &key, None).await?.1,
                 UPGRADE_READINESS_BODY,
                 "previous-release node {reader} must read baseline data from writer {writer}"
             );
@@ -2315,7 +2323,7 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
     // callbacks and source controls settle before old binaries reopen volumes.
     cluster.stop();
     cluster.start_with_binary(&previous_binary).await?;
-    prepare_release_baseline(&mut cluster, &previous_binary, MIXED_BUCKET, "rollback").await?;
+    prepare_release_baseline(&mut cluster, &previous_binary, "rollback").await?;
     let old_clients = cluster.create_all_clients()?;
     assert_resumed_multipart(&old_clients, &completed_pending).await?;
     for phase in ["homogeneous-previous", "homogeneous-current"] {
