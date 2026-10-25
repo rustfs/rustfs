@@ -21,6 +21,15 @@ an external producer. Neither sample proves distributed failure tolerance,
 power-loss durability, transitioned objects, or reverse migration into a live
 MinIO drive set.
 
+The encoder regression also compares every data and parity shard from the
+borrowed, owned `Vec`, and owned `BytesMut` inputs directly with these captured
+bytes, excluding the existing 32-byte bitrot prefix. The odd payload exercises
+GF8 tail padding and historical GF16 even padding. Pre-reserved owned inputs
+must retain their backing allocation; the `BytesMut` case includes initialized
+stale tail bytes past the logical payload, which must not reach encoded shards.
+These checks protect existing copy-avoiding inputs and byte compatibility; they
+are not a throughput benchmark or proof of a new runtime optimization.
+
 ## Payload and capture
 
 Both processes used twelve disposable local directories with `EC:6`, producing
