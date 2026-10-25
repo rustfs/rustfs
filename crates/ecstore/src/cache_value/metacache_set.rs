@@ -40,7 +40,7 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_METACACHE: &str = "metacache";
 const EVENT_METACACHE_LISTING: &str = "metacache_listing";
 
-pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = Result<(), DiskError>> + Send>> + Send + 'static>;
 pub type PartialFn =
     Box<dyn Fn(MetaCacheEntries, &[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 pub(crate) type PartialResultFn = Box<
@@ -970,7 +970,7 @@ async fn list_path_raw_inner(
                     tokio::select! {
                         biased;
                         _ = revjob_rx.cancelled() => return Ok(()),
-                        _ = agreed_fn(current) => {}
+                        result = agreed_fn(current) => result?
                     }
                     // warn!("list_path_raw: agreed_fn done");
                 }
@@ -1711,6 +1711,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_path_raw_propagates_agreed_callback_failure() {
+        let entry = MetaCacheEntry {
+            name: "bucket/object".to_owned(),
+            metadata: vec![1],
+            ..Default::default()
+        };
+        let result = timeout(
+            Duration::from_secs(1),
+            list_path_raw(
+                CancellationToken::new(),
+                ListPathRawOptions {
+                    disks: vec![None],
+                    min_disks: 1,
+                    test_reader_behaviors: vec![TestReaderBehavior::Entries(vec![entry])],
+                    agreed: Some(Box::new(|_| Box::pin(async { Err(DiskError::ErasureReadQuorum) }))),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("callback failure must terminate the walk");
+        assert_eq!(
+            result.expect_err("agreed resolution must not silently omit the key"),
+            DiskError::ErasureReadQuorum
+        );
+    }
+
+    #[tokio::test]
     async fn list_path_raw_propagates_partial_callback_failure() {
         let first = MetaCacheEntry {
             name: "bucket/object-a".to_string(),
@@ -1811,6 +1839,7 @@ mod tests {
                     Box::pin(async move {
                         callback_started.notify_one();
                         std::future::pending::<()>().await;
+                        Ok(())
                     })
                 })),
                 ..Default::default()
@@ -1962,6 +1991,7 @@ mod tests {
                     let seen = seen_clone.clone();
                     Box::pin(async move {
                         seen.lock().expect("seen mutex poisoned").push(entry.name);
+                        Ok(())
                     })
                 })),
                 ..Default::default()
@@ -2004,6 +2034,7 @@ mod tests {
                     let seen = seen_clone.clone();
                     Box::pin(async move {
                         seen.lock().expect("seen mutex poisoned").push(entry.name);
+                        Ok(())
                     })
                 })),
                 ..Default::default()
@@ -2076,6 +2107,7 @@ mod tests {
                     let seen = agreed_seen.clone();
                     Box::pin(async move {
                         seen.lock().expect("seen mutex poisoned").push(entry.name);
+                        Ok(())
                     })
                 })),
                 partial: Some(Box::new(move |entries, _| {
@@ -2241,6 +2273,7 @@ mod tests {
                     let agreed_events = agreed_events.clone();
                     Box::pin(async move {
                         agreed_events.lock().expect("events lock").push((entry.name, 4usize, true));
+                        Ok(())
                     })
                 })),
                 partial: Some(Box::new(move |entries, _| {
@@ -2397,6 +2430,7 @@ mod tests {
                         let name = entry.name;
                         Box::pin(async move {
                             agreed_obs.lock().expect("obs lock").push((name, vec![Some(desc); 4], true));
+                            Ok(())
                         })
                     })),
                     partial: Some(Box::new(move |entries, _| {

@@ -28643,7 +28643,13 @@ impl SetDisks {
                 min_disks: listing_quorum,
                 skip_walkdir_total_timeout: true,
                 walkdir_stall_timeout: Some(DECOMMISSION_BACKGROUND_WALKDIR_STALL_TIMEOUT),
-                agreed: Some(Box::new(move |entry: MetaCacheEntry| Box::pin(cb1(entry)))),
+                agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+                    let future = cb1(entry);
+                    Box::pin(async move {
+                        future.await;
+                        Ok(())
+                    })
+                })),
                 partial: Some(Box::new(move |entries: MetaCacheEntries, errs: &[Option<DiskError>]| {
                     let resolver = resolver.clone();
                     let cb_func = cb_func.clone();

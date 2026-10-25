@@ -641,7 +641,13 @@ impl SetDisks {
                         state = "agreed_entry",
                         "Rebalance listing agreed entry"
                     );
-                    Box::pin(cb1(entry))
+                    {
+                        let future = cb1(entry);
+                        Box::pin(async move {
+                            future.await;
+                            Ok(())
+                        })
+                    }
                 })),
                 partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
                     let resolver = resolver.clone();
