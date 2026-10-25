@@ -780,7 +780,7 @@ async fn replay_authorized_tier_delete_sources(
         }
     }
     if deleted > 0 {
-        super::list_objects::observe_list_objects_mutation(store, bucket).await;
+        super::list_objects::observe_scanner_namespace_mutations(bucket, 1);
     }
     if let Some(err) = first_error {
         if publication_scope.is_some_and(|scope| !scope.can_commit())
@@ -4742,7 +4742,7 @@ impl ECStore {
             .await;
         let result = enqueue_transition_after_write(self, result, LcEventSrc::S3PutObject, request_opts).await;
         if result.is_ok() {
-            list_objects::observe_list_objects_mutation(self, bucket).await;
+            list_objects::observe_scanner_namespace_mutations(bucket, 1);
         }
         Ok((idx, result))
     }
@@ -5202,7 +5202,7 @@ impl ECStore {
                     .handle_delete_object_with_journal(&bucket, &object, opts, Some(Arc::clone(&store)))
                     .await;
                 if result.is_ok() {
-                    list_objects::observe_list_objects_mutation(&store, &bucket).await;
+                    list_objects::observe_scanner_namespace_mutations(&bucket, 1);
                 }
                 // Transient options also retain these guards through late disk I/O.
                 drop(guards);
@@ -5242,7 +5242,7 @@ impl ECStore {
                     .await;
                 let success_count = result.1.iter().filter(|err| err.is_none()).count();
                 if success_count > 0 {
-                    list_objects::observe_list_objects_mutations(&store, &bucket, success_count).await;
+                    list_objects::observe_scanner_namespace_mutations(&bucket, u64::try_from(success_count).unwrap_or(u64::MAX));
                 }
                 result
             })
