@@ -25,6 +25,8 @@ on:
       - "crates/ecstore/src/object_api/write_commit_context.rs"
       - "crates/ecstore/src/bucket/utils.rs"
       - "crates/ecstore/Cargo.toml"
+      - "crates/storage-api/src/bucket.rs"
+      - "crates/storage-api/Cargo.toml"
       - "crates/utils/src/dunce.rs"
       - "crates/utils/src/os/**"
       - "crates/utils/Cargo.toml"
@@ -48,6 +50,8 @@ on:
       - "crates/ecstore/src/object_api/write_commit_context.rs"
       - "crates/ecstore/src/bucket/utils.rs"
       - "crates/ecstore/Cargo.toml"
+      - "crates/storage-api/src/bucket.rs"
+      - "crates/storage-api/Cargo.toml"
       - "crates/utils/src/dunce.rs"
       - "crates/utils/src/os/**"
       - "crates/utils/Cargo.toml"
@@ -139,6 +143,17 @@ jobs:
       - name: Test object key Windows admission
         shell: pwsh
         run: "cargo test -p rustfs-ecstore --lib bucket::utils:: -- --nocapture"
+
+      - name: Test artifact prefix Windows file-name rules
+        shell: pwsh
+        run: |
+          $testName = 'bucket::tests::artifact_prefix_preserves_host_file_name_rules'
+          cargo test --locked -p rustfs-storage-api --lib $testName -- --exact --nocapture --color never 2>&1 |
+            Tee-Object -Variable testOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (($testOutput -join "`n") -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') {
+            throw 'Expected exactly one passing artifact prefix test on Windows'
+          }
 
       - name: Test Windows file-name rules
         shell: pwsh
