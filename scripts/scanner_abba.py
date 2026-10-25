@@ -330,10 +330,25 @@ class OwnedCommand:
                 time.sleep(min(0.05, remaining))
 
     def _signal_group(self, sig):
+        if self.process.returncode is not None:
+            return False
         try:
             os.killpg(self.process.pid, sig)
             return True
         except ProcessLookupError:
+            return False
+        except PermissionError:
+            if sys.platform != "darwin":
+                raise
+            # Darwin rejects signals to zombie-only groups. The unreaped
+            # session leader reserves this PGID; require its zombie plus no
+            # live members before treating EPERM as completed cleanup.
+            states = subprocess.check_output(["ps", "-axo", "pid=,pgid=,stat="], text=True, timeout=1)
+            group = [(pid, state) for pid, pgid, state in (line.split() for line in states.splitlines())
+                     if pgid == str(self.process.pid)]
+            if not any(pid == str(self.process.pid) and state.startswith("Z") for pid, state in group) \
+                    or any(not state.startswith("Z") for _, state in group):
+                raise
             return False
 
     def finish(self, terminate=False):
@@ -378,7 +393,78 @@ def invoke(adapter, action, request, timeout):
             return result
 
 
-def validate_result(result, request, expected):
+def client_request_window(path, reference):
+    """Recompute nearest-rank latencies from a complete client NDJSON trace.
+
+    Each record has request_id, clock_id, start_ns, end_ns and outcome
+    (success/error/timeout/cancelled). All times use one client's monotonic
+    clock. The reference supplies its clock_id and window_start_ns/window_end_ns.
+    Include failures and requests crossing a boundary; never filter them to
+    make an incomplete measurement pass. Raw integer nanoseconds retain the
+    exact order statistic independently of the millisecond JSON conversion.
+    """
+    start, end = (reference.get(key) for key in ("window_start_ns", "window_end_ns"))
+    require(type(start) is int and type(end) is int and 0 <= start < end,
+            "invalid client request window")
+    clock = reference.get("clock_id")
+    require(isinstance(clock, str) and 0 < len(clock) <= 256, "missing client clock identity")
+    latencies, seen = [], set()
+    errors = cancelled = 0
+    hasher = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        while line := stream.readline(4097):
+            require(len(line) <= 4096, "oversized client request sample")
+            hasher.update(line)
+            row = json.loads(line)
+            require(isinstance(row, dict), "invalid client request sample")
+            identifier = row.get("request_id")
+            require(isinstance(identifier, str) and 0 < len(identifier) <= 256 and identifier not in seen,
+                    "invalid or duplicate client request identity")
+            seen.add(identifier)
+            require(row.get("clock_id") == clock, "client clock identity mismatch")
+            began, finished = row.get("start_ns"), row.get("end_ns")
+            require(type(began) is int and type(finished) is int and start <= began <= finished <= end,
+                    "client request crosses or violates the measurement window")
+            outcome = row.get("outcome")
+            require(outcome in ("success", "error", "timeout", "cancelled"), "invalid client request outcome")
+            errors += outcome != "success"
+            cancelled += outcome == "cancelled"
+            latencies.append(finished - began)
+    require(len(latencies) >= 100, "insufficient client request samples for p99")
+    latencies.sort()
+    count = len(latencies)
+    p95, p99 = (latencies[(count * percentile + 99) // 100 - 1] for percentile in (95, 99))
+    return {"sha256": hasher.hexdigest(), "clock_id": clock,
+            "window_start_ns": start, "window_end_ns": end,
+            "requests": count, "errors": errors, "cancelled": cancelled,
+            "p95_ns": p95, "p99_ns": p99,
+            "p95_ms": p95 / 1_000_000, "p99_ms": p99 / 1_000_000,
+            "elapsed_seconds": (end - start) / 1_000_000_000,
+            "throughput_ops": (count - errors) * 1_000_000_000 / (end - start)}
+
+
+def validate_client_request_samples(result, request, artifact_dir):
+    reference = result.get("client_request_samples")
+    require(isinstance(reference, dict), "missing client request samples")
+    require(artifact_dir is not None, "client request samples require a cell artifact directory")
+    relative = reference.get("path")
+    require(isinstance(relative, str) and relative and not Path(relative).is_absolute(),
+            "client request samples path must be cell-relative")
+    root = Path(artifact_dir).resolve(strict=True)
+    path = (root / relative).resolve(strict=True)
+    require(path.is_file() and root in path.parents, "client request samples escape the cell artifact directory")
+    measured = client_request_window(path, reference)
+    require(sha(reference.get("sha256")) and measured["sha256"] == reference["sha256"],
+            "client request samples hash mismatch")
+    require(measured["elapsed_seconds"] >= request["duration_seconds"], "short client request window")
+    require(measured["errors"] == 0, "client request trace contains errors, timeouts or cancellations")
+    require(result["elapsed_seconds"] == measured["elapsed_seconds"], "client request elapsed time mismatch")
+    for key in ("requests", "errors", "p95_ms", "p99_ms", "throughput_ops"):
+        require(result["metrics"][key] == measured[key], f"client request {key} mismatch")
+    return measured
+
+
+def validate_result(result, request, expected, artifact_dir=None):
     require(result.get("evidence") == request["evidence"], "adapter evidence type mismatch")
     require(result.get("fixed") == request["fixed"], "offered load/config/cache/durability drift")
     require(result.get("build") == request["build"], "deployed build provenance mismatch")
@@ -410,6 +496,8 @@ def validate_result(result, request, expected):
         require(metrics["healed_objects"] == request["expected_healed_objects"], "incomplete repair oracle")
         if request["scenario"] in ("running-heal", "mrf-replay"):
             require(metrics["healed_objects"] > 0, "zero completed repairs")
+    if request["evidence"] == "measured":
+        validate_client_request_samples(result, request, artifact_dir)
     return result
 
 
@@ -757,7 +845,7 @@ def run(manifest, adapter, output, data_root):
                             require(oracle.get("complete") is True and oracle.get("errors") == 0, "correctness oracle failed")
                             require(type(oracle.get("errors")) is int, "invalid oracle error count")
                             result["oracle"] = oracle["actual"]
-                            validate_result(result, request, request["expected_oracle"])
+                            validate_result(result, request, request["expected_oracle"], cell_dir)
                             cells.append({**request, "result": result})
                         finally:
                             stopped = invoke(adapter, "stop", request_path, 300)

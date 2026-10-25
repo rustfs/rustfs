@@ -218,7 +218,7 @@ retain the failure and reconcile the service before continuing.
 
 The `measure` response echoes the observed `evidence`, `fixed`, `build`,
 `data_dir`, and `background`, plus `sample_count` (1..3600), `elapsed_seconds`,
-and `metrics`. All metrics must be finite nonnegative numbers: `p99_ms`,
+and `metrics`. All metrics must be finite nonnegative numbers: `p95_ms`, `p99_ms`,
 `throughput_ops`, `rss_bytes`, `cpu_seconds`, `iops`, `rpc_count`,
 `cache_clone_bytes`, `encode_bytes`, `save_bytes`, `oldest_age_seconds`,
 `walk_objects`, `cold_walk_objects`, `healed_objects`, `errors`, and `requests`.
@@ -234,6 +234,23 @@ request samples, counter reset checks, profiler captures, and per-node telemetry
 in the cell artifact directory; aggregate values alone do not establish their
 measurement provenance. Missing production instrumentation is a pending gate,
 not permission to report a fabricated zero.
+
+The response must include `client_request_samples` with a cell-relative `path`,
+the file's `sha256`, a `clock_id`, and integer `window_start_ns` and
+`window_end_ns` from the client's monotonic clock. Each NDJSON row records a
+unique `request_id`, that same `clock_id`, integer `start_ns` and `end_ns`, and
+an `outcome` of `success`, `error`, `timeout`, or `cancelled`. Record each real
+request from dispatch through completion, including failures and requests that
+cross a boundary; do not discard samples to make a window pass. Validation
+rejects crossing requests, mixed clocks, failed requests, and fewer than 100
+samples. It recomputes nearest-rank p95/p99 from integer nanoseconds and checks
+that request count, errors, throughput and elapsed time match the response.
+
+The live telemetry collector starts its HTTP captures concurrently and records
+their actual transport intervals. These receipts explicitly report
+`synchronized_source_window=false`: concurrent collection does not establish
+that the servers measured the same source window. The adapter must separately
+prove alignment with the client window before claiming same-window acceptance.
 
 For usage-cache saves, `encode_bytes` uses the window delta of
 `rustfs_scanner_cache_serialized_bytes_total`. `save_bytes` uses the sum of

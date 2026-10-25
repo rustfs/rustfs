@@ -250,6 +250,45 @@ class ScannerAbbaTest(unittest.TestCase):
         with patch.dict(os.environ, {"SCANNER_ABBA_TEST_FAULT": fault}), contextlib.redirect_stdout(io.StringIO()):
             return harness.run(copy.deepcopy(self.manifest), self.adapter, self.root / "out", self.root / "data")
 
+    def test_owned_command_never_signals_a_reaped_leader(self):
+        command = harness.OwnedCommand.__new__(harness.OwnedCommand)
+        command.process = Mock(pid=123, returncode=74)
+        with patch.object(harness.os, "killpg") as kill:
+            self.assertFalse(command._signal_group(signal.SIGKILL))
+        kill.assert_not_called()
+
+    def test_darwin_permission_error_requires_an_owned_zombie_only_group(self):
+        command = harness.OwnedCommand.__new__(harness.OwnedCommand)
+        command.process = Mock(pid=123, returncode=None)
+        for states, empty in [("123 123 Z\n999 999 S\n", True),
+                              ("123 123 Z\n124 123 S\n", False),
+                              ("999 999 Z\n", False)]:
+            with self.subTest(states=states), patch.object(harness.sys, "platform", "darwin"), \
+                    patch.object(harness.os, "killpg", side_effect=PermissionError), \
+                    patch.object(harness.subprocess, "check_output", return_value=states):
+                if empty:
+                    self.assertFalse(command._signal_group(signal.SIGKILL))
+                else:
+                    with self.assertRaises(PermissionError):
+                        command._signal_group(signal.SIGKILL)
+        with patch.object(harness.sys, "platform", "linux"), \
+                patch.object(harness.os, "killpg", side_effect=PermissionError), \
+                patch.object(harness.subprocess, "check_output") as inspect:
+            with self.assertRaises(PermissionError):
+                command._signal_group(signal.SIGKILL)
+        inspect.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin zombie-only process groups reject signals")
+    def test_darwin_exited_http_group_keeps_original_status(self):
+        with (self.root / "exited-command.log").open("wb") as log:
+            command = harness.OwnedCommand([sys.executable, "-c", "raise SystemExit(74)"], log)
+            try:
+                self.assertEqual(command.wait(5), 74)
+                self.assertIsNone(command.process.returncode, "leader PID remains reserved through group cleanup")
+                self.assertEqual(command.finish(terminate=True), 74)
+            finally:
+                command.finish()
+
     def test_adapter_timeout_reaps_group_after_parent_exits_on_term(self):
         request = self.root / "request.json"
         harness.write_json(request, {})
@@ -672,7 +711,7 @@ class ScannerAbbaTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "release_evidence"):
                     harness.validate_manifest(manifest)
 
-    def test_measured_result_must_echo_release_evidence(self):
+    def measured_result(self):
         manifest = self.measured_manifest()
         request = {
             "schema": 1,
@@ -705,7 +744,91 @@ class ScannerAbbaTest(unittest.TestCase):
             "metrics": metrics,
             "oracle": manifest["oracles"]["cold-hot"],
         }
-        harness.validate_result(result, request, manifest["oracles"]["cold-hot"])
+        return manifest, request, result
+
+    def test_measured_result_rejects_unsubstantiated_percentiles(self):
+        manifest, request, result = self.measured_result()
+        with self.assertRaisesRegex(ValueError, "client request samples"):
+            harness.validate_result(result, request, manifest["oracles"]["cold-hot"])
+
+    def client_samples(self, count=100):
+        manifest, request, result = self.measured_result()
+        start = 2**60 + 1
+        reference = {"path": "client.ndjson", "clock_id": "single-client-boot",
+                     "window_start_ns": start,
+                     "window_end_ns": start + request["duration_seconds"] * 1_000_000_000}
+        rows = [{"request_id": str(index), "clock_id": reference["clock_id"],
+                 "start_ns": start + index * 1_000_000, "end_ns": start + index * 1_000_000 + index,
+                 "outcome": "success"} for index in range(1, count + 1)]
+        return manifest, request, result, reference, rows
+
+    def write_client_samples(self, reference, rows):
+        path = self.root / reference["path"]
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        reference["sha256"] = harness.digest(path)
+        return path
+
+    def test_client_percentiles_use_complete_integer_samples_and_nearest_rank(self):
+        for count, expected in [(100, (95, 99)), (101, (96, 100))]:
+            with self.subTest(count=count):
+                manifest, request, result, reference, rows = self.client_samples(count)
+                rows[-1]["end_ns"] += 5_000_000
+                path = self.write_client_samples(reference, rows)
+                measured = harness.client_request_window(path, reference)
+                self.assertEqual((measured["p95_ns"], measured["p99_ns"]), expected)
+                self.assertEqual(measured["requests"], count)
+                self.assertEqual(measured["errors"], 0)
+                result["client_request_samples"] = reference
+                for key in ("p95_ms", "p99_ms", "throughput_ops", "requests", "errors"):
+                    result["metrics"][key] = measured[key]
+                harness.validate_result(result, request, manifest["oracles"]["cold-hot"], self.root)
+                for key in ("p95_ms", "p99_ms", "throughput_ops", "requests", "elapsed_seconds"):
+                    changed = copy.deepcopy(result)
+                    target = changed if key == "elapsed_seconds" else changed["metrics"]
+                    target[key] += 1
+                    with self.subTest(fabricated=key), self.assertRaisesRegex(ValueError, "client request .* mismatch"):
+                        harness.validate_result(changed, request, manifest["oracles"]["cold-hot"], self.root)
+
+    def test_client_samples_reject_missing_failed_censored_and_mixed_clock_requests(self):
+        for fault in ("few", "duplicate", "clock", "before", "after", "backwards", "fractional", "outcome",
+                      "error", "timeout", "cancelled", "hash", "path", "oversized"):
+            with self.subTest(fault=fault):
+                manifest, request, result, reference, rows = self.client_samples()
+                path = self.write_client_samples(reference, rows)
+                measured = harness.client_request_window(path, reference)
+                result["client_request_samples"] = reference
+                for key in ("p95_ms", "p99_ms", "throughput_ops", "requests", "errors"):
+                    result["metrics"][key] = measured[key]
+                if fault == "few":
+                    rows.pop()
+                elif fault == "duplicate":
+                    rows[-1]["request_id"] = rows[0]["request_id"]
+                elif fault == "clock":
+                    rows[-1]["clock_id"] = "another-client"
+                elif fault == "before":
+                    rows[-1]["start_ns"] = reference["window_start_ns"] - 1
+                elif fault == "after":
+                    rows[-1]["end_ns"] = reference["window_end_ns"] + 1
+                elif fault == "backwards":
+                    rows[-1]["end_ns"] = rows[-1]["start_ns"] - 1
+                elif fault == "fractional":
+                    rows[-1]["end_ns"] = float(rows[-1]["end_ns"])
+                elif fault == "oversized":
+                    rows[-1]["extra"] = "x" * 4096
+                elif fault == "outcome":
+                    rows[-1]["outcome"] = "ignored"
+                elif fault in ("error", "timeout", "cancelled"):
+                    rows[-1]["outcome"] = fault
+                self.write_client_samples(reference, rows)
+                if fault == "hash":
+                    reference["sha256"] = "0" * 64
+                if fault == "path":
+                    reference["path"] = str(path)
+                with self.assertRaises(ValueError):
+                    harness.validate_result(result, request, manifest["oracles"]["cold-hot"], self.root)
+
+    def test_measured_result_must_echo_release_evidence(self):
+        manifest, request, result = self.measured_result()
         result["release_evidence"] = copy.deepcopy(result["release_evidence"])
         result["release_evidence"]["profile"]["required_artifacts"].remove("flamegraph")
         with self.assertRaisesRegex(ValueError, "release evidence provenance mismatch"):
