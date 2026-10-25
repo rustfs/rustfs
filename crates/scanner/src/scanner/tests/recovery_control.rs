@@ -148,6 +148,7 @@ async fn issue_8297_contended_follower_clears_only_transient_cycle_recovery() {
                 false,
             ));
         }
+        let runtime = ScannerRuntimeGuard::new();
         for (status, clear) in cases {
             let expected = serde_json::to_value(&status).expect("expected recovery status");
             publish_scanner_cleanup_status(status, None).expect("seed local recovery status");
@@ -158,6 +159,7 @@ async fn issue_8297_contended_follower_clears_only_transient_cycle_recovery() {
                     store.clone(),
                     ScannerMaintenanceFeatures::default(),
                     None,
+                    runtime.startup_token(),
                 ),
             )
             .await
@@ -210,7 +212,7 @@ async fn issue_8297_supervisor_recovers_paused_follower_without_restart() {
             assert!(!crate::scanner_runtime_initialized(), "test must own the scanner runtime");
             let ctx = CancellationToken::new();
             let _cancel_on_drop = ctx.clone().drop_guard();
-            init_data_scanner_with_storage(ctx.clone(), store.clone()).await;
+            init_data_scanner_with_storage(ctx.clone(), store.clone(), ScannerRuntimeGuard::new()).await;
             assert!(crate::scanner_runtime_initialized());
             let recovered = tokio::time::timeout(Duration::from_secs(30), async {
                 while scanner_cycle_recovery_status().state != "healthy" {

@@ -554,18 +554,29 @@ async fn write_delete_rollback_file(
     data: &[u8],
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Result<()> {
-    write_delete_rollback_files(io_root, volume, object_dir, rollback_dir, &[(name, data)], namespace_owner).await
+    write_delete_rollback_files(io_root, volume, object_dir, rollback_dir, &[], &[(name, data)], None, namespace_owner)
+        .await
+        .map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_delete_rollback_files(
     io_root: &Path,
     volume: &str,
     object_dir: &Path,
     rollback_dir: Uuid,
+    remove_before_publish: &[&'static str],
     files: &[(&'static str, &[u8])],
+    inspect_object: Option<&str>,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
-) -> Result<()> {
+) -> Result<Option<crate::disk::DeleteRecoveryInspection>> {
     let backup_dir = object_dir.join(rollback_dir.to_string());
+    let mut removed_entries = Vec::with_capacity(remove_before_publish.len());
+    for &name in remove_before_publish {
+        let path = backup_dir.join(name);
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&path, namespace_owner.clone()).await;
+        removed_entries.push((path, lease));
+    }
     let mut entries = Vec::with_capacity(files.len());
     // Publication and cleanup both acquire FINISHED before the quorum receipt.
     for &(name, data) in files {
@@ -573,17 +584,42 @@ async fn write_delete_rollback_files(
         let lease = os::acquire_namespace_mutation_lease_with_owner(&path, namespace_owner.clone()).await;
         entries.push((name, path, data.to_vec(), lease));
     }
-    let Some(first_lease) = entries.first().map(|(_, _, _, lease)| Arc::clone(lease)) else {
-        return Ok(());
+    let inspect_lease = if inspect_object.is_some() {
+        Some(os::acquire_namespace_mutation_lease_with_owner(object_dir, namespace_owner.clone()).await)
+    } else {
+        None
+    };
+    let Some(first_lease) = entries
+        .first()
+        .map(|(_, _, _, lease)| Arc::clone(lease))
+        .or_else(|| removed_entries.first().map(|(_, lease)| Arc::clone(lease)))
+    else {
+        return Ok(None);
     };
     let sync = effective_durability(volume).syncs_commit_metadata();
     let staging_root = io_root.join(RUSTFS_META_TMP_BUCKET);
     let io_root = io_root.to_path_buf();
+    let object_dir_buf = object_dir.to_path_buf();
+    let volume_str = volume.to_owned();
+    let inspect_object = inspect_object.map(str::to_owned);
     os::run_blocking_namespace_operation_with_sync(first_lease, sync, move || {
+        for (path, _) in &removed_entries {
+            reject_local_disk_symlink_components(&io_root, path).map_err(std::io::Error::from)?;
+        }
         for (_, path, _, _) in &entries {
             reject_local_disk_symlink_components(&io_root, path).map_err(std::io::Error::from)?;
         }
         reject_local_disk_symlink_components(&io_root, &staging_root).map_err(std::io::Error::from)?;
+        for (path, _) in &removed_entries {
+            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+            os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, path);
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+        let backup_dir_existed = backup_dir.is_dir();
         std::fs::create_dir_all(&backup_dir)?;
         std::fs::create_dir_all(&staging_root)?;
         // tempfile's Windows `persist` hands both the staged and the final path
@@ -595,11 +631,10 @@ async fn write_delete_rollback_files(
         let staging_dir = tempfile::Builder::new()
             .prefix(".delete-rollback-")
             .tempdir_in(&staging_root)?;
-        for (name, path, data, lease) in entries {
-            let _lease = lease;
+        for (name, path, data, _) in &entries {
             #[cfg(test)]
-            run_owned_file_write_before_open(&path);
-            let destination = rustfs_utils::extended_length_path(&path)?;
+            run_owned_file_write_before_open(path);
+            let destination = rustfs_utils::extended_length_path(path)?;
             let staged_path = staging_dir.path().join(name);
             let mut staged_options = std::fs::OpenOptions::new();
             staged_options.write(true).create_new(true);
@@ -609,9 +644,9 @@ async fn write_delete_rollback_files(
                 staged_options.mode(0o600);
             }
             let mut staged = staged_options.open(&staged_path)?;
-            std::io::Write::write_all(&mut staged, &data)?;
-            if sync {
-                staged.sync_all()?;
+            std::io::Write::write_all(&mut staged, data)?;
+            if sync && !data.is_empty() {
+                staged.sync_data()?;
             }
             // Close the writer before publishing via std::fs::rename, which applies
             // verbatim long-path normalization and POSIX-semantics replacement on Windows.
@@ -620,15 +655,22 @@ async fn write_delete_rollback_files(
         }
         if sync {
             os::fsync_dir_std(&backup_dir)?;
-            if let Some(parent) = backup_dir.parent() {
+            if !backup_dir_existed && let Some(parent) = backup_dir.parent() {
                 os::fsync_dir_std(parent)?;
             }
         }
-        Ok(())
+        drop(staging_dir);
+        let inspected = inspect_object
+            .map(|object| {
+                delete_recovery::inspection_with_markers(&object_dir_buf, &volume_str, &object, rollback_dir)
+                    .map(|(state, _)| state)
+            })
+            .transpose();
+        drop((removed_entries, entries, inspect_lease));
+        Ok(inspected)
     })
     .await
-    .map_err(to_file_error)?;
-    Ok(())
+    .map_err(to_file_error)?
 }
 
 #[cfg(test)]
@@ -7350,7 +7392,10 @@ impl LocalDisk {
                 .await);
             }
 
-            if let Some(rollback_dir) = rollback_dir {
+            if let Some(rollback_dir) = rollback_dir
+                && (!os::rename_source_is_missing(&old_path, &self.publication_root)
+                    || should_fail_after_delete_data_staged(path))
+            {
                 let rollback_path = file_path.join(rollback_dir.to_string());
                 if let Err(err) = os::create_dir_all_with_namespace_owner(&rollback_path, namespace_owner.clone()).await {
                     let err: DiskError = to_file_error(err).into();
@@ -7510,7 +7555,8 @@ impl LocalDisk {
             )
             .await
         } else {
-            self.delete_file_with_namespace_owner(&volume_dir, &xl_path, true, false, namespace_owner.clone(), None)
+            let delete_base = if rollback_dir.is_some() { &file_path } else { &volume_dir };
+            self.delete_file_with_namespace_owner(delete_base, &xl_path, true, false, namespace_owner.clone(), None)
                 .await
         };
 
@@ -8168,13 +8214,7 @@ impl LocalDisk {
         Ok(())
     }
 
-    async fn delete_file(
-        &self,
-        base_path: &PathBuf,
-        delete_path: &PathBuf,
-        recursive: bool,
-        immediate_purge: bool,
-    ) -> Result<()> {
+    async fn delete_file(&self, base_path: &Path, delete_path: &PathBuf, recursive: bool, immediate_purge: bool) -> Result<()> {
         self.delete_file_with_namespace_owner(base_path, delete_path, recursive, immediate_purge, None, None)
             .await
     }
@@ -8182,7 +8222,7 @@ impl LocalDisk {
     #[tracing::instrument(name = "delete_file", level = "trace", skip_all)]
     fn delete_file_with_namespace_owner<'a>(
         &'a self,
-        base_path: &'a PathBuf,
+        base_path: &'a Path,
         delete_path: &'a PathBuf,
         recursive: bool,
         immediate_purge: bool,
@@ -8277,7 +8317,7 @@ impl LocalDisk {
 
             if let Some(dir_path) = delete_path
                 .parent()
-                .filter(|parent| *parent != base_path.as_path() && parent.starts_with(base_path))
+                .filter(|parent| *parent != base_path && parent.starts_with(base_path))
             {
                 self.delete_file_with_namespace_owner(
                     base_path,
@@ -8834,7 +8874,10 @@ impl LocalDisk {
                     .await);
                 }
             };
-            if let Some(rollback_dir) = rollback_dir {
+            if let Some(rollback_dir) = rollback_dir
+                && (!os::rename_source_is_missing(&dir_path, &self.publication_root)
+                    || should_fail_after_delete_data_staged(path))
+            {
                 let rollback_path = object_dir.join(rollback_dir.to_string());
                 if let Err(err) = fs::create_dir_all(&rollback_path).await {
                     let err: DiskError = to_file_error(err).into();
@@ -8963,8 +9006,13 @@ impl LocalDisk {
 
         // Remove xl.meta when no versions remain
         if fm.versions.is_empty() {
+            let delete_base = if rollback_dir.is_some() {
+                object_dir
+            } else {
+                volume_dir.as_path()
+            };
             if let Err(err) = self
-                .delete_file_with_namespace_owner(&volume_dir, &xlpath, true, false, namespace_owner.clone(), None)
+                .delete_file_with_namespace_owner(delete_base, &xlpath, true, false, namespace_owner.clone(), None)
                 .await
             {
                 if reserved_version_delete && let Some(rollback_dir) = rollback_dir {
