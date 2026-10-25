@@ -359,6 +359,38 @@ pub(crate) mod prepared_publication_test_hooks {
     }
 
     #[cfg(test)]
+    static HARDLINK_DESTINATIONS: LazyLock<Mutex<HashMap<PathBuf, RenameDestinationHook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    #[cfg(test)]
+    pub(crate) struct HardlinkDestinationGuard(PathBuf);
+    #[cfg(test)]
+    impl Drop for HardlinkDestinationGuard {
+        fn drop(&mut self) {
+            HARDLINK_DESTINATIONS.lock().remove(&self.0);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn observe_hardlink_destination(
+        source: &Path,
+        hook: impl FnOnce(&Path) + Send + 'static,
+    ) -> HardlinkDestinationGuard {
+        assert!(
+            HARDLINK_DESTINATIONS
+                .lock()
+                .insert(source.to_path_buf(), Box::new(hook))
+                .is_none()
+        );
+        HardlinkDestinationGuard(source.to_path_buf())
+    }
+    #[cfg(test)]
+    pub(super) fn run_hardlink_destination(source: &Path, destination: &Path) {
+        let hook = HARDLINK_DESTINATIONS.lock().remove(source);
+        if let Some(hook) = hook {
+            hook(destination);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) async fn drain_namespace_key(path: &Path) {
         drop(super::acquire_namespace_mutation_lease(path).await);
     }
@@ -513,6 +545,8 @@ pub fn fsync_dir_std(dir: impl AsRef<Path>) -> io::Result<()> {
 }
 
 pub(crate) fn fsync_directory_handle_std(dir: &Path, opened: Option<&std::fs::File>) -> io::Result<()> {
+    #[cfg(all(test, not(windows)))]
+    prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::DirFsync, dir);
     #[cfg(test)]
     fsync_dir_recorder::record(dir);
     #[cfg(unix)]
@@ -2744,6 +2778,75 @@ pub(crate) async fn rename_all_with_lease(
     Ok(())
 }
 
+/// A source admission must run before destination preparation can mkdir and
+/// again before the consuming rename, inside the actual owned callback.
+pub(crate) async fn rename_all_with_precondition(
+    source: &Path,
+    destination: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+    owner: Option<Arc<dyn Send + Sync>>,
+    precondition: Option<Arc<dyn Fn() -> io::Result<()> + Send + Sync>>,
+) -> Result<()> {
+    rename_all_with_precondition_and_parent_sync(source, destination, base, publication_root, owner, precondition, false).await
+}
+
+pub(crate) async fn rename_all_with_precondition_and_parent_sync(
+    source: &Path,
+    destination: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+    owner: Option<Arc<dyn Send + Sync>>,
+    precondition: Option<Arc<dyn Fn() -> io::Result<()> + Send + Sync>>,
+    sync_parent: bool,
+) -> Result<()> {
+    if precondition.is_none() && !sync_parent {
+        return rename_all_with_owner(source, destination, base, publication_root, owner).await;
+    }
+    let source = source.to_path_buf();
+    let destination = destination.to_path_buf();
+    let base = base.to_path_buf();
+    let root = publication_root.clone();
+    let lease = acquire_namespace_mutation_lease_with_owner(&destination, owner).await;
+    run_blocking_namespace_operation(lease, move || {
+        if let Some(check) = precondition.as_ref() {
+            check()?;
+        }
+        let preparation = prepare_rename_with_retry(&source, &destination, &base, &root)?;
+        #[cfg(all(test, not(windows)))]
+        prepared_publication_test_hooks::run_rename_destination(&source, &destination);
+        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+        {
+            prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &source);
+            prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &destination);
+        }
+        if let Some(check) = precondition.as_ref() {
+            check()?;
+        }
+        rename_prepared(&source, &destination, &preparation)?;
+        if sync_parent {
+            let parent = destination
+                .parent()
+                .ok_or_else(|| io::Error::other("source metadata parent is missing"))?;
+            #[cfg(unix)]
+            {
+                let pinned = preparation
+                    .parent_guard
+                    .as_ref()
+                    .and_then(|guard| guard.last())
+                    .ok_or_else(|| io::Error::other("source metadata parent was not pinned"))?;
+                let opened = std::fs::File::from(pinned.try_clone()?);
+                fsync_directory_handle_std(parent, Some(&opened))?;
+            }
+            #[cfg(not(unix))]
+            fsync_dir_std(parent)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| to_file_error(error).into())
+}
+
 /// Publish a conditional repair and sync its directory in one owned executor.
 /// Cancellation cannot release its metadata/fleet/tier leases between rename
 /// and fsync. The last authority check runs after destination preparation.
@@ -3105,8 +3208,69 @@ pub(crate) fn prepare_pool_meta_owned_backup(
     })
 }
 
+/// Faults are keyed by the final physical destination, including metadata
+/// written through random native sibling names. Absent from production builds.
+#[cfg(test)]
+pub(crate) mod multipart_source_syscall_failures {
+    use super::*;
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub(crate) enum Stage {
+        Create,
+        Write,
+        FileSync,
+        Rename,
+    }
+    type Key = (Stage, PathBuf);
+    struct Failure {
+        kind: io::ErrorKind,
+        triggered: std::sync::atomic::AtomicUsize,
+    }
+    static FAILURES: LazyLock<Mutex<HashMap<Key, Arc<Failure>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    pub(crate) struct FailureGuard {
+        key: Key,
+        failure: Arc<Failure>,
+    }
+    impl FailureGuard {
+        pub(crate) fn was_triggered(&self) -> bool {
+            self.failure.triggered.load(std::sync::atomic::Ordering::Acquire) > 0
+        }
+    }
+    impl Drop for FailureGuard {
+        fn drop(&mut self) {
+            let mut failures = FAILURES.lock();
+            if failures
+                .get(&self.key)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.failure))
+            {
+                failures.remove(&self.key);
+            }
+        }
+    }
+    pub(crate) fn fail_once(stage: Stage, path: &Path, kind: io::ErrorKind) -> FailureGuard {
+        let key = (stage, path.to_path_buf());
+        let failure = Arc::new(Failure {
+            kind,
+            triggered: std::sync::atomic::AtomicUsize::new(0),
+        });
+        assert!(
+            FAILURES.lock().insert(key.clone(), failure.clone()).is_none(),
+            "physical fault already armed"
+        );
+        FailureGuard { key, failure }
+    }
+    pub(super) fn check(stage: Stage, path: &Path) -> io::Result<()> {
+        if let Some(failure) = FAILURES.lock().remove(&(stage, path.to_path_buf())) {
+            failure.triggered.fetch_add(1, std::sync::atomic::Ordering::Release);
+            return Err(io::Error::new(failure.kind, "injected native physical syscall failure"));
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct PreparedRenameSource {
     path: PathBuf,
+    #[cfg(test)]
+    test_destination: PathBuf,
     #[cfg(windows)]
     source: winapi_util::Handle,
     #[cfg(not(windows))]
@@ -3119,6 +3283,8 @@ pub(crate) struct PreparedRenameSource {
 
 impl PreparedRenameSource {
     pub(crate) fn write_all(&mut self, data: &[u8], sync: bool) -> io::Result<()> {
+        #[cfg(test)]
+        multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::Write, &self.test_destination)?;
         #[cfg(all(test, windows))]
         windows_rename_test_hooks::run_before_source_write(&self.path);
         #[cfg(windows)]
@@ -3126,6 +3292,8 @@ impl PreparedRenameSource {
         #[cfg(not(windows))]
         std::io::Write::write_all(&mut self.source, data)?;
         if sync {
+            #[cfg(test)]
+            multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::FileSync, &self.test_destination)?;
             let _sync = StageTimer::new(true, "disk_prepared_metadata_fdatasync");
             #[cfg(windows)]
             self.source.as_file().sync_data()?;
@@ -3141,6 +3309,8 @@ pub(crate) fn create_prepared_rename_source_with_commit_guard(
     dst_file_path: &Path,
     commit_guard: &RenameCommitGuard,
 ) -> io::Result<PreparedRenameSource> {
+    #[cfg(test)]
+    multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::Create, dst_file_path)?;
     #[cfg(windows)]
     {
         if src_file_path.parent() != Some(commit_guard.source_parent.as_path()) {
@@ -3161,6 +3331,8 @@ pub(crate) fn create_prepared_rename_source_with_commit_guard(
         let source = create_windows_superseding_file(commit_guard.source_parent_guard.last_handle()?, source_name)?;
         return Ok(PreparedRenameSource {
             path: src_file_path.to_path_buf(),
+            #[cfg(test)]
+            test_destination: dst_file_path.to_path_buf(),
             source,
         });
     }
@@ -3193,6 +3365,8 @@ pub(crate) fn create_prepared_rename_source_with_commit_guard(
         use std::os::unix::fs::MetadataExt;
         Ok(PreparedRenameSource {
             path: src_file_path.to_path_buf(),
+            #[cfg(test)]
+            test_destination: dst_file_path.to_path_buf(),
             source,
             #[cfg(unix)]
             device: metadata.dev(),
@@ -3245,6 +3419,8 @@ fn rename_prepared_source_std(
     publication_root: &PublicationRoot,
     commit_guard: &RenameCommitGuard,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::Rename, dst_file_path)?;
     let result = {
         #[cfg(windows)]
         {
@@ -3345,6 +3521,8 @@ pub(crate) async fn rename_all_with_commit_guard(
                 prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &source);
                 prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &destination);
             }
+            #[cfg(test)]
+            multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::Rename, &destination)?;
             guard.directories.rename(&source, &destination, None)
         })
         .await
@@ -3510,8 +3688,12 @@ fn validate_prepared_rename_source(prepared_source: &PreparedRenameSource, src_f
 
 #[cfg(windows)]
 fn rename_with_commit_guard_std(src_file_path: &Path, dst_file_path: &Path, commit_guard: &RenameCommitGuard) -> io::Result<()> {
+    #[cfg(test)]
+    multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::Rename, dst_file_path)?;
     let prepared_source = PreparedRenameSource {
         path: src_file_path.to_path_buf(),
+        #[cfg(test)]
+        test_destination: dst_file_path.to_path_buf(),
         source: prepare_windows_rename_source(src_file_path, dst_file_path, commit_guard)?,
     };
     rename_prepared_source_with_commit_guard_std(&prepared_source, src_file_path, dst_file_path, commit_guard)
@@ -3840,6 +4022,8 @@ fn prepare_rename_with_retry(
 /// keeps its own counter, so a chain rebuilt after a concurrent prune must not
 /// cost the rename its one retry.
 fn rename_prepared(_src_file_path: &Path, dst_file_path: &Path, preparation: &RenamePreparation) -> io::Result<()> {
+    #[cfg(test)]
+    multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::Rename, dst_file_path)?;
     #[cfg(windows)]
     {
         let parent_guard = preparation
@@ -4238,11 +4422,7 @@ impl PublicationRoot {
 
     #[cfg(target_os = "linux")]
     fn open_relative(&self, path: &Path, flags: rustix::fs::OFlags, mode: rustix::fs::Mode) -> io::Result<std::fs::File> {
-        let relative = path
-            .strip_prefix(self.io_path.as_path())
-            .or_else(|_| path.strip_prefix(self.path.as_path()))
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path must remain below its publication root"))?;
-        open_linux_relative(&self.directory, relative, flags, mode)
+        open_linux_relative(&self.directory, self.relative_path(path)?, flags, mode)
     }
 
     #[cfg(target_os = "linux")]
@@ -4252,6 +4432,13 @@ impl PublicationRoot {
             rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
             rustix::fs::Mode::empty(),
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn relative_path<'a>(&self, path: &'a Path) -> io::Result<&'a Path> {
+        path.strip_prefix(self.io_path.as_path())
+            .or_else(|_| path.strip_prefix(self.path.as_path()))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path must remain below its publication root"))
     }
 
     #[cfg(windows)]
@@ -4692,6 +4879,43 @@ impl RenameCommitGuard {
             Ok(RenameDestinationPathGuard {})
         }
     }
+}
+
+/// Native MPU metadata and payload have distinct source parents. Reuse the
+/// exact target identity already held by the metadata transaction, while
+/// independently pinning the private payload source under the same root.
+#[cfg(target_os = "linux")]
+pub(crate) async fn multipart_payload_commit_guard(
+    metadata_guard: &RenameCommitGuard,
+    source_parent: &Path,
+    lease: Arc<NamespaceMutationLease>,
+) -> io::Result<RenameCommitGuard> {
+    let metadata_guard = metadata_guard.clone();
+    let source_parent = source_parent.to_path_buf();
+    run_blocking_namespace_operation(lease, move || {
+        let original = &metadata_guard.directories;
+        original.validate()?;
+        let source = LinuxCommitDirectory::new(original.root.open_directory(&source_parent)?)?;
+        let destination = original.prepare_destination()?;
+        // Clone the pinned file identity, never recapture the target pathname
+        // between payload and canonical-head publication.
+        let destination = LinuxCommitDirectory {
+            file: Arc::clone(&destination.file),
+            device: destination.device,
+            inode: destination.inode,
+        };
+        Ok(RenameCommitGuard {
+            directories: Arc::new(LinuxCommitDirectories {
+                root: original.root.clone(),
+                source_path: source_parent,
+                destination_path: original.destination_path.clone(),
+                source,
+                destination: std::sync::OnceLock::from(destination),
+                destination_base: original.destination_base.clone(),
+            }),
+        })
+    })
+    .await
 }
 
 pub(crate) fn prepare_rename_commit_guard(
@@ -5564,6 +5788,670 @@ fn existing_base_directory_suffix<'a>(dir_path: &'a Path, base_dir: &Path) -> io
     }
 
     Ok(relative)
+}
+
+/// Pin an existing MPU tree without creating any missing source directory.
+pub(crate) fn pin_multipart_source_directory(
+    directory: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<ExistingBaseDirectoryGuard> {
+    #[cfg(unix)]
+    {
+        open_existing_directory_below_base_std(directory, base, publication_root)
+    }
+    #[cfg(windows)]
+    {
+        let _ = base;
+        lock_windows_directory_tree(directory, Some(directory), publication_root)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (directory, base, publication_root);
+        Err(io::Error::new(io::ErrorKind::Unsupported, "native MPU metadata is unsupported"))
+    }
+}
+
+/// A small control record always gets its own inode and an atomic replacement.
+/// The caller owns the upload SourceRW and keeps its namespace lease alive.
+pub(crate) fn replace_multipart_source_metadata(
+    path: &Path,
+    bytes: &[u8],
+    base: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| io::Error::other("MPU record has no parent"))?;
+    let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
+    let guard = prepare_rename_commit_guard(parent, parent, base, publication_root)?;
+    let staged = parent.join(format!(".mpu-record-{}", uuid::Uuid::new_v4()));
+    let mut prepared = create_prepared_rename_source_with_commit_guard(&staged, path, &guard)?;
+    prepared.write_all(bytes, true)?;
+    rename_prepared_source_on_thread(prepared, &staged, path, base, publication_root, &guard).map_err(io::Error::other)?;
+    fsync_commit_directory_limited_std(parent, &guard)
+}
+
+/// Persist only the fixed native owner/round directory chain below an
+/// already-existing upload. Existing immutable records repair a prior failed
+/// barrier too; no per-part tree walk or source reconstruction is involved.
+pub(crate) fn sync_multipart_owned_record_parents(
+    source: &Path,
+    record_parent: &Path,
+    include_leaf: bool,
+    base: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<()> {
+    let relative = record_parent
+        .strip_prefix(source)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "native record escaped source"))?;
+    let depth = relative.components().count();
+    if depth > 2
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid native record parent depth"));
+    }
+    let mut directory = if include_leaf {
+        record_parent
+    } else {
+        record_parent
+            .parent()
+            .ok_or_else(|| io::Error::other("native record has no parent"))?
+    };
+    for _ in 0..=2 {
+        if !directory.starts_with(source) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "native record barrier escaped source"));
+        }
+        let pinned = pin_multipart_source_directory(directory, base, publication_root)?;
+        #[cfg(unix)]
+        {
+            let opened = std::fs::File::from(
+                pinned
+                    .last()
+                    .ok_or_else(|| io::Error::other("empty native directory guard"))?
+                    .try_clone()?,
+            );
+            fsync_directory_handle_std(directory, Some(&opened))?;
+        }
+        #[cfg(not(unix))]
+        fsync_dir_std(directory)?;
+        drop(pinned);
+        if directory == source {
+            return Ok(());
+        }
+        directory = directory
+            .parent()
+            .ok_or_else(|| io::Error::other("native record parent disappeared"))?;
+    }
+    Err(io::Error::new(io::ErrorKind::InvalidInput, "native record barrier depth exceeded"))
+}
+
+/// Install a complete proxy without truncating the original head, retaining
+/// this exact open inode for the following source-head -> target publication.
+pub(crate) fn install_multipart_prepared_head(
+    mut prepared: PreparedRenameSource,
+    canonical_head: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<PreparedRenameSource> {
+    let original_path = prepared.path.clone();
+    let parent = canonical_head
+        .parent()
+        .ok_or_else(|| io::Error::other("MPU head has no parent"))?;
+    if original_path.parent() != Some(parent) || original_path == canonical_head {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "MPU proxy must be a private sibling"));
+    }
+    let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
+    let guard = prepare_rename_commit_guard(parent, parent, base, publication_root)?;
+    rename_prepared_source_std(&prepared, &original_path, canonical_head, base, publication_root, &guard)?;
+    prepared.path = canonical_head.to_path_buf();
+    fsync_commit_directory_limited_std(parent, &guard)?;
+    Ok(prepared)
+}
+
+/// Observe an owned prepared metadata inode with constant buffer memory. The
+/// maximum comes from its durable native length receipt, not a caller vector.
+pub(crate) fn observe_multipart_source_metadata(
+    path: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+    maximum_length: u64,
+) -> io::Result<(u64, [u8; 32])> {
+    use sha2::{Digest, Sha256};
+    #[cfg(unix)]
+    let mut file = open_anchored_metadata(path, publication_root)?;
+    #[cfg(windows)]
+    let mut opened = {
+        use windows_sys::{
+            Wdk::Storage::FileSystem::{FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT},
+            Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_READ, SYNCHRONIZE},
+        };
+        let parent = path.parent().ok_or_else(|| io::Error::other("metadata has no parent"))?;
+        let guard = prepare_rename_commit_guard(parent, parent, base, publication_root)?;
+        open_windows_relative(
+            guard.source_parent_guard.last_handle()?,
+            path.file_name().ok_or_else(|| io::Error::other("metadata has no name"))?,
+            SYNCHRONIZE | FILE_READ_ATTRIBUTES | FILE_READ_DATA,
+            FILE_SHARE_READ,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            0,
+            true,
+        )?
+    };
+    #[cfg(windows)]
+    let mut file = opened.as_file_mut();
+    #[cfg(not(any(unix, windows)))]
+    return Err(io::Error::new(io::ErrorKind::Unsupported, "native multipart observation is unsupported"));
+    #[cfg(any(unix, windows))]
+    {
+        let _ = base;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > maximum_length {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "metadata length exceeds its owned receipt"));
+        }
+        let mut buffer = [0u8; 64 * 1024];
+        let mut digest = Sha256::new();
+        let mut count = 0u64;
+        loop {
+            let n = std::io::Read::read(&mut file, &mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            count = count
+                .checked_add(n as u64)
+                .ok_or_else(|| io::Error::other("metadata length overflow"))?;
+            if count > metadata.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "metadata changed during observation"));
+            }
+            digest.update(&buffer[..n]);
+        }
+        if count != metadata.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "metadata changed during observation"));
+        }
+        Ok((count, digest.finalize().into()))
+    }
+}
+
+/// Read the upload head without following a substituted source entry.
+pub(crate) fn read_multipart_source_metadata(
+    path: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, openat};
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("multipart metadata has no parent"))?;
+        let guards = open_existing_directory_below_base_std(parent, base, publication_root)?;
+        let directory = guards
+            .last()
+            .ok_or_else(|| io::Error::other("missing multipart source directory"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| io::Error::other("multipart metadata has no name"))?;
+        let mut file = std::fs::File::from(openat(
+            directory,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata is not a regular file"));
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, 16 * 1024 * 1024 + 1), &mut bytes)?;
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata exceeds its size limit"));
+        }
+        Ok(bytes)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::{
+            Wdk::Storage::FileSystem::{FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT},
+            Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_READ,
+                SYNCHRONIZE,
+            },
+        };
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("multipart metadata has no parent"))?;
+        let guard = prepare_rename_commit_guard(parent, parent, base, publication_root)?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| io::Error::other("multipart metadata has no name"))?;
+        let mut file = open_windows_relative(
+            guard.source_parent_guard.last_handle()?,
+            name,
+            SYNCHRONIZE | FILE_READ_ATTRIBUTES | FILE_READ_DATA,
+            FILE_SHARE_READ,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            0,
+            true,
+        )?;
+        if windows_file_attribute_tag(&file)?.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata is not a regular file"));
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(file.as_file_mut(), 16 * 1024 * 1024 + 1), &mut bytes)?;
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata exceeds its size limit"));
+        }
+        Ok(bytes)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, base, publication_root);
+        Err(io::Error::new(io::ErrorKind::Unsupported, "multipart source preservation is unsupported"))
+    }
+}
+
+/// Link immutable shard files into a unique private completion attempt.
+/// Both parent trees stay pinned through the complete batch; a source inode
+/// substitution is rejected before the staged entry can be used for publication.
+pub(crate) fn hardlink_multipart_source_files(
+    source: &Path,
+    destination: &Path,
+    names: &[String],
+    base: &Path,
+    publication_root: &PublicationRoot,
+    sync_directory: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> io::Result<()> {
+    if names.iter().any(|name| {
+        let mut components = Path::new(name).components();
+        !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some()
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "multipart shard name must be one path component",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat, unlinkat};
+        use std::os::unix::fs::MetadataExt;
+        #[cfg(test)]
+        let source_path = source.to_path_buf();
+        #[cfg(test)]
+        let destination_path = destination.to_path_buf();
+        let sources = open_existing_directory_below_base_std(source, base, publication_root)?;
+        let destinations = mkdir_all_below_existing_base_std(destination, base, publication_root)?;
+        let source = sources
+            .last()
+            .ok_or_else(|| io::Error::other("missing multipart source directory"))?;
+        let destination = destinations
+            .last()
+            .ok_or_else(|| io::Error::other("missing multipart attempt directory"))?;
+        #[cfg(test)]
+        prepared_publication_test_hooks::run_hardlink_destination(&source_path, &destination_path);
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        for name in names {
+            if cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "multipart staging cancelled"));
+            }
+            let original = std::fs::File::from(openat(source, name.as_str(), flags, Mode::empty())?);
+            let expected = original.metadata()?;
+            if !expected.is_file() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart shard is not a regular file"));
+            }
+            linkat(source, name.as_str(), destination, name.as_str(), AtFlags::empty())?;
+            let linked = std::fs::File::from(openat(destination, name.as_str(), flags, Mode::empty())?);
+            let actual = linked.metadata()?;
+            if actual.dev() != expected.dev() || actual.ino() != expected.ino() {
+                let _ = unlinkat(destination, name.as_str(), AtFlags::empty());
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart shard changed during staging"));
+            }
+        }
+        if sync_directory {
+            #[cfg(test)]
+            {
+                fsync_dir_recorder::record(&destination_path);
+                if let Some(kind) = fsync_dir_recorder::take_failure(&destination_path) {
+                    return Err(io::Error::from(kind));
+                }
+            }
+            rustix::fs::fsync(destination)?;
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::{
+            Wdk::Storage::FileSystem::{FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT},
+            Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE, SYNCHRONIZE,
+            },
+        };
+        let _destination_guard = mkdir_all_below_existing_base_std(destination, base, publication_root)?;
+        let guard = prepare_rename_commit_guard(source, destination, base, publication_root)?;
+        for name in names {
+            if cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "multipart staging cancelled"));
+            }
+            let original = open_windows_relative(
+                guard.source_parent_guard.last_handle()?,
+                name.as_ref(),
+                SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN,
+                FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                0,
+                true,
+            )?;
+            let attributes = windows_file_attribute_tag(&original)?.FileAttributes;
+            if attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart shard is not a regular file"));
+            }
+            let expected = windows_file_identity(&original)?;
+            let linked_path = destination.join(name);
+            std::fs::hard_link(source.join(name), &linked_path)?;
+            let (linked, actual) = open_windows_rename_source_identity(&linked_path, &guard.destination_parent_guard)?;
+            drop(linked);
+            if actual != expected {
+                let _ = std::fs::remove_file(&linked_path);
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart shard changed during staging"));
+            }
+        }
+        if sync_directory {
+            fsync_dir_std(destination)?;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (source, destination, names, base, publication_root, sync_directory, cancelled);
+        Err(io::Error::new(io::ErrorKind::Unsupported, "multipart source preservation is unsupported"))
+    }
+}
+
+#[cfg(test)]
+mod multipart_source_preservation_tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, PublicationRoot, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().expect("temporary publication root");
+        let source = root.path().join("upload/data");
+        let destination = root.path().join("tmp/attempt/new-data");
+        std::fs::create_dir_all(&source).expect("source directory");
+        std::fs::write(source.join("part.1"), b"immutable shard").expect("source shard");
+        std::fs::write(source.join("part.1.proof"), b"integrity proof").expect("source proof");
+        let publication = PublicationRoot::new(root.path()).expect("pinned publication root");
+        (root, publication, source, destination)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn multipart_payload_guard_pins_distinct_sources_and_the_same_destination() {
+        let (_root, publication, _source, _destination) = fixture();
+        let root = publication.io_path();
+        let canonical = root.join("multipart/upload");
+        let temporary = root.join("tmp/attempt");
+        let bucket = root.join("bucket");
+        let target = bucket.join("object");
+        for directory in [&canonical, &temporary, &target] {
+            std::fs::create_dir_all(directory).expect("two-source guard directories");
+        }
+        let payload = temporary.join("payload");
+        std::fs::create_dir(&payload).expect("private payload DD");
+        std::fs::write(payload.join("part.1"), b"native selected shard").expect("private payload shard");
+        let head = canonical.join("xl.meta");
+        let destination = target.join("xl.meta");
+        let metadata_guard =
+            prepare_rename_commit_guard(&canonical, &target, &bucket, &publication).expect("canonical metadata guard");
+        let lease = acquire_namespace_mutation_lease(&target).await;
+        let payload_guard = multipart_payload_commit_guard(&metadata_guard, &temporary, lease.clone())
+            .await
+            .expect("distinct pinned payload source");
+        assert!(
+            Arc::ptr_eq(
+                &metadata_guard
+                    .directories
+                    .prepare_destination()
+                    .expect("metadata target")
+                    .file,
+                &payload_guard.directories.prepare_destination().expect("payload target").file
+            ),
+            "both publications must retain the exact same target FD"
+        );
+        assert_ne!(metadata_guard.directories.source_path, payload_guard.directories.source_path);
+        let mut prepared = create_prepared_rename_source_with_commit_guard(&head, &destination, &metadata_guard)
+            .expect("canonical prepared metadata");
+        prepared
+            .write_all(b"prepared native metadata", true)
+            .expect("durable canonical metadata");
+        rename_all_with_commit_guard(&payload, target.join("payload"), &bucket, &publication, &payload_guard, lease.clone())
+            .await
+            .expect("payload rename uses private TMP parent FD");
+        assert!(head.exists(), "payload publication must not consume the canonical head");
+        rename_all_with_prepared_source(prepared, &head, &destination, &bucket, &publication, &metadata_guard, lease)
+            .await
+            .expect("metadata rename keeps its canonical parent FD");
+        assert!(!head.exists());
+        assert_eq!(std::fs::read(&destination).expect("published metadata"), b"prepared native metadata");
+        assert_eq!(
+            std::fs::read(target.join("payload/part.1")).expect("published selected shard"),
+            b"native selected shard"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn multipart_payload_guard_rejects_replaced_private_source_or_shared_destination() {
+        for replace_source in [false, true] {
+            let (_root, publication, _source, _destination) = fixture();
+            let root = publication.io_path();
+            let canonical = root.join("multipart/upload");
+            let temporary = root.join("tmp/attempt");
+            let bucket = root.join("bucket");
+            let target = bucket.join("object");
+            for directory in [&canonical, &temporary, &target] {
+                std::fs::create_dir_all(directory).expect("guard replacement directories");
+            }
+            let payload = temporary.join("payload");
+            std::fs::create_dir(&payload).expect("private payload DD");
+            std::fs::write(payload.join("part.1"), b"retained selected shard").expect("private payload shard");
+            let head = canonical.join("xl.meta");
+            std::fs::write(&head, b"unconsumed canonical head").expect("canonical head");
+            let metadata_guard =
+                prepare_rename_commit_guard(&canonical, &target, &bucket, &publication).expect("canonical metadata guard");
+            let lease = acquire_namespace_mutation_lease(&target).await;
+            let payload_guard = multipart_payload_commit_guard(&metadata_guard, &temporary, lease.clone())
+                .await
+                .expect("pin payload and shared target");
+            let replaced = if replace_source { &temporary } else { &target };
+            let moved = replaced.with_extension("detached");
+            std::fs::rename(replaced, &moved).expect("replace actual guarded parent");
+            std::fs::create_dir(replaced).expect("new pathname identity");
+            let result =
+                rename_all_with_commit_guard(&payload, target.join("payload"), &bucket, &publication, &payload_guard, lease)
+                    .await;
+            assert!(
+                matches!(result, Err(DiskError::FileCorrupt)),
+                "changed source/target identity must reject before rename: {result:?}"
+            );
+            assert_eq!(
+                std::fs::read(&head).expect("canonical head after rejection"),
+                b"unconsumed canonical head"
+            );
+            let retained = if replace_source {
+                moved.join("payload/part.1")
+            } else {
+                payload.join("part.1")
+            };
+            assert_eq!(
+                std::fs::read(retained).expect("rejected publication retains selected data"),
+                b"retained selected shard"
+            );
+            assert!(!target.join("payload").exists());
+        }
+    }
+
+    #[test]
+    fn multipart_owned_record_parent_barriers_repair_an_existing_record_after_failure() {
+        let (_root, publication, _source, _destination) = fixture();
+        let source = publication.path().join("upload");
+        let control = source.join(".mpu-completions");
+        let owner = control.join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&owner).expect("owned metadata directory fixture");
+        let record = owner.join("original.xl.meta");
+        std::fs::write(&record, b"immutable independent original FI").expect("original metadata fixture");
+        fsync_dir_recorder::set_failure(&control, io::ErrorKind::Other);
+        let error = sync_multipart_owned_record_parents(&source, &owner, true, publication.path(), &publication)
+            .expect_err("ancestor barrier failure must reach the owner");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(
+            !fsync_dir_recorder::was_fsynced(&source),
+            "failed intermediate barrier must stop before source ACK barrier"
+        );
+        sync_multipart_owned_record_parents(&source, &owner, true, publication.path(), &publication)
+            .expect("an existing immutable record retries every required parent barrier");
+        assert!(fsync_dir_recorder::was_fsynced(&owner));
+        assert!(fsync_dir_recorder::was_fsynced(&control));
+        assert!(fsync_dir_recorder::was_fsynced(&source));
+        assert_eq!(
+            std::fs::read(&record).expect("record retained after failed barrier"),
+            b"immutable independent original FI"
+        );
+    }
+
+    #[test]
+    fn multipart_owned_record_parent_barriers_reject_depth_and_source_escape() {
+        let (_root, publication, _source, _destination) = fixture();
+        let source = publication.path().join("upload");
+        for parent in [
+            source.join(".mpu-recovery/round/unexpected"),
+            publication.path().join("outside"),
+        ] {
+            let error = sync_multipart_owned_record_parents(&source, &parent, true, publication.path(), &publication)
+                .expect_err("only fixed owner/round ancestry is admitted");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(!parent.exists(), "barriers cannot create a source or arbitrary parent");
+        }
+    }
+
+    #[test]
+    fn multipart_source_staging_links_payload_and_proof_without_consuming_source() {
+        let (root, publication, source, destination) = fixture();
+        hardlink_multipart_source_files(
+            &source,
+            &destination,
+            &["part.1".into(), "part.1.proof".into()],
+            root.path(),
+            &publication,
+            true,
+            &|| false,
+        )
+        .expect("immutable shard batch should link and sync");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(source.join("part.1")).expect("source inode").ino(),
+                std::fs::metadata(destination.join("part.1")).expect("private inode").ino()
+            );
+        }
+        assert_eq!(
+            std::fs::read(destination.join("part.1.proof")).expect("private proof"),
+            b"integrity proof"
+        );
+        std::fs::remove_dir_all(&destination).expect("failed attempt cleanup");
+        assert_eq!(
+            std::fs::read(source.join("part.1")).expect("authoritative source must remain"),
+            b"immutable shard"
+        );
+        assert_eq!(
+            std::fs::read(source.join("part.1.proof")).expect("authoritative proof must remain"),
+            b"integrity proof"
+        );
+    }
+
+    #[test]
+    fn multipart_source_staging_rejects_path_escape_and_cancelled_batch() {
+        let (root, publication, source, destination) = fixture();
+        let escaped = hardlink_multipart_source_files(
+            &source,
+            &destination,
+            &["../part.1".into()],
+            root.path(),
+            &publication,
+            false,
+            &|| false,
+        )
+        .expect_err("shard names must not escape their pinned directory");
+        assert_eq!(escaped.kind(), io::ErrorKind::InvalidInput);
+        let cancelled =
+            hardlink_multipart_source_files(&source, &destination, &["part.1".into()], root.path(), &publication, false, &|| {
+                true
+            })
+            .expect_err("cancelled batches must not create links");
+        assert_eq!(cancelled.kind(), io::ErrorKind::Interrupted);
+        assert!(!destination.join("part.1").exists());
+        assert_eq!(
+            std::fs::read(source.join("part.1")).expect("source after cancellation"),
+            b"immutable shard"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multipart_source_staging_rejects_symlink_shard_and_source_ancestor() {
+        let (root, publication, source, destination) = fixture();
+        std::os::unix::fs::symlink(source.join("part.1"), source.join("part.2")).expect("source symlink fixture");
+        assert!(
+            hardlink_multipart_source_files(&source, &destination, &["part.2".into()], root.path(), &publication, false, &|| {
+                false
+            })
+            .is_err()
+        );
+        let alias = root.path().join("source-alias");
+        std::os::unix::fs::symlink(&source, &alias).expect("source ancestor symlink fixture");
+        assert!(
+            hardlink_multipart_source_files(&alias, &destination, &["part.1".into()], root.path(), &publication, false, &|| {
+                false
+            })
+            .is_err()
+        );
+        assert!(!destination.join("part.1").exists());
+        assert_eq!(
+            std::fs::read(source.join("part.1")).expect("source after rejected links"),
+            b"immutable shard"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multipart_source_staging_metadata_reader_rejects_symlink() {
+        let (root, publication, source, _) = fixture();
+        let metadata = source.join("xl.meta");
+        std::os::unix::fs::symlink(source.join("part.1"), &metadata).expect("source metadata symlink fixture");
+        assert!(read_multipart_source_metadata(&metadata, root.path(), &publication).is_err());
+        assert_eq!(
+            std::fs::read(source.join("part.1")).expect("symlink target remains unchanged"),
+            b"immutable shard"
+        );
+    }
+
+    #[test]
+    fn multipart_source_staging_metadata_reader_bounds_allocation() {
+        let (root, publication, source, _) = fixture();
+        let metadata = source.join("xl.meta");
+        let file = std::fs::File::create(&metadata).expect("oversized metadata fixture");
+        file.set_len(16 * 1024 * 1024 + 1).expect("sparse oversized metadata fixture");
+        let error = read_multipart_source_metadata(&metadata, root.path(), &publication)
+            .expect_err("oversized metadata must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::metadata(&metadata).expect("source metadata remains present").len(),
+            16 * 1024 * 1024 + 1
+        );
+    }
 }
 
 pub(crate) fn mkdir_all_below_existing_base_std(

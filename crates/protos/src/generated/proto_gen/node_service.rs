@@ -439,6 +439,7 @@ pub struct RenameDataRequest {
     pub bucket_incarnation_id: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[prost(skip_debug)]
 pub struct RenameDataResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
@@ -559,6 +560,31 @@ pub struct RecoverDeleteTransactionRequest {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RecoverDeleteTransactionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(uint32, tag = "2")]
+    pub protocol_version: u32,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub result: ::prost::bytes::Bytes,
+    #[prost(message, optional, tag = "4")]
+    pub error: ::core::option::Option<Error>,
+}
+/// Fixed multipart-upload scope; operation bytes never select another volume.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[prost(skip_debug)]
+pub struct RecoverMultipartSourceRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "3")]
+    pub protocol_version: u32,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub operation: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[prost(skip_debug)]
+pub struct RecoverMultipartSourceResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
     #[prost(uint32, tag = "2")]
@@ -2185,6 +2211,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "RecoverDeleteTransaction"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn recover_multipart_source(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RecoverMultipartSourceRequest>,
+        ) -> std::result::Result<tonic::Response<super::RecoverMultipartSourceResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/RecoverMultipartSource");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "RecoverMultipartSource"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn acquire_snapshot_lease(
             &mut self,
             request: impl tonic::IntoRequest<super::SnapshotLeaseRequest>,
@@ -2454,6 +2495,22 @@ pub mod node_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("node_service.NodeService", "RenameData"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// The method itself requires source-preserving multipart publication on every peer.
+        pub async fn rename_multipart_data(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RenameDataRequest>,
+        ) -> std::result::Result<tonic::Response<super::RenameDataResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/RenameMultipartData");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "RenameMultipartData"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn rename_data_at_incarnation(
@@ -3690,6 +3747,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::RecoverDeleteTransactionRequest>,
         ) -> std::result::Result<tonic::Response<super::RecoverDeleteTransactionResponse>, tonic::Status>;
+        async fn recover_multipart_source(
+            &self,
+            request: tonic::Request<super::RecoverMultipartSourceRequest>,
+        ) -> std::result::Result<tonic::Response<super::RecoverMultipartSourceResponse>, tonic::Status>;
         async fn acquire_snapshot_lease(
             &self,
             request: tonic::Request<super::SnapshotLeaseRequest>,
@@ -3772,6 +3833,11 @@ pub mod node_service_server {
             request: tonic::Request<super::WalkDirRequest>,
         ) -> std::result::Result<tonic::Response<Self::WalkDirStream>, tonic::Status>;
         async fn rename_data(
+            &self,
+            request: tonic::Request<super::RenameDataRequest>,
+        ) -> std::result::Result<tonic::Response<super::RenameDataResponse>, tonic::Status>;
+        /// The method itself requires source-preserving multipart publication on every peer.
+        async fn rename_multipart_data(
             &self,
             request: tonic::Request<super::RenameDataRequest>,
         ) -> std::result::Result<tonic::Response<super::RenameDataResponse>, tonic::Status>;
@@ -4524,6 +4590,34 @@ pub mod node_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/node_service.NodeService/RecoverMultipartSource" => {
+                    #[allow(non_camel_case_types)]
+                    struct RecoverMultipartSourceSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::RecoverMultipartSourceRequest> for RecoverMultipartSourceSvc<T> {
+                        type Response = super::RecoverMultipartSourceResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::RecoverMultipartSourceRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::recover_multipart_source(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RecoverMultipartSourceSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/node_service.NodeService/AcquireSnapshotLease" => {
                     #[allow(non_camel_case_types)]
                     struct AcquireSnapshotLeaseSvc<T: NodeService>(pub Arc<T>);
@@ -5022,6 +5116,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RenameDataSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/RenameMultipartData" => {
+                    #[allow(non_camel_case_types)]
+                    struct RenameMultipartDataSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::RenameDataRequest> for RenameMultipartDataSvc<T> {
+                        type Response = super::RenameDataResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::RenameDataRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::rename_multipart_data(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RenameMultipartDataSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

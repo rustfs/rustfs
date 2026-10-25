@@ -407,7 +407,12 @@ async fn phase_quorum_matrix(
                 match phase {
                     "create" => &["WriteMetadata"],
                     "part" => &["PreparePartTransaction"],
-                    "complete" => &["RenameData", "RenameDataAtIncarnation", "RenameDataWithQuotaFence"],
+                    "complete" => &[
+                        "RenameData",
+                        "RenameMultipartData",
+                        "RenameDataAtIncarnation",
+                        "RenameDataWithQuotaFence",
+                    ],
                     "abort" => &["Delete"],
                     _ => unreachable!(),
                 }
@@ -742,7 +747,12 @@ async fn each_multipart_phase_resumes_after_metadata_and_lock_delays() -> TestRe
             if locks {
                 &["Lock", "LockBatch"]
             } else {
-                &["RenameData", "RenameDataAtIncarnation", "RenameDataWithQuotaFence"]
+                &[
+                    "RenameData",
+                    "RenameMultipartData",
+                    "RenameDataAtIncarnation",
+                    "RenameDataWithQuotaFence",
+                ]
             },
             &scope,
             async move { Ok(complete.send().await?) },

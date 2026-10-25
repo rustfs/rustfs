@@ -419,6 +419,21 @@ message RecoverDeleteTransactionResponse {
   optional Error error = 4;
 }
 
+// Fixed multipart-upload scope; operation bytes never select another volume.
+message RecoverMultipartSourceRequest {
+  string disk = 1;
+  string path = 2;
+  uint32 protocol_version = 3;
+  bytes operation = 4;
+}
+
+message RecoverMultipartSourceResponse {
+  bool success = 1;
+  uint32 protocol_version = 2;
+  bytes result = 3;
+  optional Error error = 4;
+}
+
 message SnapshotLeaseRequest {
   string disk = 1;
   string volume = 2;
@@ -1279,6 +1294,7 @@ service NodeService {
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
   rpc DeleteAtIncarnation(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
   rpc RecoverDeleteTransaction(RecoverDeleteTransactionRequest) returns (RecoverDeleteTransactionResponse) {}; // auth-policy: body-bound
+  rpc RecoverMultipartSource(RecoverMultipartSourceRequest) returns (RecoverMultipartSourceResponse) {}; // auth-policy: body-bound
   rpc AcquireSnapshotLease(SnapshotLeaseRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
   rpc AcquireQuotaMutationFence(SnapshotLeaseRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
   rpc RenewSnapshotLease(SnapshotLeaseRenewRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
@@ -1298,6 +1314,8 @@ service NodeService {
   rpc ListDir(ListDirRequest) returns (ListDirResponse) {}; // auth-policy: read-only
   rpc WalkDir(WalkDirRequest) returns (stream WalkDirResponse) {}; // auth-policy: streaming
   rpc RenameData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
+  // The method itself requires source-preserving multipart publication on every peer.
+  rpc RenameMultipartData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc RenameDataAtIncarnation(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc RenameDataWithQuotaFence(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc RenameDataWithPoolMetaCas(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound

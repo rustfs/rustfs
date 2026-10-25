@@ -44,6 +44,37 @@ pub type NodeServiceClientType = NodeServiceClient<
 >;
 
 pub use generated::*;
+
+impl std::fmt::Debug for proto_gen::node_service::RenameDataResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RenameDataResponse")
+            .field("success", &self.success)
+            .field("payload", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for proto_gen::node_service::RecoverMultipartSourceRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoverMultipartSourceRequest")
+            .field("protocol_version", &self.protocol_version)
+            .field("operation", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for proto_gen::node_service::RecoverMultipartSourceResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoverMultipartSourceResponse")
+            .field("success", &self.success)
+            .field("protocol_version", &self.protocol_version)
+            .field("result", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
 pub use rustfs_common::ConnectionEvictionLogLevel;
 
 // Default 100 MB
@@ -1057,6 +1088,131 @@ pub fn canonical_rename_data_request_body(
         body.push_bytes(&request.bucket_incarnation_id)?;
     }
     Ok(body.finish())
+}
+
+/// The fixed-MPU recovery method authenticates every wire field in its own domain.
+pub fn canonical_recover_multipart_source_request_body(
+    request: &proto_gen::node_service::RecoverMultipartSourceRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-recover-multipart-source-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.path)?;
+    body.push_u32(request.protocol_version);
+    body.push_bytes(&request.operation)?;
+    Ok(body.finish())
+}
+
+pub const MULTIPART_SOURCE_RECOVERY_MAX_PAYLOAD_BYTES: usize = DEFAULT_GRPC_SERVER_MESSAGE_LEN;
+
+/// Recovery transports exactly one bounded, typed operation or response.
+pub fn decode_multipart_source_recovery_payload<T: serde::de::DeserializeOwned>(payload: &[u8]) -> std::io::Result<T> {
+    if payload.is_empty() || payload.len() > MULTIPART_SOURCE_RECOVERY_MAX_PAYLOAD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid multipart source recovery payload length",
+        ));
+    }
+    let mut cursor = std::io::Cursor::new(payload);
+    let value = rmp_serde::from_read(&mut cursor)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid multipart source recovery payload"))?;
+    if cursor.position() != u64::try_from(payload.len()).map_err(std::io::Error::other)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "trailing multipart source recovery payload",
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod multipart_source_rpc_tests {
+    use super::*;
+
+    #[test]
+    fn multipart_source_recovery_canonical_body_binds_all_wire_fields_and_domain() {
+        let request = proto_gen::node_service::RecoverMultipartSourceRequest {
+            disk: "disk".into(),
+            path: "upload".into(),
+            protocol_version: 1,
+            operation: vec![0x80].into(),
+        };
+        let canonical = canonical_recover_multipart_source_request_body(&request).expect("canonical recovery body");
+        let mut bodies = std::collections::HashSet::from([canonical.clone()]);
+        for change in [
+            |request: &mut proto_gen::node_service::RecoverMultipartSourceRequest| request.disk = "other".into(),
+            |request: &mut proto_gen::node_service::RecoverMultipartSourceRequest| request.path = "other".into(),
+            |request: &mut proto_gen::node_service::RecoverMultipartSourceRequest| request.protocol_version = 2,
+            |request: &mut proto_gen::node_service::RecoverMultipartSourceRequest| request.operation = vec![0x81].into(),
+        ] {
+            let mut changed = request.clone();
+            change(&mut changed);
+            assert!(bodies.insert(canonical_recover_multipart_source_request_body(&changed).expect("changed recovery body")));
+        }
+        let delete = proto_gen::node_service::RecoverDeleteTransactionRequest {
+            disk: request.disk,
+            volume: request.path,
+            protocol_version: request.protocol_version,
+            operation: request.operation,
+        };
+        assert_ne!(
+            canonical,
+            canonical_recover_delete_transaction_request_body(&delete).expect("other recovery domain")
+        );
+    }
+
+    #[test]
+    fn multipart_source_recovery_payload_requires_one_bounded_value() {
+        let encoded = rmp_serde::to_vec_named(&vec![1_u32, 2]).expect("encoded operation");
+        assert_eq!(
+            decode_multipart_source_recovery_payload::<Vec<u32>>(&encoded).expect("one value"),
+            vec![1, 2]
+        );
+        let mut trailing = encoded;
+        trailing.push(0xc0);
+        assert!(decode_multipart_source_recovery_payload::<Vec<u32>>(&trailing).is_err());
+        assert!(decode_multipart_source_recovery_payload::<Vec<u32>>(&[]).is_err());
+        assert!(decode_multipart_source_recovery_payload::<Vec<u32>>(&[0xc1]).is_err());
+        assert!(
+            decode_multipart_source_recovery_payload::<Vec<u32>>(&vec![0xc0; MULTIPART_SOURCE_RECOVERY_MAX_PAYLOAD_BYTES + 1])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn multipart_source_wire_debug_redacts_capability_payloads() {
+        let secret = "private-undo-capability";
+        let rename = proto_gen::node_service::RenameDataResponse {
+            success: true,
+            rename_data_resp: secret.into(),
+            rename_data_resp_bin: secret.as_bytes().to_vec().into(),
+            error: None,
+        };
+        assert_eq!(
+            format!("{rename:?}"),
+            r#"RenameDataResponse { success: true, payload: "[REDACTED]", .. }"#
+        );
+        let request = proto_gen::node_service::RecoverMultipartSourceRequest {
+            disk: secret.into(),
+            path: secret.into(),
+            protocol_version: 1,
+            operation: secret.as_bytes().to_vec().into(),
+        };
+        assert_eq!(
+            format!("{request:?}"),
+            r#"RecoverMultipartSourceRequest { protocol_version: 1, operation: "[REDACTED]", .. }"#
+        );
+        let response = proto_gen::node_service::RecoverMultipartSourceResponse {
+            success: true,
+            protocol_version: 1,
+            result: secret.as_bytes().to_vec().into(),
+            error: None,
+        };
+        assert_eq!(
+            format!("{response:?}"),
+            r#"RecoverMultipartSourceResponse { success: true, protocol_version: 1, result: "[REDACTED]", .. }"#
+                .replace("\\\"", "\"")
+        );
+    }
 }
 
 pub fn canonical_pool_meta_native_recovery_request_body(

@@ -27,6 +27,7 @@ mod io_admission;
 #[cfg(test)]
 pub(crate) mod lifecycle_test_io;
 pub mod local;
+pub mod multipart_source;
 pub mod os;
 
 pub use local::pool_meta_native::{PoolMetaNativeCasCondition, PoolMetaNativeFileIdentity};
@@ -938,6 +939,16 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn recover_multipart_source(
+        &self,
+        request: multipart_source::MultipartSourceRequest,
+    ) -> Result<multipart_source::MultipartSourceResponse> {
+        match self {
+            Disk::Local(disk) => disk.recover_multipart_source(request).await,
+            Disk::Remote(disk) => disk.recover_multipart_source(request).await,
+        }
+    }
+
     async fn pool_meta_native_recovery(&self, request: PoolMetaNativeRecoveryRequest) -> Result<PoolMetaNativeRecoveryResponse> {
         match self {
             Disk::Local(disk) => disk.pool_meta_native_recovery(request).await,
@@ -1651,6 +1662,13 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         Err(DiskError::UnsupportedDisk)
     }
 
+    async fn recover_multipart_source(
+        &self,
+        _request: multipart_source::MultipartSourceRequest,
+    ) -> Result<multipart_source::MultipartSourceResponse> {
+        Err(DiskError::UnsupportedDisk)
+    }
+
     async fn pool_meta_native_recovery(&self, _request: PoolMetaNativeRecoveryRequest) -> Result<PoolMetaNativeRecoveryResponse> {
         Err(DiskError::UnsupportedDisk)
     }
@@ -2198,6 +2216,9 @@ pub enum OldCurrentSize {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RenameDataResp {
+    /// Native-only source ownership result; older peers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multipart_source: Option<multipart_source::MultipartPublicationResult>,
     /// Dereferenced erasure data directory retained for older coordinators.
     pub old_data_dir: Option<Uuid>,
     /// Directory containing rollback metadata. This may be synthetic and must
@@ -3210,6 +3231,7 @@ mod tests {
         let signature = vec![0x01, 0x02, 0x03];
 
         let resp = RenameDataResp {
+            multipart_source: None,
             old_data_dir: Some(uuid),
             rollback_data_dir: Some(uuid),
             cleanup_data_dir: Some(uuid),
@@ -3232,6 +3254,7 @@ mod tests {
     fn test_rename_data_resp_old_current_size_msgpack_roundtrip() {
         for old_current_size in [None, Some(OldCurrentSize::Absent), Some(OldCurrentSize::Present(1337))] {
             let resp = RenameDataResp {
+                multipart_source: None,
                 old_data_dir: Some(Uuid::new_v4()),
                 rollback_data_dir: Some(Uuid::new_v4()),
                 cleanup_data_dir: Some(Uuid::new_v4()),

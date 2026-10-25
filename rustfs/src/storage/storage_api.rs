@@ -495,13 +495,17 @@ pub(crate) mod ecstore_disk {
         DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest,
         DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo,
         DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload,
-        GuardedFileInfoVersions, OldCurrentSize, POOL_META_NATIVE_CAS_METADATA_SUFFIX, PartTransactionAction,
+        GuardedFileInfoVersions, MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartSourceOperation, MultipartSourceRequest,
+        MultipartSourceResponse, OldCurrentSize, POOL_META_NATIVE_CAS_METADATA_SUFFIX, PartTransactionAction,
         PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
-        ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo,
-        WalkDirOptions, get_object_disk_read_timeout, is_quota_mutation_fence_path, validate_batch_read_version_item_count,
+        RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
+        SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout,
+        is_quota_mutation_fence_path, require_source_condition, validate_batch_read_version_item_count,
     };
     #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::disk::{CurrentDeleteGeneration, DiskOption, new_disk};
+    pub(crate) use rustfs_ecstore::api::disk::{
+        CurrentDeleteGeneration, DiskOption, capture_source_condition, new_disk, strip_native_controls,
+    };
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
 }
 

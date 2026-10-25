@@ -14,8 +14,9 @@
 
 use super::{LocalMutationTarget, NodeService};
 use crate::storage::storage_api::ecstore_disk::{
-    POOL_META_NATIVE_CAS_METADATA_SUFFIX, PoolMetaNativeRecoveryRequest as NativeRecoveryRequest,
-    QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, is_quota_mutation_fence_path,
+    MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartSourceOperation, MultipartSourceRequest, POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+    PoolMetaNativeRecoveryRequest as NativeRecoveryRequest, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
+    RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, is_quota_mutation_fence_path, require_source_condition,
 };
 use crate::storage::storage_api::rpc_consumer::node_service::{
     BatchReadVersionReq, BatchReadVersionResp, ConditionalFileUpdate, DeleteOptions, DiskError, DiskInfoOptions,
@@ -72,6 +73,17 @@ fn startup_cas_rename_observation(
 }
 
 impl LocalMutationTarget {
+    async fn recover_local_multipart_source(
+        &self,
+        disk_ref: &str,
+        source: MultipartSourceRequest,
+    ) -> Result<crate::storage::storage_api::ecstore_disk::MultipartSourceResponse, DiskError> {
+        match self {
+            Self::Ready(store) => store.recover_local_multipart_source(disk_ref, source).await,
+            Self::Bootstrap(_) | Self::Unbound => Err(DiskError::DiskNotFound),
+        }
+    }
+
     async fn rename_local_data(
         &self,
         disk_ref: &str,
@@ -409,6 +421,41 @@ fn decode_rename_data_request_file_info(
     json: &str,
 ) -> std::result::Result<DecodedRpcPayload<FileInfo>, DiskError> {
     decode_msgpack_or_json_with_source(binary, json, "FileInfo")
+}
+
+fn decode_multipart_rename_request_file_info(binary: &[u8]) -> Result<DecodedRpcPayload<FileInfo>, DiskError> {
+    let decoded = (|| -> Result<FileInfo, DiskError> {
+        if binary.is_empty() || binary.len() > rustfs_protos::DEFAULT_GRPC_SERVER_MESSAGE_LEN {
+            return Err(DiskError::FileCorrupt);
+        }
+        let mut cursor = Cursor::new(binary);
+        let value = rmp_serde::from_read(&mut cursor).map_err(|_| DiskError::FileCorrupt)?;
+        if cursor.position() != u64::try_from(binary.len()).map_err(DiskError::other)? {
+            return Err(DiskError::FileCorrupt);
+        }
+        Ok(value)
+    })();
+    match decoded {
+        Ok(value) => {
+            global_internode_metrics().record_msgpack_json_decode(
+                INTERNODE_MSGPACK_DIRECTION_REQUEST,
+                "FileInfo",
+                INTERNODE_MSGPACK_CODEC_MSGPACK,
+            );
+            Ok(DecodedRpcPayload {
+                value,
+                from_msgpack: true,
+            })
+        }
+        Err(error) => {
+            global_internode_metrics().record_msgpack_json_decode_error(
+                INTERNODE_MSGPACK_DIRECTION_REQUEST,
+                "FileInfo",
+                INTERNODE_MSGPACK_CODEC_MSGPACK,
+            );
+            Err(error)
+        }
+    }
 }
 
 fn encode_rename_data_response_payloads(
@@ -1370,6 +1417,70 @@ impl NodeService {
         }
     }
 
+    pub(super) async fn handle_recover_multipart_source(
+        &self,
+        request: Request<RecoverMultipartSourceRequest>,
+    ) -> Result<Response<RecoverMultipartSourceResponse>, Status> {
+        if request.get_ref().operation.len() > MultipartSourceOperation::max_wire_payload_bytes() {
+            return Err(Status::resource_exhausted("multipart source recovery operation exceeds limit"));
+        }
+        let body = rustfs_protos::canonical_recover_multipart_source_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("invalid multipart source recovery body length"))?;
+        verify_tonic_canonical_body_digest(&request, &body)
+            .map_err(|_| Status::permission_denied("multipart source recovery requires body-bound v2 authentication"))?;
+        #[cfg(feature = "e2e-test-hooks")]
+        let request_id = super::e2e_rpc_delay::request_id(&request);
+        let request = request.into_inner();
+        if request.protocol_version != u32::from(MULTIPART_SOURCE_PROTOCOL_VERSION) {
+            return Err(Status::unimplemented("incompatible multipart source recovery protocol"));
+        }
+        let operation: MultipartSourceOperation = rustfs_protos::decode_multipart_source_recovery_payload(&request.operation)
+            .map_err(|_| Status::invalid_argument("invalid multipart source recovery operation"))?;
+        let source = MultipartSourceRequest {
+            protocol_version: MULTIPART_SOURCE_PROTOCOL_VERSION,
+            path: request.path,
+            operation,
+        };
+        source
+            .validate_wire()
+            .map_err(|_| Status::invalid_argument("invalid multipart source recovery scope"))?;
+        let target = self.local_mutation_target();
+        #[cfg(feature = "e2e-test-hooks")]
+        super::e2e_rpc_delay::disk(
+            super::e2e_rpc_delay::Method::RecoverMultipartSource,
+            RUSTFS_META_MULTIPART_BUCKET,
+            &source.path,
+            request_id.as_deref(),
+        )
+        .await;
+        let result = target.recover_local_multipart_source(&request.disk, source).await;
+        let result = result.and_then(|mut result| {
+            result.prepare_wire()?;
+            Ok(result)
+        });
+        match result {
+            Ok(result) => {
+                let result = rmp_serde::to_vec_named(&result)
+                    .map_err(|_| Status::internal("cannot encode multipart source recovery response"))?;
+                if result.len() > MultipartSourceOperation::max_wire_payload_bytes() {
+                    return Err(Status::resource_exhausted("multipart source recovery response exceeds limit"));
+                }
+                Ok(Response::new(RecoverMultipartSourceResponse {
+                    success: true,
+                    protocol_version: u32::from(MULTIPART_SOURCE_PROTOCOL_VERSION),
+                    result: result.into(),
+                    error: None,
+                }))
+            }
+            Err(error) => Ok(Response::new(RecoverMultipartSourceResponse {
+                success: false,
+                protocol_version: u32::from(MULTIPART_SOURCE_PROTOCOL_VERSION),
+                result: Bytes::new(),
+                error: Some(error.into()),
+            })),
+        }
+    }
+
     pub(super) async fn handle_pool_meta_native_recovery(
         &self,
         request: Request<PoolMetaNativeRecoveryRequest>,
@@ -1605,6 +1716,7 @@ impl NodeService {
         request: Request<RenameDataRequest>,
         quota_fence: bool,
         pool_meta_cas: bool,
+        multipart_rename: bool,
     ) -> Result<Response<RenameDataResponse>, Status> {
         let service_return_started = rustfs_io_metrics::put_stage_timer();
         let service_entry_started = rustfs_io_metrics::put_stage_timer();
@@ -1627,6 +1739,8 @@ impl NodeService {
             }
         }
         let body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
+        let quota_fence =
+            quota_fence || (multipart_rename && request.metadata().contains_key(rustfs_protos::QUOTA_MUTATION_TOPOLOGY_HEADER));
         let mut quota_topology = None;
         let authenticated = if pool_meta_cas {
             let body = body.map_err(|_| Status::invalid_argument("invalid pool metadata CAS body length"))?;
@@ -1634,6 +1748,10 @@ impl NodeService {
                 .map_err(|_| Status::permission_denied("pool metadata CAS requires body-bound v2 authentication"))
         } else if quota_fence {
             verify_quota_mutation_digest(&request, body).map(|topology| quota_topology = Some(topology))
+        } else if multipart_rename {
+            let body = body.map_err(|_| Status::invalid_argument("invalid multipart rename body length"))?;
+            verify_tonic_canonical_body_digest(&request, &body)
+                .map_err(|_| Status::permission_denied("multipart rename requires body-bound v2 authentication"))
         } else {
             verify_disk_mutation_digest(&request, body, "rename_data")
         };
@@ -1656,6 +1774,13 @@ impl NodeService {
         #[cfg(feature = "e2e-test-hooks")]
         let request_id = super::e2e_rpc_delay::request_id(&request);
         let request = request.into_inner();
+        if multipart_rename
+            && (request.src_volume != RUSTFS_META_MULTIPART_BUCKET
+                || request.dst_volume == RUSTFS_META_MULTIPART_BUCKET
+                || request.dst_volume == RUSTFS_META_TMP_BUCKET)
+        {
+            return Err(Status::invalid_argument("invalid multipart rename scope"));
+        }
         let target = self.local_mutation_target();
         let bucket_incarnation = if request.bucket_incarnation_id.is_empty() {
             None
@@ -1681,13 +1806,21 @@ impl NodeService {
         };
         #[cfg(feature = "e2e-test-hooks")]
         super::rename_target_capture_test_hook::wait(&target, &request).await;
-        let decoded_file_info = match decode_rename_data_request_file_info(&request.file_info_bin, &request.file_info) {
+        let file_info = if multipart_rename {
+            decode_multipart_rename_request_file_info(&request.file_info_bin)
+        } else {
+            decode_rename_data_request_file_info(&request.file_info_bin, &request.file_info)
+        };
+        let decoded_file_info = match file_info {
             Ok(file_info) => file_info,
             Err(err) => {
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_BEFORE_HANDLER,
                     before_handler_started,
                 );
+                if multipart_rename {
+                    return Err(Status::invalid_argument("invalid multipart rename FileInfo"));
+                }
                 let response_build_started = rustfs_io_metrics::put_stage_timer();
                 let response = Response::new(RenameDataResponse {
                     success: false,
@@ -1706,6 +1839,16 @@ impl NodeService {
                 return Ok(response);
             }
         };
+        if multipart_rename {
+            let condition = require_source_condition(&decoded_file_info.value)
+                .map_err(|_| Status::invalid_argument("multipart rename requires its captured source generation"))?;
+            if condition.lineage.path != request.src_path
+                || condition.lineage.bucket != request.dst_volume
+                || condition.lineage.object != request.dst_path
+            {
+                return Err(Status::invalid_argument("multipart rename source condition does not match its scope"));
+            }
+        }
         let scanner_publication_lease_token = if request.scanner_publication_lease_token.is_empty() {
             None
         } else {
@@ -1724,6 +1867,16 @@ impl NodeService {
             }
             Some(token)
         };
+        if multipart_rename
+            && rustfs_utils::http::metadata_compat::contains_key_str(
+                &decoded_file_info.value.metadata,
+                QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+            ) != quota_fence
+        {
+            return Err(Status::invalid_argument(
+                "multipart quota rename requires its topology-bound method scope",
+            ));
+        }
         if quota_fence {
             let token = rustfs_utils::http::metadata_compat::get_consistent_str(
                 &decoded_file_info.value.metadata,
@@ -1769,7 +1922,11 @@ impl NodeService {
         );
         #[cfg(feature = "e2e-test-hooks")]
         super::e2e_rpc_delay::disk(
-            super::e2e_rpc_delay::Method::RenameData,
+            if multipart_rename {
+                super::e2e_rpc_delay::Method::RenameMultipartData
+            } else {
+                super::e2e_rpc_delay::Method::RenameData
+            },
             &request.dst_volume,
             &request.dst_path,
             request_id.as_deref(),
@@ -1791,6 +1948,12 @@ impl NodeService {
             handler_await_started,
         );
         let after_handler_started = rustfs_io_metrics::put_stage_timer();
+        let result = result.and_then(|mut result| {
+            if let Some(publication) = result.multipart_source.as_mut() {
+                publication.prepare_wire()?;
+            }
+            Ok(result)
+        });
         #[cfg(feature = "e2e-test-hooks")]
         if let Some(mut observation) = observation {
             observation["ok"] = serde_json::json!(result.is_ok());
@@ -2575,10 +2738,10 @@ impl NodeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteOptions, compat_response_json, decode_msgpack_or_json, decode_rename_data_request_file_info,
-        encode_batch_read_version_response_payloads, encode_delete_versions_errors, encode_file_info_msgpack, encode_msgpack,
-        encode_msgpack_named, encode_read_multiple_response_payloads, encode_rename_data_response_payloads,
-        rejects_legacy_delete_transaction,
+        DeleteOptions, compat_response_json, decode_msgpack_or_json, decode_multipart_rename_request_file_info,
+        decode_rename_data_request_file_info, encode_batch_read_version_response_payloads, encode_delete_versions_errors,
+        encode_file_info_msgpack, encode_msgpack, encode_msgpack_named, encode_read_multiple_response_payloads,
+        encode_rename_data_response_payloads, rejects_legacy_delete_transaction,
     };
     use crate::storage::DiskError;
     use crate::storage::rpc::node_service::make_server;
@@ -2879,6 +3042,24 @@ mod tests {
                 assert!(error.to_string().contains("decode FileInfo msgpack failed"), "unexpected error: {error}");
             },
         );
+    }
+
+    #[test]
+    fn multipart_rename_file_info_requires_exactly_one_msgpack_value() {
+        let file_info = FileInfo::default();
+        let encoded = rmp_serde::to_vec_named(&file_info).expect("multipart FileInfo encoding");
+        let decoded = decode_multipart_rename_request_file_info(&encoded).expect("valid multipart FileInfo");
+        assert!(decoded.from_msgpack);
+        for invalid in [Vec::new(), b"not-msgpack".to_vec(), {
+            let mut trailing = encoded;
+            trailing.push(0xc0);
+            trailing
+        }] {
+            assert!(
+                decode_multipart_rename_request_file_info(&invalid).is_err(),
+                "new multipart rename must not accept absent, malformed or trailing FileInfo bytes"
+            );
+        }
     }
 
     #[test]

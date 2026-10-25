@@ -4512,6 +4512,9 @@ pub struct SetDisks {
     /// listings of such a prefix are frequent and the scan reads the whole
     /// subtree, so it is not repeated within `ORPHAN_PURGE_BACKOFF` (#6898).
     orphan_purge_backoff: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    /// Hermetic sets may retain shared services while owning isolated proof scopes.
+    #[cfg(test)]
+    multipart_proof_authority_override: Arc<std::sync::RwLock<Option<crate::disk::multipart_source::ProofVerificationContext>>>,
     #[cfg(test)]
     storage_class_config_override: Arc<std::sync::RwLock<Option<Arc<storageclass::Config>>>>,
     #[cfg(test)]
@@ -5459,6 +5462,8 @@ impl SetDisks {
             tier_free_version_rename_data_source_capable: Arc::new(AtomicBool::new(false)),
             orphan_purge_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
+            multipart_proof_authority_override: Arc::new(std::sync::RwLock::new(None)),
+            #[cfg(test)]
             storage_class_config_override: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(test)]
             rename_tail_heal_capture: Arc::new(std::sync::Mutex::new(None)),
@@ -5469,6 +5474,30 @@ impl SetDisks {
     #[allow(dead_code)] // Read by tests; consumed by later slices.
     pub(crate) fn instance_ctx(&self) -> &Arc<InstanceContext> {
         &self.ctx
+    }
+
+    pub(crate) fn multipart_proof_verification_context(&self) -> crate::disk::multipart_source::ProofVerificationContext {
+        #[cfg(test)]
+        if let Some(authority) = self
+            .multipart_proof_authority_override
+            .read()
+            .expect("hermetic multipart authority lock should not be poisoned")
+            .clone()
+        {
+            return authority;
+        }
+        self.ctx.multipart_proof_verification_context()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_multipart_proof_authority_for_test(
+        &self,
+        authority: crate::disk::multipart_source::ProofVerificationContext,
+    ) {
+        *self
+            .multipart_proof_authority_override
+            .write()
+            .expect("hermetic multipart authority lock should not be poisoned") = Some(authority);
     }
 
     pub(in crate::set_disk) fn tier_free_version_rename_data_source_capable(&self) -> bool {
@@ -15525,6 +15554,26 @@ mod tests {
 
         let instance_ctx = Arc::new(InstanceContext::new());
         instance_ctx.update_erasure_type(SetupType::Erasure).await;
+        let topology = crate::layout::endpoints::EndpointServerPools(vec![crate::layout::endpoints::PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: drive_count,
+            endpoints: endpoints.clone().into(),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]);
+        let authority = instance_ctx
+            .bind_multipart_proof_topology(&topology)
+            .expect("standalone set fixture owns the complete local topology");
+        crate::disk::multipart_source::bind_multipart_proof_snapshot(&disks, &authority)
+            .expect("standalone fixture native handles should bind to its own instance");
+        for (slot, disk) in disks.iter().enumerate() {
+            assert_eq!(
+                disk.as_ref().expect("fixture disk").get_disk_id().await.unwrap(),
+                Some(format.erasure.sets[0][slot]),
+                "fixture must use the full actual formatted cohort"
+            );
+        }
         let set_disks = SetDisks::new_with_instance_ctx(
             "test-owner".to_string(),
             Arc::new(RwLock::new(disks)),

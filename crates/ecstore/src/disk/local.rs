@@ -25,6 +25,9 @@ pub(super) mod delete_recovery;
 #[cfg(all(unix, test))]
 #[path = "fd_cache_tests.rs"]
 mod fd_cache_tests;
+mod multipart_source_recovery;
+pub(in crate::disk) mod multipart_source_state;
+mod multipart_staging;
 pub(crate) mod pool_meta_native;
 mod replacement_lease;
 #[cfg(any(target_os = "linux", test))]
@@ -54,6 +57,7 @@ use crate::diagnostics::get::{
 };
 #[cfg(test)]
 use crate::disk::HEALING_MARKER_PATH;
+use crate::disk::RUSTFS_META_MULTIPART_BUCKET;
 use crate::disk::disk_store::{get_drive_walkdir_stall_timeout, get_object_disk_read_timeout};
 use crate::disk::io_admission::{DiskIoPermit, current_resource_unit, spawn_blocking_with_disk_io_permit};
 use crate::disk::{
@@ -199,7 +203,8 @@ pub(crate) fn metadata_less_part_file(entry: &str) -> bool {
 /// Native multipart sidecars travel with their part during delete recovery.
 /// Callers must additionally require a regular file inside a bound data dir.
 fn delete_recovery_part_file(entry: &str) -> bool {
-    metadata_less_part_file(entry)
+    entry == multipart_source_state::RETIREMENT_ANCHOR
+        || metadata_less_part_file(entry)
         || entry.strip_suffix(".meta").is_some_and(metadata_less_part_file)
         || entry.split_once(".integrity.").is_some_and(|(part, generation)| {
             metadata_less_part_file(part) && Uuid::parse_str(generation).is_ok_and(|id| !id.is_nil())
@@ -5783,6 +5788,7 @@ async fn build_local_io_backend(root: PathBuf) -> Arc<dyn LocalIoBackend> {
 pub struct LocalDisk {
     pub root: PathBuf,
     publication_root: os::PublicationRoot,
+    multipart_proof_authority: OnceLock<crate::disk::multipart_source::ProofVerificationContext>,
     /// I/O root pinned to the mount instance that was opened while the disk
     /// was initialized. On Linux this is `/proc/self/fd/<dirfd>/.`; resolving
     /// paths beneath it keeps repair I/O on that mount even if the configured
@@ -6059,6 +6065,34 @@ impl LocalDisk {
         &self.io_root
     }
 
+    pub(in crate::disk) fn multipart_proof_verification_context(
+        &self,
+    ) -> crate::disk::multipart_source::ProofVerificationContext {
+        self.multipart_proof_authority
+            .get()
+            .cloned()
+            .unwrap_or(crate::disk::multipart_source::ProofVerificationContext::RpcOnly)
+    }
+
+    pub(crate) fn bind_multipart_proof_authority(
+        &self,
+        authority: &crate::disk::multipart_source::ProofVerificationContext,
+    ) -> Result<()> {
+        if let Some(stored) = self.multipart_proof_authority.get() {
+            return if stored.same_authority(authority) {
+                Ok(())
+            } else {
+                Err(DiskError::ConditionalDeleteConflict)
+            };
+        }
+        authority.validate_endpoint(&self.endpoint)?;
+        let stored = self.multipart_proof_authority.get_or_init(|| authority.clone());
+        if !stored.same_authority(authority) {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
+        Ok(())
+    }
+
     /// Auto-replacement is destructive, so it is admitted only when the
     /// configured endpoint still names the directory held by `mount_lease`.
     pub fn has_replacement_mount_lease(&self) -> bool {
@@ -6280,6 +6314,7 @@ impl LocalDisk {
         let mut disk = Self {
             root: root.clone(),
             publication_root,
+            multipart_proof_authority: OnceLock::new(),
             io_root: io_root.clone(),
             #[cfg(target_os = "linux")]
             mount_lease,
@@ -7026,6 +7061,20 @@ impl LocalDisk {
         pool_meta_native::reject_raw_path(&self.root, volume, path)?;
         crate::hp_guard!("LocalDisk::write_metadata");
         fi.validate_for_metadata_read()?;
+        let initial_source = if volume == RUSTFS_META_MULTIPART_BUCKET {
+            let mut metadata = fi.metadata.clone();
+            crate::disk::multipart_source::strip_native_controls(&mut metadata);
+            fi.fresh
+                && path.trim_end_matches('/') == multipart_staging::upload_scope_root(path, false)
+                && !fi.deleted
+                && fi.parts.is_empty()
+                && fi.data.is_none()
+                && fi.data_dir.is_some_and(|dir| !dir.is_nil())
+                && metadata == fi.metadata
+        } else {
+            false
+        };
+        let source_admission = self.multipart_source_admission(volume, path, false, initial_source)?;
         let p = self.io_get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
 
         let mut meta = FileMeta::new();
@@ -7044,12 +7093,13 @@ impl LocalDisk {
 
         // Atomic temp+rename: this path also rewrites live xl.meta (delete markers,
         // decommission), where an in-place truncate would expose torn metadata.
-        self.write_all_meta_with_namespace_owner(
+        self.write_all_meta_with_source_admission(
             volume,
             format!("{path}/{STORAGE_FORMAT_FILE}").as_str(),
             &fm_data,
             true,
             namespace_owner,
+            source_admission,
         )
         .await?;
 
@@ -7791,6 +7841,9 @@ impl LocalDisk {
         opt: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
+        let namespace_owner = self
+            .multipart_source_owner(volume, path, !opt.recursive, true, namespace_owner)
+            .await?;
         if pool_meta_native::reject_raw_path(&self.root, volume, path).is_err() {
             let owner = self.pool_meta_cleanup_owner(volume, path, &opt, namespace_owner).await?;
             return self
@@ -9203,6 +9256,21 @@ impl LocalDisk {
         sync: bool,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
+        let admission = self.multipart_source_admission(volume, path, true, false)?;
+        self.write_all_meta_with_source_admission(volume, path, buf, sync, namespace_owner, admission)
+            .await
+    }
+
+    async fn write_all_meta_with_source_admission(
+        &self,
+        volume: &str,
+        path: &str,
+        buf: &[u8],
+        sync: bool,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        admission: Option<multipart_staging::MultipartSourceAdmission>,
+    ) -> Result<()> {
+        multipart_staging::reject_reserved_anchor(path)?;
         let volume_dir = self.io_get_bucket_path(volume)?;
         let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
@@ -9235,9 +9303,19 @@ impl LocalDisk {
             return Err(DiskError::Unexpected);
         }
 
-        os::rename_all_with_owner(tmp_file_path, &file_path, volume_dir, &self.publication_root, namespace_owner.clone()).await?;
+        os::rename_all_with_precondition_and_parent_sync(
+            &tmp_file_path,
+            &file_path,
+            &volume_dir,
+            &self.publication_root,
+            namespace_owner.clone(),
+            admission.as_ref().map(|admission| admission.precondition()),
+            admission.is_some() && sync && durability.syncs_commit_metadata(),
+        )
+        .await?;
 
         if sync
+            && admission.is_none()
             && durability.syncs_commit_metadata()
             && let Some(parent) = file_path.parent()
         {
@@ -9251,7 +9329,16 @@ impl LocalDisk {
 
     // write_all_public for trail
     async fn write_all_public(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
+        multipart_staging::reject_native_control_write(&self.root, self.io_root(), volume, path)?;
+        multipart_staging::reject_reserved_anchor(path)?;
         pool_meta_native::reject_raw_path(&self.root, volume, path)?;
+        multipart_staging::reject_noncanonical_scope(&self.root, self.io_root(), volume, path)?;
+        if volume == RUSTFS_META_MULTIPART_BUCKET {
+            let owner = self.multipart_source_owner(volume, path, true, false, None).await?;
+            return self
+                .write_all_meta_with_namespace_owner(volume, path, &data, true, owner)
+                .await;
+        }
         if volume == RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
             let mut format_info = self.format_info.write().await;
             format_info.data.clone_from(&data);
@@ -11377,6 +11464,11 @@ impl DiskAPI for LocalDisk {
         expected: Option<Bytes>,
         replacement: Option<Bytes>,
     ) -> Result<ConditionalFileUpdate> {
+        multipart_staging::reject_native_control_write(&self.root, self.io_root(), volume, path)?;
+        if volume == RUSTFS_META_MULTIPART_BUCKET {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
+        multipart_staging::reject_reserved_anchor(path)?;
         pool_meta_native::reject_raw_path(&self.root, volume, path)?;
         #[cfg(unix)]
         {
@@ -11721,6 +11813,11 @@ impl DiskAPI for LocalDisk {
         dst_path: &str,
         meta: Bytes,
     ) -> Result<()> {
+        multipart_staging::reject_native_control_write(&self.root, self.io_root(), src_volume, src_path)?;
+        multipart_staging::reject_native_control_write(&self.root, self.io_root(), dst_volume, dst_path)?;
+        multipart_staging::reject_noncanonical_scope(&self.root, self.io_root(), src_volume, src_path)?;
+        let source_owner = self.multipart_source_owner(dst_volume, dst_path, true, false, None).await?;
+        let admission = self.multipart_source_admission(dst_volume, dst_path, true, false)?;
         let src_volume_dir = self.io_get_bucket_path(src_volume)?;
         let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
         if !skip_access_checks(src_volume) {
@@ -11759,22 +11856,39 @@ impl DiskAPI for LocalDisk {
             }
             if durability.syncs_data_shards() {
                 let source = source.clone();
-                tokio::task::spawn_blocking(move || os::sync_file(&source))
-                    .await
-                    .map_err(DiskError::from)?
-                    .map_err(to_file_error)?;
+                let retained_owner = source_owner.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _owner = retained_owner;
+                    os::sync_file(&source)
+                })
+                .await
+                .map_err(DiskError::from)?
+                .map_err(to_file_error)?;
             }
             // Publish the immutable generation before preparing the part switch.
             // Rollback retains the old generation; an unreferenced new index is
             // reclaimed with the upload directory if preparation is interrupted.
-            rename_all(&source, &destination, &dst_volume_dir, &self.publication_root).await?;
+            os::rename_all_with_precondition(
+                &source,
+                &destination,
+                &dst_volume_dir,
+                &self.publication_root,
+                source_owner.clone(),
+                admission.as_ref().map(|check| check.precondition()),
+            )
+            .await?;
             if durability.syncs_commit_metadata() {
-                os::fsync_dir(destination.parent().ok_or(DiskError::FileCorrupt)?)
+                os::fsync_dir_with_owner(destination.parent().ok_or(DiskError::FileCorrupt)?, source_owner.clone())
                     .await
                     .map_err(to_file_error)?;
             }
         }
+        let retained_owner = source_owner.clone();
         tokio::task::spawn_blocking(move || {
+            let _owner = retained_owner;
+            if let Some(admission) = admission {
+                admission.validate().map_err(to_file_error)?;
+            }
             let source = std::fs::symlink_metadata(&src_file_path).map_err(to_file_error)?;
             if !source.is_file() {
                 return Err(DiskError::FileAccessDenied);
@@ -11836,6 +11950,8 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> Result<()> {
+        let source_owner = self.multipart_source_owner(volume, path, true, false, None).await?;
+        let admission = self.multipart_source_admission(volume, path, true, false)?;
         self.io_get_bucket_path(volume)?;
         let current_data_path = self.io_get_object_path(volume, path)?;
         let current_meta_path = self.io_get_object_path(volume, &format!("{path}.meta"))?;
@@ -11846,6 +11962,7 @@ impl DiskAPI for LocalDisk {
         let durability = effective_durability(volume);
 
         tokio::task::spawn_blocking(move || {
+            let _owner = source_owner;
             match std::fs::symlink_metadata(&transaction_path) {
                 Ok(metadata) if metadata.is_dir() => {}
                 Ok(_) => return Err(DiskError::FileCorrupt),
@@ -11853,6 +11970,9 @@ impl DiskAPI for LocalDisk {
                 Err(err) => return Err(to_file_error(err).into()),
             }
 
+            if let Some(admission) = admission {
+                admission.validate().map_err(to_file_error)?;
+            }
             if action == PartTransactionAction::Rollback {
                 std::fs::write(transaction_path.join(PART_TRANSACTION_ROLLBACK), []).map_err(to_file_error)?;
                 if durability.syncs_commit_metadata() {
@@ -11934,6 +12054,22 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
+        multipart_staging::reject_native_control_write(&self.root, self.io_root(), src_volume, src_path)?;
+        multipart_staging::reject_native_control_write(&self.root, self.io_root(), dst_volume, dst_path)?;
+        multipart_staging::reject_noncanonical_scope(&self.root, self.io_root(), src_volume, src_path)?;
+        let source_owner = self.multipart_source_owner(dst_volume, dst_path, true, false, None).await?;
+        multipart_staging::reject_reserved_anchor(dst_path)?;
+        let admission = self.multipart_source_admission(dst_volume, dst_path, true, false)?;
+        if let Some(check) = admission.clone() {
+            let retained = source_owner.clone();
+            tokio::task::spawn_blocking(move || {
+                let _owner = retained;
+                check.validate()
+            })
+            .await
+            .map_err(DiskError::from)?
+            .map_err(to_file_error)?;
+        }
         pool_meta_native::reject_raw_path(&self.root, src_volume, src_path)?;
         pool_meta_native::reject_raw_path(&self.root, dst_volume, dst_path)?;
         let src_volume_dir = self.io_get_bucket_path(src_volume)?;
@@ -12029,7 +12165,9 @@ impl DiskAPI for LocalDisk {
                     let publish_meta_path = transaction_path.join(PART_TRANSACTION_PUBLISH_META);
                     let source_meta_path = transaction_meta_path.clone();
                     let publish_path = publish_meta_path.clone();
+                    let retained_owner = source_owner.clone();
                     tokio::task::spawn_blocking(move || {
+                        let _owner = retained_owner;
                         remove_file_if_exists(&publish_path)?;
                         std::fs::hard_link(source_meta_path, &publish_path)
                     })
@@ -12057,18 +12195,32 @@ impl DiskAPI for LocalDisk {
         let durability = effective_durability(dst_volume);
         if durability.syncs_data_shards() && !src_is_dir {
             let src = src_file_path.clone();
-            tokio::task::spawn_blocking(move || os::sync_file(&src))
-                .await
-                .map_err(DiskError::from)?
-                .map_err(to_file_error)?;
+            let retained_owner = source_owner.clone();
+            tokio::task::spawn_blocking(move || {
+                let _owner = retained_owner;
+                os::sync_file(&src)
+            })
+            .await
+            .map_err(DiskError::from)?
+            .map_err(to_file_error)?;
         }
 
-        rename_all(&src_file_path, &dst_file_path, &dst_volume_dir, &self.publication_root).await?;
+        os::rename_all_with_precondition(
+            &src_file_path,
+            &dst_file_path,
+            &dst_volume_dir,
+            &self.publication_root,
+            source_owner.clone(),
+            admission.as_ref().map(|check| check.precondition()),
+        )
+        .await?;
 
         if durability.syncs_commit_metadata()
             && let Some(parent) = dst_file_path.parent()
         {
-            os::fsync_dir(parent).await.map_err(to_file_error)?;
+            os::fsync_dir_with_owner(parent, source_owner.clone())
+                .await
+                .map_err(to_file_error)?;
         }
 
         let dst_meta = lstat_std(&dst_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
@@ -12086,14 +12238,25 @@ impl DiskAPI for LocalDisk {
 
         if let Some(transaction_publish_meta) = transaction_publish_meta {
             let dst_meta_path = self.io_get_object_path(dst_volume, &format!("{dst_path}.meta"))?;
-            rename_all(&transaction_publish_meta, &dst_meta_path, &dst_volume_dir, &self.publication_root).await?;
+            os::rename_all_with_precondition(
+                &transaction_publish_meta,
+                &dst_meta_path,
+                &dst_volume_dir,
+                &self.publication_root,
+                source_owner.clone(),
+                admission.as_ref().map(|check| check.precondition()),
+            )
+            .await?;
             if durability.syncs_commit_metadata()
                 && let Some(parent) = dst_meta_path.parent()
             {
-                os::fsync_dir(parent).await.map_err(to_file_error)?;
+                os::fsync_dir_with_owner(parent, source_owner.clone())
+                    .await
+                    .map_err(to_file_error)?;
             }
         } else {
-            self.write_all(dst_volume, format!("{dst_path}.meta").as_str(), meta).await?;
+            self.write_all_meta_with_namespace_owner(dst_volume, &format!("{dst_path}.meta"), &meta, true, source_owner.clone())
+                .await?;
         }
 
         if src_is_dir {
@@ -12116,6 +12279,12 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        multipart_staging::reject_native_control_write(&self.root, self.io_root(), src_volume, src_path)?;
+        multipart_staging::reject_native_control_write(&self.root, self.io_root(), dst_volume, dst_path)?;
+        if src_volume == RUSTFS_META_MULTIPART_BUCKET || dst_volume == RUSTFS_META_MULTIPART_BUCKET {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
+        multipart_staging::reject_reserved_anchor(dst_path)?;
         pool_meta_native::reject_raw_path(&self.root, src_volume, src_path)?;
         pool_meta_native::reject_raw_path(&self.root, dst_volume, dst_path)?;
         crate::hp_guard!("LocalDisk::rename_file");
@@ -12195,6 +12364,12 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, _file_size: i64) -> Result<FileWriter> {
+        multipart_staging::reject_native_control_write(&self.root, self.io_root(), volume, path)?;
+        multipart_staging::reject_reserved_anchor(path)?;
+        multipart_staging::reject_noncanonical_scope(&self.root, self.io_root(), volume, path)?;
+        if volume == RUSTFS_META_MULTIPART_BUCKET {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
         pool_meta_native::reject_raw_path(&self.root, volume, path)?;
         crate::hp_guard!("LocalDisk::create_file");
         if !origvolume.is_empty() {
@@ -12239,6 +12414,12 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     // async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<File> {
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
+        multipart_staging::reject_native_control_write(&self.root, self.io_root(), volume, path)?;
+        multipart_staging::reject_reserved_anchor(path)?;
+        multipart_staging::reject_noncanonical_scope(&self.root, self.io_root(), volume, path)?;
+        if volume == RUSTFS_META_MULTIPART_BUCKET {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
         pool_meta_native::reject_raw_path(&self.root, volume, path)?;
         self.io_backend.open_write(volume, path, WriteMode::Append).await
     }
@@ -12732,6 +12913,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
+        multipart_staging::reject_native_control_write(&self.root, self.io_root(), volume, path)?;
         pool_meta_native::reject_raw_path(&self.root, volume, path)?;
         let object_path = self.get_object_path(volume, path)?;
         if let Some(condition) = &opts.transition_reconcile {
@@ -12749,7 +12931,9 @@ impl DiskAPI for LocalDisk {
                 .reconcile_transition_state_metadata(volume, path, fi.version_id, condition, owner, authority)
                 .await;
         }
-        let namespace_owner: Option<Arc<dyn Send + Sync>> = Some(os::acquire_metadata_mutation_lease(&object_path, None).await);
+        let source_owner = self.multipart_source_owner(volume, path, false, true, None).await?;
+        let namespace_owner: Option<Arc<dyn Send + Sync>> =
+            Some(os::acquire_metadata_mutation_lease(&object_path, source_owner).await);
         if !fi.metadata.is_empty() {
             let file_path = self.io_get_object_path(volume, path)?;
 
@@ -12790,9 +12974,19 @@ impl DiskAPI for LocalDisk {
         Err(Error::other("Invalid Argument"))
     }
 
+    async fn recover_multipart_source(
+        &self,
+        request: crate::disk::multipart_source::MultipartSourceRequest,
+    ) -> Result<crate::disk::multipart_source::MultipartSourceResponse> {
+        self.recover_multipart_source_native(request).await
+    }
+
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
+        multipart_staging::reject_native_control_write(&self.root, self.io_root(), volume, path)?;
         let object_path = self.get_object_path(volume, path)?;
-        let namespace_owner: Option<Arc<dyn Send + Sync>> = Some(os::acquire_metadata_mutation_lease(&object_path, None).await);
+        let source_owner = self.multipart_source_owner(volume, path, false, true, None).await?;
+        let namespace_owner: Option<Arc<dyn Send + Sync>> =
+            Some(os::acquire_metadata_mutation_lease(&object_path, source_owner).await);
         self.write_metadata_with_namespace_owner(volume, path, fi, namespace_owner)
             .await
     }
@@ -15571,6 +15765,15 @@ mod test {
             "8f897819-2604-4f3d-b843-c32a45d198b2x1786372838834745500/",
             "58ba822c-06e4-4332-81cc-be2c9d921900/part.1"
         );
+        let source_root = multipart_staging::upload_scope_root(dst_path, true);
+        let mut upload = FileInfo::new(source_root, 2, 2);
+        upload.erasure.index = 1;
+        upload.data_dir = Some(Uuid::new_v4());
+        upload.mod_time = Some(time::OffsetDateTime::now_utc());
+        upload.fresh = true;
+        disk.write_metadata("", RUSTFS_META_MULTIPART_BUCKET, source_root, upload)
+            .await
+            .expect("initialize live upload head");
         let transaction_path = disk
             .io_get_object_path(RUSTFS_META_MULTIPART_BUCKET, &crate::disk::part_transaction_path(dst_path))
             .expect("transaction path should resolve");
@@ -17814,6 +18017,77 @@ mod test {
     #[serial_test::serial(capacity_dirty_scope, dst_dir_fsync_group_commit)]
     async fn grouped_fsync_keeps_physical_namespace_owner_and_quota_after_timeout() {
         assert_physical_namespace_owner_and_quota_claim("fsync").await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn rename_publication_namespace_is_shared_by_reopened_disk_handles() {
+        use futures::FutureExt;
+        let directory = tempfile::tempdir().expect("reopened publication disk root");
+        let endpoint = Endpoint::try_from(directory.path().to_str().expect("UTF-8 root")).expect("disk endpoint");
+        let first = Arc::new(LocalDisk::new(&endpoint, false).await.expect("first pinned disk handle"));
+        let reopened = LocalDisk::new(&endpoint, false).await.expect("second pinned disk handle");
+        assert_eq!(first.root, reopened.root);
+        assert_ne!(first.io_root(), reopened.io_root(), "each open owns a distinct procfs FD alias");
+        let bucket = "reopened-namespace";
+        let object = "object";
+        ensure_test_volume(&first, bucket).await;
+        ensure_test_volume(&first, RUSTFS_META_TMP_BUCKET).await;
+        let physical = first
+            .io_get_object_path(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+            .expect("actual first-handle metadata target");
+        let logical = reopened
+            .get_object_path(bucket, object)
+            .expect("configured target shared by both handles");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let hook = os::prepared_publication_test_hooks::install(&physical, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let mut info = test_file_info(object, Uuid::nil(), None, Some(Bytes::from_static(b"first pinned publication")));
+        info.set_inline_data();
+        let operation = Arc::clone(&first);
+        let publishing = tokio::spawn(async move {
+            operation
+                .rename_data(RUSTFS_META_TMP_BUCKET, "source", info, bucket, object)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("physical publication must start")
+            .expect("physical publication announcement");
+        let mut probe = Box::pin(os::acquire_rename_data_mutation_lease(&reopened.root, bucket, &logical));
+        assert!(
+            probe.as_mut().now_or_never().is_none(),
+            "configured target key must wait on the first handle's actual publication"
+        );
+        release_tx.send(()).expect("release actual metadata rename");
+        tokio::time::timeout(Duration::from_secs(10), publishing)
+            .await
+            .expect("publication drains")
+            .expect("publication task")
+            .expect("actual ordinary PUT succeeds");
+        drop(
+            tokio::time::timeout(Duration::from_secs(10), probe)
+                .await
+                .expect("canonical namespace owner releases after the actual callback"),
+        );
+        drop(hook);
+        let published = reopened
+            .read_version(
+                "",
+                bucket,
+                object,
+                "",
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("reopened handle reads committed metadata and body");
+        assert_eq!(published.data, Some(Bytes::from_static(b"first pinned publication")));
     }
 
     #[tokio::test]

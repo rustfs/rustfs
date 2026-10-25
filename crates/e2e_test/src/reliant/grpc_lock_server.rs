@@ -548,6 +548,20 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn rename_multipart_data(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::RenameDataRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::RenameDataResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn recover_multipart_source(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::RecoverMultipartSourceRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::RecoverMultipartSourceResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn rename_data_at_incarnation(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::RenameDataRequest>,

@@ -487,6 +487,7 @@ impl ECStore {
         let default_pool_parities = resolve_startup_pool_defaults(&endpoint_pools)?;
 
         preflight_startup_rpc_secret(&endpoint_pools)?;
+        instance_ctx.bind_multipart_proof_topology(&endpoint_pools)?;
 
         let mut deployment_id = None;
         let mut pool_meta_bootstrap_authorities = Vec::new();
@@ -983,6 +984,7 @@ impl ECStore {
 
 #[cfg(test)]
 mod tests {
+    include!("init/multipart_copy_heal_tests.rs");
     use super::{
         LOCAL_DECOMMISSION_RESUME_RETRY_DELAY, LOCAL_DECOMMISSION_WATCHDOG_MAX_RETRY_DELAY, PoolMetaWriteState,
         establish_pool_meta_bootstrap_identity_if_proven, load_pool_meta_for_startup, local_decommission_watchdog_retry_delay,
@@ -3477,6 +3479,101 @@ mod tests {
         set_decommission_capacity_info_overrides_for_test(store.id, (0..128).map(|_| snapshot.clone()).collect());
 
         (instance_ctx, store, shutdown)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn direct_local_constructor_multipart_binds_complete_topology_without_registry_preinit() {
+        use crate::disk::DiskAPI;
+        use crate::disk::multipart_source::ProofVerificationContext;
+        use crate::layout::endpoints::SetupType;
+        use crate::storage_api_contracts::multipart::CompletePart;
+        let temp_dir = tempfile::tempdir().expect("create direct-constructor store dir");
+        let mut endpoints = Vec::new();
+        for slot in 0..4 {
+            let path = temp_dir.path().join(format!("disk{slot}"));
+            tokio::fs::create_dir_all(&path).await.unwrap();
+            let mut endpoint = Endpoint::try_from(path.to_str().unwrap()).unwrap();
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(slot);
+            endpoints.push(endpoint);
+        }
+        let topology = EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: endpoints.into(),
+            cmd_line: "direct-local-multipart".into(),
+            platform: "test".into(),
+        }]);
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        ctx.update_erasure_type(SetupType::Erasure).await;
+        assert!(ctx.local_disk_map().read().await.is_empty());
+        assert!(matches!(ctx.multipart_proof_verification_context(), ProofVerificationContext::RpcOnly));
+        let shutdown = CancellationToken::new();
+        crate::services::notification_sys::install_cross_pool_fence_fleet_proof_for_test();
+        // Exercise the public constructor directly: no initialize_local_disk_maps,
+        // local registry preinitialization, RPC key or proof override is supplied.
+        let store = without_storage_class_env(crate::store::ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().unwrap(),
+            topology,
+            shutdown.clone(),
+            ctx.clone(),
+        ))
+        .await
+        .expect("direct local constructor should establish its own native authority");
+        assert!(matches!(ctx.multipart_proof_verification_context(), ProofVerificationContext::Local(_)));
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "direct-local-constructor-multipart";
+        let object = "object";
+        store.make_bucket(bucket, &MakeBucketOptions::default()).await.unwrap();
+        let set = store.pools[0].get_disks_by_key(object);
+        let payload = b"direct native local multipart body".to_vec();
+        let opts = ObjectOptions::default();
+        let upload = set.new_multipart_upload(bucket, object, &opts).await.unwrap();
+        let part = set
+            .put_object_part(
+                bucket,
+                object,
+                &upload.upload_id,
+                1,
+                &mut crate::object_api::PutObjReader::from_vec(payload.clone()),
+                &opts,
+            )
+            .await
+            .unwrap();
+        let completed = set
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &opts,
+            )
+            .await
+            .expect("the direct local constructor must support native multipart completion");
+        assert!(completed.is_multipart());
+        let disks = set.disks.read().await.clone();
+        for (slot, disk) in disks.iter().enumerate() {
+            assert_eq!(
+                disk.as_ref().unwrap().get_disk_id().await.unwrap(),
+                Some(set.format.erasure.sets[0][slot])
+            );
+        }
+        let mut reader = set
+            .get_object_reader(bucket, object, None, http::HeaderMap::new(), &opts)
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, payload);
+        shutdown.cancel();
     }
 
     /// CopyObject destinations and CreateMultipartUpload create keys, so they
@@ -6719,6 +6816,268 @@ mod tests {
             .expect("spawn migration listing test")
             .join()
             .expect("migration listing test must complete");
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn data_movement_real_copies_keep_historical_publication_and_converge() {
+        use crate::data_movement::{DataMovementCopy, is_equivalent_data_movement_object_identity};
+        use crate::disk::DiskAPI as _;
+        use crate::disk::multipart_source::publication_identity_from_metadata;
+
+        run_large_stack_async_test("dm-historical-copy", || async {
+            let temp = tempfile::tempdir().expect("real Copy/migration store roots");
+            let (ctx, store, shutdown) =
+                without_storage_class_env(build_isolated_test_store(temp.path(), "native-historical-copy-migration", &[4, 4]))
+                    .await;
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+            let bucket = format!("historical-copy-source-{}", uuid::Uuid::new_v4());
+            let copied_bucket = format!("historical-copy-target-{}", uuid::Uuid::new_v4());
+            let object = "native-multipart-before-metadata-copy";
+            let copied_object = "new-key-after-materialized-copy";
+            for bucket in [&bucket, &copied_bucket] {
+                store
+                    .make_bucket(
+                        bucket,
+                        &MakeBucketOptions {
+                            versioning_enabled: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("real versioned bucket metadata on both pools");
+            }
+            let body = vec![0x51; 1 << 20];
+            let versioned = ObjectOptions {
+                versioned: true,
+                ..Default::default()
+            };
+            let native_opts = ObjectOptions {
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed original source mtime")),
+                ..versioned.clone()
+            };
+            let upload = store.pools[0]
+                .new_multipart_upload(&bucket, object, &native_opts)
+                .await
+                .expect("real pool-zero Init");
+            let part = store.pools[0]
+                .put_object_part(
+                    &bucket,
+                    object,
+                    &upload.upload_id,
+                    1,
+                    &mut PutObjReader::from_vec(body.clone()),
+                    &native_opts,
+                )
+                .await
+                .expect("real source Part");
+            let completed = store.pools[0]
+                .clone()
+                .complete_multipart_upload(
+                    &bucket,
+                    object,
+                    &upload.upload_id,
+                    vec![crate::storage_api_contracts::multipart::CompletePart {
+                        part_num: part.part_num,
+                        etag: part.etag,
+                        ..Default::default()
+                    }],
+                    &native_opts,
+                )
+                .await
+                .expect("real native source publication");
+            let version = completed.version_id.expect("stable source version");
+            let exact = ObjectOptions {
+                version_id: Some(version.to_string()),
+                ..versioned.clone()
+            };
+            let mut metadata_copy = store.pools[0]
+                .get_object_info(&bucket, object, &exact)
+                .await
+                .expect("actual original FI view");
+            let original = publication_identity_from_metadata(&metadata_copy.user_defined)
+                .expect("actual native tuple decodes")
+                .expect("actual native tuple exists");
+            metadata_copy.metadata_only = true;
+            Arc::make_mut(&mut metadata_copy.user_defined).insert("x-amz-meta-copy".to_owned(), "updated".to_owned());
+            store
+                .copy_object(&bucket, object, &bucket, object, &mut metadata_copy, &exact, &exact)
+                .await
+                .expect("actual same-version metadata Copy producer");
+            let metadata_copy = store.pools[0]
+                .get_object_info(&bucket, object, &exact)
+                .await
+                .expect("actual metadata Copy result");
+            assert_ne!(
+                metadata_copy.mod_time.map(|time| time.unix_timestamp_nanos()),
+                Some(original.modified_unix_nanos)
+            );
+            assert_eq!(
+                publication_identity_from_metadata(&metadata_copy.user_defined).expect("retained metadata-Copy tuple"),
+                Some(original.clone())
+            );
+            assert!(metadata_copy.is_multipart(), "metadata Copy keeps the actual multipart source shape");
+
+            // Keep full Copy on the source pool, then reserve that pool as the
+            // real migration source. This uses the existing pool admission rule.
+            *store.rebalance_meta.write().await = Some(active_rebalance_meta_for_pool(store.pools.len(), 1));
+            assert!(store.is_pool_rebalancing(1).await);
+            let reader = store
+                .get_object_reader(&bucket, object, None, HeaderMap::new(), &exact)
+                .await
+                .expect("real Copy reader");
+            let mut copy_info = reader.object_info.clone();
+            let actual_size = copy_info.get_actual_size().expect("actual Copy source size");
+            copy_info.put_object_reader = Some(PutObjReader::new(
+                rustfs_rio::HashReader::from_stream(reader.stream, actual_size, actual_size, None, None, false)
+                    .expect("real materialized Copy body"),
+            ));
+            let copied_version = uuid::Uuid::new_v4();
+            let copied_opts = ObjectOptions {
+                version_id: Some(copied_version.to_string()),
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..versioned.clone()
+            };
+            store
+                .copy_object(&bucket, object, &copied_bucket, copied_object, &mut copy_info, &exact, &copied_opts)
+                .await
+                .expect("actual cross-bucket/key full Copy producer");
+            let full_copy = store.pools[0]
+                .get_object_info(&copied_bucket, copied_object, &copied_opts)
+                .await
+                .expect("full Copy used the writable source pool");
+            let absent = store.pools[1]
+                .get_object_info(&copied_bucket, copied_object, &copied_opts)
+                .await
+                .expect_err("the reserved target pool cannot receive the source Copy");
+            assert!(crate::error::is_err_object_not_found(&absent) || crate::error::is_err_version_not_found(&absent));
+            assert_eq!(full_copy.version_id, Some(copied_version));
+            assert_ne!(full_copy.version_id, original.version_id);
+            assert_ne!(full_copy.data_dir, Some(original.final_data_dir));
+            assert_ne!(full_copy.bucket, original.lineage.bucket);
+            assert_ne!(full_copy.name, original.lineage.object);
+            assert_eq!(
+                publication_identity_from_metadata(&full_copy.user_defined).expect("retained full-Copy tuple"),
+                Some(original.clone())
+            );
+            assert!(
+                !full_copy.is_multipart(),
+                "materialized Copy has the actual ordinary-PUT ETag and part shape"
+            );
+            assert_eq!(full_copy.parts.len(), 1);
+            assert_eq!(full_copy.parts[0].number, 1);
+            assert!(full_copy.parts.iter().all(|part| part.checksums.is_none()));
+            *store.rebalance_meta.write().await = Some(active_rebalance_meta_for_pool(store.pools.len(), 0));
+            assert!(store.is_pool_rebalancing(0).await);
+            assert!(!store.is_pool_rebalancing(1).await);
+
+            for source in [metadata_copy, full_copy] {
+                let bucket = source.bucket.as_str();
+                let object = source.name.as_str();
+                let read_opts = ObjectOptions {
+                    version_id: source.version_id.map(|version| version.to_string()),
+                    versioned: true,
+                    include_part_checksums: true,
+                    ..Default::default()
+                };
+                let target_set = &store.pools[1].disk_set[0];
+                let target_disks = target_set.disk_inventory().await;
+                let mut prior = None;
+                for retry in [false, true] {
+                    let reader = store.pools[0]
+                        .get_object_reader(
+                            bucket,
+                            object,
+                            None,
+                            HeaderMap::new(),
+                            &ObjectOptions {
+                                raw_data_movement_read: true,
+                                ..read_opts.clone()
+                            },
+                        )
+                        .await
+                        .expect("actual current Copy source for real migration");
+                    assert!(is_equivalent_data_movement_object_identity(&source, &reader.object_info, true, true));
+                    let result = crate::data_movement::migrate_object(
+                        store.clone(),
+                        0,
+                        bucket.to_owned(),
+                        reader,
+                        None,
+                        "test_historical_native_copy_migration",
+                    )
+                    .await
+                    .expect("the actual MPI-or-PUT producer and overwrite retry must converge");
+                    assert_eq!(result, DataMovementCopy::Committed);
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while ctx.namespace_commits_pending() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("actual physical publication tails must drain before inspecting every target slot");
+                    let target = store.pools[1]
+                        .get_object_info(bucket, object, &read_opts)
+                        .await
+                        .expect("actual target copy");
+                    assert!(is_equivalent_data_movement_object_identity(&source, &target, true, true));
+                    let publication = publication_identity_from_metadata(&target.user_defined)
+                        .expect("actual migrated tuple decodes")
+                        .expect("actual migrated tuple remains present");
+                    if source.is_multipart() {
+                        assert_ne!(publication, original, "real multipart migration creates a new native tuple");
+                    } else {
+                        assert_eq!(publication, original, "real ordinary-PUT migration carries historical provenance");
+                    }
+                    let mut raw_files = Vec::new();
+                    for disk in &target_disks {
+                        let disk = disk.as_ref().expect("all real target participants online");
+                        raw_files.push((
+                            disk.read_all(bucket, &format!("{object}/xl.meta"))
+                                .await
+                                .expect("actual target version stack"),
+                            disk.read_all(bucket, &format!("{object}/{}/part.1", target.data_dir.expect("actual target DD")))
+                                .await
+                                .expect("actual target physical shard"),
+                        ));
+                    }
+                    if retry {
+                        assert_eq!(
+                            Some(&raw_files),
+                            prior.as_ref(),
+                            "convergence cannot republish a version or change physical bytes"
+                        );
+                    } else {
+                        prior = Some(raw_files);
+                    }
+                    let mut reader = store.pools[1]
+                        .get_object_reader(bucket, object, None, HeaderMap::new(), &read_opts)
+                        .await
+                        .expect("actual copied-and-migrated body");
+                    let mut actual = Vec::new();
+                    reader
+                        .stream
+                        .read_to_end(&mut actual)
+                        .await
+                        .expect("whole copied-and-migrated body");
+                    assert_eq!(actual, body);
+                    let upload_identity = crate::data_movement::data_movement_upload_identity_from_options(&ObjectOptions {
+                        version_id: source.version_id.map(|version| version.to_string()),
+                        mod_time: source.mod_time,
+                        ..Default::default()
+                    });
+                    assert!(
+                        target_set
+                            .data_movement_multipart_upload_ids(bucket, object, None, &upload_identity)
+                            .await
+                            .expect("inspect actual internal transfer staging")
+                            .is_empty(),
+                        "the real converged producer must retire its temporary upload"
+                    );
+                }
+            }
+            shutdown.cancel();
+        });
     }
 
     #[test]

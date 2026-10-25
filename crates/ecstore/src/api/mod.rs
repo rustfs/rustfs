@@ -429,6 +429,10 @@ pub mod data_usage {
 pub mod disk {
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
     pub use crate::disk::local::{ReplacementExecutionLease, ScanGuard};
+    pub use crate::disk::multipart_source::{
+        MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartSourceOperation, MultipartSourceRequest, MultipartSourceResponse,
+        capture_source_condition, require_source_condition, strip_native_controls,
+    };
     #[cfg(all(feature = "test-util", not(windows)))]
     pub use crate::disk::os::{LocalPublicationPause, LocalPublicationStage};
     pub use crate::disk::{
@@ -440,9 +444,10 @@ pub mod disk {
         GuardedDeleteVersionsPayload, GuardedFileInfoVersions, HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize,
         POOL_META_NATIVE_CAS_METADATA_SUFFIX, PartTransactionAction, PoolMetaNativeBackup, PoolMetaNativeInspection,
         PoolMetaNativeObject, PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse,
-        QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-        STORAGE_FORMAT_FILE, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, is_quota_mutation_fence_path,
-        new_disk, validate_batch_read_version_item_count,
+        QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
+        ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, SnapshotLeaseToken,
+        UpdateMetadataOpts, VolumeInfo, WalkDirOptions, is_quota_mutation_fence_path, new_disk,
+        validate_batch_read_version_item_count,
     };
     pub use bytes::Bytes;
     pub use endpoint::Endpoint;

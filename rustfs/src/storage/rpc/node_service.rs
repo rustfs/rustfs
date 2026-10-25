@@ -1724,7 +1724,18 @@ impl Node for NodeService {
         if !request.get_ref().bucket_incarnation_id.is_empty() {
             return Err(Status::invalid_argument("incarnation-bound rename requires RenameDataAtIncarnation"));
         }
-        self.handle_rename_data(request, false, false).await
+        self.handle_rename_data(request, false, false, false).await
+    }
+
+    async fn rename_multipart_data(&self, request: Request<RenameDataRequest>) -> Result<Response<RenameDataResponse>, Status> {
+        self.handle_rename_data(request, false, false, true).await
+    }
+
+    async fn recover_multipart_source(
+        &self,
+        request: Request<RecoverMultipartSourceRequest>,
+    ) -> Result<Response<RecoverMultipartSourceResponse>, Status> {
+        self.handle_recover_multipart_source(request).await
     }
 
     async fn rename_data_at_incarnation(
@@ -1739,21 +1750,21 @@ impl Node for NodeService {
         {
             return Err(Status::invalid_argument("bucket incarnation must be a non-nil UUID"));
         }
-        self.handle_rename_data(request, false, false).await
+        self.handle_rename_data(request, false, false, false).await
     }
 
     async fn rename_data_with_quota_fence(
         &self,
         request: Request<RenameDataRequest>,
     ) -> Result<Response<RenameDataResponse>, Status> {
-        self.handle_rename_data(request, true, false).await
+        self.handle_rename_data(request, true, false, false).await
     }
 
     async fn rename_data_with_pool_meta_cas(
         &self,
         request: Request<RenameDataRequest>,
     ) -> Result<Response<RenameDataResponse>, Status> {
-        self.handle_rename_data(request, false, true).await
+        self.handle_rename_data(request, false, true, false).await
     }
 
     async fn undo_pool_meta_write(
@@ -3136,7 +3147,10 @@ mod tests {
         validate_admin_heal_control_start,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
-    use crate::storage::storage_api::ecstore_disk::DiskAPI as _;
+    use crate::storage::storage_api::ecstore_disk::{
+        DiskAPI as _, MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartSourceOperation, RUSTFS_META_MULTIPART_BUCKET,
+        RUSTFS_META_TMP_BUCKET, capture_source_condition, require_source_condition, strip_native_controls,
+    };
     use crate::storage::storage_api::rpc_consumer::node_service::{DiskError, HealBucketInfo};
     use crate::storage::storage_api::set_tonic_canonical_body_digest;
     use crate::storage::storage_api::{
@@ -3174,13 +3188,13 @@ mod tests {
         LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest,
         MakeVolumeRequest, MakeVolumesRequest, Mss, PingRequest, PoolMetaNativeRecoveryRequest, PreparePartTransactionRequest,
         ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RecoverDeleteTransactionRequest,
-        ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest,
-        ScannerActivityRequest, ScannerDirtyUsageSnapshotRequest, ScannerPublicationLeaseReleaseRequest,
-        ScannerPublicationLeaseRequest, ServerInfoRequest, SettlePartTransactionRequest, SignalServiceRequest,
-        SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest, StartDecommissionRequest,
-        StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationFailureClass,
-        TierMutationPeerState, TierMutationPrepareRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest,
-        VerifyFileRequest, WriteAllRequest, WriteMetadataRequest, WriteRequest,
+        RecoverMultipartSourceRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest,
+        RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ScannerDirtyUsageSnapshotRequest,
+        ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ServerInfoRequest, SettlePartTransactionRequest,
+        SignalServiceRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
+        StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationAbortRequest,
+        TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest, UpdateMetacacheListingRequest,
+        UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest, WriteRequest,
         heal_control_service_client::HealControlServiceClient,
         heal_control_service_server::{HealControlService as _, HealControlServiceServer},
         node_service_client::NodeServiceClient,
@@ -3198,8 +3212,10 @@ mod tests {
     use tonic::{Request, Response, Status};
     use uuid::Uuid;
 
-    const DISK_MUTATION_RPC_METHODS: [&str; 32] = [
+    const DISK_MUTATION_RPC_METHODS: [&str; 34] = [
         "renamedata",
+        "renamemultipartdata",
+        "recovermultipartsource",
         "renamedataatincarnation",
         "renamedatawithquotafence",
         "renamedatawithpoolmetacas",
@@ -4888,6 +4904,19 @@ mod tests {
             rustfs_protos::canonical_rename_data_request_body
         );
         assert_gated!(
+            rename_multipart_data,
+            RenameDataRequest {
+                src_volume: RUSTFS_META_MULTIPART_BUCKET.to_string(),
+                ..Default::default()
+            },
+            rustfs_protos::canonical_rename_data_request_body
+        );
+        assert_gated!(
+            recover_multipart_source,
+            RecoverMultipartSourceRequest::default(),
+            rustfs_protos::canonical_recover_multipart_source_request_body
+        );
+        assert_gated!(
             rename_data_with_quota_fence,
             RenameDataRequest {
                 disk: disk.clone(),
@@ -5199,6 +5228,396 @@ mod tests {
         assert_eq!(
             covered_methods, expected_methods,
             "the disk mutation exclusion set must exactly match handlers exercised by the independent digest test",
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_source_recovery_auth_scope_version_and_payload_are_fail_closed() {
+        let service = make_server_for_context(None);
+        let message = RecoverMultipartSourceRequest {
+            disk: "unknown-source-disk".to_string(),
+            path: "upload".to_string(),
+            protocol_version: u32::from(MULTIPART_SOURCE_PROTOCOL_VERSION),
+            operation: rmp_serde::to_vec_named(&MultipartSourceOperation::Inspect { lineage: None })
+                .expect("inspection operation")
+                .into(),
+        };
+        let signed = |message| {
+            let mut request = Request::new(message);
+            let body = rustfs_protos::canonical_recover_multipart_source_request_body(request.get_ref())
+                .expect("canonical multipart recovery body");
+            set_tonic_canonical_body_digest(&mut request, &body).expect("body digest");
+            mark_v2_authenticated(&mut request);
+            request
+        };
+        assert_eq!(
+            service
+                .recover_multipart_source(Request::new(message.clone()))
+                .await
+                .expect_err("unsigned recovery")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut legacy_auth = signed(message.clone());
+        legacy_auth
+            .metadata_mut()
+            .insert("x-rustfs-rpc-auth-version", "1".parse().expect("legacy auth version"));
+        assert_eq!(
+            service
+                .recover_multipart_source(legacy_auth)
+                .await
+                .expect_err("legacy authentication")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut tampered = signed(message.clone());
+        tampered.get_mut().path.push_str("-changed");
+        assert_eq!(
+            service
+                .recover_multipart_source(tampered)
+                .await
+                .expect_err("tampered source scope")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut unsupported = message.clone();
+        unsupported.protocol_version += 1;
+        assert_eq!(
+            service
+                .recover_multipart_source(signed(unsupported))
+                .await
+                .expect_err("unsupported protocol")
+                .code(),
+            tonic::Code::Unimplemented
+        );
+        for path in [
+            "",
+            "/upload",
+            "../upload",
+            "upload/../other",
+            "upload//other",
+            "upload\\other",
+            "upload/",
+        ] {
+            let mut invalid = message.clone();
+            invalid.path = path.to_string();
+            assert_eq!(
+                service
+                    .recover_multipart_source(signed(invalid))
+                    .await
+                    .expect_err("noncanonical MPU scope")
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+        for payload in [
+            Vec::new(),
+            vec![0xc1],
+            rmp_serde::to_vec_named(&serde_json::json!({ "operation": "inspect", "lineage": null, "volume": "other" }))
+                .expect("unknown scope field"),
+            {
+                let mut trailing = message.operation.to_vec();
+                trailing.push(0xc0);
+                trailing
+            },
+        ] {
+            let mut invalid = message.clone();
+            invalid.operation = payload.into();
+            assert_eq!(
+                service
+                    .recover_multipart_source(signed(invalid))
+                    .await
+                    .expect_err("invalid recovery operation")
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+        let source = multipart_rename_test_request(&rustfs_filemeta::FileInfo::default());
+        let source_info: rustfs_filemeta::FileInfo = rmp_serde::from_slice(&source.file_info_bin).expect("captured source FI");
+        let condition = require_source_condition(&source_info).expect("captured source condition");
+        let generation = serde_json::json!({ "epoch": 1, "nonce": Uuid::new_v4() });
+        let challenge = Uuid::new_v4();
+        let round = serde_json::json!({
+            "lineage": condition.lineage,
+            "from_generation": condition.generation,
+            "old_attempt": condition.attempt,
+            "generation": generation,
+            "round": challenge,
+        });
+        let disk_ids = (0..4).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        let snapshot = |slot| {
+            serde_json::json!({
+                "disk_id": disk_ids[slot], "physical_slot": slot, "lineage": condition.lineage,
+                "generation": generation, "revision": 1, "phase": "recovering",
+                "state_sha256": vec![2_u8; 32], "head_sha256": vec![3_u8; 32],
+                "inventory_sha256": vec![4_u8; 32], "capability_sha256": null, "publication": null,
+            })
+        };
+        for authentication in [
+            serde_json::json!({ "class": "cluster_hmac", "mac": vec![0_u8; 32] }),
+            serde_json::json!({ "class": "native_local" }),
+        ] {
+            let proofs = (0..2)
+                .map(|slot| {
+                    serde_json::json!({
+                        "kind": "claimed", "challenge": challenge, "recovery": round,
+                        "snapshot": snapshot(slot), "authentication": authentication,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let operation: MultipartSourceOperation = serde_json::from_value(serde_json::json!({
+                "operation": "restore", "expected": snapshot(0),
+                "certificate": { "round": round, "disk_ids": disk_ids, "proofs": proofs },
+            }))
+            .expect("untrusted proof fields must decode without acquiring authority");
+            let mut forged = message.clone();
+            forged.operation = rmp_serde::to_vec_named(&operation).expect("forged proof operation").into();
+            assert_eq!(
+                service
+                    .recover_multipart_source(signed(forged))
+                    .await
+                    .expect_err("outer body authentication cannot mint native recovery votes")
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+        let mut oversized = message.clone();
+        oversized.operation = vec![0xc0; MultipartSourceOperation::max_wire_payload_bytes() + 1].into();
+        assert_eq!(
+            service
+                .recover_multipart_source(signed(oversized))
+                .await
+                .expect_err("oversized operation")
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        let response = service
+            .recover_multipart_source(signed(message))
+            .await
+            .expect("valid request reaches disk lookup")
+            .into_inner();
+        assert!(!response.success && response.error.is_some());
+        assert!(response.result.is_empty());
+        assert_eq!(response.protocol_version, u32::from(MULTIPART_SOURCE_PROTOCOL_VERSION));
+    }
+
+    fn multipart_rename_test_request(file_info: &rustfs_filemeta::FileInfo) -> RenameDataRequest {
+        let mut original = file_info.clone();
+        original.data_dir = Some(Uuid::new_v4());
+        original.mod_time = Some(OffsetDateTime::from_unix_timestamp(1).expect("source time"));
+        original.erasure.data_blocks = 2;
+        original.erasure.parity_blocks = 2;
+        original.erasure.block_size = 1024;
+        original.erasure.distribution = vec![1, 2, 3, 4];
+        original.erasure.index = 1;
+        let condition =
+            capture_source_condition("bucket", "object", "upload", &original, Uuid::new_v4()).expect("captured source condition");
+        let mut file_info = original;
+        file_info.data_dir = Some(Uuid::new_v4());
+        file_info.mod_time = Some(OffsetDateTime::from_unix_timestamp(2).expect("publication time"));
+        condition.attach(&mut file_info).expect("publication transport metadata");
+        RenameDataRequest {
+            disk: "unknown-multipart-disk".to_string(),
+            src_volume: RUSTFS_META_MULTIPART_BUCKET.to_string(),
+            src_path: "upload".to_string(),
+            dst_volume: "bucket".to_string(),
+            dst_path: "object".to_string(),
+            file_info: serde_json::to_string(&file_info).expect("FileInfo JSON"),
+            file_info_bin: rmp_serde::to_vec_named(&file_info).expect("FileInfo MessagePack").into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_rename_enforces_body_auth_scope_and_strict_file_info() {
+        let service = make_server_for_context(None);
+        let message = multipart_rename_test_request(&rustfs_filemeta::FileInfo::default());
+        let signed = |message| {
+            let mut request = Request::new(message);
+            let body = rustfs_protos::canonical_rename_data_request_body(request.get_ref()).expect("canonical body");
+            set_tonic_canonical_body_digest(&mut request, &body).expect("body digest");
+            mark_v2_authenticated(&mut request);
+            request
+        };
+        assert_eq!(
+            service
+                .rename_multipart_data(Request::new(message.clone()))
+                .await
+                .expect_err("unsigned multipart publication")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut tampered = signed(message.clone());
+        tampered.get_mut().src_path.push_str("-changed");
+        assert_eq!(
+            service
+                .rename_multipart_data(tampered)
+                .await
+                .expect_err("tampered source")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut legacy_auth = signed(message.clone());
+        legacy_auth
+            .metadata_mut()
+            .insert("x-rustfs-rpc-auth-version", "1".parse().expect("auth version"));
+        assert_eq!(
+            service
+                .rename_multipart_data(legacy_auth)
+                .await
+                .expect_err("new multipart publication cannot use legacy authentication")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        for (source, destination) in [
+            ("bucket", "other-bucket"),
+            (RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET),
+            (RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET),
+        ] {
+            let mut invalid = message.clone();
+            invalid.src_volume = source.to_string();
+            invalid.dst_volume = destination.to_string();
+            assert_eq!(
+                service
+                    .rename_multipart_data(signed(invalid))
+                    .await
+                    .expect_err("multipart method must reject unrelated source or staging destination")
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+        for binary in [Vec::new(), b"invalid-msgpack".to_vec(), {
+            let mut trailing = message.file_info_bin.to_vec();
+            trailing.push(0xc0);
+            trailing
+        }] {
+            let mut invalid = message.clone();
+            invalid.file_info_bin = binary.into();
+            assert_eq!(
+                service
+                    .rename_multipart_data(signed(invalid))
+                    .await
+                    .expect_err("new method cannot fall back to valid JSON or ignore trailing FileInfo bytes")
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+        let mut invalid_incarnation = message.clone();
+        invalid_incarnation.bucket_incarnation_id = vec![0; 16].into();
+        assert_eq!(
+            service
+                .rename_multipart_data(signed(invalid_incarnation))
+                .await
+                .expect_err("the dedicated method must retain incarnation validation")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let valid = service
+            .rename_multipart_data(signed(message.clone()))
+            .await
+            .expect("valid new multipart request should reach the unbound target")
+            .into_inner();
+        assert!(!valid.success && valid.error.is_some());
+        let mut legacy = message;
+        let mut legacy_info: rustfs_filemeta::FileInfo = rmp_serde::from_slice(&legacy.file_info_bin).expect("legacy FileInfo");
+        let condition = require_source_condition(&legacy_info).expect("captured source");
+        strip_native_controls(&mut legacy_info.metadata);
+        legacy_info.data_dir = Some(condition.lineage.original_data_dir);
+        legacy_info.mod_time =
+            Some(OffsetDateTime::from_unix_timestamp_nanos(condition.lineage.created_unix_nanos).expect("source time"));
+        legacy_info.version_id = condition.lineage.original_version_id;
+        legacy.file_info = serde_json::to_string(&legacy_info).expect("legacy original-DD FileInfo JSON");
+        legacy.file_info_bin = Bytes::new();
+        let legacy = service
+            .rename_data(signed(legacy))
+            .await
+            .expect("new peers must retain old-coordinator JSON RenameData compatibility")
+            .into_inner();
+        assert!(!legacy.success && legacy.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn multipart_rename_requires_captured_condition_and_exact_target() {
+        let service = make_server_for_context(None);
+        let message = multipart_rename_test_request(&rustfs_filemeta::FileInfo::default());
+        let mut missing = message.clone();
+        let mut info: rustfs_filemeta::FileInfo = rmp_serde::from_slice(&missing.file_info_bin).expect("FileInfo");
+        strip_native_controls(&mut info.metadata);
+        missing.file_info_bin = rmp_serde::to_vec_named(&info).expect("missing condition FileInfo").into();
+        let mut conflicting = message.clone();
+        let mut info: rustfs_filemeta::FileInfo = rmp_serde::from_slice(&conflicting.file_info_bin).expect("FileInfo");
+        info.metadata
+            .insert("x-minio-internal-multipart-source-condition".to_string(), "00".to_string());
+        conflicting.file_info_bin = rmp_serde::to_vec_named(&info).expect("conflicting condition FileInfo").into();
+        let mut other_source = message.clone();
+        other_source.src_path = "another-upload".to_string();
+        let mut other_target = message.clone();
+        other_target.dst_path = "another-object".to_string();
+        let mut other_bucket = message;
+        other_bucket.dst_volume = "another-bucket".to_string();
+        for message in [missing, conflicting, other_source, other_target, other_bucket] {
+            let mut request = Request::new(message);
+            let body = rustfs_protos::canonical_rename_data_request_body(request.get_ref()).expect("canonical body");
+            set_tonic_canonical_body_digest(&mut request, &body).expect("body digest");
+            mark_v2_authenticated(&mut request);
+            assert_eq!(
+                service
+                    .rename_multipart_data(request)
+                    .await
+                    .expect_err("invalid captured source scope")
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_rename_preserves_topology_bound_quota_enforcement() {
+        use crate::storage::storage_api::ecstore_disk::QUOTA_MUTATION_FENCE_METADATA_SUFFIX;
+
+        let service = make_server_for_context(None);
+        let mut file_info = rustfs_filemeta::FileInfo::default();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut file_info.metadata,
+            QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+            Uuid::new_v4().to_string(),
+        );
+        let message = multipart_rename_test_request(&file_info);
+        let mut missing_topology = Request::new(message.clone());
+        let body = rustfs_protos::canonical_rename_data_request_body(&message).expect("canonical body");
+        set_tonic_canonical_body_digest(&mut missing_topology, &body).expect("body digest");
+        mark_v2_authenticated(&mut missing_topology);
+        assert_eq!(
+            service
+                .rename_multipart_data(missing_topology)
+                .await
+                .expect_err("multipart quota tokens must not be downgraded to an ordinary signed rename")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let mut valid = Request::new(message.clone());
+        sign_quota_test_request(&mut valid, &body, &"a".repeat(64));
+        assert_eq!(
+            service
+                .rename_multipart_data(valid)
+                .await
+                .expect_err("valid topology authentication must still require a ready target")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        let mut changed_topology = Request::new(message);
+        sign_quota_test_request(&mut changed_topology, &body, &"a".repeat(64));
+        changed_topology.metadata_mut().insert(
+            rustfs_protos::QUOTA_MUTATION_TOPOLOGY_HEADER,
+            "b".repeat(64).parse().expect("changed topology"),
+        );
+        assert_eq!(
+            service
+                .rename_multipart_data(changed_topology)
+                .await
+                .expect_err("multipart topology must remain bound to its digest")
+                .code(),
+            tonic::Code::PermissionDenied
         );
     }
 
@@ -8274,13 +8693,17 @@ mod tests {
 
     #[tokio::test]
     async fn rename_data_same_uuid_uses_captured_instance_instead_of_global_disk() {
+        use crate::storage::storage_api::ecstore_disk::{MultipartSourceRequest, MultipartSourceResponse};
         use crate::storage::storage_api::{
             ECStore,
             ecstore_disk::{DiskAPI, RUSTFS_META_BUCKET, ReadOptions},
             init_local_disks_with_instance_ctx, new_instance_ctx, read_config_no_lock,
         };
         use rustfs_filemeta::{FileInfo, ObjectPartInfo};
+        use sha2::{Digest, Sha256};
         use tokio_util::sync::CancellationToken;
+
+        let _ = rustfs_credentials::set_global_rpc_secret(Uuid::new_v4().to_string());
 
         async fn build_store(root: &std::path::Path) -> Arc<ECStore> {
             let mut endpoints = Vec::new();
@@ -8448,6 +8871,110 @@ mod tests {
                 .await
                 .expect("global UUID lookup must resolve B before the request");
             assert!(Arc::ptr_eq(&global_disk, &disk_b));
+
+            // Recovery must use the same captured instance even when the
+            // physical upload heads and disk UUIDs are deliberately identical.
+            let source_bucket = "recovery-context-bucket";
+            let source_object = "source-object";
+            let source_path = format!(
+                "{}/{}",
+                rustfs_utils::crypto::hex(Sha256::digest(format!("{source_bucket}/{source_object}").as_bytes())),
+                Uuid::new_v4()
+            );
+            let source_dir = Uuid::new_v4();
+            let mut source_info = FileInfo::new(source_object, 2, 2);
+            source_info.fresh = true;
+            source_info.erasure.index = 1;
+            source_info.erasure.distribution = vec![1, 2, 3, 4];
+            source_info.data_dir = Some(source_dir);
+            source_info.mod_time = Some(OffsetDateTime::now_utc());
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut source_info.metadata,
+                "multipart-bucket",
+                source_bucket.to_owned(),
+            );
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut source_info.metadata,
+                "multipart-object",
+                source_object.to_owned(),
+            );
+            for (disk, root) in [(&disk_a, root_a.path()), (&disk_b, root_b.path())] {
+                if let Err(error) = disk.make_volume(RUSTFS_META_MULTIPART_BUCKET).await {
+                    assert!(matches!(error, DiskError::VolumeExists), "MPU volume: {error}");
+                }
+                disk.write_metadata(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, &source_path, source_info.clone())
+                    .await.expect("real original source head");
+                tokio::fs::create_dir_all(root.join("disk0").join(RUSTFS_META_MULTIPART_BUCKET).join(&source_path).join(source_dir.to_string()))
+                    .await.expect("real source data directory");
+            }
+            let a_source_head = root_a.path().join("disk0").join(RUSTFS_META_MULTIPART_BUCKET).join(&source_path).join("xl.meta");
+            let b_source_head = root_b.path().join("disk0").join(RUSTFS_META_MULTIPART_BUCKET).join(&source_path).join("xl.meta");
+            let source_bytes = tokio::fs::read(&a_source_head).await.expect("A original head bytes");
+            tokio::fs::write(&b_source_head, &source_bytes).await.expect("identical B original head bytes");
+            let source_info = disk_a.read_version(
+                RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, &source_path, "", &ReadOptions::default(),
+            ).await.expect("actual persisted source FI");
+            let lineage = capture_source_condition(source_bucket, source_object, &source_path, &source_info, Uuid::new_v4())
+                .expect("captured actual source lineage").lineage;
+            let inspect = || MultipartSourceRequest {
+                protocol_version: MULTIPART_SOURCE_PROTOCOL_VERSION,
+                path: source_path.clone(),
+                operation: MultipartSourceOperation::Inspect { lineage: Some(lineage.clone()) },
+            };
+            let signed_recovery = |source: &MultipartSourceRequest| {
+                let mut request = Request::new(RecoverMultipartSourceRequest {
+                    disk: disk_id.to_string(), path: source.path.clone(), protocol_version: u32::from(source.protocol_version),
+                    operation: rmp_serde::to_vec_named(&source.operation).expect("typed recovery operation").into(),
+                });
+                let body = rustfs_protos::canonical_recover_multipart_source_request_body(request.get_ref()).expect("recovery body");
+                set_tonic_canonical_body_digest(&mut request, &body).expect("recovery digest");
+                mark_v2_authenticated(&mut request);
+                request
+            };
+            let inspected = service.recover_multipart_source(signed_recovery(&inspect())).await.expect("inspect captured A").into_inner();
+            assert!(inspected.success, "captured A inspection must succeed: {:?}", inspected.error);
+            let inspected: MultipartSourceResponse = rustfs_protos::decode_multipart_source_recovery_payload(&inspected.result).expect("A inspection");
+            let MultipartSourceResponse::Inspected(inspected) = inspected else { panic!("expected A inspection") };
+            let expected_a = inspected.snapshot.expect("A active source snapshot");
+            let inspected_b = store_b.recover_local_multipart_source(&disk_id.to_string(), inspect()).await.expect("inspect B directly");
+            let MultipartSourceResponse::Inspected(inspected_b) = inspected_b else { panic!("expected B inspection") };
+            let expected_b = inspected_b.snapshot.expect("B active source snapshot");
+            assert_eq!(expected_a.disk_id, expected_b.disk_id);
+            assert_eq!(expected_a.head_sha256, expected_b.head_sha256);
+            let a_source_before = internal_snapshot(root_a.path()).await;
+            let b_source_before = internal_snapshot(root_b.path()).await;
+            let mut new_generation = expected_a.generation;
+            new_generation.epoch += 1;
+            new_generation.nonce = Uuid::new_v4();
+            let claim = |expected| MultipartSourceRequest {
+                protocol_version: MULTIPART_SOURCE_PROTOCOL_VERSION,
+                path: source_path.clone(),
+                operation: MultipartSourceOperation::Claim {
+                    expected,
+                    round: serde_json::from_value(serde_json::json!({
+                        "lineage": lineage, "from_generation": expected_a.generation,
+                        "old_attempt": Uuid::new_v4(), "generation": new_generation, "round": Uuid::new_v4()
+                    })).expect("typed recovery round"),
+                },
+            };
+            let claim_a = claim(expected_a.clone());
+            let claimed = service.recover_multipart_source(signed_recovery(&claim_a)).await.expect("claim captured A").into_inner();
+            assert!(claimed.success, "captured A claim must perform its real mutation: {:?}", claimed.error);
+            let claimed: MultipartSourceResponse = rustfs_protos::decode_multipart_source_recovery_payload(&claimed.result).expect("native A claim proof");
+            claimed.validate_wire().expect("native authenticated claim");
+            claimed.validate_for(&claim_a).expect("claim belongs to A request");
+            assert_ne!(internal_snapshot(root_a.path()).await, a_source_before, "A must actually persist its source claim");
+            assert_eq!(internal_snapshot(root_b.path()).await, b_source_before, "B source must remain byte-for-byte unchanged");
+            let claim_b = claim(expected_b);
+            for not_ready in [
+                super::make_server_for_context(None),
+                super::make_server_for_slot(super::ServerContextSlot::with_instance_context(new_instance_ctx())),
+            ] {
+                let denied = not_ready.recover_multipart_source(signed_recovery(&claim_b)).await.expect("typed not-ready response").into_inner();
+                assert!(!denied.success);
+                assert_eq!(denied.error.expect("not-ready error").code, DiskError::DiskNotFound.to_u32());
+                assert_eq!(internal_snapshot(root_b.path()).await, b_source_before, "not-ready listeners must never bind ambient B");
+            }
 
             let topology_a = heal_topology_fingerprint(&store_a.instance_endpoints().expect("A layout")).expect("A identity");
             let topology_b = heal_topology_fingerprint(&store_b.instance_endpoints().expect("B layout")).expect("B identity");

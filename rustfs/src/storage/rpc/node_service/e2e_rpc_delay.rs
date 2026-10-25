@@ -36,6 +36,8 @@ pub(super) enum Method {
     WriteMetadata,
     RenamePart,
     RenameData,
+    RenameMultipartData,
+    RecoverMultipartSource,
     Delete,
     Lock,
     LockBatch,
@@ -82,16 +84,21 @@ impl Arm {
                         && sha256
                             .bytes()
                             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                        && self
-                            .methods
-                            .iter()
-                            .all(|method| matches!(method, Method::WriteMetadata | Method::RenamePart | Method::Delete))
+                        && self.methods.iter().all(|method| {
+                            matches!(
+                                method,
+                                Method::WriteMetadata | Method::RenamePart | Method::Delete | Method::RecoverMultipartSource
+                            )
+                        })
                 }
                 Scope::Object { bucket, key } => {
                     user_bucket(bucket)
                         && !key.is_empty()
                         && key.len() <= 1024
-                        && self.methods.iter().all(|method| *method == Method::RenameData)
+                        && self
+                            .methods
+                            .iter()
+                            .all(|method| matches!(method, Method::RenameData | Method::RenameMultipartData))
                 }
                 Scope::Incarnation { bucket } => {
                     user_bucket(bucket) && self.methods.iter().all(|method| *method == Method::ReadVersion)
@@ -401,6 +408,36 @@ mod tests {
         let mut invalid = valid;
         invalid["methods"] = serde_json::json!(["delete"]);
         assert!(!serde_json::from_value::<Arm>(invalid).expect("known method").validate());
+    }
+
+    #[test]
+    fn rpc_delay_multipart_recovery_is_limited_to_its_upload_scope() {
+        let hash = "a".repeat(64);
+        let arm: Arm = serde_json::from_value(serde_json::json!({
+            "nonce": Uuid::new_v4(), "methods": ["recover_multipart_source"],
+            "scope": { "class": "multipart", "sha256": hash },
+            "delay": { "kind": "delay", "milliseconds": 80 }
+        }))
+        .expect("multipart recovery arm");
+        assert!(arm.validate());
+        assert!(arm.matches(Method::RecoverMultipartSource, ".rustfs.sys/multipart", &format!("{hash}/upload")));
+        assert!(!arm.matches(Method::RecoverMultipartSource, ".rustfs.sys", &format!("{hash}/upload")));
+        assert!(!arm.matches(Method::RecoverMultipartSource, ".rustfs.sys/multipart", "other/upload"));
+        assert!(!arm.matches(Method::Delete, ".rustfs.sys/multipart", &format!("{hash}/upload")));
+    }
+
+    #[test]
+    fn rpc_delay_multipart_rename_matches_only_the_complete_object() {
+        let mut value = serde_json::json!({ "nonce": Uuid::new_v4(), "methods": ["rename_multipart_data"],
+            "scope": { "class": "object", "bucket": "mpu-scope", "key": "complete-object" },
+            "delay": { "kind": "delay", "milliseconds": 80 } });
+        let arm: Arm = serde_json::from_value(value.clone()).expect("multipart rename arm");
+        assert!(arm.validate());
+        assert!(arm.matches(Method::RenameMultipartData, "mpu-scope", "complete-object"));
+        assert!(!arm.matches(Method::RenameData, "mpu-scope", "complete-object"));
+        assert!(!arm.matches(Method::RenameMultipartData, "mpu-scope", "other-object"));
+        value["scope"] = serde_json::json!({ "class": "multipart", "sha256": "a".repeat(64) });
+        assert!(!serde_json::from_value::<Arm>(value).expect("multipart scope arm").validate());
     }
 
     #[test]

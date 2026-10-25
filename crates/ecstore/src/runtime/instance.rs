@@ -45,6 +45,7 @@ use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, TransitionStat
 use crate::bucket::metadata_sys::BucketMetadataSys;
 use crate::bucket::replication::{DynReplicationPool, ReplicationStats};
 use crate::disk::DiskStore;
+use crate::disk::multipart_source::ProofVerificationContext;
 use crate::layout::endpoints::{EndpointServerPools, SetupType};
 use crate::object_api::ObjectEncryptionResolver;
 use crate::services::event_notification::EventNotifier;
@@ -222,6 +223,8 @@ pub struct InstanceContext {
     /// Write-once: storage startup publishes the server pools exactly once.
     /// Replaces the process-global endpoints static.
     endpoints: OnceLock<EndpointServerPools>,
+    /// Only a complete validated topology may enable native local proof origin.
+    multipart_proof_topology: OnceLock<([u8; 32], ProofVerificationContext)>,
     /// This instance's tier configuration manager (Phase 5 Slice 7, backlog#939).
     ///
     /// Lazily materialized on first access so `InstanceContext::new()` stays
@@ -363,6 +366,7 @@ impl InstanceContext {
             region: OnceLock::new(),
             deployment_id: OnceLock::new(),
             endpoints: OnceLock::new(),
+            multipart_proof_topology: OnceLock::new(),
             tier_config_mgr: OnceLock::new(),
             event_notifier: OnceLock::new(),
             expiry_state: OnceLock::new(),
@@ -806,6 +810,38 @@ impl InstanceContext {
     /// This instance's endpoint topology, if it has been set.
     pub fn endpoints(&self) -> Option<EndpointServerPools> {
         self.endpoints.get().cloned()
+    }
+
+    /// Keep one authority identity across complete local registry reinitializations.
+    /// Changing the instance or crossing the local/RPC mode boundary is forbidden.
+    pub(crate) fn bind_multipart_proof_topology(
+        &self,
+        endpoints: &EndpointServerPools,
+    ) -> crate::disk::error::Result<ProofVerificationContext> {
+        // Registry vectors are indexed by pool_idx. Validate every index before
+        // adding endpoint permissions or allowing a caller to clear the registry.
+        if endpoints.as_ref().iter().enumerate().any(|(pool, entry)| {
+            entry
+                .endpoints
+                .as_ref()
+                .iter()
+                .any(|endpoint| usize::try_from(endpoint.pool_idx).ok() != Some(pool))
+        }) {
+            return Err(crate::disk::error::DiskError::InconsistentDisk);
+        }
+        let (identity, authority) = ProofVerificationContext::for_topology(endpoints)?;
+        let stored = self.multipart_proof_topology.get_or_init(|| (identity, authority.clone()));
+        if stored.0 != identity {
+            stored.1.register_topology(&authority)?;
+        }
+        Ok(stored.1.clone())
+    }
+
+    pub(crate) fn multipart_proof_verification_context(&self) -> ProofVerificationContext {
+        self.multipart_proof_topology
+            .get()
+            .map(|(_, authority)| authority.clone())
+            .unwrap_or_default()
     }
 
     /// This instance's tier configuration manager, materializing it on first
@@ -1702,5 +1738,136 @@ mod tests {
         token_a.cancel();
         assert!(a.background_cancel_token().expect("a token").is_cancelled());
         assert!(b.background_cancel_token().is_none());
+    }
+}
+
+#[cfg(test)]
+mod multipart_instance_authority_tests {
+    use super::*;
+    use crate::layout::endpoint::Endpoint;
+    use crate::layout::endpoints::PoolEndpoints;
+
+    fn local_topology(root: &str) -> EndpointServerPools {
+        let mut endpoint = Endpoint::try_from(root).expect("local endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: vec![endpoint].into(),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }])
+    }
+
+    #[test]
+    fn multipart_instance_authority_is_explicit_stable_across_local_topologies() {
+        let ctx = InstanceContext::new();
+        assert!(matches!(ctx.multipart_proof_verification_context(), ProofVerificationContext::RpcOnly));
+        let topology = local_topology("/tmp/multipart-instance-a");
+        let first = ctx
+            .bind_multipart_proof_topology(&topology)
+            .expect("complete local topology should bind");
+        let again = ctx
+            .bind_multipart_proof_topology(&topology)
+            .expect("reopening the same topology should retain authority");
+        assert!(first.same_authority(&again));
+        assert!(first.same_authority(&ctx.multipart_proof_verification_context()));
+        let replacement = local_topology("/tmp/multipart-instance-b");
+        let extended = ctx
+            .bind_multipart_proof_topology(&replacement)
+            .expect("a complete local reinitialization should retain the native owner");
+        assert!(first.same_authority(&extended));
+        first.validate_endpoint(&topology.0[0].endpoints.as_ref()[0]).unwrap();
+        first.validate_endpoint(&replacement.0[0].endpoints.as_ref()[0]).unwrap();
+        assert!(first.same_authority(&ctx.multipart_proof_verification_context()));
+        let independent = InstanceContext::new().bind_multipart_proof_topology(&topology).unwrap();
+        assert!(!first.same_authority(&independent));
+    }
+
+    #[test]
+    fn multipart_distributed_instance_never_becomes_local_after_reinitialization() {
+        let ctx = InstanceContext::new();
+        let mut topology = local_topology("/tmp/multipart-remote-instance");
+        topology.0[0].endpoints.as_mut()[0].is_local = false;
+        assert!(matches!(
+            ctx.bind_multipart_proof_topology(&topology).unwrap(),
+            ProofVerificationContext::RpcOnly
+        ));
+        topology.0[0].endpoints.as_mut()[0].is_local = true;
+        assert!(ctx.bind_multipart_proof_topology(&topology).is_err());
+        assert!(matches!(ctx.multipart_proof_verification_context(), ProofVerificationContext::RpcOnly));
+    }
+
+    #[test]
+    fn multipart_parallel_topology_bind_retains_one_instance_authority() {
+        let ctx = Arc::new(InstanceContext::new());
+        let topologies = (0..4)
+            .map(|slot| local_topology(&format!("/tmp/multipart-parallel-instance-{slot}")))
+            .collect::<Vec<_>>();
+        let authorities = std::thread::scope(|scope| {
+            let tasks = topologies
+                .iter()
+                .map(|topology| {
+                    let ctx = ctx.clone();
+                    scope.spawn(move || ctx.bind_multipart_proof_topology(topology).unwrap())
+                })
+                .collect::<Vec<_>>();
+            tasks.into_iter().map(|task| task.join().unwrap()).collect::<Vec<_>>()
+        });
+        assert!(authorities.iter().all(|authority| authority.same_authority(&authorities[0])));
+        for topology in topologies {
+            authorities[0]
+                .validate_endpoint(&topology.0[0].endpoints.as_ref()[0])
+                .unwrap();
+        }
+    }
+    #[test]
+    fn multipart_topology_registration_rejects_invalid_indices_and_mode_switch_without_granting_endpoints() {
+        let ctx = InstanceContext::new();
+        let original = local_topology("/tmp/multipart-original-registry");
+        let first = ctx.bind_multipart_proof_topology(&original).unwrap();
+        let candidate = local_topology("/tmp/multipart-unregistered-candidate");
+        let mut outside = candidate.clone();
+        outside.0[0].endpoints.as_mut()[0].set_pool_index(1);
+        assert!(
+            ctx.bind_multipart_proof_topology(&outside).is_err(),
+            "one pool cannot address registry slot one"
+        );
+        assert!(first.validate_endpoint(&outside.0[0].endpoints.as_ref()[0]).is_err());
+        let fresh = InstanceContext::new();
+        assert!(fresh.bind_multipart_proof_topology(&outside).is_err());
+        assert!(
+            fresh.multipart_proof_topology.get().is_none(),
+            "invalid initial registration must have no authority effect"
+        );
+
+        let mut sparse = candidate.clone();
+        let mut second = local_topology("/tmp/multipart-unregistered-second").0.remove(0);
+        second.endpoints.as_mut()[0].set_pool_index(2);
+        sparse.0.push(second);
+        assert!(ctx.bind_multipart_proof_topology(&sparse).is_err());
+        assert!(
+            first.validate_endpoint(&candidate.0[0].endpoints.as_ref()[0]).is_err(),
+            "a valid early pool cannot be partially granted"
+        );
+        let mut mixed = candidate.clone();
+        let mut second = local_topology("/tmp/multipart-remote-later-pool").0.remove(0);
+        second.endpoints.as_mut()[0].set_pool_index(1);
+        second.endpoints.as_mut()[0].is_local = false;
+        mixed.0.push(second);
+        assert!(
+            ctx.bind_multipart_proof_topology(&mixed).is_err(),
+            "local authority cannot switch mode for a remote later pool"
+        );
+        assert!(first.validate_endpoint(&candidate.0[0].endpoints.as_ref()[0]).is_err());
+        let mut incomplete = candidate.clone();
+        incomplete.0[0].drives_per_set = 2;
+        assert!(ctx.bind_multipart_proof_topology(&incomplete).is_err());
+        assert!(first.validate_endpoint(&candidate.0[0].endpoints.as_ref()[0]).is_err());
+        assert!(first.same_authority(&ctx.multipart_proof_verification_context()));
+        first.validate_endpoint(&original.0[0].endpoints.as_ref()[0]).unwrap();
     }
 }

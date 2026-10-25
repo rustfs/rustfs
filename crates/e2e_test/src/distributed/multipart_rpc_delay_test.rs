@@ -61,7 +61,7 @@ impl Operation {
         match self {
             Self::Create => "write_metadata",
             Self::Part => "rename_part",
-            Self::Complete => "rename_data",
+            Self::Complete => "rename_multipart_data",
             Self::Abort => "delete",
         }
     }

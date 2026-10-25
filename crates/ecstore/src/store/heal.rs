@@ -3013,10 +3013,36 @@ mod tests {
     async fn replacement_format_heal_initialized_identity_without_pool_meta_never_writes_and_latches() {
         let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
         let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        // Simulate physical loss; raw deletion of authoritative pool.bin is
+        // deliberately rejected by the native metadata mutation guard.
         for pool in &store.pools {
-            delete_config(pool.clone(), POOL_META_NAME)
+            let (original_identity, _) = read_config_no_lock_preserve_empty_with_metadata(pool.clone(), POOL_META_IDENTITY_NAME)
                 .await
-                .expect("pool metadata replica should be removable");
+                .expect("initialized identity before physical pool metadata loss");
+            let metadata_set = pool.get_disks_by_key(POOL_META_NAME);
+            let disks = metadata_set.disks.read().await.clone();
+            assert!(disks.iter().all(Option::is_some), "metadata-loss fixture requires every replica online");
+            for disk in disks.iter().flatten() {
+                assert!(disk.is_local(), "metadata-loss fixture requires local disks");
+                let metadata = std::path::PathBuf::from(disk.endpoint().get_file_path())
+                    .join(RUSTFS_META_BUCKET)
+                    .join(POOL_META_NAME);
+                tokio::fs::remove_dir_all(&metadata)
+                    .await
+                    .expect("remove the actual pool metadata shard");
+                assert!(
+                    !tokio::fs::try_exists(&metadata)
+                        .await
+                        .expect("inspect physically absent metadata")
+                );
+            }
+            let (identity_after, _) = read_config_no_lock_preserve_empty_with_metadata(pool.clone(), POOL_META_IDENTITY_NAME)
+                .await
+                .expect("initialized identity survives physical metadata loss");
+            assert!(
+                identity_after == original_identity,
+                "fault injection must preserve the initialized identity bytes"
+            );
         }
 
         let err = store

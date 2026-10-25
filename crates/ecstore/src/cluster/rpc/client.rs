@@ -357,6 +357,7 @@ fn rename_data_grpc_stage(path: &str) -> bool {
     matches!(
         path,
         "/node_service.NodeService/RenameData"
+            | "/node_service.NodeService/RenameMultipartData"
             | "/node_service.NodeService/RenameDataAtIncarnation"
             | "/node_service.NodeService/RenameDataWithQuotaFence"
     )

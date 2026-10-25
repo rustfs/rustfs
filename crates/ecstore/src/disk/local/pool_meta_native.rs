@@ -1837,16 +1837,32 @@ mod tests {
             }
         }
 
+        let upload_root = format!(
+            "{}/{}x{}",
+            "a".repeat(64),
+            Uuid::new_v4(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        let directory = Uuid::new_v4();
+        let mut upload = FileInfo::new(&upload_root, 2, 2);
+        upload.erasure.index = 1;
+        upload.data_dir = Some(directory);
+        upload.mod_time = Some(time::OffsetDateTime::now_utc());
+        upload.fresh = true;
+        disk.write_metadata("", RUSTFS_META_MULTIPART_BUCKET, &upload_root, upload)
+            .await
+            .expect("initialize the real canonical upload head before its Part mutation");
+        let part_path = format!("{upload_root}/{directory}/part.1");
         disk.rename_part(
             RUSTFS_META_TMP_BUCKET,
             source_path,
             RUSTFS_META_MULTIPART_BUCKET,
-            "upload/part.1",
+            &part_path,
             Bytes::from_static(b"part metadata"),
         )
         .await
         .expect("ordinary multipart rename must still publish its part and metadata");
-        let part = dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join("upload/part.1");
+        let part = dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&part_path);
         assert_eq!(fs::read(&part).await.expect("published part"), source_bytes);
         assert_eq!(
             fs::read(part.with_extension("1.meta"))
