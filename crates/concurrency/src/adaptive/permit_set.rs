@@ -13,6 +13,24 @@ use super::{AdaptiveAdmission, AdaptivePermit, MAX_PERMIT_REFERENCES, NodeAdmiss
 /// Matches the bounded physical-device topology. Construct owners during disk
 /// attachment, before object work; this does not acquire or discover resources.
 const MAX_OWNERS: usize = 256;
+const NO_UNIT: usize = usize::MAX;
+
+#[derive(Clone, Copy)]
+struct ResourceMask([u64; MAX_OWNERS / 64]);
+
+impl ResourceMask {
+    fn empty() -> Self {
+        Self([0; MAX_OWNERS / 64])
+    }
+
+    fn insert(&mut self, index: usize) {
+        self.0[index / 64] |= 1 << (index % 64);
+    }
+
+    fn contains(self, index: usize) -> bool {
+        self.0[index / 64] & (1 << (index % 64)) != 0
+    }
+}
 
 /// A stable subset of resource owners, such as the physical leaves backing one
 /// logical disk. Slots are allocated once and reused after their final clone.
@@ -22,6 +40,41 @@ pub struct AdaptivePermitSetOwner {
     turn_order: Box<[usize]>,
     capacity: Arc<AdaptiveAdmission>,
     units: Box<[AtomicUsize]>,
+    all: ResourceMask,
+}
+
+/// A selection from one preallocated resource owner. Build selections during
+/// attachment; combining them for an operation does not allocate or take locks.
+/// Aliases and overlapping disk groups charge each physical resource once.
+#[derive(Clone)]
+pub struct AdaptiveResourceSelection {
+    owner: Arc<AdaptivePermitSetOwner>,
+    selected: ResourceMask,
+}
+
+impl AdaptiveResourceSelection {
+    /// Combine attachments from the same owner generation. A rejected union
+    /// leaves this selection unchanged, so callers can defer stale topology.
+    pub fn union_with(&mut self, other: &Self) -> Result<(), CaptureError> {
+        if !Arc::ptr_eq(&self.owner, &other.owner) {
+            return Err(CaptureError::ResourceOwner);
+        }
+        for (selected, additional) in self.selected.0.iter_mut().zip(other.selected.0) {
+            *selected |= additional;
+        }
+        Ok(())
+    }
+
+    /// Attempt only the selected resources without retaining partial grants.
+    pub fn try_acquire_with_node(&self, node: &Arc<NodeAdmission>) -> Option<NodeResourcePermit> {
+        self.owner.try_acquire_selected(node, self.selected)
+    }
+
+    /// Preserve the owner's FIFO order while waiting for the selected leaves.
+    /// Call before storage locks; cancellation and deadlines belong to callers.
+    pub async fn acquire_with_node(&self, node: &Arc<NodeAdmission>) -> Result<NodeResourcePermit, tokio::sync::AcquireError> {
+        self.owner.acquire_selected(node, self.selected).await
+    }
 }
 
 /// Capturing ownership never waits. Exhaustion must be handled before storage
@@ -77,7 +130,11 @@ impl NodeResourcePermit {
     /// Return physical ownership before recording and releasing node progress.
     pub fn complete(self) {
         let Self { resources, node } = self;
-        for owner in &resources.owner.owners {
+        let first_unit = resources.slot * resources.owner.owners.len();
+        for (index, owner) in resources.owner.owners.iter().enumerate() {
+            if resources.owner.units[first_unit + index].load(Ordering::Relaxed) == NO_UNIT {
+                continue;
+            }
             let _ = owner
                 .completed
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1));
@@ -89,16 +146,21 @@ impl NodeResourcePermit {
 
 struct ResourceTurns<'a> {
     owner: &'a AdaptivePermitSetOwner,
+    selected: ResourceMask,
     held: usize,
 }
 
 impl Drop for ResourceTurns<'_> {
     fn drop(&mut self) {
-        for owner in &self.owner.owners {
-            owner.queued.fetch_sub(1, Ordering::AcqRel);
+        for (index, owner) in self.owner.owners.iter().enumerate() {
+            if self.selected.contains(index) {
+                owner.queued.fetch_sub(1, Ordering::AcqRel);
+            }
         }
         for index in self.owner.turn_order[..self.held].iter().rev() {
-            self.owner.owners[*index].turn.add_permits(1);
+            if self.selected.contains(*index) {
+                self.owner.owners[*index].turn.add_permits(1);
+            }
         }
     }
 }
@@ -122,7 +184,11 @@ impl AdaptivePermitSetOwner {
         let count = usize::from(maximum.get()).div_ceil(64) * 64;
         let mut units = Vec::new();
         units.try_reserve_exact(count * owners.len()).map_err(io::Error::other)?;
-        units.extend((0..count * owners.len()).map(|_| AtomicUsize::new(0)));
+        units.extend((0..count * owners.len()).map(|_| AtomicUsize::new(NO_UNIT)));
+        let mut all = ResourceMask::empty();
+        for index in 0..owners.len() {
+            all.insert(index);
+        }
         // All overlapping sets take FIFO turns in the same order, irrespective
         // of disk attachment order. Strong references keep these addresses stable.
         let mut turn_order: Vec<_> = (0..owners.len()).collect();
@@ -132,7 +198,29 @@ impl AdaptivePermitSetOwner {
             turn_order: turn_order.into_boxed_slice(),
             capacity: AdaptiveAdmission::new(maximum, u32::from(maximum.get())),
             units: units.into_boxed_slice(),
+            all,
         }))
+    }
+
+    /// Resolve an attachment's leaves against this immutable owner outside the
+    /// object path. Repeated aliases select the same unit; foreign owners fail.
+    pub fn select(self: &Arc<Self>, owners: &[Arc<AdaptiveAdmission>]) -> Result<AdaptiveResourceSelection, CaptureError> {
+        if owners.is_empty() || owners.len() > MAX_OWNERS {
+            return Err(CaptureError::ResourceCount);
+        }
+        let mut selected = ResourceMask::empty();
+        for expected in owners {
+            let index = self
+                .owners
+                .iter()
+                .position(|owner| Arc::ptr_eq(owner, expected))
+                .ok_or(CaptureError::ResourceOwner)?;
+            selected.insert(index);
+        }
+        Ok(AdaptiveResourceSelection {
+            owner: self.clone(),
+            selected,
+        })
     }
 
     /// Retain exactly these previously admitted units, in attachment order.
@@ -178,6 +266,13 @@ impl AdaptivePermitSetOwner {
     /// allocation, or wait occurs while projecting native I/O ownership.
     pub fn capture_from(self: &Arc<Self>, source: &AdaptivePermitSet) -> Result<AdaptivePermitSet, CaptureError> {
         if Arc::ptr_eq(self, &source.owner) {
+            let first_unit = source.slot * self.owners.len();
+            if self.units[first_unit..first_unit + self.owners.len()]
+                .iter()
+                .any(|unit| unit.load(Ordering::Relaxed) == NO_UNIT)
+            {
+                return Err(CaptureError::ResourceOwner);
+            }
             // A single-disk plan is already its native subset. Reuse that row
             // so a full carrier pool does not block its own admitted operation.
             return Ok(source.clone());
@@ -193,6 +288,10 @@ impl AdaptivePermitSetOwner {
             // The borrowed source keeps every referenced unit alive throughout
             // projection, even if other carriers release their references.
             let unit_slot = source.owner.units[source_first + source_index].load(Ordering::Relaxed);
+            if unit_slot == NO_UNIT {
+                self.release_units(slot.slot, index);
+                return Err(CaptureError::ResourceOwner);
+            }
             if expected.slots[unit_slot / 64].references[unit_slot % 64]
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |references| {
                     (references < MAX_PERMIT_REFERENCES).then(|| references + 1)
@@ -209,9 +308,13 @@ impl AdaptivePermitSetOwner {
 
     /// Attempt the whole set without waiting or retaining a partial grant.
     pub fn try_acquire_with_node(self: &Arc<Self>, node: &Arc<NodeAdmission>) -> Option<NodeResourcePermit> {
+        self.try_acquire_selected(node, self.all)
+    }
+
+    fn try_acquire_selected(self: &Arc<Self>, node: &Arc<NodeAdmission>, selected: ResourceMask) -> Option<NodeResourcePermit> {
         let slot = self.capacity.try_acquire()?;
         let node = node.try_acquire()?;
-        let resources = self.acquire_units(slot.slot, false).ok()?;
+        let resources = self.acquire_units(slot.slot, false, selected).ok()?;
         Some(NodeResourcePermit { resources, node })
     }
 
@@ -223,30 +326,51 @@ impl AdaptivePermitSetOwner {
         self: &Arc<Self>,
         node: &Arc<NodeAdmission>,
     ) -> Result<NodeResourcePermit, tokio::sync::AcquireError> {
-        if let Some(permit) = self.try_acquire_with_node(node) {
+        self.acquire_selected(node, self.all).await
+    }
+
+    async fn acquire_selected(
+        self: &Arc<Self>,
+        node: &Arc<NodeAdmission>,
+        selected: ResourceMask,
+    ) -> Result<NodeResourcePermit, tokio::sync::AcquireError> {
+        if let Some(permit) = self.try_acquire_selected(node, selected) {
             return Ok(permit);
         }
-        // This reserves bookkeeping only, not a physical or scheduling unit.
-        let slot = self.capacity.acquire().await;
-        for owner in &self.owners {
-            owner.queued.fetch_add(1, Ordering::AcqRel);
+        for (index, owner) in self.owners.iter().enumerate() {
+            if selected.contains(index) {
+                owner.queued.fetch_add(1, Ordering::AcqRel);
+            }
         }
-        let mut turns = ResourceTurns { owner: self, held: 0 };
-        for index in &self.turn_order {
+        let mut turns = ResourceTurns {
+            owner: self,
+            selected,
+            held: 0,
+        };
+        for (position, index) in self.turn_order.iter().enumerate() {
+            if !selected.contains(*index) {
+                continue;
+            }
             self.owners[*index].turn.acquire().await?.forget();
-            turns.held += 1;
+            turns.held = position + 1;
         }
         loop {
-            for owner in &self.owners {
-                Self::wait_available(owner).await;
+            for (index, owner) in self.owners.iter().enumerate() {
+                if selected.contains(index) {
+                    Self::wait_available(owner).await;
+                }
             }
+            // Waiting for a device must not occupy a shared carrier and block
+            // an operation whose selected devices are already available.
+            let slot = self.capacity.acquire().await;
             let node = node.acquire().await;
-            match self.acquire_units(slot.slot, true) {
+            match self.acquire_units(slot.slot, true, selected) {
                 Ok(resources) => return Ok(NodeResourcePermit { resources, node }),
                 Err(index) => {
                     // A leaf may shrink or expire during the node wait. Return
                     // node capacity before any further wait on that leaf.
                     drop(node);
+                    drop(slot);
                     Self::wait_available(&self.owners[index]).await;
                 }
             }
@@ -266,9 +390,17 @@ impl AdaptivePermitSetOwner {
         }
     }
 
-    fn acquire_units(self: &Arc<Self>, slot: usize, owns_turns: bool) -> Result<AdaptivePermitSet, usize> {
+    fn acquire_units(
+        self: &Arc<Self>,
+        slot: usize,
+        owns_turns: bool,
+        selected: ResourceMask,
+    ) -> Result<AdaptivePermitSet, usize> {
         let first_unit = slot * self.owners.len();
         for (index, owner) in self.owners.iter().enumerate() {
+            if !selected.contains(index) {
+                continue;
+            }
             let unit = if owns_turns {
                 owner.acquire_capacity()
             } else {
@@ -299,7 +431,11 @@ impl AdaptivePermitSetOwner {
     fn release_units(&self, slot: usize, count: usize) {
         let first_unit = slot * self.owners.len();
         for (index, owner) in self.owners[..count].iter().enumerate() {
-            owner.release_reference(self.units[first_unit + index].load(Ordering::Relaxed));
+            let unit = self.units[first_unit + index].load(Ordering::Relaxed);
+            if unit != NO_UNIT {
+                owner.release_reference(unit);
+                self.units[first_unit + index].store(NO_UNIT, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -317,8 +453,13 @@ impl Clone for AdaptivePermitSet {
 
 impl std::fmt::Debug for AdaptivePermitSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let first_unit = self.slot * self.owner.owners.len();
+        let resources = self.owner.units[first_unit..first_unit + self.owner.owners.len()]
+            .iter()
+            .filter(|unit| unit.load(Ordering::Relaxed) != NO_UNIT)
+            .count();
         f.debug_struct("AdaptivePermitSet")
-            .field("resources", &self.owner.owners.len())
+            .field("resources", &resources)
             .field("slot", &self.slot)
             .finish()
     }
@@ -360,6 +501,201 @@ mod tests {
         assert!(future.poll(&mut Context::from_waker(Waker::noop())).is_pending());
     }
 
+    #[test]
+    fn selected_union_deduplicates_aliases_and_does_not_charge_an_unselected_device() {
+        let a = gate(1);
+        let b = gate(1);
+        let unrelated = gate(1);
+        unrelated.set_limit(0);
+        let node = node(1);
+        let group = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), unrelated.clone(), b.clone()]).expect("owner");
+        let mut selected = group.select(&[a.clone(), a.clone()]).expect("aliases");
+        selected
+            .union_with(&group.select(&[a.clone(), b.clone()]).expect("overlap"))
+            .expect("same owner");
+        let admitted = selected
+            .try_acquire_with_node(&node)
+            .expect("unselected closed device cannot block this work");
+        assert_eq!(a.snapshot().active, 1, "aliases charge one physical unit");
+        assert_eq!(b.snapshot().active, 1);
+        assert_eq!(unrelated.snapshot().active, 0);
+        assert_eq!(
+            group
+                .capture_from(admitted.resources())
+                .expect_err("partial selection is not the whole owner"),
+            CaptureError::ResourceOwner
+        );
+        let native = AdaptivePermitSetOwner::new(maximum(1), vec![b.clone()]).expect("native subset");
+        let retained = native.capture_from(admitted.resources()).expect("only the touched device");
+        admitted.complete();
+        assert_eq!(a.snapshot().active, 0);
+        assert_eq!(b.snapshot().active, 1, "native work survives the async scheduling unit");
+        assert_eq!(node.snapshot().active, 0);
+        assert_eq!(a.completed(), Some(1));
+        assert_eq!(b.completed(), Some(1));
+        assert_eq!(unrelated.completed(), Some(0), "completion must not credit an unselected device");
+        drop(retained);
+        assert_eq!(b.snapshot().active, 0);
+        assert!(group.units.iter().all(|unit| unit.load(Ordering::Relaxed) == NO_UNIT));
+    }
+
+    #[test]
+    fn selected_projection_rejects_unadmitted_leaves_and_refunds_its_prefix() {
+        let a = gate(1);
+        let b = gate(1);
+        let node = node(1);
+        let group = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("owner");
+        let selected = group.select(std::slice::from_ref(&a)).expect("selection");
+        let admitted = selected.try_acquire_with_node(&node).expect("admitted");
+        let native = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("native subset");
+        assert_eq!(
+            native.capture_from(admitted.resources()).expect_err("b was not admitted"),
+            CaptureError::ResourceOwner
+        );
+        assert_eq!(native.capacity.snapshot().active, 0);
+        assert_eq!(a.snapshot().active, 1);
+        assert_eq!(b.snapshot().active, 0);
+        drop(admitted);
+        assert_eq!(a.snapshot().active, 0, "rejected projection did not retain a prefix");
+        let whole = group.try_acquire_with_node(&node).expect("carrier remains reusable");
+        let retained = native
+            .capture_from(whole.resources())
+            .expect("whole source now covers both leaves");
+        drop((whole, retained));
+        assert_eq!(a.snapshot().active, 0);
+        assert_eq!(b.snapshot().active, 0);
+    }
+
+    #[test]
+    fn selected_union_rejects_a_different_owner_without_changing_the_selection() {
+        let a = gate(1);
+        let b = gate(1);
+        b.set_limit(0);
+        let node = node(1);
+        let group = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("owner");
+        let replacement = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("replacement owner");
+        let mut selected = group.select(std::slice::from_ref(&a)).expect("selection");
+        let additional = replacement.select(std::slice::from_ref(&b)).expect("other generation");
+        assert_eq!(selected.union_with(&additional), Err(CaptureError::ResourceOwner));
+        selected
+            .try_acquire_with_node(&node)
+            .expect("rejected union left b unselected")
+            .complete();
+        assert_eq!(a.completed(), Some(1));
+        assert_eq!(b.completed(), Some(0));
+        assert!(matches!(group.select(&[]), Err(CaptureError::ResourceCount)));
+        assert!(matches!(group.select(&[gate(1)]), Err(CaptureError::ResourceOwner)));
+    }
+
+    #[tokio::test]
+    async fn selected_cancel_returns_only_acquired_turns_across_unselected_gaps() {
+        let gates = [gate(1), gate(1), gate(1)];
+        let node = node(1);
+        let group = AdaptivePermitSetOwner::new(maximum(1), gates.to_vec()).expect("owner");
+        let first = &gates[group.turn_order[0]];
+        let unrelated = &gates[group.turn_order[1]];
+        let last = &gates[group.turn_order[2]];
+        last.set_limit(0);
+        let held_turn = last.turn.acquire().await.expect("hold later turn");
+        let selected = group
+            .select(&[first.clone(), last.clone()])
+            .expect("non-contiguous selection");
+        let mut waiting = Box::pin(selected.acquire_with_node(&node));
+        assert_pending(waiting.as_mut());
+        assert_eq!(first.turn.available_permits(), 0);
+        assert_eq!(unrelated.turn.available_permits(), 1);
+        assert_eq!(unrelated.queued.load(Ordering::Acquire), 0);
+        assert_eq!(node.snapshot().active, 0);
+        assert_eq!(first.snapshot().active, 0);
+        assert!(unrelated.try_acquire().is_some(), "unrelated work keeps its fast path");
+        drop(waiting);
+        assert_eq!(first.turn.available_permits(), 1);
+        assert_eq!(last.turn.available_permits(), 0, "cancellation does not return somebody else's turn");
+        assert_eq!(group.capacity.snapshot().active, 0);
+        assert!(gates.iter().all(|gate| gate.queued.load(Ordering::Acquire) == 0));
+        drop(held_turn);
+        last.set_limit(1);
+        selected
+            .acquire_with_node(&node)
+            .await
+            .expect("cancelled reservations were returned")
+            .complete();
+        assert_eq!(unrelated.completed(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn selected_blocked_device_does_not_reserve_the_shared_carrier() {
+        let stalled = gate(1);
+        let healthy = gate(1);
+        stalled.set_limit(0);
+        let node = node(1);
+        let group = AdaptivePermitSetOwner::new(maximum(1), vec![stalled.clone(), healthy.clone()]).expect("one carrier");
+        let blocked = group.select(std::slice::from_ref(&stalled)).expect("blocked device");
+        let available = group.select(std::slice::from_ref(&healthy)).expect("healthy device");
+        let mut waiting = Box::pin(blocked.acquire_with_node(&node));
+        assert_pending(waiting.as_mut());
+        available
+            .try_acquire_with_node(&node)
+            .expect("a device wait cannot monopolize bookkeeping needed by a healthy device")
+            .complete();
+        drop(waiting);
+        assert_eq!(group.capacity.snapshot().active, 0);
+        assert_eq!(stalled.snapshot().active, 0);
+        assert_eq!(healthy.completed(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn selected_shrink_during_node_wait_leaves_unrelated_work_available() {
+        let a = gate(1);
+        let b = gate(1);
+        let unrelated = gate(1);
+        let node = node(1);
+        let group = AdaptivePermitSetOwner::new(maximum(2), vec![a.clone(), unrelated.clone(), b.clone()]).expect("owner");
+        let selected = group.select(&[a.clone(), b.clone()]).expect("selection");
+        let other = group.select(std::slice::from_ref(&unrelated)).expect("unrelated selection");
+        let busy = node.try_acquire().expect("hold node");
+        let mut waiting = Box::pin(selected.acquire_with_node(&node));
+        assert_pending(waiting.as_mut());
+        assert_eq!(a.snapshot().active, 0);
+        assert_eq!(b.snapshot().active, 0);
+        b.set_limit(0);
+        drop(busy);
+        assert_pending(waiting.as_mut());
+        assert_eq!(node.snapshot().active, 0, "shrink refunds node capacity before the next disk wait");
+        other
+            .try_acquire_with_node(&node)
+            .expect("healthy device is independent")
+            .complete();
+        b.set_limit(1);
+        waiting.await.expect("selected devices recovered").complete();
+        assert_eq!(node.completed(), Some(2));
+        for gate in [&a, &b, &unrelated] {
+            assert_eq!(gate.snapshot().active, 0);
+            assert_eq!(gate.completed(), Some(1));
+        }
+    }
+
+    #[test]
+    fn selected_boundary_bits_and_reused_rows_never_retain_previous_devices() {
+        let gates: Vec<_> = (0..MAX_OWNERS).map(|_| gate(1)).collect();
+        let node = node(1);
+        let group = AdaptivePermitSetOwner::new(maximum(1), gates.clone()).expect("maximum owner count");
+        let boundaries = [0, 63, 64, 127, 128, 191, 192, 255];
+        let selected = group
+            .select(&boundaries.map(|index| gates[index].clone()))
+            .expect("all mask boundaries");
+        let other = group.select(std::slice::from_ref(&gates[1])).expect("different selection");
+        for _ in 0..128 {
+            selected.try_acquire_with_node(&node).expect("boundary resources").complete();
+            other.try_acquire_with_node(&node).expect("reused row").complete();
+            assert!(gates.iter().all(|gate| gate.snapshot().active == 0));
+        }
+        for (index, gate) in gates.iter().enumerate() {
+            assert_eq!(gate.completed(), Some(if boundaries.contains(&index) || index == 1 { 128 } else { 0 }));
+        }
+        assert!(group.units.iter().all(|unit| unit.load(Ordering::Relaxed) == NO_UNIT));
+    }
+
     #[tokio::test]
     async fn cancelled_group_wait_returns_all_turns_without_holding_partial_capacity() {
         let a = gate(1);
@@ -373,7 +709,7 @@ mod tests {
         assert_eq!(a.snapshot().active, 0, "partial physical capacity is never held across a wait");
         assert_eq!(b.snapshot().active, 0);
         assert_eq!(node.snapshot().active, 0, "a blocked disk cannot reserve node capacity");
-        assert_eq!(group.capacity.snapshot().active, 1, "only a bookkeeping row is reserved");
+        assert_eq!(group.capacity.snapshot().active, 0, "a physical wait reserves no shared carrier");
         drop(pending);
         assert_eq!(group.capacity.snapshot().active, 0);
         for owner in [&a, &b] {
