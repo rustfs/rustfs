@@ -906,6 +906,11 @@ test-group = 'e2e-reliability'
 filter = 'package(e2e_test) & test(/^inline_fast_path_cluster_test::/)'
 test-group = 'e2e-inline-boundaries'
 
+[[profile.e2e-full.overrides]]
+filter = 'package(e2e_test) & test(=inline_fast_path_cluster_test::four_node_add_tier_converges)'
+success-output = "immediate"
+junit.store-success-output = true
+
 # Heal interruption cases start whole multi-node clusters. Bound their overlap
 # just as the nightly lane does, without changing membership or retry policy.
 [[profile.e2e-full.overrides]]
