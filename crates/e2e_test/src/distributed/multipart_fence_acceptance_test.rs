@@ -162,7 +162,12 @@ where
                     || error.as_service_error()?.meta().code() != Some("ServiceUnavailable")
                     || !matches!(
                         response.headers().get("x-rustfs-error-cause"),
-                        Some("namespace_lock_timeout" | "namespace_lock_unavailable" | "storage_write_quorum")
+                        Some(
+                            "namespace_lock_timeout"
+                                | "namespace_lock_unavailable"
+                                | "storage_write_quorum"
+                                | "storage_read_quorum"
+                        )
                     )
                 {
                     return None;
@@ -377,6 +382,42 @@ async fn wait_for_lock_peer_recovery(proxies: &[RpcFaultProxy], client: &Client,
     .await
 }
 
+async fn wait_for_storage_peer_recovery(
+    proxies: &[RpcFaultProxy],
+    client: &Client,
+    bucket: &str,
+    upload: &str,
+    drives_per_node: usize,
+) -> TestResult {
+    let scope = upload_scope(upload)?;
+    tokio::time::timeout(
+        DEADLINE,
+        wait_until(
+            DEADLINE,
+            || async {
+                let observers = proxies[1..]
+                    .iter()
+                    .map(|proxy| proxy.pause(&["ReadVersion"], usize::MAX, Some(&scope)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for observer in &observers {
+                    observer.release();
+                }
+                // A fresh absent key forces a full metadata read without mutating
+                // this upload. Count distinct configured disk routes, not retries
+                // from the same healthy disk or just lock-RPC reachability.
+                let key = format!("storage-ready-{}", uuid::Uuid::new_v4());
+                let _ = client.list_parts().bucket(bucket).key(key).upload_id(upload).send().await;
+                Ok(observers
+                    .iter()
+                    .all(|observer| observer.forwarded_routes() >= drives_per_node))
+            },
+            "all storage disk routes recover after fault retirement",
+        ),
+    )
+    .await
+    .map_err(|_| "storage route recovery deadline exceeded".to_string())?
+}
+
 async fn phase_quorum_matrix(
     proxies: &[RpcFaultProxy],
     clients: &[Client],
@@ -417,7 +458,9 @@ async fn phase_quorum_matrix(
                 let request = clients[0].create_multipart_upload().bucket(bucket).key(&key);
                 let result = with_paused_peers(proxies, methods, &limits, bucket, async move { request.send().await }).await?;
                 if let Some(upload) = quorum_outcome(result, unavailable == unavailable_at_quorum, locks)? {
-                    abort_after_fault(&clients[0], bucket, &key, upload.upload_id().ok_or("missing upload ID")?, false).await?;
+                    let upload_id = upload.upload_id().ok_or("missing upload ID")?;
+                    wait_for_storage_peer_recovery(proxies, &clients[0], bucket, upload_id, drives_per_node).await?;
+                    abort_after_fault(&clients[0], bucket, &key, upload_id, false).await?;
                 }
             } else {
                 let upload = clients[0]
@@ -520,9 +563,11 @@ async fn phase_quorum_matrix(
                     }
                     _ => unreachable!(),
                 }
-                // Cleanup must recover even after a below-quorum mutation;
-                // only an already retired session may return NoSuchUpload.
-                abort_after_fault(&clients[0], bucket, &key, upload_id, true).await?;
+                wait_for_storage_peer_recovery(proxies, &clients[0], bucket, upload_id, drives_per_node).await?;
+                // A rejected Complete must retain authority for ordinary
+                // Abort. NoSuchUpload must not hide partial staging loss.
+                let allow_missing = phase != "complete" || unavailable == unavailable_at_quorum;
+                abort_after_fault(&clients[0], bucket, &key, upload_id, allow_missing).await?;
                 recover_after_fault(&format!("DeleteObject {key} after {phase}"), || {
                     clients[0].delete_object().bucket(bucket).key(&key).send()
                 })

@@ -7022,6 +7022,14 @@ impl LocalDisk {
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
         crate::hp_guard!("LocalDisk::write_metadata");
+        if volume == super::RUSTFS_META_MULTIPART_BUCKET {
+            let recovery = self.io_get_object_path(volume, &format!("{path}/{}", super::MULTIPART_RECOVERY_DIR))?;
+            match fs::symlink_metadata(recovery).await {
+                Ok(_) => return Err(DiskError::FileNotFound),
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(to_file_error(error).into()),
+            }
+        }
         fi.validate_for_metadata_read()?;
         let p = self.io_get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
 
