@@ -22,8 +22,8 @@ use super::harness::{
     wait_for_rebalance_complete,
 };
 use super::scanner_heal_topology_fixture::{
-    MOVEMENT_COMPLETE_TIMEOUT, MovementOperation, SEED_POOL, STAGE_BEFORE_SOURCE_CLEANUP, TopologyRun,
-    assert_bucket_durability_strict, assert_process_durability_strict, require_test_hooks,
+    MOVEMENT_COMPLETE_TIMEOUT, MovementOperation, SEED_POOL, STAGE_AFTER_RESPONSIBILITY_PERSISTED, STAGE_BEFORE_SOURCE_CLEANUP,
+    TopologyRun, assert_bucket_durability_strict, assert_process_durability_strict, require_test_hooks,
 };
 use crate::common::init_logging;
 use crate::fake_s3_target::{FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, Operation, RequestRecord};
@@ -368,8 +368,41 @@ async fn tier_delete_during_movement(decommission: bool) -> TestResult {
     assert_eq!(seeded.len(), 2 * DRIVES_PER_NODE);
     assert!(seeded.iter().all(|owner| owner.pool == SEED_POOL && !owner.free));
 
-    run.movement_barrier
-        .arm_movement(operation, &bucket, KEY, STAGE_BEFORE_SOURCE_CLEANUP)?;
+    let mut decommission_start = Box::pin(start_decommission(&run.dist.cluster, DECOMMISSION_POOL_ID));
+    let mut startup = Value::Null;
+    if decommission {
+        run.movement_barrier.arm_movement(
+            "decommission_start",
+            ".rustfs.sys",
+            "pool.bin",
+            STAGE_AFTER_RESPONSIBILITY_PERSISTED,
+        )?;
+        let requested_at = OffsetDateTime::now_utc();
+        let preparation_started = Instant::now();
+        let reached = tokio::select! {
+            reached = run.movement_barrier.wait_reached(MOVEMENT_COMPLETE_TIMEOUT) => {
+                reached.map_err(|error| format!(
+                    "G-TIER decommission start preparation failed before DELETE: {error}"
+                ))?
+            }
+            result = &mut decommission_start => {
+                return Err(format!(
+                    "G-TIER decommission start preparation returned before durable-start barrier {}: {result:?}",
+                    run.movement_barrier.nonce()
+                ).into());
+            }
+        };
+        startup = json!({
+            "requested_at": requested_at.format(&Rfc3339)?,
+            "parked_at": OffsetDateTime::now_utc().format(&Rfc3339)?,
+            "preparation_elapsed_ms": preparation_started.elapsed().as_millis(),
+            "barrier": reached,
+        });
+    }
+    // The durable-start barrier has released the movement writer but has not
+    // started a worker. Install a separate release nonce before holding DELETE.
+    let cleanup_barrier = run.movement_barrier.next_phase();
+    cleanup_barrier.arm_movement(operation, &bucket, KEY, STAGE_BEFORE_SOURCE_CLEANUP)?;
     let mut delete_gate = target.hold_delete_object(&remote_bucket, &old_remote.key);
     // The public DELETE persists a free owner and enqueues its remote cleanup.
     let client = run.dist.client(0)?;
@@ -379,9 +412,15 @@ async fn tier_delete_during_movement(decommission: bool) -> TestResult {
         .key(KEY)
         .version_id(&old_version)
         .send()
-        .await?;
-    timeout(TRANSITION_TIMEOUT, delete_gate.wait_until_entered()).await??;
-    let overlap_deadline = Instant::now() + DELETE_OVERLAP_TIMEOUT;
+        .await
+        .map_err(|error| format!("G-TIER {operation} public DELETE before remote gate failed: {error}; startup={startup}"))?;
+    timeout(TRANSITION_TIMEOUT, delete_gate.wait_until_entered())
+        .await
+        .map_err(|error| format!("G-TIER {operation} DELETE gate entry timed out: {error}; startup={startup}"))?
+        .map_err(|error| format!("G-TIER {operation} DELETE gate entry failed: {error}; startup={startup}"))?;
+    let delete_gate_entered_at = OffsetDateTime::now_utc();
+    let overlap_started = Instant::now();
+    let overlap_deadline = overlap_started + DELETE_OVERLAP_TIMEOUT;
     let held = owners(&run, &bucket, &remote_bucket)?;
     assert_eq!(held.len(), 2 * DRIVES_PER_NODE);
     let old_owners: Vec<_> = held.iter().filter(|owner| owner.remote == old_remote).collect();
@@ -410,30 +449,54 @@ async fn tier_delete_during_movement(decommission: bool) -> TestResult {
     assert!(deletes(&target, &live_remote).is_empty());
 
     let movement_started = OffsetDateTime::now_utc();
+    if decommission {
+        startup["released_at"] = json!(movement_started.format(&Rfc3339)?);
+        run.movement_barrier.release_movement()?;
+    }
     let rebalance_id = timeout_at(overlap_deadline, async {
         if decommission {
-            start_decommission(&run.dist.cluster, DECOMMISSION_POOL_ID).await?;
+            decommission_start.as_mut().await?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(None)
         } else {
             Ok(Some(start_rebalance(&run.dist.cluster).await?))
         }
     })
-    .await??;
-    let pending = timeout_at(overlap_deadline, pending_publication(&run, &bucket, movement_started)).await??;
+    .await
+    .map_err(|error| {
+        format!("G-TIER {operation} start acknowledgment timed out within DELETE overlap: {error}; startup={startup}")
+    })?
+    .map_err(|error| {
+        format!("G-TIER {operation} start acknowledgment failed within DELETE overlap: {error}; startup={startup}")
+    })?;
+    drop(decommission_start);
+    let movement_acknowledged_at = OffsetDateTime::now_utc();
+    let pending = timeout_at(overlap_deadline, pending_publication(&run, &bucket, movement_started))
+        .await
+        .map_err(|error| format!(
+            "G-TIER {operation} publication pending timed out within DELETE overlap: {error}; startup={startup}; lock_events={:?}; cleanup_barrier={:?}",
+            lock_events(&run, &bucket), cleanup_barrier.reached_observations()
+        ))?
+        .map_err(|error| format!("G-TIER {operation} publication pending failed within DELETE overlap: {error}"))?;
     // Positive gate entry, exact physical ownership and the pending lock attempt
     // establish the overlap; an absent log alone is not an ordering assertion.
     assert_eq!(owners(&run, &bucket, &remote_bucket)?, held);
     assert_remote(&target, &old_remote, &old_body)?;
     let released_at = OffsetDateTime::now_utc();
+    let delete_overlap_elapsed_ms = overlap_started.elapsed().as_millis();
     drop(delete_gate);
-    let acquired = timeout(DELETE_OVERLAP_TIMEOUT, acquired_publication(&run, &bucket, &pending)).await??;
+    let acquired = timeout(DELETE_OVERLAP_TIMEOUT, acquired_publication(&run, &bucket, &pending))
+        .await
+        .map_err(|error| format!(
+            "G-TIER {operation} publication acquired after DELETE release timed out: {error}; pending={pending}; lock_events={:?}; cleanup_barrier={:?}",
+            lock_events(&run, &bucket), cleanup_barrier.reached_observations()
+        ))?
+        .map_err(|error| format!("G-TIER {operation} publication acquired after DELETE release failed: {error}"))?;
     assert!(event_time(&pending)? >= movement_started && event_time(&pending)? < released_at);
     assert!(
         event_time(&acquired)? >= released_at,
         "the same publication attempt must acquire after DELETE is released"
     );
-    let reached = run
-        .movement_barrier
+    let reached = cleanup_barrier
         .wait_reached_during(
             &run.dist.cluster,
             match rebalance_id.as_deref() {
@@ -442,7 +505,8 @@ async fn tier_delete_during_movement(decommission: bool) -> TestResult {
             },
             MOVEMENT_COMPLETE_TIMEOUT,
         )
-        .await?;
+        .await
+        .map_err(|error| format!("G-TIER {operation} before-source-cleanup barrier failed: {error}"))?;
     let published = owners(&run, &bucket, &remote_bucket)?;
     assert!(
         published
@@ -454,8 +518,8 @@ async fn tier_delete_during_movement(decommission: bool) -> TestResult {
     assert_eq!(published.len(), publication_pools.len() * DRIVES_PER_NODE);
     assert!(target.stored_versions(&remote_bucket, &old_remote.key).is_empty());
     assert_remote(&target, &live_remote, &live_body)?;
-    run.movement_barrier.release_movement()?;
-    run.movement_barrier.disarm()?;
+    cleanup_barrier.release_movement()?;
+    cleanup_barrier.disarm()?;
     let completion = match rebalance_id.as_deref() {
         Some(id) => {
             wait_for_rebalance_complete(&run.dist.cluster, id, MOVEMENT_COMPLETE_TIMEOUT).await?;
@@ -520,6 +584,12 @@ async fn tier_delete_during_movement(decommission: bool) -> TestResult {
         &format!("g-tier-{operation}"),
         &json!({
             "gate": "G-TIER", "operation": operation, "rebalance_id": rebalance_id,
+            "startup": startup,
+            "delete_gate_entered_at": delete_gate_entered_at.format(&Rfc3339)?,
+            "movement_overlap_started_at": movement_started.format(&Rfc3339)?,
+            "movement_acknowledged_at": movement_acknowledged_at.format(&Rfc3339)?,
+            "delete_overlap_timeout_ms": DELETE_OVERLAP_TIMEOUT.as_millis(),
+            "delete_overlap_elapsed_ms": delete_overlap_elapsed_ms,
             "remote_backend": "HTTP fake_s3_target with versioning enabled",
             "ordering": "remote DELETE held, mover publication waiting, DELETE released, same publication acquired",
             "bucket": bucket, "key": KEY, "bucket_durability": bucket_durability,

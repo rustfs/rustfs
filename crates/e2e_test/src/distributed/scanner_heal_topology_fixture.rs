@@ -334,6 +334,11 @@ impl FileBarrier {
         &self.nonce
     }
 
+    /// Keep the previous phase's release handle while arming a fresh nonce.
+    pub(crate) fn next_phase(&self) -> Self {
+        Self::new(self.dir.clone())
+    }
+
     fn write_atomic(&self, name: &str, body: &[u8]) -> TestResult {
         let tmp = self.dir.join(format!(".{name}.{}.tmp", Uuid::new_v4().simple()));
         std::fs::write(&tmp, body)?;
