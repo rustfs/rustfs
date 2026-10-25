@@ -40,6 +40,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::{
     collections::HashMap,
+    io,
     path::PathBuf,
     pin::Pin,
     sync::{
@@ -1666,6 +1667,25 @@ impl LocalDiskWrapper {
         context
     }
 
+    // Projection cannot wait: callers may already hold namespace or cache locks.
+    // Enter before identity probes, disk permits, or owned native jobs are created.
+    async fn with_native_resources<F: std::future::Future>(&self, operation: F) -> Result<F::Output> {
+        use crate::disk::io_admission::ResourceIoUnit;
+
+        let Some(ResourceIoUnit::Set(resources)) = current_resource_unit() else {
+            return Ok(operation.await);
+        };
+        let unavailable = || DiskError::Io(io::Error::from(io::ErrorKind::WouldBlock));
+        let plan = self.physical_admission.plan().ok_or_else(unavailable)?;
+        let native = plan
+            .capture_native(&resources)
+            .map_err(|error| DiskError::Io(io::Error::new(io::ErrorKind::WouldBlock, error)))?;
+        if !plan.is_current() {
+            return Err(unavailable());
+        }
+        Ok(crate::disk::with_background_resource_set(native, operation).await)
+    }
+
     async fn acquire_disk_io_permit(&self) -> Result<Option<crate::disk::io_admission::DiskIoPermit>> {
         if let Some(context) = current_disk_io_context() {
             if let Some(permit) = context.permit
@@ -2077,6 +2097,19 @@ impl LocalDiskWrapper {
         opts: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Vec<Option<Error>> {
+        let count = versions.len();
+        self.with_native_resources(self.delete_versions_admitted(volume, versions, opts, namespace_owner))
+            .await
+            .unwrap_or_else(|error| vec![Some(error); count])
+    }
+
+    async fn delete_versions_admitted(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Vec<Option<Error>> {
         let version_count = versions.len();
         self.metrics.record_operation_call("delete_versions");
         // Check if disk is faulty before proceeding
@@ -2123,6 +2156,19 @@ impl LocalDiskWrapper {
     }
 
     pub(crate) async fn delete_versions_guarded_with_namespace_owner(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Vec<Option<Error>> {
+        let count = versions.len();
+        self.with_native_resources(self.delete_versions_guarded_admitted(volume, versions, opts, namespace_owner))
+            .await
+            .unwrap_or_else(|error| vec![Some(error); count])
+    }
+
+    async fn delete_versions_guarded_admitted(
         &self,
         volume: &str,
         versions: Vec<GuardedFileInfoVersions>,
@@ -2319,6 +2365,28 @@ impl LocalDiskWrapper {
     }
 
     async fn track_disk_health_with_op_timeout_action_and_mutation_with_io_permit<T, F, Fut>(
+        &self,
+        op: &'static str,
+        operation: F,
+        timeout_duration: Duration,
+        timeout_health_action: TimeoutHealthAction,
+        mutation: DiskMetricMutation,
+    ) -> Result<T>
+    where
+        F: FnOnce(Option<crate::disk::io_admission::DiskIoPermit>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        self.with_native_resources(self.track_admitted_disk_operation(
+            op,
+            operation,
+            timeout_duration,
+            timeout_health_action,
+            mutation,
+        ))
+        .await?
+    }
+
+    async fn track_admitted_disk_operation<T, F, Fut>(
         &self,
         op: &'static str,
         operation: F,
@@ -2936,25 +3004,29 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn read_file(&self, volume: &str, path: &str) -> Result<crate::disk::FileReader> {
-        let reader = self
-            .track_disk_health_with_op(
-                "read_file",
-                || async { self.disk.read_file(volume, path).await },
-                get_max_timeout_duration(),
-            )
-            .await?;
-        Ok(Box::new(AdmissionReader::new(reader, self.io_admission.clone(), self.disk_io_context())))
+        self.track_disk_health_with_op(
+            "read_file",
+            || async {
+                let reader = self.disk.read_file(volume, path).await?;
+                Ok(Box::new(AdmissionReader::new(reader, self.io_admission.clone(), self.disk_io_context()))
+                    as crate::disk::FileReader)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<crate::disk::FileReader> {
-        let reader = self
-            .track_disk_health_with_op(
-                "read_file_stream",
-                || async { self.disk.read_file_stream(volume, path, offset, length).await },
-                get_max_timeout_duration(),
-            )
-            .await?;
-        Ok(Box::new(AdmissionReader::new(reader, self.io_admission.clone(), self.disk_io_context())))
+        self.track_disk_health_with_op(
+            "read_file_stream",
+            || async {
+                let reader = self.disk.read_file_stream(volume, path, offset, length).await?;
+                Ok(Box::new(AdmissionReader::new(reader, self.io_admission.clone(), self.disk_io_context()))
+                    as crate::disk::FileReader)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn read_file_stream_chunks(
@@ -2964,20 +3036,21 @@ impl DiskAPI for LocalDiskWrapper {
         offset: usize,
         length: usize,
     ) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
-        let reader = self
-            .track_disk_health_with_op(
-                "read_file_stream_chunks",
-                || async { self.disk.read_file_stream_chunks(volume, path, offset, length).await },
-                get_max_timeout_duration(),
-            )
-            .await?;
-        Ok(reader.map(|reader| {
-            Box::new(AdmissionReader::new(
-                BoxedChunkReader(reader),
-                self.io_admission.clone(),
-                self.disk_io_context(),
-            )) as rustfs_rio::ChunkReaderBox
-        }))
+        self.track_disk_health_with_op(
+            "read_file_stream_chunks",
+            || async {
+                let reader = self.disk.read_file_stream_chunks(volume, path, offset, length).await?;
+                Ok(reader.map(|reader| {
+                    Box::new(AdmissionReader::new(
+                        BoxedChunkReader(reader),
+                        self.io_admission.clone(),
+                        self.disk_io_context(),
+                    )) as rustfs_rio::ChunkReaderBox
+                }))
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<bytes::Bytes> {
@@ -3836,6 +3909,204 @@ mod tests {
             held_after_cancel, 1,
             "cancelling the waiter must not release a live mutation's resource unit"
         );
+    }
+
+    #[tokio::test]
+    async fn local_disk_resource_projection_releases_unrelated_devices_after_native_cancellation() {
+        use crate::disk::io_admission::spawn_blocking_with_disk_io_permit;
+        use rustfs_concurrency::adaptive::{
+            AdaptiveAdmission, FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure,
+            permit_set::AdaptivePermitSetOwner,
+        };
+        use std::num::NonZeroU16;
+
+        let dir = tempfile::tempdir().expect("local disk fixture");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+        let first = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let second = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let shared = AdaptivePermitSetOwner::new(NonZeroU16::MIN, vec![first.clone(), second.clone()])
+            .expect("shared operation resources");
+        wrapper
+            .physical_admission
+            .set_test_shared_capacity(shared.clone(), vec![first.clone()])
+            .expect("only the first device backs this wrapper");
+        let node = NodeAdmission::new(NonZeroU16::MIN);
+        node.update(
+            &mut FeedbackController::new(),
+            Some(FeedbackObservation {
+                generation: 1,
+                max_concurrency: 1,
+                pressure: ResourcePressure::Unknown,
+                completed_units: None,
+            }),
+        );
+        let parent = shared.try_acquire_with_node(&node).expect("parent admits both devices");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            crate::disk::with_background_resource_set(parent.resources().clone(), async {
+                wrapper
+                    .track_disk_health_with_op_timeout_action_and_mutation_with_io_permit(
+                        "read_all",
+                        move |permit| async move {
+                            spawn_blocking_with_disk_io_permit(permit, move || {
+                                started_tx.send(()).expect("signal native start");
+                                release_rx.blocking_recv().expect("release native I/O");
+                            })
+                            .await
+                            .expect("native I/O joined");
+                            Ok(())
+                        },
+                        Duration::ZERO,
+                        TimeoutHealthAction::MarkFailure,
+                        DiskMetricMutation::None,
+                    )
+                    .await
+                    .expect("wrapped I/O");
+            })
+            .await;
+            parent.complete();
+        });
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("native work starts")
+            .expect("start notification");
+        task.abort();
+        assert!(task.await.expect_err("cancel waiter").is_cancelled());
+        let held = [node.snapshot().active, first.snapshot().active, second.snapshot().active];
+        let healthy_available = second.try_acquire().is_some();
+        release_tx.send(()).expect("finish native work before asserting");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while first.snapshot().active != 0 || second.snapshot().active != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native resource return");
+        assert_eq!(held, [0, 1, 0], "only the actual native device remains charged");
+        assert!(healthy_available, "healthy work must resume before native I/O finishes");
+        assert_eq!(node.completed(), Some(0), "cancelled work is not progress");
+    }
+
+    #[tokio::test]
+    async fn local_disk_resource_projection_escaped_readers_keep_only_their_device() {
+        use rustfs_concurrency::adaptive::{AdaptiveAdmission, permit_set::AdaptivePermitSetOwner};
+        use std::num::NonZeroU16;
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().expect("reader fixture");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+        tokio::fs::create_dir_all(dir.path().join("bucket"))
+            .await
+            .expect("bucket directory");
+        let bytes = b"physical disk reader payload";
+        tokio::fs::write(dir.path().join("bucket/object"), bytes)
+            .await
+            .expect("reader bytes");
+        let first = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let second = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let shared = AdaptivePermitSetOwner::new(NonZeroU16::MIN, vec![first.clone(), second.clone()]).expect("parent resources");
+        wrapper
+            .physical_admission
+            .set_test_shared_capacity(shared.clone(), vec![first.clone()])
+            .expect("reader device");
+
+        for stream in [false, true] {
+            let a = first.try_acquire().expect("first device");
+            let b = second.try_acquire().expect("second device");
+            let parent = shared.capture(&[&a, &b]).expect("admitted parent");
+            drop((a, b));
+            let mut reader = crate::disk::with_background_resource_set(parent, async {
+                if stream {
+                    wrapper.read_file_stream("bucket", "object", 0, bytes.len()).await
+                } else {
+                    wrapper.read_file("bucket", "object").await
+                }
+            })
+            .await
+            .expect("reader escapes the resource scope");
+            assert_eq!([first.snapshot().active, second.snapshot().active], [1, 0]);
+            assert!(second.try_acquire().is_some(), "unrelated work is available while the reader lives");
+            let mut actual = Vec::new();
+            reader.read_to_end(&mut actual).await.expect("consume escaped reader");
+            assert_eq!(actual, bytes);
+            drop(reader);
+            assert_eq!(first.snapshot().active, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_disk_resource_projection_defers_missing_or_foreign_owners_before_io() {
+        use rustfs_concurrency::adaptive::{AdaptiveAdmission, permit_set::AdaptivePermitSetOwner};
+        use std::num::NonZeroU16;
+
+        let dir = tempfile::tempdir().expect("unavailable resource fixture");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+        let gate = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let shared = AdaptivePermitSetOwner::new(NonZeroU16::MIN, vec![gate.clone()]).expect("parent");
+        let permit = gate.try_acquire().expect("parent device");
+        let parent = shared.capture(&[&permit]).expect("parent ownership");
+        drop(permit);
+        for foreign in [false, true] {
+            if foreign {
+                wrapper
+                    .physical_admission
+                    .set_test_capacity(vec![AdaptiveAdmission::new(NonZeroU16::MIN, 1)])
+                    .expect("replaced device");
+            }
+            crate::disk::with_background_resource_set(parent.clone(), async {
+                let polled = std::cell::Cell::new(false);
+                let result = wrapper
+                    .track_disk_health_with_op(
+                        "read_all",
+                        || async {
+                            polled.set(true);
+                            Ok(())
+                        },
+                        Duration::ZERO,
+                    )
+                    .await;
+                assert!(matches!(result, Err(DiskError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock));
+                assert!(!polled.get(), "unavailable ownership cannot start native work");
+                let group = FileInfoVersions::default();
+                let plain = wrapper
+                    .delete_versions("bucket", vec![group.clone(); 2], DeleteOptions::default())
+                    .await;
+                let guarded = wrapper
+                    .delete_versions_guarded_with_namespace_owner(
+                        "bucket",
+                        vec![
+                            GuardedFileInfoVersions {
+                                group,
+                                expected_current: crate::disk::CurrentDeleteGeneration::Absent
+                            };
+                            2
+                        ],
+                        DeleteOptions::default(),
+                        None,
+                    )
+                    .await;
+                for errors in [plain, guarded] {
+                    assert_eq!(errors.len(), 2);
+                    assert!(errors.iter().all(|error| matches!(error,
+                        Some(DiskError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)));
+                }
+            })
+            .await;
+            assert_eq!(wrapper.health.waiting_count(), 0);
+            assert_eq!(
+                wrapper.metrics_snapshot().total_errors_availability,
+                0,
+                "resource deferral is not a failed drive"
+            );
+            assert_eq!(gate.snapshot().active, 1, "rejection does not refund parent ownership");
+        }
     }
 
     struct PendingWriter;
