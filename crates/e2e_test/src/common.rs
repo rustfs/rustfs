@@ -1514,7 +1514,10 @@ impl RustFSTestClusterEnvironment {
             .address
             .parse::<SocketAddr>()
             .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
-        let listen = SocketAddr::from((Ipv6Addr::LOCALHOST, target.port()));
+        let listen = match target {
+            SocketAddr::V4(_) => SocketAddr::from((Ipv6Addr::LOCALHOST, target.port())),
+            SocketAddr::V6(_) => SocketAddr::from(([127, 0, 0, 1], target.port())),
+        };
         let proxy = crate::rpc_fault_proxy::RpcFaultProxy::start_on(listen, target).await?;
         self.volume_proxy_addresses[node_idx] = Some(proxy.local_addr());
         Ok(proxy)
