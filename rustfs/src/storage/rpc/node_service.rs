@@ -1253,7 +1253,7 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
                 rustfs_protos::encode_mrf_lifecycle_reader_capability(
                     rustfs_heal::heal::mrf_queue::MRF_LIFECYCLE_READER_MAX_FORMAT_VERSION,
                     &topology_member,
-                    NODE_CAPABILITY_SERVER_EPOCH.as_bytes(),
+                    crate::storage::storage_api::mrf_lifecycle_reader_local_process_epoch().as_bytes(),
                 )
                 .map_err(|_| Status::internal("MRF lifecycle reader capability length cannot be represented"))?
             } else {
@@ -5896,6 +5896,10 @@ mod tests {
             rustfs_protos::decode_remote_version_state_capability(&response.result[1..]).expect("reader capability identity");
         assert_eq!(member, "node-a:9000");
         assert!(!Uuid::from_slice(epoch).expect("process epoch").is_nil());
+        assert_eq!(
+            Uuid::from_slice(epoch).expect("shared reader epoch"),
+            crate::storage::storage_api::mrf_lifecycle_reader_local_process_epoch(),
+        );
         let canonical = rustfs_protos::canonical_heal_control_response_body(
             rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
             &fingerprint,

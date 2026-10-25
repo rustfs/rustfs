@@ -11345,6 +11345,19 @@ impl DiskAPI for LocalDisk {
         expected: Option<Bytes>,
         replacement: Option<Bytes>,
     ) -> Result<ConditionalFileUpdate> {
+        let authority = crate::services::notification_sys::current_mrf_lifecycle_publication();
+        let commit_allowed = move || {
+            if authority
+                .as_ref()
+                .is_some_and(|proof| !crate::services::notification_sys::mrf_lifecycle_writer_fleet_proof_current(proof))
+            {
+                return Err(DiskError::conditional_file_not_committed(std::io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "MRF lifecycle writer authority expired or was revoked",
+                )));
+            }
+            Ok(())
+        };
         #[cfg(unix)]
         {
             use rustix::fs::{FlockOperation, flock};
@@ -11354,6 +11367,7 @@ impl DiskAPI for LocalDisk {
             let path = path.to_string();
             let sync_metadata = effective_durability(volume).syncs_commit_metadata();
             return Ok(tokio::task::spawn_blocking(move || {
+                commit_allowed()?;
                 // A persistent directory lock bounds metadata growth. Removing
                 // per-target lock files can split flock ownership across inodes.
                 let lock_path = file_path
@@ -11433,6 +11447,14 @@ impl DiskAPI for LocalDisk {
                                 if sync_metadata {
                                     staged.sync_all().map_err(not_committed)?;
                                 }
+                                #[cfg(any(test, feature = "test-util"))]
+                                os::prepared_publication_test_hooks::run(
+                                    os::prepared_publication_test_hooks::Stage::Rename,
+                                    &file_path,
+                                );
+                                // The file CAS lock precedes the brief proof-slot
+                                // read; proof updates never acquire disk locks.
+                                commit_allowed()?;
                                 std::fs::rename(&temporary, &file_path)?;
                                 Ok(())
                             })();
@@ -11446,6 +11468,7 @@ impl DiskAPI for LocalDisk {
                             }
                         }
                         None => {
+                            commit_allowed()?;
                             std::fs::remove_file(&file_path)?;
                             if sync_metadata
                                 && let Some(parent) = file_path.parent()
@@ -11477,6 +11500,7 @@ impl DiskAPI for LocalDisk {
                     replacement.as_deref(),
                     sync_metadata,
                     &publication_root,
+                    commit_allowed,
                 )
             })
             .await
@@ -11485,7 +11509,7 @@ impl DiskAPI for LocalDisk {
 
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = (volume, path, expected, replacement);
+            let _ = (volume, path, expected, replacement, commit_allowed);
             Err(DiskError::MethodNotAllowed)
         }
     }
