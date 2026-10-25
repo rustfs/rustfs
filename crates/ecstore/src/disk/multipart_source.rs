@@ -119,10 +119,10 @@ impl ProofVerificationContext {
     }
 
     pub(crate) fn validate_endpoint(&self, endpoint: &super::endpoint::Endpoint) -> Result<()> {
-        if let Self::Local(authority) = self {
-            if !endpoint.is_local || !authority.endpoints.read().contains(endpoint) {
-                return Err(DiskError::InconsistentDisk);
-            }
+        if let Self::Local(authority) = self
+            && (!endpoint.is_local || !authority.endpoints.read().contains(endpoint))
+        {
+            return Err(DiskError::InconsistentDisk);
         }
         Ok(())
     }
@@ -694,7 +694,7 @@ pub enum MultipartSourceOperation {
         round: MultipartRecoveryRound,
     },
     UndoAndClaim {
-        expected: MultipartSourceSnapshot,
+        expected: Box<MultipartSourceSnapshot>,
         publication: PublicationIdentity,
         capability: MultipartUndoCapability,
         round: MultipartRecoveryRound,
@@ -799,10 +799,10 @@ impl MultipartSourceRequest {
             | MultipartSourceOperation::DeleteAborted { expected, .. }
             | MultipartSourceOperation::ConfirmCleanupTarget { expected, .. }
             | MultipartSourceOperation::Claim { expected, .. }
-            | MultipartSourceOperation::UndoAndClaim { expected, .. }
             | MultipartSourceOperation::Restore { expected, .. }
             | MultipartSourceOperation::Activate { expected, .. }
             | MultipartSourceOperation::SealConsumedTerminal { expected, .. } => Some(&expected.lineage),
+            MultipartSourceOperation::UndoAndClaim { expected, .. } => Some(&expected.lineage),
             MultipartSourceOperation::ConfirmTerminal { publication, .. } => Some(&publication.lineage),
         };
         if let Some(lineage) = lineage {
@@ -1452,7 +1452,7 @@ mod multipart_proof_authority_tests {
             "a separate instance must not share authority"
         );
         assert!(proof.verify().is_err(), "the RPC-facing default must reject local origin");
-        assert!(proof.clone().verify_with_authority(&authority).is_ok());
+        assert!(proof.verify_with_authority(&authority).is_ok());
     }
 
     #[test]
@@ -1497,7 +1497,7 @@ mod multipart_proof_authority_tests {
         let mut p = proof.clone();
         p.snapshot.inventory_sha256[0] ^= 1;
         changed.push(p);
-        let mut p = proof.clone();
+        let mut p = proof;
         p.snapshot.capability_sha256 = Some([8; 32]);
         changed.push(p);
         for altered in changed {
@@ -1516,7 +1516,7 @@ mod multipart_proof_authority_tests {
         assert!(decoded.verify_with_authority(&authority).is_err());
         assert!(decoded.verify().is_err());
         assert!(decoded.prepare_wire().is_err(), "raw bytes must not become an RPC signing oracle");
-        let mut edited = proof.clone();
+        let mut edited = proof;
         edited.snapshot.revision += 1;
         assert!(
             edited.prepare_wire().is_err(),
@@ -2068,7 +2068,7 @@ mod multipart_proof_authority_tests {
         fi.metadata
             .insert(format!("{MINIO_INTERNAL_PREFIX}{SUFFIX_DATA_MOVED}"), String::new());
         invalids.push(fi);
-        let mut fi = before.clone();
+        let mut fi = before;
         let suffix = format!("{SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX}arn:test");
         insert_str(&mut fi.metadata, &suffix, "version-a".into());
         fi.metadata
@@ -2337,5 +2337,142 @@ mod multipart_proof_authority_tests {
             |_| Err(DiskError::UnsupportedDisk),
         );
         assert!(matches!(result, Err(DiskError::UnsupportedDisk)));
+    }
+}
+
+#[cfg(test)]
+mod boxed_wire_layout_tests {
+    use super::multipart_proof_authority_tests::{fixture, local_authority};
+    use super::*;
+
+    #[derive(Serialize)]
+    #[serde(tag = "operation", rename_all = "snake_case")]
+    enum UnboxedOperation<'a> {
+        UndoAndClaim {
+            expected: &'a MultipartSourceSnapshot,
+            publication: &'a PublicationIdentity,
+            capability: &'a MultipartUndoCapability,
+            round: &'a MultipartRecoveryRound,
+        },
+    }
+
+    #[test]
+    fn boxed_failed_undo_expected_preserves_exact_legacy_msgpack_and_json_bytes() {
+        let (round, snapshot) = fixture();
+        let publication = PublicationIdentity {
+            lineage: round.lineage.clone(),
+            source_generation: round.from_generation,
+            attempt: round.old_attempt,
+            version_id: Some(Uuid::new_v4()),
+            final_data_dir: Uuid::new_v4(),
+            modified_unix_nanos: 1,
+            completion_identity: [7; 32],
+        };
+        let operation = MultipartSourceOperation::UndoAndClaim {
+            expected: Box::new(snapshot),
+            publication,
+            capability: MultipartUndoCapability::new(),
+            round,
+        };
+        let MultipartSourceOperation::UndoAndClaim {
+            expected,
+            publication,
+            capability,
+            round,
+        } = &operation
+        else {
+            unreachable!()
+        };
+        let legacy = UnboxedOperation::UndoAndClaim {
+            expected,
+            publication,
+            capability,
+            round,
+        };
+        let encoded = rmp_serde::to_vec_named(&operation).expect("boxed operation encoding");
+        assert_eq!(encoded, rmp_serde::to_vec_named(&legacy).expect("old unboxed operation encoding"));
+        assert_eq!(serde_json::to_vec(&operation).unwrap(), serde_json::to_vec(&legacy).unwrap());
+        let decoded: MultipartSourceOperation = rmp_serde::from_slice(&encoded).expect("existing wire bytes remain accepted");
+        assert_eq!(rmp_serde::to_vec_named(&decoded).unwrap(), encoded);
+    }
+
+    #[derive(Serialize)]
+    struct UnboxedRenameResponse<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        multipart_source: Option<&'a MultipartPublicationResult>,
+        old_data_dir: Option<Uuid>,
+        rollback_data_dir: Option<Uuid>,
+        cleanup_data_dir: Option<Uuid>,
+        sign: Option<&'a Vec<u8>>,
+        old_current_size: Option<super::super::OldCurrentSize>,
+        old_current_source_checked: bool,
+        old_current_source: Option<&'a FileInfo>,
+    }
+
+    #[test]
+    fn boxed_native_result_preserves_response_bytes_and_linear_capability() {
+        let authority = local_authority();
+        let (round, mut snapshot) = fixture();
+        let publication = PublicationIdentity {
+            lineage: round.lineage,
+            source_generation: snapshot.generation,
+            attempt: Uuid::new_v4(),
+            version_id: None,
+            final_data_dir: Uuid::new_v4(),
+            modified_unix_nanos: 1,
+            completion_identity: [9; 32],
+        };
+        let capability = MultipartUndoCapability::new();
+        snapshot.phase = MultipartSourcePhase::ConsumedUnsealed;
+        snapshot.publication = Some(publication.clone());
+        snapshot.head_sha256 = None;
+        snapshot.capability_sha256 = Some(capability.digest());
+        let proof =
+            MultipartSourceProof::issue(&authority, MultipartProofKind::Published, publication.attempt, None, snapshot).unwrap();
+        let response = super::super::RenameDataResp {
+            multipart_source: Some(Box::new(MultipartPublicationResult {
+                publication,
+                proof,
+                undo_capability: capability,
+            })),
+            ..Default::default()
+        };
+        response
+            .multipart_source
+            .as_ref()
+            .unwrap()
+            .verify_with_authority(&authority)
+            .unwrap();
+        let legacy = UnboxedRenameResponse {
+            multipart_source: response.multipart_source.as_deref(),
+            old_data_dir: response.old_data_dir,
+            rollback_data_dir: response.rollback_data_dir,
+            cleanup_data_dir: response.cleanup_data_dir,
+            sign: response.sign.as_ref(),
+            old_current_size: response.old_current_size,
+            old_current_source_checked: response.old_current_source_checked,
+            old_current_source: response.old_current_source.as_ref(),
+        };
+        let encoded = rmp_serde::to_vec_named(&response).unwrap();
+        assert_eq!(encoded, rmp_serde::to_vec_named(&legacy).unwrap());
+        assert_eq!(serde_json::to_vec(&response).unwrap(), serde_json::to_vec(&legacy).unwrap());
+        let decoded: super::super::RenameDataResp = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(
+            decoded.multipart_source.as_ref().unwrap().undo_capability.digest(),
+            response.multipart_source.as_ref().unwrap().undo_capability.digest()
+        );
+        assert!(
+            decoded
+                .multipart_source
+                .as_ref()
+                .unwrap()
+                .verify_with_authority(&authority)
+                .is_err(),
+            "serde indirection must not reconstruct native proof origin"
+        );
+        assert!(
+            std::mem::size_of::<super::super::RenameDataResp>() < std::mem::size_of::<MultipartPublicationResult>(),
+            "ordinary responses must not reserve the native publication payload inline"
+        );
     }
 }

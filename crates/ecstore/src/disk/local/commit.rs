@@ -1200,7 +1200,7 @@ impl LocalDisk {
 
             let multipart_source = match multipart_publication.as_ref() {
                 Some(publication) => match publication.finish(commit.mutation_lease.clone()).await {
-                    Ok(result) => Some(result),
+                    Ok(result) => Some(Box::new(result)),
                     Err(error) => {
                         publication.restore_target_after_error(commit.mutation_lease.clone()).await?;
                         return Err(error);

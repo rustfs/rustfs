@@ -803,12 +803,45 @@ fn unpack_health_state(snapshot: u64) -> (RuntimeDriveHealthState, u32) {
     (RuntimeDriveHealthState::from_u32((snapshot >> 32) as u32), snapshot as u32)
 }
 
+/// One upload-scoped observer; it is never part of production disk state.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ScopedMultipartCleanupCompletions {
+    path: String,
+    delete_paths_returns: AtomicU64,
+    delete_returns: AtomicU64,
+}
+
+#[cfg(test)]
+impl ScopedMultipartCleanupCompletions {
+    fn observes(&self, operation: &str, volume: &str, path: &str) -> bool {
+        volume == super::RUSTFS_META_MULTIPART_BUCKET
+            && match operation {
+                "delete" => path == self.path,
+                "delete_paths" => path
+                    .strip_prefix(self.path.as_str())
+                    .is_some_and(|suffix| suffix.starts_with('/') && suffix.len() > 1),
+                _ => false,
+            }
+    }
+
+    pub(crate) fn completed(&self, operation: &str) -> u64 {
+        match operation {
+            "delete_paths" => self.delete_paths_returns.load(Ordering::Acquire),
+            "delete" => self.delete_returns.load(Ordering::Acquire),
+            _ => 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct DiskHealthMetricEpoch {
     /// Preallocated per-operation metrics for built-in disk operation names.
     operation_metrics: Box<[DiskOperationMetricEntry]>,
     /// Fallback for tests or future extension operations outside DISK_OPERATION_NAMES.
     fallback_operation_metrics: StdRwLock<HashMap<&'static str, Arc<DiskOperationMetrics>>>,
+    #[cfg(test)]
+    multipart_cleanup_observer: std::sync::Mutex<Option<std::sync::Weak<ScopedMultipartCleanupCompletions>>>,
     /// Caller API operations currently executing through the disk health wrapper.
     api_waiting: AtomicU32,
     /// Operations rejected because the disk was unavailable for the caller.
@@ -834,6 +867,8 @@ impl Default for DiskHealthMetricEpoch {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             fallback_operation_metrics: StdRwLock::new(HashMap::new()),
+            #[cfg(test)]
+            multipart_cleanup_observer: std::sync::Mutex::new(None),
             api_waiting: AtomicU32::new(0),
             total_errors_availability: AtomicU64::new(0),
             total_errors_timeout: AtomicU64::new(0),
@@ -891,6 +926,46 @@ impl DiskHealthMetricEpoch {
         } else {
             self.fallback_operation_metric(op).record_latency_atomic(now_sec, elapsed);
         }
+    }
+
+    #[cfg(test)]
+    fn observe_multipart_cleanup(&self, path: &str) -> Arc<ScopedMultipartCleanupCompletions> {
+        assert!(!path.is_empty() && !path.ends_with('/'), "observe one exact canonical upload root");
+        let scope = Arc::new(ScopedMultipartCleanupCompletions {
+            path: path.to_owned(),
+            delete_paths_returns: AtomicU64::new(0),
+            delete_returns: AtomicU64::new(0),
+        });
+        let mut observer = self.multipart_cleanup_observer.lock().expect("test cleanup observer lock");
+        assert!(
+            observer.as_ref().and_then(std::sync::Weak::upgrade).is_none(),
+            "one observer per physical wrapper"
+        );
+        *observer = Some(Arc::downgrade(&scope));
+        scope
+    }
+
+    #[cfg(test)]
+    fn matching_multipart_cleanup<'a>(
+        &self,
+        operation: &str,
+        volume: &str,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Option<Arc<ScopedMultipartCleanupCompletions>> {
+        let scope = self
+            .multipart_cleanup_observer
+            .lock()
+            .expect("test cleanup observer lock")
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)?;
+        let mut nonempty = false;
+        for path in paths {
+            if !scope.observes(operation, volume, path) {
+                return None;
+            }
+            nonempty = true;
+        }
+        nonempty.then_some(scope)
     }
 
     fn record_availability_error(&self) {
@@ -2080,6 +2155,11 @@ impl LocalDiskWrapper {
         self.metrics.metrics_snapshot()
     }
 
+    #[cfg(test)]
+    pub(crate) fn observe_multipart_cleanup_for_test(&self, path: &str) -> Arc<ScopedMultipartCleanupCompletions> {
+        self.metrics.observe_multipart_cleanup(path)
+    }
+
     fn record_result_error_metrics<T>(&self, result: &Result<T>) {
         match result {
             Err(DiskError::Timeout) => self.metrics.record_timeout_error(),
@@ -2784,13 +2864,23 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
-        self.track_disk_health_mutation(
-            "delete_paths",
-            DiskMetricMutation::Delete,
-            || async { self.disk.delete_paths(volume, paths).await },
-            get_max_timeout_duration(),
-        )
-        .await
+        #[cfg(test)]
+        let observed = self
+            .metrics
+            .matching_multipart_cleanup("delete_paths", volume, paths.iter().map(String::as_str));
+        let result = self
+            .track_disk_health_mutation(
+                "delete_paths",
+                DiskMetricMutation::Delete,
+                || async { self.disk.delete_paths(volume, paths).await },
+                get_max_timeout_duration(),
+            )
+            .await;
+        #[cfg(test)]
+        if let Some(scope) = observed {
+            scope.delete_paths_returns.fetch_add(1, Ordering::Release);
+        }
+        result
     }
 
     async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> Result<SnapshotLeaseToken> {
@@ -3197,13 +3287,23 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
-        self.track_cleanup_mutation(
-            "delete",
-            DiskMetricMutation::Delete,
-            || async { self.cleanup_delete(volume, path, opt, None).await },
-            get_max_timeout_duration(),
-        )
-        .await
+        #[cfg(test)]
+        let observed = self
+            .metrics
+            .matching_multipart_cleanup("delete", volume, std::iter::once(path));
+        let result = self
+            .track_cleanup_mutation(
+                "delete",
+                DiskMetricMutation::Delete,
+                || async { self.cleanup_delete(volume, path, opt, None).await },
+                get_max_timeout_duration(),
+            )
+            .await;
+        #[cfg(test)]
+        if let Some(scope) = observed {
+            scope.delete_returns.fetch_add(1, Ordering::Release);
+        }
+        result
     }
 
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
@@ -3327,6 +3427,100 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    #[tokio::test]
+    async fn multipart_cleanup_completion_receipts_are_path_volume_operation_and_return_scoped() {
+        let dir = tempfile::tempdir().expect("cleanup receipt disk root");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk root")).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("actual local disk"));
+        let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+        let path = format!("{}/{}", "a".repeat(64), Uuid::new_v4());
+        let scope = wrapper.observe_multipart_cleanup_for_test(&path);
+        let source = disk
+            .get_object_path_for_io(super::super::RUSTFS_META_MULTIPART_BUCKET, &path)
+            .expect("exact source root");
+        std::fs::create_dir_all(&source).expect("actual orphan upload root");
+        std::fs::write(source.join("part.1.meta"), b"selected part record").expect("actual selected cleanup child");
+        std::fs::write(source.join("sentinel"), b"retained root child").expect("actual root child");
+        let recursive = DeleteOptions {
+            recursive: true,
+            ..Default::default()
+        };
+        let tmp = disk
+            .get_object_path_for_io(super::super::RUSTFS_META_TMP_BUCKET, &path)
+            .expect("same spelling in TMP");
+        std::fs::create_dir_all(&tmp).expect("actual old TMP cleanup");
+        wrapper
+            .delete(super::super::RUSTFS_META_TMP_BUCKET, &path, recursive.clone())
+            .await
+            .expect("actual unrelated TMP deletion returns");
+        assert_eq!(scope.completed("delete"), 0, "old TMP completion cannot credit the MPI phase");
+        let sibling = format!("{}/{}", "a".repeat(64), Uuid::new_v4());
+        let sibling_root = disk
+            .get_object_path_for_io(super::super::RUSTFS_META_MULTIPART_BUCKET, &sibling)
+            .expect("different upload");
+        std::fs::create_dir_all(&sibling_root).expect("actual different upload root");
+        wrapper
+            .delete(super::super::RUSTFS_META_MULTIPART_BUCKET, &sibling, recursive.clone())
+            .await
+            .expect("actual unrelated upload deletion returns");
+        assert_eq!(scope.completed("delete"), 0, "another upload cannot credit the observed phase");
+        assert_eq!(
+            wrapper
+                .read_all(super::super::RUSTFS_META_MULTIPART_BUCKET, &format!("{path}/part.1.meta"))
+                .await
+                .expect("actual same-scope read"),
+            Bytes::from_static(b"selected part record")
+        );
+        assert_eq!(scope.completed("read_all"), 0);
+        assert_eq!(scope.completed("delete_paths"), 0, "other operations do not credit cleanup");
+        wrapper
+            .delete_paths(super::super::RUSTFS_META_MULTIPART_BUCKET, &[])
+            .await
+            .expect("empty actual cleanup returns");
+        assert_eq!(scope.completed("delete_paths"), 0, "empty cleanup has no scoped part observation");
+        std::fs::write(source.join("obsolete"), b"old child").expect("actual obsolete source child");
+        wrapper
+            .delete(
+                super::super::RUSTFS_META_MULTIPART_BUCKET,
+                &format!("{path}/obsolete"),
+                DeleteOptions::default(),
+            )
+            .await
+            .expect("actual same-upload child deletion returns");
+        assert_eq!(scope.completed("delete"), 0, "a descendant delete cannot credit upload-root cleanup");
+        wrapper
+            .delete_paths(super::super::RUSTFS_META_MULTIPART_BUCKET, &[format!("{path}/part.1.meta")])
+            .await
+            .expect("actual selected source child deletion returns");
+        assert_eq!(scope.completed("delete_paths"), 1);
+        assert_eq!(scope.completed("delete"), 0, "part cleanup cannot credit root cleanup");
+        let admission = wrapper.disk_id.write().await;
+        {
+            let cancelled = wrapper.delete(super::super::RUSTFS_META_MULTIPART_BUCKET, &path, recursive.clone());
+            tokio::pin!(cancelled);
+            assert!(futures::poll!(&mut cancelled).is_pending());
+            assert_eq!(
+                wrapper.metrics_snapshot().total_waiting,
+                0,
+                "the real wrapper is still in stale-check admission"
+            );
+            assert_eq!(scope.completed("delete"), 0);
+        }
+        drop(admission);
+        assert_eq!(scope.completed("delete"), 0, "cancelled wrappers cannot fabricate a return receipt");
+        assert!(source.exists());
+        let admission = wrapper.disk_id.write().await;
+        let deletion = wrapper.delete(super::super::RUSTFS_META_MULTIPART_BUCKET, &path, recursive);
+        tokio::pin!(deletion);
+        assert!(futures::poll!(&mut deletion).is_pending());
+        assert_eq!(scope.completed("delete"), 0, "a pending real delete has not returned");
+        drop(admission);
+        deletion.await.expect("actual exact-source root deletion returns");
+        assert_eq!(scope.completed("delete"), 1);
+        assert_eq!(scope.completed("delete_paths"), 1);
+        assert!(!source.exists(), "the receipt follows the real destructive operation");
     }
 
     #[tokio::test(start_paused = true)]

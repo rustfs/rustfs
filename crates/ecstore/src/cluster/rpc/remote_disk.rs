@@ -5000,7 +5000,7 @@ mod tests {
                 ..valid.clone()
             },
             {
-                let mut trailing = valid.clone();
+                let mut trailing = valid;
                 let mut bytes = trailing.result.to_vec();
                 bytes.push(0xc0);
                 trailing.result = bytes.into();

@@ -777,9 +777,9 @@ mod multipart_copy_heal_tests {
                 let result = fixture.disks[0]
                     .rename_data(RUSTFS_META_TMP_BUCKET, &tmp, incoming, &fixture.bucket, &fixture.object)
                     .await;
-                let error: DiskError = result
-                    .err()
-                    .expect("malformed geometry, alias conflict or reserved incoming record is a typed failure, never a panic");
+                let error: DiskError = result.expect_err(
+                    "malformed geometry, alias conflict or reserved incoming record is a typed failure, never a panic",
+                );
                 if case == "incoming-reserved" {
                     assert!(
                         matches!(&error, DiskError::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied)

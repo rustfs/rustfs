@@ -106,10 +106,10 @@ struct Failure {
 }
 
 impl Failure {
-    fn from_sdk<E: ProvideErrorMetadata>(error: SdkError<E>) -> Self {
+    fn from_sdk<E: ProvideErrorMetadata>(error: SdkError<E>) -> Box<Self> {
         let response = error.raw_response();
         let header = |name: &str| response.and_then(|response| response.headers().get(name)).map(str::to_owned);
-        Self {
+        Box::new(Self {
             status: response.map(|response| response.status().as_u16()),
             code: error
                 .as_service_error()
@@ -120,7 +120,7 @@ impl Failure {
             content_type: header("content-type"),
             request_id: header("x-request-id"),
             amz_request_id: header("x-amz-request-id"),
-        }
+        })
     }
 
     fn assert_unavailable(&self) {
@@ -191,7 +191,7 @@ impl Session {
             .build()
     }
 
-    async fn execute(&self, client: &Client, operation: Operation) -> Result<Ack, Failure> {
+    async fn execute(&self, client: &Client, operation: Operation) -> Result<Ack, Box<Failure>> {
         match operation {
             Operation::Create => client
                 .create_multipart_upload()
@@ -643,7 +643,7 @@ impl Drop for Run {
     }
 }
 
-async fn finish_request(task: JoinHandle<Result<Ack, Failure>>) -> TestResult<Result<Ack, Failure>> {
+async fn finish_request(task: JoinHandle<Result<Ack, Box<Failure>>>) -> TestResult<Result<Ack, Box<Failure>>> {
     Ok(timeout(REQUEST_LIMIT, task)
         .await
         .map_err(|_| "MPU exceeded its unchanged production budgets and E2E observation bound")??)

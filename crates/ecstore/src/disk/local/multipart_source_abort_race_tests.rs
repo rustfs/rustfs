@@ -173,7 +173,7 @@ fn assert_target_publications(fixture: &Fixture, expected: &PublicationIdentity,
 #[cfg(unix)]
 #[tokio::test]
 async fn native_abort_waits_for_a_real_late_third_publication_before_closing_all_sources() {
-    let fixture = heap_native(|| Fixture::new()).await;
+    let fixture = heap_native(Fixture::new).await;
     publication_volumes(&fixture).await;
     let published = heap_native(|| fixture.publish_zero_on(&[0, 1])).await;
     let expected_publication = published[0].1.publication.clone();
@@ -270,7 +270,7 @@ async fn native_abort_waits_for_a_real_late_third_publication_before_closing_all
 #[cfg(unix)]
 #[tokio::test]
 async fn native_abort_preserves_target_votes_when_compensation_restores_prepared_head_but_target_undo_fails() {
-    let fixture = heap_native(|| Fixture::new()).await;
+    let fixture = heap_native(Fixture::new).await;
     publication_volumes(&fixture).await;
     let predecessor = heap_native(|| put_actual_predecessor(&fixture, 2)).await;
     let published = heap_native(|| fixture.publish_zero_on(&[0, 1])).await;
@@ -384,7 +384,7 @@ async fn native_abort_preserves_target_votes_when_compensation_restores_prepared
 #[cfg(unix)]
 #[tokio::test]
 async fn native_abort_waits_for_an_all_active_marked_source_stage_captured_before_reserve() {
-    let fixture = heap_native(|| Fixture::new()).await;
+    let fixture = heap_native(Fixture::new).await;
     publication_volumes(&fixture).await;
     let expected = heap_native(|| fixture.snapshot(0)).await;
     let round = abort_round(&fixture).await;

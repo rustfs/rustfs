@@ -7653,6 +7653,7 @@ impl LocalDisk {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn move_to_trash(&self, delete_path: &PathBuf, recursive: bool, immediate_purge: bool) -> Result<()> {
         self.move_to_trash_with_namespace_owner(delete_path, recursive, immediate_purge, None)
             .await
@@ -7765,11 +7766,11 @@ impl LocalDisk {
         multipart_staging::reject_native_control_write(&self.root, self.io_root(), volume, path)?;
         let source_owner = self.acquire_multipart_delete_owner(volume, path, namespace_owner).await?;
         let namespace_owner = source_owner.namespace_owner();
-        if volume == RUSTFS_META_MULTIPART_BUCKET {
-            if let Some(check) = self.multipart_delete_check(&self.io_get_object_path(volume, path)?, opt.recursive)? {
-                self.validate_multipart_delete_admission(check, namespace_owner.clone())
-                    .await?;
-            }
+        if volume == RUSTFS_META_MULTIPART_BUCKET
+            && let Some(check) = self.multipart_delete_check(&self.io_get_object_path(volume, path)?, opt.recursive)?
+        {
+            self.validate_multipart_delete_admission(check, namespace_owner.clone())
+                .await?;
         }
         if pool_meta_native::reject_raw_path(&self.root, volume, path).is_err() {
             let owner = self.pool_meta_cleanup_owner(volume, path, &opt, namespace_owner).await?;

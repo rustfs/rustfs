@@ -65,8 +65,9 @@ use crate::crash_inject::{self, CrashPoint};
 use crate::disk::DiskOption;
 use crate::disk::STORAGE_FORMAT_FILE;
 use crate::disk::multipart_source::{
-    bind_multipart_proof_snapshot, capture_source_condition, copy_publication_controls, is_active_source, mark_native_source,
-    native_source_protocol, publication_identity, recognized_native_source_controls, strip_native_controls,
+    bind_multipart_proof_snapshot, capture_source_condition, copy_publication_controls, is_active_source,
+    is_initial_native_source, mark_initial_native_source, native_source_protocol, publication_identity,
+    recognized_native_source_controls, strip_native_controls,
 };
 #[cfg(test)]
 use crate::disk::new_disk;
@@ -2922,7 +2923,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         for f in parts_metadatas.iter_mut() {
             f.metadata = user_defined.clone();
-            mark_native_source(f);
+            mark_initial_native_source(f);
             f.mod_time = Some(mod_time);
             f.fresh = true;
         }
@@ -3214,9 +3215,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
-        if let Some(completed) = self
-            .replay_completed_multipart_upload(bucket, object, upload_id, &uploaded_parts, Some(&fi), opts)
-            .await?
+        if !initial_multipart_source_observations(&fi, &files_metas)
+            && let Some(completed) = self
+                .replay_completed_multipart_upload(bucket, object, upload_id, &uploaded_parts, Some(&fi), opts)
+                .await?
         {
             self.reclaim_replayed_multipart_staging(bucket, object, upload_id, &upload_id_path)
                 .await;
@@ -4399,6 +4401,53 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
     }
 }
 
+/// All current initial heads precede native publication, which consumes a
+/// canonical head atomically. Restores persist status in the same head write;
+/// old or upgraded native-v1 heads deliberately remain ambiguous. Unknown or
+/// partial observations take the existing strict destination replay path.
+fn initial_multipart_source_observations(selected: &FileInfo, observations: &[FileInfo]) -> bool {
+    let geometry = &selected.erasure;
+    if observations.is_empty()
+        || observations.len() != geometry.distribution.len()
+        || geometry.data_blocks.checked_add(geometry.parity_blocks) != Some(observations.len())
+        || selected.size != 0
+        || !selected.parts.is_empty()
+        || selected.data_dir.is_none_or(|directory| directory.is_nil())
+        || !is_initial_native_source(selected).is_ok_and(|initial| initial)
+    {
+        return false;
+    }
+    observations.iter().enumerate().all(|(slot, source)| {
+        file_info_is_valid_for_metadata(source)
+            && is_initial_native_source(source).is_ok_and(|initial| initial)
+            && source.size == 0
+            && source.parts.is_empty()
+            && source.data_dir == selected.data_dir
+            && source.mod_time == selected.mod_time
+            && source.version_id.filter(|version| !version.is_nil()) == selected.version_id.filter(|version| !version.is_nil())
+            && source.metadata == selected.metadata
+            && source.checksum == selected.checksum
+            && source.mode == selected.mode
+            && source.written_by_version == selected.written_by_version
+            && source.mark_deleted == selected.mark_deleted
+            && source.replication_state_internal == selected.replication_state_internal
+            && source.transition_status == selected.transition_status
+            && source.transition_tier == selected.transition_tier
+            && source.transitioned_objname == selected.transitioned_objname
+            && source.transition_version_id == selected.transition_version_id
+            && source.transition_version == selected.transition_version
+            && source.transition_version_state == selected.transition_version_state
+            && source.expire_restored == selected.expire_restored
+            && source.erasure.algorithm == geometry.algorithm
+            && source.erasure.checksums == geometry.checksums
+            && source.erasure.data_blocks == geometry.data_blocks
+            && source.erasure.parity_blocks == geometry.parity_blocks
+            && source.erasure.block_size == geometry.block_size
+            && source.erasure.distribution == geometry.distribution
+            && geometry.distribution.get(slot) == Some(&source.erasure.index)
+    })
+}
+
 fn mark_multipart_completion_replayed(mut info: ObjectInfo) -> ObjectInfo {
     info.multipart_completion_replayed = true;
     info
@@ -5344,7 +5393,7 @@ mod tests {
             .collect::<HashSet<_>>();
         let _ = drain_global_dirty_scopes();
 
-        set_disks.cleanup_multipart_path(&[part_path.to_string()]).await;
+        set_disks.cleanup_multipart_path(std::slice::from_ref(&part_path)).await;
         assert!(matches!(
             recovered.read_all(RUSTFS_META_MULTIPART_BUCKET, &part_path).await,
             Err(DiskError::FileNotFound)
@@ -9157,6 +9206,20 @@ mod tests {
             }
         }
 
+        async fn cleanup_finished(
+            local: &crate::disk::disk_store::LocalDiskWrapper,
+            scope: &crate::disk::disk_store::ScopedMultipartCleanupCompletions,
+            operation: &str,
+            prior_completions: u64,
+        ) {
+            loop {
+                if scope.completed(operation) > prior_completions && local.metrics_snapshot().total_waiting == 0 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
         temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60"))], async {
             let (dirs, store) = crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks().await;
             crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
@@ -9179,6 +9242,10 @@ mod tests {
                         .expect("snapshot acknowledged physical shard"),
                 );
             }
+            let healthy_cleanup_scopes = disks[..3].iter().map(|disk| {
+                let disk::Disk::Local(local) = disk.as_ref() else { panic!("actual healthy local backend") };
+                local.observe_multipart_cleanup_for_test(&upload_path)
+            }).collect::<Vec<_>>();
             let disk::Disk::Local(paused_local) = disks[3].as_ref() else { panic!("actual local physical tail") };
             let io_target = paused_local.get_disk().get_object_path_for_io(bucket, object).expect("real IO target");
             let mutation_key = paused_local.get_disk().get_object_path(bucket, object).expect("logical native mutation key");
@@ -9238,6 +9305,7 @@ mod tests {
                         panic!("publication wrappers must retire before part cleanup: {err}; phase=publication, calls={:?}, waiting={}", current.api_calls, current.total_waiting);
                     });
                 let metrics = paused_local.metrics_snapshot();
+                let healthy_part_cleanup_baselines = healthy_cleanup_scopes.iter().map(|scope| scope.completed("delete_paths")).collect::<Vec<_>>();
                 let old = after_publication.take().expect("publication barrier");
                 old.release();
                 drop(old);
@@ -9247,7 +9315,16 @@ mod tests {
                 let cleanup_waiting = tokio::time::timeout(Duration::from_secs(5), async {
                     tokio::select! {
                         () = after_cleanup.as_ref().expect("cleanup barrier").wait_until_paused() => false,
-                        () = cleanup_active(paused_local, "delete_paths", metrics.api_calls.get("delete_paths").copied().unwrap_or(0)) => true,
+                        () = cleanup_active(paused_local, "delete_paths", metrics.api_calls.get("delete_paths").copied().unwrap_or(0)) => {
+                            // Advance only the paused leg's deadline. Exact
+                            // upload-scoped returns exclude old TMP cleanups
+                            // and calls that are still waiting for admission.
+                            for ((disk, scope), prior_completions) in disks[..3].iter().zip(&healthy_cleanup_scopes).zip(&healthy_part_cleanup_baselines) {
+                                let disk::Disk::Local(local) = disk.as_ref() else { panic!("actual healthy local backend") };
+                                cleanup_finished(local, scope, "delete_paths", *prior_completions).await;
+                            }
+                            true
+                        },
                     }
                 }).await.unwrap_or_else(|err| {
                     let current = paused_local.metrics_snapshot();
@@ -9265,11 +9342,18 @@ mod tests {
                         panic!("part cleanup wrappers must retire before root cleanup: {err}; phase=part_cleanup_finished, calls={:?}, waiting={}", current.api_calls, current.total_waiting);
                     });
                 let metrics = paused_local.metrics_snapshot();
+                let healthy_root_cleanup_baselines = healthy_cleanup_scopes.iter().map(|scope| scope.completed("delete")).collect::<Vec<_>>();
                 after_cleanup.take().expect("cleanup barrier").release();
                 let root_waiting = tokio::time::timeout(Duration::from_secs(5), async {
                     tokio::select! {
                         result = &mut complete => { joined = true; committed = Some(result.expect("completion task").expect("verified native write quorum must return success")); false },
-                        () = cleanup_active(paused_local, "delete", metrics.api_calls.get("delete").copied().unwrap_or(0)) => true,
+                        () = cleanup_active(paused_local, "delete", metrics.api_calls.get("delete").copied().unwrap_or(0)) => {
+                            for ((disk, scope), prior_completions) in disks[..3].iter().zip(&healthy_cleanup_scopes).zip(&healthy_root_cleanup_baselines) {
+                                let disk::Disk::Local(local) = disk.as_ref() else { panic!("actual healthy local backend") };
+                                cleanup_finished(local, scope, "delete", *prior_completions).await;
+                            }
+                            true
+                        },
                     }
                 }).await.unwrap_or_else(|err| {
                     let current = paused_local.metrics_snapshot();
@@ -9292,8 +9376,31 @@ mod tests {
                 drop(tokio::time::timeout(Duration::from_secs(5), set.acquire_write_lock_diag("mpu_quorum_success_upload_probe", RUSTFS_META_MULTIPART_BUCKET, &upload_path))
                     .await.expect("successful completion releases the global upload lock while its physical tail remains")
                     .expect("actual upload probe"));
-                let mut reader = tokio::time::timeout(Duration::from_secs(5), store.get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default()))
-                    .await.expect("GET cannot wait on the old successful logical owner").expect("committed GET");
+                let committed_get = tokio::time::timeout(Duration::from_secs(5), store.get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default()))
+                    .await.expect("GET cannot wait on the old successful logical owner");
+                let mut reader = match committed_get {
+                    Ok(reader) => reader,
+                    Err(error) => {
+                        let inventory = set.disk_inventory().await;
+                        eprintln!("MPU committed GET failed before physical release: error={error:?}; tasks_running={}; inventory_present={:?}", tasks.running(), inventory.iter().map(Option::is_some).collect::<Vec<_>>());
+                        for (slot, disk) in disks.iter().enumerate() {
+                            let disk::Disk::Local(local) = disk.as_ref() else { panic!("actual local diagnostic backend") };
+                            let metrics = local.metrics_snapshot();
+                            let native = local.get_disk();
+                            let metadata_path = native.get_object_path_for_io(bucket, object).expect("actual diagnostic target").join(STORAGE_FORMAT_FILE);
+                            let physical_metadata = std::fs::symlink_metadata(&metadata_path)
+                                .map(|metadata| (metadata.is_file(), metadata.len()))
+                                .map_err(|error| error.kind());
+                            // Failure-only direct observations diagnose the same
+                            // original GET; they never retry or replace it.
+                            let disk_id = tokio::time::timeout(Duration::from_secs(1), native.get_disk_id()).await;
+                            let direct = tokio::time::timeout(Duration::from_secs(1), native.read_version("", bucket, object, "", &ReadOptions { read_data: true, ..Default::default() })).await;
+                            let physical_layout = direct.map(|result| result.map(|fi| (fi.version_id, fi.data_dir, fi.deleted, fi.size, fi.parts.len(), fi.erasure.index, fi.erasure.distribution)));
+                            eprintln!("MPU committed GET failure disk: slot={slot}; runtime={:?}; disk_id={disk_id:?}; metadata={physical_metadata:?}; layout={physical_layout:?}; calls={:?}; waiting={}; timeout_errors={}; availability_errors={}", disk.runtime_state(), metrics.api_calls, metrics.total_waiting, metrics.total_errors_timeout, metrics.total_errors_availability);
+                        }
+                        panic!("committed GET: {error:?}");
+                    }
+                };
                 let mut actual = Vec::new();
                 reader.stream.read_to_end(&mut actual).await.expect("whole committed body");
                 assert_eq!(actual, body);

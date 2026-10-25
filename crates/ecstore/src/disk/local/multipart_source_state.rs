@@ -204,7 +204,7 @@ pub(super) fn raw_sha(raw: &[u8]) -> [u8; 32] {
     Sha256::digest(raw).into()
 }
 pub(super) fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
-    Ok(rmp_serde::to_vec_named(value).map_err(Error::other)?)
+    rmp_serde::to_vec_named(value).map_err(Error::other)
 }
 pub(super) fn decode<T: serde::de::DeserializeOwned>(raw: &[u8]) -> Result<T> {
     if raw.len() > MULTIPART_SOURCE_MAX_PAYLOAD_BYTES {
@@ -285,7 +285,7 @@ pub(super) fn validate_source_mutation(source: &Path, base: &Path, root: &os::Pu
 }
 
 fn file_info(raw: &[u8], volume: &str, path: &str, version: Option<Uuid>) -> Result<FileInfo> {
-    Ok(get_file_info(
+    get_file_info(
         raw,
         volume,
         path,
@@ -296,7 +296,7 @@ fn file_info(raw: &[u8], volume: &str, path: &str, version: Option<Uuid>) -> Res
             include_part_checksums: true,
         },
     )
-    .map_err(Error::other)?)
+    .map_err(Error::other)
 }
 fn certificate_path(source: &Path, round: Uuid, ready: bool) -> PathBuf {
     source
@@ -1478,7 +1478,6 @@ impl LocalDisk {
     /// TMP/heal never imports or issues provenance. Conserve only an existing
     /// physical DD owner's immutable record; exact current-FI confirmation is
     /// performed separately when a native proof is requested.
-
     pub(super) async fn retain_owned_multipart_anchor(
         &self,
         incoming: &FileInfo,

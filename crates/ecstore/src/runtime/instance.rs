@@ -1808,13 +1808,11 @@ mod multipart_instance_authority_tests {
             .map(|slot| local_topology(&format!("/tmp/multipart-parallel-instance-{slot}")))
             .collect::<Vec<_>>();
         let authorities = std::thread::scope(|scope| {
-            let tasks = topologies
-                .iter()
-                .map(|topology| {
-                    let ctx = ctx.clone();
-                    scope.spawn(move || ctx.bind_multipart_proof_topology(topology).unwrap())
-                })
-                .collect::<Vec<_>>();
+            let mut tasks = Vec::with_capacity(topologies.len());
+            for topology in &topologies {
+                let ctx = ctx.clone();
+                tasks.push(scope.spawn(move || ctx.bind_multipart_proof_topology(topology).unwrap()));
+            }
             tasks.into_iter().map(|task| task.join().unwrap()).collect::<Vec<_>>()
         });
         assert!(authorities.iter().all(|authority| authority.same_authority(&authorities[0])));

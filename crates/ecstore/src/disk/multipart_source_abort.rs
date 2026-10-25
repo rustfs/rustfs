@@ -6,12 +6,13 @@ use super::*;
 
 pub const NATIVE_SOURCE_PROTOCOL_SUFFIX: &str = "multipart-source-protocol";
 const NATIVE_SOURCE_PROTOCOL_VALUE: &str = "native-v1";
+const NATIVE_SOURCE_INITIAL_VALUE: &str = "native-initial-v1";
 const ABORT_PROOF_DOMAIN: &[u8] = b"rustfs-mpu-source-abort-proof-v1\0";
 
 pub fn native_source_protocol(fi: &FileInfo) -> Result<bool> {
     use rustfs_utils::http::metadata_compat::{contains_key_str, get_consistent_str};
     match get_consistent_str(&fi.metadata, NATIVE_SOURCE_PROTOCOL_SUFFIX) {
-        Some(NATIVE_SOURCE_PROTOCOL_VALUE) => Ok(true),
+        Some(NATIVE_SOURCE_PROTOCOL_VALUE | NATIVE_SOURCE_INITIAL_VALUE) => Ok(true),
         Some(_) => Err(DiskError::FileCorrupt),
         None if contains_key_str(&fi.metadata, NATIVE_SOURCE_PROTOCOL_SUFFIX) => Err(DiskError::FileCorrupt),
         None => Ok(false),
@@ -24,6 +25,39 @@ pub fn mark_native_source(fi: &mut FileInfo) {
         NATIVE_SOURCE_PROTOCOL_VALUE.to_owned(),
     );
 }
+/// Only the unique current NewMultipartUpload writes this origin. Legacy
+/// upgrades keep native-v1, which cannot distinguish a retained completed head.
+pub fn mark_initial_native_source(fi: &mut FileInfo) {
+    rustfs_utils::http::metadata_compat::insert_str(
+        &mut fi.metadata,
+        NATIVE_SOURCE_PROTOCOL_SUFFIX,
+        NATIVE_SOURCE_INITIAL_VALUE.to_owned(),
+    );
+}
+
+/// A strict source-only fast-path hint. It never grants publication rights;
+/// native publication still validates the actual current SourceStore CAS.
+pub fn is_initial_native_source(fi: &FileInfo) -> Result<bool> {
+    use rustfs_utils::http::metadata_compat::{
+        MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, get_consistent_str, has_internal_suffix, starts_with_ignore_ascii_case,
+    };
+    native_source_protocol(fi)?;
+    if get_consistent_str(&fi.metadata, NATIVE_SOURCE_PROTOCOL_SUFFIX) != Some(NATIVE_SOURCE_INITIAL_VALUE) {
+        return Ok(false);
+    }
+    let mut rustfs = false;
+    let mut minio = false;
+    for key in fi
+        .metadata
+        .keys()
+        .filter(|key| has_internal_suffix(key, NATIVE_SOURCE_PROTOCOL_SUFFIX))
+    {
+        rustfs |= starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_PREFIX);
+        minio |= starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX);
+    }
+    Ok(rustfs && minio && !fi.deleted && !has_nonbirth_native_controls(fi)?)
+}
+
 pub fn recognized_native_source_controls(fi: &FileInfo) -> Result<bool> {
     let marker = native_source_protocol(fi)?;
     let state = has_nonbirth_native_controls(fi)?;
@@ -445,6 +479,56 @@ mod tests {
         strip_native_controls(&mut source.metadata);
         assert!(!native_source_protocol(&source).unwrap());
     }
+    #[test]
+    fn only_explicit_dual_family_initial_origins_without_status_can_skip_replay() {
+        use rustfs_utils::http::metadata_compat::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX};
+        let mut source = FileInfo::default();
+        mark_native_source(&mut source);
+        assert!(native_source_protocol(&source).unwrap());
+        assert!(
+            !is_initial_native_source(&source).unwrap(),
+            "existing and upgraded v1 heads remain ambiguous"
+        );
+        mark_initial_native_source(&mut source);
+        assert!(is_initial_native_source(&source).unwrap());
+        source
+            .metadata
+            .remove(&format!("{MINIO_INTERNAL_PREFIX}{NATIVE_SOURCE_PROTOCOL_SUFFIX}"));
+        assert!(
+            !is_initial_native_source(&source).unwrap(),
+            "a single compatibility alias is not a fresh-origin proof"
+        );
+        mark_initial_native_source(&mut source);
+        source.metadata.insert(
+            format!("{RUSTFS_INTERNAL_PREFIX}{NATIVE_SOURCE_PROTOCOL_SUFFIX}"),
+            NATIVE_SOURCE_PROTOCOL_VALUE.into(),
+        );
+        assert!(
+            is_initial_native_source(&source).is_err(),
+            "conflicting origins never authorize the fast path"
+        );
+        mark_initial_native_source(&mut source);
+        let generation = SourceGeneration {
+            epoch: 1,
+            nonce: Uuid::new_v4(),
+        };
+        set_source_status(
+            &mut source,
+            &SourceStatus {
+                generation,
+                recovering: false,
+                round: Some(Uuid::new_v4()),
+                ready_sha256: Some([3; 32]),
+            },
+        )
+        .unwrap();
+        assert!(is_active_source(&source).unwrap(), "the restored fixture is an ordinary ACTIVE source");
+        assert!(
+            !is_initial_native_source(&source).unwrap(),
+            "an atomically restored ACTIVE head must still probe prior targets"
+        );
+    }
+
     #[test]
     fn omitted_abort_fields_preserve_existing_inspection_encoding() {
         let inspection = MultipartSourceInspection {

@@ -175,25 +175,24 @@ pub(super) fn upload_scope_root(path: &str, part_path: bool) -> &str {
     }
     // Keep generic short fixtures and legacy exact-key cleanup compatible.
     // Production roots above cover every head, data directory and child path.
-    if part_path && part_file_name(path) {
-        if let Some(parent) = Path::new(path)
+    if part_path
+        && part_file_name(path)
+        && let Some(parent) = Path::new(path)
             .parent()
             .and_then(Path::parent)
             .and_then(Path::to_str)
             .filter(|root| !root.is_empty())
-        {
-            return parent;
-        }
+    {
+        return parent;
     }
     let name = Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or_default();
-    if name.eq_ignore_ascii_case("xl.meta") || Uuid::parse_str(name).is_ok_and(|directory| !directory.is_nil()) {
-        if let Some(parent) = Path::new(path)
+    if (name.eq_ignore_ascii_case("xl.meta") || Uuid::parse_str(name).is_ok_and(|directory| !directory.is_nil()))
+        && let Some(parent) = Path::new(path)
             .parent()
             .and_then(Path::to_str)
             .filter(|root| !root.is_empty())
-        {
-            return parent;
-        }
+    {
+        return parent;
     }
     path
 }

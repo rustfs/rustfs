@@ -459,7 +459,7 @@ mod native_abort_closure_tests {
                         &path,
                         MultipartSourceOperation::DeleteAborted {
                             expected: snapshots[slot].clone().expect("actual committed source"),
-                            certificate: certificate.clone(),
+                            certificate: certificate.as_ref().clone(),
                         },
                     )
                     .await;
@@ -828,5 +828,8 @@ mod native_abort_closure_tests {
             "Abort never mutates any target metadata, shard or native anchor"
         );
         assert_eq!(body(&set, bucket, object, &ObjectOptions::default()).await, predecessor);
+    }
+    mod initial_probe_tests {
+        include!("multipart_initial_probe_tests.rs");
     }
 }

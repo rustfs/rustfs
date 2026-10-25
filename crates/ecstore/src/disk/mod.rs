@@ -2098,7 +2098,7 @@ pub enum OldCurrentSize {
 pub struct RenameDataResp {
     /// Native-only source ownership result; older peers omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub multipart_source: Option<multipart_source::MultipartPublicationResult>,
+    pub multipart_source: Option<Box<multipart_source::MultipartPublicationResult>>,
     /// Dereferenced erasure data directory retained for older coordinators.
     pub old_data_dir: Option<Uuid>,
     /// Directory containing rollback metadata. This may be synthetic and must

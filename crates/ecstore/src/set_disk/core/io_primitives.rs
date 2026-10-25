@@ -4570,7 +4570,7 @@ impl SetDisks {
             match result {
                 Ok(Ok(mut res)) => {
                     if let Some(owner) = multipart_capabilities.as_mut() {
-                        let publication = res.multipart_source.take();
+                        let publication = res.multipart_source.take().map(|result| *result);
                         let valid = publication.as_ref().is_some_and(|publication| {
                             publication.verify_with_authority(&owner.authority).is_ok()
                                 && publication.proof.snapshot.lineage == publication.publication.lineage

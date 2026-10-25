@@ -7456,7 +7456,7 @@ mod tests {
         }
         let ordinary_file = ObjectInfo {
             name: "directory".to_owned(),
-            ..source.clone()
+            ..source
         };
         assert!(!ECStore::is_equivalent_decommission_capacity_target(&ordinary_file, &target));
     }

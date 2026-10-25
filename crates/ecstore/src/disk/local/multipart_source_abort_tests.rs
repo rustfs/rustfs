@@ -146,7 +146,7 @@ async fn assert_generic_deletes_preserve_source(fixture: &Fixture, slot: usize) 
         assert_eq!(exact_tree(&source_root(fixture, slot)), before);
     }
     assert!(
-        disk.delete_paths(RUSTFS_META_MULTIPART_BUCKET, &[fixture.path.clone()])
+        disk.delete_paths(RUSTFS_META_MULTIPART_BUCKET, std::slice::from_ref(&fixture.path))
             .await
             .is_err(),
         "raw DeletePaths cannot move a closed upload to trash"
@@ -177,7 +177,7 @@ async fn assert_generic_deletes_preserve_source(fixture: &Fixture, slot: usize) 
 
 #[tokio::test]
 async fn native_abort_pending_intent_is_not_a_delete_certificate_and_raw_cleanup_preserves_exact_evidence() {
-    let fixture = heap_native(|| Fixture::new()).await;
+    let fixture = heap_native(Fixture::new).await;
     let original = all_sources(&fixture);
     let certificate = heap_native(|| prepare_actual_abort(&fixture)).await;
     let before = all_sources(&fixture);
@@ -231,7 +231,7 @@ async fn native_abort_pending_intent_is_not_a_delete_certificate_and_raw_cleanup
 
 #[tokio::test]
 async fn native_abort_delete_requires_all_n_actual_slots_and_the_current_exact_committed_binding() {
-    let fixture = heap_native(|| Fixture::new()).await;
+    let fixture = heap_native(Fixture::new).await;
     let first = heap_native(|| prepare_actual_abort(&fixture)).await;
     heap_native(|| commit_actual_abort(&fixture, &first)).await;
     let old_expected = heap_native(|| fixture.snapshot(0)).await;
@@ -239,7 +239,7 @@ async fn native_abort_delete_requires_all_n_actual_slots_and_the_current_exact_c
     fewer.proofs.pop();
     let mut swapped = first.clone();
     swapped.disk_ids.swap(0, 1);
-    let foreign_fixture = heap_native(|| Fixture::new()).await;
+    let foreign_fixture = heap_native(Fixture::new).await;
     let foreign = heap_native(|| prepare_actual_abort(&foreign_fixture)).await;
     for certificate in [fewer, swapped, foreign] {
         let before = all_sources(&fixture);
@@ -311,7 +311,7 @@ async fn native_abort_delete_requires_all_n_actual_slots_and_the_current_exact_c
 
 #[tokio::test]
 async fn native_abort_rejects_old_recovery_activation_init_part_and_publication_without_reopening_a_head() {
-    let fixture = heap_native(|| Fixture::new()).await;
+    let fixture = heap_native(Fixture::new).await;
     let initial_raw = std::fs::read(fixture.head(0)).expect("exact marked initial source head");
     let mut initial = get_file_info(
         &initial_raw,
@@ -398,7 +398,7 @@ async fn native_abort_rejects_old_recovery_activation_init_part_and_publication_
 async fn native_abort_delete_rechecks_the_committed_certificate_inside_the_actual_rename_callback() {
     use crate::disk::os::prepared_publication_test_hooks as hooks;
     use std::sync::atomic::{AtomicBool, Ordering};
-    let fixture = heap_native(|| Fixture::new()).await;
+    let fixture = heap_native(Fixture::new).await;
     match fixture.disks[0].make_volume(RUSTFS_META_TMP_DELETED_BUCKET).await {
         Ok(()) | Err(DiskError::VolumeExists) => {}
         Err(error) => panic!("prepare the actual strict-delete rename parent: {error}"),
@@ -453,7 +453,7 @@ async fn native_abort_delete_rechecks_the_committed_certificate_inside_the_actua
 
 #[tokio::test]
 async fn native_abort_partial_delete_retains_the_producer_certificate_and_never_changes_exact_targets() {
-    let mut fixture = heap_native(|| Fixture::new()).await;
+    let mut fixture = heap_native(Fixture::new).await;
     for slot in 0..4 {
         heap_native(|| put_actual_predecessor(&fixture, slot)).await;
         match fixture.disks[slot].make_volume(RUSTFS_META_TMP_DELETED_BUCKET).await {
@@ -577,7 +577,7 @@ async fn native_abort_partial_delete_retains_the_producer_certificate_and_never_
 
 #[tokio::test]
 async fn native_abort_missing_state_with_actual_owned_records_never_becomes_legacy_or_missing() {
-    let fixture = heap_native(|| Fixture::new()).await;
+    let fixture = heap_native(Fixture::new).await;
     let initial = std::fs::read(fixture.head(0)).expect("exact actual marked source before publication");
     let produced = heap_native(|| fixture.publish_zero_on(&[0])).await;
     produced[0]
@@ -627,7 +627,7 @@ async fn native_abort_missing_state_with_actual_owned_records_never_becomes_lega
     );
     assert_eq!(all_sources(&fixture), before);
     let deleted = fixture.disks[0]
-        .delete_paths(RUSTFS_META_MULTIPART_BUCKET, &[fixture.path.clone()])
+        .delete_paths(RUSTFS_META_MULTIPART_BUCKET, std::slice::from_ref(&fixture.path))
         .await;
     assert!(
         matches!(deleted, Err(DiskError::ConditionalDeleteConflict)),
@@ -683,7 +683,7 @@ async fn close_actual_source_owned_by_staging(
 #[tokio::test]
 async fn native_abort_public_data_dir_delete_waits_for_the_actual_staging_source_writer_and_then_denies_closure() {
     use std::time::Duration;
-    let fixture = heap_native(|| Fixture::new()).await;
+    let fixture = heap_native(Fixture::new).await;
     for slot in 0..4 {
         heap_native(|| put_actual_predecessor(&fixture, slot)).await;
     }
@@ -739,7 +739,7 @@ async fn native_abort_public_data_dir_delete_waits_for_the_actual_staging_source
 async fn native_abort_deferred_snapshot_release_and_settlement_reacquire_source_rw_before_cleanup() {
     use std::time::Duration;
     for settle_while_reader_retained in [false, true] {
-        let fixture = heap_native(|| Fixture::new()).await;
+        let fixture = heap_native(Fixture::new).await;
         for slot in 0..4 {
             heap_native(|| put_actual_predecessor(&fixture, slot)).await;
         }
