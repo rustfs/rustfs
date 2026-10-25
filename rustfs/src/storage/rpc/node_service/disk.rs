@@ -6919,17 +6919,12 @@ mod legacy_artifact_tests {
         assert_eq!(restored.data, fi.data);
     }
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn artifact_delete_recovery_single_receiver_applies_and_rolls_back_real_ordinary_version() {
-        let fixture = ordinary_delete_recovery_fixture("single").await;
-        let operation = DeleteRecoveryRpcOperation::ApplyVersion {
-            object: fixture.object.clone(),
-            file_info: Box::new(fixture.fi.clone()),
-            force_del_marker: false,
-            opts: fixture.opts.clone(),
-        };
-        {
+    fn assert_unavailable_ordinary_delete_recovery<'a>(
+        fixture: &'a OrdinaryDeleteRecoveryFixture,
+        operation: &'a DeleteRecoveryRpcOperation,
+    ) -> impl std::future::Future<Output = ()> + 'a {
+        // Keep RPC construction and polling off the fixture/apply/rollback frame.
+        Box::pin(async move {
             let instance = crate::storage::storage_api::bootstrap_instance_ctx();
             assert!(super::super::BootstrapLocalTarget::new(instance.clone()).is_for_store(&fixture._env.ecstore));
             let bootstrap = super::super::make_server_for_slot(super::super::ServerContextSlot::with_instance_context(instance));
@@ -6941,7 +6936,7 @@ mod legacy_artifact_tests {
                     disk: fixture.disk_ref.clone(),
                     volume: fixture.bucket.to_owned(),
                     protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
-                    operation: rmp_serde::to_vec_named(&operation)
+                    operation: rmp_serde::to_vec_named(operation)
                         .expect("ordinary recovery operation")
                         .into(),
                 });
@@ -6957,7 +6952,20 @@ mod legacy_artifact_tests {
                 assert_eq!(denied.code(), tonic::Code::PermissionDenied);
                 assert_eq!(path_delete_snapshot(&fixture.physical), fixture.before);
             }
-        }
+        })
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn artifact_delete_recovery_single_receiver_applies_and_rolls_back_real_ordinary_version() {
+        let fixture = ordinary_delete_recovery_fixture("single").await;
+        let operation = DeleteRecoveryRpcOperation::ApplyVersion {
+            object: fixture.object.clone(),
+            file_info: Box::new(fixture.fi.clone()),
+            force_del_marker: false,
+            opts: fixture.opts.clone(),
+        };
+        assert_unavailable_ordinary_delete_recovery(&fixture, &operation).await;
         match recover_ordinary_delete_transaction(&fixture.service, &fixture.disk_ref, fixture.bucket, operation).await {
             DeleteRecoveryRpcReply::AppliedVersion => {}
             reply => panic!("unexpected apply reply: {reply:?}"),
