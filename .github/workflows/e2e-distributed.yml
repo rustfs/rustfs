@@ -170,7 +170,7 @@ jobs:
           set -euo pipefail
           rm -f target/nextest/e2e-distributed/junit.xml target/nextest/e2e-full/junit.xml
           if [ -n "${FILTER}" ]; then
-            python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-full -p e2e_test -E "${FILTER}" --no-tests=fail
+            python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-full -p e2e_test -E "${FILTER}" --no-tests=fail --success-output=immediate
             test -s target/nextest/e2e-full/junit.xml
           else
             python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test --no-tests=fail
