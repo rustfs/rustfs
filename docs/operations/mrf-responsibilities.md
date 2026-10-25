@@ -12,7 +12,9 @@
 
 These entries stay outside object-heal dispatch. After an initial 60-second delay, the consumer rotates through a bounded probe queue, attempts at most one identity lookup per dispatch round, and limits each lookup to one second. Failed or unresolved attempts use the existing bounded backoff, with a five-second minimum and a 60-second ceiling. The queue examination budget is `RUSTFS_HEAL_MRF_REPLAY_BATCH`.
 
-The listing exposes `lastIdentityProbeResult` (`unresolved`, `unavailable`, or `known`), `lastIdentityProbeAtMs`, and `nextIdentityProbeAtMs` when available. These are process-local observations. Restart resets the probe delay; these timestamps do not establish when a responsibility was first retained.
+The listing exposes `lastIdentityProbeResult` (`unresolved`, `unavailable`, or `known`), `lastIdentityProbeAtMs`, and `nextIdentityProbeAtMs` when available. The result and last-probe timestamp are process-local observations. For lifecycle V1, restart resets the probe delay; these timestamps do not establish when a responsibility was first retained.
+
+A lifecycle V2 checkpoint can contain `source_and_current_generation_unknown`. It retains the first-held timestamp, next-probe timestamp, and attempt count. Both incarnation fields remain null, and the listing exposes the first-held timestamp as `heldSinceMs`. Restart restores the remaining delay within five to 60 seconds, including after clock changes or an expired deadline. Identity probes retain their schedule after unsuccessful lookups. Risk acceptance and targeted recheck require a known current incarnation; a guessed identity cannot bypass refresh.
 
 When a same-name bucket becomes visible, its identity is recorded as the observed current incarnation in `legacy_generation_unknown`. The source stays null. This transition does not enqueue object repair or create a repair proof. Targeted recheck remains rejected because the original generation cannot be established.
 
@@ -28,6 +30,8 @@ Do not delete a companion, journal, or commit manifest to clear this condition. 
 
 ## Format and rollout boundary
 
-The writer continues to emit lifecycle format version 1. A source-less `Active` record still means a parked legacy responsibility, and observing a current incarnation uses the existing `LegacyGenerationUnknown` state. No new persistent state is activated by identity probing.
+Owners that have not read a V2 checkpoint continue to emit lifecycle format version 1. A source-less `Active` record still means a parked legacy responsibility, and observing a current incarnation uses the existing `LegacyGenerationUnknown` state. No new persistent state is activated by admission or identity probing.
 
-A durable state for unknown source and current generations, including the first-retained time and probe schedule across restarts, needs a separate reader-first rollout. The existing heal-control and cross-pool protocol capabilities do not prove support for a new lifecycle state. New writers require evidence for every reader and the minimum supported rollback reader; do not downgrade past that reader or silently convert an unknown state to `Active`.
+The reader accepts lifecycle formats 1 and 2. Replaying a V2 owner preserves that format in successor checkpoints, even after the current bucket becomes visible; it never writes the new state inside a V1 envelope. A valid V2 unknown-generation state cannot contain a source incarnation. Unknown fields, missing retry fields, unsupported versions, and mismatched envelope/payload versions remain unreadable.
+
+Creating the new state requires a separate writer rollout. The existing heal-control and cross-pool protocol capabilities do not prove support for it. New writers require pinned read/restart evidence for every supported reader and an explicit minimum rollback reader. Reader support alone does not qualify writer activation; do not downgrade past that reader or silently convert an unknown state to `Active`.

@@ -48,7 +48,7 @@ fn unknown_source_deleted_bucket_lifecycle_rejects_unknown_state_version_and_fie
     let valid = lifecycle_frame(&payload);
     assert!(decode_mrf_lifecycle_checkpoint(&valid, 8192).is_ok());
     let mut future_version = valid;
-    future_version[8] += 1;
+    future_version[8] = MRF_LIFECYCLE_FORMAT_VERSION_V2 + 1;
     assert!(matches!(
         decode_mrf_lifecycle_checkpoint(&future_version, 8192),
         Err(MrfReplayError::Snapshot(snapshot::SnapshotError::Unsupported))
@@ -176,6 +176,7 @@ async fn assert_unreadable_lifecycle_is_retained(corrupt: fn(&mut Value)) {
         config,
         checkpoint_owner: Uuid::new_v4(),
         next_checkpoint_sequence: replay.next_checkpoint_sequence,
+        lifecycle_format_version: replay.lifecycle_format_version,
         new_since_flush: 0,
         dirty: true,
         journal_on_disk: replay.journal_on_disk,

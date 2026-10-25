@@ -123,10 +123,17 @@ fn validate_certificate_shape(
 }
 
 impl LocalDisk {
-    pub(super) async fn recover_multipart_source_native(
+    // Construct the large recovery state machine outside the caller's poll
+    // frame, including when several native operations share one async frame.
+    #[inline(never)]
+    pub(super) fn recover_multipart_source_native(
         &self,
         request: MultipartSourceRequest,
-    ) -> Result<MultipartSourceResponse> {
+    ) -> impl std::future::Future<Output = Result<MultipartSourceResponse>> + Send + '_ {
+        Box::pin(self.recover_multipart_source_native_inner(request))
+    }
+
+    async fn recover_multipart_source_native_inner(&self, request: MultipartSourceRequest) -> Result<MultipartSourceResponse> {
         request.validate()?;
         // Source RW ownership precedes source namespace, target metadata, and
         // target publication ownership. Every filesystem tail retains it.
@@ -609,22 +616,6 @@ mod tests {
     use rustfs_filemeta::{FileInfo, FileInfoOpts, FileMeta, ObjectPartInfo, get_file_info};
     use sha2::{Digest, Sha256};
 
-    // Construct the concrete native dispatcher future off each caller's poll
-    // frame; boxing an already-built future would retain its stack temporary.
-    #[inline(never)]
-    fn heap_native<F: std::future::Future>(build: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
-        Box::pin(build())
-    }
-
-    impl LocalDisk {
-        fn recover_native_on_heap(
-            &self,
-            request: MultipartSourceRequest,
-        ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<MultipartSourceResponse>> + '_>> {
-            heap_native(|| self.recover_multipart_source_native(request))
-        }
-    }
-
     mod abort_tests {
         include!("multipart_source_abort_tests.rs");
     }
@@ -759,7 +750,7 @@ mod tests {
 
         async fn inspect(&self, slot: usize) -> MultipartSourceInspection {
             match self.disks[slot]
-                .recover_native_on_heap(self.request(MultipartSourceOperation::Inspect { lineage: None }))
+                .recover_multipart_source_native(self.request(MultipartSourceOperation::Inspect { lineage: None }))
                 .await
                 .expect("inspect actual native source")
             {
@@ -795,7 +786,7 @@ mod tests {
             for &slot in slots {
                 let expected = self.snapshot(slot).await;
                 match self.disks[slot]
-                    .recover_native_on_heap(self.request(MultipartSourceOperation::Claim {
+                    .recover_multipart_source_native(self.request(MultipartSourceOperation::Claim {
                         expected,
                         round: round.clone(),
                     }))
@@ -930,7 +921,7 @@ mod tests {
             for slot in 0..4 {
                 let expected = self.snapshot(slot).await;
                 match self.disks[slot]
-                    .recover_native_on_heap(self.request(MultipartSourceOperation::Restore {
+                    .recover_multipart_source_native(self.request(MultipartSourceOperation::Restore {
                         expected,
                         certificate: negative.clone(),
                     }))
@@ -970,7 +961,7 @@ mod tests {
         let before = std::fs::read(fixture.head(0)).expect("blocked source head before invalid activation");
         assert!(
             fixture.disks[0]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Activate {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Activate {
                     expected: expected.clone(),
                     certificate: incomplete,
                 }))
@@ -983,7 +974,7 @@ mod tests {
         for slot in 0..3 {
             let expected = fixture.snapshot(slot).await;
             let response = fixture.disks[slot]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Activate {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Activate {
                     expected,
                     certificate: ready.clone(),
                 }))
@@ -1020,7 +1011,7 @@ mod tests {
         let before = std::fs::read(fixture.head(0)).expect("active source before stale restore");
         assert!(
             fixture.disks[0]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Restore {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Restore {
                     expected: old,
                     certificate: negative,
                 }))
@@ -1063,7 +1054,7 @@ mod tests {
         ] {
             assert!(
                 fixture.disks[2]
-                    .recover_native_on_heap(fixture.request(MultipartSourceOperation::Restore {
+                    .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Restore {
                         expected: expected.clone(),
                         certificate,
                     }))
@@ -1121,7 +1112,7 @@ mod tests {
         let ready = fixture.restore_all(&negative).await;
         for slot in 0..4 {
             fixture.disks[slot]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Activate {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Activate {
                     expected: fixture.snapshot(slot).await,
                     certificate: ready.clone(),
                 }))
@@ -1151,7 +1142,7 @@ mod tests {
         for operation in stale {
             assert!(
                 fixture.disks[0]
-                    .recover_native_on_heap(fixture.request(operation))
+                    .recover_multipart_source_native(fixture.request(operation))
                     .await
                     .is_err(),
                 "current full snapshot cannot authorize an old generation's operation"
@@ -1168,7 +1159,7 @@ mod tests {
         let negative = fixture.negative(&round).await;
         let bare_wire = rmp_serde::to_vec_named(&negative).expect("serialized proof has no local runtime authority");
         fixture.disks[0]
-            .recover_native_on_heap(fixture.request(MultipartSourceOperation::Restore {
+            .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Restore {
                 expected: fixture.snapshot(0).await,
                 certificate: negative,
             }))
@@ -1205,7 +1196,7 @@ mod tests {
             std::fs::write(&record, bytes).expect("inject changed owned certificate bytes");
             assert!(
                 fixture.disks[0]
-                    .recover_native_on_heap(fixture.request(MultipartSourceOperation::Inspect { lineage: None }))
+                    .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Inspect { lineage: None }))
                     .await
                     .is_err(),
                 "changed bytes or wrong round cannot hydrate authority"
@@ -1219,7 +1210,7 @@ mod tests {
         std::fs::remove_file(&record).expect("remove owned certificate record");
         assert!(
             fixture.disks[0]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Inspect { lineage: None }))
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Inspect { lineage: None }))
                 .await
                 .is_err(),
             "missing owned record cannot hydrate authority"
@@ -1242,7 +1233,7 @@ mod tests {
             );
         }
         if let Ok(MultipartSourceResponse::Inspected(inspection)) = fixture.disks[0]
-            .recover_native_on_heap(fixture.request(MultipartSourceOperation::Inspect { lineage: None }))
+            .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Inspect { lineage: None }))
             .await
         {
             assert!(
@@ -1252,7 +1243,7 @@ mod tests {
         }
         assert!(
             fixture.disks[0]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Restore {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Restore {
                     expected,
                     certificate: bare,
                 }))
@@ -1299,7 +1290,7 @@ mod tests {
         assert_eq!(std::fs::read(fixture.head(0)).expect("old head after injected claim crash"), original);
         let resume = fixture.snapshot(0).await;
         let result = fixture.disks[0]
-            .recover_native_on_heap(fixture.request(MultipartSourceOperation::Claim {
+            .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Claim {
                 expected: resume,
                 round: round.clone(),
             }))
@@ -1314,7 +1305,7 @@ mod tests {
         let before = std::fs::read(fixture.head(0)).expect("new-generation blocked head");
         assert!(
             fixture.disks[0]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Claim { expected, round }))
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Claim { expected, round }))
                 .await
                 .is_err(),
             "old pre-fence snapshot is permanently stale"
@@ -1350,7 +1341,7 @@ mod tests {
         }
         let expected = fixture.snapshot(0).await;
         fixture.disks[0]
-            .recover_native_on_heap(fixture.request(MultipartSourceOperation::Activate {
+            .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Activate {
                 expected,
                 certificate: ready.clone(),
             }))
@@ -1359,7 +1350,7 @@ mod tests {
         assert_eq!(fixture.snapshot(0).await.phase, MultipartSourcePhase::Active);
         let expected = fixture.snapshot(0).await;
         fixture.disks[0]
-            .recover_native_on_heap(fixture.request(MultipartSourceOperation::Activate {
+            .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Activate {
                 expected,
                 certificate: ready.clone(),
             }))
@@ -1372,7 +1363,7 @@ mod tests {
         std::fs::remove_dir_all(&source_root).expect("remove canonical upload root");
         assert!(
             fixture.disks[0]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Activate {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Activate {
                     expected,
                     certificate: ready,
                 }))
@@ -1392,7 +1383,7 @@ mod tests {
         let mut seals = Vec::new();
         for (slot, result) in &publications {
             let response = fixture.disks[*slot]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::ConfirmTerminal {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::ConfirmTerminal {
                     expected: Some(result.proof.snapshot.clone()),
                     publication: publication.clone(),
                     challenge: Uuid::new_v4(),
@@ -1446,7 +1437,7 @@ mod tests {
         let source = std::fs::read(fixture.head(slot)).expect("blocked restored source before stale cap");
         assert!(
             fixture.disks[slot]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::UndoAndClaim {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::UndoAndClaim {
                     expected: Box::new(old.proof.snapshot),
                     publication: old.publication,
                     capability: old.undo_capability,
@@ -1460,7 +1451,7 @@ mod tests {
         assert_eq!(std::fs::read(fixture.head(slot)).expect("source after rejected stale cap"), source);
         for slot in 0..3 {
             fixture.disks[slot]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Activate {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Activate {
                     expected: fixture.snapshot(slot).await,
                     certificate: ready.clone(),
                 }))
@@ -1504,7 +1495,7 @@ mod tests {
         let capability_wire = rmp_serde::to_vec_named(&result.undo_capability).expect("same owner's opaque retry token");
         let expected = result.proof.snapshot.clone();
         let response = fixture.disks[0]
-            .recover_native_on_heap(fixture.request(MultipartSourceOperation::UndoAndClaim {
+            .recover_multipart_source_native(fixture.request(MultipartSourceOperation::UndoAndClaim {
                 expected: Box::new(expected.clone()),
                 publication: publication.clone(),
                 capability: result.undo_capability,
@@ -1529,7 +1520,7 @@ mod tests {
         assert!(!data.exists(), "snapshot release must reclaim the exact failed DD and anchor");
         let duplicate = rmp_serde::from_slice(&capability_wire).expect("same owned opaque request retry");
         let response = fixture.disks[0]
-            .recover_native_on_heap(fixture.request(MultipartSourceOperation::UndoAndClaim {
+            .recover_multipart_source_native(fixture.request(MultipartSourceOperation::UndoAndClaim {
                 expected: Box::new(expected.clone()),
                 publication: publication.clone(),
                 capability: duplicate,
@@ -1546,7 +1537,7 @@ mod tests {
         let ready = fixture.restore_all(&negative).await;
         for slot in 0..4 {
             fixture.disks[slot]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Activate {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Activate {
                     expected: fixture.snapshot(slot).await,
                     certificate: ready.clone(),
                 }))
@@ -1559,7 +1550,7 @@ mod tests {
         let duplicate = rmp_serde::from_slice(&capability_wire).expect("old opaque capability replay");
         assert!(
             fixture.disks[0]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::UndoAndClaim {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::UndoAndClaim {
                     expected: Box::new(expected),
                     publication,
                     capability: duplicate,
@@ -1586,7 +1577,7 @@ mod tests {
         let ready = fixture.restore_all(&old_negative).await;
         for slot in 0..4 {
             fixture.disks[slot]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Activate {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Activate {
                     expected: fixture.snapshot(slot).await,
                     certificate: ready.clone(),
                 }))
@@ -1600,7 +1591,7 @@ mod tests {
         let mut terminal = Vec::new();
         for (slot, result) in publications {
             let response = fixture.disks[slot]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::ConfirmTerminal {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::ConfirmTerminal {
                     expected: Some(result.proof.snapshot),
                     publication: publication.clone(),
                     challenge,
@@ -1617,7 +1608,7 @@ mod tests {
             let snapshot = fixture.snapshot(slot).await;
             assert!(
                 fixture.disks[slot]
-                    .recover_native_on_heap(fixture.request(MultipartSourceOperation::Claim {
+                    .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Claim {
                         expected: snapshot.clone(),
                         round: round.clone(),
                     }))
@@ -1641,7 +1632,7 @@ mod tests {
             std::fs::read(fixture.disks[0].root.join("bucket/object/xl.meta")).expect("terminal target before insufficient H");
         assert!(
             fixture.disks[0]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Restore {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Restore {
                     expected,
                     certificate: only_present,
                 }))
@@ -1674,7 +1665,7 @@ mod tests {
         let expected = fixture.snapshot(0).await;
         assert!(
             fixture.disks[0]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Restore {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Restore {
                     expected: expected.clone(),
                     certificate: old_negative,
                 }))
@@ -1698,7 +1689,7 @@ mod tests {
         let ready = fixture.restore_all(&negative).await;
         for slot in 0..4 {
             fixture.disks[slot]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Activate {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Activate {
                     expected: fixture.snapshot(slot).await,
                     certificate: ready.clone(),
                 }))
@@ -1726,7 +1717,7 @@ mod tests {
         ] {
             assert!(
                 fixture.disks[0]
-                    .recover_native_on_heap(fixture.request(operation))
+                    .recover_multipart_source_native(fixture.request(operation))
                     .await
                     .is_err(),
                 "a current snapshot does not give historical certificates authority over a consumed head"
@@ -1764,7 +1755,7 @@ mod tests {
         fixture.reopen().await;
         for slot in 0..3 {
             let response = fixture.disks[slot]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::ConfirmTerminal {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::ConfirmTerminal {
                     expected: None,
                     publication: publication.clone(),
                     challenge: Uuid::new_v4(),
@@ -1792,7 +1783,7 @@ mod tests {
         std::fs::write(anchor(1), donor).expect("inject donor anchor without rebinding disk identity");
         assert!(
             fixture.disks[1]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::ConfirmTerminal {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::ConfirmTerminal {
                     expected: None,
                     publication: publication.clone(),
                     challenge: Uuid::new_v4(),
@@ -1804,7 +1795,7 @@ mod tests {
         std::fs::remove_file(anchor(1)).expect("remove mismatched target anchor");
         assert!(
             fixture.disks[1]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::ConfirmTerminal {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::ConfirmTerminal {
                     expected: None,
                     publication,
                     challenge: Uuid::new_v4(),
@@ -1860,7 +1851,7 @@ mod tests {
             .await
             .expect("actual PUT reaches physical publication")
             .expect("physical PUT pause entered");
-        let mut confirm = Box::pin(fixture.disks[0].recover_native_on_heap(fixture.request(
+        let mut confirm = Box::pin(fixture.disks[0].recover_multipart_source_native(fixture.request(
             MultipartSourceOperation::ConfirmTerminal {
                 expected: None,
                 publication,
@@ -1941,7 +1932,7 @@ mod tests {
     async fn activate_all_actual_heads(fixture: &Fixture, ready: &MultipartCertificate) {
         for slot in 0..4 {
             fixture.disks[slot]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Activate {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Activate {
                     expected: fixture.snapshot(slot).await,
                     certificate: ready.clone(),
                 }))
@@ -2159,7 +2150,7 @@ mod tests {
         });
         let failed = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            fixture.disks[0].recover_native_on_heap(fixture.request(MultipartSourceOperation::UndoAndClaim {
+            fixture.disks[0].recover_multipart_source_native(fixture.request(MultipartSourceOperation::UndoAndClaim {
                 expected: Box::new(expected.clone()),
                 publication: publication.clone(),
                 capability: result.undo_capability,
@@ -2195,7 +2186,7 @@ mod tests {
         assert_eq!(pending.generation, expected.generation);
         let retry = rmp_serde::from_slice(&capability_wire).expect("same owned capability retry");
         let response = fixture.disks[0]
-            .recover_native_on_heap(fixture.request(MultipartSourceOperation::UndoAndClaim {
+            .recover_multipart_source_native(fixture.request(MultipartSourceOperation::UndoAndClaim {
                 expected: Box::new(expected.clone()),
                 publication: publication.clone(),
                 capability: retry,
@@ -2227,7 +2218,7 @@ mod tests {
         let stale = rmp_serde::from_slice(&capability_wire).expect("historical owned retry packet");
         assert!(
             fixture.disks[0]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::UndoAndClaim {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::UndoAndClaim {
                     expected: Box::new(expected),
                     publication,
                     capability: stale,
@@ -2381,7 +2372,7 @@ mod tests {
         assert!(expected.head_sha256.is_some());
         let round = Fixture::round_for(&publication);
         let response = fixture.disks[0]
-            .recover_native_on_heap(fixture.request(MultipartSourceOperation::Claim {
+            .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Claim {
                 expected,
                 round: round.clone(),
             }))
@@ -2543,7 +2534,7 @@ mod tests {
         let raw = std::fs::read(fixture.head(0)).expect("cold source before failed terminal confirmation");
         assert!(
             fixture.disks[0]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::ConfirmTerminal {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::ConfirmTerminal {
                     expected: Some(snapshot.clone()),
                     publication: publication.clone(),
                     challenge: Uuid::new_v4(),
@@ -2892,7 +2883,7 @@ mod tests {
                 os::fsync_dir_recorder::set_failure(&ancestor, std::io::ErrorKind::Other);
                 assert!(
                     fixture.disks[2]
-                        .recover_native_on_heap(fixture.request(MultipartSourceOperation::Restore {
+                        .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Restore {
                             expected: before.clone(),
                             certificate: negative.clone(),
                         }))
@@ -2912,7 +2903,7 @@ mod tests {
                 );
             }
             let restored = fixture.disks[2]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Restore {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Restore {
                     expected: before,
                     certificate: negative,
                 }))
@@ -3151,7 +3142,7 @@ mod tests {
         let negative = fixture.negative(&round).await;
         assert!(
             fixture.disks[3]
-                .recover_native_on_heap(fixture.request(MultipartSourceOperation::Restore {
+                .recover_multipart_source_native(fixture.request(MultipartSourceOperation::Restore {
                     expected,
                     certificate: negative,
                 }))

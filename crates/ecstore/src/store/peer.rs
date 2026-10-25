@@ -966,6 +966,7 @@ mod tests {
                 initial.mod_time = fi.mod_time;
                 initial.data_dir = Some(original_dir);
                 initial.fresh = true;
+                crate::disk::multipart_source::mark_native_source(&mut initial);
                 rustfs_utils::http::insert_str(&mut initial.metadata, "multipart-bucket", volume.to_string());
                 rustfs_utils::http::insert_str(&mut initial.metadata, "multipart-object", "destination".to_string());
                 disk.write_metadata(volume, volume, &path, initial)
@@ -1016,6 +1017,7 @@ mod tests {
                 completed.data_dir = Some(Uuid::new_v4());
                 rustfs_utils::http::remove_str(&mut completed.metadata, "multipart-bucket");
                 rustfs_utils::http::remove_str(&mut completed.metadata, "multipart-object");
+                crate::disk::multipart_source::strip_native_controls(&mut completed.metadata);
                 condition
                     .attach(&mut completed)
                     .expect("attach native publication precondition");
