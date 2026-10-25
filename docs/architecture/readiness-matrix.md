@@ -14,6 +14,8 @@
 | S3 data plane | Bucket/object S3 API routes | Receives `503 Service Unavailable` from the readiness gate with `Retry-After: 5`. | Routed to S3 handlers. | This is the main data-plane behavior protected by `FullReady`. |
 | Optional sidecars | FTP, FTPS, SFTP, WebDAV | Governed by protocol-specific startup and shutdown handling. | Governed by protocol-specific runtime handling. | These are not HTTP readiness-gate surfaces. |
 
+The outer gate uses the same HTTP/2 and `application/grpc` predicate as the hybrid router. This includes NodeService, HealControlService, ScannerControlService, and TierMutationControlService while startup is pending. Their registered handlers still enforce RPC signatures, replay protection, storage owners, and operation-specific dependencies. Ordinary HTTP/1 and non-gRPC HTTP/2 requests retain the S3 readiness gate. Reaching the RPC router does not authorize an operation or prove that a storage owner is ready.
+
 ## Runtime Dependency Matrix
 
 | Dependency | Ready signal | Blocks `FullReady` | Notes |
