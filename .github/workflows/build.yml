@@ -322,7 +322,8 @@ jobs:
           download_console_assets() {
             local curl_bin="curl"
             local python_bin="python3"
-            local console_api="https://api.github.com/repos/rustfs/console/releases/latest"
+            # Preserve the reviewed 1.0.3 Console in this security-only release branch.
+            local console_api="https://api.github.com/repos/rustfs/console/releases/tags/v0.1.37"
             local console_json="console-release.json"
             local console_url
             local console_sha256
@@ -359,12 +360,15 @@ jobs:
               release = json.load(handle)
 
           tag = release.get("tag_name", "") or "unknown"
+          if tag != "v0.1.37":
+              raise SystemExit("Console release does not match the security-release pin")
+          expected_digest = "sha256:e6ff2c7e7695de824ec4cda91d8611d1aba5d8462e6809592c92a50b23f5b9ab"
 
           for asset in release.get("assets", []):
               name = asset.get("name", "")
               digest = asset.get("digest", "")
               url = asset.get("browser_download_url", "")
-              if name.startswith("rustfs-console-") and name.endswith(".zip") and digest.startswith("sha256:") and url:
+              if name == "rustfs-console-v0.1.37.zip" and digest == expected_digest and url:
                   sha256 = digest.split(":", 1)[1]
                   if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
                       raise SystemExit(f"console zip asset has invalid sha256 digest: {sha256}")
