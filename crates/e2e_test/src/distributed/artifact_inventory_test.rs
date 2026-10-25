@@ -55,7 +55,7 @@ impl Reader {
     }
 
     async fn request(&self, dist: &DistCluster, target: &Value, invocation: Uuid) -> TestResult<reqwest::Response> {
-        Ok(timeout(
+        timeout(
             BUDGET,
             signed_s3_request(
                 Method::POST,
@@ -66,7 +66,7 @@ impl Reader {
                 &self.secret,
             ),
         )
-        .await??)
+        .await?
     }
 }
 
