@@ -14,6 +14,7 @@
 
 use crate::admin::{
     auth::authorize_admin_request,
+    handlers::audit_runtime_config::load_server_config_from_store,
     handlers::notify_runtime_access::{get_notification_system, load_notification_config_snapshot},
     handlers::supervise_admin_mutation,
     handlers::target_descriptor::{
@@ -537,8 +538,13 @@ impl Operation for ListNotificationTargets {
             s3_error!(InternalError, "failed to refresh notification module state")
         })?;
         let notify_enabled = refresh_notify_module_enabled();
-        let (ns, config) = load_notification_config_snapshot().await?;
-        let runtime_statuses = collect_runtime_statuses(ns.get_target_values().await).await;
+        let config = load_server_config_from_store().await?;
+        // Configured destinations must remain inspectable when runtime reconciliation fails or stalls.
+        let runtime_statuses = if let Some(ns) = rustfs_notify::notification_system() {
+            collect_runtime_statuses(ns.get_target_values().await).await
+        } else {
+            HashMap::new()
+        };
         let notification_endpoints = merge_notification_endpoints(&config, runtime_statuses)?;
 
         let data = serde_json::to_vec(&NotificationEndpointsResponse {
@@ -674,6 +680,116 @@ mod tests {
             state: if online { "online" } else { "offline" }.to_string(),
             reason: if online { "reachable" } else { "unreachable" }.to_string(),
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn target_list_reads_durable_config_without_runtime_reconciliation() {
+        use crate::admin::storage_api::config::{save_admin_config, save_admin_server_config};
+        use crate::server::{mark_event_notifier_unreconciled, with_notify_runtime_reconcile_lock};
+        use http_body_util::BodyExt as _;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("notification-list-root".to_string()),
+            Some("notification-list-secret".to_string()),
+        );
+        let temp_dir = tempfile::tempdir().expect("create notification list test directory");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp_dir.path())
+            .disk_count(1)
+            .init_bucket_metadata(false)
+            .build()
+            .await;
+        crate::runtime_sources::install_test_app_context(Arc::clone(&env.ecstore)).await;
+
+        let credentials = crate::runtime_sources::current_action_credentials().expect("test root credentials");
+        let request = || S3Request {
+            input: Body::empty(),
+            method: Method::GET,
+            uri: "/rustfs/admin/v3/target/list".parse().expect("target list URI"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: Some(s3s::auth::Credentials {
+                access_key: credentials.access_key.clone(),
+                secret_key: credentials.secret_key.clone().into(),
+            }),
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        temp_env::async_with_vars([(rustfs_config::ENV_NOTIFY_ENABLE, Some("true"))], async {
+            let mut config = Config::new();
+            let mut kvs = enabled_kvs("on");
+            kvs.insert(rustfs_config::WEBHOOK_ENDPOINT.to_string(), "http://127.0.0.1:9/hook".to_string());
+            config
+                .0
+                .entry(NOTIFY_WEBHOOK_SUB_SYS.to_string())
+                .or_default()
+                .insert("unavailable".to_string(), kvs);
+            save_admin_server_config(env.ecstore.clone(), &config)
+                .await
+                .expect("persist target without loading it into the runtime");
+            mark_event_notifier_unreconciled();
+
+            with_notify_runtime_reconcile_lock(async {
+                for initialize_runtime in [false, true] {
+                    if initialize_runtime {
+                        rustfs_notify::ensure_live_events();
+                    }
+                    let response =
+                        tokio::time::timeout(Duration::from_secs(10), ListNotificationTargets {}.call(request(), Params::new()))
+                            .await
+                            .expect("destination inventory must not wait for runtime reconciliation")
+                            .expect("read configured destinations while the runtime is unavailable");
+                    assert_eq!(response.output.0, StatusCode::OK);
+                    let body = response
+                        .output
+                        .1
+                        .collect()
+                        .await
+                        .expect("collect target list response")
+                        .to_bytes();
+                    let value: Value = serde_json::from_slice(&body).expect("decode target list response");
+                    assert_eq!(value["notify_enabled"], true);
+                    let endpoints = value["notification_endpoints"].as_array().expect("destination inventory");
+                    let endpoint = endpoints
+                        .iter()
+                        .find(|endpoint| endpoint["account_id"] == "unavailable" && endpoint["service"] == "webhook")
+                        .expect("persisted destination remains visible");
+                    assert_eq!(endpoint["status"], "offline");
+                    assert_eq!(endpoint["health_state"], "offline");
+                    assert_eq!(endpoint["health_reason"], "not_loaded_in_runtime");
+                    assert_eq!(endpoint["source"], "config");
+                    assert!(!crate::server::is_event_notifier_reconciled());
+                    if let Some(system) = rustfs_notify::notification_system() {
+                        assert_eq!(system.runtime_lifecycle_state(), rustfs_notify::NotificationRuntimeState::LiveOnly);
+                    }
+                }
+
+                save_admin_config(env.ecstore.clone(), "config/config.json", b"invalid-server-config".to_vec())
+                    .await
+                    .expect("inject corrupt persisted configuration");
+                let error = ListNotificationTargets {}
+                    .call(request(), Params::new())
+                    .await
+                    .expect_err("unreadable persisted config must not become an empty inventory");
+                assert_eq!(error.code(), &S3ErrorCode::InternalError);
+
+                let mut unsigned = request();
+                unsigned.credentials = None;
+                let error = ListNotificationTargets {}
+                    .call(unsigned, Params::new())
+                    .await
+                    .expect_err("authorization must precede persisted configuration access");
+                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+                assert_eq!(error.message(), Some("credentials not found"));
+            })
+            .await;
+        })
+        .await;
     }
 
     fn subscription_router() -> Router<()> {
@@ -1319,7 +1435,7 @@ mod tests {
             .find("let notify_enabled = refresh_notify_module_enabled();")
             .expect("target list should resolve the effective env and persisted module state");
         let load_index = list_block
-            .find("load_notification_config_snapshot().await?")
+            .find("load_server_config_from_store().await?")
             .expect("target list should load notification config");
         assert!(
             authorize_index < refresh_index && refresh_index < effective_state_index && effective_state_index < load_index,
