@@ -607,6 +607,224 @@ async fn sixteen_shard_multipart_metadata_requires_twelve_votes() -> TestResult 
 }
 
 #[tokio::test]
+async fn partial_abort_below_identity_quorum_returns_uncertainty_after_peer_recovery() -> TestResult {
+    let (cluster, proxies, clients, bucket) = fixture(4, "EC:4").await?;
+    let key = "partial-abort";
+    let committed = payload_for("committed-before-abort", 4096);
+    clients[0]
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(committed.clone()))
+        .send()
+        .await?;
+    let upload = clients[0].create_multipart_upload().bucket(&bucket).key(key).send().await?;
+    let upload_id = upload.upload_id().ok_or("missing upload ID")?;
+    clients[0]
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(ByteStream::from(vec![0x62; 8 * 1024 * 1024]))
+        .send()
+        .await?;
+    let path = upload_path_scope(&bucket, key, upload_id)?;
+    // One whole peer plus one disk on another peer leaves eleven deletes,
+    // below payload write quorum twelve and only five authority copies.
+    let pauses = vec![
+        proxies[1].pause(&["Delete"], 1, Some(&path))?,
+        proxies[2].pause(&["Delete"], usize::MAX, Some(&path))?,
+    ];
+    let request = clients[0]
+        .abort_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id);
+    let caller = tokio::spawn(async move { request.send().await });
+    pauses[0].wait_for_hits(1).await?;
+    pauses[1].wait_for_hits(4).await?;
+    let first = tokio::time::timeout(DEADLINE, caller)
+        .await??
+        .expect_err("eleven deletes cannot acknowledge Abort");
+    assert_unavailable(&first, "storage_write_quorum", None);
+    for pause in &pauses {
+        pause.discard_pending();
+    }
+    drop(pauses);
+    wait_for_storage_peer_recovery(&proxies, &clients[0], &bucket, upload_id, 4).await?;
+    let roots = cluster
+        .nodes
+        .iter()
+        .flat_map(|node| &node.data_dirs)
+        .map(|root| std::path::Path::new(root).join(".rustfs.sys/multipart").join(&path))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roots.iter().filter(|root| root.exists()).count(),
+        5,
+        "the partial delete must be physically observed"
+    );
+    let retained = roots.iter().filter(|root| root.exists()).collect::<Vec<_>>();
+    let mut metadata = Vec::new();
+    for root in &retained {
+        metadata.push(tokio::fs::read(root.join("xl.meta")).await?);
+    }
+    eprintln!(
+        "MPU partial Abort: stage=first_delete, expected_write_quorum=12, deleted=11, survivors=5, request_id={:?}",
+        first
+            .raw_response()
+            .and_then(|response| response.headers().get("x-amz-request-id"))
+    );
+    let delete_observers = proxies
+        .iter()
+        .map(|proxy| proxy.pause(&["Delete"], usize::MAX, Some(&path)))
+        .collect::<Result<Vec<_>, _>>()?;
+    for observer in &delete_observers {
+        observer.release();
+    }
+    let retried = clients[0]
+        .abort_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await
+        .expect_err("peer recovery cannot invent quorum authority from five copies");
+    assert_unavailable(&retried, "storage_write_quorum", None);
+    let delete_calls = delete_observers.iter().map(RpcPause::hits).sum::<usize>();
+    assert_eq!(delete_calls, 0, "unknown authority must not dispatch another recursive delete");
+    eprintln!(
+        "MPU partial Abort: stage=retry_identity, expected_metadata_read_quorum=8, observed=5, remote_delete_calls={delete_calls}, request_id={:?}",
+        retried
+            .raw_response()
+            .and_then(|response| response.headers().get("x-amz-request-id"))
+    );
+    assert_eq!(roots.iter().filter(|root| root.exists()).count(), 5);
+    for (root, before) in retained.into_iter().zip(metadata) {
+        assert_eq!(tokio::fs::read(root.join("xl.meta")).await?, before);
+    }
+    for client in &clients {
+        assert_object_bytes_after_fault(client, &bucket, key, &committed).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn late_complete_packets_cannot_publish_after_abort_and_bucket_recreation() -> TestResult {
+    for size in [0, 8 * 1024 * 1024] {
+        let (cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+        let key = "late-complete";
+        let upload = clients[0].create_multipart_upload().bucket(&bucket).key(key).send().await?;
+        let upload_id = upload.upload_id().ok_or("missing upload ID")?;
+        let part = clients[0]
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(vec![0x62; size]))
+            .send()
+            .await?;
+        let path = upload_path_scope(&bucket, key, upload_id)?;
+        let staging_roots = cluster
+            .nodes
+            .iter()
+            .flat_map(|node| &node.data_dirs)
+            .map(|root| std::path::Path::new(root).join(".rustfs.sys/multipart").join(&path))
+            .collect::<Vec<_>>();
+        assert_eq!(staging_roots.len(), 4);
+        assert!(
+            staging_roots.iter().all(|root| root.exists()),
+            "staging paths must be physically witnessed before retirement"
+        );
+        let scope = upload_scope(upload_id)?;
+        let pauses = proxies[1..3]
+            .iter()
+            .map(|proxy| proxy.pause_late(&["RenameData", "RenameDataAtIncarnation", "RenameDataWithQuotaFence"], 64, &scope))
+            .collect::<Result<Vec<_>, _>>()?;
+        let complete = clients[0]
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .part_number(1)
+                            .e_tag(part.e_tag().ok_or("missing ETag")?)
+                            .build(),
+                    )
+                    .build(),
+            );
+        let caller = tokio::spawn(async move { complete.send().await });
+        wait_for_faults(&pauses, &["RenameData"]).await?;
+        let failure = tokio::time::timeout(DEADLINE, caller)
+            .await??
+            .expect_err("two retained peers must reject Complete below write quorum");
+        assert_unavailable(&failure, "storage_write_quorum", None);
+        assert!(pauses.iter().all(|pause| pause.responses() == 0));
+
+        // Retire the upload and old bucket while the exact signed packets are
+        // still owned by the proxy, beyond their callers' operation budget.
+        abort_after_fault(&clients[0], &bucket, key, upload_id, false).await?;
+        assert!(
+            staging_roots.iter().all(|root| !root.exists()),
+            "Abort must reclaim every staging root before delivery"
+        );
+        recover_after_fault("retire the old target before bucket recreation", || {
+            clients[0].delete_object().bucket(&bucket).key(key).send()
+        })
+        .await??;
+        clients[0].delete_bucket().bucket(&bucket).send().await?;
+        clients[1].create_bucket().bucket(&bucket).send().await?;
+        let fresh = payload_for("new-bucket-incarnation", 4096);
+        recover_after_fault("publish in the recreated bucket", || {
+            clients[1]
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from(fresh.clone()))
+                .send()
+        })
+        .await??;
+        for client in &clients {
+            assert_object_bytes_after_fault(client, &bucket, key, &fresh).await?;
+        }
+        for pause in &pauses {
+            pause.release();
+        }
+        wait_until(
+            DEADLINE,
+            || async {
+                Ok(pauses
+                    .iter()
+                    .all(|pause| pause.refused_mutations() == pause.hits() && pause.responses() == pause.hits()))
+            },
+            "every retained RenameData packet reaches the peer and returns an authenticated mutation refusal",
+        )
+        .await?;
+        eprintln!(
+            "MPU late delivery: bytes={size}, stage=after_abort_gc_and_bucket_recreation, delivered={}, refused={}, request_id={:?}",
+            pauses.iter().map(RpcPause::responses).sum::<usize>(),
+            pauses.iter().map(RpcPause::refused_mutations).sum::<usize>(),
+            failure
+                .raw_response()
+                .and_then(|response| response.headers().get("x-amz-request-id"))
+        );
+        for client in &clients {
+            assert_object_bytes_after_fault(client, &bucket, key, &fresh).await?;
+        }
+        assert_no_uploads_after_fault(&clients, &bucket).await?;
+        assert!(
+            staging_roots.iter().all(|root| !root.exists()),
+            "refused late packets must not recreate staging"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancelled_metadata_wait_releases_fence_for_bucket_recreation() -> TestResult {
     let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
     let pauses: Vec<_> = proxies[1..]

@@ -1341,9 +1341,13 @@ impl SetDisks {
                 }
             }
         }
+        // A partial Abort can leave only primary metadata below identity
+        // quorum. Recovery callers must preserve that uncertainty just as
+        // they do for retained publication authority, without authorizing GC.
+        let authority_seen = recovery_seen || (include_recovery && errs.iter().any(Option::is_none));
         let map_error = |error| {
             let error = map_upload_id_metadata_error(bucket, object, upload_id, error);
-            if recovery_seen && crate::error::is_err_invalid_upload_id(&error) {
+            if authority_seen && crate::error::is_err_invalid_upload_id(&error) {
                 Error::ErasureWriteQuorum
             } else {
                 error
@@ -7854,7 +7858,7 @@ mod tests {
                     );
                 }
             } else {
-                assert!(matches!(result, Err(StorageError::InvalidUploadID(..))), "{result:?}");
+                assert!(matches!(result, Err(StorageError::ErasureWriteQuorum)), "{result:?}");
                 for directory in &temp_dirs {
                     assert!(
                         directory
@@ -7920,6 +7924,125 @@ mod tests {
             .check_upload_id_exists(bucket, object, &below_quorum_upload.upload_id, false)
             .await
             .expect("failed abort must leave quorum-visible staging on the restored disks");
+    }
+
+    #[tokio::test]
+    async fn partial_abort_retry_preserves_surviving_authority_below_metadata_quorum() {
+        use crate::set_disk::core::io_primitives::rename_fault_injection;
+        use tokio::io::AsyncReadExt as _;
+
+        for (disk_count, parity) in [(4, 2), (16, 4)] {
+            for after_failed_complete in [false, true] {
+                let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity(disk_count, 0, parity).await;
+                let bucket = "multipart-partial-abort-retry";
+                let object = "object";
+                make_bucket_on_all(&disks, bucket).await;
+                let previous_body = vec![0x41; 4096];
+                set.put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(previous_body.clone()),
+                    &ObjectOptions {
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed an unrelated committed object");
+                let (upload, parts) =
+                    stage_upload_with_create_opts(&set, bucket, object, &[0x62; 4096], &ObjectOptions::default()).await;
+                let path = SetDisks::get_upload_id_dir(bucket, object, &upload);
+                let mut original_metadata = Vec::new();
+                for disk in &disks {
+                    original_metadata.push(
+                        disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &format!("{path}/{STORAGE_FORMAT_FILE}"))
+                            .await
+                            .expect("capture upload identity before any deletion"),
+                    );
+                }
+                let available = set.default_write_quorum() - 1;
+                if after_failed_complete {
+                    let failed = (available..disk_count).collect::<Vec<_>>();
+                    let fault = rename_fault_injection::fail_rename_on(object, &failed);
+                    let completed = set
+                        .clone()
+                        .complete_multipart_upload(bucket, object, &upload, parts, &ObjectOptions::default())
+                        .await;
+                    drop(fault);
+                    assert!(matches!(completed, Err(StorageError::ErasureWriteQuorum)), "{completed:?}");
+                }
+                let original_disks = {
+                    let mut current = set.disks.write().await;
+                    let original = current.clone();
+                    for disk in &mut current[available..] {
+                        *disk = None;
+                    }
+                    original
+                };
+                let first_abort = set
+                    .abort_multipart_upload(bucket, object, &upload, &ObjectOptions::default())
+                    .await;
+                *set.disks.write().await = original_disks;
+                assert!(matches!(first_abort, Err(StorageError::ErasureWriteQuorum)), "{first_abort:?}");
+                for (index, dir) in dirs.iter().enumerate() {
+                    assert_eq!(
+                        dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&path).exists(),
+                        index >= available,
+                        "the rejected Abort must really have deleted exactly its available disk roots"
+                    );
+                }
+                let retried = set
+                    .abort_multipart_upload(bucket, object, &upload, &ObjectOptions::default())
+                    .await;
+                if disk_count == 4 {
+                    retried.expect("two surviving identities still reach EC:2 metadata read quorum");
+                    assert!(
+                        dirs.iter()
+                            .all(|dir| !dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&path).exists())
+                    );
+                } else {
+                    assert!(
+                        matches!(retried, Err(StorageError::ErasureWriteQuorum)),
+                        "five surviving identities are uncertain authority, not a missing upload: {retried:?}"
+                    );
+                    for (index, disk) in disks.iter().enumerate().skip(available) {
+                        let retained = match disk
+                            .read_all(RUSTFS_META_MULTIPART_BUCKET, &format!("{path}/{STORAGE_FORMAT_FILE}"))
+                            .await
+                        {
+                            Ok(metadata) => metadata,
+                            Err(DiskError::FileNotFound) => disk
+                                .read_all(
+                                    RUSTFS_META_MULTIPART_BUCKET,
+                                    &format!("{path}/{MULTIPART_RECOVERY_DIR}/{STORAGE_FORMAT_FILE}"),
+                                )
+                                .await
+                                .expect("a refused retry must retain recovery authority"),
+                            Err(error) => panic!("read surviving authority: {error}"),
+                        };
+                        assert_eq!(retained, original_metadata[index]);
+                        assert!(dirs[index].path().join(RUSTFS_META_MULTIPART_BUCKET).join(&path).exists());
+                    }
+                }
+                let missing = base64_simd::URL_SAFE_NO_PAD.encode_to_string(b"deployment.absent-upload");
+                assert!(matches!(
+                    set.abort_multipart_upload(bucket, object, &missing, &ObjectOptions::default())
+                        .await,
+                    Err(StorageError::InvalidUploadID(..))
+                ));
+                let mut reader = set
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("neither Abort may delete the unrelated committed object");
+                let mut actual = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut actual)
+                    .await
+                    .expect("read the complete previous object");
+                assert_eq!(actual, previous_body);
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -10076,7 +10199,7 @@ mod tests {
             if remaining == 8 {
                 aborted.expect("read-quorum legacy authority can authorize full-quorum deletion");
             } else {
-                assert!(matches!(aborted, Err(StorageError::InvalidUploadID(..))), "{aborted:?}");
+                assert!(matches!(aborted, Err(StorageError::ErasureWriteQuorum)), "{aborted:?}");
             }
             for dir in &dirs {
                 assert_eq!(
