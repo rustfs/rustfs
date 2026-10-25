@@ -190,8 +190,7 @@ pub struct BucketQuotaResponse {
 pub struct BucketQuotaStats {
     pub bucket: String,
     pub quota_limit: Option<u64>,
-    /// `null` when the bucket is admitted by the reservation ledger and no
-    /// scanner usage is available; never reported as zero.
+    /// `null` when no scanner usage is available; never reported as zero.
     pub current_usage: Option<u64>,
     pub remaining_quota: Option<u64>,
     pub usage_percentage: Option<f64>,
@@ -1119,5 +1118,29 @@ mod tests {
 
         let json: serde_json::Value = serde_json::to_value(&response).unwrap();
         assert!(json["size"].is_null(), "unknown usage must not be reported as zero: {json}");
+    }
+
+    #[test]
+    fn quota_responses_keep_known_zero_usage_numeric() {
+        let quota = BucketQuotaResponse {
+            bucket: "test-bucket".to_string(),
+            quota: Some(2048),
+            size: Some(0),
+            quota_type: default_quota_type(),
+        };
+        let stats = BucketQuotaStats {
+            bucket: "test-bucket".to_string(),
+            quota_limit: Some(2048),
+            current_usage: Some(0),
+            remaining_quota: Some(2048),
+            usage_percentage: Some(0.0),
+        };
+
+        let quota = serde_json::to_value(&quota).expect("quota response should serialize");
+        let stats = serde_json::to_value(&stats).expect("quota statistics should serialize");
+        assert_eq!(quota["size"], 0);
+        assert_eq!(stats["current_usage"], 0);
+        assert_eq!(stats["remaining_quota"], 2048);
+        assert_eq!(stats["usage_percentage"], 0.0);
     }
 }
