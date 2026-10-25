@@ -3214,9 +3214,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
-        if let Some(completed) = self
-            .replay_completed_multipart_upload(bucket, object, upload_id, &uploaded_parts, Some(&fi), opts)
-            .await?
+        // The source check selected an ACTIVE write quorum. Native publication
+        // consumes those heads, excluding an earlier completion. Legacy
+        // publication can retain active metadata and still needs replay.
+        if !native_source_protocol(&fi)?
+            && let Some(completed) = self
+                .replay_completed_multipart_upload(bucket, object, upload_id, &uploaded_parts, Some(&fi), opts)
+                .await?
         {
             self.reclaim_replayed_multipart_staging(bucket, object, upload_id, &upload_id_path)
                 .await;

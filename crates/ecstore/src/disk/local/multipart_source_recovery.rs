@@ -123,10 +123,17 @@ fn validate_certificate_shape(
 }
 
 impl LocalDisk {
-    pub(super) async fn recover_multipart_source_native(
+    // Construct the large recovery state machine outside the caller's poll
+    // frame, including when several native operations share one async frame.
+    #[inline(never)]
+    pub(super) fn recover_multipart_source_native(
         &self,
         request: MultipartSourceRequest,
-    ) -> Result<MultipartSourceResponse> {
+    ) -> impl std::future::Future<Output = Result<MultipartSourceResponse>> + Send + '_ {
+        Box::pin(self.recover_multipart_source_native_inner(request))
+    }
+
+    async fn recover_multipart_source_native_inner(&self, request: MultipartSourceRequest) -> Result<MultipartSourceResponse> {
         request.validate()?;
         // Source RW ownership precedes source namespace, target metadata, and
         // target publication ownership. Every filesystem tail retains it.
