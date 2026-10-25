@@ -72,12 +72,49 @@ impl S3 for Consumer {
 }
 
 fn service(consumer: Consumer) -> S3Service {
+    service_with_config(consumer, S3Config::default())
+}
+
+fn service_with_config(consumer: Consumer, mut config: S3Config) -> S3Service {
     let mut builder = S3ServiceBuilder::new(consumer);
     builder.set_auth(SimpleAuth::from_single("test-access", "test-secret"));
-    let mut config = S3Config::default();
     config.presigned_url_max_skew_time_secs = u32::MAX;
     builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(config))));
     builder.build()
+}
+
+#[tokio::test]
+async fn signed_chunk_size_limit_accepts_exact_boundary_and_rejects_one_more() {
+    for exceeds_limit in [false, true] {
+        let payload = b"chunk-size-boundary";
+        let SignedRequest {
+            request,
+            sender,
+            prefix,
+            suffix,
+        } = signed_request(payload, false);
+        let consumer = Consumer::default();
+        let mut config = S3Config::default();
+        config.aws_chunked_stream_max_chunk_size = payload.len() - usize::from(exceeds_limit);
+        let service = service_with_config(consumer.clone(), config);
+        sender.send(Ok(Frame::data(prefix))).expect("chunk metadata");
+        sender.send(Ok(Frame::data(Bytes::from_static(payload)))).expect("chunk data");
+        sender.send(Ok(Frame::data(suffix))).expect("terminating chunk");
+        drop(sender);
+        let response = service.call(request).await.expect("S3 response");
+        if exceeds_limit {
+            assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+            let body = BodyExt::collect(response.into_body()).await.expect("error XML").to_bytes();
+            let xml = std::str::from_utf8(&body).expect("UTF-8 XML");
+            assert!(xml.contains("<Code>EntityTooLarge</Code>"));
+            assert!(!xml.contains("ChunkDataTooLarge"));
+            assert_eq!(consumer.received.load(Ordering::Relaxed), 0);
+            assert!(consumer.committed.lock().is_none());
+        } else {
+            assert_eq!(response.status(), http::StatusCode::OK);
+            assert_eq!(*consumer.committed.lock(), Some(payload.to_vec()));
+        }
+    }
 }
 
 struct SignedRequest {

@@ -132,6 +132,13 @@ async fn scoped_ack_publication_companion_only_does_not_authorize_root_ack() {
 
         let publication = publish_candidate(&store, &scan, candidate, Some(baseline)).await;
         assert_eq!(publication.outcome(), DataUsagePersistOutcome::AlreadyDurable);
+        let observed = publication.observation_for_attempt(PROOF_EPOCH, PROOF_CYCLE, false, publication.outcome());
+        assert_eq!(
+            observed.class,
+            ScannerUsagePublicationClass::Unknown,
+            "a companion is not the published root"
+        );
+        assert_eq!(observed.pending_bucket_count, None);
         let (_, pending, acknowledgements) = finalize_scanner_cycle_result(scan, publication);
         assert!(pending, "unacknowledged durable companion work must remain pending");
         assert!(acknowledgements.is_empty());
@@ -175,6 +182,9 @@ async fn scoped_ack_publication_actual_root_readback_accepts_semantic_json_equiv
 
     let publication = publish_candidate(&store, &scan, candidate.clone(), Some(baseline)).await;
     assert_eq!(publication.outcome(), DataUsagePersistOutcome::AlreadyDurable);
+    let observed = publication.observation_for_attempt(PROOF_EPOCH, PROOF_CYCLE, false, publication.outcome());
+    assert_eq!(observed.class, ScannerUsagePublicationClass::CompleteConverged);
+    assert_eq!(observed.pending_bucket_count, Some(0));
     let (_, proof) = publication.into_parts();
     let proof = proof.expect("actual primary readback must produce its own root proof");
     let expected = scan.publication_expectation().expect("real scan expectation");
@@ -211,6 +221,9 @@ async fn scoped_ack_publication_successful_root_cas_authorizes_its_scan() {
     assert!(crate::scanner_io::dirty_usage_buckets_pending());
     let publication = publish_candidate(&store, &scan, candidate.clone(), Some(baseline)).await;
     assert_eq!(publication.outcome(), DataUsagePersistOutcome::Saved);
+    let observed = publication.observation_for_attempt(PROOF_EPOCH, PROOF_CYCLE, false, publication.outcome());
+    assert_eq!(observed.class, ScannerUsagePublicationClass::CompleteConverged);
+    assert_eq!(observed.pending_bucket_count, Some(0));
     let (bytes, revision) = read_root(&store).await;
     assert!(matches!(revision, DataUsageCacheRevision::Etag(etag) if !etag.is_empty()));
     assert_eq!(
@@ -424,6 +437,9 @@ async fn scoped_ack_publication_stale_baseline_cannot_prove_a_replaced_root() {
     // now contains B. Compatibility's AlreadyDurable outcome is not proof.
     let publication = publish_candidate(&store, &first_scan, first_candidate, Some(stale_baseline)).await;
     assert_eq!(publication.outcome(), DataUsagePersistOutcome::AlreadyDurable);
+    let observed = publication.observation_for_attempt(PROOF_EPOCH, PROOF_CYCLE, false, publication.outcome());
+    assert_eq!(observed.class, ScannerUsagePublicationClass::Unknown);
+    assert_eq!(observed.pending_bucket_count, None);
     let (_, pending, acknowledgements) = finalize_scanner_cycle_result(first_scan, publication);
     assert!(pending);
     assert!(acknowledgements.is_empty());

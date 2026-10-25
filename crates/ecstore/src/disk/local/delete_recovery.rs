@@ -1219,7 +1219,7 @@ impl LocalDisk {
         let journal = journal_bytes(journal)?;
         self.wait_for_startup_cleanup().await;
         let temporary = self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?;
-        let root = self.io_get_object_path(volume, object)?;
+        let (bucket, root) = self.io_get_bucket_and_object_path(volume, object)?;
         let destination = root.join(transaction.to_string());
         let original = original.map(<[u8]>::to_vec);
         let sync = effective_durability(volume).syncs_commit_metadata();
@@ -1227,7 +1227,7 @@ impl LocalDisk {
         let record_destination = destination.clone();
         let staging_root = temporary.clone();
         let lease = os::acquire_namespace_mutation_lease_with_owner(&destination, owner.clone()).await;
-        let (staged, target) = os::run_blocking_namespace_operation(lease, move || {
+        let (staged, target) = os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
             std::fs::create_dir_all(&staging_root)?;
             let staged = Arc::new(
                 tempfile::Builder::new()
@@ -1262,6 +1262,17 @@ impl LocalDisk {
         self.delete_recovery_barrier(volume, object, transaction, "PREACTIVATION")
             .await?;
         match fs::symlink_metadata(&destination).await {
+            Ok(metadata) if metadata.is_dir() => {
+                // Proof GC may persist before its final rmdir. Only an empty
+                // leaf can be retired; nested prefixes and new evidence fail
+                // closed under the same namespace ownership as publication.
+                match os::remove_dir_with_owner(&destination, owner.clone()).await {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) if is_dir_not_empty_error(&err) => return Err(DiskError::OutdatedXLMeta),
+                    Err(err) => return Err(to_file_error(err).into()),
+                }
+            }
             Ok(_) => return Err(DiskError::OutdatedXLMeta),
             Err(err) if err.kind() == ErrorKind::NotFound => {}
             Err(err) => return Err(to_file_error(err).into()),
@@ -1269,25 +1280,27 @@ impl LocalDisk {
         // The directory owner accompanies the blocking rename, so cancelling
         // its waiter cannot delete staged files while activation is running.
         let publication_owner: Option<Arc<dyn Send + Sync>> = Some(Arc::new((owner.clone(), staged.clone())));
-        os::rename_all_with_owner(
-            staged.path(),
-            &destination,
-            &self.io_get_bucket_path(volume)?,
-            &self.publication_root,
-            publication_owner,
-        )
-        .await?;
+        os::rename_all_with_owner(staged.path(), &destination, &bucket, &self.publication_root, publication_owner).await?;
         if sync {
-            let bucket = self.io_get_bucket_path(volume)?;
+            let mut dirs_to_sync = Vec::new();
             let mut path = root.as_path();
             loop {
-                os::fsync_dir_with_owner(path, owner.clone()).await.map_err(to_file_error)?;
+                dirs_to_sync.push(path.to_path_buf());
                 if path == bucket {
                     break;
                 }
                 path = path.parent().ok_or(DiskError::InvalidPath)?;
             }
-            os::fsync_dir_with_owner(&temporary, owner.clone())
+            dirs_to_sync.push(temporary);
+            let sync_owner = owner.clone();
+            self.blocking_queue
+                .run_fsync_cancellable(move |_| {
+                    let _owner = sync_owner;
+                    for dir in dirs_to_sync {
+                        os::fsync_dir_std(&dir)?;
+                    }
+                    Ok(())
+                })
                 .await
                 .map_err(to_file_error)?;
         }
@@ -1722,18 +1735,15 @@ impl LocalDisk {
                 }
                 self.commit_reserved_version_delete_with_namespace_owner(volume, object, transaction, owner.clone())
                     .await?;
-                for name in [STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE] {
-                    match os::remove_file_with_owner(rollback.join(name), owner.clone()).await {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == ErrorKind::NotFound => {}
-                        Err(err) => return Err(to_file_error(err).into()),
-                    }
-                }
-                if effective_durability(volume).syncs_commit_metadata() {
-                    os::fsync_dir_with_owner(&rollback, owner.clone())
-                        .await
-                        .map_err(to_file_error)?;
-                }
+                os::remove_files_and_fsync_with_owner(
+                    &rollback,
+                    &[STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE],
+                    effective_durability(volume).syncs_commit_metadata(),
+                    None,
+                    owner.clone(),
+                )
+                .await
+                .map_err(to_file_error)?;
                 let (_, complete) = self
                     .finish_version_delete(volume, object, transaction, true, owner.clone())
                     .await?;
@@ -1787,18 +1797,17 @@ impl LocalDisk {
                         Err(err) => return Err(to_file_error(err).into()),
                     }
                 }
-                write_delete_rollback_file(self.io_root(), volume, &root, transaction, FINISHED, &[], owner.clone()).await?;
                 let receipt = CommitReceipt {
                     journal: journal.clone(),
                     finished: true,
                 };
-                write_delete_rollback_file(
+                let receipt_bytes = serde_json::to_vec(&receipt)?;
+                write_delete_rollback_files(
                     self.io_root(),
                     volume,
                     &root,
                     transaction,
-                    DELETE_QUORUM_COMMITTED_FILE,
-                    &serde_json::to_vec(&receipt)?,
+                    &[(FINISHED, &[]), (DELETE_QUORUM_COMMITTED_FILE, &receipt_bytes)],
                     owner.clone(),
                 )
                 .await?;
@@ -1807,21 +1816,15 @@ impl LocalDisk {
                 if observed.state != DeleteRecoveryState::CommitFinished {
                     return Err(DiskError::DiskOngoingReq);
                 }
-                for name in [TARGET, PREPARED, FINISHED] {
-                    match os::remove_file_with_owner(rollback.join(name), owner.clone()).await {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == ErrorKind::NotFound => {}
-                        Err(err) => return Err(to_file_error(err).into()),
-                    }
-                }
-                if effective_durability(volume).syncs_commit_metadata() {
-                    os::fsync_dir_with_owner(&rollback, owner.clone())
-                        .await
-                        .map_err(to_file_error)?;
-                }
-                os::remove_file_with_owner(rollback.join(DELETE_QUORUM_COMMITTED_FILE), owner.clone())
-                    .await
-                    .map_err(to_file_error)?;
+                os::remove_files_and_fsync_with_owner(
+                    &rollback,
+                    &[TARGET, PREPARED, FINISHED],
+                    effective_durability(volume).syncs_commit_metadata(),
+                    Some(DELETE_QUORUM_COMMITTED_FILE),
+                    owner.clone(),
+                )
+                .await
+                .map_err(to_file_error)?;
                 self.delete_unleased_with_namespace_owner(
                     volume,
                     &format!("{object}/{transaction}"),
@@ -2276,6 +2279,131 @@ mod tests {
             .expect("object directory");
         fs::write(path, &bytes).await.expect("original metadata");
         (temp, disk, info, bytes)
+    }
+
+    #[test]
+    fn delete_recovery_batch_parallelism_preserves_overlapping_key_order() {
+        let opts = DeleteOptions {
+            recoverable_delete: true,
+            ..Default::default()
+        };
+        for names in [
+            vec!["a", "a"],
+            vec!["a", "a-0", "a/child"],
+            vec!["a//b", "a/b"],
+            vec!["a/./b", "a/b"],
+            vec!["a/../b", "b"],
+        ] {
+            let groups: Vec<_> = names
+                .into_iter()
+                .map(|name| super::super::FileInfoVersions {
+                    name: name.to_owned(),
+                    ..Default::default()
+                })
+                .collect();
+            assert_eq!(
+                super::super::delete_version_batch_concurrency(&groups, &opts),
+                1,
+                "overlapping or noncanonical keys retain serial execution"
+            );
+        }
+        let groups: Vec<_> = ["a/one", "a/two"]
+            .into_iter()
+            .map(|name| super::super::FileInfoVersions {
+                name: name.to_owned(),
+                ..Default::default()
+            })
+            .collect();
+        let expected = if cfg!(target_os = "linux") {
+            super::super::DELETE_VERSION_PREPARE_CONCURRENCY
+        } else {
+            1
+        };
+        assert_eq!(super::super::delete_version_batch_concurrency(&groups, &opts), expected);
+        for options in [
+            DeleteOptions::default(),
+            DeleteOptions {
+                undo_write: true,
+                ..opts.clone()
+            },
+            DeleteOptions {
+                undo_delete: true,
+                ..opts
+            },
+        ] {
+            assert_eq!(
+                super::super::delete_version_batch_concurrency(&groups, &options),
+                1,
+                "legacy and rollback ordering is unchanged"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn delete_recovery_batch_prepares_independent_keys_while_one_metadata_lease_is_held() {
+        let (temp, disk, info, _) = fixture().await;
+        let disk = Arc::new(disk);
+        let mut healthy = info.clone();
+        healthy.name = "healthy".to_owned();
+        let healthy_root = temp.path().join("recovery/healthy");
+        fs::create_dir_all(&healthy_root).await.expect("healthy object directory");
+        fs::write(healthy_root.join(STORAGE_FORMAT_FILE), test_meta(healthy))
+            .await
+            .expect("healthy source");
+        let corrupt_root = temp.path().join("recovery/corrupt");
+        fs::create_dir_all(&corrupt_root).await.expect("corrupt object directory");
+        fs::write(corrupt_root.join(STORAGE_FORMAT_FILE), b"invalid xl.meta")
+            .await
+            .expect("corrupt source");
+        let held = os::acquire_metadata_mutation_lease(&temp.path().join("recovery/object"), None).await;
+        let groups = ["object", "corrupt", "healthy"]
+            .into_iter()
+            .map(|name| super::super::FileInfoVersions {
+                name: name.to_owned(),
+                versions: vec![FileInfo {
+                    name: name.to_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .collect();
+        let worker_disk = disk.clone();
+        let worker = tokio::spawn(async move {
+            worker_disk
+                .delete_versions_with_namespace_owner(
+                    "recovery",
+                    groups,
+                    DeleteOptions {
+                        recoverable_delete: true,
+                        old_data_dir: Some(Uuid::new_v4()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+        });
+        let prepared = tokio::time::timeout(Duration::from_secs(5), async {
+            while fs::try_exists(healthy_root.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("inspect healthy metadata")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(temp.path().join("recovery/object/xl.meta").exists(), "the locked source must stay intact");
+        drop(held);
+        let results = worker.await.expect("complete every disk result");
+        assert_eq!(
+            results,
+            vec![None, Some(DiskError::FileCorrupt), None],
+            "completion order cannot change per-key error positions"
+        );
+        assert!(
+            prepared.is_ok(),
+            "one key's metadata lease cannot serialize unrelated transaction preparation"
+        );
     }
 
     #[tokio::test]
@@ -4060,6 +4188,51 @@ mod tests {
         assert_eq!(witness.deleted_versions, authority.deleted_versions);
         assert_eq!(witness.bucket_incarnation, authority.bucket_incarnation);
         assert!(witness.original_digest.is_none() && witness.target_digest.is_none() && witness.data_dirs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_activation_preserves_occupied_transaction_directory() {
+        let (_source_temp, source, _, _) = fixture().await;
+        let transaction = Uuid::new_v4();
+        let applied = apply(&source, transaction).await;
+        let mut witness = source
+            .settle_delete_transaction(
+                "recovery",
+                "object",
+                transaction,
+                applied.fingerprint,
+                DeleteRecoveryAction::PublishCommit,
+            )
+            .await
+            .unwrap()
+            .journal
+            .unwrap();
+        witness.original_digest = None;
+        witness.target_digest = None;
+        witness.data_dirs.clear();
+        for nested in [false, true] {
+            let (_peer_temp, peer, _, _) = fixture().await;
+            let root = peer.io_get_object_path("recovery", "object").unwrap();
+            fs::remove_file(root.join(STORAGE_FORMAT_FILE)).await.unwrap();
+            let retained = root.join(transaction.to_string());
+            fs::create_dir(&retained).await.unwrap();
+            if nested {
+                fs::create_dir(retained.join("prefix-child")).await.unwrap();
+            } else {
+                fs::write(retained.join("unknown-file"), b"retained").await.unwrap();
+            }
+            assert!(matches!(
+                peer.activate_delete_preparation(&witness, None, None, None).await,
+                Err(DiskError::OutdatedXLMeta)
+            ));
+            assert!(!retained.join(PREPARED).exists());
+            if nested {
+                assert!(retained.join("prefix-child").is_dir());
+            } else {
+                assert_eq!(fs::read(retained.join("unknown-file")).await.unwrap(), b"retained");
+            }
+            assert!(!root.join(STORAGE_FORMAT_FILE).exists());
+        }
     }
 
     #[tokio::test]

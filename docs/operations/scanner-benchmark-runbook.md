@@ -268,6 +268,36 @@ use the same visit definition on both builds. Bucket labels follow the existing
 bucket/drive scanner metrics and have bucket-scale cardinality; no key or version
 is a label. An absent or dropped series is not zero.
 
+On Linux with a readable cgroup v2 hierarchy, the existing memory observation
+worker also samples the process's current cgroup and effective CPU affinity.
+`rustfs_background_resource_cpu_millis`, `memory_limit_bytes`, and
+`memory_headroom_bytes` (all with the `rustfs_background_resource_` prefix)
+reflect visible ancestor limits, sibling memory use, and host available memory.
+Ancestors hidden by the mount/cgroup namespace are not observable; these values
+are not a reservation or proof of every enclosing resource limit. The
+startup-only container gauges retain their existing meaning. These new gauges
+are observations; they do not resize scanner/heal workers or prove hot-shrink
+acceptance.
+
+Require `rustfs_background_resource_sample_available = 1` and a fresh
+`rustfs_background_resource_observed_timestamp_seconds`. Sampling follows
+`RUSTFS_MEMORY_OBSERVABILITY_INTERVAL_SECS` (15 seconds by default), not a
+one-second control loop. A failed sample clears availability and leaves the
+last successful timestamp and values unchanged. Missing/invalid limits, invisible
+membership, or oversized files must not be interpreted as host capacity or zero
+pressure. Other platforms and cgroup v1 have no sample from this observer.
+
+The `cpu_usage_microseconds`, `cpu_throttled_microseconds`, `cpu_stall_microseconds`,
+`memory_stall_microseconds`, and `io_stall_microseconds` gauges, under the same
+prefix, expose cumulative leaf-cgroup counters. Each requires its own
+`rustfs_background_resource_counter_available{resource=...}` flag (`cpu_usage`,
+`cpu_throttled`, `cpu_stall`, `memory_stall`, or `io_stall`). They do not summarize
+ancestor throttling. `identity_high` and `identity_low` preserve the cgroup
+generation hash in two exact 32-bit gauge values; a change invalidates counter
+differences. Floating-point counter exports cannot establish exact large-integer
+deltas. These series are not an atomic cross-instrument snapshot: retain the raw
+sample times and do not manufacture a common acceptance window.
+
 Each comparison records a `w22` section with clone, encode, and save bytes per
 walked object, clone/encode and save/encode byte ratios, and candidate changes.
 These are traffic amplification indicators, not allocation attribution or an
@@ -366,6 +396,14 @@ be a new file, and failure never produces a passing response. Workers and queued
 GETs are bounded (`--workers`, default 8, maximum 64); each body is read in 1 MiB
 chunks. This checks S3-visible content and versions, not every on-disk erasure
 fragment, and does not replace the seeded repair or performance gates.
+
+#### In-Process Foreground Windows
+
+When scanner or heal is enabled, a one-second process-local sampler tracks external S3 requests from the outer service call through response-body completion, stream failure or cancellation. It runs independently of the metrics export switch and stops with background services. Requests and their existing body buffers are not copied or moved to another task. The start boundary is `Service::call`; connection establishment and Tower readiness waits before that call are outside this window. A successful body observation means the server produced its final frame, not that the client received or acknowledged it. HEAD and bodyless HTTP statuses finish at response headers. Admin, health, console, STS and internal RPC traffic are excluded by the existing external S3 route classifier.
+
+Windows preserve request starts, in-flight requests and completed, failed and cancelled counts in four fixed classes: `read`, `write`, `metadata` and `other`. Cancellation is a censored observation and contributes no completed-latency sample. P99 is an inclusive nanosecond interval over non-cancelled completions, including errors, and is unavailable below 100 samples; 100 samples permit rank calculation but do not establish statistical confidence. The overflow bucket has no upper bound. The sampler brackets each atomic window cut with two monotonic clock readings. A writer delayed across a cut delays publication without changing those readings. Consumers must check validity, age and cut uncertainty; a missing or low-sample window does not prove that foreground work is idle.
+
+With metrics export enabled, `rustfs_background_foreground_window_*` gauges expose validity, cut uncertainty, duration, starts, in-flight work and per-class counts and percentile bounds. Check the class and percentile availability gauges before reading retained numeric values. Exported floating-point gauges are diagnostic; the in-process counters retain integer precision. These local windows neither align different nodes nor provide the exact client-side percentile required by the SSD ABBA gate. They supply observations, without enabling an adaptive admission policy or completing performance acceptance.
 
 #### Histogram Window Evidence
 
@@ -519,6 +557,8 @@ scripts/run_scanner_validation_harness.sh \
 ```
 
 For ad hoc per-node snapshots outside the harness window, use the by-host `awscurl` loop in [Reading Distributed Metrics](scanner-runtime-controls.md#reading-distributed-metrics); the metrics endpoint reports only the node that handles the request.
+
+Host collectors are optional. Check `host-telemetry-status.tsv` before using their output: each started collector records its exit status, and a failure emits a warning while scanner status collection remains available. A missing collector row is not a zero measurement. Each run resets its host telemetry artifacts, including when collection is skipped or the interval is zero. If a scanner status request fails, the harness stops and waits for its started collectors while preserving the request failure exit code; collector statuses are recorded when the output file remains writable. On macOS the harness uses `iostat -d -w <interval> -c <samples>`; Linux retains `iostat -xz <interval> <samples>`. These are host/device aggregates, not RustFS process I/O or filesystem syscall counts. The initial iostat report may cover time since boot; do not treat it as an aligned workload interval. `fs_usage` still requires the appropriate macOS privileges. Without it, report filesystem-event counts as unavailable and keep CPU/progress observations separate from production-burst attribution.
 
 ### Bucket metrics freshness validation
 
