@@ -2147,13 +2147,12 @@ async fn four_node_add_tier_converges() -> TestResult {
 
     let mut hot = RustFSTestClusterEnvironment::new(4).await?;
     hot.set_env(ALLOW_LOOPBACK_TIER_ENDPOINT_ENV, "true");
-    hot.set_env(
-        "RUST_LOG",
-        "rustfs=info,rustfs_notify=debug,rustfs_ecstore::object_lock_diag=trace,rustfs_lock=debug,rustfs_ecstore::cluster::rpc::remote_locker=debug",
-    );
-    hot.set_env("RUSTFS_OBJECT_LOCK_DIAG_ENABLE", "true");
-    hot.set_env("RUSTFS_OBJECT_LOCK_DIAG_SLOW_ACQUIRE_MS", "1");
-    hot.set_env("RUSTFS_OBJECT_LOCK_DIAG_SLOW_HOLD_MS", "1");
+    if let Ok(log_filter) = std::env::var("RUSTFS_E2E_ADD_TIER_LOG") {
+        hot.set_env("RUST_LOG", log_filter);
+        hot.set_env("RUSTFS_OBJECT_LOCK_DIAG_ENABLE", "true");
+        hot.set_env("RUSTFS_OBJECT_LOCK_DIAG_SLOW_ACQUIRE_MS", "1");
+        hot.set_env("RUSTFS_OBJECT_LOCK_DIAG_SLOW_HOLD_MS", "1");
+    }
     hot.start().await?;
 
     let tier_name = unique_tier_name();
