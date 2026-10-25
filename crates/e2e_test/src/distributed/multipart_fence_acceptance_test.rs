@@ -54,8 +54,8 @@ async fn fixture_from_binary(
         cluster.set_env("RAYON_NUM_THREADS", "2");
         // The pinned release passes host_str() directly to TCP resolution,
         // which rejects bracketed IPv6. A loopback hostname retains direct
-        // IPv4 S3 listeners and the same signed RPC port. Scoped hit counts
-        // below must prove that mutations actually traverse the IPv6 proxy.
+        // IPv4 S3 listeners and the same signed RPC port. Install the IPv6
+        // observers only after the genuine previous-release upload is seeded.
         let mut volumes = Vec::new();
         for node in &cluster.nodes {
             let address: std::net::SocketAddr = node.address.parse()?;
@@ -91,12 +91,10 @@ async fn fixture_from_binary(
         cluster.set_env(name, value);
     }
     let mut proxies = Vec::new();
-    for node in 0..4 {
-        let proxy = cluster.start_rpc_proxy_for_node(node).await?;
-        if binary.is_some() {
-            proxy.set_transport_passthrough(true);
+    if binary.is_none() {
+        for node in 0..4 {
+            proxies.push(cluster.start_rpc_proxy_for_node(node).await?);
         }
-        proxies.push(proxy);
     }
     configure_node_logs(&mut cluster, None)?;
     if let Some(binary) = binary {
@@ -1110,7 +1108,11 @@ async fn sixteen_shard_multipart_metadata_requires_twelve_votes() -> TestResult 
 #[tokio::test]
 async fn mixed_version_failed_complete_requires_current_coordinator_for_abort() -> TestResult {
     let previous = super::upgrade_test::source_binary()?;
-    let (mut cluster, proxies, clients, bucket) = fixture_from_binary(4, "EC:4", Some(&previous)).await?;
+    let (mut cluster, mut proxies, clients, bucket) = fixture_from_binary(4, "EC:4", Some(&previous)).await?;
+    assert!(
+        proxies.is_empty(),
+        "the genuine previous fleet boots and seeds through its normal direct transport"
+    );
     let key = "mixed-failed-complete";
     let unrelated = payload_for("historical-unrelated", 4096);
     clients[0]
@@ -1154,8 +1156,10 @@ async fn mixed_version_failed_complete_requires_current_coordinator_for_abort() 
     )
     .await?;
     let original = create_sources(&cluster, &bucket, key)?;
-    for proxy in &proxies {
-        proxy.set_transport_passthrough(false);
+    // Keep every old source byte and the advertised localhost authority.
+    // Only the new coordinator's fresh channels enter the method observers.
+    for node in 0..cluster.nodes.len() {
+        proxies.push(cluster.start_rpc_proxy_for_node(node).await?);
     }
     cluster.stop_node(0)?;
     cluster.start_node(0).await?;
@@ -1165,15 +1169,15 @@ async fn mixed_version_failed_complete_requires_current_coordinator_for_abort() 
     let observers = proxies[1..]
         .iter()
         .map(|proxy| {
-            proxy.pause(
+            proxy.observe_source_inspections(
                 &[
                     "RenameMultipartData",
                     "RenameData",
                     "RenameDataAtIncarnation",
                     "RenameDataWithQuotaFence",
                 ],
-                usize::MAX,
-                Some(&scope),
+                &scope,
+                &path,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1206,6 +1210,19 @@ async fn mixed_version_failed_complete_requires_current_coordinator_for_abort() 
         observers.iter().all(|observer| observer.hits() == 0),
         "unsupported legacy inspection must stop before any old or new remote publication RPC"
     );
+    for (observer, peer) in observers.iter().zip(&cluster.nodes[1..]) {
+        let address: std::net::SocketAddr = peer.address.parse()?;
+        let expected: std::collections::HashSet<_> = peer
+            .data_dirs
+            .iter()
+            .map(|root| format!("http://localhost:{}{root}", address.port()))
+            .collect();
+        assert_eq!(
+            observer.unsupported_source_inspection_routes(),
+            expected,
+            "the new coordinator must observe native Inspect rejection from this old peer's exact configured disk routes"
+        );
+    }
     drop(observers);
     // Legacy upgrade validates every physical participant before writing any
     // marker. An old peer's Unsupported inspection leaves all authority intact.

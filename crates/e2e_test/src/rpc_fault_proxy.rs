@@ -58,6 +58,8 @@ enum Disposition {
 struct PauseState {
     methods: Vec<&'static str>,
     scope: Option<Vec<u8>>,
+    inspection_path: Option<Vec<u8>>,
+    unsupported_inspection_routes: Mutex<HashSet<String>>,
     limit: usize,
     retain_after_disconnect: bool,
     refused_mutations: AtomicUsize,
@@ -98,6 +100,14 @@ impl RpcPause {
 
     pub(crate) fn refused_mutations(&self) -> usize {
         self.state.refused_mutations.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn unsupported_source_inspection_routes(&self) -> HashSet<String> {
+        self.state
+            .unsupported_inspection_routes
+            .lock()
+            .expect("inspection response routes")
+            .clone()
     }
 
     pub(crate) async fn wait_for_hits(&self, count: usize) -> io::Result<()> {
@@ -155,7 +165,6 @@ pub(crate) struct RpcFaultProxy {
     slot: PauseSlot,
     task: JoinHandle<()>,
     late_requests: LateRequests,
-    transport_passthrough: watch::Sender<bool>,
 }
 
 impl RpcFaultProxy {
@@ -166,7 +175,6 @@ impl RpcFaultProxy {
         let active = slot.clone();
         let late_requests: LateRequests = Arc::new(Mutex::new(Some(Vec::new())));
         let late = late_requests.clone();
-        let (transport_passthrough, transport_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
             let h1: ProxyClient = Client::builder(TokioExecutor::new()).build_http();
             let h2: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(true).build_http();
@@ -174,26 +182,12 @@ impl RpcFaultProxy {
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
-                        let Ok((mut socket, _)) = accepted else { break };
+                        let Ok((socket, _)) = accepted else { break };
                         let h1 = h1.clone();
                         let h2 = h2.clone();
                         let active = active.clone();
                         let late = late.clone();
-                        let mut transport = transport_rx.clone();
                         connections.spawn(async move {
-                            if *transport.borrow_and_update() {
-                                // Seed legacy streaming traffic without HTTP adaptation.
-                                // Switching to method faults retires every raw connection.
-                                tokio::select! {
-                                    _ = transport.changed() => {},
-                                    _ = async {
-                                        let mut server = tokio::net::TcpStream::connect(target).await?;
-                                        tokio::io::copy_bidirectional(&mut socket, &mut server).await?;
-                                        Ok::<_, io::Error>(())
-                                    } => {},
-                                }
-                                return;
-                            }
                             let service = service_fn(move |request: Request<Incoming>| {
                                 let client = if request.version() == http::Version::HTTP_2 { h2.clone() } else { h1.clone() };
                                 let pause = active.lock().expect("RPC pause slot").clone();
@@ -235,12 +229,7 @@ impl RpcFaultProxy {
             slot,
             task,
             late_requests,
-            transport_passthrough,
         })
-    }
-
-    pub(crate) fn set_transport_passthrough(&self, enabled: bool) {
-        self.transport_passthrough.send_replace(enabled);
     }
 
     pub(crate) fn local_addr(&self) -> SocketAddr {
@@ -250,7 +239,7 @@ impl RpcFaultProxy {
     /// Pause at most limit requests to the named unary methods; other streams
     /// on the same HTTP/2 connection continue forwarding.
     pub(crate) fn pause(&self, methods: &[&'static str], limit: usize, scope: Option<&str>) -> io::Result<RpcPause> {
-        self.pause_with_lifetime(methods, limit, scope, false)
+        self.pause_with_lifetime(methods, limit, scope, false, None)
     }
 
     /// Retain bounded control packets until explicit delivery after caller retirement.
@@ -261,7 +250,24 @@ impl RpcFaultProxy {
                 "late RPC limit exceeds control-packet budget",
             ));
         }
-        self.pause_with_lifetime(methods, limit, Some(scope), true)
+        self.pause_with_lifetime(methods, limit, Some(scope), true, None)
+    }
+
+    /// Observe exact native Inspect rejections without consuming mutation hits
+    /// or holding preparation. The signed request and response remain opaque.
+    pub(crate) fn observe_source_inspections(
+        &self,
+        mutation_methods: &[&'static str],
+        mutation_scope: &str,
+        path: &str,
+    ) -> io::Result<RpcPause> {
+        let mut methods = mutation_methods.to_vec();
+        if !methods.contains(&"RecoverMultipartSource") {
+            methods.push("RecoverMultipartSource");
+        }
+        let observer = self.pause_with_lifetime(&methods, usize::MAX, Some(mutation_scope), false, Some(path))?;
+        observer.release();
+        Ok(observer)
     }
 
     fn pause_with_lifetime(
@@ -270,9 +276,15 @@ impl RpcFaultProxy {
         limit: usize,
         scope: Option<&str>,
         retain_after_disconnect: bool,
+        inspection_path: Option<&str>,
     ) -> io::Result<RpcPause> {
         let mut slot = self.slot.lock().expect("RPC pause slot");
-        if slot.is_some() || methods.is_empty() || limit == 0 || scope.is_some_and(str::is_empty) {
+        if slot.is_some()
+            || methods.is_empty()
+            || limit == 0
+            || scope.is_some_and(str::is_empty)
+            || inspection_path.is_some_and(str::is_empty)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "RPC pause needs an empty slot, methods and a positive limit",
@@ -282,6 +294,8 @@ impl RpcFaultProxy {
         let state = Arc::new(PauseState {
             methods: methods.to_vec(),
             scope: scope.map(|scope| scope.as_bytes().to_vec()),
+            inspection_path: inspection_path.map(|path| path.as_bytes().to_vec()),
+            unsupported_inspection_routes: Mutex::new(HashSet::new()),
             limit,
             retain_after_disconnect,
             refused_mutations: AtomicUsize::new(0),
@@ -346,6 +360,25 @@ fn scope_matches(method: &str, body: &[u8], scope: &[u8]) -> io::Result<bool> {
         && options.get("recursive").and_then(serde_json::Value::as_bool) == Some(true))
 }
 
+fn source_inspection_route(body: &[u8], path: &[u8]) -> io::Result<Option<String>> {
+    let request = RecoverMultipartSourceRequest::decode(unary_payload(body)?).map_err(io::Error::other)?;
+    if request.protocol_version != u32::from(MULTIPART_SOURCE_PROTOCOL_VERSION) || request.path.as_bytes() != path {
+        return Ok(None);
+    }
+    let operation = rustfs_protos::decode_multipart_source_recovery_payload(&request.operation)?;
+    if !matches!(operation, MultipartSourceOperation::Inspect { .. }) {
+        return Ok(None);
+    }
+    NativeSourceRequest {
+        protocol_version: MULTIPART_SOURCE_PROTOCOL_VERSION,
+        path: request.path,
+        operation,
+    }
+    .validate()
+    .map_err(io::Error::other)?;
+    Ok((!request.disk.is_empty()).then_some(request.disk))
+}
+
 async fn forward_request(
     request: Request<Incoming>,
     client: ProxyClient,
@@ -355,6 +388,7 @@ async fn forward_request(
     let (mut parts, body) = request.into_parts();
     let mut body = body.map_err(io::Error::other).boxed();
     let mut observed = None;
+    let mut inspection = None;
     if let Some(pause) = pause {
         let method = parts.uri.path().strip_prefix("/node_service.NodeService/");
         if let Some(method) = method.filter(|name| pause.methods.contains(name)) {
@@ -365,6 +399,12 @@ async fn forward_request(
                 let collected = Limited::new(body, 1024 * 1024).collect().await.map_err(io::Error::other)?;
                 let trailers = collected.trailers().cloned();
                 let bytes = collected.to_bytes();
+                if method == "RecoverMultipartSource"
+                    && let Some(path) = pause.inspection_path.as_deref()
+                    && let Some(disk) = source_inspection_route(&bytes, path)?
+                {
+                    inspection = Some((pause.clone(), disk));
+                }
                 let matches = scope_matches(method, &bytes, scope)?;
                 if matches && method == "ReadVersion" {
                     let disk = ReadVersionRequest::decode(unary_payload(&bytes)?)
@@ -427,6 +467,16 @@ async fn forward_request(
         .request(Request::from_parts(parts, body))
         .await
         .map_err(io::Error::other)?;
+    if let Some((pause, disk)) = inspection
+        && response.status().is_success()
+        && response.headers().get("grpc-status").is_some_and(|status| status == "12")
+    {
+        pause
+            .unsupported_inspection_routes
+            .lock()
+            .expect("inspection response routes")
+            .insert(disk);
+    }
     if let Some((pause, route, rename)) = observed {
         pause.responses.fetch_add(1, Ordering::SeqCst);
         if response.status().is_success() && response.headers().get("grpc-status").is_none_or(|status| status == "0") {
@@ -490,6 +540,10 @@ mod tests {
     }
 
     async fn backend() -> io::Result<Backend> {
+        backend_with_status(None).await
+    }
+
+    async fn backend_with_status(status: Option<&'static str>) -> io::Result<Backend> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let received = Arc::new(AtomicUsize::new(0));
@@ -513,13 +567,14 @@ mod tests {
                                 });
                                 let body = request.into_body().collect().await?.to_bytes();
                                 let mut trailers = http::HeaderMap::new();
-                                trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+                                trailers.insert("grpc-status", http::HeaderValue::from_static(status.unwrap_or("0")));
                                 trailers.insert("x-proof", http::HeaderValue::from_static("unchanged-proof"));
                                 let stream = futures::stream::iter([
                                     Ok::<_, Infallible>(Frame::data(body)),
                                     Ok(Frame::trailers(trailers)),
                                 ]);
                                 let mut response = Response::new(StreamBody::new(stream));
+                                if let Some(status) = status { response.headers_mut().insert("grpc-status", http::HeaderValue::from_static(status)); }
                                 response.headers_mut().insert(http::header::TRAILER, http::HeaderValue::from_static("grpc-status, x-proof"));
                                 if let Some(authority) = authority { response.headers_mut().insert("x-original-authority", authority); }
                                 Ok::<_, hyper::Error>(response)
@@ -747,6 +802,121 @@ mod tests {
         assert!(scope_matches("RecoverMultipartSource", &[0, 0, 0, 0, 1], root).is_err());
     }
 
+    #[test]
+    fn source_inspection_observer_requires_exact_read_only_native_packet() {
+        let path = b"hash/upload";
+        let mut request = native_abort_request("hash/upload");
+        assert!(
+            source_inspection_route(&unary_frame(&request), path)
+                .expect("valid mutation remains separate")
+                .is_none()
+        );
+        request.operation = rmp_serde::to_vec_named(&MultipartSourceOperation::Inspect { lineage: None })
+            .unwrap()
+            .into();
+        let body = unary_frame(&request);
+        assert_eq!(source_inspection_route(&body, path).unwrap(), Some(request.disk.clone()));
+        assert!(
+            !scope_matches("RecoverMultipartSource", &body, path).unwrap(),
+            "Inspect still cannot consume a DeleteAborted fault"
+        );
+        assert!(source_inspection_route(&body, b"hash/other").unwrap().is_none());
+        request.protocol_version += 1;
+        assert!(source_inspection_route(&unary_frame(&request), path).unwrap().is_none());
+        request.protocol_version -= 1;
+        request.operation = [request.operation.as_ref(), &[0]].concat().into();
+        assert!(
+            source_inspection_route(&unary_frame(&request), path).is_err(),
+            "trailing operation bytes cannot prove a read-only route"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_inspection_observer_proves_backend_rejection_without_consuming_mutation_hits() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let backend = backend_with_status(Some("12")).await.expect("old unsupported endpoint");
+            let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().unwrap(), backend.address)
+                .await
+                .unwrap();
+            let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(true).build_http();
+            let observer = proxy
+                .observe_source_inspections(&["RenameMultipartData"], "hash/upload", "hash/upload")
+                .unwrap();
+            let mut request = native_abort_request("hash/upload");
+            request.operation = rmp_serde::to_vec_named(&MultipartSourceOperation::Inspect { lineage: None })
+                .unwrap()
+                .into();
+            for slot in 0..4 {
+                request.disk = format!("physical-disk-{slot}");
+                let bytes = unary_frame(&request);
+                let response = call_body(&client, proxy.local_addr(), "RecoverMultipartSource", bytes.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(response.headers()["grpc-status"], "12");
+                let body = response.into_body().collect().await.unwrap();
+                assert_eq!(body.trailers().unwrap()["x-proof"], "unchanged-proof");
+                assert_eq!(body.to_bytes(), bytes, "inspection must not re-encode the opaque request");
+            }
+            let expected: HashSet<_> = (0..4).map(|slot| format!("physical-disk-{slot}")).collect();
+            assert_eq!(observer.unsupported_source_inspection_routes(), expected);
+            assert_eq!(observer.hits(), 0, "read-only rejections never count as publication mutations");
+            request.path = "hash/other".to_owned();
+            request.disk = "foreign-physical-route".to_owned();
+            let response = call_body(&client, proxy.local_addr(), "RecoverMultipartSource", unary_frame(&request))
+                .await
+                .unwrap();
+            response.into_body().collect().await.unwrap();
+            assert_eq!(
+                observer.unsupported_source_inspection_routes(),
+                expected,
+                "other upload responses add no route"
+            );
+            request.path = "hash/upload".to_owned();
+            request.disk = "physical-disk-0".to_owned();
+            call_body(&client, proxy.local_addr(), "RecoverMultipartSource", unary_frame(&request))
+                .await
+                .unwrap()
+                .into_body()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                observer.unsupported_source_inspection_routes(),
+                expected,
+                "duplicate responses add no physical route"
+            );
+            request.disk = "nonconfigured-physical-route".to_owned();
+            call_body(&client, proxy.local_addr(), "RecoverMultipartSource", unary_frame(&request))
+                .await
+                .unwrap()
+                .into_body()
+                .collect()
+                .await
+                .unwrap();
+            assert_ne!(
+                observer.unsupported_source_inspection_routes(),
+                expected,
+                "same-path foreign route evidence must fail the exact configured participant oracle"
+            );
+            assert!(
+                observer
+                    .unsupported_source_inspection_routes()
+                    .contains("nonconfigured-physical-route")
+            );
+            call_body(&client, proxy.local_addr(), "RenameMultipartData", Bytes::from_static(b"hash/upload"))
+                .await
+                .unwrap()
+                .into_body()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(observer.hits(), 1, "a publication method remains independently observable");
+            assert_eq!(backend.received.load(Ordering::SeqCst), 8);
+        })
+        .await
+        .expect("read-only observation deadline");
+    }
+
     #[tokio::test]
     async fn native_abort_scoped_pause_preserves_opaque_payload_and_grpc_trailers() {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -826,21 +996,18 @@ mod tests {
             let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback address"), backend.address)
                 .await
                 .expect("proxy");
-            for transport in [true, false] {
-                proxy.set_transport_passthrough(transport);
-                for h2 in [false, true] {
-                    let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(h2).build_http();
-                    let response = call(&client, proxy.local_addr(), "ReadVersion")
-                        .await
-                        .expect("transparent request");
-                    assert_eq!(response.version(), if h2 { http::Version::HTTP_2 } else { http::Version::HTTP_11 });
-                    assert_eq!(response.headers()["x-original-authority"], proxy.local_addr().to_string());
-                    let collected = response.into_body().collect().await.expect("complete body and trailers");
-                    let trailers = collected.trailers().expect("gRPC trailers must survive both proxy hops");
-                    assert_eq!(trailers["grpc-status"], "0");
-                    assert_eq!(trailers["x-proof"], "unchanged-proof");
-                    assert_eq!(collected.to_bytes(), Bytes::from_static(b"opaque signed protobuf"));
-                }
+            for h2 in [false, true] {
+                let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(h2).build_http();
+                let response = call(&client, proxy.local_addr(), "ReadVersion")
+                    .await
+                    .expect("transparent request");
+                assert_eq!(response.version(), if h2 { http::Version::HTTP_2 } else { http::Version::HTTP_11 });
+                assert_eq!(response.headers()["x-original-authority"], proxy.local_addr().to_string());
+                let collected = response.into_body().collect().await.expect("complete body and trailers");
+                let trailers = collected.trailers().expect("gRPC trailers must survive both proxy hops");
+                assert_eq!(trailers["grpc-status"], "0");
+                assert_eq!(trailers["x-proof"], "unchanged-proof");
+                assert_eq!(collected.to_bytes(), Bytes::from_static(b"opaque signed protobuf"));
             }
         })
         .await
