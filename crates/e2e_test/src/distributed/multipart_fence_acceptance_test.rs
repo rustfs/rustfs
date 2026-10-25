@@ -48,13 +48,19 @@ async fn fixture_from_binary(
         RustFSTestClusterEnvironment::with_topology(ClusterTopology::single_pool_multidrive(4, drives_per_node)).await?;
     if binary.is_some() {
         // The pinned release passes host_str() directly to TCP resolution,
-        // which rejects bracketed IPv6. Advertise IPv4 proxies instead while
-        // retaining direct IPv6 S3 listeners and the same signed RPC port.
-        for node in &mut cluster.nodes {
+        // which rejects bracketed IPv6. A loopback hostname retains direct
+        // IPv4 S3 listeners and the same signed RPC port. Scoped hit counts
+        // below must prove that mutations actually traverse the IPv6 proxy.
+        let mut volumes = Vec::new();
+        for node in &cluster.nodes {
             let address: std::net::SocketAddr = node.address.parse()?;
-            node.address = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, address.port())).to_string();
-            node.url = format!("http://{}", node.address);
+            volumes.extend(
+                node.data_dirs
+                    .iter()
+                    .map(|root| format!("http://localhost:{}{root}", address.port())),
+            );
         }
+        cluster.set_env("RUSTFS_VOLUMES", volumes.join(" "));
     }
     let fault_budgets = [
         ("RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT", "5"),
