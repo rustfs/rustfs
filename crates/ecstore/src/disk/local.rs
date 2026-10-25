@@ -5168,7 +5168,13 @@ impl FdCache {
 }
 
 #[cfg(target_os = "linux")]
-type BudgetedUringDriver = uring_driver_budget::BudgetedDriver<rustfs_uring::UringDriver>;
+struct UringReadOwner {
+    _resource_unit: Option<ResourceIoUnit>,
+    _mount_lease: Option<Arc<std::fs::File>>,
+}
+
+#[cfg(target_os = "linux")]
+type BudgetedUringDriver = uring_driver_budget::BudgetedDriver<rustfs_uring::OwnedUringDriver<UringReadOwner>>;
 
 /// Runtime-probed io_uring read backend (backlog#1104).
 ///
@@ -5403,7 +5409,7 @@ impl UringBackend {
         let read_budget = read_budget.clone();
         let probe = uring_probe::run(move || {
             read_budget
-                .start_driver(URING_QUEUE_DEPTH, shards)
+                .start_driver::<UringReadOwner>(URING_QUEUE_DEPTH, shards)
                 .map(|driver| uring_driver_budget::BudgetedDriver::new(driver, thread_slots))
         })
         .await
@@ -5612,6 +5618,15 @@ impl UringBackend {
         }
     }
 
+    fn native_read_owner(&self) -> UringReadOwner {
+        // Only the submitted read owns these leases; the descriptor cache and
+        // returned bytes must not retain a physical I/O slot.
+        UringReadOwner {
+            _resource_unit: current_resource_unit(),
+            _mount_lease: self.inner.mount_lease.clone(),
+        }
+    }
+
     /// Positioned read via io_uring. Mirrors `StdBackend::pread_bytes`'s
     /// resolution/access/bounds preamble, then reads the range with the driver
     /// (whole-range: the driver resubmits short reads for positioned reads).
@@ -5664,7 +5679,9 @@ impl UringBackend {
                 let root = self.root.clone();
                 let volume_owned = volume.to_owned();
                 let path_owned = path.to_owned();
-                let (file, len) = tokio::task::spawn_blocking(move || -> Result<(std::fs::File, u64)> {
+                let mount_lease = self.inner.mount_lease.clone();
+                let (file, len) = spawn_blocking_with_disk_io_permit(None, move || -> Result<(std::fs::File, u64)> {
+                    let _mount_lease = mount_lease;
                     let file_path = resolve_uring_object_path(&root, &volume_owned, &path_owned)?;
                     let file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
                     let meta = file.metadata().map_err(DiskError::from)?;
@@ -5695,7 +5712,11 @@ impl UringBackend {
         let file_for_reclaim = Arc::clone(&file);
         let bytes = if length <= self.read_chunk_size.get() {
             // Fast path: one op. The driver's Vec becomes the result with no copy.
-            match self.driver.read_at(file, offset_u64, length).await {
+            match self
+                .driver
+                .read_at_with_owner(file, offset_u64, length, self.native_read_owner())
+                .await
+            {
                 Ok(bytes) => bytes,
                 Err(io_err) => {
                     // Latch io_uring off for this disk if the errno says the
@@ -5716,7 +5737,11 @@ impl UringBackend {
             while done < length {
                 let chunk = (length - done).min(self.read_chunk_size.get());
                 let chunk_off = offset_u64 + done as u64;
-                let part = match self.driver.read_at(Arc::clone(&file), chunk_off, chunk).await {
+                let part = match self
+                    .driver
+                    .read_at_with_owner(Arc::clone(&file), chunk_off, chunk, self.native_read_owner())
+                    .await
+                {
                     Ok(part) => part,
                     Err(io_err) => {
                         if is_io_uring_unsupported(&io_err) {
@@ -5796,8 +5821,11 @@ impl UringBackend {
                 let volume_owned = volume.to_owned();
                 let path_owned = path.to_owned();
                 let gen_at_open = cache.map(FdCache::generation);
-                let opened =
-                    tokio::task::spawn_blocking(move || -> std::result::Result<(std::fs::File, u64, usize), DirectOpenError> {
+                let mount_lease = self.inner.mount_lease.clone();
+                let opened = spawn_blocking_with_disk_io_permit(
+                    None,
+                    move || -> std::result::Result<(std::fs::File, u64, usize), DirectOpenError> {
+                        let _mount_lease = mount_lease;
                         use std::os::unix::fs::OpenOptionsExt;
                         let file_path =
                             resolve_uring_object_path(&root, &volume_owned, &path_owned).map_err(DirectOpenError::Disk)?;
@@ -5819,9 +5847,10 @@ impl UringBackend {
                         }
                         let align = cached_align.unwrap_or_else(|| probe_direct_io_align(&file));
                         Ok((file, len, align))
-                    })
-                    .await
-                    .map_err(|e| DiskError::other(format!("uring O_DIRECT pread join error: {e}")))?;
+                    },
+                )
+                .await
+                .map_err(|e| DiskError::other(format!("uring O_DIRECT pread join error: {e}")))?;
                 let (file, len, align) = match opened {
                     Ok(opened) => opened,
                     Err(DirectOpenError::ODirectRefused) => {
@@ -5864,7 +5893,11 @@ impl UringBackend {
         let file_for_reclaim = Arc::clone(&file);
         let bytes = if length <= self.read_chunk_size.get() {
             // Fast path: one op. The driver's Vec becomes the result with no copy.
-            match self.driver.read_at_direct(Arc::clone(&file), offset_u64, length, align).await {
+            match self
+                .driver
+                .read_at_direct_with_owner(Arc::clone(&file), offset_u64, length, align, self.native_read_owner())
+                .await
+            {
                 Ok(bytes) => bytes,
                 Err(io_err) => {
                     self.classify_direct_read_error(&io_err);
@@ -5881,7 +5914,11 @@ impl UringBackend {
             while done < length {
                 let chunk = (length - done).min(self.read_chunk_size.get());
                 let chunk_off = offset_u64 + done as u64;
-                let part = match self.driver.read_at_direct(Arc::clone(&file), chunk_off, chunk, align).await {
+                let part = match self
+                    .driver
+                    .read_at_direct_with_owner(Arc::clone(&file), chunk_off, chunk, align, self.native_read_owner())
+                    .await
+                {
                     Ok(part) => part,
                     Err(io_err) => {
                         self.classify_direct_read_error(&io_err);
@@ -30290,6 +30327,244 @@ mod test {
             panic!("SKIP {name}: io_uring unavailable but RUSTFS_URING_TESTS_MUST_RUN is set — this leg must exercise io_uring");
         }
         eprintln!("SKIP {name}: io_uring unavailable (restricted environment)");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uring_open_job_retains_resources_after_cancellation() {
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
+        use std::os::fd::AsRawFd;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single native opener");
+        runtime.block_on(async {
+            for direct in [false, true] {
+                for count in [0, 1, 2] {
+                    let dir = tempfile::tempdir().expect("opener fixture");
+                    std::fs::create_dir(dir.path().join("bucket")).expect("bucket");
+                    let content = vec![73; 16384];
+                    std::fs::write(dir.path().join("bucket/part.1"), &content).expect("shard");
+                    let mount = Arc::new(std::fs::File::open(dir.path()).expect("mount lease"));
+                    let root = PathBuf::from(format!("/proc/self/fd/{}", mount.as_raw_fd()));
+                    let retained_mount = Arc::downgrade(&mount);
+                    let Some(mut backend) = UringBackend::try_new(root).await else {
+                        uring_test_skip("uring_open_job_retains_resources_after_cancellation");
+                        return;
+                    };
+                    backend.inner.mount_lease = Some(mount);
+                    backend.fd_cache = None;
+                    let (resources, gates) = if count == 0 {
+                        (None, Vec::new())
+                    } else {
+                        let (resources, gates) = test_resource_units(count);
+                        (Some(resources), gates)
+                    };
+                    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    let blocker = tokio::task::spawn_blocking(move || {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.recv();
+                    });
+                    started_rx.await.expect("native opener occupied");
+                    let mut future = Box::pin(with_optional_resource_unit(resources, async move {
+                        if direct {
+                            backend.pread_uring_direct("bucket", "part.1", 17, 8192).await
+                        } else {
+                            backend.pread_uring("bucket", "part.1", 17, 8192).await
+                        }
+                    }));
+                    let pending = futures::poll!(&mut future).is_pending();
+                    drop(future);
+                    let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
+                    let mount_held = retained_mount.strong_count() > 0;
+                    release_tx.send(()).expect("release native opener before assertions");
+                    blocker.await.expect("blocker finished");
+                    tokio::task::spawn_blocking(|| ()).await.expect("native queue drained");
+                    assert!(pending, "opener must queue native work");
+                    assert_eq!(held, vec![1; count], "direct={direct}, physical_count={count}");
+                    assert!(mount_held, "queued opener owns the mount even without a physical quota");
+                    assert_eq!(retained_mount.strong_count(), 0, "completed opener releases the mount");
+                    assert!(
+                        gates.iter().all(|gate| gate.snapshot().active == 0),
+                        "completed opener returns every physical slot"
+                    );
+                    assert_eq!(std::fs::read(dir.path().join("bucket/part.1")).expect("unchanged shard"), content);
+                }
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uring_native_reads_retain_only_their_device_and_mount() {
+        use crate::disk::disk_store::LocalDiskWrapper;
+        use crate::disk::io_admission::{ResourceIoUnit, with_optional_resource_unit};
+        use rustfs_concurrency::adaptive::{AdaptiveAdmission, permit_set::AdaptivePermitSetOwner};
+        use std::num::NonZeroU16;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        const CHILD: &str = "RUSTFS_URING_RESOURCE_OWNER_CHILD";
+        const TEST: &str = "disk::local::test::uring_native_reads_retain_only_their_device_and_mount";
+        if std::env::var_os(CHILD).is_none() {
+            for direct in ["false", "true"] {
+                let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, "1")
+                    .env("RUSTFS_URING_FAULT_STUCK_DRAIN", "1")
+                    .env("RUSTFS_URING_FAULT_DRAIN_TIMEOUT_MS", "50")
+                    .env(ENV_RUSTFS_IO_URING_READ_ENABLE, "false")
+                    .env(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, direct)
+                    .env(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, "1")
+                    .output()
+                    .expect("native-owner subprocess");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(output.status.success(), "direct={direct}: {stdout}{stderr}");
+                if stderr.contains("SKIP ") {
+                    uring_test_skip(TEST);
+                    return;
+                }
+                assert!(
+                    stdout.contains("URING_RESOURCE_OWNER_OK cases=8"),
+                    "missing native execution evidence: {stdout}"
+                );
+            }
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("native-owner runtime");
+        runtime.block_on(async {
+            let direct = is_direct_io_read_enabled();
+            let mut observations = Vec::new();
+            for cache_hit in [false, true] {
+                for chunk_size in [4096, 16384] {
+                    for admitted in [false, true] {
+                        let dir = tempfile::tempdir().expect("native-owner fixture");
+                        let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("endpoint");
+                        let mut disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+                        let exit = disk.exit_signal.take().expect("cleanup monitor exit sender");
+                        exit.send(()).expect("stop fixture cleanup monitor");
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            while exit.receiver_count() != 0 {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .expect("cleanup monitor stopped");
+                        std::fs::create_dir(dir.path().join("bucket")).expect("bucket");
+                        std::fs::write(dir.path().join("bucket/part.1"), vec![73; 16384]).expect("shard");
+                        let chunks =
+                            uring_read_chunks::ReadChunkSize::from_env_value(Some(std::ffi::OsStr::new(&chunk_size.to_string())))
+                                .expect("read chunk size");
+                        let Some(mut backend) =
+                            UringBackend::try_new_with_read_chunk_size(disk.io_root().to_path_buf(), chunks).await
+                        else {
+                            uring_test_skip(TEST);
+                            return;
+                        };
+                        let mount = Arc::downgrade(&disk.mount_lease);
+                        backend.inner.mount_lease = Some(disk.mount_lease.clone());
+                        backend.fd_cache = Some(FdCache::new());
+                        if cache_hit {
+                            let file = Arc::new(
+                                std::fs::OpenOptions::new()
+                                    .read(true)
+                                    .custom_flags(if direct { rustix::fs::OFlags::DIRECT.bits() as i32 } else { 0 })
+                                    .open(dir.path().join("bucket/part.1"))
+                                    .expect("cache fixture descriptor"),
+                            );
+                            if direct {
+                                backend
+                                    .direct_uring
+                                    .align
+                                    .set(probe_direct_io_align(&file))
+                                    .expect("cache alignment");
+                            }
+                            backend
+                                .fd_cache
+                                .as_ref()
+                                .expect("fixture cache")
+                                .insert(
+                                    FdKey {
+                                        volume: "bucket".into(),
+                                        path: "part.1".into(),
+                                        direct,
+                                    },
+                                    file,
+                                )
+                                .await;
+                        }
+                        let driver = Arc::clone(&backend.driver);
+                        disk.io_backend = Arc::new(backend);
+                        let wrapper = LocalDiskWrapper::new(Arc::new(disk), false);
+                        let first = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+                        let second = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+                        let shared = AdaptivePermitSetOwner::new(NonZeroU16::MIN, vec![first.clone(), second.clone()])
+                            .expect("resource catalog");
+                        wrapper
+                            .physical_admission()
+                            .set_test_shared_capacity(shared.clone(), vec![first.clone()])
+                            .expect("selected device");
+                        let parent = admitted.then(|| {
+                            let a = first.try_acquire().expect("selected quota");
+                            let b = second.try_acquire().expect("unrelated quota");
+                            ResourceIoUnit::from(shared.capture(&[&a, &b]).expect("parent resources"))
+                        });
+                        let mut future = Box::pin(with_optional_resource_unit(parent, async move {
+                            wrapper.read_file_mmap_copy("bucket", "part.1", 17, 8192).await
+                        }));
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            loop {
+                                assert!(
+                                    futures::poll!(&mut future).is_pending(),
+                                    "completion fault must keep the native read pending"
+                                );
+                                if driver.stats().in_flight == 1 {
+                                    break;
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .expect("read reached native pending table");
+                        drop(future);
+                        let held = [first.snapshot().active, second.snapshot().active];
+                        let mount_held = mount.strong_count() > 0;
+                        driver.request_shutdown();
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            while !driver.is_finished() {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .expect("bounded driver shutdown");
+                        assert_eq!(driver.stats().in_flight, 1, "withheld completion remains unresolved");
+                        drop(driver);
+                        assert_eq!(
+                            [first.snapshot().active, second.snapshot().active],
+                            held,
+                            "unresolved shutdown cannot refund resources"
+                        );
+                        observations.push((cache_hit, chunk_size, admitted, held, mount_held));
+                    }
+                }
+            }
+            for (cache_hit, chunk_size, admitted, held, mount_held) in observations {
+                assert_eq!(
+                    held,
+                    [u32::from(admitted), 0],
+                    "direct={direct}, cache_hit={cache_hit}, chunk_size={chunk_size}, admitted={admitted}"
+                );
+                assert!(mount_held, "native completion owns the selected mount generation");
+            }
+            println!("URING_RESOURCE_OWNER_OK cases=8");
+        });
     }
 
     #[cfg(target_os = "linux")]

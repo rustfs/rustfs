@@ -228,9 +228,11 @@ metrics = { workspace = true }
 # The guard scripts/check_no_tokio_io_uring.sh allows an explicit
 # io-uring integration; only the tokio "io-uring" runtime feature is banned.
 [target.'cfg(target_os = "linux")'.dependencies]
-# SharedReadBudget and the bounded read APIs are available in the 0.3.0
-# registry release; keep the application on the published contract.
-rustfs-uring = "0.3.0"
+# Native completion owners keep physical I/O leases alive after cancellation.
+rustfs-uring = { git = "https://github.com/rustfs/uring.git", rev = "eb8fc160e71d804427de1e905f5c226d580f71bf" }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustfs-uring = { git = "https://github.com/rustfs/uring.git", rev = "eb8fc160e71d804427de1e905f5c226d580f71bf", features = ["fault-injection"] }
 
 [target.'cfg(windows)'.dependencies]
 winapi-util.workspace = true

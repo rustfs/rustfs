@@ -76,14 +76,14 @@ impl DriverReadBudget {
         }
     }
 
-    pub(super) fn start_driver(
+    pub(super) fn start_driver<O: Send + Unpin + 'static>(
         &self,
         entries: u32,
         shards: usize,
-    ) -> Result<rustfs_uring::UringDriver, rustfs_uring::ProbeFailure> {
+    ) -> Result<rustfs_uring::OwnedUringDriver<O>, rustfs_uring::ProbeFailure> {
         match self {
-            Self::Disabled => rustfs_uring::UringDriver::probe_and_start_sharded(entries, shards),
-            Self::Limited { pool, per_driver } => rustfs_uring::UringDriver::probe_and_start_with_shared_budget(
+            Self::Disabled => rustfs_uring::OwnedUringDriver::probe_and_start_sharded(entries, shards),
+            Self::Limited { pool, per_driver } => rustfs_uring::OwnedUringDriver::probe_and_start_with_shared_budget(
                 entries,
                 shards,
                 rustfs_uring::ReadLimits {
