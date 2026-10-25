@@ -152,7 +152,13 @@ async fn four_node_tls_large_and_range_gets_preserve_bytes() -> TestResult {
             ("RUSTFS_SCANNER_START_DELAY_SECS", "0"),
             ("RUSTFS_SCANNER_CYCLE", "1"),
             ("RUSTFS_HEAL_ENABLED", "true"),
-            ("RUST_LOG", "warn"),
+            (
+                "RUST_LOG",
+                "warn,rustfs_ecstore::object_lock_diag=trace,rustfs_ecstore::set_disk::read=debug,rustfs_ecstore::set_disk::ops::heal=debug,rustfs_ecstore::set_disk::core::io_primitives=debug,rustfs_heal::heal::task::heal_object=debug",
+            ),
+            ("RUSTFS_OBJECT_LOCK_DIAG_ENABLE", "true"),
+            ("RUSTFS_OBJECT_LOCK_DIAG_SLOW_ACQUIRE_MS", "1"),
+            ("RUSTFS_OBJECT_LOCK_DIAG_SLOW_HOLD_MS", "1"),
         ],
     )
     .await?;
