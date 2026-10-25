@@ -27,6 +27,7 @@ script-tests: ## Run shell script tests
 	trap 'status=$$?; printf "ERROR: script-tests failed (exit %s): %s\n" "$$status" "$$BASH_COMMAND" >&2; exit "$$status"' ERR
 	./scripts/test_build_rustfs_options.sh
 	./scripts/test_docker_runtime_timezone.sh
+	sh ./scripts/test_ca_bundle.sh
 	./scripts/test_entrypoint_credentials.sh
 	./scripts/test_internode_grpc_ab_bench.sh
 	./scripts/test_object_batch_bench_enhanced.sh

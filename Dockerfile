@@ -18,6 +18,13 @@ ARG TARGETARCH
 ARG RELEASE=latest
 
 RUN apk add --no-cache ca-certificates curl jq unzip
+# Keep the native store safe even if the distribution CA package lags distrust.
+COPY scripts/check_ca_bundle.sh /tmp/check_ca_bundle.sh
+RUN sed -i '/^mozilla\/emSign_ECC_Root_CA_-_G3.crt$/s/^/!/' /etc/ca-certificates.conf && \
+    update-ca-certificates --fresh && \
+    sh /tmp/check_ca_bundle.sh /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs && \
+    rm /tmp/check_ca_bundle.sh
+
 WORKDIR /build
 
 RUN set -eux; \
@@ -98,7 +105,13 @@ RUN apk upgrade --no-cache && \
     tzdata \
     && test "$(TZ=Asia/Kolkata date +%z)" = "+0530"
 
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+# Keep the native store safe even if the distribution CA package lags distrust.
+COPY scripts/check_ca_bundle.sh /tmp/check_ca_bundle.sh
+RUN sed -i '/^mozilla\/emSign_ECC_Root_CA_-_G3.crt$/s/^/!/' /etc/ca-certificates.conf && \
+    update-ca-certificates --fresh && \
+    sh /tmp/check_ca_bundle.sh /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs && \
+    rm /tmp/check_ca_bundle.sh
+
 COPY --from=build /build/rustfs /usr/bin/rustfs
 COPY entrypoint.sh /entrypoint.sh
 

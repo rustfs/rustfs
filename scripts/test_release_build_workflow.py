@@ -45,6 +45,32 @@ def archive(path, members, binary):
 
 
 class ReleaseBuildTests(unittest.TestCase):
+    def test_security_release_console_pin(self):
+        script = shell_body(STEPS['Download static console assets'])
+        self.assertIn('releases/tags/v0.1.37', script)
+        self.assertNotIn('console/releases/latest', script)
+        parser = re.search(r"<<'PY'\n(.*?)\nPY", script, re.S)[1]
+        expected_digest = 'sha256:e6ff2c7e7695de824ec4cda91d8611d1aba5d8462e6809592c92a50b23f5b9ab'
+        asset = {'name': 'rustfs-console-v0.1.37.zip', 'digest': expected_digest,
+                 'browser_download_url': 'https://github.com/rustfs/console/releases/download/v0.1.37/rustfs-console-v0.1.37.zip'}
+        cases = [
+            ('exact pin', 'v0.1.37', asset, True),
+            ('different tag', 'v0.1.38', asset, False),
+            ('different name', 'v0.1.37', {**asset, 'name': 'rustfs-console-v0.1.38.zip'}, False),
+            ('different digest', 'v0.1.37', {**asset, 'digest': 'sha256:' + '0' * 64}, False),
+            ('missing URL', 'v0.1.37', {**asset, 'browser_download_url': ''}, False),
+        ]
+        for name, tag, entry, accepted in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                metadata = Path(directory) / 'release.json'
+                metadata.write_text(json.dumps({'tag_name': tag, 'assets': [entry]}))
+                result = subprocess.run([sys.executable, '-c', parser, str(metadata)],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                if accepted:
+                    self.assertEqual(result.stdout.split(),
+                                     ['v0.1.37', asset['browser_download_url'], expected_digest.split(':')[1]])
+
     def test_every_matrix_target_builds_only_server(self):
         mock_cargo = r'''
 cargo() {
