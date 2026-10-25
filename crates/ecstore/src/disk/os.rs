@@ -112,7 +112,6 @@ pub(crate) mod fsync_dir_recorder {
     static RECORDED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static LIMITED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static GROUPED: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
-    #[cfg(unix)]
     static FAILURES: std::sync::LazyLock<Mutex<HashMap<PathBuf, io::ErrorKind>>> =
         std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
     #[cfg(unix)]
@@ -175,7 +174,6 @@ pub(crate) mod fsync_dir_recorder {
         contains_path(&RECORDED.lock().expect("fsync dir recorder poisoned"), dir)
     }
 
-    #[cfg(unix)]
     pub(crate) fn set_failure(dir: &Path, kind: io::ErrorKind) {
         FAILURES
             .lock()
@@ -183,7 +181,6 @@ pub(crate) mod fsync_dir_recorder {
             .insert(dir.to_path_buf(), kind);
     }
 
-    #[cfg(unix)]
     pub(crate) fn take_failure(dir: &Path) -> Option<io::ErrorKind> {
         remove_path_keyed(&FAILURES, dir, "fsync dir failure hook poisoned")
     }
@@ -548,13 +545,14 @@ pub(crate) fn fsync_directory_handle_std(dir: &Path, opened: Option<&std::fs::Fi
     #[cfg(all(test, not(windows)))]
     prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::DirFsync, dir);
     #[cfg(test)]
-    fsync_dir_recorder::record(dir);
-    #[cfg(unix)]
     {
-        #[cfg(test)]
+        fsync_dir_recorder::record(dir);
         if let Some(kind) = fsync_dir_recorder::take_failure(dir) {
             return Err(io::Error::from(kind));
         }
+    }
+    #[cfg(unix)]
+    {
         let _sync = StageTimer::new(true, "disk_directory_open_fsync");
         match opened {
             Some(file) => file.sync_all()?,
