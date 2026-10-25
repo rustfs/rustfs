@@ -15,7 +15,10 @@
 //! Exercise the target inventory through HTTP authentication and authorization.
 //! Handler-level tests separately control reconciliation locks and config faults.
 
-use crate::common::{RustFSTestEnvironment, admin_create_user, admin_request, init_logging, local_http_client};
+use crate::common::{
+    RustFSTestEnvironment, admin_create_user, admin_request, admin_request_with_session_token, build_test_sts_client,
+    init_logging, local_http_client,
+};
 use http::header::{AUTHORIZATION, HOST};
 use reqwest::StatusCode;
 use rustfs_signer::{constants::UNSIGNED_PAYLOAD, sign_v4};
@@ -94,46 +97,84 @@ async fn target_inventory_preserves_unloaded_targets_and_http_auth_boundaries() 
     admin_create_user(&env, LIMITED_KEY, LIMITED_SECRET).await?;
 
     tokio::time::timeout(Duration::from_secs(60), async {
+        let assumed = build_test_sts_client(&env.url, &env.access_key, &env.secret_key, None, "e2e-target-inventory")
+            .assume_role()
+            .role_arn("arn:aws:iam::123456789012:role/target-inventory")
+            .role_session_name("target-inventory-console-session")
+            .send()
+            .await?;
+        let temporary = assumed
+            .credentials()
+            .ok_or("AssumeRole should return temporary inventory credentials")?;
+        assert_ne!(
+            temporary.access_key_id(),
+            env.access_key,
+            "inventory must exercise a distinct session credential"
+        );
+        assert!(
+            !temporary.session_token().is_empty(),
+            "temporary inventory credentials must include a token"
+        );
+
         for path in PATHS {
-            let (status, body) = admin_request(&env.url, http::Method::GET, path, None, &env.access_key, &env.secret_key).await?;
-            assert_eq!(status, StatusCode::OK, "{path}: signed admin inventory failed");
-            assert!(!body.contains(SECRET), "{path}: inventory exposed a target secret");
-            let value: Value = serde_json::from_str(&body)?;
-            let entries: Vec<&Value> = if path.ends_with("/target/list") {
-                let field = if path.contains("/audit/") {
-                    "audit_endpoints"
+            for (principal, access_key, secret_key, session_token) in [
+                ("root", env.access_key.as_str(), env.secret_key.as_str(), None),
+                (
+                    "temporary admin",
+                    temporary.access_key_id(),
+                    temporary.secret_access_key(),
+                    Some(temporary.session_token()),
+                ),
+            ] {
+                let (status, body) = admin_request_with_session_token(
+                    &env.url,
+                    http::Method::GET,
+                    path,
+                    None,
+                    access_key,
+                    secret_key,
+                    session_token,
+                )
+                .await?;
+                assert_eq!(status, StatusCode::OK, "{path}: signed {principal} inventory failed");
+                assert!(!body.contains(SECRET), "{path}: inventory exposed a target secret");
+                let value: Value = serde_json::from_str(&body)?;
+                let entries: Vec<&Value> = if path.ends_with("/target/list") {
+                    let field = if path.contains("/audit/") {
+                        "audit_endpoints"
+                    } else {
+                        "notification_endpoints"
+                    };
+                    value[field].as_array().ok_or("missing endpoint inventory")?.iter().collect()
+                } else if path.ends_with("/instances") {
+                    value["instances"]
+                        .as_array()
+                        .ok_or("missing instance inventory")?
+                        .iter()
+                        .collect()
                 } else {
-                    "notification_endpoints"
+                    vec![&value]
                 };
-                value[field].as_array().ok_or("missing endpoint inventory")?.iter().collect()
-            } else if path.ends_with("/instances") {
-                value["instances"]
-                    .as_array()
-                    .ok_or("missing instance inventory")?
-                    .iter()
-                    .collect()
-            } else {
-                vec![&value]
-            };
-            let targets: Vec<_> = entries
-                .into_iter()
-                .filter(|entry| {
-                    entry["account_id"]
-                        .as_str()
-                        .is_some_and(|id| id.eq_ignore_ascii_case("acceptance"))
-                })
-                .collect();
-            let expected = if path.ends_with("/instances") { 2 } else { 1 };
-            assert_eq!(targets.len(), expected, "{path}: configured targets disappeared");
-            for entry in &targets {
-                assert_unloaded_target(entry, path);
-                if path.contains("/v4/") {
-                    assert_eq!(entry["config"]["auth_token"], "***redacted***", "{path}: missing secret redaction");
+                let targets: Vec<_> = entries
+                    .into_iter()
+                    .filter(|entry| {
+                        entry["account_id"]
+                            .as_str()
+                            .is_some_and(|id| id.eq_ignore_ascii_case("acceptance"))
+                    })
+                    .collect();
+                let expected = if path.ends_with("/instances") { 2 } else { 1 };
+                assert_eq!(targets.len(), expected, "{path}: configured targets disappeared");
+                for entry in &targets {
+                    assert_unloaded_target(entry, path);
+                    if path.contains("/v4/") {
+                        assert_eq!(entry["config"]["auth_token"], "***redacted***", "{path}: missing secret redaction");
+                    }
                 }
-            }
-            if expected == 2 {
-                for domain in ["notify", "audit"] {
-                    assert!(targets.iter().any(|entry| entry["domain"] == domain), "{path}: missing {domain} domain");
+                if expected == 2 {
+                    for domain in ["notify", "audit"] {
+                        assert!(targets.iter().any(|entry| entry["domain"] == domain), "{path}: missing {domain} domain");
+                    }
                 }
             }
 

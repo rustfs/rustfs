@@ -31,8 +31,7 @@
 
 // Keep inventory acceptance in the admin-auth PR smoke selection.
 #[cfg(test)]
-#[path = "admin_target_inventory_test.rs"]
-mod target_inventory;
+mod target_inventory_test;
 
 #[cfg(test)]
 mod tests {
