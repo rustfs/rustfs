@@ -110,7 +110,7 @@ use time::OffsetDateTime;
 use tokio::fs::{self, File};
 #[cfg(not(unix))]
 use tokio::io::AsyncReadExt;
-use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind, ReadBuf};
+use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, ErrorKind, ReadBuf};
 use tokio::sync::{Notify, RwLock, Semaphore};
 use tokio::time::{Instant, Sleep, interval_at, timeout};
 use tracing::{debug, error, info, warn};
@@ -3133,12 +3133,6 @@ pub struct FormatInfo {
     pub data: Bytes,
     pub file_info: Option<Metadata>,
     pub last_check: Option<OffsetDateTime>,
-}
-
-/// A helper enum to handle internal buffer types for writing data.
-pub enum InternalBuf<'a> {
-    Ref(&'a [u8]),
-    Owned(Bytes),
 }
 
 /// Durability mode for `write_all_internal`.
@@ -7400,7 +7394,7 @@ impl LocalDisk {
         self.write_all_meta_with_namespace_owner(
             volume,
             format!("{path}/{STORAGE_FORMAT_FILE}").as_str(),
-            &fm_data,
+            fm_data.into(),
             true,
             namespace_owner,
         )
@@ -7892,7 +7886,7 @@ impl LocalDisk {
             self.write_all_meta_with_namespace_owner(
                 volume,
                 format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str(),
-                &buf,
+                buf.into(),
                 true,
                 namespace_owner.clone(),
             )
@@ -8902,7 +8896,7 @@ impl LocalDisk {
                 self.write_all_meta_with_namespace_owner(
                     volume,
                     &format!("{path}/{STORAGE_FORMAT_FILE}"),
-                    &target,
+                    target.into(),
                     true,
                     namespace_owner.clone(),
                 )
@@ -9356,7 +9350,7 @@ impl LocalDisk {
             .write_all_meta_with_namespace_owner(
                 volume,
                 format!("{path}/{STORAGE_FORMAT_FILE}").as_str(),
-                &buf,
+                buf.into(),
                 true,
                 namespace_owner.clone(),
             )
@@ -9499,7 +9493,7 @@ impl LocalDisk {
         let tmp_file = self.io_get_object_path(RUSTFS_META_TMP_BUCKET, &Uuid::new_v4().to_string())?;
         // Admission above requires metadata durability. Keep rename and its
         // directory sync in the same owned executor even after cancellation.
-        self.write_all_internal(&tmp_file, InternalBuf::Ref(&replacement), SyncMode::FileOnly, &tmp_volume)
+        self.write_all_internal(&tmp_file, replacement.into(), SyncMode::FileOnly, &tmp_volume)
             .await?;
         if crash_inject::should_crash_at(CrashPoint::MetaWriteAfterTmpBeforeRename, &metadata_path) {
             return Err(DiskError::Unexpected);
@@ -9527,14 +9521,15 @@ impl LocalDisk {
 
     #[cfg(test)]
     async fn write_all_meta(&self, volume: &str, path: &str, buf: &[u8], sync: bool) -> Result<()> {
-        self.write_all_meta_with_namespace_owner(volume, path, buf, sync, None).await
+        self.write_all_meta_with_namespace_owner(volume, path, Bytes::copy_from_slice(buf), sync, None)
+            .await
     }
 
     async fn write_all_meta_with_namespace_owner(
         &self,
         volume: &str,
         path: &str,
-        buf: &[u8],
+        buf: Bytes,
         sync: bool,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
@@ -9557,7 +9552,7 @@ impl LocalDisk {
         } else {
             SyncMode::None
         };
-        self.write_all_internal(&tmp_file_path, InternalBuf::Ref(buf), tmp_sync, &tmp_volume_dir)
+        self.write_all_internal(&tmp_file_path, buf, tmp_sync, &tmp_volume_dir)
             .await?;
 
         // Crash-consistency injection: hard power loss after the replacement
@@ -9614,121 +9609,61 @@ impl LocalDisk {
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
         self.io_backend.invalidate_cached_fd(volume, path).await;
-        let res = self
-            .write_all_internal(&file_path, InternalBuf::Owned(buf), sync, skip_parent)
-            .await;
+        let res = self.write_all_internal(&file_path, buf, sync, skip_parent).await;
         self.io_backend.invalidate_cached_fd(volume, path).await;
         res
     }
     // write_all_internal do write file.
     // Executes the given SyncMode verbatim: durability policy (tier gating,
     // system-critical pinning) is resolved by callers via effective_durability.
-    async fn write_all_internal(
-        &self,
-        file_path: &Path,
-        data: InternalBuf<'_>,
-        sync: SyncMode,
-        skip_parent: &Path,
-    ) -> Result<()> {
+    async fn write_all_internal(&self, file_path: &Path, data: Bytes, sync: SyncMode, skip_parent: &Path) -> Result<()> {
         let skip_parent = if skip_parent.as_os_str().is_empty() {
             self.io_root()
         } else {
             skip_parent
         };
 
-        match data {
-            InternalBuf::Ref(buf) => {
-                let mut f = self.open_file(file_path, O_CREATE | O_WRONLY | O_TRUNC, skip_parent).await?;
-                f.write_all(buf).await.map_err(to_file_error)?;
-                if sync != SyncMode::None {
-                    f.sync_data().await.map_err(to_file_error)?;
-                    // Persist the directory entry too, so a freshly created file
-                    // survives power loss along with its contents. Skipped for
-                    // FileOnly: the caller renames the file away immediately.
-                    if sync == SyncMode::FileAndDir
-                        && let Some(parent) = file_path.parent()
-                    {
-                        os::fsync_dir(parent).await.map_err(to_file_error)?;
-                    }
-                }
-            }
-            InternalBuf::Owned(buf) => {
-                let path = file_path.to_path_buf();
-                if let Some(parent) = path.parent()
-                    && parent != skip_parent
-                {
-                    os::make_dir_all(parent, skip_parent).await?;
-                }
-
-                let root = self.publication_root.clone();
-                let operation = move |is_cancelled: &dyn Fn() -> bool| {
-                    if is_cancelled() {
-                        return Err(std::io::Error::other("blocking namespace operation cancelled"));
-                    }
-                    #[cfg(test)]
-                    run_owned_file_before_open(&path);
-
-                    let (mut file, parent_handle) = if sync == SyncMode::FileAndDir {
-                        root.create_truncate_with_parent(&path)?
-                    } else {
-                        (root.create_truncate(&path)?, None)
-                    };
-                    std::io::Write::write_all(&mut file, buf.as_ref())?;
-                    if sync != SyncMode::None {
-                        file.sync_data()?;
-                        // FileOnly callers rename the file away, so the tmp
-                        // directory entry never needs to become durable.
-                        if sync == SyncMode::FileAndDir
-                            && let Some(parent) = path.parent()
-                        {
-                            os::fsync_directory_handle_std(parent, parent_handle.as_ref())?;
-                        }
-                    }
-                    Ok(())
-                };
-                let result = if sync == SyncMode::None {
-                    self.blocking_queue.run_cancellable(operation).await
-                } else {
-                    self.blocking_queue.run_fsync_cancellable(operation).await
-                };
-                result.map_err(to_file_error)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn open_file(&self, path: impl AsRef<Path>, mode: usize, skip_parent: impl AsRef<Path>) -> Result<File> {
-        let mut skip_parent = skip_parent.as_ref();
-        if skip_parent.as_os_str().is_empty() {
-            skip_parent = self.io_root();
-        }
-
-        if let Some(parent) = path.as_ref().parent()
+        let path = file_path.to_path_buf();
+        if let Some(parent) = path.parent()
             && parent != skip_parent
         {
             os::make_dir_all(parent, skip_parent).await?;
         }
 
-        let f = if mode == O_CREATE | O_WRONLY | O_TRUNC {
-            let path = path.as_ref().to_path_buf();
-            let root = self.publication_root.clone();
-            File::from_std(
-                self.blocking_queue
-                    .run_cancellable(move |is_cancelled| {
-                        if is_cancelled() {
-                            return Err(std::io::Error::other("blocking namespace operation cancelled"));
-                        }
-                        root.create_truncate(&path)
-                    })
-                    .await
-                    .map_err(to_file_error)?,
-            )
-        } else {
-            super::fs::open_file(path.as_ref(), mode).await.map_err(to_file_error)?
-        };
+        let root = self.publication_root.clone();
+        let operation = move |is_cancelled: &dyn Fn() -> bool| {
+            if is_cancelled() {
+                return Err(std::io::Error::other("blocking namespace operation cancelled"));
+            }
+            #[cfg(test)]
+            run_owned_file_before_open(&path);
 
-        Ok(f)
+            let (mut file, parent_handle) = if sync == SyncMode::FileAndDir {
+                root.create_truncate_with_parent(&path)?
+            } else {
+                (root.create_truncate(&path)?, None)
+            };
+            std::io::Write::write_all(&mut file, data.as_ref())?;
+            if sync != SyncMode::None {
+                file.sync_data()?;
+                // FileOnly callers rename the file away, so the tmp
+                // directory entry never needs to become durable.
+                if sync == SyncMode::FileAndDir
+                    && let Some(parent) = path.parent()
+                {
+                    os::fsync_directory_handle_std(parent, parent_handle.as_ref())?;
+                }
+            }
+            Ok(())
+        };
+        let result = if sync == SyncMode::None {
+            self.blocking_queue.run_cancellable(operation).await
+        } else {
+            self.blocking_queue.run_fsync_cancellable(operation).await
+        };
+        result.map_err(to_file_error)?;
+
+        Ok(())
     }
 
     #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
@@ -13173,7 +13108,7 @@ impl DiskAPI for LocalDisk {
                 .write_all_meta_with_namespace_owner(
                     volume,
                     format!("{path}/{STORAGE_FORMAT_FILE}").as_str(),
-                    &wbuf,
+                    wbuf.into(),
                     !opts.no_persistence,
                     namespace_owner,
                 )
@@ -26496,8 +26431,7 @@ mod test {
             });
             started_rx.await.expect("fsync lane blocked");
             let path = dir.path().join("new-metadata");
-            let mut write =
-                std::pin::pin!(disk.write_all_internal(&path, InternalBuf::Owned(Bytes::from_static(b"new")), sync, dir.path(),));
+            let mut write = std::pin::pin!(disk.write_all_internal(&path, Bytes::from_static(b"new"), sync, dir.path(),));
             assert!(futures::FutureExt::now_or_never(&mut write).is_none());
             let read = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -26527,6 +26461,73 @@ mod test {
             assert_eq!(fs::read(&path).await.expect("new metadata"), b"new");
             fs::remove_file(&path).await.expect("remove fixture");
         }
+    }
+
+    #[test]
+    fn staged_metadata_write_retains_native_resources_after_cancellation() {
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single metadata native worker");
+        runtime.block_on(async {
+            let payload = b"staged metadata keeps its device until the native write finishes";
+            let mut observations = Vec::new();
+            for count in 1..=2 {
+                for cancel_step in [0, 1] {
+                    let dir = tempfile::tempdir().expect("metadata cancellation fixture");
+                    let endpoint = Endpoint::try_from(dir.path().to_str().expect("fixture path")).expect("endpoint");
+                    let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+                    let path = dir.path().join("staged-xl.meta");
+                    let (resources, gates) = test_resource_units(count);
+                    let mut future = Some(Box::pin(with_optional_resource_unit(
+                        Some(resources),
+                        disk.write_all_internal(&path, Bytes::from_static(payload), SyncMode::None, dir.path()),
+                    )));
+                    for step in 0..=cancel_step {
+                        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                        let (release_tx, release_rx) = std::sync::mpsc::channel();
+                        let blocker = tokio::task::spawn_blocking(move || {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.recv();
+                        });
+                        started_rx.await.expect("native worker occupied");
+                        let poll = futures::poll!(future.as_mut().expect("active write"));
+                        let ready = poll.is_ready();
+                        let pending_io = poll.is_pending() || std::fs::read(&path).ok().as_deref() != Some(payload.as_slice());
+                        if step == cancel_step || ready {
+                            drop(future.take());
+                            observations.push((
+                                count,
+                                step,
+                                pending_io,
+                                gates.iter().map(|gate| gate.snapshot().active).collect::<Vec<_>>(),
+                            ));
+                        }
+                        release_tx.send(()).expect("release native worker before assertions");
+                        blocker.await.expect("native blocker finished");
+                        tokio::task::spawn_blocking(|| ()).await.expect("native queue drained");
+                        if let Poll::Ready(result) = poll {
+                            result.expect("completed metadata write");
+                            break;
+                        }
+                    }
+                    assert!(gates.iter().all(|gate| gate.snapshot().active == 0));
+                    if path.exists() {
+                        assert_eq!(std::fs::read(&path).expect("completed staged write"), payload);
+                    }
+                }
+            }
+            for (count, step, pending_io, held) in observations {
+                assert_eq!(
+                    held,
+                    vec![u32::from(pending_io); count],
+                    "step={step}: unfinished native write keeps its physical resources"
+                );
+            }
+        });
     }
 
     #[tokio::test]

@@ -1713,7 +1713,7 @@ impl LocalDisk {
                         self.write_all_meta_with_namespace_owner(
                             volume,
                             &format!("{object}/{STORAGE_FORMAT_FILE}"),
-                            &target,
+                            target,
                             true,
                             owner.clone(),
                         )
