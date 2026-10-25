@@ -200,3 +200,12 @@ the shared usage lookup retains its normal cache/backend refresh behavior.
 They do not publish intermediate bucket-scan results, so finishing a bucket
 walk does not guarantee immediately updated usage. Legacy write admission
 and quota-check previews retain their existing usage requirements.
+
+Distributed single-bucket usage reads project the requested size directly from
+the cached snapshot. They share the full-snapshot loader's TTL, negative cache,
+serialized refresh and invalidation generation, but do not clone other buckets
+or their histograms. Refresh-only consumers also avoid copying the snapshot.
+The full-snapshot API still returns an owned copy. Cache hits therefore perform
+one bucket lookup; a cold or invalidated cache still requires the existing
+backend load. This does not change scanner publication latency or the local
+mutation cache's refresh policy.
