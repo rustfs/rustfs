@@ -2076,7 +2076,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             // lifetime; a fence by itself cannot transfer the outer lock lease.
             let detach_commit_owner = _upload_commit_guard.is_some()
                 && opts.namespace_lock_fence.is_none()
-                && (opts.bucket_lifecycle_lock_fence.is_none() || opts.bucket_lifecycle_lock_owner.is_some());
+                && (opts.bucket_lifecycle_lock_fence.is_none()
+                    || opts.bucket_lifecycle_lock_owner.is_some()
+                    || opts.bucket_incarnation_fence.is_some());
             let commit_set = self.clone();
             let commit_bucket = bucket.to_owned();
             let commit_object = object.to_owned();
@@ -7373,9 +7375,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn cancelled_put_object_part_keeps_upload_lock_through_commit() {
-        for pause in [
-            MultipartCommitPause::PutPartAfterCapacityAdmission,
-            MultipartCommitPause::PutPartAfterRename,
+        for (pause, typed_owner) in [
+            (MultipartCommitPause::PutPartAfterCapacityAdmission, false),
+            (MultipartCommitPause::PutPartAfterCapacityAdmission, true),
+            (MultipartCommitPause::PutPartAfterRename, false),
+            (MultipartCommitPause::PutPartAfterRename, true),
         ] {
             let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
             let signaling = Arc::new(SignalingLockClient::new(Arc::new(LocalClient::with_manager(manager))));
@@ -7392,6 +7396,17 @@ mod tests {
             let upload_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
             signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_path.clone()));
             let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
+            let put_opts = if typed_owner {
+                lifecycle_owned_put_options(&set_disks, bucket, ObjectOptions::default()).await
+            } else {
+                ObjectOptions::default()
+            };
+            let lifecycle_owner = put_opts.bucket_incarnation_fence.as_ref().map(Arc::downgrade);
+            if typed_owner {
+                assert!(put_opts.bucket_lifecycle_lock_fence.is_some());
+                assert!(put_opts.bucket_lifecycle_lock_owner.is_none());
+                assert!(lifecycle_owner.is_some());
+            }
             let barrier = MultipartCommitBarrier::install(bucket, object, pause);
 
             let put_store = set_disks.clone();
@@ -7399,7 +7414,7 @@ mod tests {
             let put = tokio::spawn(async move {
                 let mut reader = PutObjReader::from_vec(vec![0x45; 4096]);
                 put_store
-                    .put_object_part(bucket, object, &put_upload_id, 1, &mut reader, &ObjectOptions::default())
+                    .put_object_part(bucket, object, &put_upload_id, 1, &mut reader, &put_opts)
                     .await
             });
             barrier.wait_until_paused().await;
@@ -7409,6 +7424,13 @@ mod tests {
                     .expect_err("the request waiter should remain cancellable")
                     .is_cancelled()
             );
+
+            if let Some(owner) = lifecycle_owner {
+                assert!(
+                    owner.upgrade().is_some(),
+                    "cancelled caller must not release the commit's typed lifecycle owner"
+                );
+            }
 
             let abort_store = set_disks.clone();
             let abort_upload_id = upload_id.clone();
