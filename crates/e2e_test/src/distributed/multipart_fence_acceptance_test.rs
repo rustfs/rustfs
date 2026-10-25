@@ -35,6 +35,13 @@ use tokio::task::JoinHandle;
 
 const DEADLINE: Duration = Duration::from_secs(45);
 
+const FAULT_BUDGETS: [(&str, &str); 4] = [
+    ("RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT", "5"),
+    ("RUSTFS_OBJECT_LOCK_RPC_TIMEOUT_MS", "3000"),
+    ("RUSTFS_DRIVE_METADATA_TIMEOUT_SECS", "2"),
+    ("RUSTFS_DRIVE_MAX_TIMEOUT_DURATION", "5"),
+];
+
 async fn fixture(
     drives_per_node: usize,
     storage_class: &str,
@@ -52,6 +59,8 @@ async fn fixture_from_binary(
     if binary.is_some() {
         cluster.set_env("TOKIO_WORKER_THREADS", "2");
         cluster.set_env("RAYON_NUM_THREADS", "2");
+        let (name, value) = crate::upgrade_compatibility_test::ALL_DRIVES_STORAGE_CLASS_ENV;
+        cluster.set_env(name, value);
         // The pinned release passes host_str() directly to TCP resolution,
         // which rejects bracketed IPv6. A loopback hostname retains direct
         // IPv4 S3 listeners and the same signed RPC port. Install the IPv6
@@ -67,14 +76,8 @@ async fn fixture_from_binary(
         }
         cluster.set_env("RUSTFS_VOLUMES", volumes.join(" "));
     }
-    let fault_budgets = [
-        ("RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT", "5"),
-        ("RUSTFS_OBJECT_LOCK_RPC_TIMEOUT_MS", "3000"),
-        ("RUSTFS_DRIVE_METADATA_TIMEOUT_SECS", "2"),
-        ("RUSTFS_DRIVE_MAX_TIMEOUT_DURATION", "5"),
-    ];
     if binary.is_none() {
-        for (name, value) in fault_budgets {
+        for (name, value) in FAULT_BUDGETS {
             cluster.set_env(name, value);
         }
     }
@@ -98,12 +101,9 @@ async fn fixture_from_binary(
     }
     configure_node_logs(&mut cluster, None)?;
     if let Some(binary) = binary {
-        // Bootstrap the old fleet with its normal budgets. Subsequent current
-        // replacements still receive the short method-fault budgets above.
+        // Homogeneous release preparation and seeding retain normal budgets.
+        // The mixed case installs fault budgets only before current replacements.
         cluster.start_with_binary(binary).await?;
-        for (name, value) in fault_budgets {
-            cluster.set_env(name, value);
-        }
     } else {
         cluster.start().await?;
     }
@@ -1113,6 +1113,7 @@ async fn mixed_version_failed_complete_requires_current_coordinator_for_abort() 
         proxies.is_empty(),
         "the genuine previous fleet boots and seeds through its normal direct transport"
     );
+    crate::upgrade_compatibility_test::prepare_release_baseline(&mut cluster, &previous, &bucket, "mixed-mpu-previous").await?;
     let key = "mixed-failed-complete";
     let unrelated = payload_for("historical-unrelated", 4096);
     clients[0]
@@ -1156,6 +1157,9 @@ async fn mixed_version_failed_complete_requires_current_coordinator_for_abort() 
     )
     .await?;
     let original = create_sources(&cluster, &bucket, key)?;
+    for (name, value) in FAULT_BUDGETS {
+        cluster.set_env(name, value);
+    }
     // Keep every old source byte and the advertised localhost authority.
     // Only the new coordinator's fresh channels enter the method observers.
     for node in 0..cluster.nodes.len() {
