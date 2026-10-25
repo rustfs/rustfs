@@ -12644,6 +12644,22 @@ fn resolve_data_movement_lifecycle_expiry_result(action: IlmAction, apply_action
     )))
 }
 
+const DATA_MOVEMENT_DELETE_ALL_DEFERRED_REASON: &str = "delete_all_needs_bucket_write_lock";
+
+fn log_data_movement_lifecycle_expiry_deferred(bucket: &str, object: &str, action: IlmAction, reason: &str) {
+    warn!(
+        event = EVENT_DECOMMISSION_ENTRY,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_POOLS,
+        state = "lifecycle_expiry_deferred",
+        bucket = %bucket,
+        object = %object,
+        action = ?action,
+        reason,
+        "Data movement deferred a version's lifecycle expiry; moving the version"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn should_skip_lifecycle_for_data_movement(
     store: Arc<ECStore>,
@@ -12703,6 +12719,21 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
             }
             let applied = !apply_actions
                 || match lock_lost_signal {
+                    // A delete-all is a prefix delete that takes the bucket
+                    // lifecycle write lock, which the lifecycle read locks held
+                    // by the inline apply and by the rebalance entry's bucket
+                    // incarnation fence would block until timeout. The version
+                    // is still live, so it moves like any other version and
+                    // lifecycle expires it on the target.
+                    Some(_) if action.delete_all() => {
+                        log_data_movement_lifecycle_expiry_deferred(
+                            bucket,
+                            &version.name,
+                            action,
+                            DATA_MOVEMENT_DELETE_ALL_DEFERRED_REASON,
+                        );
+                        return Ok(false);
+                    }
                     Some(signal) => {
                         apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, Some(signal)).await
                     }
@@ -12728,16 +12759,15 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
                             // The version is still live, so it moves like any
                             // other version and lifecycle expires it on the
                             // target.
-                            warn!(
-                                event = EVENT_DECOMMISSION_ENTRY,
-                                component = LOG_COMPONENT_ECSTORE,
-                                subsystem = LOG_SUBSYSTEM_POOLS,
-                                state = "lifecycle_expiry_deferred",
-                                bucket = %bucket,
-                                object = %version.name,
-                                action = ?action,
-                                reason = if delete_all { "delete_all_needs_bucket_write_lock" } else { "not_applied" },
-                                "Data movement deferred a transitioned version's lifecycle expiry; moving the version"
+                            log_data_movement_lifecycle_expiry_deferred(
+                                bucket,
+                                &version.name,
+                                action,
+                                if delete_all {
+                                    DATA_MOVEMENT_DELETE_ALL_DEFERRED_REASON
+                                } else {
+                                    "not_applied"
+                                },
                             );
                             return Ok(false);
                         }

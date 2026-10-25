@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// Narrow a store error into the filemeta vocabulary for `MetaCacheEntriesSortedResult.err`.
-/// Faithful port of the retired blanket `From<StorageError> for rustfs_filemeta::Error`:
-/// unmatched variants fold into the io-backed `other()`, whose boxed identity the io bridge
-/// recovers on the way back (see conversion_roundtrip_tests).
+/// Narrow a store error into the filemeta vocabulary used inside the per-set
+/// walk closures. Faithful port of the retired blanket
+/// `From<StorageError> for rustfs_filemeta::Error`: unmatched variants fold
+/// into the io-backed `other()`, whose boxed identity the io bridge recovers
+/// on the way back (see conversion_roundtrip_tests).
 fn to_filemeta_err(err: Error) -> rustfs_filemeta::Error {
     err.narrow_to_filemeta().unwrap_or_else(rustfs_filemeta::Error::other)
 }
@@ -27,7 +28,8 @@ use crate::bucket::metadata_sys::{
 use crate::bucket::utils::{check_list_objs_args, has_bad_path_component};
 use crate::bucket::versioning::VersioningApi;
 use crate::cache_value::metacache_set::{
-    FallbackClaimTracker, ListPathRawOptions, list_path_raw_with_claim_tracker, list_path_raw_with_partial_result,
+    FallbackClaimTracker, ListPathRawOptions, ListPathRawOutcome, list_path_raw_with_claim_tracker,
+    list_path_raw_with_partial_result,
 };
 use crate::core::sets::Sets;
 use crate::disk::error::DiskError;
@@ -51,7 +53,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use rand::seq::SliceRandom;
 use rustfs_filemeta::{
-    FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry,
+    FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry,
     MetaCacheEntryResolution as ListingEntryResolution, MetacacheReader, MetadataResolutionParams, is_io_eof,
     resolve_agreed_entry as resolve_agreed_listing_entry,
 };
@@ -66,7 +68,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::duplex;
@@ -171,7 +173,7 @@ fn walk_result_from_set_errors(errs: &[Option<Error>]) -> Result<()> {
     }
 
     for err in errs.iter().flatten() {
-        if err == &Error::Unexpected || err.is_not_found() {
+        if err.is_not_found() {
             continue;
         }
 
@@ -213,6 +215,23 @@ enum GatherResultsState {
     /// (the `list_path` wrapper future) having been dropped — e.g. the client
     /// disconnected mid-listing. This is a benign completion, not an error.
     ConsumerGone,
+}
+
+/// One page of merged listing entries.
+#[derive(Debug, Default)]
+pub struct ListPage {
+    pub entries: MetaCacheEntriesSorted,
+    /// Every producer reached the end of the requested namespace while this
+    /// page was collected, so no continuation page can exist. A page cut at
+    /// the collector's limit, or fed by a producer that stopped at its own
+    /// per-disk limit, is never exhausted even when it is empty.
+    pub exhausted: bool,
+}
+
+/// Which page worker finished, with what it knows about the stream end.
+enum ListWorkerExit {
+    Producer(ListPathRawOutcome),
+    Gather(GatherResultsState),
 }
 
 #[derive(Clone)]
@@ -343,18 +362,6 @@ pub struct ListPathOptions {
     pub cursor_generation: Option<String>,
     pub walkdir_timeout: Option<Duration>,
     pub walkdir_stall_timeout: Option<Duration>,
-    /// Shared by the collector and raw producers to preserve bounded-walk
-    /// completion when filtering removes all entries from a batch.
-    pub producer_limit_reached: Option<Arc<AtomicBool>>,
-}
-
-fn ensure_producer_limit_state(options: &mut ListPathOptions) -> Arc<AtomicBool> {
-    let state = options
-        .producer_limit_reached
-        .clone()
-        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-    options.producer_limit_reached = Some(state.clone());
-    state
 }
 
 fn list_path_folds_common_prefixes(options: &ListPathOptions) -> bool {
@@ -2200,8 +2207,8 @@ fn append_list_cache_id_to_marker(marker: String, cache_id: Option<&str>) -> Str
 /// `forward_past`), captured before delimiter folding collapses many keys into a
 /// few common prefixes. Used as a continuation marker so a fully re-folded page
 /// can still advance past its scan window (ECA-03 / #944).
-fn last_scanned_entry_name(entries: Option<&MetaCacheEntriesSorted>) -> Option<String> {
-    entries.and_then(|entries| entries.entries().last().map(|entry| entry.name.clone()))
+fn last_scanned_entry_name(entries: &MetaCacheEntriesSorted) -> Option<String> {
+    entries.entries().last().map(|entry| entry.name.clone())
 }
 
 fn filter_versions_common_prefixes_after_marker(objects: &mut Vec<ObjectInfo>, delimiter: Option<&str>, marker: Option<&str>) {
@@ -3290,7 +3297,7 @@ fn parse_version_marker(marker: String) -> Result<VersionMarker> {
 }
 
 fn version_marker_for_entries(
-    entries: Option<&MetaCacheEntriesSorted>,
+    entries: &MetaCacheEntriesSorted,
     key_marker: Option<&str>,
     version_marker: Option<VersionMarker>,
 ) -> Option<VersionMarker> {
@@ -3300,8 +3307,9 @@ fn version_marker_for_entries(
     };
 
     entries
-        .and_then(|entries| entries.entries().first().map(|entry| entry.name.as_str() == key_marker))
-        .unwrap_or_default()
+        .entries()
+        .first()
+        .is_some_and(|entry| entry.name.as_str() == key_marker)
         .then_some(marker)
 }
 
@@ -3390,43 +3398,22 @@ impl ECStore {
                 cursor_generation: Some(LIST_CURSOR_GENERATION_LIVE.to_owned()),
                 ..Default::default()
             };
-            let mut list_result = self
-                .clone()
-                .list_path(&page_opts)
-                .await
-                .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                    err: Some(to_filemeta_err(err)),
-                    ..Default::default()
-                });
-            let reached_end = match list_result.err.take() {
-                Some(rustfs_filemeta::Error::Unexpected) => true,
-                Some(err) => return Err(Error::from(err)),
-                None => false,
-            };
+            let mut page = self.clone().list_path(&page_opts).await?;
+            let reached_end = page.exhausted;
+            page.entries.forward_past(marker.clone());
 
-            if let Some(result) = list_result.entries.as_mut() {
-                result.forward_past(marker.clone());
-            }
-
-            let page_keys = list_result
+            let page_keys = page
                 .entries
-                .as_ref()
-                .map(|entries| {
-                    entries
-                        .entries()
-                        .into_iter()
-                        .map(|entry| entry.name.clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+                .entries()
+                .into_iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>();
 
             if page_keys.is_empty() {
                 break;
             }
-            if let Some(entries) = list_result.entries.as_ref() {
-                let page_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(entries, &opts.bucket, "", None).await;
-                objects.extend(page_objects.iter().map(PersistentListMetadataObject::from_object_info));
-            }
+            let page_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(&page.entries, &opts.bucket, "", None).await;
+            objects.extend(page_objects.iter().map(PersistentListMetadataObject::from_object_info));
 
             marker = page_keys.last().cloned();
             if marker == previous_marker {
@@ -3753,40 +3740,20 @@ impl ECStore {
                 provider_opts.cursor_source = Some(mode);
                 provider_opts.cursor_generation = health.active_generation.clone();
 
-                let mut list_result =
-                    self.clone()
-                        .list_path(&provider_opts)
-                        .await
-                        .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                            err: Some(to_filemeta_err(err)),
-                            ..Default::default()
-                        });
-
-                if let Some(err) = list_result.err.take()
-                    && err != rustfs_filemeta::Error::Unexpected
-                {
+                let Ok(mut page) = self.clone().list_path(&provider_opts).await else {
                     if list_metrics_enabled {
                         record_list_objects_index_fallback(mode, ListIndexFallbackReason::Unhealthy);
                     }
                     return Ok(None);
-                }
-
-                if let Some(result) = list_result.entries.as_mut() {
-                    result.forward_past(provider_opts.marker.clone());
-                }
+                };
+                page.entries.forward_past(provider_opts.marker.clone());
 
                 let candidate_keys = Arc::new(
-                    list_result
-                        .entries
-                        .as_ref()
-                        .map(|entries| {
-                            entries
-                                .entries()
-                                .into_iter()
-                                .map(|entry| entry.name.clone())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default(),
+                    page.entries
+                        .entries()
+                        .into_iter()
+                        .map(|entry| entry.name.clone())
+                        .collect::<Vec<_>>(),
                 );
                 (candidate_keys, health)
             }
@@ -4000,40 +3967,23 @@ impl ECStore {
         let result = if let Some(result) = key_only_result {
             result
         } else {
-            let mut list_result = self
+            let mut page = self
                 .clone()
                 .list_path(&opts)
                 .await
-                .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                    err: Some(to_filemeta_err(err)),
-                    ..Default::default()
-                });
-            let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
+                .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
+            let next_cache_id = page.entries.list_id.clone();
 
-            // err=None means gather_results filled its limit → disk has more data
-            let disk_has_more = list_result.err.is_none();
+            let disk_has_more = !page.exhausted;
 
-            if let Some(err) = list_result.err.take()
-                && err != rustfs_filemeta::Error::Unexpected
-            {
-                return Err(to_object_err(err.into(), vec![bucket, prefix]));
-            }
-
-            if let Some(result) = list_result.entries.as_mut() {
-                result.forward_past(opts.marker.clone());
-            }
+            page.entries.forward_past(opts.marker.clone());
 
             // Last RAW scanned key, captured before folding, so `list_objects_paginate`
             // can advance past a fully-collapsed common-prefix page (ECA-03 / #944).
-            let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+            let last_scanned_key = last_scanned_entry_name(&page.entries);
 
-            let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
-                &list_result.entries.unwrap_or_default(),
-                bucket,
-                prefix,
-                delimiter.clone(),
-            )
-            .await;
+            let get_objects =
+                ObjectInfo::from_meta_cache_entries_sorted_infos(&page.entries, bucket, prefix, delimiter.clone()).await;
 
             let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
                 get_objects,
@@ -4240,36 +4190,24 @@ impl ECStore {
         // (notably `forward_past`) — see backlog#1047.
         opts.parse_marker();
 
-        let mut list_result = self
+        let mut page = self
             .list_path(&opts)
             .await
-            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(to_filemeta_err(err)),
-                ..Default::default()
-            });
-        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
+            .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
+        let next_cache_id = page.entries.list_id.clone();
 
-        // err=None means gather_results filled its limit → disk has more data
-        let disk_has_more = list_result.err.is_none();
+        let disk_has_more = !page.exhausted;
 
-        if let Some(err) = list_result.err.take()
-            && err != rustfs_filemeta::Error::Unexpected
-        {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
+        if !has_version_marker {
+            page.entries.forward_past(opts.marker.clone());
         }
 
-        if let Some(result) = list_result.entries.as_mut()
-            && !has_version_marker
-        {
-            result.forward_past(opts.marker.clone());
-        }
-
-        let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
+        let version_marker = version_marker_for_entries(&page.entries, opts.marker.as_deref(), version_marker);
 
         // Last RAW scanned key, captured before folding (ECA-03 / #944).
-        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+        let last_scanned_key = last_scanned_entry_name(&page.entries);
 
-        let entries = list_result.entries.unwrap_or_default();
+        let entries = page.entries;
         let get_objects = if include_version_purge {
             ObjectInfo::from_meta_cache_entries_sorted_versions_for_lifecycle(
                 &entries,
@@ -4305,7 +4243,7 @@ impl ECStore {
         })
     }
 
-    pub async fn list_path(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSortedResult> {
+    pub async fn list_path(self: Arc<Self>, o: &ListPathOptions) -> Result<ListPage> {
         // tracing::warn!("list_path opt {:?}", &o);
 
         let list_path_started = std::time::Instant::now();
@@ -4318,19 +4256,17 @@ impl ECStore {
         let mut o = o.clone();
         o.marker = o.marker.filter(|v| v >= &o.prefix);
 
-        if let Some(marker) = &o.marker
-            && !o.prefix.is_empty()
-            && !marker.starts_with(&o.prefix)
-        {
-            return Err(Error::Unexpected);
-        }
-
-        if o.limit == 0 {
-            return Err(Error::Unexpected);
-        }
-
-        if o.prefix.starts_with(SLASH_SEPARATOR) {
-            return Err(Error::Unexpected);
+        // Nothing can match these requests; answer with an exhausted empty
+        // page instead of walking.
+        let marker_outside_prefix = o
+            .marker
+            .as_deref()
+            .is_some_and(|marker| !o.prefix.is_empty() && !marker.starts_with(&o.prefix));
+        if marker_outside_prefix || o.limit == 0 || o.prefix.starts_with(SLASH_SEPARATOR) {
+            return Ok(ListPage {
+                entries: MetaCacheEntriesSorted::default(),
+                exhausted: true,
+            });
         }
 
         let slash_separator = Some(SLASH_SEPARATOR.to_owned());
@@ -4361,36 +4297,25 @@ impl ECStore {
 
         // cancel channel
         let cancel = CancellationToken::new();
-        ensure_producer_limit_state(&mut o);
 
         let (sender, recv) = mpsc::channel(o.limit as usize);
         let store = self.clone();
         let mut opts = o.clone();
         opts.stop_disk_at_limit = true;
         let producer_cancel = cancel.clone();
-        let producer = async move { store.list_merged(producer_cancel, opts, sender).await.map(|_| ()) };
-        let mut result = collect_list_path_results("store", &log_context, cancel, o.clone(), recv, producer).await;
-
-        if result.err.is_some() {
-            log_list_path_finished("store", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
-            return Ok(result);
-        }
-
-        if let Some(entries) = result.entries.as_mut() {
-            entries.reuse = true;
-            let truncated = !entries.entries().is_empty() || result.err.is_none();
-            entries.o.0.truncate(o.limit as usize);
-            if !o.transient && truncated {
-                entries.list_id = if let Some(id) = o.id {
-                    Some(id)
-                } else {
-                    Some(Uuid::new_v4().to_string())
-                }
+        let producer = async move { store.list_merged(producer_cancel, opts, sender).await };
+        let mut page = match collect_list_path_results("store", &log_context, cancel, o.clone(), recv, producer).await {
+            Ok(page) => page,
+            Err(err) => {
+                log_list_path_finished("store", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
+                return Err(err);
             }
+        };
 
-            if !truncated {
-                result.err = Some(rustfs_filemeta::Error::Unexpected);
-            }
+        page.entries.reuse = true;
+        page.entries.o.0.truncate(o.limit as usize);
+        if !o.transient {
+            page.entries.list_id = Some(o.id.unwrap_or_else(|| Uuid::new_v4().to_string()));
         }
 
         rustfs_io_metrics::record_stage_duration(
@@ -4402,15 +4327,11 @@ impl ECStore {
             "store",
             &log_context,
             list_path_started.elapsed().as_secs_f64() * 1000.0,
-            result
-                .entries
-                .as_ref()
-                .map(|entries| entries.entries().len())
-                .unwrap_or_default(),
-            result.err.is_some(),
+            page.entries.entries().len(),
+            false,
         );
 
-        Ok(result)
+        Ok(page)
     }
 
     // Read all
@@ -4419,7 +4340,7 @@ impl ECStore {
         rx: CancellationToken,
         opts: ListPathOptions,
         sender: Sender<MetaCacheEntry>,
-    ) -> Result<Vec<ObjectInfo>> {
+    ) -> Result<ListPathRawOutcome> {
         // warn!("list_merged ops {:?}", &opts);
         let merge_started = std::time::Instant::now();
 
@@ -4452,15 +4373,15 @@ impl ECStore {
         let results = join_all(futures).await;
         merge_task.await.map_err(Error::from)??;
 
-        let mut all_at_eof = true;
-
+        let mut outcome = ListPathRawOutcome::default();
         let mut errs = Vec::new();
         for result in results {
-            if let Err(err) = result {
-                all_at_eof = false;
-                errs.push(Some(err));
-            } else {
-                errs.push(None);
+            match result {
+                Ok(set_outcome) => {
+                    outcome.limit_reached |= set_outcome.limit_reached;
+                    errs.push(None);
+                }
+                Err(err) => errs.push(Some(err)),
             }
         }
 
@@ -4471,23 +4392,12 @@ impl ECStore {
         // VolumeNotFound check caused spurious errors when a pool had not
         // yet created the bucket prefix on every set.
         if is_all_not_found(&errs) {
-            return Ok(Vec::new());
+            return Ok(outcome);
         }
 
-        for err in errs.iter() {
-            if let Some(err) = err {
-                if err == &Error::Unexpected {
-                    continue;
-                }
-
-                return Err(err.clone());
-            } else {
-                all_at_eof = false;
-                continue;
-            }
+        if let Some(err) = errs.iter().flatten().next() {
+            return Err(err.clone());
         }
-
-        // check all_at_eof
 
         rustfs_io_metrics::record_stage_duration(
             "store_list_objects_list_merged",
@@ -4496,14 +4406,12 @@ impl ECStore {
 
         debug!(
             set_pair_count = self.pools.len(),
-            all_at_eof = all_at_eof,
+            limit_reached = outcome.limit_reached,
             error_count = errs.iter().filter(|err| err.is_some()).count(),
             "store list_merged finished"
         );
 
-        _ = all_at_eof;
-
-        Ok(Vec::new())
+        Ok(outcome)
     }
 
     #[allow(unused_assignments)]
@@ -4892,7 +4800,7 @@ impl ECStore {
         let mut errs = Vec::new();
         for walk_result in walk_results {
             match walk_result {
-                Ok(()) => errs.push(None),
+                Ok(_) => errs.push(None),
                 Err(err) => errs.push(Some(err.into())),
             }
         }
@@ -4924,9 +4832,9 @@ async fn collect_list_path_results<P>(
     opts: ListPathOptions,
     recv: Receiver<MetaCacheEntry>,
     producer: P,
-) -> MetaCacheEntriesSortedResult
+) -> Result<ListPage>
 where
-    P: Future<Output = Result<()>> + Send + 'static,
+    P: Future<Output = Result<ListPathRawOutcome>> + Send + 'static,
 {
     let _cancel_guard = cancel.clone().drop_guard();
     let (result_tx, mut result_rx) = mpsc::channel(1);
@@ -4953,7 +4861,7 @@ where
     {
         diagnostic_context.caller = request_caller;
     }
-    let producer = async move { producer.await.map(|()| None) };
+    let producer = async move { producer.await.map(ListWorkerExit::Producer) };
     #[cfg(feature = "diagnostic-read-version-caller")]
     let producer = crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
         diagnostic_context,
@@ -4962,7 +4870,11 @@ where
     );
     workers.spawn(producer.instrument(tracing::Span::current()));
     let gather_cancel = cancel.clone();
-    let gather = async move { gather_results(gather_cancel, opts, recv, result_tx).await.map(Some) };
+    let gather = async move {
+        gather_results(gather_cancel, opts, recv, result_tx)
+            .await
+            .map(ListWorkerExit::Gather)
+    };
     #[cfg(feature = "diagnostic-read-version-caller")]
     let gather = crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
         diagnostic_context,
@@ -4973,14 +4885,22 @@ where
 
     let mut failure = None;
     let mut stopping = false;
+    let mut gather_state = None;
+    let mut producer_outcome = None;
     while let Some(completion) = workers.join_next().await {
         let error = match completion {
-            Ok(Ok(Some(GatherResultsState::LimitReached | GatherResultsState::ConsumerGone))) => {
-                stopping = true;
+            Ok(Ok(ListWorkerExit::Gather(state))) => {
+                if matches!(state, GatherResultsState::LimitReached | GatherResultsState::ConsumerGone) {
+                    stopping = true;
+                }
+                gather_state = Some(state);
                 None
             }
             // EOF is only authoritative after the producer also succeeds.
-            Ok(Ok(None | Some(GatherResultsState::InputClosed))) => None,
+            Ok(Ok(ListWorkerExit::Producer(outcome))) => {
+                producer_outcome = Some(outcome);
+                None
+            }
             Ok(Err(err)) => Some(err),
             Err(err) if stopping && err.is_cancelled() => None,
             // Do not expose a panic payload through the S3 error or logs.
@@ -4999,24 +4919,30 @@ where
         // by a page limit becoming ready at the same time.
     }
 
-    // gather_results sends at most one page into a capacity-1 channel, so it
-    // never needs this receiver to make progress. Read only after both joins.
-    let mut result = result_rx.try_recv().unwrap_or_else(|_| MetaCacheEntriesSortedResult {
-        entries: None,
-        err: Some(rustfs_filemeta::Error::other("listing worker exited without a page")),
-    });
     if let Some(error) = failure {
         log_list_path_worker_error(component, "worker_error", context, &error);
-        result.err = Some(to_filemeta_err(error));
+        return Err(error);
     }
-    result
+
+    // gather_results sends at most one page into a capacity-1 channel, so it
+    // never needs this receiver to make progress. Read only after both joins.
+    let Ok(entries) = result_rx.try_recv() else {
+        return Err(Error::other("listing worker exited without a page"));
+    };
+    // The page is complete only when the collector drained a closed input and
+    // every producer stopped at the end of its namespace rather than at a
+    // per-disk limit: a bounded producer can close the input after spending
+    // its budget on entries this page filtered out.
+    let exhausted = matches!(gather_state, Some(GatherResultsState::InputClosed))
+        && producer_outcome.is_some_and(|outcome| !outcome.limit_reached);
+    Ok(ListPage { entries, exhausted })
 }
 
 async fn gather_results(
     rx: CancellationToken,
     opts: ListPathOptions,
     recv: Receiver<MetaCacheEntry>,
-    results_tx: Sender<MetaCacheEntriesSortedResult>,
+    results_tx: Sender<MetaCacheEntriesSorted>,
 ) -> Result<GatherResultsState> {
     let mut recv = recv;
     let mut entries = Vec::new();
@@ -5132,12 +5058,9 @@ async fn gather_results(
             // performs at most one send per call, so a send failure here means
             // the receiver was dropped (consumer gone), never a full buffer.
             if results_tx
-                .send(MetaCacheEntriesSortedResult {
-                    entries: Some(MetaCacheEntriesSorted {
-                        o: MetaCacheEntries(entries),
-                        ..Default::default()
-                    }),
-                    err: None,
+                .send(MetaCacheEntriesSorted {
+                    o: MetaCacheEntries(entries),
+                    ..Default::default()
                 })
                 .await
                 .is_err()
@@ -5153,16 +5076,9 @@ async fn gather_results(
         }
     }
 
-    // A producer can close its stream after exhausting its own scan budget
-    // before this collector reaches its output limit.  In that case the input
-    // channel closing is not authoritative EOF: the caller must advertise a
-    // continuation page even when every remaining entry was filtered out.
-    let producer_limit_reached = opts
-        .producer_limit_reached
-        .as_ref()
-        .is_some_and(|reached| reached.load(Ordering::Acquire));
-
-    // finish not full, return eof
+    // The input closed before the limit. Whether that is the end of the
+    // namespace is decided by `collect_list_path_results`, which also sees how
+    // the producers stopped.
     let filtered = scanned_entries.saturating_sub(candidate_entries);
     if let Some(started) = gather_started {
         let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -5194,12 +5110,9 @@ async fn gather_results(
     // at most one send per call, so a send failure here means the receiver was
     // dropped (consumer gone), never a full buffer.
     if results_tx
-        .send(MetaCacheEntriesSortedResult {
-            entries: Some(MetaCacheEntriesSorted {
-                o: MetaCacheEntries(entries),
-                ..Default::default()
-            }),
-            err: (!producer_limit_reached).then_some(rustfs_filemeta::Error::Unexpected),
+        .send(MetaCacheEntriesSorted {
+            o: MetaCacheEntries(entries),
+            ..Default::default()
         })
         .await
         .is_err()
@@ -5648,37 +5561,21 @@ impl Sets {
         // (notably `forward_past`) — see backlog#1047.
         opts.parse_marker();
 
-        let mut list_result = self
+        let mut page = self
             .list_path(&opts)
             .await
-            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(to_filemeta_err(err)),
-                ..Default::default()
-            });
-        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
+            .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
+        let next_cache_id = page.entries.list_id.clone();
 
-        let disk_has_more = list_result.err.is_none();
+        let disk_has_more = !page.exhausted;
 
-        if let Some(err) = list_result.err.take()
-            && err != rustfs_filemeta::Error::Unexpected
-        {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
-        }
-
-        if let Some(result) = list_result.entries.as_mut() {
-            result.forward_past(opts.marker);
-        }
+        page.entries.forward_past(opts.marker);
 
         // Last RAW scanned key, captured before folding (ECA-03 / #944).
-        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+        let last_scanned_key = last_scanned_entry_name(&page.entries);
 
-        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
-            &list_result.entries.unwrap_or_default(),
-            bucket,
-            prefix,
-            delimiter.clone(),
-        )
-        .await;
+        let get_objects =
+            ObjectInfo::from_meta_cache_entries_sorted_infos(&page.entries, bucket, prefix, delimiter.clone()).await;
 
         let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
             get_objects,
@@ -5737,35 +5634,24 @@ impl Sets {
         // (notably `forward_past`) — see backlog#1047.
         opts.parse_marker();
 
-        let mut list_result = self
+        let mut page = self
             .list_path(&opts)
             .await
-            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(to_filemeta_err(err)),
-                ..Default::default()
-            });
-        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
+            .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
+        let next_cache_id = page.entries.list_id.clone();
 
-        let disk_has_more = list_result.err.is_none();
+        let disk_has_more = !page.exhausted;
 
-        if let Some(err) = list_result.err.take()
-            && err != rustfs_filemeta::Error::Unexpected
-        {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
+        if !has_version_marker {
+            page.entries.forward_past(opts.marker.clone());
         }
 
-        if let Some(result) = list_result.entries.as_mut()
-            && !has_version_marker
-        {
-            result.forward_past(opts.marker.clone());
-        }
-
-        let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
+        let version_marker = version_marker_for_entries(&page.entries, opts.marker.as_deref(), version_marker);
 
         // Last RAW scanned key, captured before folding (ECA-03 / #944).
-        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+        let last_scanned_key = last_scanned_entry_name(&page.entries);
 
-        let entries = list_result.entries.unwrap_or_default();
+        let entries = page.entries;
         let get_objects =
             ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, bucket, prefix, delimiter.clone(), version_marker)
                 .await;
@@ -5792,26 +5678,24 @@ impl Sets {
         })
     }
 
-    pub async fn list_path(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSortedResult> {
+    pub async fn list_path(self: Arc<Self>, o: &ListPathOptions) -> Result<ListPage> {
         check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
         let list_path_started = std::time::Instant::now();
 
         let mut o = o.clone();
         o.marker = o.marker.filter(|v| v >= &o.prefix);
 
-        if let Some(marker) = &o.marker
-            && !o.prefix.is_empty()
-            && !marker.starts_with(&o.prefix)
-        {
-            return Err(Error::Unexpected);
-        }
-
-        if o.limit == 0 {
-            return Err(Error::Unexpected);
-        }
-
-        if o.prefix.starts_with(SLASH_SEPARATOR) {
-            return Err(Error::Unexpected);
+        // Nothing can match these requests; answer with an exhausted empty
+        // page instead of walking.
+        let marker_outside_prefix = o
+            .marker
+            .as_deref()
+            .is_some_and(|marker| !o.prefix.is_empty() && !marker.starts_with(&o.prefix));
+        if marker_outside_prefix || o.limit == 0 || o.prefix.starts_with(SLASH_SEPARATOR) {
+            return Ok(ListPage {
+                entries: MetaCacheEntriesSorted::default(),
+                exhausted: true,
+            });
         }
 
         let slash_separator = Some(SLASH_SEPARATOR.to_owned());
@@ -5840,50 +5724,35 @@ impl Sets {
         let log_context = ListPathLogContext::from_options(&o);
 
         let cancel = CancellationToken::new();
-        ensure_producer_limit_state(&mut o);
         let (sender, recv) = mpsc::channel(o.limit as usize);
         let sets = self.clone();
         let mut opts = o.clone();
         opts.stop_disk_at_limit = true;
         let producer_cancel = cancel.clone();
-        let producer = async move { sets.list_merged(producer_cancel, opts, sender).await.map(|_| ()) };
-        let mut result = collect_list_path_results("sets", &log_context, cancel, o.clone(), recv, producer).await;
-
-        if result.err.is_some() {
-            log_list_path_finished("sets", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
-            return Ok(result);
-        }
-
-        if let Some(entries) = result.entries.as_mut() {
-            entries.reuse = true;
-            let truncated = !entries.entries().is_empty() || result.err.is_none();
-            entries.o.0.truncate(o.limit as usize);
-            if !o.transient && truncated {
-                entries.list_id = if let Some(id) = o.id {
-                    Some(id)
-                } else {
-                    Some(Uuid::new_v4().to_string())
-                };
+        let producer = async move { sets.list_merged(producer_cancel, opts, sender).await };
+        let mut page = match collect_list_path_results("sets", &log_context, cancel, o.clone(), recv, producer).await {
+            Ok(page) => page,
+            Err(err) => {
+                log_list_path_finished("sets", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
+                return Err(err);
             }
+        };
 
-            if !truncated {
-                result.err = Some(rustfs_filemeta::Error::Unexpected);
-            }
+        page.entries.reuse = true;
+        page.entries.o.0.truncate(o.limit as usize);
+        if !o.transient {
+            page.entries.list_id = Some(o.id.unwrap_or_else(|| Uuid::new_v4().to_string()));
         }
 
         log_list_path_finished(
             "sets",
             &log_context,
             list_path_started.elapsed().as_secs_f64() * 1000.0,
-            result
-                .entries
-                .as_ref()
-                .map(|entries| entries.entries().len())
-                .unwrap_or_default(),
-            result.err.is_some(),
+            page.entries.entries().len(),
+            false,
         );
 
-        Ok(result)
+        Ok(page)
     }
 
     async fn list_merged(
@@ -5891,7 +5760,7 @@ impl Sets {
         rx: CancellationToken,
         opts: ListPathOptions,
         sender: Sender<MetaCacheEntry>,
-    ) -> Result<Vec<ObjectInfo>> {
+    ) -> Result<ListPathRawOutcome> {
         let merge_started = std::time::Instant::now();
 
         debug!(
@@ -5919,43 +5788,36 @@ impl Sets {
 
         let results = join_all(futures).await;
         merge_task.await.map_err(Error::from)??;
-        let mut all_at_eof = true;
+        let mut outcome = ListPathRawOutcome::default();
         let mut errs = Vec::new();
         for result in results {
-            if let Err(err) = result {
-                all_at_eof = false;
-                errs.push(Some(err));
-            } else {
-                errs.push(None);
+            match result {
+                Ok(set_outcome) => {
+                    outcome.limit_reached |= set_outcome.limit_reached;
+                    errs.push(None);
+                }
+                Err(err) => errs.push(Some(err)),
             }
         }
 
         if is_all_not_found(&errs) {
-            return Ok(Vec::new());
+            return Ok(outcome);
         }
 
-        for err in &errs {
-            if let Some(err) = err {
-                if err == &Error::Unexpected {
-                    continue;
-                }
-                return Err(err.clone());
-            } else {
-                all_at_eof = false;
-            }
+        if let Some(err) = errs.iter().flatten().next() {
+            return Err(err.clone());
         }
 
         rustfs_io_metrics::record_stage_duration("sets_list_objects_list_merged", merge_started.elapsed().as_secs_f64() * 1000.0);
 
         debug!(
             set_count = self.disk_set.len(),
-            all_at_eof = all_at_eof,
+            limit_reached = outcome.limit_reached,
             error_count = errs.iter().filter(|err| err.is_some()).count(),
             "sets list_merged finished"
         );
 
-        _ = all_at_eof;
-        Ok(Vec::new())
+        Ok(outcome)
     }
 
     #[allow(unused_assignments)]
@@ -6305,7 +6167,7 @@ impl Sets {
         let mut errs = Vec::new();
         for walk_result in walk_results {
             match walk_result {
-                Ok(()) => errs.push(None),
+                Ok(_) => errs.push(None),
                 Err(err) => errs.push(Some(err.into())),
             }
         }
@@ -6359,28 +6221,18 @@ impl SetDisks {
         };
         opts.parse_marker();
 
-        let mut list_result = self
+        let mut page = self
             .list_path_result(&opts)
             .await
-            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(to_filemeta_err(err)),
-                ..Default::default()
-            });
-        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
-        let disk_has_more = list_result.err.is_none();
-        if let Some(err) = list_result.err.take()
-            && err != rustfs_filemeta::Error::Unexpected
-        {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
+            .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
+        let next_cache_id = page.entries.list_id.clone();
+        let disk_has_more = !page.exhausted;
+        if !has_version_marker {
+            page.entries.forward_past(opts.marker.clone());
         }
-        if let Some(result) = list_result.entries.as_mut()
-            && !has_version_marker
-        {
-            result.forward_past(opts.marker.clone());
-        }
-        let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
-        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
-        let entries = list_result.entries.unwrap_or_default();
+        let version_marker = version_marker_for_entries(&page.entries, opts.marker.as_deref(), version_marker);
+        let last_scanned_key = last_scanned_entry_name(&page.entries);
+        let entries = page.entries;
         let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions_for_recursive_delete(
             &entries,
             bucket,
@@ -6462,37 +6314,21 @@ impl SetDisks {
         // (notably `forward_past`) — see backlog#1047.
         opts.parse_marker();
 
-        let mut list_result = self
+        let mut page = self
             .list_path_result(&opts)
             .await
-            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(to_filemeta_err(err)),
-                ..Default::default()
-            });
-        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
+            .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
+        let next_cache_id = page.entries.list_id.clone();
 
-        let disk_has_more = list_result.err.is_none();
+        let disk_has_more = !page.exhausted;
 
-        if let Some(err) = list_result.err.take()
-            && err != rustfs_filemeta::Error::Unexpected
-        {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
-        }
-
-        if let Some(result) = list_result.entries.as_mut() {
-            result.forward_past(opts.marker);
-        }
+        page.entries.forward_past(opts.marker);
 
         // Last RAW scanned key, captured before folding (ECA-03 / #944).
-        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+        let last_scanned_key = last_scanned_entry_name(&page.entries);
 
-        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
-            &list_result.entries.unwrap_or_default(),
-            bucket,
-            prefix,
-            delimiter.clone(),
-        )
-        .await;
+        let get_objects =
+            ObjectInfo::from_meta_cache_entries_sorted_infos(&page.entries, bucket, prefix, delimiter.clone()).await;
 
         let (objects, prefixes, is_truncated, next_marker, _next_version_idmarker) = list_objects_paginate(
             get_objects,
@@ -6550,35 +6386,24 @@ impl SetDisks {
         // (notably `forward_past`) — see backlog#1047.
         opts.parse_marker();
 
-        let mut list_result = self
+        let mut page = self
             .list_path_result(&opts)
             .await
-            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(to_filemeta_err(err)),
-                ..Default::default()
-            });
-        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
+            .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
+        let next_cache_id = page.entries.list_id.clone();
 
-        let disk_has_more = list_result.err.is_none();
+        let disk_has_more = !page.exhausted;
 
-        if let Some(err) = list_result.err.take()
-            && err != rustfs_filemeta::Error::Unexpected
-        {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
+        if !has_version_marker {
+            page.entries.forward_past(opts.marker.clone());
         }
 
-        if let Some(result) = list_result.entries.as_mut()
-            && !has_version_marker
-        {
-            result.forward_past(opts.marker.clone());
-        }
-
-        let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
+        let version_marker = version_marker_for_entries(&page.entries, opts.marker.as_deref(), version_marker);
 
         // Last RAW scanned key, captured before folding (ECA-03 / #944).
-        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+        let last_scanned_key = last_scanned_entry_name(&page.entries);
 
-        let entries = list_result.entries.unwrap_or_default();
+        let entries = page.entries;
         let get_objects =
             ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, bucket, prefix, delimiter.clone(), version_marker)
                 .await;
@@ -6728,12 +6553,12 @@ impl SetDisks {
         let _ = result_task.await;
 
         match list_result {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
             Err(err) => walk_result_from_set_errors(&[Some(err)]),
         }
     }
 
-    pub async fn list_path_result(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSortedResult> {
+    pub async fn list_path_result(self: Arc<Self>, o: &ListPathOptions) -> Result<ListPage> {
         check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
 
         let list_path_started = std::time::Instant::now();
@@ -6741,19 +6566,17 @@ impl SetDisks {
         let mut o = o.clone();
         o.marker = o.marker.filter(|v| v >= &o.prefix);
 
-        if let Some(marker) = &o.marker
-            && !o.prefix.is_empty()
-            && !marker.starts_with(&o.prefix)
-        {
-            return Err(Error::Unexpected);
-        }
-
-        if o.limit == 0 {
-            return Err(Error::Unexpected);
-        }
-
-        if o.prefix.starts_with(SLASH_SEPARATOR) {
-            return Err(Error::Unexpected);
+        // Nothing can match these requests; answer with an exhausted empty
+        // page instead of walking.
+        let marker_outside_prefix = o
+            .marker
+            .as_deref()
+            .is_some_and(|marker| !o.prefix.is_empty() && !marker.starts_with(&o.prefix));
+        if marker_outside_prefix || o.limit == 0 || o.prefix.starts_with(SLASH_SEPARATOR) {
+            return Ok(ListPage {
+                entries: MetaCacheEntriesSorted::default(),
+                exhausted: true,
+            });
         }
 
         let slash_separator = Some(SLASH_SEPARATOR.to_owned());
@@ -6782,35 +6605,24 @@ impl SetDisks {
         let log_context = ListPathLogContext::from_options(&o);
 
         let cancel = CancellationToken::new();
-        ensure_producer_limit_state(&mut o);
         let (sender, recv) = mpsc::channel(o.limit as usize);
         let set = self.clone();
         let mut opts = o.clone();
         opts.stop_disk_at_limit = true;
         let producer_cancel = cancel.clone();
-        let producer = async move { set.list_path(producer_cancel, opts, sender).await.map(|_| ()) };
-        let mut result = collect_list_path_results("set_disks", &log_context, cancel, o.clone(), recv, producer).await;
-
-        if result.err.is_some() {
-            log_list_path_finished("set_disks", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
-            return Ok(result);
-        }
-
-        if let Some(entries) = result.entries.as_mut() {
-            entries.reuse = true;
-            let truncated = !entries.entries().is_empty() || result.err.is_none();
-            entries.o.0.truncate(o.limit as usize);
-            if !o.transient && truncated {
-                entries.list_id = if let Some(id) = o.id {
-                    Some(id)
-                } else {
-                    Some(Uuid::new_v4().to_string())
-                };
+        let producer = async move { set.list_path(producer_cancel, opts, sender).await };
+        let mut page = match collect_list_path_results("set_disks", &log_context, cancel, o.clone(), recv, producer).await {
+            Ok(page) => page,
+            Err(err) => {
+                log_list_path_finished("set_disks", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
+                return Err(err);
             }
+        };
 
-            if !truncated {
-                result.err = Some(rustfs_filemeta::Error::Unexpected);
-            }
+        page.entries.reuse = true;
+        page.entries.o.0.truncate(o.limit as usize);
+        if !o.transient {
+            page.entries.list_id = Some(o.id.unwrap_or_else(|| Uuid::new_v4().to_string()));
         }
 
         rustfs_io_metrics::record_stage_duration(
@@ -6822,15 +6634,11 @@ impl SetDisks {
             "set_disks",
             &log_context,
             list_path_started.elapsed().as_secs_f64() * 1000.0,
-            result
-                .entries
-                .as_ref()
-                .map(|entries| entries.entries().len())
-                .unwrap_or_default(),
-            result.err.is_some(),
+            page.entries.entries().len(),
+            false,
         );
 
-        Ok(result)
+        Ok(page)
     }
 
     async fn list_versions_authoritatively(
@@ -6838,7 +6646,7 @@ impl SetDisks {
         rx: CancellationToken,
         opts: ListPathOptions,
         sender: Sender<MetaCacheEntry>,
-    ) -> Result<()> {
+    ) -> Result<ListPathRawOutcome> {
         let (disks, _, _) = self.get_online_disks_with_healing_and_info(true).await;
         let disk_count = self.set_drive_count;
         let parity = self.default_parity_count;
@@ -6897,7 +6705,14 @@ impl SetDisks {
         result.map_err(Into::into)
     }
 
-    pub async fn list_path(&self, rx: CancellationToken, opts: ListPathOptions, sender: Sender<MetaCacheEntry>) -> Result<()> {
+    /// Streams the merged raw entries of this set into `sender` and reports
+    /// how the producers stopped.
+    pub async fn list_path(
+        &self,
+        rx: CancellationToken,
+        opts: ListPathOptions,
+        sender: Sender<MetaCacheEntry>,
+    ) -> Result<ListPathRawOutcome> {
         if opts.versioned {
             return self.list_versions_authoritatively(rx, opts, sender).await;
         }
@@ -7031,7 +6846,6 @@ impl SetDisks {
                 forward_to: opts.marker,
                 min_disks: raw_min_disks,
                 per_disk_limit: limit,
-                producer_limit_reached: opts.producer_limit_reached.clone(),
                 // A foreground listing is bounded by lack of drive progress (the walk
                 // stall timeout) and by the page limit, never by how long a healthy
                 // walk takes — a large prefix on slow media is not a fault (#4644).
@@ -7250,7 +7064,7 @@ mod test {
         walk_result_from_set_errors, write_namespace_mutation_journal_state, write_persistent_key_only_index_with_metadata,
     };
     use crate::bucket::replication::ReplicationState;
-    use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
+    use crate::cache_value::metacache_set::{FallbackClaimTracker, ListPathRawOutcome, TestReaderBehavior, list_path_raw};
     use crate::disk::{DeleteOptions, DiskAPI, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, error::DiskError, new_disk};
     use crate::error::{Result, StorageError};
     use crate::object_api::ObjectInfo;
@@ -7262,7 +7076,6 @@ mod test {
     };
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -7828,7 +7641,7 @@ mod test {
             .await
             .expect("limited result should be sent promptly")
             .expect("limited result should be present");
-        assert_eq!(result.entries.unwrap().entries().len(), 1);
+        assert_eq!(result.entries().len(), 1);
 
         let state = timeout(Duration::from_secs(1), handle)
             .await
@@ -7873,7 +7686,7 @@ mod test {
             .await
             .expect("limited result should be sent promptly")
             .expect("limited result should be present");
-        let entries = result.entries.unwrap();
+        let entries = result;
         let names = entries
             .entries()
             .into_iter()
@@ -7939,8 +7752,6 @@ mod test {
                 }
                 assert_eq!(
                     result
-                        .entries
-                        .expect("delimiter entries should exist")
                         .entries()
                         .into_iter()
                         .map(|entry| entry.name.clone())
@@ -7948,14 +7759,14 @@ mod test {
                     expected,
                     "delimiter={separator}, extra={extra_object}"
                 );
-                assert_eq!(result.err.is_none(), extra_object, "n=max must reach EOF; max+1 must retain lookahead");
                 assert_eq!(
                     state,
                     if extra_object {
                         GatherResultsState::LimitReached
                     } else {
                         GatherResultsState::InputClosed
-                    }
+                    },
+                    "n=max must reach EOF; max+1 must retain lookahead"
                 );
             }
         }
@@ -7986,12 +7797,7 @@ mod test {
             )
             .await
             .expect("logical marker collection should succeed");
-            let entries = result_rx
-                .recv()
-                .await
-                .expect("logical marker page should arrive")
-                .entries
-                .expect("logical marker entries should exist");
+            let entries = result_rx.recv().await.expect("logical marker page should arrive");
             let projected = ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, "bucket", "", Some("/".to_owned())).await;
             let names: Vec<_> = projected.into_iter().map(|object| object.name).collect();
             assert_eq!(
@@ -8159,13 +7965,13 @@ mod test {
 
         let listed_after_deleted_marker = sorted_entries(&["obj-b", "obj-c"]);
         assert_eq!(
-            version_marker_for_entries(Some(&listed_after_deleted_marker), Some("obj-a"), version_marker),
+            version_marker_for_entries(&listed_after_deleted_marker, Some("obj-a"), version_marker),
             None
         );
 
         let listed_with_marker = sorted_entries(&["obj-a", "obj-b"]);
         assert_eq!(
-            version_marker_for_entries(Some(&listed_with_marker), Some("obj-a"), version_marker),
+            version_marker_for_entries(&listed_with_marker, Some("obj-a"), version_marker),
             version_marker
         );
     }
@@ -8203,7 +8009,7 @@ mod test {
             .await
             .expect("eof result should be sent promptly")
             .expect("eof result should be present");
-        let entries = result.entries.unwrap();
+        let entries = result;
         let names = entries
             .entries()
             .into_iter()
@@ -8211,7 +8017,6 @@ mod test {
             .collect::<Vec<_>>();
 
         assert_eq!(names, ["obj-b"]);
-        assert!(result.err.is_some());
 
         let state = timeout(Duration::from_secs(1), handle)
             .await
@@ -8256,7 +8061,7 @@ mod test {
             .await
             .expect("result should be sent promptly")
             .expect("result should be present");
-        let entries = result.entries.unwrap();
+        let entries = result;
         let names = entries
             .entries()
             .into_iter()
@@ -8308,7 +8113,7 @@ mod test {
             .await
             .expect("eof result should be sent promptly")
             .expect("eof result should be present");
-        let entries = result.entries.expect("result entries should be present");
+        let entries = result;
         let names = entries
             .entries()
             .into_iter()
@@ -8397,58 +8202,55 @@ mod test {
         assert!(!cancel.is_cancelled());
     }
 
+    /// A bounded producer can spend its whole per-disk budget on entries this
+    /// page filters out. The closed input is then not the end of the namespace:
+    /// the page must stay non-exhausted so the caller advertises a continuation.
     #[tokio::test]
-    async fn list_path_gather_results_preserves_bounded_producer_after_filtering() {
-        let (entry_tx, entry_rx) = mpsc::channel(4);
-        let (result_tx, mut result_rx) = mpsc::channel(1);
-        let cancel = CancellationToken::new();
-        let producer_limit_reached = Arc::new(AtomicBool::new(true));
-
-        entry_tx
-            .send(test_meta_entry("outside-prefix"))
+    async fn list_path_bounded_producer_keeps_filtered_empty_page_non_exhausted() {
+        for limit_reached in [true, false] {
+            let (sender, recv) = mpsc::channel(4);
+            let page = collect_list_path_results(
+                CancellationToken::new(),
+                ListPathOptions {
+                    bucket: "bucket".to_owned(),
+                    prefix: "requested/".to_owned(),
+                    limit: 8,
+                    incl_deleted: true,
+                    ..Default::default()
+                },
+                recv,
+                async move {
+                    sender
+                        .send(test_meta_entry("outside-prefix"))
+                        .await
+                        .expect("filtered test entry should be queued");
+                    drop(sender);
+                    Ok(ListPathRawOutcome { limit_reached })
+                },
+            )
             .await
-            .expect("filtered test entry should be queued");
-        drop(entry_tx);
+            .expect("a fully filtered page is still a successful page");
 
-        let handle = tokio::spawn(gather_results(
-            cancel,
-            ListPathOptions {
-                bucket: "bucket".to_owned(),
-                prefix: "requested/".to_owned(),
-                limit: 8,
-                incl_deleted: true,
-                producer_limit_reached: Some(producer_limit_reached),
-                ..Default::default()
-            },
-            entry_rx,
-            result_tx,
-        ));
-
-        let result = result_rx.recv().await.expect("bounded producer result should be delivered");
-        assert!(result.entries.expect("entries should be present").entries().is_empty());
-        assert!(result.err.is_none(), "bounded producer must not be reported as EOF");
-        assert_eq!(
-            handle
-                .await
-                .expect("gather task should not panic")
-                .expect("gather should succeed"),
-            GatherResultsState::InputClosed
-        );
+            assert!(page.entries.entries().is_empty(), "the only entry lies outside the prefix");
+            assert_eq!(
+                page.exhausted, !limit_reached,
+                "limit_reached={limit_reached}: a producer that stopped at its limit must not yield an exhausted page"
+            );
+        }
     }
 
     /// A-1 guard (rustfs/backlog#1306): pin that a *successful* send is never
     /// misclassified as `ConsumerGone`. With the receiver alive, gather_results
-    /// must return the real drain state and deliver the payload carrying the
-    /// state-specific `err` sentinel the wrappers depend on (limit reached =>
-    /// err None so the wrapper knows the disk may hold more; input closed =>
-    /// err Some so the wrapper knows the disk was fully drained). Together with
-    /// the receiver-dropped ConsumerGone tests above, this locks in
-    /// "ConsumerGone is returned only on send failure": a broken send-failure
-    /// check that classified a successful send as ConsumerGone would drop the
-    /// delivered payload (and its err sentinel) and trip this test.
+    /// must deliver the page and return the real drain state that
+    /// `collect_list_path_results` turns into `ListPage::exhausted` (limit
+    /// reached => the disk may hold more; input closed => everything offered
+    /// was drained). Together with the receiver-dropped ConsumerGone tests
+    /// above, this locks in "ConsumerGone is returned only on send failure": a
+    /// broken send-failure check that classified a successful send as
+    /// ConsumerGone would drop the delivered page and trip this test.
     #[tokio::test]
-    async fn list_path_gather_results_send_success_delivers_state_specific_err_sentinel() {
-        // Limit reached with the receiver alive: LimitReached + err None.
+    async fn list_path_gather_results_send_success_returns_real_drain_state() {
+        // Limit reached with the receiver alive: LimitReached.
         {
             let (entry_tx, entry_rx) = mpsc::channel(4);
             let (result_tx, mut result_rx) = mpsc::channel(1);
@@ -8474,8 +8276,7 @@ mod test {
                 .await
                 .expect("limited result should be sent promptly")
                 .expect("limited result should be present");
-            assert_eq!(result.entries.expect("limit payload delivers entries").entries().len(), 1);
-            assert!(result.err.is_none(), "limit-reached payload must carry no err sentinel");
+            assert_eq!(result.entries().len(), 1, "the limit page must be delivered");
 
             let state = timeout(Duration::from_secs(1), handle)
                 .await
@@ -8485,7 +8286,7 @@ mod test {
             assert_eq!(state, GatherResultsState::LimitReached);
         }
 
-        // Input closed with the receiver alive: InputClosed + err Some (eof sentinel).
+        // Input closed with the receiver alive: InputClosed.
         {
             let (entry_tx, entry_rx) = mpsc::channel(4);
             let (result_tx, mut result_rx) = mpsc::channel(1);
@@ -8512,8 +8313,7 @@ mod test {
                 .await
                 .expect("eof result should be sent promptly")
                 .expect("eof result should be present");
-            assert_eq!(result.entries.expect("eof payload delivers entries").entries().len(), 1);
-            assert!(result.err.is_some(), "eof payload must carry the sentinel err the wrapper relies on");
+            assert_eq!(result.entries().len(), 1, "the drained page must be delivered");
 
             let state = timeout(Duration::from_secs(1), handle)
                 .await
@@ -10960,7 +10760,7 @@ mod test {
         assert_eq!(resolver.requested_versions, 0);
     }
 
-    async fn collect_native_listing(set: &SetDisks, bucket: &str, mode: &str) -> (Result<()>, Vec<String>) {
+    async fn collect_native_listing(set: &SetDisks, bucket: &str, mode: &str) -> (Result<ListPathRawOutcome>, Vec<String>) {
         let (sender, mut receiver) = mpsc::channel(1);
         let walk = set.list_path(
             CancellationToken::new(),
@@ -11149,14 +10949,9 @@ mod test {
                 })
                 .await
                 .expect("collector should finish");
-            assert_eq!(
-                result.err,
-                Some(rustfs_filemeta::Error::Unexpected),
-                "complete metacache pages carry the EOF sentinel"
-            );
+            assert!(result.exhausted, "a complete metacache page is reported as exhausted");
             let names: Vec<_> = result
                 .entries
-                .expect("collected page")
                 .o
                 .0
                 .into_iter()
@@ -11503,7 +11298,7 @@ mod test {
 
     #[tokio::test]
     async fn latest_listing_fails_closed_for_unversioned_two_by_two_metadata_split() {
-        async fn collect_listing(set: &Arc<SetDisks>, bucket: &str) -> (crate::error::Result<()>, Vec<String>) {
+        async fn collect_listing(set: &Arc<SetDisks>, bucket: &str) -> (crate::error::Result<ListPathRawOutcome>, Vec<String>) {
             let (sender, mut receiver) = mpsc::channel(4);
             let walk = set.list_path(
                 CancellationToken::new(),
@@ -12267,8 +12062,8 @@ mod test {
     }
 
     #[test]
-    fn walk_result_from_set_errors_returns_non_eof_error() {
-        let err = walk_result_from_set_errors(&[Some(StorageError::Unexpected), Some(StorageError::FileAccessDenied)])
+    fn walk_result_from_set_errors_returns_real_error_after_missing_entries() {
+        let err = walk_result_from_set_errors(&[Some(StorageError::FileNotFound), Some(StorageError::FileAccessDenied)])
             .expect_err("walk should fail when any set reports a real listing error");
 
         assert_eq!(err, StorageError::FileAccessDenied);
@@ -12300,10 +12095,14 @@ mod test {
             .expect("missing objects under an existing listing path should not fail the walk");
     }
 
+    // `Unexpected` is a failure like any other; it no longer doubles as the
+    // "this set reached the end of its listing" sentinel.
     #[test]
-    fn walk_result_from_set_errors_ignores_only_unexpected_and_successes() {
-        walk_result_from_set_errors(&[None, Some(StorageError::Unexpected)])
-            .expect("successful sets and unexpected EOF-style markers should not fail the walk");
+    fn walk_result_from_set_errors_surfaces_unexpected_next_to_successes() {
+        let err = walk_result_from_set_errors(&[None, Some(StorageError::Unexpected)])
+            .expect_err("an unexpected set failure must fail the walk instead of posing as EOF");
+
+        assert_eq!(err, StorageError::Unexpected);
     }
 
     // Regression for #952 (ECA-11): when every set is unreachable the walk must
@@ -12750,9 +12549,9 @@ mod test {
         opts: ListPathOptions,
         recv: mpsc::Receiver<MetaCacheEntry>,
         producer: P,
-    ) -> rustfs_filemeta::MetaCacheEntriesSortedResult
+    ) -> Result<super::ListPage>
     where
-        P: std::future::Future<Output = Result<()>> + Send + 'static,
+        P: std::future::Future<Output = Result<ListPathRawOutcome>> + Send + 'static,
     {
         let context = super::ListPathLogContext::from_options(&opts);
         super::collect_list_path_results("test", &context, cancel, opts, recv, producer).await
@@ -12772,8 +12571,7 @@ mod test {
         .expect("producer panic must not strand the collector");
         assert!(
             result
-                .err
-                .expect("panic must be reported")
+                .expect_err("panic must be reported")
                 .to_string()
                 .contains("listing worker panicked")
         );
@@ -12807,13 +12605,14 @@ mod test {
                     Some(rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller::ListObjects)
                 );
                 drop(sender);
-                Ok(())
+                Ok(ListPathRawOutcome::default())
             })
             .await
         })
         .await;
 
-        assert!(result.err.is_some(), "the empty page channel remains an error");
+        let page = result.expect("an empty drained page is a successful page");
+        assert!(page.exhausted && page.entries.entries().is_empty());
         assert_eq!(rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(), None);
     }
 
@@ -12826,7 +12625,27 @@ mod test {
             Err(StorageError::FileCorrupt)
         })
         .await;
-        assert_eq!(result.err, Some(rustfs_filemeta::Error::FileCorrupt));
+        assert_eq!(
+            result.expect_err("producer failure must surface after the input closes"),
+            StorageError::FileCorrupt
+        );
+    }
+
+    /// `Unexpected` used to double as the EOF sentinel, so a producer failing
+    /// with it read as "listing complete". It must surface as the error it is.
+    #[tokio::test]
+    async fn list_path_workers_surface_unexpected_producer_failure_instead_of_empty_page() {
+        let (sender, recv) = mpsc::channel(1);
+        let result = collect_list_path_results(CancellationToken::new(), ListPathOptions::default(), recv, async move {
+            drop(sender);
+            tokio::task::yield_now().await;
+            Err(StorageError::Unexpected)
+        })
+        .await;
+        assert_eq!(
+            result.expect_err("an unexpected producer failure must not pose as a complete empty page"),
+            StorageError::Unexpected
+        );
     }
 
     #[tokio::test]
@@ -12844,14 +12663,18 @@ mod test {
                 for name in ["a", "b", "c"] {
                     sender.try_send(test_meta_entry(name)).expect("queue page");
                 }
-                Ok(())
+                Ok(ListPathRawOutcome::default())
             },
         )
         .await;
-        assert_eq!(result.err, Some(rustfs_filemeta::Error::Unexpected));
-        let entries = result.entries.expect("EOF retains entries");
+        let page = result.expect("a drained page is a successful page");
+        assert!(page.exhausted, "a closed input with no bounded producer is the end of the listing");
         assert_eq!(
-            entries.entries().iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+            page.entries
+                .entries()
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
             ["a", "b", "c"]
         );
     }
@@ -12874,14 +12697,15 @@ mod test {
                 async move {
                     let _drop_guard = producer_dropped.drop_guard();
                     sender.send(test_meta_entry("a")).await.expect("send page");
-                    std::future::pending::<Result<()>>().await
+                    std::future::pending::<Result<ListPathRawOutcome>>().await
                 },
             ),
         )
         .await
         .expect("page limit must not wait for a producer that ignores cancellation");
-        assert!(result.err.is_none());
-        assert_eq!(result.entries.expect("page").entries().len(), 1);
+        let page = result.expect("page");
+        assert!(!page.exhausted, "a page cut at its limit may have more");
+        assert_eq!(page.entries.entries().len(), 1);
         assert!(dropped.is_cancelled(), "producer must be dropped before the page is returned");
     }
 
@@ -12895,7 +12719,7 @@ mod test {
         let parent = tokio::spawn(collect_list_path_results(cancel.clone(), ListPathOptions::default(), recv, async move {
             let _drop_guard = producer_dropped.drop_guard();
             started_tx.send(()).expect("notify parent");
-            std::future::pending::<Result<()>>().await
+            std::future::pending::<Result<ListPathRawOutcome>>().await
         }));
         started_rx.await.expect("producer started");
         parent.abort();
@@ -12927,7 +12751,10 @@ mod test {
                 },
             )
             .await;
-            assert_eq!(result.err, Some(rustfs_filemeta::Error::FileCorrupt));
+            assert_eq!(
+                result.expect_err("a ready producer error must win over the page limit"),
+                StorageError::FileCorrupt
+            );
         }
     }
 
