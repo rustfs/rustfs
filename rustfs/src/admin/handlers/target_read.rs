@@ -15,10 +15,12 @@
 use crate::admin::{
     handlers::target_descriptor::{EndpointKey, RuntimeHealthStatus, collect_runtime_statuses},
     runtime_sources::{AppContext, current_app_context, current_object_store_handle_for_context},
-    storage_api::config::read_admin_config_without_migrate,
+    storage_api::{
+        config::read_admin_config_without_migrate,
+        s3::{self, S3Error, S3ErrorCode, S3Result},
+    },
 };
 use rustfs_config::server_config::Config;
-use s3s::{S3Error, S3Result, s3_error};
 use std::{collections::HashMap, future::Future};
 
 pub(crate) async fn load_server_config_from_store_for_context(context: Option<&AppContext>) -> S3Result<Config> {
@@ -28,7 +30,7 @@ pub(crate) async fn load_server_config_from_store_for_context(context: Option<&A
 
     read_admin_config_without_migrate(store)
         .await
-        .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))
+        .map_err(|e| s3::error(S3ErrorCode::InternalError, format!("failed to read server config: {e}")))
 }
 
 pub(crate) async fn load_server_config_from_store() -> S3Result<Config> {

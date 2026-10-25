@@ -32,6 +32,7 @@ use crate::admin::{
         PluginInstanceDiagnosticCount, PluginInstanceEntry, PluginInstanceSource, PluginInstancesResponse,
     },
     router::{AdminOperation, Operation, S3Router},
+    storage_api::s3::{self, S3ErrorCode},
 };
 use crate::server::{
     ADMIN_PREFIX, is_audit_module_enabled, is_notify_module_enabled, refresh_audit_module_enabled, refresh_notify_module_enabled,
@@ -606,7 +607,7 @@ async fn refresh_persisted_module_switches() -> S3Result<()> {
             error = %err,
             "failed to reload persisted module switches before checking plugin instance operation gating"
         );
-        return Err(s3_error!(InternalError, "failed to refresh target module state"));
+        return Err(s3::error(S3ErrorCode::InternalError, "failed to refresh target module state"));
     }
     Ok(())
 }
