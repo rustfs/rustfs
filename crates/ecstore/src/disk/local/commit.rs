@@ -402,6 +402,14 @@ pub(super) struct RenameDataState {
     preflight_rejection: Option<LocalRenamePreflightRejection>,
 }
 
+// Keep optional native MPU state machines out of ordinary rename frames.
+// Construct the future here as well as pinning it, so its temporary stays off
+// the caller's poll stack. Call only from the existing native MPU branches.
+#[inline(never)]
+fn pin_multipart_future<F: std::future::Future>(build: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    Box::pin(build())
+}
+
 impl LocalDisk {
     #[tracing::instrument(name = "rename_data", target = "rustfs_ecstore::disk::local", level = "trace", skip_all)]
     pub(super) async fn rename_data_inner(
@@ -491,14 +499,16 @@ impl LocalDisk {
         // this private attempt's links and generated metadata may be consumed.
         let multipart_staging = if src_volume == super::super::RUSTFS_META_MULTIPART_BUCKET {
             Some(
-                self.prepare_multipart_commit_staging(src_path, &fi, dst_volume, state.namespace_owner.clone())
-                    .await?,
+                pin_multipart_future(|| {
+                    self.prepare_multipart_commit_staging(src_path, &fi, dst_volume, state.namespace_owner.clone())
+                })
+                .await?,
             )
         } else {
             None
         };
         let multipart_publication = if let Some(staging) = multipart_staging.as_ref() {
-            Some(self.prepare_native_multipart_publication(src_path, &mut fi, staging).await?)
+            Some(pin_multipart_future(|| self.prepare_native_multipart_publication(src_path, &mut fi, staging)).await?)
         } else {
             None
         };
@@ -797,7 +807,7 @@ impl LocalDisk {
             // PUT was never acknowledged. A metadata commit: relaxed tiers
             // leave it to the page cache.
             if let Some(publication) = multipart_publication.as_ref() {
-                publication.prepare_metadata(&new_dst_buf, has_dst_buf.as_deref()).await?;
+                pin_multipart_future(|| publication.prepare_metadata(&new_dst_buf, has_dst_buf.as_deref())).await?;
             }
             let tmp_meta_sync = if durability.syncs_commit_metadata() || multipart_publication.is_some() {
                 SyncMode::FileOnly
@@ -859,7 +869,7 @@ impl LocalDisk {
             let prepared_metadata_source = tmp_meta_res?;
             shard_sync_res?;
             let prepared_metadata_source = match multipart_publication.as_ref() {
-                Some(publication) => publication.install_head(prepared_metadata_source).await?,
+                Some(publication) => pin_multipart_future(|| publication.install_head(prepared_metadata_source)).await?,
                 None => prepared_metadata_source,
             };
             commit.directory_guard = remove_dst_base_before_commit(
@@ -1075,7 +1085,7 @@ impl LocalDisk {
             }
             if should_fail_after_metadata_commit(dst_path) {
                 if let Some(publication) = multipart_publication.as_ref() {
-                    publication.restore_target_after_error(commit.mutation_lease.clone()).await?;
+                    pin_multipart_future(|| publication.restore_target_after_error(commit.mutation_lease.clone())).await?;
                 } else {
                     commit.rollback_non_inline_std(rollback_data_dir).map_err(to_file_error)?;
                 }
@@ -1106,7 +1116,7 @@ impl LocalDisk {
                         fsync_started,
                     );
                     if let Some(publication) = multipart_publication.as_ref() {
-                        publication.restore_target_after_error(commit.mutation_lease.clone()).await?;
+                        pin_multipart_future(|| publication.restore_target_after_error(commit.mutation_lease.clone())).await?;
                     } else {
                         commit.rollback_non_inline_std(rollback_data_dir).map_err(to_file_error)?;
                     }
@@ -1147,7 +1157,8 @@ impl LocalDisk {
                             fsync_started,
                         );
                         if let Some(publication) = multipart_publication.as_ref() {
-                            publication.restore_target_after_error(commit.mutation_lease.clone()).await?;
+                            pin_multipart_future(|| publication.restore_target_after_error(commit.mutation_lease.clone()))
+                                .await?;
                         } else {
                             commit.rollback_non_inline_std(rollback_data_dir).map_err(to_file_error)?;
                         }
@@ -1199,10 +1210,10 @@ impl LocalDisk {
             }
 
             let multipart_source = match multipart_publication.as_ref() {
-                Some(publication) => match publication.finish(commit.mutation_lease.clone()).await {
+                Some(publication) => match pin_multipart_future(|| publication.finish(commit.mutation_lease.clone())).await {
                     Ok(result) => Some(Box::new(result)),
                     Err(error) => {
-                        publication.restore_target_after_error(commit.mutation_lease.clone()).await?;
+                        pin_multipart_future(|| publication.restore_target_after_error(commit.mutation_lease.clone())).await?;
                         return Err(error);
                     }
                 },
