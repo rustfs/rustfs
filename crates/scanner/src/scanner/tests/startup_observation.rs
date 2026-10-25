@@ -107,3 +107,60 @@ async fn startup_observation_records_real_runner_entry_before_any_cycle() {
     assert!(!report.current_cycle_active);
     assert_eq!(report.usage_freshness.last_durable_success_unix_secs, before);
 }
+
+#[tokio::test]
+#[serial]
+async fn startup_observation_covers_enabled_recovery_before_admission() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    assert!(!crate::scanner_runtime_initialized());
+    let before_success = global_metrics().report().await.usage_freshness.last_durable_success_unix_secs;
+    let set = store.all_set_disks()[0].clone();
+    let held_inventory = set.disks.write().await;
+    let mut startup = Box::pin(init_scanner_with_recovery(CancellationToken::new(), store, true));
+    assert!(matches!(futures::poll!(&mut startup), Poll::Pending));
+    let initializing = global_metrics().report().await.startup;
+    assert!(initializing.runtime_active, "enabled recovery must already have an observation owner");
+    assert_eq!(initializing.phase, ScannerStartupPhase::Initializing);
+    assert!(initializing.first_attempt_at_unix_secs.is_none());
+    assert!(initializing.planned_attempt_at_unix_secs.is_none());
+    assert!(!crate::scanner_runtime_initialized(), "recovery cannot enable admission early");
+    drop(startup);
+    let stopped = global_metrics().report().await.startup;
+    assert_eq!(stopped.phase, ScannerStartupPhase::Stopped);
+    assert!(!stopped.runtime_active);
+    assert!(stopped.first_attempt_at_unix_secs.is_none());
+    assert!(!crate::scanner_runtime_initialized());
+    assert_eq!(
+        global_metrics().report().await.usage_freshness.last_durable_success_unix_secs,
+        before_success
+    );
+    drop(held_inventory);
+}
+
+#[tokio::test]
+#[serial]
+async fn startup_observation_excludes_disabled_recovery() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let previous = ScannerRuntimeGuard::new();
+    global_metrics().startup().record_attempt(previous.startup_token());
+    drop(previous);
+    let before = global_metrics().report().await.startup;
+    let cleanup = init_scanner_with_recovery(CancellationToken::new(), store, false)
+        .await
+        .expect("disabled startup returns finite cleanup");
+    tokio::time::timeout(Duration::from_secs(15), cleanup)
+        .await
+        .expect("disabled cleanup must finish")
+        .expect("disabled cleanup must not panic");
+    let after = global_metrics().report().await.startup;
+    assert!(after.phase_age_seconds >= before.phase_age_seconds);
+    assert_eq!(
+        rustfs_scanner_metrics::startup::ScannerStartupStatus {
+            phase_age_seconds: before.phase_age_seconds,
+            ..after
+        },
+        before,
+        "disabled recovery must preserve the previous normal runtime observation"
+    );
+    assert!(!crate::scanner_runtime_initialized());
+}

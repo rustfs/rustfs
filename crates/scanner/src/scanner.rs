@@ -1060,7 +1060,7 @@ fn prepare_cycle_for_usage_floor_bootstrap(
 }
 
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
-    init_data_scanner_with_storage(ctx, storeapi).await;
+    init_data_scanner_with_storage(ctx, storeapi, ScannerRuntimeGuard::new()).await;
 }
 
 async fn run_scanner_usage_recovery_intents_for_startup(
@@ -1089,6 +1089,7 @@ pub async fn init_scanner_with_recovery(
     enabled: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if enabled {
+        let runtime_guard = ScannerRuntimeGuard::new();
         if let Err(error) = run_scanner_usage_recovery_intents_for_startup(ctx.clone(), storeapi.clone()).await {
             warn!(
                 target: "rustfs::scanner",
@@ -1100,7 +1101,7 @@ pub async fn init_scanner_with_recovery(
                 "Scanner recovery intent startup discovery failed"
             );
         }
-        init_data_scanner(ctx, storeapi).await;
+        init_data_scanner_with_storage(ctx, storeapi, runtime_guard).await;
         return None;
     }
     Some(tokio::spawn(async move {
@@ -1129,11 +1130,10 @@ pub async fn init_scanner_with_recovery(
     }))
 }
 
-async fn init_data_scanner_with_storage<S>(ctx: CancellationToken, storeapi: Arc<S>)
+async fn init_data_scanner_with_storage<S>(ctx: CancellationToken, storeapi: Arc<S>, mut runtime_guard: ScannerRuntimeGuard)
 where
     S: ScannerStorage,
 {
-    let mut runtime_guard = ScannerRuntimeGuard::new();
     let startup = runtime_guard.startup_token();
     let (startup_features, startup_maintenance_generation) = configure_scanner_defaults(&ctx, &storeapi).await;
     // Force init global sleeper so config is read once at startup.
@@ -2879,7 +2879,7 @@ where
     S: ScannerStorage,
 {
     reset_scanner_cycle_schedule();
-    // Entry is an attempt, not evidence of leadership, coverage, or publication.
+    // Normal scanner entry is an attempt, not evidence of leadership, coverage, or publication.
     global_metrics().startup().record_attempt(startup);
     // Acquire leader lock (write lock) to ensure only one scanner runs
     let mut guard = match storeapi.new_ns_lock(RUSTFS_META_BUCKET, "leader.lock").await {

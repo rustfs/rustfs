@@ -854,7 +854,7 @@ pub static SCANNER_STARTUP_WAIT_OVERDUE_SECONDS_MD: LazyLock<MetricDescriptor> =
 pub static SCANNER_STARTUP_FIRST_ATTEMPT_UNIX_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::Custom("startup_first_attempt_unix_seconds".to_string()),
-        "Unix timestamp of first entry to scanner leadership or recovery, not scan success; zero if unobserved",
+        "Unix timestamp of first normal scanner leadership/recovery attempt after startup recovery, not scan success; zero if unobserved",
         &[],
         subsystems::SCANNER,
     )

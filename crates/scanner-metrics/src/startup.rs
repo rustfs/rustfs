@@ -59,7 +59,8 @@ pub struct ScannerStartupStatus {
     pub planned_attempt_at_unix_secs: Option<u64>,
     pub wait_remaining_seconds: u64,
     pub wait_overdue_seconds: u64,
-    /// Entry to the leadership/recovery path, not an acquired lease or scan success.
+    /// Entry to the normal scanner leadership/recovery loop after startup recovery.
+    /// This is not an acquired lease or scan success.
     pub first_attempt_at_unix_secs: Option<u64>,
 }
 

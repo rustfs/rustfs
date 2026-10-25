@@ -88,15 +88,15 @@ The native status response exposes one node-local `metrics.startup` snapshot. Pr
 | `metrics.startup.phase` | Prometheus `rustfs_scanner_startup_phase` | Meaning |
 |---|---:|---|
 | `unknown` | 0 | No runtime has been observed, or the report came from an older binary. |
-| `initializing` | 1 | Maintenance/default configuration initialization is in progress. |
+| `initializing` | 1 | Startup recovery-intent discovery/replay or maintenance/default configuration initialization is in progress. |
 | `usage_inspection` | 2 | The bounded read-only startup usage probe is in progress. No eventual attempt deadline has been chosen yet. |
 | `waiting` | 3 | The runtime is waiting for its actual sampled startup deadline. |
-| `attempted` | 4 | The runtime has entered the leadership/recovery path at least once. This does not prove leadership, an active bucket scan, or publication. |
+| `attempted` | 4 | The runtime has entered the normal scanner leadership/recovery loop at least once. This does not prove leadership, an active bucket scan, or publication. |
 | `stopped` | 5 | The owner ended or was cancelled. Earlier start/attempt timestamps remain available; the planned wait is cleared. |
 
 `runtime_active` means the observation owner still exists, not that it is healthy or ready. `started_at_unix_secs` records that owner's creation. `phase_started_at_unix_secs` and `phase_age_seconds` describe its last transition or changed waiting deadline. `planned_attempt_at_unix_secs` is available only during an actual startup wait; it is a seconds-resolution estimate anchored to runtime start. The scheduler still uses its original monotonic deadline. `wait_remaining_seconds` and `wait_overdue_seconds` are derived from that deadline when read, so they do not require a polling task and remain useful if the wall clock changes. A deadline is eligibility to attempt the scanner's fenced path, not a promised scan-completion time.
 
-`first_attempt_at_unix_secs` is recorded immediately before the first leadership acquisition attempt. Lock contention or recovery failure is still an attempt. Repeated attempts retain the first timestamp; restarting creates a fresh observation. Late updates from an older runtime cannot overwrite the new owner's state.
+`first_attempt_at_unix_secs` is recorded immediately before the first normal scanner leadership acquisition attempt, after startup recovery-intent discovery/replay. Startup intent replay remains `initializing`, including any leadership locks it needs. Lock contention or recovery failure is still an attempt. Repeated attempts retain the first timestamp; restarting creates a fresh observation. Late updates from an older runtime cannot overwrite the new owner's state.
 
 Prometheus exports `rustfs_scanner_runtime_active`, `rustfs_scanner_startup_started_unix_seconds`, `rustfs_scanner_startup_phase_age_seconds`, `rustfs_scanner_startup_planned_attempt_unix_seconds`, `rustfs_scanner_startup_wait_remaining_seconds`, `rustfs_scanner_startup_wait_overdue_seconds`, and `rustfs_scanner_startup_first_attempt_unix_seconds` alongside the phase code. Optional times are zero when unavailable in Prometheus and null in native JSON. No bucket, path, or runtime-generation label is added.
 

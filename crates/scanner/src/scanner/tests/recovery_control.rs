@@ -212,7 +212,7 @@ async fn issue_8297_supervisor_recovers_paused_follower_without_restart() {
             assert!(!crate::scanner_runtime_initialized(), "test must own the scanner runtime");
             let ctx = CancellationToken::new();
             let _cancel_on_drop = ctx.clone().drop_guard();
-            init_data_scanner_with_storage(ctx.clone(), store.clone()).await;
+            init_data_scanner_with_storage(ctx.clone(), store.clone(), ScannerRuntimeGuard::new()).await;
             assert!(crate::scanner_runtime_initialized());
             let recovered = tokio::time::timeout(Duration::from_secs(30), async {
                 while scanner_cycle_recovery_status().state != "healthy" {
