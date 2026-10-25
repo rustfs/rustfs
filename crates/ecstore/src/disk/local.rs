@@ -10786,6 +10786,7 @@ impl LocalDisk {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn delete_file(
         &self,
         base_path: &PathBuf,
@@ -10797,6 +10798,7 @@ impl LocalDisk {
             .await
     }
 
+    #[cfg(test)]
     #[tracing::instrument(name = "delete_file", level = "trace", skip_all)]
     fn delete_file_with_namespace_owner<'a>(
         &'a self,
