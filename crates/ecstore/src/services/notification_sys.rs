@@ -4440,12 +4440,9 @@ mod tests {
                     "metadata volume: {volume:?}"
                 );
                 let relative = "mrf-authority";
-                let path = root
-                    .path()
-                    .canonicalize()
-                    .expect("canonical disk root for the native publication hook")
-                    .join(RUSTFS_META_BUCKET)
-                    .join(relative);
+                let path = disk
+                    .get_object_path_for_io(RUSTFS_META_BUCKET, relative)
+                    .expect("native CAS publication path");
                 std::fs::write(&path, b"old").expect("old committed file");
                 let peers = BTreeMap::from([("local".to_owned(), Uuid::new_v4())]);
                 assert!(publish_fleet_capability_probe_result(slot, topology, Ok(peers), Instant::now()).is_none());
