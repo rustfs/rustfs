@@ -12,27 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::{
-    auth::authorize_admin_request,
+    auth::authorize_admin_envelope,
     plugin_contract::{
         PluginCatalogAdminDiscovery, PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain,
         PluginContractEntrypointKind, PluginContractPackaging, PluginDistributionContract, PluginRuntimeContract,
     },
-    router::{AdminOperation, Operation, S3Router},
+    router::{AdminOperation, S3Router},
     runtime_sources::default_admin_usecase,
 };
 use crate::server::ADMIN_PREFIX;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Result, s3_error};
 use rustfs_targets::catalog::{
     builtin::builtin_audit_target_admin_descriptors, builtin::builtin_notify_target_admin_descriptors,
 };
 use rustfs_targets::{BuiltinTargetAdminDescriptor, builtin_target_marketplace_manifest, builtin_target_plugin_installation};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -116,36 +116,32 @@ fn merge_catalog_descriptor(plugins: &mut HashMap<&'static str, PluginCatalogEnt
 
 /// The pre-check keeps this endpoint's historical missing-credentials message;
 /// the shared gate reports "get cred failed".
-async fn authorize_plugin_catalog_request(req: &S3Request<Body>) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize_plugin_catalog_request(req: &AdminRequest) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     }
 
-    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await?;
     Ok(())
 }
 
-fn build_json_response(
-    status: StatusCode,
-    body: &impl Serialize,
-    request_id: Option<&HeaderValue>,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn build_json_response(status: StatusCode, body: &impl Serialize, request_id: Option<&HeaderValue>) -> S3Result<AdminResponse> {
     let data = serde_json::to_vec(body).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
     let mut header = HeaderMap::new();
     header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     if let Some(value) = request_id {
         header.insert("x-request-id", value.clone());
     }
-    Ok(S3Response::with_headers((status, Body::from(data)), header))
+    Ok(AdminResponse::with_headers(status, Body::from(data), header))
 }
 
 pub struct GetPluginCatalogHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetPluginCatalogHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_plugin_catalog_request(&req).await?;
-        build_json_response(StatusCode::OK, &build_catalog_response(), req.headers.get("x-request-id"))
+        build_json_response(StatusCode::OK, &build_catalog_response(), req.headers().get("x-request-id"))
     }
 }
 
@@ -155,6 +151,7 @@ mod tests {
     use crate::admin::plugin_contract::{
         PluginContractDomain, PluginContractEntrypointKind, PluginContractPackaging, PluginRuntimeTransport,
     };
+    use rustfs_s3_types::Body;
 
     #[test]
     fn plugin_catalog_handlers_require_admin_authorization_contract() {
@@ -172,17 +169,11 @@ mod tests {
     /// message it has always returned (rustfs/backlog#1829).
     #[tokio::test]
     async fn plugin_catalog_gate_keeps_its_missing_credentials_message() {
-        let req = s3s::S3Request {
-            input: s3s::Body::from(String::new()),
-            method: http::Method::GET,
-            uri: http::Uri::from_static("/rustfs/admin/v4/plugins/catalog"),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let req = crate::admin::operation::test_support::TestRequest::new(http::Method::GET, "/rustfs/admin/v4/plugins/catalog")
+            .headers(http::HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::from(String::new()))
+            .build();
 
         let err = super::authorize_plugin_catalog_request(&req)
             .await

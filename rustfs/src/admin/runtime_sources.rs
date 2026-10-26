@@ -87,13 +87,6 @@ pub(crate) fn app_context_from_envelope(envelope: &RequestEnvelope) -> Option<Ar
 
 /// Envelope form of [`object_store_from_req`]: the injected server slot wins,
 /// the ambient process store is the single-instance fallback.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-    )
-)]
 pub(crate) fn object_store_from_envelope(envelope: &RequestEnvelope) -> Option<Arc<ECStore>> {
     match envelope.server_context() {
         Some(slot) => slot.installed_object_store(),

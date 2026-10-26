@@ -55,24 +55,10 @@ impl AdminRequest {
         self.envelope.uri()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-        )
-    )]
     pub(crate) fn headers(&self) -> &HeaderMap {
         self.envelope.headers()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-        )
-    )]
     pub(crate) fn credentials(&self) -> Option<&RequestCredentials> {
         self.envelope.credentials()
     }
@@ -100,13 +86,6 @@ impl AdminRequest {
     }
 
     /// The peer address the connection layer recorded, if any.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-        )
-    )]
     pub(crate) fn remote_addr(&self) -> Option<SocketAddr> {
         self.envelope.remote_addr()
     }
@@ -169,13 +148,6 @@ impl AdminRequest {
 
     /// Moves the body out while the rest of the request stays readable; a
     /// second call yields an empty body.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-        )
-    )]
     pub(crate) fn take_body(&mut self) -> Body {
         std::mem::take(&mut self.body)
     }

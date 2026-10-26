@@ -42,16 +42,15 @@
 use super::account_audit::{
     AccountAuditContext, AccountAuditFailure, AccountAuditOperation, AccountAuditRecord, MfaMethod, emit as emit_audit,
 };
-use super::admin_json_response;
 use crate::admin::auth::validate_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{current_token_signing_key, object_store_from_req};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
+use crate::admin::runtime_sources::{current_token_signing_key, object_store_from_envelope};
 use crate::admin::service::caller_identity::CallerIdentity;
 use crate::admin::storage_api::runtime::ECStore;
-use crate::admin::storage_api::s3::{self, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use crate::admin::storage_api::s3::{self, S3Error, S3ErrorCode, S3Result};
 use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::constant_time_eq;
-use crate::server::RemoteAddr;
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
@@ -59,6 +58,7 @@ use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_iam::mfa::{MfaServiceError, MfaVerification, service as mfa_service};
 use rustfs_madmin::account::{MfaChallengeResponse, MfaCodeRequest, MfaDisableRequest, UserMfaStatus};
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::Body;
 use rustfs_utils::MaskedAccessKey;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -141,14 +141,15 @@ fn audit_failure_for(error: &MfaServiceError) -> AccountAuditFailure {
     }
 }
 
-fn store_from_req(req: &S3Request<Body>) -> S3Result<Arc<ECStore>> {
-    object_store_from_req(req).ok_or_else(|| s3::error(S3ErrorCode::ServiceUnavailable, "the object store is not ready"))
+fn store_from_req(req: &AdminRequest) -> S3Result<Arc<ECStore>> {
+    object_store_from_envelope(req.envelope())
+        .ok_or_else(|| s3::error(S3ErrorCode::ServiceUnavailable, "the object store is not ready"))
 }
 
 /// Resolve the caller and confirm this credential kind may manage a second
 /// factor for its identity.
-async fn resolve_self_service_caller(req: &S3Request<Body>) -> S3Result<CallerIdentity> {
-    let caller = CallerIdentity::resolve(req).await?;
+async fn resolve_self_service_caller(req: &AdminRequest) -> S3Result<CallerIdentity> {
+    let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
     // The MFA capability, not the password one: a root identity may enroll a
     // second factor even though its secret key is fixed for the life of the
     // process.
@@ -161,18 +162,18 @@ pub struct AccountMfaStatusHandler {}
 
 #[async_trait::async_trait]
 impl Operation for AccountMfaStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         // Reading state is allowed for every credential kind: a service account
         // may need to know whether its parent is protected, even though it may
         // not change that.
-        let caller = CallerIdentity::resolve(&req).await?;
+        let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
         let store = store_from_req(&req)?;
 
         let status = mfa_service::status(store, &caller.access_key, OffsetDateTime::now_utc())
             .await
             .map_err(map_service_error)?;
 
-        admin_json_response(req.uri.path(), &caller.credentials.secret_key, StatusCode::OK, &status)
+        owned_admin_json_response(req.uri().path(), &caller.credentials.secret_key, StatusCode::OK, &status)
     }
 }
 
@@ -181,9 +182,9 @@ pub struct AccountMfaEnrollHandler {}
 
 #[async_trait::async_trait]
 impl Operation for AccountMfaEnrollHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let caller = resolve_self_service_caller(&req).await?;
-        let audit = AccountAuditContext::from_request(&req);
+        let audit = AccountAuditContext::from_envelope(req.envelope());
         let store = store_from_req(&req)?;
 
         let response = match mfa_service::enroll(store, &caller.access_key, OffsetDateTime::now_utc()).await {
@@ -218,7 +219,7 @@ impl Operation for AccountMfaEnrollHandler {
             "admin mfa state"
         );
 
-        admin_json_response(req.uri.path(), &caller.credentials.secret_key, StatusCode::OK, &response)
+        owned_admin_json_response(req.uri().path(), &caller.credentials.secret_key, StatusCode::OK, &response)
     }
 }
 
@@ -227,14 +228,15 @@ pub struct AccountMfaActivateHandler {}
 
 #[async_trait::async_trait]
 impl Operation for AccountMfaActivateHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let caller = resolve_self_service_caller(&req).await?;
-        let audit = AccountAuditContext::from_request(&req);
+        let audit = AccountAuditContext::from_envelope(req.envelope());
         let store = store_from_req(&req)?;
-        let path = req.uri.path().to_string();
+        let path = req.uri().path().to_string();
 
         let body =
-            read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key).await?;
+            read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key)
+                .await?;
         let request: MfaCodeRequest = serde_json::from_slice(&body)
             .map_err(|e| s3::error(S3ErrorCode::InvalidRequest, format!("invalid activation request: {e}")))?;
 
@@ -271,7 +273,7 @@ impl Operation for AccountMfaActivateHandler {
                 .with_recovery_codes_remaining(response.recovery_codes.len() as u32),
         );
 
-        admin_json_response(&path, &caller.credentials.secret_key, StatusCode::OK, &response)
+        owned_admin_json_response(&path, &caller.credentials.secret_key, StatusCode::OK, &response)
     }
 }
 
@@ -280,14 +282,15 @@ pub struct AccountMfaDisableHandler {}
 
 #[async_trait::async_trait]
 impl Operation for AccountMfaDisableHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let caller = resolve_self_service_caller(&req).await?;
-        let audit = AccountAuditContext::from_request(&req);
+        let audit = AccountAuditContext::from_envelope(req.envelope());
         let store = store_from_req(&req)?;
-        let path = req.uri.path().to_string();
+        let path = req.uri().path().to_string();
 
         let body =
-            read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key).await?;
+            read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key)
+                .await?;
         let request: MfaDisableRequest = serde_json::from_slice(&body)
             .map_err(|e| s3::error(S3ErrorCode::InvalidRequest, format!("invalid disable request: {e}")))?;
 
@@ -352,14 +355,15 @@ pub struct AccountMfaRecoveryCodesHandler {}
 
 #[async_trait::async_trait]
 impl Operation for AccountMfaRecoveryCodesHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let caller = resolve_self_service_caller(&req).await?;
-        let audit = AccountAuditContext::from_request(&req);
+        let audit = AccountAuditContext::from_envelope(req.envelope());
         let store = store_from_req(&req)?;
-        let path = req.uri.path().to_string();
+        let path = req.uri().path().to_string();
 
         let body =
-            read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key).await?;
+            read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key)
+                .await?;
         let request: MfaCodeRequest = serde_json::from_slice(&body)
             .map_err(|e| s3::error(S3ErrorCode::InvalidRequest, format!("invalid recovery-code request: {e}")))?;
 
@@ -394,7 +398,7 @@ impl Operation for AccountMfaRecoveryCodesHandler {
             .with_recovery_codes_remaining(response.recovery_codes.len() as u32),
         );
 
-        admin_json_response(&path, &caller.credentials.secret_key, StatusCode::OK, &response)
+        owned_admin_json_response(&path, &caller.credentials.secret_key, StatusCode::OK, &response)
     }
 }
 
@@ -409,9 +413,9 @@ pub struct MfaChallengeHandler {}
 
 #[async_trait::async_trait]
 impl Operation for MfaChallengeHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let caller = CallerIdentity::resolve(&req).await?;
-        let audit = AccountAuditContext::from_request(&req);
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
+        let audit = AccountAuditContext::from_envelope(req.envelope());
         let store = store_from_req(&req)?;
         let now = OffsetDateTime::now_utc();
 
@@ -444,7 +448,7 @@ impl Operation for MfaChallengeHandler {
             }
         };
 
-        admin_json_response(req.uri.path(), &caller.credentials.secret_key, StatusCode::OK, &response)
+        owned_admin_json_response(req.uri().path(), &caller.credentials.secret_key, StatusCode::OK, &response)
     }
 }
 
@@ -454,8 +458,8 @@ struct UserMfaQuery {
     access_key: Option<String>,
 }
 
-fn parse_user_mfa_query(req: &S3Request<Body>) -> S3Result<String> {
-    let query: UserMfaQuery = match req.uri.query() {
+fn parse_user_mfa_query(req: &AdminRequest) -> S3Result<String> {
+    let query: UserMfaQuery = match req.uri().query() {
         Some(query) => {
             serde_urlencoded::from_str(query).map_err(|_| s3::error(S3ErrorCode::InvalidArgument, "failed to decode query"))?
         }
@@ -474,17 +478,17 @@ pub struct UserMfaStatusHandler {}
 
 #[async_trait::async_trait]
 impl Operation for UserMfaStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let target = parse_user_mfa_query(&req)?;
-        let caller = CallerIdentity::resolve(&req).await?;
+        let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
 
         validate_admin_request(
-            &req.headers,
+            req.headers(),
             &caller.credentials,
             caller.is_owner,
             false,
             vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            req.remote_addr(),
         )
         .await?;
 
@@ -493,7 +497,7 @@ impl Operation for UserMfaStatusHandler {
             .await
             .map_err(map_service_error)?;
 
-        admin_json_response(req.uri.path(), &caller.credentials.secret_key, StatusCode::OK, &status)
+        owned_admin_json_response(req.uri().path(), &caller.credentials.secret_key, StatusCode::OK, &status)
     }
 }
 
@@ -510,18 +514,18 @@ pub struct UserMfaResetHandler {}
 
 #[async_trait::async_trait]
 impl Operation for UserMfaResetHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let target = parse_user_mfa_query(&req)?;
-        let caller = CallerIdentity::resolve(&req).await?;
-        let audit = AccountAuditContext::from_request(&req);
+        let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
+        let audit = AccountAuditContext::from_envelope(req.envelope());
 
         validate_admin_request(
-            &req.headers,
+            req.headers(),
             &caller.credentials,
             caller.is_owner,
             false,
             vec![Action::AdminAction(AdminAction::EnableUserAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            req.remote_addr(),
         )
         .await
         .inspect_err(|_| {
@@ -630,10 +634,23 @@ pub(crate) async fn verify_for_session(
     }
 }
 
-fn empty_ok() -> S3Response<(StatusCode, Body)> {
+fn empty_ok() -> AdminResponse {
     let mut header = hyper::HeaderMap::new();
-    header.insert(s3::header::CONTENT_LENGTH, "0".parse().expect("valid header value"));
-    S3Response::with_headers((StatusCode::OK, Body::empty()), header)
+    header.insert(http::header::CONTENT_LENGTH, "0".parse().expect("valid header value"));
+    AdminResponse::with_headers(StatusCode::OK, Body::empty(), header)
+}
+
+/// Owned form of [`super::admin_json_response`], which still answers on the
+/// legacy response type: the same encoded payload and headers, converted here.
+fn owned_admin_json_response<T: serde::Serialize>(
+    path: &str,
+    secret_key: &str,
+    status: StatusCode,
+    payload: &T,
+) -> S3Result<AdminResponse> {
+    let response = super::admin_json_response(path, secret_key, status, payload)?;
+    let (status, body) = response.output;
+    Ok(AdminResponse::with_headers(status, body.into(), response.headers))
 }
 
 #[cfg(test)]
@@ -723,17 +740,7 @@ mod tests {
 
     #[test]
     fn the_target_access_key_is_required_for_the_administrative_routes() {
-        let request = |uri: &str| S3Request {
-            input: Body::empty(),
-            method: Method::GET,
-            uri: uri.parse().expect("uri should parse"),
-            headers: hyper::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let request = |uri: &str| crate::admin::operation::test_support::TestRequest::new(Method::GET, uri).build();
 
         // No query at all, and an explicitly empty value, must both be refused
         // rather than resolving to some default identity.
