@@ -784,6 +784,8 @@ impl ScannerIOCache for SetDisks {
             let scope_clone = scope.clone();
             let cache_cycle_floor_clone = cache_cycle_floor.clone();
             let expected_publication_epoch_clone = expected_publication_epoch;
+            #[cfg(feature = "e2e-test-hooks")]
+            let worker_incarnations = current_bucket_incarnations.clone();
             let remote_server_epoch = match worker_mode {
                 NamespaceScannerWorkerMode::RemoteV4(server_epoch) => Some(server_epoch),
                 NamespaceScannerWorkerMode::Coordinator => None,
@@ -884,7 +886,7 @@ impl ScannerIOCache for SetDisks {
                             break;
                         };
                         remote_session_sequence = next_sequence;
-                        let remote_outcome = crate::remote_scanner::scan_remote_bucket(
+                        let remote_scan = crate::remote_scanner::scan_remote_bucket(
                             &disk,
                             ctx_clone.clone(),
                             budget_clone.clone(),
@@ -900,8 +902,13 @@ impl ScannerIOCache for SetDisks {
                                 skip_healing: healing,
                                 scan_mode,
                             },
-                        )
-                        .await;
+                        );
+                        #[cfg(feature = "e2e-test-hooks")]
+                        let remote_scan = crate::e2e_barrier::worker_observation::with_incarnation(
+                            worker_incarnations.as_ref().and_then(|values| values.get(&bucket.name)).copied(),
+                            remote_scan,
+                        );
+                        let remote_outcome = remote_scan.await;
                         match remote_outcome {
                             Ok(crate::remote_scanner::RemoteScannerOutcome::Complete {
                                 usage,
@@ -1298,11 +1305,22 @@ impl ScannerIOCache for SetDisks {
 
                     let scan_ctx = ctx_clone.child_token();
                     #[cfg(feature = "e2e-test-hooks")]
-                    let _ = crate::e2e_barrier::checkpoint("bucket_walk", serde_json::json!({
-                        "epoch": leader_epoch, "cycle": want_cycle,
-                        "pool": source.pool_index, "set": source.set_index,
-                        "bucket": bucket.name, "drive": disk.path().display().to_string(),
-                    })).await;
+                    {
+                        let disk_uuid = if crate::e2e_barrier::worker_observation::enabled() {
+                            crate::storage_api::owner::EcstoreDiskAPI::get_disk_id(disk.as_ref()).await.ok().flatten()
+                        } else { None };
+                        let location = disk.get_disk_location();
+                        let _ = crate::e2e_barrier::checkpoint("bucket_walk", serde_json::json!({
+                            "epoch": leader_epoch, "cycle": want_cycle,
+                            "pool": source.pool_index, "set": source.set_index,
+                            "bucket": bucket.name, "drive": disk.path().display().to_string(),
+                            "worker_kind": "local", "worker_path": disk.path().display().to_string(),
+                            "worker_endpoint": crate::storage_api::owner::EcstoreDiskAPI::endpoint(disk.as_ref()).grid_host(),
+                            "disk_uuid": disk_uuid,
+                            "disk_index": location.disk_idx,
+                            "bucket_incarnation": worker_incarnations.as_ref().and_then(|values| values.get(&bucket.name)),
+                        })).await;
+                    }
                     let scan = disk.clone().nsscanner_disk(
                         scan_ctx.clone(),
                         budget_clone.clone(),

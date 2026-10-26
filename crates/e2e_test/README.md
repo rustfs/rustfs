@@ -79,6 +79,10 @@ python3 scripts/e2e_binary.py run --features e2e-test-hooks -- \
   --test-threads 1 --retries 0 --no-tests=fail
 ```
 
+The separate `scanner_peer_bucket_new_coordinator_certifies_old_worker_peers_and_scopes_next_cycle` case uses the same feature and qualified old binary inputs. Select its exact name in the command above. It keeps the original N process enabled and starts the three official O replacements with `RUSTFS_SCANNER_ENABLED=false`: their autonomous scanner loops are disabled, while real S3 dirty tracking, authenticated snapshots, publication leases, scoped ACKs, and N-dispatched RemoteScanner workers remain active. It records each node's actual scanner status and retains the same identity, durability, root, ACK, data-conservation, and physical-walk requirements. This fixed-role case does not validate autonomous O scanning or all-enabled election behavior. The original all-enabled N/O test remains separate and has not passed acceptance; a fixed-role result cannot satisfy that gate.
+
+For this fixed-role case, the `e2e-test-hooks` server also records the N client's complete bounded worker inventory. Requests are observed before opening the normal stream and paired only after authenticated source/plan validation and terminal EOF. Closed manifests and final health receipts must bind both cycles to their actual candidate/root; the next cycle needs exactly four sets of hot-only execution and at least one positive-progress worker mapped to a measured official O process. A zero-progress Current response, missing/extra request, unhealthy recorder, or missing physical coverage fails the gate. The recorder does not add O hooks or change any protocol or timeout. Final health reads check immutable closed-cycle evidence, not current N liveness.
+
 ### `#[ignore]` semantics
 
 Ignored tests are excluded from the default `cargo nextest run` pass because

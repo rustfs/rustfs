@@ -78,7 +78,12 @@ impl PeerBucketRun {
     }
 
     #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
-    pub async fn replace_followers_with_old_binary(&mut self, old_binary: &Path, expected_old_sha256: &str) -> TestResult<Value> {
+    pub async fn replace_followers_with_old_binary(
+        &mut self,
+        old_binary: &Path,
+        expected_old_sha256: &str,
+        old_scanner_enabled: bool,
+    ) -> TestResult<Value> {
         if expected_old_sha256.len() != 64 || !expected_old_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err("mixed-version fixture requires the qualified old executable digest".into());
         }
@@ -117,6 +122,9 @@ impl PeerBucketRun {
             }
             let log_offset = log_before.len();
             self.dist.cluster.stop_node_gracefully(node).await?;
+            self.dist
+                .cluster
+                .set_node_env(node, "RUSTFS_SCANNER_ENABLED", old_scanner_enabled.to_string())?;
             self.dist.cluster.start_node_from_binary(node, &old_binary).await?;
             let process = self.process_executable_identity(node, &old_binary, expected_old_sha256)?;
             // A follower restart may invalidate the original fixed-quorum lease.
@@ -190,11 +198,13 @@ impl PeerBucketRun {
         if drives_before != drives_after {
             return Err("mixed-version setup changed a retained drive identity".into());
         }
-        let fleet = json!({"leader": leader, "leader_pid": self.pid(leader)?, "retained": retained,
+        let mut fleet = json!({"leader": leader, "leader_pid": self.pid(leader)?, "retained": retained,
+            "old_scanner_enabled": old_scanner_enabled,
             "old_sha256": expected_old_sha256, "new_executable": current, "old_binary": old_binary,
             "initial_processes": initial_processes, "processes": processes, "peers": peers,
             "replacements": replacements, "requalification": requalification, "drives_before": drives_before, "drives_after": drives_after});
-        self.assert_mixed_roles(&fleet).await?;
+        let roles = self.assert_mixed_roles(&fleet).await?;
+        fleet["scanner_statuses"] = roles["scanner_statuses"].clone();
         self.write_evidence("mixed-version-fleet", &fleet)?;
         Ok(fleet)
     }
@@ -423,7 +433,11 @@ impl PeerBucketRun {
             .as_array()
             .filter(|entries| entries.len() == 4)
             .ok_or("mixed fleet omitted four peer identities")?;
+        let old_scanner_enabled = fleet["old_scanner_enabled"]
+            .as_bool()
+            .ok_or("mixed fleet omitted old scanner configuration")?;
         let mut snapshots = Vec::new();
+        let mut scanner_statuses = Vec::new();
         for node in 0..4 {
             let pid = self.pid(node)?;
             if processes[node]["pid"].as_u64() != Some(u64::from(pid))
@@ -436,13 +450,20 @@ impl PeerBucketRun {
                 return Err("mixed-version window changed an authenticated peer identity".into());
             }
             snapshots.push(peer);
+            let status = self.admin_json(node, "/rustfs/admin/v3/scanner/status").await?;
+            if status["enabled"].as_bool() != Some(node == leader || old_scanner_enabled)
+                || status["metrics"]["leader_lock_held_by_this_process"].as_bool() != Some(node == leader)
+            {
+                return Err("mixed-version window changed scanner configuration or coordinator role".into());
+            }
+            scanner_statuses.push(json!({"node": node, "pid": pid, "status": status}));
         }
         if snapshots[leader]["instance_id"] != fleet["retained"]["instance_id"]
             || snapshots[leader]["owner_id"] != fleet["retained"]["owner_id"]
         {
             return Err("mixed-version setup did not retain the original new coordinator".into());
         }
-        Ok(json!({"leader": leader, "leader_pid": self.pid(leader)?, "peers": snapshots}))
+        Ok(json!({"leader": leader, "leader_pid": self.pid(leader)?, "peers": snapshots, "scanner_statuses": scanner_statuses}))
     }
 
     #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
@@ -1338,6 +1359,203 @@ pub(super) struct ScannerBarrier {
 }
 
 impl ScannerBarrier {
+    pub fn enable_worker_observation(&self, pid: u32, gate: &Value) -> TestResult {
+        let stage = "before_start_snapshot";
+        if gate["nonce"].as_str() != Some(self.nonce.as_str())
+            || gate["pid"].as_u64() != Some(u64::from(pid))
+            || gate["stage"] != stage
+            || gate["armed"].as_bool() != Some(true)
+            || gate["detail"]["epoch"].as_u64().is_none()
+            || gate["detail"]["cycle"].as_u64().is_none()
+        {
+            return Err("worker observer admission requires the actual held before-start gate".into());
+        }
+        let sequence_limit = u64::try_from(OBSERVATION_LIMIT)?;
+        let sequence = gate["sequence"]
+            .as_u64()
+            .filter(|sequence| *sequence < sequence_limit)
+            .ok_or("worker admission gate omitted its bounded sequence")?;
+        let read_gate = |name: &str| -> TestResult<Vec<u8>> {
+            let path = self.directory.join(name);
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err("worker admission gate file is not regular".into());
+            }
+            read_bounded_file(&path)
+        };
+        let suffix = format!("{}.{pid}.{sequence}.json", self.nonce);
+        let reached_file = format!("reached.{suffix}");
+        let observed_file = format!("observed.{suffix}");
+        let reached = read_gate(&reached_file)?;
+        let observed = read_gate(&observed_file)?;
+        if reached != observed || serde_json::from_slice::<Value>(&reached)? != *gate {
+            return Err("worker admission gate differs from the real reached observation".into());
+        }
+        let arm: Value = serde_json::from_slice(&read_gate("arm.json")?)?;
+        let session: Value = serde_json::from_slice(&read_gate("session.json")?)?;
+        if arm["nonce"] != self.nonce
+            || arm["pid"].as_u64() != Some(u64::from(pid))
+            || arm["stage"] != stage
+            || session["nonce"] != self.nonce
+            || ["epoch", "cycle"].iter().any(|field| {
+                arm.get(*field)
+                    .is_some_and(|value| value.as_u64().is_none() || value != &gate["detail"][*field])
+            })
+        {
+            return Err("worker admission no longer matches the actual armed session".into());
+        }
+        let release_file = format!("release.{}.{stage}.{pid}", self.nonce);
+        if self.directory.join(&release_file).try_exists()? {
+            return Err("worker admission gate was already released".into());
+        }
+        if self.directory.join("worker-observer.json").try_exists()? {
+            return Err("worker observer was already admitted".into());
+        }
+        let control = json!({"nonce": self.nonce, "pid": pid});
+        self.write_json(
+            "worker-admission.json",
+            &json!({"schema":1,"gate":gate,"control":control,
+            "reached_file":reached_file,"reached_sha256":sha256_hex(&reached),
+            "observed_file":observed_file,"observed_sha256":sha256_hex(&observed),
+            "release_file":release_file,"release_exists":false}),
+        )?;
+        self.write_json("worker-observer.json", &control)?;
+        if self.directory.join(&release_file).try_exists()? {
+            return Err("worker admission raced an already released gate".into());
+        }
+        Ok(())
+    }
+
+    pub fn worker_observations(&self, pid: u32, cycles: &[(u64, u64)]) -> TestResult<Value> {
+        let read_worker = |name: &str| -> TestResult<(Value, String)> {
+            let path = self.directory.join(name);
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err("worker evidence is not a regular file".into());
+            }
+            let bytes = read_bounded_file(&path)?;
+            Ok((serde_json::from_slice(&bytes)?, sha256_hex(&bytes)))
+        };
+        let (control, _) = read_worker("worker-observer.json")?;
+        if control != json!({"nonce": self.nonce, "pid": pid}) {
+            return Err("worker recorder configuration changed".into());
+        }
+        let (admission, admission_sha256) = read_worker("worker-admission.json")?;
+        let gate = &admission["gate"];
+        let (first_epoch, first_cycle) = *cycles.first().ok_or("worker admission has no measured cycle")?;
+        let gate_sequence = gate["sequence"].as_u64().ok_or("worker admission omitted gate sequence")?;
+        let suffix = format!("{}.{pid}.{gate_sequence}.json", self.nonce);
+        let reached_file = format!("reached.{suffix}");
+        let observed_file = format!("observed.{suffix}");
+        let (reached, reached_sha256) = read_worker(&reached_file)?;
+        let (observed, observed_sha256) = read_worker(&observed_file)?;
+        if admission["schema"] != 1
+            || admission["control"] != control
+            || admission["release_exists"] != false
+            || admission["release_file"] != format!("release.{}.before_start_snapshot.{pid}", self.nonce)
+            || admission["reached_file"] != reached_file
+            || admission["reached_sha256"] != reached_sha256
+            || admission["observed_file"] != observed_file
+            || admission["observed_sha256"] != observed_sha256
+            || reached != *gate
+            || observed != *gate
+            || gate["nonce"] != self.nonce
+            || gate["pid"] != pid
+            || gate["stage"] != "before_start_snapshot"
+            || gate["armed"] != true
+            || gate["detail"]["epoch"] != first_epoch
+            || gate["detail"]["cycle"] != first_cycle
+        {
+            return Err("worker inventory lacks the actual held-start admission receipt".into());
+        }
+        let (health, health_sha256) = read_worker(&format!("worker-health.{}.{pid}.json", self.nonce))?;
+        if health["schema"] != 1
+            || health["nonce"] != self.nonce
+            || health["pid"] != pid
+            || health["max_events"] != 512
+            || health["max_cycles"] != 8
+            || health["max_bytes"] != 1024 * 1024
+            || health["errors"].as_array().is_none_or(|errors| !errors.is_empty())
+        {
+            return Err(format!("worker recorder is unhealthy: {health}").into());
+        }
+        let indexes = health["manifests"].as_array().ok_or("worker health omitted manifests")?;
+        if indexes.len() != cycles.len() {
+            return Err("worker recorder has extra or missing cycles".into());
+        }
+        let mut manifests = Vec::new();
+        let mut events = Vec::new();
+        let mut files = BTreeSet::new();
+        for (index, &(epoch, cycle)) in indexes.iter().zip(cycles) {
+            let name = format!("worker-manifest.{}.{pid}.{epoch}.{cycle}.json", self.nonce);
+            let (manifest, digest) = read_worker(&name)?;
+            if index["file"] != name
+                || index["sha256"] != digest
+                || index["epoch"] != epoch
+                || index["cycle"] != cycle
+                || manifest["schema"] != 1
+                || manifest["nonce"] != self.nonce
+                || manifest["pid"] != pid
+                || manifest["epoch"] != epoch
+                || manifest["cycle"] != cycle
+                || manifest["closed"] != true
+                || manifest["outstanding"] != 0
+                || manifest["errors"].as_array().is_none_or(|errors| !errors.is_empty())
+                || manifest["close_sequence"] != index["close_sequence"]
+            {
+                return Err("worker manifest is not bound to its healthy closing receipt".into());
+            }
+            let start = manifest["start_sequence"].as_u64().ok_or("worker manifest omitted start")?;
+            let close = manifest["close_sequence"].as_u64().ok_or("worker manifest omitted close")?;
+            let references = manifest["events"]
+                .as_array()
+                .ok_or("worker manifest omitted event inventory")?;
+            if close < start || close >= 512 || u64::try_from(references.len())? != close - start + 1 {
+                return Err("worker cycle inventory is incomplete".into());
+            }
+            for (reference, sequence) in references.iter().zip(start..=close) {
+                let name = format!("worker-observed.{}.{pid}.{sequence}.json", self.nonce);
+                let (event, digest) = read_worker(&name)?;
+                if !files.insert(name.clone())
+                    || reference["file"] != name
+                    || reference["sha256"] != digest
+                    || reference["sequence"] != sequence
+                    || event["sequence"] != sequence
+                    || event["kind"] != reference["kind"]
+                    || event["schema"] != 1
+                    || event["nonce"] != self.nonce
+                    || event["pid"] != pid
+                    || event["epoch"] != epoch
+                    || event["cycle"] != cycle
+                {
+                    return Err("worker raw event is missing, duplicated, or changed".into());
+                }
+                events.push(event);
+            }
+            manifests.push(manifest);
+        }
+        if health["event_count"].as_u64() != Some(u64::try_from(events.len())?)
+            || events
+                .iter()
+                .enumerate()
+                .any(|(sequence, event)| event["sequence"].as_u64() != u64::try_from(sequence).ok())
+        {
+            return Err("worker recorder sequence has missing or late events".into());
+        }
+        let prefix = format!("worker-observed.{}.{pid}.", self.nonce);
+        let actual = std::fs::read_dir(&self.directory)?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<TestResult<Vec<String>>>()?
+            .into_iter()
+            .filter(|name| name.starts_with(&prefix))
+            .collect::<BTreeSet<_>>();
+        if actual != files {
+            return Err("worker recorder has unlisted raw events".into());
+        }
+        Ok(json!({"control": control, "admission": admission, "admission_sha256": admission_sha256,
+            "health": health, "health_sha256": health_sha256, "manifests": manifests, "events": events}))
+    }
+
     pub fn start_session(&self, buckets: &[String]) -> TestResult {
         self.write_json("session.json", &json!({"nonce": self.nonce, "buckets": buckets}))
     }
@@ -1460,5 +1678,56 @@ impl ScannerBarrier {
         )
         .await?;
         select()?.ok_or_else(|| format!("scanner stage {stage} disappeared after observation").into())
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_observer_admission_requires_real_unreleased_start_gate() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let barrier = ScannerBarrier {
+            directory: directory.path().to_path_buf(),
+            nonce: "admission-unit".into(),
+        };
+        let pid = std::process::id();
+        barrier.arm("before_start_snapshot", pid, Some((1, 2)))?;
+        barrier.start_session(&["hot".to_string()])?;
+        let gate = json!({"nonce":barrier.nonce,"pid":pid,"sequence":7,"stage":"before_start_snapshot",
+            "armed":true,"detail":{"epoch":1,"cycle":2}});
+        assert!(barrier.enable_worker_observation(pid, &gate).is_err(), "an arm is not a reached gate");
+        assert!(!barrier.directory.join("worker-observer.json").exists());
+        let suffix = format!("{}.{pid}.7.json", barrier.nonce);
+        barrier.write_json(&format!("observed.{suffix}"), &gate)?;
+        assert!(
+            barrier.enable_worker_observation(pid, &gate).is_err(),
+            "an unpaused observation is not reached"
+        );
+        barrier.write_json(&format!("reached.{suffix}"), &gate)?;
+        let mut forged = gate.clone();
+        forged["detail"]["cycle"] = json!(3);
+        let error = barrier
+            .enable_worker_observation(pid, &forged)
+            .expect_err("supplied state must match the raw reached gate");
+        assert!(error.to_string().contains("real reached observation"));
+        assert!(!barrier.directory.join("worker-observer.json").exists());
+        barrier.enable_worker_observation(pid, &gate)?;
+        let control: Value = serde_json::from_slice(&read_bounded_file(&barrier.directory.join("worker-observer.json"))?)?;
+        assert_eq!(control, json!({"nonce":barrier.nonce,"pid":pid}));
+        let admission: Value = serde_json::from_slice(&read_bounded_file(&barrier.directory.join("worker-admission.json"))?)?;
+        assert_eq!(admission["gate"], gate);
+        assert_eq!(admission["release_exists"], false);
+        // Remove only this unit's control so an already-admitted guard cannot mask release validation.
+        std::fs::remove_file(barrier.directory.join("worker-observer.json"))?;
+        std::fs::remove_file(barrier.directory.join("worker-admission.json"))?;
+        barrier.release("before_start_snapshot", pid)?;
+        let error = barrier
+            .enable_worker_observation(pid, &gate)
+            .expect_err("a reached gate must still be held");
+        assert!(error.to_string().contains("already released"));
+        assert!(!barrier.directory.join("worker-observer.json").exists());
+        Ok(())
     }
 }

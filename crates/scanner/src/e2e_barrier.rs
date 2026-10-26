@@ -15,6 +15,8 @@
 //! Test-cluster observations and bounded pauses at real scanner boundaries.
 //! This module is absent unless `e2e-test-hooks` is explicitly enabled.
 
+pub(crate) mod worker_observation;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{self, Write};
@@ -104,6 +106,11 @@ pub async fn checkpoint(stage: &str, detail: Value) -> io::Result<()> {
     {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid scanner test session"));
     }
+    // Admission may enable the recorder while this actual start gate is held.
+    // Begin on release, before any snapshot or worker; other boundaries stay synchronous here.
+    if stage != "before_start_snapshot" {
+        worker_observation::boundary(stage, &detail);
+    }
     if detail
         .get("bucket")
         .and_then(Value::as_str)
@@ -151,6 +158,9 @@ pub async fn checkpoint(stage: &str, detail: Value) -> io::Result<()> {
     let suffix = format!("{}.{}.{}.json", session.nonce, pid, sequence);
     write_observation(directory, &format!("observed.{suffix}"), &encoded)?;
     if !armed {
+        if stage == "before_start_snapshot" {
+            worker_observation::boundary(stage, &event["detail"]);
+        }
         return Ok(());
     }
     write_observation(directory, &format!("reached.{suffix}"), &encoded)?;
@@ -161,6 +171,9 @@ pub async fn checkpoint(stage: &str, detail: Value) -> io::Result<()> {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "scanner test barrier release timed out"));
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    if stage == "before_start_snapshot" {
+        worker_observation::boundary(stage, &event["detail"]);
     }
     Ok(())
 }

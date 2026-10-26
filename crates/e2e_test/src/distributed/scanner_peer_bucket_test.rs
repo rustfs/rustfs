@@ -1301,6 +1301,270 @@ async fn reordered_scoped_acks(newer_generation: bool) -> TestResult {
     )
 }
 
+fn assert_worker_cycle(
+    evidence: &Value,
+    candidate: &Value,
+    root: &Value,
+    scope: &BTreeSet<String>,
+    fleet: &Value,
+    require_walks: bool,
+) -> TestResult<Value> {
+    let cycle = identity(root)?;
+    let manifests = evidence["manifests"].as_array().ok_or("worker evidence omitted manifests")?;
+    let matching = manifests
+        .iter()
+        .filter(|manifest| manifest["epoch"].as_u64() == Some(cycle.0) && manifest["cycle"].as_u64() == Some(cycle.1))
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err("worker cycle manifest is not unique".into());
+    }
+    let manifest = matching[0];
+    if manifest["candidate"] != candidate["detail"]
+        || manifest["root"] != root["detail"]
+        || manifest["pid"] != root["pid"]
+        || manifest["nonce"] != root["nonce"]
+    {
+        return Err("worker manifest is not bound to the actual candidate and durable root".into());
+    }
+    let leader = usize::try_from(fleet["leader"].as_u64().ok_or("fleet omitted leader")?)?;
+    let events = evidence["events"].as_array().ok_or("worker evidence omitted raw events")?;
+    let event_at = |sequence: &Value| -> TestResult<&Value> {
+        let sequence = usize::try_from(sequence.as_u64().ok_or("worker event sequence is absent")?)?;
+        let event = events.get(sequence).ok_or("worker raw event was omitted")?;
+        if event["epoch"].as_u64() != Some(cycle.0) || event["cycle"].as_u64() != Some(cycle.1) {
+            return Err("worker event crossed cycle identity".into());
+        }
+        Ok(event)
+    };
+    let endpoint = |value: &str| -> TestResult<(String, u16)> {
+        let value = if value.contains("://") {
+            value.to_string()
+        } else {
+            format!("http://{value}")
+        };
+        let url = reqwest::Url::parse(&value)?;
+        Ok((
+            url.host_str().ok_or("worker endpoint omitted host")?.to_string(),
+            url.port_or_known_default().ok_or("worker endpoint omitted port")?,
+        ))
+    };
+    let mut tuples_seen = BTreeSet::new();
+    let mut physical = BTreeSet::new();
+    let mut old_workers = Vec::new();
+    let mut validate_context = |context: &Value, remote: bool, walked: bool| -> TestResult<Option<Value>> {
+        let bucket = context["bucket"].as_str().ok_or("worker context omitted bucket")?;
+        let pool = context["pool"].as_u64().ok_or("worker omitted pool")?;
+        let set = context["set"].as_u64().ok_or("worker omitted set")?;
+        if !scope.contains(bucket) || pool != 0 || set >= 4 || !tuples_seen.insert((pool, set, bucket.to_string())) {
+            return Err("worker inventory has a cold/unknown/extra or duplicate request".into());
+        }
+        let coverage = candidate["detail"]["set_coverage"]
+            .as_array()
+            .ok_or("candidate omitted actual completions")?;
+        let incarnation = context["bucket_incarnation"]
+            .as_str()
+            .ok_or("worker omitted captured incarnation")?;
+        if uuid::Uuid::parse_str(incarnation)?.is_nil()
+            || !coverage.iter().any(|row| {
+                row["pool"].as_u64() == Some(pool)
+                    && row["set"].as_u64() == Some(set)
+                    && row["bucket_incarnations"][bucket].as_str() == Some(incarnation)
+            })
+        {
+            return Err("worker was not in the candidate's actual completion set".into());
+        }
+        let path = context["worker_path"].as_str().ok_or("worker omitted actual disk path")?;
+        let disk_uuid = context["disk_uuid"].as_str().ok_or("worker omitted cached disk UUID")?;
+        let disk_index = usize::try_from(context["disk_index"].as_u64().ok_or("worker omitted disk index")?)?;
+        if uuid::Uuid::parse_str(disk_uuid)?.is_nil() {
+            return Err("worker disk UUID is nil".into());
+        }
+        let drives = fleet["drives_after"]
+            .as_array()
+            .filter(|nodes| nodes.len() == 4)
+            .ok_or("fleet omitted drives")?;
+        let mut owners = Vec::new();
+        for (node, disks) in drives.iter().enumerate() {
+            for disk in disks.as_array().ok_or("fleet drive inventory is malformed")? {
+                if disk["drive"].as_str() == Some(path)
+                    && disk["format"]["xl"]["this"].as_str() == Some(disk_uuid)
+                    && disk["set"].as_u64() == Some(set)
+                    && disk["format"]["xl"]["sets"]
+                        .get(usize::try_from(set)?)
+                        .and_then(|group| group.get(disk_index))
+                        .and_then(Value::as_str)
+                        == Some(disk_uuid)
+                {
+                    owners.push(node);
+                }
+            }
+        }
+        if owners.len() != 1 || remote == (owners[0] == leader) {
+            return Err("worker endpoint/path/UUID does not map to the measured local/remote process".into());
+        }
+        let node = owners[0];
+        if remote {
+            let host = fleet["peers"][node]["host"].as_str().ok_or("worker peer omitted host")?;
+            if endpoint(context["worker_endpoint"].as_str().ok_or("worker omitted endpoint")?)? != endpoint(host)?
+                || fleet["processes"][node]["sha256"] != fleet["old_sha256"]
+            {
+                return Err("remote worker is not the measured official O endpoint and executable".into());
+            }
+        }
+        if walked {
+            physical.insert((pool, set, bucket.to_string()));
+        }
+        Ok((remote && walked).then(|| {
+            json!({"node": node, "pid": fleet["processes"][node]["pid"],
+            "executable_sha256": fleet["processes"][node]["sha256"], "owner_id": fleet["peers"][node]["owner_id"],
+            "instance_id": fleet["peers"][node]["instance_id"], "context": context})
+        }))
+    };
+    let requests = manifest["requests"]
+        .as_object()
+        .ok_or("worker manifest omitted complete request map")?;
+    for (id, request) in requests {
+        let context = &request["context"];
+        if context["request_id"].as_str() != Some(id.as_str()) {
+            return Err("worker request map changed request ID".into());
+        }
+        let opening = event_at(&request["opening_sequence"])?;
+        let complete = event_at(&request["complete_sequence"])?;
+        let progress = request["progress"]
+            .as_array()
+            .filter(|values| values.len() == 3)
+            .ok_or("worker completion omitted progress")?;
+        let positive = progress
+            .iter()
+            .map(|value| value.as_u64().ok_or("worker progress is malformed"))
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|value| *value > 0);
+        if opening["kind"] != "remote_scan_opening"
+            || opening["detail"] != *context
+            || complete["kind"] != "remote_scan_complete"
+            || complete["detail"]["context"] != *context
+            || complete["detail"]["request_id"].as_str() != Some(id.as_str())
+            || complete["detail"]["progress"] != request["progress"]
+            || complete["detail"]["eof_verified"] != true
+            || complete["detail"]["mac_source_plan_verified"] != true
+            || request["opening_sequence"].as_u64() >= request["complete_sequence"].as_u64()
+        {
+            return Err("remote worker is unpaired or lacks verified terminal EOF and source/plan proof".into());
+        }
+        if require_walks && !positive {
+            return Err("verified remote Complete made zero physical progress".into());
+        }
+        if let Some(worker) = validate_context(context, true, positive)? {
+            old_workers.push(worker);
+        }
+    }
+    for walk in manifest["local_walks"]
+        .as_array()
+        .ok_or("worker manifest omitted local walk inventory")?
+    {
+        let event = event_at(&walk["sequence"])?;
+        if event["kind"] != "local_walk" || event["detail"] != walk["context"] {
+            return Err("local walk is absent from the raw worker inventory".into());
+        }
+        validate_context(&walk["context"], false, true)?;
+    }
+    let expected = (0..4_u64)
+        .flat_map(|set| scope.iter().map(move |bucket| (0_u64, set, bucket.clone())))
+        .collect::<BTreeSet<_>>();
+    if require_walks && (physical != expected || tuples_seen != expected || old_workers.is_empty()) {
+        return Err(
+            "hot-only cycle lacks exact four-set physical execution or a verified positive-progress official O worker".into(),
+        );
+    }
+    Ok(json!({"epoch": cycle.0, "cycle": cycle.1, "request_count": requests.len(),
+        "physical_walks": physical, "old_workers": old_workers, "cold_requests": 0}))
+}
+
+#[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+#[test]
+fn worker_cycle_rejects_cold_zero_progress_and_incomplete_sets() {
+    let candidate = json!({"detail":{"epoch":1,"cycle":2,"set_coverage":[]}});
+    let root = json!({"pid":1,"nonce":"unit","detail":{"epoch":1,"cycle":2}});
+    let fleet = json!({"leader":0});
+    let scope = BTreeSet::from(["hot".to_string()]);
+    let evidence = |bucket: &str, progress: [u64; 3]| {
+        let context = json!({"request_id":"request","bucket":bucket,"pool":0,"set":0});
+        let request = json!({"context":context,"opening_sequence":0,"complete_sequence":1,"progress":progress});
+        json!({"manifests":[{"epoch":1,"cycle":2,"pid":1,"nonce":"unit", "candidate":candidate["detail"],
+            "root":root["detail"],"requests":{"request":request},"local_walks":[]}],
+            "events":[{"epoch":1,"cycle":2,"kind":"remote_scan_opening","detail":context},
+                {"epoch":1,"cycle":2,"kind":"remote_scan_complete","detail":{"context":context,"request_id":"request",
+                    "progress":progress,"eof_verified":true,"mac_source_plan_verified":true}}]})
+    };
+    let cold = assert_worker_cycle(&evidence("cold", [1, 0, 0]), &candidate, &root, &scope, &fleet, true)
+        .expect_err("complete cold request must not be hidden by filtering");
+    assert!(cold.to_string().contains("cold/unknown/extra"));
+    let zero = assert_worker_cycle(&evidence("hot", [0, 0, 0]), &candidate, &root, &scope, &fleet, true)
+        .expect_err("Current Complete with zero progress cannot prove a physical walk");
+    assert!(zero.to_string().contains("zero physical progress"));
+    let incarnation = uuid::Uuid::new_v4();
+    let disk_ids = (0..4)
+        .map(|_| (0..4).map(|_| uuid::Uuid::new_v4()).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let sets = (0..4)
+        .map(|set| disk_ids.iter().map(|disks| disks[set]).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let drives = disk_ids
+        .iter()
+        .enumerate()
+        .map(|(node, disks)| {
+            disks
+                .iter()
+                .enumerate()
+                .map(|(set, disk)| {
+                    json!({"drive":format!("/node-{node}/set-{set}"),"set":set,
+            "format":{"xl":{"this":disk,"sets":sets}}})
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let old_sha256 = "a7fd2f93862ff7b6a7e1e6603e69f31a506abfafcc64c5067ded0516f24a0b6d";
+    let candidate = json!({"detail":{"epoch":1,"cycle":2,"set_coverage":(0..4).map(|set| json!({"pool":0,"set":set,
+        "bucket_incarnations":{"hot":incarnation}})).collect::<Vec<_>>()}});
+    let fleet = json!({"leader":0,"old_sha256":old_sha256,"drives_after":drives,
+        "processes":[{"pid":1,"sha256":"b".repeat(64)},{"pid":2,"sha256":old_sha256},
+            {"pid":3,"sha256":old_sha256},{"pid":4,"sha256":old_sha256}],
+        "peers":[{}, {"host":"127.0.0.1:29001","owner_id":uuid::Uuid::new_v4(),"instance_id":uuid::Uuid::new_v4()}, {}, {}]});
+    let valid = |set_count: usize| {
+        let mut requests = serde_json::Map::new();
+        let mut events = Vec::new();
+        for set in 0..set_count {
+            let id = uuid::Uuid::new_v4().to_string();
+            let context = json!({"epoch":1,"cycle":2,"request_id":id,"bucket":"hot","pool":0,"set":set,
+                "bucket_incarnation":incarnation,"worker_path":format!("/node-1/set-{set}"),"disk_uuid":disk_ids[1][set],
+                "disk_index":1,"worker_endpoint":"http://127.0.0.1:29001","server_epoch":uuid::Uuid::new_v4(),
+                "wire_session_id":uuid::Uuid::new_v4(),"wire_session_sequence":set,
+                "reuse_plan_sha256":"c".repeat(64),"coverage_plan_sha256":"d".repeat(64)});
+            let opening = events.len();
+            events.push(json!({"epoch":1,"cycle":2,"kind":"remote_scan_opening","detail":context}));
+            events.push(json!({"epoch":1,"cycle":2,"kind":"remote_scan_complete","detail":{"context":context,
+                "request_id":id,"progress":[1,0,0],"eof_verified":true,"mac_source_plan_verified":true}}));
+            requests.insert(
+                id,
+                json!({"context":context,"opening_sequence":opening,"complete_sequence":opening+1,"progress":[1,0,0]}),
+            );
+        }
+        json!({"manifests":[{"epoch":1,"cycle":2,"pid":1,"nonce":"unit","candidate":candidate["detail"],
+            "root":root["detail"],"requests":requests,"local_walks":[]}],"events":events})
+    };
+    let healthy = assert_worker_cycle(&valid(4), &candidate, &root, &scope, &fleet, true)
+        .expect("four completed positive-progress official O sets must satisfy the worker contract");
+    assert_eq!(healthy["old_workers"].as_array().expect("mapped O workers").len(), 4);
+    let partial = valid(3);
+    let otherwise_valid = assert_worker_cycle(&partial, &candidate, &root, &scope, &fleet, false)
+        .expect("the missing-set example must pass pairing, progress, incarnation and official O mapping");
+    assert_eq!(otherwise_valid["old_workers"].as_array().expect("mapped O workers").len(), 3);
+    let missing = assert_worker_cycle(&partial, &candidate, &root, &scope, &fleet, true)
+        .expect_err("three valid positive O sets cannot substitute for all four sets");
+    assert!(missing.to_string().contains("exact four-set"));
+}
+
 async fn hot_window(fault: Option<ScopedAckFault>) -> TestResult {
     hot_window_with_old_followers(fault, None).await
 }
@@ -1308,30 +1572,38 @@ async fn hot_window(fault: Option<ScopedAckFault>) -> TestResult {
 #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn scanner_peer_bucket_new_coordinator_certifies_old_peers_and_scopes_next_cycle() -> TestResult {
+    mixed_version_n_over_o(true).await
+}
+
+#[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn scanner_peer_bucket_new_coordinator_certifies_old_worker_peers_and_scopes_next_cycle() -> TestResult {
+    mixed_version_n_over_o(false).await
+}
+
+#[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+async fn mixed_version_n_over_o(old_scanner_enabled: bool) -> TestResult {
     let old_binary = std::env::var_os("RUSTFS_SCANNER_COMPAT_OLD_BINARY")
         .filter(|path| !path.is_empty())
         .map(std::path::PathBuf::from)
         .ok_or("RUSTFS_SCANNER_COMPAT_OLD_BINARY must identify the qualified previous executable")?;
     let old_sha256 = std::env::var("RUSTFS_SCANNER_COMPAT_OLD_SHA256")
         .map_err(|error| format!("RUSTFS_SCANNER_COMPAT_OLD_SHA256 must identify that executable: {error}"))?;
-    mixed_version_n_over_o(&old_binary, &old_sha256).await
-}
-
-#[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
-async fn mixed_version_n_over_o(old_binary: &std::path::Path, expected_old_sha256: &str) -> TestResult {
-    hot_window_with_old_followers(None, Some((old_binary, expected_old_sha256))).await
+    hot_window_with_old_followers(None, Some((&old_binary, &old_sha256, old_scanner_enabled))).await
 }
 
 async fn hot_window_with_old_followers(
     fault: Option<ScopedAckFault>,
-    old_followers: Option<(&std::path::Path, &str)>,
+    old_followers: Option<(&std::path::Path, &str, bool)>,
 ) -> TestResult {
     init_logging();
     let mixed = old_followers.is_some();
+    let observe_workers = old_followers.is_some_and(|(_, _, enabled)| !enabled);
     if mixed && fault.is_some() {
         return Err("the mixed-version gate requires successful original ACK forwarding".into());
     }
     let label = match fault {
+        None if old_followers.is_some_and(|(_, _, enabled)| !enabled) => "new-coordinator-old-worker-peers",
         None if mixed => "new-coordinator-old-peers",
         None => "hot-window",
         Some(ScopedAckFault::RequestLoss) => "ack-request-loss",
@@ -1347,14 +1619,15 @@ async fn hot_window_with_old_followers(
     } else {
         PeerBucketRun::start(label).await?
     };
-    let mixed_fleet = if let Some((old_binary, expected_old_sha256)) = old_followers {
+    let mixed_fleet = if let Some((old_binary, expected_old_sha256, old_scanner_enabled)) = old_followers {
         #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
         {
-            run.replace_followers_with_old_binary(old_binary, expected_old_sha256).await?
+            run.replace_followers_with_old_binary(old_binary, expected_old_sha256, old_scanner_enabled)
+                .await?
         }
         #[cfg(not(all(target_os = "linux", feature = "scanner-peer-mixed-version")))]
         {
-            let _ = (old_binary, expected_old_sha256);
+            let _ = (old_binary, expected_old_sha256, old_scanner_enabled);
             return Err("mixed-version process evidence requires the dedicated Linux feature".into());
         }
     } else {
@@ -1401,6 +1674,9 @@ async fn hot_window_with_old_followers(
     let cycle = identity(&start_gate)?;
     if baseline.scanner_epoch != Some(cycle.0) || baseline.scanner_cycle.is_none_or(|value| value >= cycle.1) {
         return Err("test window did not follow the quiet baseline under the observed leader epoch".into());
+    }
+    if observe_workers {
+        run.barrier.enable_worker_observation(leader_pid, &start_gate)?;
     }
     // These are actual mutations after leading activity and before the start
     // map RPCs. All three buckets must appear on the remote ingress peer.
@@ -1907,12 +2183,21 @@ async fn hot_window_with_old_followers(
                 .ok_or_else(|| "actual bucket walk omitted bucket".into())
         })
         .collect::<TestResult<BTreeSet<_>>>()?;
-    if walked_buckets != next_scope {
-        return Err(format!(
-            "next Normal cycle must physically walk exactly the retained bucket scope {next_scope:?}: {next_walks:?}"
-        )
-        .into());
-    }
+    let worker_observations = if observe_workers {
+        let evidence = run.barrier.worker_observations(leader_pid, &[cycle, next_cycle])?;
+        let initial = assert_worker_cycle(&evidence, &candidate, &root, &all, &mixed_fleet, false)?;
+        let next = assert_worker_cycle(&evidence, &next_candidate, &next_root, &next_scope, &mixed_fleet, true)?;
+        run.write_evidence("worker-execution", &json!({"raw": evidence, "initial": initial, "next": next}))?;
+        evidence
+    } else {
+        if walked_buckets != next_scope {
+            return Err(format!(
+                "next Normal cycle must physically walk exactly the retained bucket scope {next_scope:?}: {next_walks:?}"
+            )
+            .into());
+        }
+        Value::Null
+    };
     run.barrier.disarm()?;
     run.barrier.release("root_durable", leader_pid)?;
     let mut recovered_ack = Value::Null;
@@ -1959,7 +2244,7 @@ async fn hot_window_with_old_followers(
     }
     run.barrier.stop_session()?;
     run.verify_objects().await?;
-    let mixed_final_processes = if let Some((old_binary, expected_old_sha256)) = old_followers {
+    let mixed_final_processes = if let Some((old_binary, expected_old_sha256, _)) = old_followers {
         #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
         {
             run.assert_mixed_roles(&mixed_fleet).await?;
@@ -1998,6 +2283,20 @@ async fn hot_window_with_old_followers(
     } else {
         Value::Null
     };
+    let mixed_final_roles = if mixed {
+        #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+        {
+            let roles = run.assert_mixed_roles(&mixed_fleet).await?;
+            run.write_evidence("mixed-final-roles", &roles)?;
+            roles
+        }
+        #[cfg(not(all(target_os = "linux", feature = "scanner-peer-mixed-version")))]
+        {
+            return Err("mixed-version process evidence requires the dedicated Linux feature".into());
+        }
+    } else {
+        Value::Null
+    };
     let mut evidence = json!({"topology": run.topology, "objects": run.objects, "baseline": baseline, "scheduler_config": scheduler_config,
             "leader_node": leader, "leader_pid": leader_pid, "producer_node": producer, "producer_pid": producer_pid,
             "producers": producers, "start_producers": start_producers, "secondary_acks": secondary_acks,
@@ -2021,5 +2320,14 @@ async fn hot_window_with_old_followers(
     evidence["mixed_final_processes"] = mixed_final_processes;
     evidence["mixed_final_physical"] = mixed_final_physical;
     evidence["mixed_final_drives"] = mixed_final_drives;
+    evidence["mixed_final_roles"] = mixed_final_roles;
+    if observe_workers {
+        let final_workers = run.barrier.worker_observations(leader_pid, &[cycle, next_cycle])?;
+        if final_workers != worker_observations {
+            return Err("worker inventory changed or failed after root closure".into());
+        }
+        run.write_evidence("worker-final-health", &final_workers)?;
+    }
+    evidence["worker_observations"] = worker_observations;
     run.write_evidence(label, &evidence)
 }
