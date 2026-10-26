@@ -457,9 +457,10 @@ impl FrontObservation {
         }
     }
 
-    fn error(&self) -> Option<&ShutdownWaitError> {
+    fn error(&self) -> Option<ShutdownWaitError> {
         match self {
-            Self::Observed(Err(error)) => Some(error),
+            Self::Observed(Err(error)) => Some(error.clone()),
+            Self::Observed(Ok(ShutdownReceipt::Http12ChildrenRetired(outcome))) => outcome.late_failure(),
             _ => None,
         }
     }
@@ -507,8 +508,8 @@ impl FrontShutdownReport {
             .any(|observation| observation.http12().is_some_and(|outcome| outcome.deadline_missed()));
         let incomplete_leaf_proof = !self.producers_retired();
         Err(FrontShutdownFailure {
-            s3: self.s3.error().cloned(),
-            console: self.console.error().cloned(),
+            s3: self.s3.error(),
+            console: self.console.error(),
             optional: self.optional,
             deadline_missed,
             incomplete_leaf_proof,
@@ -1051,6 +1052,59 @@ mod tests {
                 assert_eq!(source.id(), task_id);
             }
         }
+    }
+
+    async fn assert_early_tls_receipt_final_join(fail: bool) {
+        use super::{FrontObservation, FrontShutdownReport};
+        use crate::server::ShutdownReceipt;
+
+        let release = tokio_util::sync::CancellationToken::new();
+        let child_release = release.clone();
+        // This unit fixture tests Root propagation only, not TLS/native retirement.
+        let actual_task = tokio::spawn(async move {
+            child_release.cancelled().await;
+            assert!(!fail, "test late TLS driver panic");
+        });
+        let receipt = crate::server::tls_material::test_retirement_from_task(actual_task);
+        let outcome =
+            crate::server::test_retire_http12_scope(std::future::ready(()), tokio::time::Instant::now() + Duration::from_secs(5))
+                .await
+                .with_test_tls_receipt(receipt.clone());
+        let before_join = outcome.verified_scope_complete();
+        let original_deadline_missed = outcome.deadline_missed();
+        let report = FrontShutdownReport {
+            s3: FrontObservation::Observed(Ok(ShutdownReceipt::Http12ChildrenRetired(outcome))),
+            ..Default::default()
+        };
+        release.cancel();
+        receipt.test_observe_join().await;
+        let result = report.into_result();
+        assert!(!before_join, "an own-round receipt cannot certify an unjoined group");
+        assert!(!original_deadline_missed, "this original scope observation was timely");
+        if fail {
+            let failure = result.expect_err("late real group failure vetoes marker clearing");
+            let error = failure.s3.expect("the earlier positive receipt retains the late failure");
+            let source = std::error::Error::source(&error).expect("actual JoinError source");
+            assert!(
+                source
+                    .downcast_ref::<tokio::task::JoinError>()
+                    .expect("typed JoinError")
+                    .is_panic()
+            );
+            assert!(!failure.deadline_missed, "late error does not rewrite the frozen scope deadline");
+        } else {
+            result.expect("retained early receipt sees the eventual original successful group join");
+        }
+    }
+
+    #[tokio::test]
+    async fn early_positive_tls_receipt_preserves_late_original_join_error() {
+        assert_early_tls_receipt_final_join(true).await;
+    }
+
+    #[tokio::test]
+    async fn early_positive_tls_receipt_sees_original_group_join_success() {
+        assert_early_tls_receipt_final_join(false).await;
     }
 
     #[tokio::test]

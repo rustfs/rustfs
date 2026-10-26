@@ -116,19 +116,36 @@ pub(crate) struct Http12ShutdownOutcome {
     child_failures: u64,
     unverified_h3: bool,
     unverified_tls_reloader: bool,
+    tls_reloader: Option<tls_material::TlsReloadRetirement>,
 }
 
 impl Http12ShutdownOutcome {
+    #[cfg(test)]
+    pub(crate) fn with_test_tls_receipt(mut self, receipt: tls_material::TlsReloadRetirement) -> Self {
+        self.unverified_tls_reloader = true;
+        self.tls_reloader = Some(receipt);
+        self
+    }
+
     pub(crate) fn deadline_missed(&self) -> bool {
         self.deadline_missed
     }
 
     pub(crate) fn verified_scope_complete(&self) -> bool {
-        !self.unverified_h3 && !self.unverified_tls_reloader
+        !self.unverified_h3
+            && (!self.unverified_tls_reloader || self.tls_reloader.as_ref().is_some_and(|receipt| receipt.group_joined()))
+    }
+
+    fn tls_reload_error(&self) -> Option<&std::sync::Arc<tokio::task::JoinError>> {
+        self.tls_reloader.as_ref().and_then(|receipt| receipt.join_error())
+    }
+
+    pub(crate) fn late_failure(&self) -> Option<ShutdownWaitError> {
+        self.tls_reload_error().map(|_| ShutdownWaitError::Http12(self.clone()))
     }
 
     fn failed(&self) -> bool {
-        self.deadline_missed || self.child_failures != 0
+        self.deadline_missed || self.child_failures != 0 || self.tls_reload_error().is_some()
     }
 }
 
@@ -153,6 +170,10 @@ impl ShutdownWaitError {
             Self::Join(_) => "join_panicked",
             Self::MissingTask => "join_unconfirmed",
             Self::Http12(outcome) if outcome.deadline_missed => "http12_deadline_missed",
+            Self::Http12(outcome) if outcome.tls_reload_error().is_some_and(|error| error.is_cancelled()) => {
+                "tls_reload_join_cancelled"
+            }
+            Self::Http12(outcome) if outcome.tls_reload_error().is_some() => "tls_reload_join_panicked",
             Self::Http12(_) => "http12_child_join_failed",
         }
     }
@@ -179,7 +200,11 @@ impl std::error::Error for ShutdownWaitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Join(error) => Some(error.as_ref()),
-            Self::Http12(outcome) => outcome.first_child_error.as_ref().map(|error| error.as_ref() as _),
+            Self::Http12(outcome) => outcome
+                .first_child_error
+                .as_ref()
+                .or_else(|| outcome.tls_reload_error())
+                .map(|error| error.as_ref() as _),
             Self::MissingTask => None,
         }
     }

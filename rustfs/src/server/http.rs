@@ -919,7 +919,42 @@ async fn retire_http12_children(
         child_failures,
         unverified_h3,
         unverified_tls_reloader,
+        tls_reloader: None,
     }
+}
+
+#[cfg(feature = "http3")]
+async fn retire_http3_after_tls_startup_failure(
+    shutdown: &tokio::sync::broadcast::Sender<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    reload: super::tls_material::TlsMaterialError,
+) -> super::tls_material::TlsMaterialError {
+    let _ = shutdown.send(());
+    if let Some(task) = task
+        && let Err(error) = task.await
+    {
+        return super::tls_material::TlsMaterialError::ReloadStartupCleanup {
+            reload: Box::new(reload),
+            http3_join_error: Arc::new(error),
+        };
+    }
+    reload
+}
+
+pub(super) async fn retire_tls_reloader(
+    task: &super::tls_material::TlsReloadTask,
+    outcome: &mut Http12ShutdownOutcome,
+    deadline: tokio::time::Instant,
+) {
+    let stop = task.wait_stopped();
+    tokio::pin!(stop);
+    let observed = tokio::time::timeout_at(deadline, stop.as_mut()).await;
+    outcome.deadline_missed |= observed.is_err() || tokio::time::Instant::now() >= deadline;
+    outcome.unverified_tls_reloader = true;
+    outcome.tls_reloader = Some(match observed {
+        Ok(receipt) => receipt,
+        Err(_) => stop.as_mut().await,
+    });
 }
 
 #[cfg(test)]
@@ -2151,15 +2186,24 @@ async fn start_http_server_inner(
     };
     let tls_reload_task = if let (Some(holder), Some((initial, prepared))) = (tls_acceptor.as_ref(), tls_initial_snapshot.take())
     {
-        spawn_reload_loop(
+        let registration = spawn_reload_loop(
             tls_path.to_string(),
             holder.clone(),
             initial,
             prepared,
             #[cfg(feature = "http3")]
             http3_server.as_ref().map(|(endpoint, _)| endpoint.clone()),
-        )
-        .map_err(|e| Error::other(e.to_string()))?
+        );
+        match registration {
+            Ok(task) => task,
+            Err(error) => {
+                #[cfg(feature = "http3")]
+                let error = retire_http3_after_tls_startup_failure(&shutdown_tx, http3_server.map(|(_, task)| task), error).await;
+                #[cfg(not(feature = "http3"))]
+                let _ = shutdown_tx.send(());
+                return Err(Error::other(error));
+            }
+        }
     } else {
         None
     };
@@ -2466,15 +2510,24 @@ async fn start_http_server_inner(
         let unverified_h3 = http3_server.is_some();
         #[cfg(not(feature = "http3"))]
         let unverified_h3 = false;
-        let outcome = retire_http12_children(
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        if let Some(task) = &tls_reload_task {
+            task.request_stop();
+        }
+        let mut outcome = retire_http12_children(
             graceful.shutdown(),
             tasks,
-            tokio::time::Instant::now() + Duration::from_secs(10),
+            deadline,
             unverified_h3,
             tls_reload_task.is_some(),
             active_connections,
         )
         .await;
+
+        if let Some(task) = tls_reload_task {
+            retire_tls_reloader(&task, &mut outcome, deadline).await;
+        }
+
         if !outcome.deadline_missed() {
             debug!(
                 event = EVENT_HTTP_CONNECTION_DRAIN,
@@ -2483,11 +2536,6 @@ async fn start_http_server_inner(
                 state = "completed",
                 "HTTP connection drain completed"
             );
-        }
-
-        if let Some(task) = tls_reload_task {
-            task.abort();
-            let _ = task.await;
         }
 
         #[cfg(feature = "http3")]
@@ -3357,6 +3405,64 @@ mod tests {
         start_http_server_inner(&config, readiness, ServerContextSlot::new(), Some(control))
             .await
             .expect("actual production HTTP listener")
+    }
+
+    #[cfg(feature = "http3")]
+    async fn assert_tls_startup_failure_joins_started_http3_outer(fail: bool) {
+        use super::super::tls_material::TlsMaterialError;
+        let (shutdown, mut receiver) = tokio::sync::broadcast::channel(1);
+        let entered = tokio_util::sync::CancellationToken::new();
+        let task_entered = entered.clone();
+        let release = tokio_util::sync::CancellationToken::new();
+        let task_release = release.clone();
+        let actual_outer = tokio::spawn(async move {
+            receiver.recv().await.expect("explicit startup stop signal");
+            task_entered.cancel();
+            task_release.cancelled().await;
+            assert!(!fail, "test started H3 outer join failure");
+        });
+        let mut cleanup = Box::pin(retire_http3_after_tls_startup_failure(
+            &shutdown,
+            Some(actual_outer),
+            TlsMaterialError::ReloadStopping,
+        ));
+        let pending =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(cleanup.as_mut(), cx).is_pending())).await;
+        let signalled = tokio::time::timeout(Duration::from_secs(5), entered.cancelled())
+            .await
+            .is_ok();
+        release.cancel();
+        let error = cleanup.await;
+        assert!(pending && signalled, "cleanup signals then joins the original held outer task");
+        if fail {
+            match error {
+                TlsMaterialError::ReloadStartupCleanup {
+                    reload,
+                    http3_join_error,
+                } => {
+                    assert!(matches!(*reload, TlsMaterialError::ReloadStopping));
+                    assert!(http3_join_error.is_panic(), "actual secondary JoinError retained");
+                }
+                _ => panic!("both real startup cleanup errors must survive"),
+            }
+        } else {
+            assert!(
+                matches!(error, TlsMaterialError::ReloadStopping),
+                "original typed failure retained after successful join"
+            );
+        }
+    }
+
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn tls_startup_failure_joins_original_started_http3_outer() {
+        assert_tls_startup_failure_joins_started_http3_outer(false).await;
+    }
+
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn tls_startup_failure_preserves_both_original_cleanup_errors() {
+        assert_tls_startup_failure_joins_started_http3_outer(true).await;
     }
 
     #[tokio::test]
