@@ -429,7 +429,7 @@ const LIST_CURSOR_SOURCE_INDEX_METADATA_FAST: &str = "index_metadata_fast";
 const LIST_CURSOR_GENERATION_LIVE: &str = "live";
 const DEFAULT_API_LIST_QUORUM: &str = "strict";
 const ENV_API_LIST_OBJECTS_QUORUM: &str = "RUSTFS_LIST_OBJECTS_QUORUM";
-const DEFAULT_API_LIST_OBJECTS_QUORUM: &str = "optimal";
+const DEFAULT_API_LIST_OBJECTS_QUORUM: &str = "strict";
 
 /// Identifies the source that produced a ListObjects page.
 ///
@@ -5620,9 +5620,9 @@ mod test {
 
     #[test]
     #[serial_test::serial]
-    fn list_objects_quorum_from_env_defaults_to_optimal() {
+    fn list_objects_quorum_from_env_defaults_to_strict() {
         temp_env::with_var_unset(ENV_API_LIST_OBJECTS_QUORUM, || {
-            assert_eq!(list_objects_quorum_from_env(), "optimal");
+            assert_eq!(list_objects_quorum_from_env(), "strict");
         });
     }
 
