@@ -57,7 +57,7 @@ impl HealManager {
             "Heal auto disk scanner started"
         );
 
-        tokio::spawn(async move {
+        self.workers.spawn_fixed(1, move |_parent| async move {
             let mut interval = interval(duration);
 
             loop {
@@ -793,7 +793,7 @@ impl HealManager {
                     }
                 }
             }
-        });
+        })?;
         Ok(())
     }
 }

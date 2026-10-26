@@ -28,6 +28,7 @@ use tempfile::TempDir;
 
 pub(super) mod admin_overlap;
 mod admission_timing;
+mod owned_workers;
 mod root_recovery;
 use uuid::Uuid;
 mod auto_scan;
