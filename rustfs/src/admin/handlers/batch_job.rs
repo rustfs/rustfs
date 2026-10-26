@@ -35,9 +35,10 @@
 //! When RustFS grows a real batch-job engine, these handlers should be rewired to
 //! it; the request parsing and response shapes here are intended to stay stable.
 
-use crate::admin::auth::authorize_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::utils::{extract_query_params, json_response, read_compatible_admin_body};
+use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
+use crate::admin::utils::{extract_query_params, owned_json_response, read_compatible_admin_body};
 use crate::server::ADMIN_PREFIX;
 use http::Uri;
 use hyper::{Method, StatusCode};
@@ -46,7 +47,6 @@ use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
-use s3s::{Body, S3Request, S3Response};
 use serde::Serialize;
 use tracing::warn;
 
@@ -57,8 +57,8 @@ use tracing::warn;
 /// (`NotImplemented`) from "unknown job type" (`InvalidRequest`).
 const KNOWN_JOB_TYPES: &[&str] = &["replicate", "keyrotate", "expire"];
 
-async fn validate_batch_job_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<Credentials> {
-    authorize_admin_request(req, vec![Action::AdminAction(action)]).await
+async fn validate_batch_job_admin_request(req: &AdminRequest, action: AdminAction) -> S3Result<Credentials> {
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await
 }
 
 /// Best-effort detection of the declared job type from a MinIO batch-job
@@ -140,10 +140,11 @@ pub struct StartBatchJobHandler {}
 
 #[async_trait::async_trait]
 impl Operation for StartBatchJobHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_batch_job_admin_request(&req, AdminAction::StartBatchJobAction).await?;
 
-        let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key).await?;
+        let body =
+            read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, req.uri().path(), &cred.secret_key).await?;
 
         if body.trim_ascii().is_empty() {
             return Err(s3_error!(InvalidRequest, "batch job definition is required"));
@@ -177,10 +178,10 @@ pub struct ListBatchJobsHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ListBatchJobsHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_batch_job_admin_request(&req, AdminAction::ListBatchJobsAction).await?;
 
-        let queries = extract_query_params(&req.uri);
+        let queries = extract_query_params(req.uri());
         if let Some(job_type) = queries.get("jobType").filter(|v| !v.is_empty()) {
             let job_type = job_type.to_ascii_lowercase();
             if !KNOWN_JOB_TYPES.contains(&job_type.as_str()) {
@@ -188,7 +189,7 @@ impl Operation for ListBatchJobsHandler {
             }
         }
 
-        json_response(StatusCode::OK, &ListBatchJobsResult { jobs: Vec::new() })
+        owned_json_response(StatusCode::OK, &ListBatchJobsResult { jobs: Vec::new() })
     }
 }
 
@@ -200,9 +201,9 @@ pub struct StatusBatchJobHandler {}
 
 #[async_trait::async_trait]
 impl Operation for StatusBatchJobHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_batch_job_admin_request(&req, AdminAction::DescribeBatchJobAction).await?;
-        let job_id = require_job_id(&req.uri)?;
+        let job_id = require_job_id(req.uri())?;
         Err(no_such_job(&job_id))
     }
 }
@@ -215,9 +216,9 @@ pub struct DescribeBatchJobHandler {}
 
 #[async_trait::async_trait]
 impl Operation for DescribeBatchJobHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_batch_job_admin_request(&req, AdminAction::DescribeBatchJobAction).await?;
-        let job_id = require_job_id(&req.uri)?;
+        let job_id = require_job_id(req.uri())?;
         Err(no_such_job(&job_id))
     }
 }
@@ -230,9 +231,9 @@ pub struct CancelBatchJobHandler {}
 
 #[async_trait::async_trait]
 impl Operation for CancelBatchJobHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_batch_job_admin_request(&req, AdminAction::CancelBatchJobAction).await?;
-        let job_id = require_job_id(&req.uri)?;
+        let job_id = require_job_id(req.uri())?;
         Err(no_such_job(&job_id))
     }
 }

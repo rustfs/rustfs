@@ -101,6 +101,28 @@ pub(crate) fn admin_json_response<T: serde::Serialize>(
     Ok(s3s::S3Response::with_headers((status, s3s::Body::from(body)), header))
 }
 
+/// Owned-boundary form of [`admin_json_response`]: the same compat-prefix
+/// encryption decision, `Content-Type`, and bytes, as an `AdminResponse`.
+pub(crate) fn owned_admin_json_response<T: serde::Serialize>(
+    path: &str,
+    secret_key: &str,
+    status: http::StatusCode,
+    payload: &T,
+) -> rustfs_s3_types::S3Result<crate::admin::operation::AdminResponse> {
+    let body = serde_json::to_vec(payload).map_err(|e| {
+        rustfs_s3_types::S3Error::with_message(rustfs_s3_types::S3ErrorCode::InternalError, format!("serialize error: {e}"))
+    })?;
+    let (body, content_type) = crate::admin::utils::encode_compatible_admin_payload(path, secret_key, body)?;
+
+    let mut header = hyper::HeaderMap::new();
+    header.insert(http::header::CONTENT_TYPE, content_type.parse().expect("valid header value"));
+    Ok(crate::admin::operation::AdminResponse::with_headers(
+        status,
+        rustfs_s3_types::Body::from(body),
+        header,
+    ))
+}
+
 pub(crate) async fn supervise_admin_mutation<T>(
     operation: &'static str,
     mutation: impl std::future::Future<Output = rustfs_s3_types::S3Result<T>> + Send + 'static,
@@ -117,6 +139,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn owned_admin_json_response_matches_the_legacy_shape_on_both_prefixes() {
+        let payload = serde_json::json!({"users": ["alice", "bob"]});
+
+        let mut legacy = admin_json_response("/rustfs/admin/v3/list-users", "secret", http::StatusCode::OK, &payload)
+            .expect("legacy serializes");
+        let (status, headers, mut body) =
+            owned_admin_json_response("/rustfs/admin/v3/list-users", "secret", http::StatusCode::OK, &payload)
+                .expect("owned serializes")
+                .into_parts();
+        assert_eq!(status, legacy.output.0);
+        assert_eq!(headers, legacy.headers);
+        assert_eq!(
+            body.store_all_limited(4096).await.expect("owned body reads"),
+            legacy.output.1.store_all_limited(4096).await.expect("legacy body reads")
+        );
+
+        let legacy = admin_json_response("/minio/admin/v3/list-users", "secret", http::StatusCode::OK, &payload)
+            .expect("legacy serializes compat payload");
+        let (status, headers, mut body) =
+            owned_admin_json_response("/minio/admin/v3/list-users", "secret", http::StatusCode::OK, &payload)
+                .expect("owned serializes compat payload")
+                .into_parts();
+        assert_eq!(status, legacy.output.0);
+        assert_eq!(headers, legacy.headers);
+        assert_eq!(
+            headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        let encrypted = body.store_all_limited(4096).await.expect("owned compat body reads");
+        let decrypted = rustfs_crypto::decrypt_stream_io(b"secret", &encrypted).expect("owned compat payload decrypts");
+        assert_eq!(decrypted, serde_json::to_vec(&payload).expect("payload serializes"));
+    }
 
     #[test]
     fn test_handler_struct_creation() {

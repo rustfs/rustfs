@@ -12,15 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::router::Operation;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::runtime_sources::current_endpoints_handle;
 use crate::admin::storage_api::runtime::PeerRestClient;
-use http::StatusCode;
 use hyper::Uri;
 use matchit::Params;
 use rustfs_madmin::service_commands::ServiceTraceOpts;
 use rustfs_s3_types::{S3Result, s3_error};
-use s3s::{Body, S3Request, S3Response};
 
 fn extract_trace_options(uri: &Uri) -> S3Result<ServiceTraceOpts> {
     let mut st_opts = ServiceTraceOpts::default();
@@ -35,8 +33,8 @@ pub struct Trace {}
 
 #[async_trait::async_trait]
 impl Operation for Trace {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let _trace_opts = extract_trace_options(&req.uri)?;
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let _trace_opts = extract_trace_options(req.uri())?;
 
         // let (tx, rx) = mpsc::channel(10000);
         let _peers = match current_endpoints_handle() {

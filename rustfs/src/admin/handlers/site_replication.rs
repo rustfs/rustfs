@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::authorize_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{
     current_deployment_id, current_iam_handle, current_object_store_handle, current_oidc_config_query, current_region,
     current_replication_pool_handle, current_replication_stats_handle, current_server_config, current_token_signing_key,
-    object_store_from_req,
+    object_store_from_envelope,
 };
 use crate::admin::storage_api::bucket::metadata::{
     BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
@@ -40,7 +41,7 @@ use crate::admin::storage_api::contract::bucket::{
     BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp,
 };
 use crate::admin::storage_api::error::{Error as StorageError, is_err_bucket_not_found};
-use crate::admin::utils::{empty_response, json_response, read_compatible_admin_body};
+use crate::admin::utils::{owned_empty_response, owned_json_response, read_compatible_admin_body};
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
 use crate::site_replication::identity::{
@@ -50,8 +51,8 @@ use crate::site_replication::identity::{
 use crate::storage::storage_api::{lock_bucket_targets_metadata, with_config_object_write_lock};
 use crate::storage_api::site_replication::{format_lifecycle_date, parse_lifecycle_date};
 use base64_simd::URL_SAFE_NO_PAD;
-use futures::StreamExt;
 use http::Uri;
+use http_body_util::BodyExt;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::{DEFAULT_DELIMITER, MAX_ADMIN_REQUEST_BODY_SIZE};
@@ -81,8 +82,7 @@ use rustfs_policy::policy::{
     Policy,
     action::{Action, AdminAction},
 };
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
-use s3s::{Body, S3Request, S3Response};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -532,10 +532,10 @@ pub fn register_site_replication_route(r: &mut S3Router<AdminOperation>) -> std:
 }
 
 async fn validate_site_replication_admin_request(
-    req: &S3Request<Body>,
+    req: &AdminRequest,
     action: AdminAction,
 ) -> S3Result<rustfs_credentials::Credentials> {
-    authorize_admin_request(req, vec![Action::AdminAction(action)]).await
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await
 }
 
 fn reject_site_replicator_on_public_admin(cred: &rustfs_credentials::Credentials) -> S3Result<()> {
@@ -548,9 +548,9 @@ fn reject_site_replicator_on_public_admin(cred: &rustfs_credentials::Credentials
     Ok(())
 }
 
-fn go_gob_site_netperf_response(value: &SiteNetPerfNodeResult) -> S3Response<(StatusCode, Body)> {
+fn go_gob_site_netperf_response(value: &SiteNetPerfNodeResult) -> AdminResponse {
     let data = encode_go_gob_site_netperf_node_result(value);
-    S3Response::new((StatusCode::OK, Body::from(data)))
+    AdminResponse::new(StatusCode::OK, Body::from(data))
 }
 
 fn encode_go_gob_site_netperf_node_result(value: &SiteNetPerfNodeResult) -> Vec<u8> {
@@ -638,7 +638,7 @@ async fn read_plain_admin_body(mut input: Body) -> S3Result<Vec<u8>> {
 }
 
 async fn read_site_replication_json<T: DeserializeOwned>(
-    req: S3Request<Body>,
+    req: AdminRequest,
     secret_key: &str,
     compat_encrypted: bool,
 ) -> S3Result<T> {
@@ -646,11 +646,11 @@ async fn read_site_replication_json<T: DeserializeOwned>(
     parse_site_replication_json(&body)
 }
 
-async fn read_site_replication_body(req: S3Request<Body>, secret_key: &str, compat_encrypted: bool) -> S3Result<Vec<u8>> {
+async fn read_site_replication_body(mut req: AdminRequest, secret_key: &str, compat_encrypted: bool) -> S3Result<Vec<u8>> {
     let body = if compat_encrypted {
-        read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), secret_key).await?
+        read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, req.uri().path(), secret_key).await?
     } else {
-        read_plain_admin_body(req.input).await?
+        read_plain_admin_body(req.take_body()).await?
     };
     Ok(body)
 }
@@ -785,8 +785,8 @@ fn non_negative_u64(value: i64) -> u64 {
     value.max(0) as u64
 }
 
-fn current_local_peer(req: &S3Request<Body>, state: &SiteReplicationState) -> PeerInfo {
-    local_peer_at_endpoint(site_replication_local_endpoint(&req.uri, &req.headers), state)
+fn current_local_peer(req: &AdminRequest, state: &SiteReplicationState) -> PeerInfo {
+    local_peer_at_endpoint(site_replication_local_endpoint(req.uri(), req.headers()), state)
 }
 
 fn existing_peer_for_endpoint(state: &SiteReplicationState, endpoint: &str) -> Option<PeerInfo> {
@@ -6892,11 +6892,11 @@ fn ensure_add_bucket_set_matches_preflight(expected: &HashSet<String>, present: 
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationAddHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
-        let replicate_ilm_expiry = sr_add_replicate_ilm_expiry(&req.uri);
-        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
+        let replicate_ilm_expiry = sr_add_replicate_ilm_expiry(req.uri());
+        let local_endpoint = site_replication_local_endpoint(req.uri(), req.headers());
         let lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
         let mut sites: Vec<PeerSite> = read_site_replication_json(req, &cred.secret_key, true).await?;
         let admin_access_key = cred.access_key.clone();
@@ -7122,7 +7122,7 @@ impl Operation for SiteReplicationAddHandler {
         // response below (BUG2) rather than swallowed; they do not abort the overall add.
         initial_sync_errors.extend(backfill_existing_buckets_after_add(&state, &local_peer, None).await);
 
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &ReplicateAddStatus {
                 success: true,
@@ -7139,7 +7139,7 @@ pub struct SiteReplicationRemoveHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationRemoveHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationRemoveAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
@@ -7147,7 +7147,7 @@ impl Operation for SiteReplicationRemoveHandler {
         // transaction: a client that stalls mid-body must hold neither the
         // state-object lock nor the write half of the bucket-op RwLock (which
         // would starve every bucket-operation hook in the meantime).
-        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
+        let local_endpoint = site_replication_local_endpoint(req.uri(), req.headers());
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
         let (pending_remove, local_peer) = {
             let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
@@ -7205,7 +7205,7 @@ impl Operation for SiteReplicationRemoveHandler {
             site_replication_remove_status(&peer_errors)
         };
 
-        json_response(StatusCode::OK, &status)
+        owned_json_response(StatusCode::OK, &status)
     }
 }
 
@@ -7232,11 +7232,11 @@ pub struct SiteReplicationInfoHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationInfoHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationInfoAction).await?;
         let state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
-        json_response(StatusCode::OK, &site_replication_info_for(&state, &local_peer))
+        owned_json_response(StatusCode::OK, &site_replication_info_for(&state, &local_peer))
     }
 }
 
@@ -7244,13 +7244,13 @@ pub struct SiteReplicationMetaInfoHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationMetaInfoHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationInfoAction).await?;
         let state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
-        let opts = sr_status_options(&req.uri);
+        let opts = sr_status_options(req.uri());
         let info = filter_sr_info(build_sr_info(&state, &local_peer).await?, &opts);
-        json_response(StatusCode::OK, &info)
+        owned_json_response(StatusCode::OK, &info)
     }
 }
 
@@ -7258,12 +7258,12 @@ pub struct SiteReplicationStatusHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationInfoAction).await?;
         let state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
-        let status = build_status_info(&state, &local_peer, &req.uri).await?;
-        json_response(StatusCode::OK, &status)
+        let status = build_status_info(&state, &local_peer, req.uri()).await?;
+        owned_json_response(StatusCode::OK, &status)
     }
 }
 
@@ -7273,8 +7273,8 @@ impl Operation for SiteReplicationStatusHandler {
 /// buffering through the 1MB admin body cap turned any larger probe into a
 /// 400 and a false link failure. Stream and discard instead — no size cap.
 async fn drain_site_replication_devnull(mut input: Body) -> S3Result<()> {
-    while let Some(chunk) = input.next().await {
-        chunk.map_err(|e| s3_error!(InvalidRequest, "failed to read devnull stream: {}", e))?;
+    while let Some(frame) = input.frame().await {
+        frame.map_err(|e| s3_error!(InvalidRequest, "failed to read devnull stream: {}", e))?;
     }
     Ok(())
 }
@@ -7283,10 +7283,10 @@ pub struct SiteReplicationDevNullHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationDevNullHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
-        drain_site_replication_devnull(req.input).await?;
-        Ok(empty_response(StatusCode::NO_CONTENT))
+        drain_site_replication_devnull(req.take_body()).await?;
+        Ok(owned_empty_response(StatusCode::NO_CONTENT))
     }
 }
 
@@ -7306,9 +7306,9 @@ fn unsupported_site_netperf_result(endpoint: String) -> SiteNetPerfNodeResult {
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationNetPerfHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
-        let endpoint = request_endpoint(&req.uri, &req.headers);
+        let endpoint = request_endpoint(req.uri(), req.headers());
         Ok(go_gob_site_netperf_response(&unsupported_site_netperf_result(endpoint)))
     }
 }
@@ -7516,11 +7516,13 @@ fn applied_join_response(peer: PeerInfo, initial_sync_error_message: String) -> 
 
 #[async_trait::async_trait]
 impl Operation for SRPeerJoinHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
-        let bootstrap_token = site_replication_bootstrap_token(&req.uri);
-        let initial_sync_only = query_pairs(&req.uri).get("initial-sync").is_some_and(|value| value == "true");
-        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
+        let bootstrap_token = site_replication_bootstrap_token(req.uri());
+        let initial_sync_only = query_pairs(req.uri())
+            .get("initial-sync")
+            .is_some_and(|value| value == "true");
+        let local_endpoint = site_replication_local_endpoint(req.uri(), req.headers());
         // The body is fully read before the admission takes the lifecycle
         // guard: a sender that stalls mid-body must not block this node's
         // add/remove/rotate/reconciler.
@@ -7556,14 +7558,14 @@ impl Operation for SRPeerJoinHandler {
                     result = "join_superseded",
                     "admin site replication state"
                 );
-                return json_response(StatusCode::OK, &superseded_join_response(peer));
+                return owned_json_response(StatusCode::OK, &superseded_join_response(peer));
             }
         };
         if defer_initial_sync && !initial_sync_only {
             let mut response =
                 applied_join_response(state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer), String::new());
             response.initial_sync_deferred = true;
-            return json_response(StatusCode::OK, &response);
+            return owned_json_response(StatusCode::OK, &response);
         }
         // Fix 1 (receiving side): ensure the joining peer also sets up replication for any
         // buckets it already owns so the reverse direction works from the start. Per-bucket
@@ -7581,7 +7583,7 @@ impl Operation for SRPeerJoinHandler {
                 "admin site replication state"
             );
         }
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &applied_join_response(
                 state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
@@ -7608,11 +7610,11 @@ pub struct SRPeerBucketOpsHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SRPeerBucketOpsHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
         let state = load_site_replication_state().await?;
-        let queries = query_pairs(&req.uri);
+        let queries = query_pairs(req.uri());
         let bucket = queries
             .get("bucket")
             .filter(|bucket| !bucket.is_empty())
@@ -7634,7 +7636,7 @@ impl Operation for SRPeerBucketOpsHandler {
             return Err(s3_error!(InvalidRequest, "site replication is not enabled"));
         }
 
-        let Some(store) = object_store_from_req(&req) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -7720,7 +7722,7 @@ impl Operation for SRPeerBucketOpsHandler {
             _ => return Err(s3_error!(InvalidRequest, "unsupported site replication bucket operation")),
         }
 
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -7728,11 +7730,11 @@ pub struct SRPeerReplicateIAMItemHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SRPeerReplicateIAMItemHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         let item: SRIAMItem = read_site_replication_json(req, "", false).await?;
         apply_iam_item(item).await?;
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -7740,11 +7742,11 @@ pub struct SRPeerReplicateBucketItemHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SRPeerReplicateBucketItemHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         let item: SRBucketMeta = read_site_replication_json(req, "", false).await?;
         apply_bucket_meta_item(item).await?;
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -7752,10 +7754,10 @@ pub struct SRPeerGetIDPSettingsHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SRPeerGetIDPSettingsHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
 
-        json_response(StatusCode::OK, &local_idp_settings())
+        owned_json_response(StatusCode::OK, &local_idp_settings())
     }
 }
 
@@ -7763,10 +7765,10 @@ pub struct SiteReplicationEditHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationEditHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
-        let ilm_expiry_override = sr_edit_ilm_expiry_override(&req.uri);
+        let ilm_expiry_override = sr_edit_ilm_expiry_override(req.uri());
         let body = read_site_replication_body(req, &cred.secret_key, true).await?;
         let (mut incoming, tls_presence) = parse_public_peer_edit(&body)?;
         // Planning snapshot: every commit below re-loads the state inside its
@@ -8041,7 +8043,7 @@ impl Operation for SiteReplicationEditHandler {
             }
         }
 
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &ReplicateEditStatus {
                 success: true,
@@ -8057,12 +8059,12 @@ pub struct SRPeerEditCapabilitiesHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SRPeerEditCapabilitiesHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &ReplicateEditStatus {
-                success: query_pairs(&req.uri)
+                success: query_pairs(req.uri())
                     .get("capability")
                     .is_some_and(|value| peer_edit_capability_supported(value)),
                 status: SITE_REPL_EDIT_SUCCESS.to_string(),
@@ -8091,13 +8093,13 @@ enum PeerEditOutcome {
 
 #[async_trait::async_trait]
 impl Operation for SRPeerEditHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
-        let queries = query_pairs(&req.uri);
-        let ilm_expiry_override = sr_edit_ilm_expiry_override(&req.uri);
+        let queries = query_pairs(req.uri());
+        let ilm_expiry_override = sr_edit_ilm_expiry_override(req.uri());
         let endpoint_refresh_requested = queries.get("refresh-targets").is_some_and(|value| value == "true");
         let commit_fence = peer_edit_fence(&queries);
-        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
+        let local_endpoint = site_replication_local_endpoint(req.uri(), req.headers());
         let (refresh_id, incoming) = if endpoint_refresh_requested {
             let refresh: EndpointRefreshRequest = read_site_replication_json(req, "", false).await?;
             (Some(refresh.id), refresh.peer)
@@ -8191,7 +8193,7 @@ impl Operation for SRPeerEditHandler {
         let service_account_access_key = match outcome {
             PeerEditOutcome::Applied(service_account_access_key) => service_account_access_key,
             PeerEditOutcome::Acked => {
-                return json_response(
+                return owned_json_response(
                     StatusCode::OK,
                     &ReplicateEditStatus {
                         success: true,
@@ -8202,7 +8204,7 @@ impl Operation for SRPeerEditHandler {
                 );
             }
             PeerEditOutcome::Rejected(err_detail) => {
-                return json_response(
+                return owned_json_response(
                     StatusCode::OK,
                     &ReplicateEditStatus {
                         success: false,
@@ -8215,7 +8217,7 @@ impl Operation for SRPeerEditHandler {
         };
         if endpoint_refresh_requested {
             if service_account_access_key.is_empty() {
-                return json_response(
+                return owned_json_response(
                     StatusCode::OK,
                     &ReplicateEditStatus {
                         success: false,
@@ -8241,7 +8243,7 @@ impl Operation for SRPeerEditHandler {
             })
             .await?;
             if !committed {
-                return json_response(
+                return owned_json_response(
                     StatusCode::OK,
                     &ReplicateEditStatus {
                         success: false,
@@ -8251,7 +8253,7 @@ impl Operation for SRPeerEditHandler {
                     },
                 );
             }
-            return json_response(
+            return owned_json_response(
                 StatusCode::OK,
                 &ReplicateEditStatus {
                     success: true,
@@ -8261,7 +8263,7 @@ impl Operation for SRPeerEditHandler {
                 },
             );
         }
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -8269,7 +8271,7 @@ pub struct SRPeerRemoveHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SRPeerRemoveHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationRemoveAction).await?;
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
@@ -8302,7 +8304,7 @@ impl Operation for SRPeerRemoveHandler {
             );
         }
 
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -8310,11 +8312,11 @@ pub struct SiteReplicationResyncOpHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationResyncOpHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationResyncAction).await?;
-        let query = query_pairs(&req.uri);
+        let query = query_pairs(req.uri());
         let operation = query.get("operation").cloned().unwrap_or_default();
-        let resolved_store = object_store_from_req(&req);
+        let resolved_store = object_store_from_envelope(req.envelope());
         let requested_peer: PeerInfo = read_site_replication_json(req, "", false).await?;
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
         let (peer, existing_status) = {
@@ -8466,7 +8468,7 @@ impl Operation for SiteReplicationResyncOpHandler {
             .buckets
             .sort_by(|left, right| left.bucket.cmp(&right.bucket).then(left.target_arn.cmp(&right.target_arn)));
         let (limit, offset) = parse_site_resync_page(&query, &status)?;
-        json_response(StatusCode::OK, &site_resync_page(&status, limit, offset)?)
+        owned_json_response(StatusCode::OK, &site_resync_page(&status, limit, offset)?)
     }
 }
 
@@ -8474,7 +8476,7 @@ pub struct SRStateEditHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SRStateEditHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let body: SRStateEditReq = read_site_replication_json(req, "", false).await?;
@@ -8483,7 +8485,7 @@ impl Operation for SRStateEditHandler {
             Ok(())
         })
         .await?;
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -8491,7 +8493,7 @@ pub struct SiteReplicationRepairHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationRepairHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let state = load_site_replication_state().await?;
@@ -8512,7 +8514,7 @@ impl Operation for SiteReplicationRepairHandler {
             if body.preflight_token.is_some() || body.operation_id.is_some() {
                 return Err(s3_error!(InvalidRequest, "dry-run does not accept preflightToken or operationId"));
             }
-            return json_response(
+            return owned_json_response(
                 StatusCode::OK,
                 &SiteReplicationRepairPreflight {
                     mode: "dry-run",
@@ -8544,13 +8546,18 @@ impl Operation for SiteReplicationRepairHandler {
                 .to_string(),
             None => Uuid::new_v4().to_string(),
         };
-        execute_site_replication_repair(SiteReplicationRepairExecutionRequest {
+        let response = execute_site_replication_repair(SiteReplicationRepairExecutionRequest {
             local_peer,
             preflight_token: supplied_token.to_string(),
             operation_id,
             signing_key,
         })
-        .await
+        .await?;
+        // The repair executor still answers with the s3s response type; the
+        // router reads the status from the output tuple, so only the tuple and
+        // the headers carry over to the owned response.
+        let (status, body) = response.output;
+        Ok(AdminResponse::with_headers(status, body.into(), response.headers))
     }
 }
 
@@ -8558,11 +8565,11 @@ pub struct SiteReplicationRepairStatusHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationRepairStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let operation_id = req
-            .uri
+            .uri()
             .query()
             .and_then(|query| {
                 form_urlencoded::parse(query.as_bytes())
@@ -8578,7 +8585,7 @@ impl Operation for SiteReplicationRepairStatusHandler {
             .get(&operation_id)
             .cloned()
             .ok_or_else(|| s3_error!(InvalidRequest, "repair operation was not found"))?;
-        json_response(StatusCode::OK, &site_replication_repair_operation_response(&operation))
+        owned_json_response(StatusCode::OK, &site_replication_repair_operation_response(&operation))
     }
 }
 
@@ -8601,7 +8608,7 @@ pub struct SRRotateServiceAccountHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SRRotateServiceAccountHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         // The lifecycle guard is what keeps the rotation's IAM writes and the
@@ -8612,7 +8619,7 @@ impl Operation for SRRotateServiceAccountHandler {
         // stale one. (The removed process mutex used to provide this
         // exclusion as a side effect.)
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
-        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
+        let local_endpoint = site_replication_local_endpoint(req.uri(), req.headers());
         let rotation_parent = cred.access_key.clone();
         let (pending_rotation, local_peer, previous_access_key) = update_site_replication_state_when_changed(move |state| {
             if !state.enabled() {
@@ -8673,7 +8680,7 @@ impl Operation for SRRotateServiceAccountHandler {
             peer_errors.push("service account rotation is still pending".to_string());
         }
 
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &ReplicateEditStatus {
                 success: complete && peer_errors.is_empty(),

@@ -12,16 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::{
-    auth::authorize_admin_request,
+    auth::authorize_admin_envelope,
     handlers::audit_runtime_config::{load_server_config_from_store, update_audit_config_and_reload},
     handlers::target_descriptor::{
         AdminTargetSpec, EndpointKey, RuntimeHealthStatus, TargetEndpointSource, admin_target_spec_from_builtin,
-        build_enabled_target_kvs, build_json_response, collect_runtime_statuses, extract_supported_target_params,
-        merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
+        build_enabled_target_kvs, collect_runtime_statuses, extract_supported_target_params,
+        merge_target_endpoints as shared_merge_target_endpoints, owned_build_json_response, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason,
     },
-    router::{AdminOperation, Operation, S3Router},
+    router::{AdminOperation, S3Router},
 };
 use crate::server::{
     ADMIN_PREFIX, is_audit_module_enabled, refresh_audit_module_enabled, refresh_persisted_module_switches_from_store,
@@ -34,9 +35,8 @@ use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
 use rustfs_config::server_config::Config;
 use rustfs_config::{AUDIT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Result, s3_error};
 use rustfs_targets::catalog::builtin::builtin_audit_target_admin_descriptors;
-use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -215,11 +215,11 @@ fn audit_target_specs() -> &'static [AdminTargetSpec] {
 
 /// The pre-check keeps these endpoints' historical missing-credentials message;
 /// the shared gate reports "get cred failed".
-async fn authorize_audit_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize_audit_admin_request(req: &AdminRequest, action: AdminAction) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "credentials not found"));
     }
-    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await?;
     Ok(())
 }
 
@@ -277,7 +277,7 @@ pub struct AuditTargetConfig {}
 
 #[async_trait::async_trait]
 impl Operation for AuditTargetConfig {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (target_type, target_name) = extract_target_params(&params)?;
 
         authorize_audit_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
@@ -291,7 +291,7 @@ impl Operation for AuditTargetConfig {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
-        let mut input = req.input;
+        let mut input = req.take_body();
         let body_bytes = input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await.map_err(|e| {
             log_audit_target_body_read_failed!(target_type, target_name, e);
             s3_error!(InvalidRequest, "failed to read request body")
@@ -334,7 +334,11 @@ impl Operation for AuditTargetConfig {
         })?;
         log_audit_target_config_updated!("set_audit_target_config", target_type, target_name);
 
-        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::empty(),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
@@ -342,7 +346,7 @@ pub struct ListAuditTargets {}
 
 #[async_trait::async_trait]
 impl Operation for ListAuditTargets {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_audit_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
 
         let mut runtime_statuses = HashMap::new();
@@ -357,7 +361,11 @@ impl Operation for ListAuditTargets {
             s3_error!(InternalError, "failed to serialize audit targets: {}", e)
         })?;
 
-        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::from(data),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
@@ -365,7 +373,7 @@ pub struct RemoveAuditTarget {}
 
 #[async_trait::async_trait]
 impl Operation for RemoveAuditTarget {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (target_type, target_name) = extract_target_params(&params)?;
 
         authorize_audit_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
@@ -405,7 +413,11 @@ impl Operation for RemoveAuditTarget {
         })?;
         log_audit_target_config_updated!("remove_audit_target_config", target_type, target_name);
 
-        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::empty(),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
@@ -829,17 +841,11 @@ mod tests {
     /// message they have always returned (rustfs/backlog#1829).
     #[tokio::test]
     async fn audit_target_gate_keeps_its_missing_credentials_message() {
-        let req = S3Request {
-            input: Body::from(String::new()),
-            method: Method::PUT,
-            uri: http::Uri::from_static("/rustfs/admin/v3/audit/target"),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let req = crate::admin::operation::test_support::TestRequest::new(Method::PUT, "/rustfs/admin/v3/audit/target")
+            .headers(http::HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::from(String::new()))
+            .build();
 
         let err = authorize_audit_admin_request(&req, AdminAction::SetBucketTargetAction)
             .await

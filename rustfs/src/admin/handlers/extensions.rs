@@ -12,17 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::storage_api::cluster::CapabilityStatus;
 use crate::admin::{
-    auth::authorize_admin_request,
+    auth::authorize_admin_envelope,
     handlers::{cluster_snapshot, plugins_instances, system},
     plugin_contract::{
         PluginContractDomain, PluginInstanceDiagnosticCode, PluginInstanceDiagnosticCount, PluginInstanceEntry,
         PluginInstanceSource, PluginOperationalStateContract,
     },
-    router::{AdminOperation, Operation, S3Router},
+    router::{AdminOperation, S3Router},
 };
 use crate::server::ADMIN_PREFIX;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
@@ -31,14 +33,12 @@ use rustfs_extension_schema::{
     OPS_PROFILER_CAPABILITY, OpsDiagnosticsContract, OpsProfilerContract,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Result, s3_error};
 use rustfs_targets::{
     TargetPluginExternalFlowGate, TargetPluginExternalFlowGateStatus, builtin_extension_schemas,
     builtin_ops_diagnostics_contract, builtin_ops_diagnostics_extension_schema, builtin_ops_profiler_contract,
     builtin_ops_profiler_extension_schema,
 };
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -185,50 +185,46 @@ fn map_extension_instance(instance: PluginInstanceEntry) -> ExtensionInstanceEnt
 
 /// The pre-check keeps this endpoint's historical missing-credentials message;
 /// the shared gate reports "get cred failed".
-async fn authorize_extension_catalog_request(req: &S3Request<Body>) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize_extension_catalog_request(req: &AdminRequest) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     }
 
-    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await?;
     Ok(())
 }
 
 /// The pre-check keeps this endpoint's historical missing-credentials message;
 /// the shared gate reports "get cred failed".
-async fn authorize_extension_instance_request(req: &S3Request<Body>) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize_extension_instance_request(req: &AdminRequest) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     }
 
-    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::GetBucketTargetAction)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::GetBucketTargetAction)]).await?;
     Ok(())
 }
 
-fn build_json_response(
-    status: StatusCode,
-    body: &impl Serialize,
-    request_id: Option<&HeaderValue>,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn build_json_response(status: StatusCode, body: &impl Serialize, request_id: Option<&HeaderValue>) -> S3Result<AdminResponse> {
     let data = serde_json::to_vec(body).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
     let mut header = HeaderMap::new();
     header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     if let Some(value) = request_id {
         header.insert("x-request-id", value.clone());
     }
-    Ok(S3Response::with_headers((status, Body::from(data)), header))
+    Ok(AdminResponse::with_headers(status, Body::from(data), header))
 }
 
 pub struct GetExtensionCatalogHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetExtensionCatalogHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_extension_catalog_request(&req).await?;
         let response = build_extension_catalog_response()
             .await
             .map_err(|err| s3_error!(InternalError, "failed to build extension catalog response: {}", err))?;
-        build_json_response(StatusCode::OK, &response, req.headers.get("x-request-id"))
+        build_json_response(StatusCode::OK, &response, req.headers().get("x-request-id"))
     }
 }
 
@@ -236,9 +232,9 @@ pub struct ListExtensionInstancesHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ListExtensionInstancesHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_extension_instance_request(&req).await?;
-        let filters = plugins_instances::extract_plugin_instance_filters(&req)?;
+        let filters = plugins_instances::extract_plugin_instance_filters(req.uri())?;
         let instances = plugins_instances::filter_plugin_instances(plugins_instances::collect_all_instances().await?, &filters);
         let diagnostic_counts = plugins_instances::collect_diagnostic_counts(&instances);
         let (instances, truncated, next_marker) = plugins_instances::paginate_plugin_instances(instances, &filters)?;
@@ -248,7 +244,7 @@ impl Operation for ListExtensionInstancesHandler {
             truncated,
             next_marker,
         };
-        build_json_response(StatusCode::OK, &response, req.headers.get("x-request-id"))
+        build_json_response(StatusCode::OK, &response, req.headers().get("x-request-id"))
     }
 }
 
@@ -265,6 +261,7 @@ mod tests {
         ExtensionKind, ExtensionRuntimeBoundary, OPS_DIAGNOSTICS_CAPABILITY, OPS_PROFILER_CAPABILITY, validate_extension_schemas,
         validate_ops_diagnostics_contract, validate_ops_profiler_contract,
     };
+    use rustfs_s3_types::Body;
     use std::collections::HashMap;
 
     #[test]
@@ -309,16 +306,10 @@ mod tests {
     /// message these endpoints have always returned (rustfs/backlog#1829).
     #[tokio::test]
     async fn extension_gates_keep_their_missing_credentials_message() {
-        let credential_less_request = || s3s::S3Request {
-            input: s3s::Body::from(String::new()),
-            method: http::Method::GET,
-            uri: http::Uri::from_static("/rustfs/admin/v4/extensions/catalog"),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
+        let credential_less_request = || {
+            crate::admin::operation::test_support::TestRequest::new(http::Method::GET, "/rustfs/admin/v4/extensions/catalog")
+                .body(Body::from(String::new()))
+                .build()
         };
 
         for err in [

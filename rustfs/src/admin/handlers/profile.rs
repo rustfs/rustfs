@@ -12,7 +12,11 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::admin::{auth::authorize_admin_request, router::Operation};
+use crate::admin::{
+    auth::{authorize_admin_envelope, authorize_admin_request},
+    router::Operation,
+};
+use crate::app::RequestEnvelope;
 use http::StatusCode;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -28,6 +32,17 @@ pub(super) async fn authorize_profile_request(req: &S3Request<Body>) -> S3Result
     }
 
     authorize_admin_request(req, vec![Action::AdminAction(AdminAction::ProfilingAdminAction)]).await?;
+    Ok(())
+}
+
+/// Owned-boundary form of [`authorize_profile_request`] with the same
+/// `AccessDenied` pre-check.
+pub(super) async fn authorize_profile_envelope(envelope: &RequestEnvelope) -> S3Result<()> {
+    if envelope.credentials().is_none() {
+        return Err(s3_error!(AccessDenied, "Signature is required"));
+    }
+
+    authorize_admin_envelope(envelope, vec![Action::AdminAction(AdminAction::ProfilingAdminAction)]).await?;
     Ok(())
 }
 
@@ -61,7 +76,34 @@ impl Operation for TriggerProfileMemory {
 
 #[cfg(test)]
 mod tests {
-    use super::{TriggerProfileCPU, TriggerProfileMemory};
+    use super::{TriggerProfileCPU, TriggerProfileMemory, authorize_profile_envelope, authorize_profile_request};
+
+    #[tokio::test]
+    async fn authorize_profile_envelope_keeps_the_access_denied_precheck() {
+        let legacy_request = s3s::S3Request {
+            input: s3s::Body::empty(),
+            method: http::Method::GET,
+            uri: http::Uri::from_static("/debug/pprof/cpu"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let legacy = authorize_profile_request(&legacy_request).await.expect_err("no credentials");
+
+        let owned_request =
+            crate::admin::operation::test_support::TestRequest::new(http::Method::GET, "/debug/pprof/cpu").build();
+        let owned = authorize_profile_envelope(owned_request.envelope())
+            .await
+            .expect_err("no credentials");
+
+        assert_eq!(owned.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+        assert_eq!(owned.code(), legacy.code());
+        assert_eq!(owned.message(), Some("Signature is required"));
+        assert_eq!(owned.message(), legacy.message());
+    }
     use crate::admin::router::Operation;
     use crate::server::{PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
     use http::{Extensions, HeaderMap, Uri};

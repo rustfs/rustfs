@@ -16,21 +16,21 @@
 
 use super::kms_audit::{KmsAdminAudit, KmsAdminOperation};
 use crate::admin::auth::{validate_admin_request, validate_admin_request_with_kms_key};
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{current_kms_runtime_service_manager, current_or_init_kms_runtime_service_manager};
 use crate::admin::storage_api::s3;
 use crate::admin::utils::extract_query_params;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::kms_deletion_gate::current_key_impact;
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
+use http::header::CONTENT_TYPE;
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_kms::{KeyImpactReport, KmsAuditOperation, KmsError, types::*};
 use rustfs_policy::policy::action::{Action, KmsAction};
-use rustfs_s3_types::{S3Result, s3_error};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response};
+use rustfs_s3_types::{Body, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
@@ -309,32 +309,24 @@ pub struct CreateKeyHandler {}
 
 #[async_trait::async_trait]
 impl Operation for CreateKeyHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+        let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate(
-            validate_admin_request(
-                &req.headers,
-                &cred,
-                owner,
-                false,
-                kms_create_key_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-            )
-            .await,
+            validate_admin_request(req.headers(), &cred, owner, false, kms_create_key_actions(), req.remote_addr()).await,
             KmsAuditOperation::CreateKey,
             None,
         )?;
 
         let body = req
-            .input
+            .take_body()
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
@@ -354,7 +346,7 @@ impl Operation for CreateKeyHandler {
         };
 
         let tags = request.tags.unwrap_or_default();
-        let key_name = legacy_create_key_name(&req.uri, &tags)?;
+        let key_name = legacy_create_key_name(req.uri(), &tags)?;
 
         let kms_request = CreateKeyRequest {
             key_name,
@@ -378,7 +370,7 @@ impl Operation for CreateKeyHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
-                Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+                Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), headers))
             }
             Err(e) => {
                 error!(
@@ -401,25 +393,25 @@ pub struct DescribeKeyHandler {}
 
 #[async_trait::async_trait]
 impl Operation for DescribeKeyHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let requested_key_id = extract_key_id(&req.uri);
-        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+        let requested_key_id = extract_key_id(req.uri());
+        let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate(
             validate_admin_request_with_kms_key(
-                &req.headers,
+                req.headers(),
                 &cred,
                 owner,
                 false,
                 kms_describe_key_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                req.remote_addr(),
                 requested_key_id.as_deref().unwrap_or_default(),
             )
             .await,
@@ -449,7 +441,7 @@ impl Operation for DescribeKeyHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
-                Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+                Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), headers))
             }
             Err(e) => {
                 error!(
@@ -1472,31 +1464,23 @@ pub struct ListKeysHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ListKeysHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+        let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate(
-            validate_admin_request(
-                &req.headers,
-                &cred,
-                owner,
-                false,
-                kms_list_keys_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-            )
-            .await,
+            validate_admin_request(req.headers(), &cred, owner, false, kms_list_keys_actions(), req.remote_addr()).await,
             KmsAuditOperation::ListKeys,
             None,
         )?;
 
-        let query_params = extract_query_params(&req.uri);
+        let query_params = extract_query_params(req.uri());
         // Validated before the listing runs, so a page size or filter the
         // service cannot apply fails as the input error it is instead of
         // returning the whole key set as if it had been narrowed.
@@ -1531,7 +1515,7 @@ impl Operation for ListKeysHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
-                Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+                Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), headers))
             }
             Err(e) => {
                 error!(
@@ -1554,19 +1538,19 @@ pub struct GenerateDataKeyHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GenerateDataKeyHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
         // The body names the key this endpoint derives a data key from, so it has
         // to be read before the gate runs. Input failures stay deferred until
         // after the gate so an unauthorized caller still sees AccessDenied.
         let parsed = req
-            .input
+            .take_body()
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))
@@ -1575,16 +1559,16 @@ impl Operation for GenerateDataKeyHandler {
                     .map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))
             });
 
-        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+        let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate_admin(
             validate_admin_request_with_kms_key(
-                &req.headers,
+                req.headers(),
                 &cred,
                 owner,
                 false,
                 kms_generate_data_key_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                req.remote_addr(),
                 parsed.as_ref().map(|request| request.key_id.as_str()).unwrap_or_default(),
             )
             .await,
@@ -1625,7 +1609,7 @@ impl Operation for GenerateDataKeyHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
-                Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+                Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), headers))
             }
             Err(e) => {
                 error!(
@@ -1648,32 +1632,24 @@ pub struct CreateKmsKeyHandler;
 
 #[async_trait::async_trait]
 impl Operation for CreateKmsKeyHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+        let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate(
-            validate_admin_request(
-                &req.headers,
-                &cred,
-                owner,
-                false,
-                kms_create_key_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-            )
-            .await,
+            validate_admin_request(req.headers(), &cred, owner, false, kms_create_key_actions(), req.remote_addr()).await,
             KmsAuditOperation::CreateKey,
             None,
         )?;
 
         let body = req
-            .input
+            .take_body()
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
@@ -1699,7 +1675,7 @@ impl Operation for CreateKmsKeyHandler {
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
             headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
-            return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
+            return Ok(AdminResponse::with_headers(StatusCode::SERVICE_UNAVAILABLE, Body::from(data), headers));
         };
 
         let Some(manager) = service_manager.get_manager().await else {
@@ -1713,7 +1689,7 @@ impl Operation for CreateKmsKeyHandler {
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
             headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
-            return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
+            return Ok(AdminResponse::with_headers(StatusCode::SERVICE_UNAVAILABLE, Body::from(data), headers));
         };
 
         // Extract key name from tags if provided
@@ -1753,7 +1729,7 @@ impl Operation for CreateKmsKeyHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
-                Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+                Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), headers))
             }
             Err(e) => {
                 error!(
@@ -1779,7 +1755,7 @@ impl Operation for CreateKmsKeyHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
-                Ok(S3Response::with_headers((status, Body::from(data)), headers))
+                Ok(AdminResponse::with_headers(status, Body::from(data), headers))
             }
         }
     }
@@ -1922,29 +1898,29 @@ pub struct DeleteKmsKeyHandler;
 
 #[async_trait::async_trait]
 impl Operation for DeleteKmsKeyHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
         // Read the body before the gate so the request can be scoped to the key it
         // targets; the read failure is surfaced afterwards to keep AccessDenied
         // ahead of input errors for callers that are not authorized at all.
-        let body = req.input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await;
-        let scoped = body.as_ref().ok().and_then(|body| scoped_key_id(body, &req.uri));
-        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+        let body = req.take_body().store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await;
+        let scoped = body.as_ref().ok().and_then(|body| scoped_key_id(body, req.uri()));
+        let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate(
             validate_admin_request_with_kms_key(
-                &req.headers,
+                req.headers(),
                 &cred,
                 owner,
                 false,
                 kms_delete_key_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                req.remote_addr(),
                 scoped.as_deref().unwrap_or_default(),
             )
             .await,
@@ -1955,14 +1931,14 @@ impl Operation for DeleteKmsKeyHandler {
         let body = body.map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
         let request: DeleteKmsKeyRequest = if body.is_empty() {
-            match delete_request_from_query(&req.uri) {
+            match delete_request_from_query(req.uri()) {
                 Ok(request) => request,
                 Err(response) => {
                     let data = serde_json::to_vec(&response)
                         .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
                     let mut headers = HeaderMap::new();
                     headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
-                    return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
+                    return Ok(AdminResponse::with_headers(StatusCode::BAD_REQUEST, Body::from(data), headers));
                 }
             }
         } else {
@@ -1981,7 +1957,7 @@ impl Operation for DeleteKmsKeyHandler {
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
             headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
-            return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
+            return Ok(AdminResponse::with_headers(StatusCode::SERVICE_UNAVAILABLE, Body::from(data), headers));
         };
 
         let Some(manager) = service_manager.get_manager().await else {
@@ -1996,7 +1972,7 @@ impl Operation for DeleteKmsKeyHandler {
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
             headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
-            return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
+            return Ok(AdminResponse::with_headers(StatusCode::SERVICE_UNAVAILABLE, Body::from(data), headers));
         };
 
         let kms_request = DeleteKeyRequest {
@@ -2038,7 +2014,7 @@ impl Operation for DeleteKmsKeyHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
-                Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+                Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), headers))
             }
             Err(e) => {
                 error!(
@@ -2066,7 +2042,7 @@ impl Operation for DeleteKmsKeyHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
-                Ok(S3Response::with_headers((status, Body::from(data)), headers))
+                Ok(AdminResponse::with_headers(status, Body::from(data), headers))
             }
         }
     }
@@ -2091,28 +2067,28 @@ pub struct CancelKmsKeyDeletionHandler;
 
 #[async_trait::async_trait]
 impl Operation for CancelKmsKeyDeletionHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
         // Same ordering as the delete endpoint: the target key is resolved before
         // the gate, the read failure only after it.
-        let body = req.input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await;
-        let scoped = body.as_ref().ok().and_then(|body| scoped_key_id(body, &req.uri));
-        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+        let body = req.take_body().store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await;
+        let scoped = body.as_ref().ok().and_then(|body| scoped_key_id(body, req.uri()));
+        let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate(
             validate_admin_request_with_kms_key(
-                &req.headers,
+                req.headers(),
                 &cred,
                 owner,
                 false,
                 kms_delete_key_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                req.remote_addr(),
                 scoped.as_deref().unwrap_or_default(),
             )
             .await,
@@ -2123,7 +2099,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
         let body = body.map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
         let request: CancelKmsKeyDeletionRequest = if body.is_empty() {
-            let query_params = extract_query_params(&req.uri);
+            let query_params = extract_query_params(req.uri());
             let Some(key_id) = query_params.get("keyId") else {
                 let response = CancelKmsKeyDeletionResponse {
                     success: false,
@@ -2135,7 +2111,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
-                return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
+                return Ok(AdminResponse::with_headers(StatusCode::BAD_REQUEST, Body::from(data), headers));
             };
             CancelKmsKeyDeletionRequest { key_id: key_id.clone() }
         } else {
@@ -2153,7 +2129,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
             headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
-            return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
+            return Ok(AdminResponse::with_headers(StatusCode::SERVICE_UNAVAILABLE, Body::from(data), headers));
         };
 
         let Some(manager) = service_manager.get_manager().await else {
@@ -2167,7 +2143,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
             headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
-            return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
+            return Ok(AdminResponse::with_headers(StatusCode::SERVICE_UNAVAILABLE, Body::from(data), headers));
         };
 
         let kms_request = CancelKeyDeletionRequest {
@@ -2198,7 +2174,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
-                Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+                Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), headers))
             }
             Err(e) => {
                 error!(
@@ -2224,7 +2200,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
-                Ok(S3Response::with_headers((StatusCode::INTERNAL_SERVER_ERROR, Body::from(data)), headers))
+                Ok(AdminResponse::with_headers(StatusCode::INTERNAL_SERVER_ERROR, Body::from(data), headers))
             }
         }
     }
@@ -2247,31 +2223,23 @@ pub struct ListKmsKeysHandler;
 
 #[async_trait::async_trait]
 impl Operation for ListKmsKeysHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+        let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate(
-            validate_admin_request(
-                &req.headers,
-                &cred,
-                owner,
-                false,
-                kms_list_keys_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-            )
-            .await,
+            validate_admin_request(req.headers(), &cred, owner, false, kms_list_keys_actions(), req.remote_addr()).await,
             KmsAuditOperation::ListKeys,
             None,
         )?;
 
-        let query_params = extract_query_params(&req.uri);
+        let query_params = extract_query_params(req.uri());
         let marker = query_params.get("marker").cloned();
         // Validated before the listing runs, so a page size or filter the
         // service cannot apply fails as the input error it is instead of
@@ -2293,7 +2261,7 @@ impl Operation for ListKmsKeysHandler {
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
-                return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
+                return Ok(AdminResponse::with_headers(StatusCode::BAD_REQUEST, Body::from(data), headers));
             }
         };
 
@@ -2310,7 +2278,7 @@ impl Operation for ListKmsKeysHandler {
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
             headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
-            return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
+            return Ok(AdminResponse::with_headers(StatusCode::SERVICE_UNAVAILABLE, Body::from(data), headers));
         };
 
         let Some(manager) = service_manager.get_manager().await else {
@@ -2326,7 +2294,7 @@ impl Operation for ListKmsKeysHandler {
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
             headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
-            return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
+            return Ok(AdminResponse::with_headers(StatusCode::SERVICE_UNAVAILABLE, Body::from(data), headers));
         };
 
         let kms_request = ListKeysRequest {
@@ -2362,7 +2330,7 @@ impl Operation for ListKmsKeysHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
-                Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+                Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), headers))
             }
             Err(e) => {
                 error!(
@@ -2389,7 +2357,7 @@ impl Operation for ListKmsKeysHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
-                Ok(S3Response::with_headers((StatusCode::INTERNAL_SERVER_ERROR, Body::from(data)), headers))
+                Ok(AdminResponse::with_headers(StatusCode::INTERNAL_SERVER_ERROR, Body::from(data), headers))
             }
         }
     }
@@ -2443,24 +2411,24 @@ pub struct DescribeKmsKeyHandler;
 
 #[async_trait::async_trait]
 impl Operation for DescribeKmsKeyHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+        let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate(
             validate_admin_request_with_kms_key(
-                &req.headers,
+                req.headers(),
                 &cred,
                 owner,
                 false,
                 kms_describe_key_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                req.remote_addr(),
                 params.get("key_id").unwrap_or_default(),
             )
             .await,
@@ -2479,12 +2447,12 @@ impl Operation for DescribeKmsKeyHandler {
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
             headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
-            return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
+            return Ok(AdminResponse::with_headers(StatusCode::BAD_REQUEST, Body::from(data), headers));
         };
 
         // Validated before the key is looked up, so a malformed opt-in fails as
         // the input error it is instead of riding along on the key's outcome.
-        let wants_impact = match wants_key_impact(&req.uri) {
+        let wants_impact = match wants_key_impact(req.uri()) {
             Ok(wants_impact) => wants_impact,
             Err(message) => {
                 let response = DescribeKmsKeyResponse {
@@ -2497,7 +2465,7 @@ impl Operation for DescribeKmsKeyHandler {
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
-                return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
+                return Ok(AdminResponse::with_headers(StatusCode::BAD_REQUEST, Body::from(data), headers));
             }
         };
 
@@ -2512,7 +2480,7 @@ impl Operation for DescribeKmsKeyHandler {
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
             headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
-            return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
+            return Ok(AdminResponse::with_headers(StatusCode::SERVICE_UNAVAILABLE, Body::from(data), headers));
         };
 
         let Some(manager) = service_manager.get_manager().await else {
@@ -2526,7 +2494,7 @@ impl Operation for DescribeKmsKeyHandler {
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
             headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
-            return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
+            return Ok(AdminResponse::with_headers(StatusCode::SERVICE_UNAVAILABLE, Body::from(data), headers));
         };
 
         let kms_request = DescribeKeyRequest {
@@ -2562,7 +2530,7 @@ impl Operation for DescribeKmsKeyHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
-                Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+                Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), headers))
             }
             Err(e) => {
                 error!(
@@ -2601,7 +2569,7 @@ impl Operation for DescribeKmsKeyHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
-                Ok(S3Response::with_headers((status, Body::from(data)), headers))
+                Ok(AdminResponse::with_headers(status, Body::from(data), headers))
             }
         }
     }

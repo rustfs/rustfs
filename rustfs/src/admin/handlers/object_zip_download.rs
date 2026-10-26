@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{current_action_credentials, current_object_store_handle, current_region};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, S3Router};
+use crate::admin::runtime_sources::{ServerContextSlot, current_action_credentials, current_object_store_handle, current_region};
 use crate::admin::storage_api::access::{ReqInfo, authorize_request};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::contract::list::ListOperations as _;
@@ -29,6 +30,7 @@ use aes_gcm::{
 };
 use async_zip::{Compression, ZipEntryBuilder, base::write::ZipFileWriter};
 use futures_lite::io::AsyncWriteExt;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use hyper::{Method, Uri};
 use matchit::Params;
@@ -36,15 +38,15 @@ use rand::RngExt;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_s3_types::{S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Result, s3_error};
 use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
 use rustfs_utils::{base64_decode_url_safe_no_pad, base64_encode_url_safe_no_pad};
-use s3s::{Body, S3Request, S3Response, dto::StreamingBlob, header::CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -400,23 +402,22 @@ fn build_download_url(id: &str, token: &str) -> String {
     format!("{ADMIN_PREFIX}{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH}/{id}.zip?token={token}")
 }
 
-async fn authenticate_object_zip_download_request(req: &mut S3Request<Body>) -> S3Result<()> {
-    let Some(input_cred) = &req.credentials else {
+async fn authenticate_object_zip_download_request(req: &mut AdminRequest) -> S3Result<()> {
+    let Some(input_cred) = req.credentials() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
 
     let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
 
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().cloned().unwrap_or_default();
-    req.extensions.insert(ReqInfo {
+    let request_context = req.request_context().cloned();
+    req.install_req_info(ReqInfo {
         cred: Some(cred),
         is_owner: owner,
         region: current_region(),
-        request_context: req.extensions.get().cloned(),
+        request_context,
         ..Default::default()
     });
-    req.extensions.insert(remote_addr);
 
     license_check().map_err(|er| match er.kind() {
         std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
@@ -429,10 +430,9 @@ async fn authenticate_object_zip_download_request(req: &mut S3Request<Body>) -> 
     Ok(())
 }
 
-fn authenticated_zip_download_principal(req: &S3Request<Body>) -> S3Result<String> {
+fn authenticated_zip_download_principal(req: &AdminRequest) -> S3Result<String> {
     let req_info = req
-        .extensions
-        .get::<ReqInfo>()
+        .req_info()
         .ok_or_else(|| s3_error!(AccessDenied, "authentication required"))?;
     let credentials = req_info
         .cred
@@ -442,10 +442,9 @@ fn authenticated_zip_download_principal(req: &S3Request<Body>) -> S3Result<Strin
     Ok(credentials.access_key)
 }
 
-fn authenticated_zip_download_req_info(req: &S3Request<Body>) -> S3Result<ReqInfo> {
+fn authenticated_zip_download_req_info(req: &AdminRequest) -> S3Result<ReqInfo> {
     let mut req_info = req
-        .extensions
-        .get::<ReqInfo>()
+        .req_info()
         .cloned()
         .ok_or_else(|| s3_error!(AccessDenied, "authentication required"))?;
     if let Some(cred) = req_info.cred.as_mut() {
@@ -455,18 +454,15 @@ fn authenticated_zip_download_req_info(req: &S3Request<Body>) -> S3Result<ReqInf
     Ok(req_info)
 }
 
-fn authenticated_zip_download_auth_context(req: &S3Request<Body>) -> ObjectZipDownloadAuthContext {
+fn authenticated_zip_download_auth_context(req: &AdminRequest) -> ObjectZipDownloadAuthContext {
     ObjectZipDownloadAuthContext {
-        headers: req.headers.clone(),
-        remote_addr: req.extensions.get::<Option<RemoteAddr>>().copied().flatten(),
-        client_info: req.extensions.get::<ClientInfo>().cloned(),
+        headers: req.headers().clone(),
+        remote_addr: req.remote_addr().map(RemoteAddr),
+        client_info: req.client_info().cloned(),
     }
 }
 
-async fn authorize_object_zip_download_scope(
-    req: &mut S3Request<Body>,
-    request: &CreateObjectZipDownloadRequest,
-) -> S3Result<()> {
+async fn authorize_object_zip_download_scope(req: &mut AdminRequest, request: &CreateObjectZipDownloadRequest) -> S3Result<()> {
     for prefix in listing_prefixes(request) {
         authorize_object_zip_download_list_prefix(req, &request.bucket, prefix).await?;
     }
@@ -478,27 +474,74 @@ async fn authorize_object_zip_download_scope(
     Ok(())
 }
 
-async fn authorize_object_zip_download_list_prefix(req: &mut S3Request<Body>, bucket: &str, prefix: &str) -> S3Result<()> {
-    let original_uri = req.uri.clone();
-    req.uri = uri_with_prefix_query(&original_uri, prefix)?;
+async fn authorize_object_zip_download_list_prefix(req: &mut AdminRequest, bucket: &str, prefix: &str) -> S3Result<()> {
+    let original_uri = req.uri().clone();
+    *req.envelope_mut().uri_mut() = uri_with_prefix_query(&original_uri, prefix)?;
     let result = authorize_object_zip_download_s3_action(req, bucket, None, S3Action::ListBucketAction).await;
-    req.uri = original_uri;
+    *req.envelope_mut().uri_mut() = original_uri;
     result
 }
 
 async fn authorize_object_zip_download_s3_action(
-    req: &mut S3Request<Body>,
+    req: &mut AdminRequest,
     bucket: &str,
     object: Option<&str>,
     action: S3Action,
 ) -> S3Result<()> {
-    if let Some(req_info) = req.extensions.get_mut::<ReqInfo>() {
+    if let Some(req_info) = req.req_info_mut() {
         req_info.bucket = Some(bucket.to_string());
         req_info.object = object.map(str::to_string);
         req_info.version_id = None;
     }
 
-    authorize_request(req, Action::S3Action(action)).await.map_err(Into::into)
+    let mut authorization = s3_authorization_request(
+        req.method().clone(),
+        req.uri().clone(),
+        &authenticated_zip_download_auth_context(req),
+        req.envelope().server_context().cloned(),
+        req.req_info().cloned(),
+    );
+    authorize_request(&mut authorization, Action::S3Action(action))
+        .await
+        .map_err(Into::into)
+}
+
+/// The S3 gate (`storage::access::authorize_request`) still evaluates the s3s
+/// request shape, so the facts it reads are copied into one for the duration
+/// of the call: the authenticated `ReqInfo`, the peer and proxy-reported client
+/// addresses, the headers and query the policy conditions come from, and the
+/// server slot that selects the store. The gate reads neither the presented
+/// credentials nor the region or service, so those stay unset, and nothing it
+/// attaches to the request is read afterwards.
+fn s3_authorization_request(
+    method: Method,
+    uri: Uri,
+    auth_context: &ObjectZipDownloadAuthContext,
+    server_context: Option<Arc<ServerContextSlot>>,
+    req_info: Option<ReqInfo>,
+) -> s3s::S3Request<()> {
+    let mut extensions = http::Extensions::new();
+    extensions.insert(auth_context.remote_addr);
+    if let Some(client_info) = auth_context.client_info.clone() {
+        extensions.insert(client_info);
+    }
+    if let Some(server_context) = server_context {
+        extensions.insert(server_context);
+    }
+    if let Some(req_info) = req_info {
+        extensions.insert(req_info);
+    }
+    s3s::S3Request {
+        input: (),
+        method,
+        uri,
+        headers: auth_context.headers.clone(),
+        extensions,
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
 }
 
 fn uri_with_prefix_query(uri: &Uri, prefix: &str) -> S3Result<Uri> {
@@ -527,18 +570,14 @@ fn uri_with_prefix_query(uri: &Uri, prefix: &str) -> S3Result<Uri> {
     Uri::from_parts(parts).map_err(|e| s3_error!(InvalidRequest, "invalid prefix authorization URI: {}", e))
 }
 
-fn build_json_response(
-    status: StatusCode,
-    body: &impl Serialize,
-    request_id: Option<&HeaderValue>,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn build_json_response(status: StatusCode, body: &impl Serialize, request_id: Option<&HeaderValue>) -> S3Result<AdminResponse> {
     let data = serde_json::to_vec(body).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
     let mut header = HeaderMap::new();
     header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     if let Some(value) = request_id {
         header.insert("x-request-id", value.clone());
     }
-    Ok(S3Response::with_headers((status, Body::from(data)), header))
+    Ok(AdminResponse::with_headers(status, Body::from(data), header))
 }
 
 fn query_value_exact(uri: &Uri, key: &str) -> Option<String> {
@@ -552,11 +591,11 @@ pub struct CreateObjectZipDownloadHandler {}
 
 #[async_trait::async_trait]
 impl Operation for CreateObjectZipDownloadHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authenticate_object_zip_download_request(&mut req).await?;
 
         let body = req
-            .input
+            .take_body()
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
@@ -576,7 +615,7 @@ impl Operation for CreateObjectZipDownloadHandler {
                 download_url: build_download_url(&created.id, &created.token),
                 expires_at: Some(format_expires_at(created.expires_at)?),
             },
-            req.headers.get("x-request-id"),
+            req.headers().get("x-request-id"),
         )
     }
 }
@@ -585,9 +624,9 @@ pub struct DownloadObjectZipHandler {}
 
 #[async_trait::async_trait]
 impl Operation for DownloadObjectZipHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let id = params.get("id").unwrap_or("");
-        let token = query_value_exact(&req.uri, "token").unwrap_or_default();
+        let token = query_value_exact(req.uri(), "token").unwrap_or_default();
         if id.is_empty() || token.is_empty() {
             return Err(s3_error!(AccessDenied, "invalid or expired download token"));
         }
@@ -611,7 +650,7 @@ impl Operation for DownloadObjectZipHandler {
             .map_err(|e| s3_error!(InternalError, "invalid download filename: {}", e))?,
         );
 
-        Ok(S3Response::with_headers((StatusCode::OK, body), headers))
+        Ok(AdminResponse::with_headers(StatusCode::OK, body, headers))
     }
 }
 
@@ -695,31 +734,19 @@ fn listing_prefixes(request: &CreateObjectZipDownloadRequest) -> Vec<&str> {
 
 async fn authorize_zip_items_for_download(record: &ObjectZipDownloadToken, items: &[ZipDownloadItem]) -> S3Result<()> {
     for item in items {
-        let mut req = S3Request {
-            input: Body::empty(),
-            method: Method::GET,
-            uri: format!("{ADMIN_PREFIX}{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH}/{}.zip", record.id)
-                .parse()
-                .map_err(|e| s3_error!(InternalError, "failed to build download authorization URI: {}", e))?,
-            headers: record.auth_context.headers.clone(),
-            extensions: {
-                let mut extensions = http::Extensions::new();
-                extensions.insert(record.auth_context.remote_addr);
-                if let Some(client_info) = record.auth_context.client_info.clone() {
-                    extensions.insert(client_info);
-                }
-                extensions
-            },
-            credentials: None,
-            region: current_region(),
-            service: None,
-            trailing_headers: None,
-        };
         let mut req_info = record.req_info.clone();
         req_info.bucket = Some(record.request.bucket.clone());
         req_info.object = Some(item.key.clone());
         req_info.version_id = None;
-        req.extensions.insert(req_info);
+        let mut req = s3_authorization_request(
+            Method::GET,
+            format!("{ADMIN_PREFIX}{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH}/{}.zip", record.id)
+                .parse()
+                .map_err(|e| s3_error!(InternalError, "failed to build download authorization URI: {}", e))?,
+            &record.auth_context,
+            None,
+            Some(req_info),
+        );
         authorize_request(&mut req, Action::S3Action(S3Action::GetObjectAction)).await?;
     }
     Ok(())
@@ -770,7 +797,7 @@ fn normalized_listing_prefixes(request: &CreateObjectZipDownloadRequest) -> Vec<
 
 fn build_zip_stream_body(prepared: PreparedZipArchive) -> Body {
     let stream = ReaderStream::with_capacity(prepared.file, ZIP_STREAM_BUFFER_SIZE);
-    Body::from(StreamingBlob::wrap(stream))
+    Body::from_stream(stream)
 }
 
 async fn prepare_zip_download_archive(record: &ObjectZipDownloadToken) -> S3Result<PreparedZipArchive> {

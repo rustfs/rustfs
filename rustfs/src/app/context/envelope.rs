@@ -188,13 +188,6 @@ impl RequestEnvelope {
         &self.uri
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "URI-mutating admin handlers move to the envelope in later T1.12 slices"
-        )
-    )]
     pub(crate) fn uri_mut(&mut self) -> &mut Uri {
         &mut self.uri
     }
@@ -226,10 +219,6 @@ impl RequestEnvelope {
         self.client_info.as_ref()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the TLS admin handler moves to the envelope in a later T1.12 slice")
-    )]
     pub(crate) fn native_tls_transport(&self) -> Option<bool> {
         self.native_tls_transport
     }

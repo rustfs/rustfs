@@ -75,6 +75,45 @@ impl Body {
     }
 }
 
+impl Body {
+    /// Reads the whole body into memory, stopping as soon as more than
+    /// `max_len` bytes have arrived so an oversized payload is rejected before
+    /// it is buffered in full. A transport error ends the read with that error.
+    pub async fn store_all_limited(&mut self, max_len: usize) -> Result<Bytes, StdError> {
+        let mut buf = bytes::BytesMut::new();
+        while let Some(frame) = self.0.frame().await {
+            let Ok(data) = frame?.into_data() else {
+                continue;
+            };
+            if buf.len() + data.len() > max_len {
+                return Err(BodyTooLarge { max_len }.into());
+            }
+            buf.extend_from_slice(&data);
+        }
+        Ok(buf.freeze())
+    }
+}
+
+/// The body exceeded the caller's limit in [`Body::store_all_limited`].
+#[derive(Debug)]
+pub struct BodyTooLarge {
+    max_len: usize,
+}
+
+impl fmt::Display for BodyTooLarge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "request body exceeds the {} byte limit", self.max_len)
+    }
+}
+
+impl std::error::Error for BodyTooLarge {}
+
+impl Default for Body {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 impl From<Bytes> for Body {
     fn from(bytes: Bytes) -> Self {
         // `Full` holds nothing for an empty buffer, so it ends at once and
@@ -621,5 +660,50 @@ mod tests {
     fn the_body_is_send_sync_unpin_and_static_as_hyper_and_s3s_require() {
         fn require<T: Send + Sync + Unpin + 'static>() {}
         require::<Body>();
+    }
+
+    #[tokio::test]
+    async fn store_all_limited_collects_frames_up_to_the_limit() {
+        let mut body = Body::from_http_body(Scripted::chunks(&[b"abc", b"", b"de"]));
+        let bytes = body.store_all_limited(5).await.expect("five bytes fit a five byte limit");
+        assert_eq!(bytes.as_ref(), b"abcde");
+        assert!(
+            body.store_all_limited(5)
+                .await
+                .expect("a drained body reads empty")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn store_all_limited_rejects_the_first_frame_past_the_limit() {
+        let mut body = Body::from_http_body(Scripted::chunks(&[b"abc", b"def", b"never read"]));
+        let err = body
+            .store_all_limited(5)
+            .await
+            .expect_err("six bytes exceed a five byte limit");
+        assert!(err.is::<super::BodyTooLarge>(), "{err}");
+        assert_eq!(err.to_string(), "request body exceeds the 5 byte limit");
+    }
+
+    #[tokio::test]
+    async fn store_all_limited_surfaces_the_body_error() {
+        let frames = vec![
+            Ok(Bytes::from_static(b"abc")),
+            Err(io_error(ErrorKind::BrokenPipe, "peer went away")),
+        ];
+        let mut body = Body::from_http_body(Scripted::new(frames, SizeHint::default()));
+        let err = body
+            .store_all_limited(1024)
+            .await
+            .expect_err("a transport error ends the read");
+        assert_eq!(as_io(&err).expect("io error is preserved").kind(), ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn default_is_the_empty_body() {
+        let body = Body::default();
+        assert!(body.is_end_stream());
+        assert_eq!(body.size_hint().exact(), Some(0));
     }
 }

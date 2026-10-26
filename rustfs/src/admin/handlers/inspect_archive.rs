@@ -27,8 +27,9 @@
 //! digest does not match. Raw `xl.meta`, object contents, drive paths,
 //! endpoints, user metadata, and encryption keys are never archive entries.
 
-use crate::admin::auth::authorize_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::storage_api::access::spawn_traced;
 use crate::server::ADMIN_PREFIX;
 use crate::storage::storage_api::DiskError;
@@ -36,7 +37,8 @@ use crate::storage::{StorageDiskRpcExt, all_local_disk};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key};
 use bytes::Bytes;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -46,16 +48,11 @@ use rsa::traits::PublicKeyParts;
 use rsa::{Oaep, RsaPublicKey};
 use rustfs_filemeta::{FileMeta, VersionType};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Result, s3_error};
-use s3s::header::CONTENT_TYPE;
-use s3s::stream::{ByteStream, DynByteStream};
-use s3s::{Body, S3Request, S3Response, StdError};
+use rustfs_s3_types::{Body, S3Result, StdError, s3_error};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{mpsc, oneshot};
@@ -395,20 +392,6 @@ where
     archive.finish().await
 }
 
-struct ArchiveByteStream {
-    inner: ReceiverStream<Result<Bytes, StdError>>,
-}
-
-impl Stream for ArchiveByteStream {
-    type Item = Result<Bytes, StdError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).inner.poll_next_unpin(cx)
-    }
-}
-
-impl ByteStream for ArchiveByteStream {}
-
 fn encryption_aad(record_type: u8, counter: u32) -> [u8; 13] {
     let mut aad = [0_u8; 13];
     aad[..8].copy_from_slice(FORMAT_MAGIC);
@@ -561,10 +544,7 @@ fn encrypted_archive_body(
         }
     });
 
-    let stream: DynByteStream = Box::pin(ArchiveByteStream {
-        inner: ReceiverStream::new(rx),
-    });
-    Body::from(stream)
+    Body::from_stream(ReceiverStream::new(rx))
 }
 
 pub struct InspectArchiveHandler {}
@@ -575,14 +555,14 @@ fn inspect_archive_gate_actions() -> Vec<Action> {
 
 #[async_trait::async_trait]
 impl Operation for InspectArchiveHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        if req.credentials.is_none() {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        if req.credentials().is_none() {
             return Err(s3_error!(AccessDenied, "Signature is required"));
         }
-        authorize_admin_request(&req, inspect_archive_gate_actions()).await?;
+        authorize_admin_envelope(req.envelope(), inspect_archive_gate_actions()).await?;
 
         let body = req
-            .input
+            .take_body()
             .store_all_limited(rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|_| s3_error!(InvalidRequest, "failed to read inspect archive request"))?;
@@ -601,8 +581,9 @@ impl Operation for InspectArchiveHandler {
             http::header::CONTENT_DISPOSITION,
             HeaderValue::from_static("attachment; filename=\"rustfs-inspect-v1.rfsa\""),
         );
-        Ok(S3Response::with_headers(
-            (StatusCode::OK, encrypted_archive_body(artifacts, public_key, deadline)),
+        Ok(AdminResponse::with_headers(
+            StatusCode::OK,
+            encrypted_archive_body(artifacts, public_key, deadline),
             headers,
         ))
     }
@@ -615,8 +596,10 @@ mod tests {
     use rsa::RsaPrivateKey;
     use rsa::pkcs8::{EncodePublicKey, LineEnding};
     use rustfs_s3_types::S3ErrorCode;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
     use tokio::io::AsyncWriteExt;
 
     fn test_keypair() -> (RsaPrivateKey, RsaPublicKey, String) {
@@ -979,19 +962,16 @@ mod tests {
 
     #[tokio::test]
     async fn missing_credentials_are_denied_before_request_processing() {
-        let request = S3Request {
-            method: Method::POST,
-            uri: format!("{ADMIN_PREFIX}{INSPECT_ARCHIVE_ROUTE_SUFFIX}")
-                .parse()
+        let request = crate::admin::operation::test_support::TestRequest::new(
+            Method::POST,
+            format!("{ADMIN_PREFIX}{INSPECT_ARCHIVE_ROUTE_SUFFIX}")
+                .parse::<http::Uri>()
                 .expect("valid route"),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-            input: Body::from(Bytes::from_static(b"not-json")),
-        };
+        )
+        .headers(HeaderMap::new())
+        .extensions(http::Extensions::new())
+        .body(Body::from(Bytes::from_static(b"not-json")))
+        .build();
         let error = InspectArchiveHandler {}
             .call(request, Params::new())
             .await
@@ -1016,12 +996,12 @@ mod tests {
             .1;
 
         assert_eq!(
-            block.matches("authorize_admin_request(").count(),
+            block.matches("authorize_admin_envelope(").count(),
             1,
             "InspectArchiveHandler must use exactly one shared gate"
         );
         assert!(
-            block.contains("authorize_admin_request(&req, inspect_archive_gate_actions())"),
+            block.contains("authorize_admin_envelope(req.envelope(), inspect_archive_gate_actions())"),
             "InspectArchiveHandler must keep deriving its actions from inspect_archive_gate_actions()"
         );
         assert_eq!(
@@ -1030,7 +1010,7 @@ mod tests {
             "InspectArchiveHandler must not inline an action vector"
         );
         assert!(
-            !block.contains("let cred = authorize_admin_request("),
+            !block.contains("let cred = authorize_admin_envelope("),
             "InspectArchiveHandler does not need the authenticated credentials"
         );
         assert!(!production.contains("check_key_valid(get_session_token"));

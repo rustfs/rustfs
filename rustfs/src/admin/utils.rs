@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::operation::AdminResponse;
 use crate::server::{MINIO_ADMIN_PREFIX, has_path_prefix};
 use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use rustfs_crypto::{decrypt_data, decrypt_stream_io, encrypt_stream_io};
@@ -35,15 +36,21 @@ pub(crate) fn is_compat_admin_request(path: &str) -> bool {
 }
 
 pub(crate) async fn read_compatible_admin_body(
-    mut input: Body,
+    input: impl Into<rustfs_s3_types::Body>,
     max_len: usize,
     path: &str,
     secret_key: &str,
 ) -> S3Result<Vec<u8>> {
-    let body = input
-        .store_all_limited(max_len)
-        .await
-        .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
+    // Legacy handlers still hand over the s3s body; owned handlers pass the
+    // RustFS body. Both read through the owned type so one limit applies.
+    let mut input: rustfs_s3_types::Body = input.into();
+    let body = input.store_all_limited(max_len).await.map_err(|e| {
+        if e.is::<rustfs_s3_types::BodyTooLarge>() {
+            s3_error!(InvalidRequest, "failed to read request body: length limit exceeded")
+        } else {
+            s3_error!(InvalidRequest, "failed to read request body: {}", e)
+        }
+    })?;
 
     if is_compat_admin_request(path) {
         decrypt_stream_io(secret_key.as_bytes(), body.as_ref())
@@ -80,13 +87,23 @@ pub(crate) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Re
     Ok(S3Response::with_headers((status, Body::from(data)), headers))
 }
 
+/// Owned-boundary form of [`json_response`]: the same single `Content-Type`
+/// header and the same serialized bytes, as an [`AdminResponse`].
+pub(crate) fn owned_json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<AdminResponse> {
+    let data = serde_json::to_vec(value)
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(AdminResponse::with_headers(status, rustfs_s3_types::Body::from(data), headers))
+}
+
 /// A bodiless admin response carrying only `status`.
 ///
 /// Used by the endpoints whose success answer is the status code itself
 /// (`204 No Content`, or a `200 OK` acknowledgement with nothing to report).
 /// No `Content-Type` is set, because there is no content to type.
-pub(crate) fn empty_response(status: StatusCode) -> S3Response<(StatusCode, Body)> {
-    S3Response::new((status, Body::empty()))
+pub(crate) fn owned_empty_response(status: StatusCode) -> AdminResponse {
+    AdminResponse::new(status, rustfs_s3_types::Body::empty())
 }
 
 /// Collect a request URI's query string into a parameter map.
@@ -167,6 +184,65 @@ mod tests {
         assert_eq!(decoded, payload);
     }
 
+    #[tokio::test]
+    async fn owned_json_response_matches_the_legacy_shape() {
+        let value = serde_json::json!({"ok": true, "count": 3});
+        let mut legacy = json_response(StatusCode::CREATED, &value).expect("legacy serializes");
+        let (status, headers, mut body) = owned_json_response(StatusCode::CREATED, &value)
+            .expect("owned serializes")
+            .into_parts();
+
+        assert_eq!(status, legacy.output.0);
+        assert_eq!(headers, legacy.headers);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()), Some("application/json"));
+        let legacy_bytes = legacy.output.1.store_all_limited(1024).await.expect("legacy body reads");
+        let owned_bytes = body.store_all_limited(1024).await.expect("owned body reads");
+        assert_eq!(owned_bytes, legacy_bytes);
+    }
+
+    #[tokio::test]
+    async fn owned_empty_response_carries_only_the_status() {
+        let (status, headers, mut body) = owned_empty_response(StatusCode::NO_CONTENT).into_parts();
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(headers.is_empty());
+        assert!(body.store_all_limited(16).await.expect("empty body reads").is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_an_owned_body_past_the_limit() {
+        let err =
+            read_compatible_admin_body(rustfs_s3_types::Body::from("nine bytes!"), 8, "/rustfs/admin/v3/list-users", "secret")
+                .await
+                .expect_err("eleven bytes exceed an eight byte limit");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("failed to read request body: length limit exceeded"));
+
+        let legacy_body = Body::http_body(http_body_util::Full::new(bytes::Bytes::from_static(b"nine bytes!")));
+        let legacy_err = read_compatible_admin_body(legacy_body, 8, "/rustfs/admin/v3/list-users", "secret")
+            .await
+            .expect_err("legacy streaming bodies retain the same limit error");
+        assert_eq!(legacy_err.code(), err.code());
+        assert_eq!(legacy_err.message(), err.message());
+
+        let exact =
+            read_compatible_admin_body(rustfs_s3_types::Body::from("12345678"), 8, "/rustfs/admin/v3/list-users", "secret")
+                .await
+                .expect("the exact byte limit is allowed");
+        assert_eq!(exact, b"12345678");
+
+        let failed_body = rustfs_s3_types::Body::from_stream(futures_util::stream::iter([Err::<bytes::Bytes, _>(
+            std::io::Error::other("transport failed"),
+        )]));
+        let stream_err = read_compatible_admin_body(failed_body, 8, "/rustfs/admin/v3/list-users", "secret")
+            .await
+            .expect_err("transport errors remain distinct from the byte limit");
+        assert_eq!(stream_err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(stream_err.message(), Some("failed to read request body: transport failed"));
+    }
+
     async fn body_bytes(mut body: Body) -> Vec<u8> {
         body.store_all_limited(64 * 1024).await.expect("body should read").to_vec()
     }
@@ -220,12 +296,12 @@ mod tests {
     /// The bodiless answer must stay bodiless and must not claim a content
     /// type: callers use it for `204 No Content` and bare acknowledgements.
     #[tokio::test]
-    async fn empty_response_has_no_body_and_no_headers() {
-        for status in [StatusCode::OK, StatusCode::NO_CONTENT] {
-            let response = empty_response(status);
-            assert_eq!(response.output.0, status);
-            assert!(response.headers.is_empty());
-            assert!(body_bytes(response.output.1).await.is_empty());
+    async fn owned_empty_response_has_no_body_and_no_headers() {
+        for expected in [StatusCode::OK, StatusCode::NO_CONTENT] {
+            let (status, headers, mut body) = owned_empty_response(expected).into_parts();
+            assert_eq!(status, expected);
+            assert!(headers.is_empty());
+            assert!(body.store_all_limited(16).await.expect("empty body reads").is_empty());
         }
     }
 

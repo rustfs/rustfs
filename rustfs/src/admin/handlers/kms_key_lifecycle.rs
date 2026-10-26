@@ -17,11 +17,12 @@
 use super::kms_audit::KmsAdminAudit;
 use super::kms_keys::scoped_key_id;
 use crate::admin::auth::validate_admin_request_with_kms_key;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::current_kms_runtime_service_manager;
-use crate::admin::utils::{extract_query_params, json_response};
+use crate::admin::utils::{extract_query_params, owned_json_response};
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -31,7 +32,6 @@ use rustfs_kms::{
 };
 use rustfs_policy::policy::action::{Action, KmsAction};
 use rustfs_s3_types::{S3Result, s3_error};
-use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -234,8 +234,8 @@ async fn execute_lifecycle(
     }
 }
 
-fn unavailable_response(message: &str, key_id: String) -> S3Result<S3Response<(StatusCode, Body)>> {
-    json_response(
+fn unavailable_response(message: &str, key_id: String) -> S3Result<AdminResponse> {
+    owned_json_response(
         StatusCode::SERVICE_UNAVAILABLE,
         &KmsKeyLifecycleResponse {
             success: false,
@@ -247,31 +247,32 @@ fn unavailable_response(message: &str, key_id: String) -> S3Result<S3Response<(S
 }
 
 async fn handle_lifecycle_request(
-    mut req: S3Request<Body>,
+    mut req: AdminRequest,
     actions: Vec<Action>,
     operation: LifecycleOperation,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let Some(cred) = req.credentials else {
+) -> S3Result<AdminResponse> {
+    let Some(cred) = req.credentials() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
 
-    let (cred, owner) = check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+    let (cred, owner) =
+        check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
     // The body (or the `keyId` query parameter) names the key this operation acts
     // on, so it has to be resolved before the gate runs. A read failure is
     // surfaced only afterwards so an unauthorized caller still sees AccessDenied.
-    let body = req.input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await;
-    let scoped = body.as_ref().ok().and_then(|body| scoped_key_id(body, &req.uri));
-    let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+    let body = req.take_body().store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await;
+    let scoped = body.as_ref().ok().and_then(|body| scoped_key_id(body, req.uri()));
+    let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
     audit.gate(
         validate_admin_request_with_kms_key(
-            &req.headers,
+            req.headers(),
             &cred,
             owner,
             false,
             actions,
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            req.remote_addr(),
             scoped.as_deref().unwrap_or_default(),
         )
         .await,
@@ -282,9 +283,9 @@ async fn handle_lifecycle_request(
     let body = body.map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
     let request: KmsKeyLifecycleRequest = if body.is_empty() {
-        let query_params = extract_query_params(&req.uri);
+        let query_params = extract_query_params(req.uri());
         let Some(key_id) = query_params.get("keyId") else {
-            return json_response(
+            return owned_json_response(
                 StatusCode::BAD_REQUEST,
                 &KmsKeyLifecycleResponse {
                     success: false,
@@ -308,7 +309,7 @@ async fn handle_lifecycle_request(
     };
 
     let (status, response) = execute_lifecycle(&manager, &request.key_id, operation, audit.context()).await;
-    json_response(status, &response)
+    owned_json_response(status, &response)
 }
 
 fn kms_service_manager_from_context() -> Option<Arc<rustfs_kms::KmsServiceManager>> {
@@ -320,7 +321,7 @@ pub struct EnableKmsKeyHandler;
 
 #[async_trait::async_trait]
 impl Operation for EnableKmsKeyHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         handle_lifecycle_request(req, kms_enable_key_actions(), LifecycleOperation::Enable).await
     }
 }
@@ -330,7 +331,7 @@ pub struct DisableKmsKeyHandler;
 
 #[async_trait::async_trait]
 impl Operation for DisableKmsKeyHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         handle_lifecycle_request(req, kms_disable_key_actions(), LifecycleOperation::Disable).await
     }
 }
@@ -340,7 +341,7 @@ pub struct RotateKmsKeyHandler;
 
 #[async_trait::async_trait]
 impl Operation for RotateKmsKeyHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         handle_lifecycle_request(req, kms_rotate_key_actions(), LifecycleOperation::Rotate).await
     }
 }
@@ -483,7 +484,7 @@ mod tests {
             "lifecycle requests must scope authorization to the requested key"
         );
         assert!(
-            handler.contains("scoped_key_id(body, &req.uri)"),
+            handler.contains("scoped_key_id(body, req.uri())"),
             "authorization must resolve the key exactly as execution does"
         );
 

@@ -14,7 +14,7 @@
 
 use super::profile::{TriggerProfileCPU, TriggerProfileMemory};
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
-use crate::admin::router::{AdminOperation, LegacyAdminAdapter, S3Router};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::app_context_from_envelope;
 use crate::server::{
     HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, build_health_response_parts,
@@ -30,16 +30,13 @@ use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_s3_types::{Body, S3Result};
 
-static HEALTH_CHECK_HANDLER: HealthCheckHandler = HealthCheckHandler {};
-static HEALTH_CHECK_ADAPTER: LegacyAdminAdapter = LegacyAdminAdapter(&HEALTH_CHECK_HANDLER);
-
 pub fn register_health_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     if rustfs_utils::get_env_bool(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, rustfs_config::DEFAULT_HEALTH_ENDPOINT_ENABLE) {
         // Health check endpoint for monitoring and orchestration
-        r.insert(Method::GET, HEALTH_PREFIX, AdminOperation(&HEALTH_CHECK_ADAPTER))?;
-        r.insert(Method::HEAD, HEALTH_PREFIX, AdminOperation(&HEALTH_CHECK_ADAPTER))?;
-        r.insert(Method::GET, HEALTH_READY_PATH, AdminOperation(&HEALTH_CHECK_ADAPTER))?;
-        r.insert(Method::HEAD, HEALTH_READY_PATH, AdminOperation(&HEALTH_CHECK_ADAPTER))?;
+        r.insert(Method::GET, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
+        r.insert(Method::HEAD, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
+        r.insert(Method::GET, HEALTH_READY_PATH, AdminOperation(&HealthCheckHandler {}))?;
+        r.insert(Method::HEAD, HEALTH_READY_PATH, AdminOperation(&HealthCheckHandler {}))?;
     }
 
     // Profiling routes are controlled separately and must not be affected by health endpoint toggles.
@@ -115,7 +112,7 @@ mod tests {
     async fn call_real_health_handler(method: Method) -> s3s::S3Response<s3s::Body> {
         let mut router = S3Router::new(false);
         router
-            .insert(method.clone(), HEALTH_PREFIX, AdminOperation(&HEALTH_CHECK_ADAPTER))
+            .insert(method.clone(), HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))
             .expect("health route should register");
         router
             .call(health_request(method))

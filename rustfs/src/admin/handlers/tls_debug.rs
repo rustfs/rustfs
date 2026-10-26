@@ -12,18 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::profile::authorize_profile_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use super::profile::authorize_profile_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::current_outbound_tls_state;
 use crate::server::ADMIN_PREFIX;
 use http::StatusCode;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
 use hyper::Method;
 use matchit::Params;
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result};
 use rustfs_tls_runtime::{OutboundOnlySnapshotArgs, TlsConsumerStatusItem, TlsDebugStatusResponse, TlsRuntimeStatusSnapshot};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response};
 
 pub fn register_tls_debug_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -42,8 +42,8 @@ const ECSTORE_TRANSITION_CLIENT_CONSUMER: &str = "ecstore_transition_client";
 
 #[async_trait::async_trait]
 impl Operation for TlsStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_profile_request(&req).await?;
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        authorize_profile_envelope(req.envelope()).await?;
 
         let tls_path = rustfs_utils::get_env_opt_str(rustfs_config::ENV_RUSTFS_TLS_PATH).unwrap_or_default();
         let outbound = current_outbound_tls_state().await;
@@ -91,33 +91,28 @@ impl Operation for TlsStatusHandler {
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), headers))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(body), headers))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::TlsStatusHandler;
-    use crate::admin::router::Operation;
-    use http::{Extensions, HeaderMap, Uri};
+    use crate::admin::operation::AdminRequest;
+    use crate::admin::operation::Operation;
+    use http::{Extensions, HeaderMap};
     use hyper::Method;
     use matchit::Params;
+    use rustfs_s3_types::Body;
     use rustfs_s3_types::S3ErrorCode;
     use rustfs_tls_runtime::{OutboundOnlySnapshotArgs, TlsConsumerStatusItem, TlsRuntimeStatusSnapshot};
-    use s3s::{Body, S3Request};
 
-    fn build_tls_status_request() -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method: Method::GET,
-            uri: Uri::from_static("/rustfs/admin/debug/tls/status"),
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn build_tls_status_request() -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(Method::GET, "/rustfs/admin/debug/tls/status")
+            .headers(HeaderMap::new())
+            .extensions(Extensions::new())
+            .body(Body::empty())
+            .build()
     }
 
     #[tokio::test]

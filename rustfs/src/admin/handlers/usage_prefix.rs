@@ -22,7 +22,7 @@
 use crate::admin::auth::authorize_admin_envelope;
 use crate::admin::handlers::system::data_usage_info_gate_actions;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
-use crate::admin::router::{AdminOperation, LegacyAdminAdapter, S3Router};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::server::ADMIN_PREFIX;
 use http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE};
 use hyper::Method;
@@ -35,14 +35,11 @@ const MAX_ENTRIES_LIMIT: usize = 10_000;
 
 pub struct BucketPrefixUsageHandler {}
 
-static BUCKET_PREFIX_USAGE_HANDLER: BucketPrefixUsageHandler = BucketPrefixUsageHandler {};
-static BUCKET_PREFIX_USAGE_ADAPTER: LegacyAdminAdapter = LegacyAdminAdapter(&BUCKET_PREFIX_USAGE_HANDLER);
-
 pub fn register_usage_prefix_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/usage/{bucket}").as_str(),
-        AdminOperation(&BUCKET_PREFIX_USAGE_ADAPTER),
+        AdminOperation(&BucketPrefixUsageHandler {}),
     )?;
     Ok(())
 }

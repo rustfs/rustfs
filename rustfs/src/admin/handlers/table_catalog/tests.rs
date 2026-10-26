@@ -1,4 +1,6 @@
 use super::*;
+use crate::admin::operation::test_support::TestRequest;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, ServerContextSlot};
 use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 use crate::table_catalog::{TableCatalogObjectBackend, TableCatalogStore};
@@ -10,6 +12,7 @@ use datafusion::{
     },
     parquet::arrow::ArrowWriter,
 };
+use rustfs_s3_types::Body;
 use std::sync::Arc;
 
 use crate::table_catalog::test_support::{
@@ -44,17 +47,49 @@ impl KmsInterface for RequestKms {
     }
 }
 
-fn table_catalog_handler_request(context: Arc<AppContext>, access_key: &str, secret_key: &str) -> S3Request<Body> {
+const LOAD_TABLE_URI: &str = "/iceberg/v1/warehouse/namespaces/analytics/tables/events";
+
+/// A handler request whose server slot holds `context`; `credentials` `None`
+/// leaves the request anonymous.
+fn table_catalog_request_builder(
+    context: Arc<AppContext>,
+    credentials: Option<(&str, &str)>,
+    method: Method,
+    uri: &str,
+) -> TestRequest {
+    let slot = ServerContextSlot::new();
+    assert!(slot.install(context));
+    let request = TestRequest::new(method, uri).extension(slot);
+    match credentials {
+        Some((access_key, secret_key)) => request.credentials(access_key, secret_key, None),
+        None => request,
+    }
+}
+
+fn load_table_request_builder(context: Arc<AppContext>, access_key: &str, secret_key: &str) -> TestRequest {
+    table_catalog_request_builder(context, Some((access_key, secret_key)), Method::GET, LOAD_TABLE_URI)
+}
+
+fn table_catalog_handler_request(context: Arc<AppContext>, access_key: &str, secret_key: &str) -> AdminRequest {
+    load_table_request_builder(context, access_key, secret_key).build()
+}
+
+/// The s3s form of [`table_catalog_handler_request`] for the commit backend,
+/// which still holds the legacy request (see `legacy_request_view`).
+// TODO(T1.12-codemod): remove with `TableCommitObjectBackend::for_request`'s s3s parameter.
+fn legacy_table_catalog_handler_request(
+    context: Arc<AppContext>,
+    access_key: &str,
+    secret_key: &str,
+) -> s3s::S3Request<s3s::Body> {
     let slot = ServerContextSlot::new();
     assert!(slot.install(context));
     let mut extensions = http::Extensions::new();
     extensions.insert(slot);
-    S3Request {
-        input: Body::empty(),
+    s3s::S3Request {
+        input: s3s::Body::empty(),
         method: Method::GET,
-        uri: "/iceberg/v1/warehouse/namespaces/analytics/tables/events"
-            .parse()
-            .expect("load table URI"),
+        uri: LOAD_TABLE_URI.parse().expect("load table URI"),
         headers: HeaderMap::new(),
         extensions,
         credentials: Some(s3s::auth::Credentials {
@@ -67,42 +102,49 @@ fn table_catalog_handler_request(context: Arc<AppContext>, access_key: &str, sec
     }
 }
 
-fn with_access_delegation(mut request: S3Request<Body>, values: &[&str]) -> S3Request<Body> {
-    for value in values {
-        request.headers.append(
-            ICEBERG_ACCESS_DELEGATION_HEADER,
-            HeaderValue::from_str(value).expect("access delegation header should be valid"),
-        );
-    }
-    request
+fn with_access_delegation(request: TestRequest, values: &[&str]) -> AdminRequest {
+    values
+        .iter()
+        .fold(request, |request, value| request.header(ICEBERG_ACCESS_DELEGATION_HEADER, value))
+        .build()
 }
 
-async fn call_load_table_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+/// Buffers an owned response into its status, headers and body bytes.
+async fn response_parts(response: AdminResponse) -> (StatusCode, HeaderMap, Bytes) {
+    let (status, headers, body) = response.into_parts();
+    let body = http_body_util::BodyExt::collect(body)
+        .await
+        .expect("response body should buffer")
+        .to_bytes();
+    (status, headers, body)
+}
+
+async fn call_load_table_handler(request: AdminRequest) -> S3Result<AdminResponse> {
     let mut router = matchit::Router::new();
     router
         .insert("/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}", ())
         .expect("load table test route should insert");
-    let path = request.uri.path().to_string();
+    let path = request.uri().path().to_string();
     let matched = router.at(&path).expect("load table test route should match");
     RestLoadTableHandler {}.call(request, matched.params).await
 }
 
-async fn call_maintenance_worker_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+async fn call_maintenance_worker_handler(request: AdminRequest) -> S3Result<AdminResponse> {
     let mut router = matchit::Router::new();
     router
         .insert("/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run", ())
         .expect("worker test route should insert");
-    let path = request.uri.path().to_string();
+    let path = request.uri().path().to_string();
     let matched = router.at(&path).expect("worker test route should match");
     RunTableMaintenanceWorkerHandler {}.call(request, matched.params).await
 }
 
-async fn call_metadata_maintenance_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+async fn call_metadata_maintenance_handler(request: AdminRequest) -> S3Result<AdminResponse> {
     let mut router = matchit::Router::new();
     router
         .insert("/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata", ())
         .expect("maintenance test route should insert");
-    let path = request.uri.path().to_string();
+    let path = request.uri().path().to_string();
     let matched = router.at(&path).expect("maintenance test route should match");
     RestTableMetadataMaintenanceHandler {}.call(request, matched.params).await
 }
@@ -231,22 +273,10 @@ async fn table_catalog_authentication_and_credentials_use_the_request_context() 
     assert!(context.publish_action_credentials(credentials.clone()));
     let slot = ServerContextSlot::new();
     assert!(slot.install(context));
-    let mut extensions = http::Extensions::new();
-    extensions.insert(slot);
-    let request = S3Request {
-        input: Body::empty(),
-        method: Method::GET,
-        uri: "/table-context".parse().expect("test URI"),
-        headers: HeaderMap::new(),
-        extensions,
-        credentials: Some(s3s::auth::Credentials {
-            access_key: user_access_key.to_string(),
-            secret_key: s3s::auth::SecretKey::from(user_secret_key.to_string()),
-        }),
-        region: None,
-        service: None,
-        trailing_headers: None,
-    };
+    let request = TestRequest::new(Method::GET, "/table-context")
+        .extension(slot.clone())
+        .credentials(user_access_key, user_secret_key, None)
+        .build();
 
     let principal = table_catalog_request_principal(&request)
         .await
@@ -264,15 +294,17 @@ async fn table_catalog_authentication_and_credentials_use_the_request_context() 
     assert!(Arc::ptr_eq(&issuer.iam_store, &iam));
     assert_eq!(issuer.token_signing_key.as_deref(), Some("request-root-secret-key"));
     let resolved_store =
-        runtime_sources::object_store_from_extensions(&request.extensions).expect("request object store should resolve");
+        runtime_sources::object_store_from_envelope(request.envelope()).expect("request object store should resolve");
     assert!(Arc::ptr_eq(&resolved_store, &store));
 
-    let mut request = request;
-    request.method = Method::POST;
-    request.uri = "/iceberg/v1/request-warehouse/namespaces/analytics/tables/events/maintenance/worker/run"
-        .parse()
-        .expect("worker URI");
-    request.input = Body::from(br#"{"expected-job-id":"job-a","expected-attempt":0}"#.to_vec());
+    let request = TestRequest::new(
+        Method::POST,
+        "/iceberg/v1/request-warehouse/namespaces/analytics/tables/events/maintenance/worker/run",
+    )
+    .extension(slot)
+    .credentials(user_access_key, user_secret_key, None)
+    .body(Body::from(br#"{"expected-job-id":"job-a","expected-attempt":0}"#.to_vec()))
+    .build();
     let err = call_maintenance_worker_handler(request)
         .await
         .expect_err("table read permission must not authorize a conditional maintenance worker");
@@ -342,8 +374,7 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
             .expect_err("namespace create grant cannot authorize another prefix");
         assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
     }
-    let mut anonymous = request();
-    anonymous.credentials = None;
+    let anonymous = table_catalog_request_builder(context.clone(), None, Method::GET, LOAD_TABLE_URI).build();
     assert!(
         authorize_table_warehouse_location_request(&anonymous, "warehouse", "s3://warehouse/owned")
             .await
@@ -370,7 +401,10 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
         ("s3://warehouse/owned", true),
         ("s3://warehouse/shared", false),
     ] {
-        let backend = TableCommitObjectBackend::for_request(TestTableCatalogObjectBackend::default(), request());
+        let backend = TableCommitObjectBackend::for_request(
+            TestTableCatalogObjectBackend::default(),
+            legacy_table_catalog_handler_request(context.clone(), access_key, secret_key),
+        );
         let mut target = metadata.clone();
         target["location"] = serde_json::json!(location);
         let result = validate_table_metadata_snapshot_graph(&backend, "warehouse", &entry, Some(&metadata), &target).await;
@@ -444,16 +478,17 @@ async fn table_maintenance_worker_handler_enforces_conditions_after_authorizatio
                 ..Default::default()
             }));
             let request = |body: serde_json::Value| {
-                let mut request = table_catalog_handler_request(context.clone(), access_key, secret_key);
-                request.method = Method::POST;
-                request.uri = "/iceberg/v1/warehouse/namespaces/analytics/tables/events/maintenance/worker/run"
-                    .parse()
-                    .expect("worker URI");
-                request.input = Body::from(serde_json::to_vec(&body).expect("worker request JSON"));
-                request
+                table_catalog_request_builder(
+                    context.clone(),
+                    Some((access_key, secret_key)),
+                    Method::POST,
+                    "/iceberg/v1/warehouse/namespaces/analytics/tables/events/maintenance/worker/run",
+                )
+                .body(Body::from(serde_json::to_vec(&body).expect("worker request JSON")))
+                .build()
             };
             let setup = request(serde_json::json!({}));
-            let backend = table_catalog_backend_from_extensions(&setup.extensions).expect("request catalog backend");
+            let backend = table_catalog_backend_from_envelope(setup.envelope()).expect("request catalog backend");
             let catalog = table_catalog_store_from_backend(backend.clone()).expect("object-backed catalog");
             enable_table_bucket_marker(object_store.as_ref(), "warehouse")
                 .await
@@ -545,9 +580,9 @@ async fn table_maintenance_worker_handler_enforces_conditions_after_authorizatio
             let response = call_maintenance_worker_handler(request(claim.clone()))
                 .await
                 .expect("authorized conditional claim");
-            assert_eq!(response.output.0, StatusCode::OK);
-            let completed: TableMetadataMaintenanceReport =
-                serde_json::from_slice(&response.output.1.bytes().expect("buffered worker response")).expect("worker report");
+            let (status, _, body) = response_parts(response).await;
+            assert_eq!(status, StatusCode::OK);
+            let completed: TableMetadataMaintenanceReport = serde_json::from_slice(&body).expect("worker report");
             assert_eq!(completed.job.job_id, queued.job.job_id);
             assert_eq!(completed.job.attempt, 1);
             assert_eq!(completed.job.status, TableMetadataMaintenanceJobStatus::Successful);
@@ -566,9 +601,9 @@ async fn table_maintenance_worker_handler_enforces_conditions_after_authorizatio
             let response = call_maintenance_worker_handler(request(claim))
                 .await
                 .expect("same-worker replay");
-            assert_eq!(response.output.0, StatusCode::OK);
-            let replay: TableMetadataMaintenanceReport =
-                serde_json::from_slice(&response.output.1.bytes().expect("buffered replay response")).expect("replayed report");
+            let (status, _, body) = response_parts(response).await;
+            assert_eq!(status, StatusCode::OK);
+            let replay: TableMetadataMaintenanceReport = serde_json::from_slice(&body).expect("replayed report");
             assert_eq!(replay, completed);
             assert_eq!(inventory(&backend).await, committed);
 
@@ -593,10 +628,9 @@ async fn table_maintenance_worker_handler_enforces_conditions_after_authorizatio
             let response = call_maintenance_worker_handler(request(serde_json::json!({})))
                 .await
                 .expect("legacy unconditional request remains supported");
-            assert_eq!(response.output.0, StatusCode::OK);
-            let legacy: TableMetadataMaintenanceReport =
-                serde_json::from_slice(&response.output.1.bytes().expect("buffered legacy response"))
-                    .expect("legacy worker report");
+            let (status, _, body) = response_parts(response).await;
+            assert_eq!(status, StatusCode::OK);
+            let legacy: TableMetadataMaintenanceReport = serde_json::from_slice(&body).expect("legacy worker report");
             assert_ne!(legacy.job.job_id, completed.job.job_id);
             assert_eq!(legacy.job.worker_id.as_deref(), Some(DEFAULT_TABLE_MAINTENANCE_WORKER_ID));
             assert_eq!(legacy.job.status, TableMetadataMaintenanceJobStatus::Successful);
@@ -686,17 +720,19 @@ async fn strong_metadata_maintenance_handler_plans_without_changing_table_object
                 status: "on".to_string(),
                 ..Default::default()
             }));
-            let request = |body: &str| {
-                let mut request = table_catalog_handler_request(context.clone(), access_key, secret_key);
-                request.method = Method::POST;
-                request.uri = "/iceberg/v1/warehouse/namespaces/analytics/tables/events/maintenance/metadata"
-                    .parse()
-                    .expect("maintenance URI");
-                request.input = Body::from(body.as_bytes().to_vec());
-                request
+            let request_as = |credentials: Option<(&str, &str)>, body: &str| {
+                table_catalog_request_builder(
+                    context.clone(),
+                    credentials,
+                    Method::POST,
+                    "/iceberg/v1/warehouse/namespaces/analytics/tables/events/maintenance/metadata",
+                )
+                .body(Body::from(body.as_bytes().to_vec()))
+                .build()
             };
+            let request = |body: &str| request_as(Some((access_key, secret_key)), body);
             let setup = request("{}");
-            let backend = table_catalog_backend_from_extensions(&setup.extensions).expect("request catalog backend");
+            let backend = table_catalog_backend_from_envelope(setup.envelope()).expect("request catalog backend");
             enable_table_bucket_marker(object_store.as_ref(), "warehouse")
                 .await
                 .expect("enable table bucket");
@@ -774,18 +810,13 @@ async fn strong_metadata_maintenance_handler_plans_without_changing_table_object
                 assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
                 assert_eq!(inventory(&backend).await, before, "{body}");
             }
-            let mut anonymous = request("{}");
-            anonymous.credentials = None;
+            let anonymous = request_as(None, "{}");
             let error = call_metadata_maintenance_handler(anonymous)
                 .await
                 .expect_err("planning requires authentication");
             assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
             assert!(error.message().unwrap_or_default().contains("authentication required"));
-            let mut reader = request("not-json");
-            reader.credentials = Some(s3s::auth::Credentials {
-                access_key: reader_access_key.to_string(),
-                secret_key: s3s::auth::SecretKey::from(reader_secret_key.to_string()),
-            });
+            let reader = request_as(Some((reader_access_key, reader_secret_key)), "not-json");
             let error = call_metadata_maintenance_handler(reader)
                 .await
                 .expect_err("read-only permission must not authorize planning");
@@ -805,10 +836,9 @@ async fn strong_metadata_maintenance_handler_plans_without_changing_table_object
                 let response = call_metadata_maintenance_handler(request(&body.to_string()))
                     .await
                     .expect("authorized strong planning");
-                assert_eq!(response.output.0, StatusCode::OK);
-                let report: TableMetadataMaintenanceReport =
-                    serde_json::from_slice(&response.output.1.bytes().expect("buffered planning response"))
-                        .expect("planning report");
+                let (status, _, response_body) = response_parts(response).await;
+                assert_eq!(status, StatusCode::OK);
+                let report: TableMetadataMaintenanceReport = serde_json::from_slice(&response_body).expect("planning report");
                 assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Successful);
                 assert_eq!(report.job.operation, TableMetadataMaintenanceOperation::DryRun);
                 assert_eq!(report.job.table_id, entry.table_id);
@@ -981,7 +1011,7 @@ async fn load_table_handler_negotiates_vended_credentials_without_breaking_metad
 
     let setup_request = table_catalog_handler_request(context.clone(), vended_access_key, vended_secret_key);
     let metadata_backend =
-        table_catalog_backend_from_extensions(&setup_request.extensions).expect("table catalog backend should resolve");
+        table_catalog_backend_from_envelope(setup_request.envelope()).expect("table catalog backend should resolve");
     let catalog_store = table_catalog_store_from_backend(metadata_backend.clone()).expect("table catalog store should resolve");
     enable_table_bucket_marker(object_store.as_ref(), "warehouse")
         .await
@@ -1026,28 +1056,27 @@ async fn load_table_handler_negotiates_vended_credentials_without_breaking_metad
     })
     .await
     .expect("metadata-only caller should load without requesting delegation");
-    assert!(absent.headers.get(http::header::CACHE_CONTROL).is_none());
-    let absent_json: serde_json::Value =
-        serde_json::from_slice(&absent.output.1.bytes().expect("absent delegation body should be buffered"))
-            .expect("absent delegation response should parse");
+    let (_, absent_headers, absent_body) = response_parts(absent).await;
+    assert!(absent_headers.get(http::header::CACHE_CONTROL).is_none());
+    let absent_json: serde_json::Value = serde_json::from_slice(&absent_body).expect("absent delegation response should parse");
     assert_eq!(absent_json["storage-credentials"], serde_json::json!([]));
 
     let disabled = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, None::<&str>)], async {
         call_load_table_handler(with_access_delegation(
-            table_catalog_handler_request(context.clone(), metadata_access_key, metadata_secret_key),
+            load_table_request_builder(context.clone(), metadata_access_key, metadata_secret_key),
             &["vended-credentials"],
         ))
         .await
     })
     .await
     .expect("disabled vending should not add a credential permission requirement");
+    let (_, disabled_headers, disabled_body) = response_parts(disabled).await;
     assert_eq!(
-        disabled.headers.get(http::header::CACHE_CONTROL),
+        disabled_headers.get(http::header::CACHE_CONTROL),
         Some(&HeaderValue::from_static("no-store, private"))
     );
     let disabled_json: serde_json::Value =
-        serde_json::from_slice(&disabled.output.1.bytes().expect("disabled vending body should be buffered"))
-            .expect("disabled vending response should parse");
+        serde_json::from_slice(&disabled_body).expect("disabled vending response should parse");
     assert_eq!(
         disabled_json["config"][CREDENTIAL_VENDING_REASON_CONFIG_KEY],
         serde_json::Value::String(CREDENTIAL_VENDING_DISABLED_REASON.to_string())
@@ -1056,32 +1085,28 @@ async fn load_table_handler_negotiates_vended_credentials_without_breaking_metad
 
     let remote_signing = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, Some("true"))], async {
         call_load_table_handler(with_access_delegation(
-            table_catalog_handler_request(context.clone(), metadata_access_key, metadata_secret_key),
+            load_table_request_builder(context.clone(), metadata_access_key, metadata_secret_key),
             &["remote-signing"],
         ))
         .await
     })
     .await
     .expect("unrequested vending should preserve metadata-only access");
-    assert!(remote_signing.headers.get(http::header::CACHE_CONTROL).is_none());
+    let (_, remote_signing_headers, _) = response_parts(remote_signing).await;
+    assert!(remote_signing_headers.get(http::header::CACHE_CONTROL).is_none());
 
     let not_authorized = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, Some("true"))], async {
         call_load_table_handler(with_access_delegation(
-            table_catalog_handler_request(context.clone(), metadata_access_key, metadata_secret_key),
+            load_table_request_builder(context.clone(), metadata_access_key, metadata_secret_key),
             &["vended-credentials"],
         ))
         .await
     })
     .await
     .expect("credential denial should fall back to the authorized metadata response");
-    let not_authorized_json: serde_json::Value = serde_json::from_slice(
-        &not_authorized
-            .output
-            .1
-            .bytes()
-            .expect("credential denial body should be buffered"),
-    )
-    .expect("credential denial response should parse");
+    let (_, _, not_authorized_body) = response_parts(not_authorized).await;
+    let not_authorized_json: serde_json::Value =
+        serde_json::from_slice(&not_authorized_body).expect("credential denial response should parse");
     assert_eq!(
         not_authorized_json["config"][CREDENTIAL_VENDING_REASON_CONFIG_KEY],
         serde_json::Value::String(CREDENTIAL_VENDING_NOT_AUTHORIZED_REASON.to_string())
@@ -1090,23 +1115,22 @@ async fn load_table_handler_negotiates_vended_credentials_without_breaking_metad
 
     let issued = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, Some("true"))], async {
         call_load_table_handler(with_access_delegation(
-            table_catalog_handler_request(context.clone(), vended_access_key, vended_secret_key),
+            load_table_request_builder(context.clone(), vended_access_key, vended_secret_key),
             &["remote-signing", "unknown, vended-credentials"],
         ))
         .await
     })
     .await
     .expect("credential-authorized caller should receive vended credentials");
-    assert_eq!(issued.output.0, StatusCode::OK);
+    let (issued_status, issued_headers, issued_body) = response_parts(issued).await;
+    assert_eq!(issued_status, StatusCode::OK);
     assert_eq!(
-        issued.headers.get(http::header::CACHE_CONTROL),
+        issued_headers.get(http::header::CACHE_CONTROL),
         Some(&HeaderValue::from_static("no-store, private"))
     );
-    assert_eq!(issued.headers.get(http::header::PRAGMA), Some(&HeaderValue::from_static("no-cache")));
-    assert_eq!(issued.headers.get(http::header::EXPIRES), Some(&HeaderValue::from_static("0")));
-    let issued_json: serde_json::Value =
-        serde_json::from_slice(&issued.output.1.bytes().expect("issued credential body should be buffered"))
-            .expect("issued credential response should parse");
+    assert_eq!(issued_headers.get(http::header::PRAGMA), Some(&HeaderValue::from_static("no-cache")));
+    assert_eq!(issued_headers.get(http::header::EXPIRES), Some(&HeaderValue::from_static("0")));
+    let issued_json: serde_json::Value = serde_json::from_slice(&issued_body).expect("issued credential response should parse");
     assert_eq!(
         issued_json["config"][CREDENTIAL_VENDING_CONFIG_KEY],
         serde_json::Value::String(CREDENTIAL_VENDING_SUPPORTED.to_string())
@@ -1506,12 +1530,12 @@ fn table_catalog_handlers_require_table_admin_actions() {
 fn standard_rest_handlers_wire_strict_response_guards() {
     let src = table_catalog_handler_source();
     let drop_table = operation_block(&src, "RestDropTableHandler");
-    assert!(drop_table.contains("rest_purge_requested_from_query(&req.uri)?"));
+    assert!(drop_table.contains("rest_purge_requested_from_query(req.uri())?"));
     assert!(drop_table.contains("if purge_requested"));
     assert!(drop_table.contains("StatusCode::NOT_ACCEPTABLE"));
 
     let load_table = operation_block(&src, "RestLoadTableHandler");
-    assert!(load_table.contains("rest_table_snapshot_selection_from_query(&req.uri)?"));
+    assert!(load_table.contains("rest_table_snapshot_selection_from_query(req.uri())?"));
     assert!(load_table.contains("apply_rest_table_snapshot_selection(&mut response.metadata, snapshot_selection);"));
 
     let credentials = operation_block(&src, "RestLoadCredentialsHandler");
@@ -1522,12 +1546,12 @@ fn standard_rest_handlers_wire_strict_response_guards() {
 fn table_bucket_handlers_resolve_state_from_the_request_context() {
     let src = table_catalog_handler_source();
     let enable = operation_block(&src, "EnableTableBucketHandler");
-    assert!(enable.contains("table_catalog_backend_from_extensions(&req.extensions)?;"));
-    assert!(enable.contains("runtime_sources::object_store_from_req(&req)"));
+    assert!(enable.contains("table_catalog_backend_from_envelope(req.envelope())?;"));
+    assert!(enable.contains("runtime_sources::object_store_from_envelope(req.envelope())"));
 
     let get = operation_block(&src, "GetTableBucketHandler");
-    assert!(get.contains("table_catalog_store_from_extensions(&req.extensions)?;"));
-    assert!(get.contains("table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;"));
+    assert!(get.contains("table_catalog_store_from_envelope(req.envelope())?;"));
+    assert!(get.contains("table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;"));
 }
 
 #[test]
@@ -1536,15 +1560,15 @@ fn table_catalog_list_handlers_parse_standard_pagination() {
     for (handler, helper_call) in [
         (
             "RestListNamespacesHandler",
-            "list_namespaces_response(&store, &warehouse, parent.as_ref(), &req.uri).await?",
+            "list_namespaces_response(&store, &warehouse, parent.as_ref(), req.uri()).await?",
         ),
         (
             "RestListTablesHandler",
-            "list_tables_response(&store, &warehouse, &namespace, &req.uri).await?",
+            "list_tables_response(&store, &warehouse, &namespace, req.uri()).await?",
         ),
         (
             "RestListViewsHandler",
-            "list_views_response(&store, &warehouse, &namespace, &req.uri).await?",
+            "list_views_response(&store, &warehouse, &namespace, req.uri()).await?",
         ),
     ] {
         let block = operation_block(&src, handler);
@@ -1583,11 +1607,11 @@ fn table_pointer_write_handlers_install_commit_publication_guard() {
     ] {
         let block = operation_block(&src, handler);
         assert!(
-            block.contains("install_table_catalog_s3_request_info(&mut req, &principal)?;"),
+            block.contains("install_table_catalog_s3_request_info(&mut s3s_req, &principal)?;"),
             "{handler} should install exact-key S3 authorization context"
         );
         assert!(
-            block.contains("TableCommitObjectBackend::for_request(metadata_backend, req)"),
+            block.contains("TableCommitObjectBackend::for_request(metadata_backend, s3s_req)"),
             "{handler} should use the guarded table commit backend"
         );
         assert!(
@@ -1652,8 +1676,8 @@ fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_sta
     ] {
         let block = operation_block(&src, handler);
         assert!(
-            block.contains("ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;")
-                || block.contains("table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;"),
+            block.contains("ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;")
+                || block.contains("table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;"),
             "{handler} should require the table bucket metadata marker before catalog state access"
         );
     }
@@ -1810,8 +1834,14 @@ fn table_catalog_resource_builds_policy_object_scope() {
 }
 
 fn operation_block<'a>(src: &'a str, handler: &str) -> &'a str {
+    // Commit-path handlers still implement the legacy router trait; see `legacy_request_view`.
     let marker = format!("impl Operation for {handler}");
-    let block = src.split_once(&marker).expect("handler impl should exist").1;
+    let legacy_marker = format!("impl crate::admin::router::Operation for {handler}");
+    let block = src
+        .split_once(&marker)
+        .or_else(|| src.split_once(&legacy_marker))
+        .expect("handler impl should exist")
+        .1;
     let end = block
         .find("\npub struct ")
         .or_else(|| block.find("\n#[cfg(test)]"))
@@ -1846,6 +1876,8 @@ fn function_block<'a>(src: &'a str, signature: &str) -> &'a str {
 #[test]
 fn rest_catalog_mvp_routes_use_implemented_handlers() {
     fn assert_operation<T: Operation>() {}
+    // Commit-path handlers keep the legacy router trait; see `legacy_request_view`.
+    fn assert_legacy_operation<T: crate::admin::router::Operation>() {}
 
     let _: &EnableTableBucketHandler = &ENABLE_TABLE_BUCKET_HANDLER;
     let _: &GetTableBucketHandler = &GET_TABLE_BUCKET_HANDLER;
@@ -1906,21 +1938,21 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
     assert_operation::<RestDropNamespaceHandler>();
     assert_operation::<RestListTablesHandler>();
     assert_operation::<RestCreateTableHandler>();
-    assert_operation::<RestRegisterTableHandler>();
+    assert_legacy_operation::<RestRegisterTableHandler>();
     assert_operation::<RestListViewsHandler>();
     assert_operation::<RestCreateViewHandler>();
     assert_operation::<RestLoadTableHandler>();
     assert_operation::<RestTableExistsHandler>();
     assert_operation::<RestLoadCredentialsHandler>();
-    assert_operation::<RestCommitTableHandler>();
+    assert_legacy_operation::<RestCommitTableHandler>();
     assert_operation::<RestDropTableHandler>();
     assert_operation::<RestRenameTableHandler>();
     assert_operation::<RestLoadViewHandler>();
-    assert_operation::<RestReplaceViewHandler>();
+    assert_legacy_operation::<RestReplaceViewHandler>();
     assert_operation::<RestDropViewHandler>();
     assert_operation::<ListTableRefsHandler>();
     assert_operation::<GetTableMetadataLocationHandler>();
-    assert_operation::<UpdateTableMetadataLocationHandler>();
+    assert_legacy_operation::<UpdateTableMetadataLocationHandler>();
     assert_operation::<RestTableMetadataMaintenanceHandler>();
     assert_operation::<GetTableMaintenanceConfigHandler>();
     assert_operation::<PutTableMaintenanceConfigHandler>();
@@ -1931,13 +1963,13 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
     assert_operation::<HeartbeatTableMaintenanceJobHandler>();
     assert_operation::<TableMaintenanceQuarantineHandler>();
     assert_operation::<ExportTableCatalogHandler>();
-    assert_operation::<ImportTableCatalogHandler>();
+    assert_legacy_operation::<ImportTableCatalogHandler>();
     assert_operation::<ExternalCatalogBridgeHandler>();
     assert_operation::<PutExternalCatalogBridgeHandler>();
-    assert_operation::<SyncExternalCatalogBridgeHandler>();
+    assert_legacy_operation::<SyncExternalCatalogBridgeHandler>();
     assert_operation::<GetTableCatalogDiagnosticsHandler>();
     assert_operation::<RecoverTableCatalogHandler>();
-    assert_operation::<RollbackTableCatalogHandler>();
+    assert_legacy_operation::<RollbackTableCatalogHandler>();
 }
 
 #[test]
@@ -2104,19 +2136,14 @@ fn table_maintenance_worker_condition_rejects_null_malformed_duplicate_and_unkno
 #[tokio::test]
 async fn table_maintenance_worker_handler_requires_authentication_for_both_request_forms() {
     for body in [r#"{}"#, r#"{"expected-job-id":"job-a","expected-attempt":0}"#] {
-        let request = S3Request {
-            input: Body::from(body.as_bytes().to_vec()),
-            method: Method::POST,
-            uri: "/iceberg/v1/warehouse/namespaces/analytics/tables/events/maintenance/worker/run"
-                .parse()
-                .expect("worker URI"),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let request = crate::admin::operation::test_support::TestRequest::new(
+            Method::POST,
+            "/iceberg/v1/warehouse/namespaces/analytics/tables/events/maintenance/worker/run",
+        )
+        .headers(HeaderMap::new())
+        .extensions(http::Extensions::new())
+        .body(Body::from(body.as_bytes().to_vec()))
+        .build();
         let err = call_maintenance_worker_handler(request)
             .await
             .expect_err("worker requires authentication");
@@ -2311,6 +2338,7 @@ async fn rename_table_body_rejects_declared_and_streamed_oversize_payloads() {
     .await
     .expect_err("oversized streamed body should fail");
     assert_eq!(streamed.code(), &S3ErrorCode::InvalidRequest);
+    assert_eq!(streamed.message(), Some("failed to read request body: length limit exceeded"));
 }
 
 fn assert_rejects_unknown_field<T>(target: &str, value: serde_json::Value)
@@ -2537,14 +2565,10 @@ async fn namespace_property_update_body_is_bounded_and_required() {
 
 #[tokio::test(start_paused = true)]
 async fn generic_json_body_readers_time_out_stalled_streams() {
-    let required_stream = futures::stream::pending::<Result<http_body::Frame<Bytes>, std::io::Error>>();
-    let required = tokio::spawn(read_json_body::<serde_json::Value>(Body::http_body(http_body_util::StreamBody::new(
-        required_stream,
-    ))));
-    let optional_stream = futures::stream::pending::<Result<http_body::Frame<Bytes>, std::io::Error>>();
-    let optional = tokio::spawn(read_json_body_or_default::<serde_json::Value>(Body::http_body(
-        http_body_util::StreamBody::new(optional_stream),
-    )));
+    let required_stream = futures::stream::pending::<Result<Bytes, std::io::Error>>();
+    let required = tokio::spawn(read_json_body::<serde_json::Value>(Body::from_stream(required_stream)));
+    let optional_stream = futures::stream::pending::<Result<Bytes, std::io::Error>>();
+    let optional = tokio::spawn(read_json_body_or_default::<serde_json::Value>(Body::from_stream(optional_stream)));
     tokio::task::yield_now().await;
     tokio::time::advance(TABLE_CATALOG_REQUEST_BODY_TIMEOUT).await;
 
@@ -13358,13 +13382,14 @@ async fn credential_response_serializes_sensitive_config_only_inside_storage_cre
 fn credential_http_response_disables_caching() {
     let response = build_sensitive_json_response(StatusCode::OK, &serde_json::json!({"storage-credentials": []}))
         .expect("sensitive response should build");
+    let (_, headers, _) = response.into_parts();
 
     assert_eq!(
-        response.headers.get(http::header::CACHE_CONTROL),
+        headers.get(http::header::CACHE_CONTROL),
         Some(&HeaderValue::from_static("no-store, private"))
     );
-    assert_eq!(response.headers.get(http::header::PRAGMA), Some(&HeaderValue::from_static("no-cache")));
-    assert_eq!(response.headers.get(http::header::EXPIRES), Some(&HeaderValue::from_static("0")));
+    assert_eq!(headers.get(http::header::PRAGMA), Some(&HeaderValue::from_static("no-cache")));
+    assert_eq!(headers.get(http::header::EXPIRES), Some(&HeaderValue::from_static("0")));
 }
 
 #[tokio::test]
@@ -14423,24 +14448,11 @@ async fn namespace_property_handler_updates_object_backed_catalog_and_maps_error
                 .expect("namespace should be seeded");
 
             let request = |namespace: &str, body: serde_json::Value| {
-                let mut extensions = http::Extensions::new();
-                extensions.insert(slot.clone());
-                S3Request {
-                    input: Body::from(serde_json::to_vec(&body).expect("request body should serialize")),
-                    method: Method::POST,
-                    uri: format!("/iceberg/v1/{bucket}/namespaces/{namespace}/properties")
-                        .parse()
-                        .expect("request URI should parse"),
-                    headers: HeaderMap::new(),
-                    extensions,
-                    credentials: Some(s3s::auth::Credentials {
-                        access_key: root_access_key.to_string(),
-                        secret_key: s3s::auth::SecretKey::from(root_secret_key.to_string()),
-                    }),
-                    region: None,
-                    service: None,
-                    trailing_headers: None,
-                }
+                TestRequest::new(Method::POST, format!("/iceberg/v1/{bucket}/namespaces/{namespace}/properties"))
+                    .extension(slot.clone())
+                    .body(Body::from(serde_json::to_vec(&body).expect("request body should serialize")))
+                    .credentials(root_access_key, root_secret_key, None)
+                    .build()
             };
             let mut params_router = matchit::Router::new();
             params_router
@@ -14464,11 +14476,8 @@ async fn namespace_property_handler_updates_object_backed_catalog_and_maps_error
                 )
                 .await
                 .expect("handler should update object-backed namespace properties");
-            assert_eq!(response.output.0, StatusCode::OK);
-            let body = http_body_util::BodyExt::collect(response.output.1)
-                .await
-                .expect("response body should collect")
-                .to_bytes();
+            let (status, _, body) = response_parts(response).await;
+            assert_eq!(status, StatusCode::OK);
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&body).expect("response body should decode"),
                 serde_json::json!({
@@ -16252,5 +16261,40 @@ async fn disable_table_bucket_preserves_objects_and_can_be_reenabled() {
             .await
             .unwrap()
             .table_bucket_enabled()
+    );
+}
+
+/// An injected server slot that has not finished startup must fail closed
+/// rather than fall back to the ambient process context.
+#[tokio::test]
+async fn envelope_helpers_fail_closed_on_an_empty_server_slot() {
+    let request = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/tables")
+        .extension(ServerContextSlot::new())
+        .build();
+    let envelope = request.envelope();
+
+    let backend = table_catalog_backend_from_envelope(envelope)
+        .map(|_| ())
+        .expect_err("empty slot has no context");
+    assert_eq!(backend.message(), Some("request application context is not initialized"));
+    assert_eq!(
+        table_catalog_store_from_envelope(envelope)
+            .map(|_| ())
+            .expect_err("store needs a context")
+            .message(),
+        backend.message()
+    );
+    assert!(table_catalog_object_store_from_envelope(envelope).is_err());
+
+    let enabled = table_bucket_enabled_from_envelope(envelope, "probe")
+        .await
+        .expect_err("empty slot has no store");
+    assert_eq!(enabled.message(), Some("request object store is not initialized"));
+    assert_eq!(
+        ensure_table_bucket_enabled_from_envelope(envelope, "probe")
+            .await
+            .expect_err("ensure fails closed too")
+            .message(),
+        enabled.message()
     );
 }

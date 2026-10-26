@@ -288,6 +288,13 @@ pub(crate) fn target_module_disabled_reason(module_name: &str, env_key: &str, en
     })
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "kept for the legacy/owned equivalence test until the legacy admin response helpers retire in T1.12 (rustfs/backlog#2788)"
+    )
+)]
 pub(crate) fn build_json_response(
     status: StatusCode,
     body: Body,
@@ -299,6 +306,20 @@ pub(crate) fn build_json_response(
         header.insert("x-request-id", v.clone());
     }
     S3Response::with_headers((status, body), header)
+}
+
+/// Owned-boundary form of [`build_json_response`].
+pub(crate) fn owned_build_json_response(
+    status: StatusCode,
+    body: rustfs_s3_types::Body,
+    request_id: Option<&HeaderValue>,
+) -> crate::admin::operation::AdminResponse {
+    let mut header = HeaderMap::new();
+    header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Some(v) = request_id {
+        header.insert("x-request-id", v.clone());
+    }
+    crate::admin::operation::AdminResponse::with_headers(status, body, header)
 }
 
 pub(crate) async fn collect_runtime_statuses<E>(targets: Vec<SharedTarget<E>>) -> HashMap<EndpointKey, RuntimeHealthStatus>
@@ -981,5 +1002,28 @@ mod webhook_request_tests {
         validate_webhook_request(&config)
             .await
             .expect("a public HTTPS webhook should pass outbound preflight");
+    }
+}
+
+#[cfg(test)]
+mod owned_response_tests {
+    use super::{build_json_response, owned_build_json_response};
+
+    #[tokio::test]
+    async fn owned_build_json_response_matches_the_legacy_shape() {
+        let request_id = http::HeaderValue::from_static("req-42");
+        for id in [None, Some(&request_id)] {
+            let mut legacy = build_json_response(http::StatusCode::ACCEPTED, s3s::Body::from(b"{\"ok\":true}".to_vec()), id);
+            let (status, headers, mut body) =
+                owned_build_json_response(http::StatusCode::ACCEPTED, rustfs_s3_types::Body::from("{\"ok\":true}"), id)
+                    .into_parts();
+            assert_eq!(status, legacy.output.0);
+            assert_eq!(headers, legacy.headers);
+            assert_eq!(headers.get("x-request-id"), id);
+            assert_eq!(
+                body.store_all_limited(64).await.expect("owned body reads"),
+                legacy.output.1.store_all_limited(64).await.expect("legacy body reads")
+            );
+        }
     }
 }

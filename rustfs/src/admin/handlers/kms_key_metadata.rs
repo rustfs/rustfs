@@ -21,11 +21,12 @@
 use super::kms_audit::{KmsAdminAudit, KmsAdminOperation};
 use super::kms_keys::scoped_key_id;
 use crate::admin::auth::validate_admin_request_with_kms_key;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::current_kms_runtime_service_manager;
-use crate::admin::utils::json_response;
+use crate::admin::utils::owned_json_response;
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -35,7 +36,6 @@ use rustfs_kms::{
 };
 use rustfs_policy::policy::action::{Action, KmsAction};
 use rustfs_s3_types::{S3Result, s3_error};
-use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{error, info, warn};
@@ -269,8 +269,8 @@ async fn execute_metadata_update(
     }
 }
 
-fn unavailable_response(message: &str, key_id: String) -> S3Result<S3Response<(StatusCode, Body)>> {
-    json_response(
+fn unavailable_response(message: &str, key_id: String) -> S3Result<AdminResponse> {
+    owned_json_response(
         StatusCode::SERVICE_UNAVAILABLE,
         &KmsKeyMetadataResponse {
             success: false,
@@ -303,32 +303,33 @@ fn parse_untag_key(body: &[u8]) -> S3Result<(String, MetadataUpdate)> {
 }
 
 async fn handle_metadata_request(
-    mut req: S3Request<Body>,
+    mut req: AdminRequest,
     actions: Vec<Action>,
     audit_operation: KmsAdminOperation,
     parse: ParseUpdate,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let Some(cred) = req.credentials else {
+) -> S3Result<AdminResponse> {
+    let Some(cred) = req.credentials() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
 
-    let (cred, owner) = check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+    let (cred, owner) =
+        check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
     // The body names the key this operation acts on, so it has to be resolved
     // before the gate runs. A read failure is surfaced only afterwards so an
     // unauthorized caller still sees AccessDenied.
-    let body = req.input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await;
-    let scoped = body.as_ref().ok().and_then(|body| scoped_key_id(body, &req.uri));
-    let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+    let body = req.take_body().store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await;
+    let scoped = body.as_ref().ok().and_then(|body| scoped_key_id(body, req.uri()));
+    let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
     audit.gate_admin(
         validate_admin_request_with_kms_key(
-            &req.headers,
+            req.headers(),
             &cred,
             owner,
             false,
             actions,
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            req.remote_addr(),
             scoped.as_deref().unwrap_or_default(),
         )
         .await,
@@ -359,7 +360,7 @@ async fn handle_metadata_request(
 
     let (status, response, error) = execute_metadata_update(&service, &key_id, update).await;
     audit.finish(audit_operation, Some(key_id.as_str()), error.as_ref());
-    json_response(status, &response)
+    owned_json_response(status, &response)
 }
 
 /// Replace a KMS key's description
@@ -367,7 +368,7 @@ pub struct UpdateKmsKeyDescriptionHandler {}
 
 #[async_trait::async_trait]
 impl Operation for UpdateKmsKeyDescriptionHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         handle_metadata_request(
             req,
             kms_update_key_description_actions(),
@@ -383,7 +384,7 @@ pub struct TagKmsKeyHandler {}
 
 #[async_trait::async_trait]
 impl Operation for TagKmsKeyHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         handle_metadata_request(req, kms_tag_key_actions(), KmsAdminOperation::TagResource, parse_tag_key).await
     }
 }
@@ -393,7 +394,7 @@ pub struct UntagKmsKeyHandler {}
 
 #[async_trait::async_trait]
 impl Operation for UntagKmsKeyHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         handle_metadata_request(req, kms_untag_key_actions(), KmsAdminOperation::UntagResource, parse_untag_key).await
     }
 }
@@ -700,7 +701,7 @@ mod tests {
             "metadata requests must scope authorization to the requested key"
         );
         assert!(
-            handler.contains("scoped_key_id(body, &req.uri)"),
+            handler.contains("scoped_key_id(body, req.uri())"),
             "authorization must resolve the key exactly as execution does"
         );
 
