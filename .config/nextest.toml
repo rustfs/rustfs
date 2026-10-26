@@ -69,6 +69,17 @@ command = ['sh', '-c', 'echo RUST_MIN_STACK=33554432 >> "$NEXTEST_ENV"']
 # their existing deadlines and typed-failure assertions (rustfs/backlog#2706).
 # Keep each test's internal concurrency and zero-retry policy unchanged.
 [[profile.default.overrides]]
+filter = """
+package(rustfs-ecstore) & (
+    test(/^set_disk::ops::multipart::tests::complete_multipart_(quorum_success_releases_logical_guards_before_physical_tail|waits_for_tail_before_releasing_guards_and_marking_capacity)$/)
+    | test(=store::heal::tests::full_format_heal_lost_after_last_save_does_not_publish_or_renew_and_latches)
+    | test(/^store::init::tests::(decommission_durable_ilm_receipt_pagination_fails_closed_on_second_page|dispatch_manifest_shutdown_(drains_admitted_delete_batch_without_tail_admission|stops_aborting_validation_tail_reads|stops_authorized_tail_reads_before_receipt_or_cas))$/)
+    | (binary(metadata_read_lock_reuse_test) & test(=replica_multipart_completes_while_metadata_writer_waits_for_its_snapshot))
+)
+"""
+threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
 filter = 'package(rustfs) & test(/^connect::diagnostics::schedule::tests::/)'
 threads-required = "num-test-threads"
 
@@ -351,6 +362,17 @@ path = "junit.xml"
 
 # Match the local durable-progress reservations. All members, deadlines,
 # assertions, and internal concurrency remain enabled without retries.
+[[profile.ci.overrides]]
+filter = """
+package(rustfs-ecstore) & (
+    test(/^set_disk::ops::multipart::tests::complete_multipart_(quorum_success_releases_logical_guards_before_physical_tail|waits_for_tail_before_releasing_guards_and_marking_capacity)$/)
+    | test(=store::heal::tests::full_format_heal_lost_after_last_save_does_not_publish_or_renew_and_latches)
+    | test(/^store::init::tests::(decommission_durable_ilm_receipt_pagination_fails_closed_on_second_page|dispatch_manifest_shutdown_(drains_admitted_delete_batch_without_tail_admission|stops_aborting_validation_tail_reads|stops_authorized_tail_reads_before_receipt_or_cas))$/)
+    | (binary(metadata_read_lock_reuse_test) & test(=replica_multipart_completes_while_metadata_writer_waits_for_its_snapshot))
+)
+"""
+threads-required = "num-test-threads"
+
 [[profile.ci.overrides]]
 filter = 'package(rustfs) & test(/^connect::diagnostics::schedule::tests::/)'
 threads-required = "num-test-threads"

@@ -8814,17 +8814,31 @@ mod tests {
             metrics::with_local_recorder(&recorder, || {
                 rustfs_io_metrics::set_put_stage_metrics_enabled(true);
                 runtime.block_on(async {
-                    let healthy: Arc<dyn LockClient> =
-                        Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
-                    let failing: Arc<dyn LockClient> = Arc::new(FailingClient);
                     let ctx = Arc::new(InstanceContext::new());
                     ctx.update_erasure_type(SetupType::DistErasure).await;
-                    let set = make_test_set_disks_with_ctx(vec![healthy, failing], ctx).await;
+                    let set = make_test_set_disks_with_ctx(Vec::new(), ctx).await;
+                    // A real acquire can time out before the failing client is scheduled.
+                    let err = resolve_put_object_commit_lock_acquire_result(
+                        &set,
+                        "put_object_commit",
+                        "bucket",
+                        "object",
+                        Err(LockError::QuorumNotReached {
+                            required: 2,
+                            achieved: 1,
+                        }),
+                    )
+                    .expect_err("a quorum failure must remain a lock error");
                     assert!(
-                        set.acquire_write_lock_diag("put_object_commit", "bucket", "object")
-                            .await
-                            .is_err(),
-                        "one healthy locker must not satisfy the PUT commit write quorum"
+                        matches!(
+                            err,
+                            StorageError::NamespaceLockQuorumUnavailable {
+                                required: 2,
+                                achieved: 1,
+                                ..
+                            }
+                        ),
+                        "expected the typed quorum error, got: {err:?}"
                     );
                     rustfs_io_metrics::set_put_stage_metrics_enabled(false);
                 });

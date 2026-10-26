@@ -12018,7 +12018,9 @@ mod tests {
                     Ok::<(), Error>(())
                 }
             })
-            .buffer_unordered(32)
+            // Pagination, not write throughput, is the oracle. Drain each pair of
+            // durable receipts before preparing the next to bound fixture IO.
+            .buffer_unordered(1)
             .try_collect::<Vec<_>>()
             .await
             .expect("more than one receipt page should persist");
