@@ -147,14 +147,19 @@ impl QuotaTestEnv {
 
     pub async fn get_bucket_usage(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let stats = self.get_bucket_quota_stats().await?;
-        Ok(stats.get("current_usage").and_then(|v| v.as_u64()).unwrap_or(0))
+        stats
+            .get("current_usage")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| format!("bucket quota usage is not authoritative for {}", self.bucket_name).into())
     }
 
     async fn wait_for_bucket_usage(&self, expected: u64) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let convergence = async {
             loop {
-                let usage = self.get_bucket_usage().await?;
-                if usage == expected {
+                let stats = self.get_bucket_quota_stats().await?;
+                if let Some(usage) = stats.get("current_usage").and_then(|value| value.as_u64())
+                    && usage == expected
+                {
                     return Ok::<u64, Box<dyn std::error::Error + Send + Sync>>(usage);
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -214,9 +219,11 @@ impl QuotaTestEnv {
                     admin_request(&self.env.url, Method::GET, &stats_path, None, &self.env.access_key, &self.env.secret_key)
                         .await?;
                 if status.is_success() {
-                    return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
-                }
-                if status != StatusCode::SERVICE_UNAVAILABLE {
+                    let stats: serde_json::Value = serde_json::from_str(&response)?;
+                    if stats.get("current_usage").and_then(|value| value.as_u64()).is_some() {
+                        return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
+                    }
+                } else if status != StatusCode::SERVICE_UNAVAILABLE {
                     return Err(format!("quota usage readiness failed for {bucket}: {status} {response}").into());
                 }
                 sleep(Duration::from_secs(1)).await;

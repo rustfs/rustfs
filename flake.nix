@@ -77,7 +77,7 @@
 
           rustfs = rustPlatform.buildRustPackage {
             pname = "rustfs";
-            version = "1.0.3";
+            version = "1.0.4";
 
             src = ./.;
 

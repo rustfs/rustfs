@@ -5440,10 +5440,9 @@ require_source_contains \
   "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
   "fn set_disks_implements_storage_object_operations_contract()" \
   "SetDisks storage-api ObjectOperations compile-time coverage test"
-require_source_contains \
-  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
-  "fn set_disks_implements_storage_list_operations_contract()" \
-  "SetDisks storage-api ListOperations compile-time coverage test"
+# No ListOperations row for SetDisks: a paginated listing merges every set of
+# every pool, so the contract is implemented by ECStore only and SetDisks
+# exposes `walk` as an inherent method (crates/ecstore/src/set_disk/ops/list.rs).
 require_source_contains \
   "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
   "fn set_disks_implements_storage_multipart_operations_contract()" \

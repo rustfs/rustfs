@@ -27,7 +27,10 @@ mod io_admission;
 #[cfg(test)]
 pub(crate) mod lifecycle_test_io;
 pub mod local;
+pub mod multipart_source;
 pub mod os;
+
+pub use local::pool_meta_native::{PoolMetaNativeCasCondition, PoolMetaNativeFileIdentity};
 
 #[cfg(test)]
 pub(crate) use io_admission::DiskIoClass;
@@ -85,6 +88,7 @@ use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_madmin::info_commands::DiskMetrics;
 use rustfs_rio::ChunkReaderBox;
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 use std::{fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -137,6 +141,73 @@ pub(crate) fn quota_mutation_fence_path(bucket: &str, object: &str) -> String {
 pub fn is_quota_mutation_fence_path(path: &str) -> bool {
     path.strip_prefix(QUOTA_MUTATION_FENCE_PREFIX)
         .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+/// Objects admitted by the native pool metadata recovery protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolMetaNativeObject {
+    PoolBin,
+}
+
+pub const POOL_META_NATIVE_CAS_METADATA_SUFFIX: &str = PoolMetaNativeCasCondition::METADATA_SUFFIX;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolMetaNativeBackup {
+    pub directory: Uuid,
+    pub data: Bytes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolMetaNativeInspection {
+    pub disk_id: Uuid,
+    /// Present only when pool.bin.identity is co-located on this disk.
+    /// None describes placement, not a missing identity in its owning set.
+    pub identity: Option<Bytes>,
+    pub current: Option<Bytes>,
+    pub backups: Vec<PoolMetaNativeBackup>,
+}
+
+impl PoolMetaNativeInspection {
+    /// Bind a repair to the complete observed inventory, independent of listing order.
+    pub fn inventory_sha256(&self) -> Result<[u8; 32]> {
+        let mut backups = self.backups.iter().collect::<Vec<_>>();
+        backups.sort_unstable_by_key(|backup| backup.directory);
+        if backups.windows(2).any(|pair| pair[0].directory == pair[1].directory) {
+            return Err(DiskError::FileCorrupt);
+        }
+        let encoded =
+            rmp_serde::to_vec_named(&(self.disk_id, &self.identity, self.current.as_ref(), backups)).map_err(Error::other)?;
+        Ok(sha2::Sha256::digest(encoded).into())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PoolMetaNativeRecoveryRequest {
+    Probe {},
+    InspectIdentity {},
+    Inspect {
+        object: PoolMetaNativeObject,
+    },
+    Apply {
+        object: PoolMetaNativeObject,
+        expected_disk_id: Uuid,
+        expected_current_sha256: Option<[u8; 32]>,
+        expected_backup_inventory_sha256: [u8; 32],
+        replacement: Bytes,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "result", content = "value", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PoolMetaNativeRecoveryResponse {
+    Probed,
+    IdentityInspected { disk_id: Uuid, raw: Bytes },
+    Inspected(PoolMetaNativeInspection),
+    Applied,
 }
 
 pub type DiskStore = Arc<Disk>;
@@ -725,6 +796,50 @@ impl DiskAPI for Disk {
     ) -> Result<RenameDataResp> {
         self.rename_data_borrowed(src_volume, src_path, &fi, dst_volume, dst_path)
             .await
+    }
+
+    async fn rename_data_with_pool_meta_cas(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp> {
+        match self {
+            Disk::Local(disk) => {
+                disk.rename_data_with_pool_meta_cas(src_volume, src_path, fi, dst_volume, dst_path)
+                    .await
+            }
+            Disk::Remote(disk) => {
+                disk.rename_data_with_pool_meta_cas(src_volume, src_path, fi, dst_volume, dst_path)
+                    .await
+            }
+        }
+    }
+
+    async fn undo_pool_meta_write(&self, volume: &str, path: &str, fi: FileInfo, opts: DeleteOptions) -> Result<()> {
+        match self {
+            Disk::Local(disk) => disk.undo_pool_meta_write(volume, path, fi, opts).await,
+            Disk::Remote(disk) => disk.undo_pool_meta_write(volume, path, fi, opts).await,
+        }
+    }
+
+    async fn recover_multipart_source(
+        &self,
+        request: multipart_source::MultipartSourceRequest,
+    ) -> Result<multipart_source::MultipartSourceResponse> {
+        match self {
+            Disk::Local(disk) => disk.recover_multipart_source(request).await,
+            Disk::Remote(disk) => disk.recover_multipart_source(request).await,
+        }
+    }
+
+    async fn pool_meta_native_recovery(&self, request: PoolMetaNativeRecoveryRequest) -> Result<PoolMetaNativeRecoveryResponse> {
+        match self {
+            Disk::Local(disk) => disk.pool_meta_native_recovery(request).await,
+            Disk::Remote(disk) => disk.pool_meta_native_recovery(request).await,
+        }
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -1418,6 +1533,32 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         dst_path: &str,
     ) -> Result<RenameDataResp>;
 
+    async fn rename_data_with_pool_meta_cas(
+        &self,
+        _src_volume: &str,
+        _src_path: &str,
+        _file_info: FileInfo,
+        _dst_volume: &str,
+        _dst_path: &str,
+    ) -> Result<RenameDataResp> {
+        Err(DiskError::UnsupportedDisk)
+    }
+
+    async fn undo_pool_meta_write(&self, _volume: &str, _path: &str, _file_info: FileInfo, _opts: DeleteOptions) -> Result<()> {
+        Err(DiskError::UnsupportedDisk)
+    }
+
+    async fn recover_multipart_source(
+        &self,
+        _request: multipart_source::MultipartSourceRequest,
+    ) -> Result<multipart_source::MultipartSourceResponse> {
+        Err(DiskError::UnsupportedDisk)
+    }
+
+    async fn pool_meta_native_recovery(&self, _request: PoolMetaNativeRecoveryRequest) -> Result<PoolMetaNativeRecoveryResponse> {
+        Err(DiskError::UnsupportedDisk)
+    }
+
     // File operations.
     // Read every file and directory within the folder
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>>;
@@ -1955,6 +2096,9 @@ pub enum OldCurrentSize {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RenameDataResp {
+    /// Native-only source ownership result; older peers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multipart_source: Option<Box<multipart_source::MultipartPublicationResult>>,
     /// Dereferenced erasure data directory retained for older coordinators.
     pub old_data_dir: Option<Uuid>,
     /// Directory containing rollback metadata. This may be synthetic and must
@@ -2966,6 +3110,7 @@ mod tests {
         let signature = vec![0x01, 0x02, 0x03];
 
         let resp = RenameDataResp {
+            multipart_source: None,
             old_data_dir: Some(uuid),
             rollback_data_dir: Some(uuid),
             cleanup_data_dir: Some(uuid),
@@ -2988,6 +3133,7 @@ mod tests {
     fn test_rename_data_resp_old_current_size_msgpack_roundtrip() {
         for old_current_size in [None, Some(OldCurrentSize::Absent), Some(OldCurrentSize::Present(1337))] {
             let resp = RenameDataResp {
+                multipart_source: None,
                 old_data_dir: Some(Uuid::new_v4()),
                 rollback_data_dir: Some(Uuid::new_v4()),
                 cleanup_data_dir: Some(Uuid::new_v4()),
@@ -3573,5 +3719,117 @@ mod orphan_data_dir_protocol_tests {
         let old: OlderDeleteOptions = serde_json::from_slice(&encoded).expect("older options ignore additive field");
         assert!(!old.recursive, "ignoring the new option must never broaden deletion");
         assert!(old.immediate);
+    }
+}
+
+#[cfg(test)]
+mod pool_meta_native_inventory_tests {
+    use super::*;
+
+    fn inspection() -> PoolMetaNativeInspection {
+        PoolMetaNativeInspection {
+            disk_id: Uuid::from_u128(1),
+            identity: Some(Bytes::from_static(b"canonical-identity")),
+            current: Some(Bytes::from_static(b"current")),
+            backups: vec![
+                PoolMetaNativeBackup {
+                    directory: Uuid::from_u128(2),
+                    data: Bytes::from_static(b"before-2"),
+                },
+                PoolMetaNativeBackup {
+                    directory: Uuid::from_u128(3),
+                    data: Bytes::from_static(b"before-3"),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn pool_meta_native_inventory_binds_every_copy_and_ignores_listing_order() {
+        let baseline = inspection();
+        let digest = baseline.inventory_sha256().expect("valid inventory must hash");
+        let mut reordered = baseline.clone();
+        reordered.backups.reverse();
+        assert_eq!(digest, reordered.inventory_sha256().expect("listing order is irrelevant"));
+        for mutate in [
+            |value: &mut PoolMetaNativeInspection| value.disk_id = Uuid::from_u128(4),
+            |value: &mut PoolMetaNativeInspection| value.identity = Some(Bytes::from_static(b"changed-identity")),
+            |value: &mut PoolMetaNativeInspection| value.identity = None,
+            |value: &mut PoolMetaNativeInspection| value.identity = Some(Bytes::new()),
+            |value: &mut PoolMetaNativeInspection| value.current = None,
+            |value: &mut PoolMetaNativeInspection| value.current = Some(Bytes::from_static(b"new-current")),
+            |value: &mut PoolMetaNativeInspection| {
+                value.backups.pop();
+            },
+            |value: &mut PoolMetaNativeInspection| value.backups[0].directory = Uuid::from_u128(5),
+            |value: &mut PoolMetaNativeInspection| value.backups[0].data = Bytes::from_static(b"changed-backup"),
+        ] {
+            let mut changed = baseline.clone();
+            mutate(&mut changed);
+            assert_ne!(digest, changed.inventory_sha256().expect("changed inventory must hash"));
+        }
+    }
+
+    #[test]
+    fn pool_meta_native_inventory_rejects_duplicate_backup_directories() {
+        let mut value = inspection();
+        value.backups.push(value.backups[0].clone());
+        assert_eq!(value.inventory_sha256(), Err(DiskError::FileCorrupt));
+    }
+
+    #[test]
+    fn pool_meta_native_recovery_payload_rejects_unknown_scope_and_trailing_bytes() {
+        for request in [
+            PoolMetaNativeRecoveryRequest::Probe {},
+            PoolMetaNativeRecoveryRequest::Inspect {
+                object: PoolMetaNativeObject::PoolBin,
+            },
+            PoolMetaNativeRecoveryRequest::InspectIdentity {},
+        ] {
+            if matches!(&request, PoolMetaNativeRecoveryRequest::Probe {}) {
+                assert_eq!(
+                    serde_json::to_value(&request).expect("probe must encode"),
+                    serde_json::json!({"operation":"probe"})
+                );
+            }
+            if matches!(&request, PoolMetaNativeRecoveryRequest::InspectIdentity {}) {
+                assert_eq!(
+                    serde_json::to_value(&request).expect("identity probe must encode"),
+                    serde_json::json!({"operation":"inspect_identity"})
+                );
+            }
+            let mut encoded = rmp_serde::to_vec_named(&request).expect("request must encode");
+            let decoded: PoolMetaNativeRecoveryRequest =
+                rustfs_protos::decode_pool_meta_native_recovery_payload(&encoded).expect("valid request must decode");
+            assert_eq!(request, decoded);
+            encoded.push(0xc0);
+            assert!(
+                rustfs_protos::decode_pool_meta_native_recovery_payload::<PoolMetaNativeRecoveryRequest>(&encoded).is_err(),
+                "trailing bytes must be rejected for {request:?}",
+            );
+        }
+        let response = PoolMetaNativeRecoveryResponse::IdentityInspected {
+            disk_id: Uuid::from_u128(7),
+            raw: Bytes::from_static(b"identity-xlmeta"),
+        };
+        let encoded = rmp_serde::to_vec_named(&response).expect("identity response must encode");
+        let decoded: PoolMetaNativeRecoveryResponse =
+            rustfs_protos::decode_pool_meta_native_recovery_payload(&encoded).expect("identity response must decode");
+        assert_eq!(response, decoded);
+        for value in [
+            serde_json::json!({"operation":"inspect","object":"identity"}),
+            serde_json::json!({"operation":"inspect","object":"pool_bin","path":"other"}),
+            serde_json::json!({"operation":"probe","object":"pool_bin"}),
+            serde_json::json!({"operation":"probe","path":"other"}),
+            serde_json::json!({"operation":"inspect_identity","object":"pool_bin"}),
+            serde_json::json!({"operation":"inspect_identity","path":"pool.bin.identity"}),
+        ] {
+            let encoded = rmp_serde::to_vec_named(&value).expect("invalid request fixture must encode");
+            let decoded = rustfs_protos::decode_pool_meta_native_recovery_payload::<PoolMetaNativeRecoveryRequest>(&encoded);
+            assert!(
+                decoded.is_err(),
+                "invalid native recovery payload was accepted: {value}; decoded={decoded:?}"
+            );
+        }
     }
 }

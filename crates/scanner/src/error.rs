@@ -36,6 +36,11 @@ pub enum ScannerError {
     #[error("Scanner error: {0}")]
     Other(String),
 
+    /// The persisted scanner cycle state could not be read (for example a lock timeout), so the
+    /// leader fence is unknown rather than known to have changed.
+    #[error("Scanner error: failed to read persisted scanner cycle state: {0}")]
+    CycleStateUnavailable(String),
+
     /// A remote namespace scanner request ID was already accepted.
     #[error("Remote namespace scanner request replay detected")]
     RemoteRequestReplay,

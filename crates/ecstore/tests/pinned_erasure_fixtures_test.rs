@@ -183,6 +183,67 @@ fn load_fixture(kind: &str) -> Fixture {
     }
 }
 
+fn assert_encoded_shards_match_fixture(fixture: &Fixture, input: &str, shards: &[bytes::Bytes]) {
+    assert_eq!(shards.len(), fixture.shards.len(), "{input}: all captured erasure slots are required");
+    for (slot, (actual, captured)) in shards.iter().zip(&fixture.shards).enumerate() {
+        // The captured part prefix belongs to the bitrot writer, not the EC encoder.
+        assert_eq!(
+            actual.as_ref(),
+            &captured[32..],
+            "{input}: {} data/parity slot {slot} differs from released producer bytes",
+            fixture.manifest.source.release
+        );
+    }
+}
+
+fn assert_encoding_inputs_match_fixture(kind: &str) {
+    let fixture = load_fixture(kind);
+    let erasure = Erasure::try_new_with_options(6, 6, 1_048_576, fixture.uses_legacy).expect("captured codec geometry");
+    let borrowed = erasure
+        .encode_data(&fixture.plaintext)
+        .expect("encode borrowed fixture plaintext");
+    assert_encoded_shards_match_fixture(&fixture, "borrowed", &borrowed);
+
+    let expanded_capacity = erasure.shard_size() * fixture.shards.len();
+    let mut owned = Vec::with_capacity(expanded_capacity);
+    owned.extend_from_slice(&fixture.plaintext);
+    let owned_start = owned.as_ptr();
+    let owned_shards = erasure
+        .encode_data_owned(owned)
+        .expect("encode pre-reserved Vec fixture plaintext");
+    assert_eq!(
+        owned_shards[0].as_ptr(),
+        owned_start,
+        "owned Vec must retain its pre-reserved backing allocation"
+    );
+    assert_encoded_shards_match_fixture(&fixture, "owned Vec", &owned_shards);
+
+    let mut mutable = bytes::BytesMut::with_capacity(expanded_capacity);
+    mutable.extend_from_slice(&fixture.plaintext);
+    // Reused input buffers may contain initialized bytes past the logical payload.
+    mutable.extend_from_slice(&[0xa5; 15]);
+    let mutable_start = mutable.as_ptr();
+    let mutable_shards = erasure
+        .encode_data_bytes_mut(mutable, fixture.plaintext.len())
+        .expect("encode pre-reserved BytesMut fixture plaintext");
+    assert_eq!(
+        mutable_shards[0].as_ptr(),
+        mutable_start,
+        "BytesMut must retain its pre-reserved backing allocation"
+    );
+    assert_encoded_shards_match_fixture(&fixture, "BytesMut with stale tail", &mutable_shards);
+}
+
+#[test]
+fn pinned_minio_shards_match_all_encoding_inputs() {
+    assert_encoding_inputs_match_fixture("minio");
+}
+
+#[test]
+fn pinned_legacy_shards_match_all_encoding_inputs() {
+    assert_encoding_inputs_match_fixture("legacy");
+}
+
 async fn decode(
     fixture: &Fixture,
     missing: &[usize],
