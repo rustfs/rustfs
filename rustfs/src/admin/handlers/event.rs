@@ -20,7 +20,7 @@ use crate::admin::{
     handlers::target_descriptor::{
         AdminTargetSpec, EndpointKey, RuntimeHealthStatus, TargetEndpointSource, admin_target_spec_from_builtin,
         build_enabled_target_kvs, collect_runtime_statuses, extract_supported_target_params,
-        merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
+        merge_target_endpoints as shared_merge_target_endpoints, owned_build_json_response, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason,
     },
     router::{AdminOperation, S3Router},
@@ -320,17 +320,6 @@ fn collect_target_subscriptions(
     Ok(subscriptions)
 }
 
-/// Owned-boundary form of `target_descriptor::build_json_response`, which
-/// still answers with the s3s response type.
-fn build_json_response(status: StatusCode, body: Body, request_id: Option<&http::HeaderValue>) -> AdminResponse {
-    let mut header = http::HeaderMap::new();
-    header.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
-    if let Some(v) = request_id {
-        header.insert("x-request-id", v.clone());
-    }
-    AdminResponse::with_headers(status, body, header)
-}
-
 #[async_trait::async_trait]
 impl Operation for ListTargetSubscriptions {
     async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
@@ -356,7 +345,11 @@ impl Operation for ListTargetSubscriptions {
         }
         let data = serde_json::to_vec(&subscriptions)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize subscriptions: {e}")))?;
-        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers().get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::from(data),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
@@ -527,7 +520,11 @@ impl Operation for NotificationTarget {
         })?;
         log_notification_target_config_updated!("set_target_config", target_type, target_name);
 
-        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers().get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::empty(),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
@@ -563,7 +560,11 @@ impl Operation for ListNotificationTargets {
             s3_error!(InternalError, "failed to serialize targets: {}", e)
         })?;
 
-        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers().get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::from(data),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
@@ -607,7 +608,11 @@ impl Operation for ListTargetsArns {
             s3_error!(InternalError, "failed to serialize targets: {}", e)
         })?;
 
-        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers().get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::from(data),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
@@ -649,7 +654,11 @@ impl Operation for RemoveNotificationTarget {
         })?;
         log_notification_target_config_updated!("remove_target_config", target_type, target_name);
 
-        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers().get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::empty(),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
@@ -824,8 +833,7 @@ mod tests {
             let err = ListTargetSubscriptions {}
                 .call(req, params)
                 .await
-                .err()
-                .expect("credentials must be required");
+                .expect_err("credentials must be required");
             assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
             assert_eq!(err.message(), Some("credentials not found"));
         }

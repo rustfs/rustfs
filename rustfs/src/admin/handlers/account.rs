@@ -32,6 +32,7 @@ use super::account_audit::{
     AccountAuditContext, AccountAuditFailure, AccountAuditOperation, AccountAuditRecord, emit as emit_audit,
 };
 use super::iam_error::iam_error_to_s3_error;
+use super::owned_admin_json_response;
 use super::site_replication::site_replication_iam_change_hook;
 use super::supervise_admin_mutation;
 use crate::admin::auth::validate_admin_request;
@@ -80,22 +81,6 @@ struct SelfAccountInfoResponse {
     username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     email: Option<String>,
-}
-
-/// Owned-boundary form of `super::admin_json_response`, which still answers
-/// with the s3s response type.
-fn admin_json_response<T: serde::Serialize>(
-    path: &str,
-    secret_key: &str,
-    status: StatusCode,
-    payload: &T,
-) -> S3Result<AdminResponse> {
-    let body = serde_json::to_vec(payload).map_err(|e| s3::error(S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
-    let (body, content_type) = crate::admin::utils::encode_compatible_admin_payload(path, secret_key, body)?;
-
-    let mut header = http::HeaderMap::new();
-    header.insert(http::header::CONTENT_TYPE, content_type.parse().expect("valid header value"));
-    Ok(AdminResponse::with_headers(status, rustfs_s3_types::Body::from(body), header))
 }
 
 #[async_trait::async_trait]
@@ -167,7 +152,7 @@ impl Operation for SelfAccountInfoHandler {
             email,
         };
 
-        admin_json_response(req.uri().path(), &caller.credentials.secret_key, StatusCode::OK, &info)
+        owned_admin_json_response(req.uri().path(), &caller.credentials.secret_key, StatusCode::OK, &info)
     }
 }
 
@@ -325,7 +310,7 @@ impl Operation for ChangeOwnPasswordHandler {
         })
         .await?;
 
-        admin_json_response(
+        owned_admin_json_response(
             &path,
             &caller.credentials.secret_key,
             StatusCode::OK,
@@ -490,7 +475,7 @@ impl Operation for SetUserSecretKeyHandler {
         })
         .await?;
 
-        admin_json_response(
+        owned_admin_json_response(
             &path,
             &caller.credentials.secret_key,
             StatusCode::OK,

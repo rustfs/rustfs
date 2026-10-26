@@ -30,6 +30,7 @@
 //! log line carries the config.
 
 use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::handlers::owned_admin_json_response;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{
@@ -715,23 +716,6 @@ fn notify_peers_reload(context: Option<Arc<AppContext>>, bucket: String, operati
     });
 }
 
-/// Owned-boundary form of `super::admin_json_response`, which still answers
-/// with the s3s response type.
-fn admin_json_response<T: serde::Serialize>(
-    path: &str,
-    secret_key: &str,
-    status: StatusCode,
-    payload: &T,
-) -> S3Result<AdminResponse> {
-    let body =
-        serde_json::to_vec(payload).map_err(|e| admin_s3_error(S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
-    let (body, content_type) = crate::admin::utils::encode_compatible_admin_payload(path, secret_key, body)?;
-
-    let mut header = http::HeaderMap::new();
-    header.insert(http::header::CONTENT_TYPE, content_type.parse().expect("valid header value"));
-    Ok(AdminResponse::with_headers(status, rustfs_s3_types::Body::from(body), header))
-}
-
 #[async_trait::async_trait]
 impl Operation for SetBucketOnDemandMigrationHandler {
     #[tracing::instrument(skip_all)]
@@ -794,7 +778,7 @@ impl Operation for SetBucketOnDemandMigrationHandler {
             updated_at,
             probe,
         };
-        admin_json_response(&path, &cred.secret_key, StatusCode::OK, &response)
+        owned_admin_json_response(&path, &cred.secret_key, StatusCode::OK, &response)
     }
 }
 
@@ -821,7 +805,7 @@ impl Operation for GetBucketOnDemandMigrationHandler {
             config: config.redacted(),
             updated_at: format_updated_at(updated_at)?,
         };
-        admin_json_response(req.uri().path(), &cred.secret_key, StatusCode::OK, &response)
+        owned_admin_json_response(req.uri().path(), &cred.secret_key, StatusCode::OK, &response)
     }
 }
 
@@ -885,7 +869,7 @@ impl Operation for GetBucketOnDemandMigrationStatusHandler {
             module_enabled(),
         )?;
         status.backfill = backfill;
-        admin_json_response(req.uri().path(), &cred.secret_key, StatusCode::OK, &status)
+        owned_admin_json_response(req.uri().path(), &cred.secret_key, StatusCode::OK, &status)
     }
 }
 
@@ -943,7 +927,7 @@ impl Operation for ControlBucketOnDemandMigrationBackfillHandler {
             }
         };
         let response = BackfillJobResponse { bucket, job };
-        admin_json_response(&path, &cred.secret_key, StatusCode::OK, &response)
+        owned_admin_json_response(&path, &cred.secret_key, StatusCode::OK, &response)
     }
 }
 
@@ -960,7 +944,7 @@ impl Operation for GetBucketOnDemandMigrationBackfillHandler {
             .map_err(|err| backfill_error(&bucket, err))?
             .ok_or_else(|| backfill_error(&bucket, BackfillError::NotFound(bucket.clone())))?;
         let response = BackfillJobResponse { bucket, job };
-        admin_json_response(req.uri().path(), &cred.secret_key, StatusCode::OK, &response)
+        owned_admin_json_response(req.uri().path(), &cred.secret_key, StatusCode::OK, &response)
     }
 }
 
@@ -1393,8 +1377,7 @@ mod tests {
             let err = handler
                 .call(request(method, uri), params.clone())
                 .await
-                .err()
-                .expect("a request without credentials must be rejected");
+                .expect_err("a request without credentials must be rejected");
             assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
             assert_eq!(err.message(), Some("get cred failed"));
         }
@@ -1411,8 +1394,7 @@ mod tests {
         let err = GetBucketOnDemandMigrationHandler {}
             .call(request, Params::new())
             .await
-            .err()
-            .expect("an empty bucket must be rejected");
+            .expect_err("an empty bucket must be rejected");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("bucket name is required"));
     }
@@ -1651,8 +1633,7 @@ mod store_tests {
                     bucket_params(&router),
                 )
                 .await
-                .err()
-                .expect("PUT must be refused while the module is disabled");
+                .expect_err("PUT must be refused while the module is disabled");
             assert_eq!(err.code(), &S3ErrorCode::Custom(ERR_CODE_MODULE_DISABLED.into()));
             assert_eq!(err.status_code(), Some(StatusCode::BAD_REQUEST));
 
@@ -1685,8 +1666,7 @@ mod store_tests {
                         missing,
                     )
                     .await
-                    .err()
-                    .expect("unknown bucket must be rejected");
+                    .expect_err("unknown bucket must be rejected");
                 assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);
 
                 // Validation failure (empty region) does not persist anything.
@@ -1698,8 +1678,7 @@ mod store_tests {
                         bucket_params(&router),
                     )
                     .await
-                    .err()
-                    .expect("invalid config must be rejected");
+                    .expect_err("invalid config must be rejected");
                 assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
                 assert!(err.message().unwrap_or_default().contains("region"));
                 assert!(get_config().await.is_err(), "a rejected PUT must not persist");
@@ -1709,8 +1688,7 @@ mod store_tests {
                 let err = SetBucketOnDemandMigrationHandler {}
                     .call(root_request(Method::PUT, config_uri(""), config_json(&closed)), bucket_params(&router))
                     .await
-                    .err()
-                    .expect("unreachable source must be rejected");
+                    .expect_err("unreachable source must be rejected");
                 assert_eq!(err.code(), &S3ErrorCode::Custom(ERR_CODE_SOURCE_UNREACHABLE.into()));
                 assert_eq!(err.status_code(), Some(StatusCode::BAD_REQUEST));
                 let rendered = format!("{err:?}");
@@ -1768,8 +1746,7 @@ mod store_tests {
                     let err = SetBucketOnDemandMigrationHandler {}
                         .call(root_request(Method::PUT, config_uri(""), invalid), bucket_params(&router))
                         .await
-                        .err()
-                        .expect("malformed replacement must be rejected");
+                        .expect_err("malformed replacement must be rejected");
                     assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
                     let after = metadata_sys::get(BUCKET).await.expect("saved metadata remains readable");
                     assert_eq!(after.on_demand_migration_config_json, before.on_demand_migration_config_json);
@@ -1816,8 +1793,7 @@ mod store_tests {
                         bucket_params(&router),
                     )
                     .await
-                    .err()
-                    .expect("reader must not PUT");
+                    .expect_err("reader must not PUT");
                 assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
                 let err = DeleteBucketOnDemandMigrationHandler {}
                     .call(
@@ -1825,8 +1801,7 @@ mod store_tests {
                         bucket_params(&router),
                     )
                     .await
-                    .err()
-                    .expect("reader must not DELETE");
+                    .expect_err("reader must not DELETE");
                 assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
                 assert!(get_config().await.is_ok(), "denied writes must not change the config");
 
