@@ -3,6 +3,65 @@
 
 use super::*;
 
+#[tokio::test]
+async fn completed_leaf_compaction_reuses_cached_storage() {
+    let (mut scanner, root) = build_test_scanner().await;
+    let _cleanup = TestGuard { temp_dir: Some(root) };
+    scanner.old_cache = bound_checkpoint().0;
+    let folder = CachedFolder {
+        name: "bucket/object".to_string(),
+        parent: Some(hash_path("bucket")),
+        object_heal_prob_div: 1,
+    };
+    let hash = hash_path(&folder.name);
+
+    for (coverage_gap, failed_objects, should_compact) in [(false, 0, true), (true, 0, false), (false, 1, false)] {
+        scanner.coverage_gap = coverage_gap;
+        scanner.new_cache = DataUsageCache {
+            info: scanner.old_cache.info.clone(),
+            ..Default::default()
+        };
+        let mut target = String::with_capacity(4096);
+        target.push_str("arn:test:replica");
+        let allocation = target.as_ptr();
+        let capacity = target.capacity();
+        let mut leaf = DataUsageEntry {
+            size: 2048,
+            objects: 1,
+            versions: 3,
+            failed_objects,
+            replication_stats: Some(rustfs_data_usage::ReplicationAllStats {
+                targets: HashMap::from([(target, rustfs_data_usage::ReplicationTargetUsage::default())]),
+                ..Default::default()
+            }),
+            all_tier_stats: Some(rustfs_data_usage::AllTierStats::new()),
+            ..Default::default()
+        };
+        leaf.obj_sizes.add(2048);
+        leaf.obj_versions.add(3);
+        let accumulator = leaf.clone();
+        let mut expected = serde_json::to_value(&leaf).expect("leaf metadata");
+        expected["compacted"] = serde_json::json!(should_compact);
+        scanner.new_cache.replace(&folder.name, "bucket", leaf);
+
+        scanner.compact_completed_folder(&folder, &hash, &accumulator);
+
+        let cached = scanner.new_cache.find(&folder.name).expect("retained leaf");
+        assert_eq!(serde_json::to_value(cached).expect("compacted metadata"), expected);
+        let target = cached
+            .replication_stats
+            .as_ref()
+            .expect("retained replication statistics")
+            .targets
+            .keys()
+            .next()
+            .expect("retained replication target");
+        assert_eq!(target.capacity(), capacity, "leaf compaction must preserve owned allocations");
+        assert_eq!(target.as_ptr(), allocation);
+        assert!(!accumulator.compacted, "cache compaction must not change the caller's accounting mode");
+    }
+}
+
 async fn scan(
     disk: &Arc<Disk>,
     cache: DataUsageCache,

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::FileType;
 use std::io::ErrorKind;
@@ -1671,6 +1672,59 @@ impl FolderScanner {
         self.data_usage_scanner_debug = debug;
     }
 
+    fn compact_completed_folder(&mut self, folder: &CachedFolder, hash: &DataUsageHash, entry: &DataUsageEntry) {
+        // Completed healthy subtrees can keep aggregate usage. Coverage gaps
+        // and failed-object debt still need child entries for precise resume
+        // and to avoid rereading healthy siblings on a retry.
+        let forward_sweep = self.old_cache.info.scan_progress.is_some();
+        if entry.compacted || self.new_cache.info.name == folder.name || (forward_sweep && self.coverage_gap) {
+            return;
+        }
+        let summary = if entry.children.is_empty() {
+            Cow::Borrowed(entry)
+        } else if let Some(flat) = self.new_cache.size_recursive(&hash.0) {
+            Cow::Owned(flat)
+        } else {
+            return;
+        };
+        if forward_sweep && summary.failed_objects != 0 {
+            return;
+        }
+        let should_compact = summary.objects < DATA_SCANNER_COMPACT_LEAST_OBJECT
+            || entry.children.iter().all(|key| {
+                self.new_cache
+                    .cache
+                    .get(key)
+                    .is_none_or(|child| child.children.is_empty() && child.objects <= 1)
+            });
+        if !should_compact {
+            return;
+        }
+        // Heal revisits also reach this path without a parent advancing
+        // coverage. Keep the endpoint addressable when its completed
+        // subtree is replaced by an aggregate.
+        if self.coverage_frontier.as_deref().is_some_and(|frontier| {
+            frontier
+                .strip_prefix(&folder.name)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
+            self.record_completed_child(&folder.name);
+        }
+        match summary {
+            Cow::Borrowed(_) => {
+                // The leaf is already cached; only its sampling mode changes.
+                if let Some(cached) = self.new_cache.cache.get_mut(&hash.0) {
+                    cached.compacted = true;
+                }
+            }
+            Cow::Owned(mut flat) => {
+                flat.compacted = true;
+                self.new_cache.delete_recursive(hash);
+                self.new_cache.replace_hashed(hash, &folder.parent, &flat);
+            }
+        }
+    }
+
     fn refresh_usage_subtree(&mut self, hash: &DataUsageHash, parent: &Option<DataUsageHash>) {
         if let Some(updates) = &mut self.usage_updates {
             updates.cache.delete_recursive(hash);
@@ -3025,48 +3079,7 @@ impl FolderScanner {
             self.new_cache.replace_hashed(&this_hash, &folder.parent, into);
         }
 
-        // Completed healthy subtrees can keep aggregate usage. Coverage gaps
-        // and failed-object debt still need child entries for precise resume
-        // and to avoid rereading healthy siblings on a retry.
-        if !into.compacted
-            && (self.old_cache.info.scan_progress.is_none() || !self.coverage_gap)
-            && self.new_cache.info.name != folder.name
-            && let Some(mut flat) = self.new_cache.size_recursive(&this_hash.key())
-            && (self.old_cache.info.scan_progress.is_none() || flat.failed_objects == 0)
-        {
-            flat.compacted = true;
-            let mut should_compact = false;
-
-            if flat.objects < DATA_SCANNER_COMPACT_LEAST_OBJECT {
-                should_compact = true;
-            } else {
-                // Compact if we only have objects as children...
-                should_compact = true;
-                for k in &into.children {
-                    if let Some(v) = self.new_cache.cache.get(k)
-                        && (!v.children.is_empty() || v.objects > 1)
-                    {
-                        should_compact = false;
-                        break;
-                    }
-                }
-            }
-
-            if should_compact {
-                // Heal revisits also reach this path without a parent advancing
-                // coverage. Keep the endpoint addressable when its completed
-                // subtree is replaced by an aggregate.
-                if self.coverage_frontier.as_deref().is_some_and(|frontier| {
-                    frontier
-                        .strip_prefix(&folder.name)
-                        .is_some_and(|suffix| suffix.starts_with('/'))
-                }) {
-                    self.record_completed_child(&folder.name);
-                }
-                self.new_cache.delete_recursive(&this_hash);
-                self.new_cache.replace_hashed(&this_hash, &folder.parent, &flat);
-            }
-        }
+        self.compact_completed_folder(&folder, &this_hash, into);
 
         // Compact if too many children...
         if !into.compacted {
