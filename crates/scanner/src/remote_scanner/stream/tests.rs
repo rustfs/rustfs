@@ -2170,10 +2170,22 @@ async fn raw_frame_staging_denial_consumes_only_the_length_prefix() {
     owner.set_sampled_limit(u64::try_from(length).expect("frame length"), Duration::from_secs(30));
     let decoded = read_frame(&mut input, &auth, &mut sequence, Some(&owner)).await;
     assert!(decoded.is_err(), "denial is terminal; do not resume from the consumed prefix");
+    let mut input = Cursor::new(wire.clone());
+    let error = read_frame(&mut input, &auth, &mut sequence, Some(&owner))
+        .await
+        .expect_err("raw-only capacity cannot fund an envelope-owned payload");
+    assert_eq!(error.kind(), ErrorKind::WouldBlock);
+    assert!(error.get_ref().is_some(), "preserve the original memory-denial cause");
+    assert_eq!(sequence, 0);
+    assert_eq!(owner.snapshot().used, 0);
+
+    // Each allocation is bounded by length: raw, the retained other field,
+    // and both old and new field growth allocations can coexist.
+    owner.set_sampled_limit(u64::try_from(length * 4).expect("growth peak bound"), Duration::from_secs(30));
     let mut input = Cursor::new(wire);
     read_frame(&mut input, &auth, &mut sequence, Some(&owner))
         .await
-        .expect("a fresh reader with an admitted frame decodes");
+        .expect("a fresh reader with all retained storage and growth funded decodes");
     assert_eq!(sequence, 1);
     assert_eq!(owner.snapshot().used, 0);
 }
@@ -2315,4 +2327,138 @@ async fn namespace_decode_denial_keeps_previously_reported_progress() {
     assert_eq!(input.input.position(), first_frame_end + 4);
     assert_eq!(owner.snapshot().used, 0);
     println!("NAMESPACE_DECODE_PROGRESS_OK");
+}
+
+#[test]
+fn background_envelope_does_not_reserve_an_unread_sequence_hint() {
+    let owner = EcstoreBackgroundMemoryBudget::new();
+    // Compact envelope: [version, sequence, payload, mac]. Neither forged
+    // byte-array hint contains a byte, so a closed budget must not be queried.
+    for encoded in [
+        &[0x94, 3, 0, 0xdd, 0xff, 0xff, 0xff, 0xff][..],
+        &[0x94, 3, 0, 0x90, 0xdd, 0xff, 0xff, 0xff, 0xff][..],
+    ] {
+        let error = decode_background_envelope(encoded, &owner)
+            .err()
+            .expect("truncated byte array");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert_eq!(owner.snapshot().used, 0);
+    }
+    let error = decode_background_envelope(&[0x94, 3, 0, 0x91, 7, 0x90], &owner)
+        .err()
+        .expect("the first actual payload byte needs admission");
+    assert_eq!(error.kind(), ErrorKind::WouldBlock);
+    assert!(error.get_ref().is_some(), "preserve the original I/O cause");
+    assert_eq!(owner.snapshot().used, 0);
+}
+
+#[tokio::test]
+async fn background_envelope_mac_denial_follows_same_budget_payload_success() {
+    let auth = FrameAuthenticator::for_test(Uuid::from_u128(7));
+    let frame = RemoteScannerFrame::progress(RemoteScannerProgress::default());
+    let payload = rmp_serde::to_vec(&frame).expect("compact frame");
+    assert!(!payload.is_empty() && payload.len() <= 32, "single 32-byte payload allocation");
+    let envelope = RemoteScannerFrameEnvelope {
+        version: NS_SCANNER_PROTOCOL_VERSION,
+        sequence: 0,
+        mac: auth.sign(0, &payload).expect("MAC"),
+        payload,
+    };
+    let encoded = rmp_serde::to_vec_named(&envelope).expect("envelope");
+    let owner = EcstoreBackgroundMemoryBudget::new();
+    let limit = u64::try_from(encoded.len() + 32).expect("raw plus payload capacity");
+    owner.set_sampled_limit(limit, Duration::from_secs(30));
+    let mut raw = EcstoreBackgroundEncodeBuffer::new(owner.clone(), encoded.len());
+    raw.prepare_read(encoded.len())
+        .expect("raw admission")
+        .copy_from_slice(&encoded);
+    let payload_wire = rmp_serde::to_vec(&envelope.payload).expect("payload byte-array wire");
+    let mut failure = None;
+    let payload_seed = BackgroundEnvelopeBytesSeed {
+        buffer: EcstoreBackgroundEncodeBuffer::new(owner.clone(), encoded.len()),
+        failure: &mut failure,
+    };
+    let payload =
+        serde::de::DeserializeSeed::deserialize(payload_seed, &mut rmp_serde::Deserializer::from_read_ref(&payload_wire))
+            .expect("the identical budget admits raw staging and the complete payload");
+    assert_eq!(payload.as_ref(), envelope.payload.as_slice());
+    assert_eq!(owner.snapshot().used, limit);
+    drop(payload);
+    drop(raw);
+    assert_eq!(owner.snapshot().used, 0);
+
+    let mut wire = u32::try_from(encoded.len()).expect("frame length").to_be_bytes().to_vec();
+    wire.extend_from_slice(&encoded);
+    let mut input = Cursor::new(wire);
+    let mut sequence = 0;
+    let error = read_frame(&mut input, &auth, &mut sequence, Some(&owner))
+        .await
+        .expect_err("MAC allocation must fail after the admitted payload");
+    assert_eq!(error.kind(), ErrorKind::WouldBlock);
+    assert!(error.get_ref().is_some(), "preserve the original I/O cause");
+    assert_eq!(input.position(), u64::try_from(encoded.len() + 4).expect("consumed frame"));
+    assert_eq!(sequence, 0);
+    assert_eq!(owner.snapshot().used, 0);
+}
+
+#[tokio::test]
+async fn background_envelope_accepts_the_full_wire_limit_and_matches_none() {
+    let auth = FrameAuthenticator::for_test(Uuid::from_u128(7));
+    let encode = |length| {
+        let frame = RemoteScannerFrame {
+            progress: RemoteScannerProgress {
+                objects_scanned: 3,
+                directories_started: 2,
+                entries_visited: 4,
+            },
+            phase: RemoteScannerPhase::Persisting,
+            result: RemoteScannerFrameResult::Error(RemoteScannerErrorFrame {
+                scope: RemoteScannerErrorScope::Bucket,
+                message: "x".repeat(length),
+            }),
+        };
+        let payload = rmp_serde::to_vec_named(&frame).expect("frame");
+        rmp_serde::to_vec_named(&RemoteScannerFrameEnvelope {
+            version: NS_SCANNER_PROTOCOL_VERSION,
+            sequence: 0,
+            mac: auth.sign(0, &payload).expect("MAC"),
+            payload,
+        })
+        .expect("envelope")
+    };
+    let (mut low, mut high) = (0, NS_SCANNER_MAX_FRAME_SIZE);
+    while low < high {
+        let length = low + (high - low).div_ceil(2);
+        if encode(length).len() <= NS_SCANNER_MAX_FRAME_SIZE {
+            low = length;
+        } else {
+            high = length - 1;
+        }
+    }
+    // MAC integers have variable MessagePack widths; do not assume monotonicity
+    // within this small neighborhood when finding the exact valid boundary.
+    let encoded = std::iter::once(low)
+        .chain(low.saturating_sub(64)..=low.saturating_add(64).min(NS_SCANNER_MAX_FRAME_SIZE))
+        .map(encode)
+        .find(|encoded| encoded.len() == NS_SCANNER_MAX_FRAME_SIZE)
+        .expect("valid authenticated frame exactly at the existing wire limit");
+    let mut wire = u32::try_from(encoded.len()).expect("wire length").to_be_bytes().to_vec();
+    wire.extend_from_slice(&encoded);
+    let owner = EcstoreBackgroundMemoryBudget::new();
+    // Each individual allocation is bounded by encoded.len(): raw staging,
+    // the retained other field, and both old and new field growth allocations.
+    owner.set_sampled_limit(u64::try_from(encoded.len() * 4).expect("growth peak bound"), Duration::from_secs(30));
+    let (mut foreground_sequence, mut background_sequence) = (0, 0);
+    let foreground = read_frame(&mut Cursor::new(&wire), &auth, &mut foreground_sequence, None)
+        .await
+        .expect("legacy None decoding");
+    let background = read_frame(&mut Cursor::new(&wire), &auth, &mut background_sequence, Some(&owner))
+        .await
+        .expect("budgeted full-limit decoding");
+    assert_eq!(
+        rmp_serde::to_vec_named(&background).expect("background frame"),
+        rmp_serde::to_vec_named(&foreground).expect("foreground frame")
+    );
+    assert_eq!((foreground_sequence, background_sequence), (1, 1));
+    assert_eq!(owner.snapshot().used, 0);
 }

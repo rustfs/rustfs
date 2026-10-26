@@ -1682,6 +1682,155 @@ where
     Ok(())
 }
 
+// These owners account only envelope payload and MAC storage, not the decoded model.
+struct BackgroundRemoteScannerEnvelope {
+    version: u16,
+    sequence: u64,
+    payload: bytes::Bytes,
+    mac: bytes::Bytes,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "lowercase")]
+enum RemoteScannerEnvelopeField {
+    Version,
+    Sequence,
+    Payload,
+    Mac,
+}
+
+struct BackgroundEnvelopeSeed<'a> {
+    memory: &'a Arc<EcstoreBackgroundMemoryBudget>,
+    maximum: usize,
+    failure: &'a mut Option<IoError>,
+}
+
+impl BackgroundEnvelopeSeed<'_> {
+    fn bytes(&mut self) -> BackgroundEnvelopeBytesSeed<'_> {
+        BackgroundEnvelopeBytesSeed {
+            buffer: EcstoreBackgroundEncodeBuffer::new(self.memory.clone(), self.maximum),
+            failure: self.failure,
+        }
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for BackgroundEnvelopeSeed<'_> {
+    type Value = BackgroundRemoteScannerEnvelope;
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_struct("RemoteScannerFrameEnvelope", &["version", "sequence", "payload", "mac"], self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for BackgroundEnvelopeSeed<'_> {
+    type Value = BackgroundRemoteScannerEnvelope;
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("remote namespace scanner frame envelope")
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(mut self, mut seq: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error;
+        let version = seq.next_element()?.ok_or_else(|| A::Error::invalid_length(0, &self))?;
+        let sequence = seq.next_element()?.ok_or_else(|| A::Error::invalid_length(1, &self))?;
+        let payload = seq
+            .next_element_seed(self.bytes())?
+            .ok_or_else(|| A::Error::invalid_length(2, &self))?;
+        let mac = seq
+            .next_element_seed(self.bytes())?
+            .ok_or_else(|| A::Error::invalid_length(3, &self))?;
+        Ok(BackgroundRemoteScannerEnvelope {
+            version,
+            sequence,
+            payload,
+            mac,
+        })
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(mut self, mut map: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error;
+        let (mut version, mut sequence, mut payload, mut mac) = (None, None, None, None);
+        while let Some(field) = map.next_key()? {
+            match field {
+                RemoteScannerEnvelopeField::Version => {
+                    if version.is_some() {
+                        return Err(A::Error::duplicate_field("version"));
+                    }
+                    version = Some(map.next_value()?);
+                }
+                RemoteScannerEnvelopeField::Sequence => {
+                    if sequence.is_some() {
+                        return Err(A::Error::duplicate_field("sequence"));
+                    }
+                    sequence = Some(map.next_value()?);
+                }
+                RemoteScannerEnvelopeField::Payload => {
+                    if payload.is_some() {
+                        return Err(A::Error::duplicate_field("payload"));
+                    }
+                    payload = Some(map.next_value_seed(self.bytes())?);
+                }
+                RemoteScannerEnvelopeField::Mac => {
+                    if mac.is_some() {
+                        return Err(A::Error::duplicate_field("mac"));
+                    }
+                    mac = Some(map.next_value_seed(self.bytes())?);
+                }
+            }
+        }
+        Ok(BackgroundRemoteScannerEnvelope {
+            version: version.ok_or_else(|| A::Error::missing_field("version"))?,
+            sequence: sequence.ok_or_else(|| A::Error::missing_field("sequence"))?,
+            payload: payload.ok_or_else(|| A::Error::missing_field("payload"))?,
+            mac: mac.ok_or_else(|| A::Error::missing_field("mac"))?,
+        })
+    }
+}
+
+struct BackgroundEnvelopeBytesSeed<'a> {
+    buffer: EcstoreBackgroundEncodeBuffer,
+    failure: &'a mut Option<IoError>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for BackgroundEnvelopeBytesSeed<'_> {
+    type Value = bytes::Bytes;
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        // deserialize_seq matches Vec<u8>, including MessagePack bin input.
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for BackgroundEnvelopeBytesSeed<'_> {
+    type Value = bytes::Bytes;
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a sequence of bytes")
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(mut self, mut seq: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error;
+        // Never allocate from an untrusted sequence size_hint.
+        while let Some(byte) = seq.next_element::<u8>()? {
+            if let Err(error) = std::io::Write::write_all(&mut self.buffer, &[byte]) {
+                *self.failure = Some(error);
+                return Err(A::Error::custom("background envelope byte storage unavailable"));
+            }
+        }
+        Ok(self.buffer.into_bytes())
+    }
+}
+
+fn decode_background_envelope(
+    encoded: &[u8],
+    memory: &Arc<EcstoreBackgroundMemoryBudget>,
+) -> std::io::Result<BackgroundRemoteScannerEnvelope> {
+    use serde::de::DeserializeSeed;
+    let mut failure = None;
+    let seed = BackgroundEnvelopeSeed {
+        memory,
+        maximum: encoded.len(),
+        failure: &mut failure,
+    };
+    seed.deserialize(&mut rmp_serde::Deserializer::from_read_ref(encoded))
+        .map_err(|_| {
+            failure.unwrap_or_else(|| IoError::new(ErrorKind::InvalidData, "invalid remote namespace scanner frame envelope"))
+        })
+}
+
 async fn read_frame<R>(
     reader: &mut R,
     authenticator: &FrameAuthenticator,
@@ -1718,19 +1867,40 @@ where
         }
     };
     reader.read_exact(encoded).await?;
-    let envelope: RemoteScannerFrameEnvelope = rmp_serde::from_slice(encoded)
-        .map_err(|_| IoError::new(ErrorKind::InvalidData, "invalid remote namespace scanner frame envelope"))?;
-    if envelope.version != NS_SCANNER_PROTOCOL_VERSION {
+    let background_envelope;
+    let foreground_envelope;
+    let (version, sequence, payload, mac) = match memory {
+        Some(memory) => {
+            background_envelope = decode_background_envelope(encoded, memory)?;
+            (
+                background_envelope.version,
+                background_envelope.sequence,
+                background_envelope.payload.as_ref(),
+                background_envelope.mac.as_ref(),
+            )
+        }
+        None => {
+            foreground_envelope = rmp_serde::from_slice::<RemoteScannerFrameEnvelope>(encoded)
+                .map_err(|_| IoError::new(ErrorKind::InvalidData, "invalid remote namespace scanner frame envelope"))?;
+            (
+                foreground_envelope.version,
+                foreground_envelope.sequence,
+                foreground_envelope.payload.as_slice(),
+                foreground_envelope.mac.as_slice(),
+            )
+        }
+    };
+    if version != NS_SCANNER_PROTOCOL_VERSION {
         return Err(IoError::new(
             ErrorKind::InvalidData,
-            format!("unsupported remote namespace scanner frame version: {}", envelope.version),
+            format!("unsupported remote namespace scanner frame version: {}", version),
         ));
     }
-    if envelope.sequence != *expected_sequence {
+    if sequence != *expected_sequence {
         return Err(IoError::new(ErrorKind::InvalidData, "remote namespace scanner frame sequence is invalid"));
     }
-    authenticator.verify(envelope.sequence, &envelope.payload, &envelope.mac)?;
-    let frame: RemoteScannerFrame = rmp_serde::from_slice(&envelope.payload)
+    authenticator.verify(sequence, payload, mac)?;
+    let frame: RemoteScannerFrame = rmp_serde::from_slice(payload)
         .map_err(|_| IoError::new(ErrorKind::InvalidData, "invalid remote namespace scanner frame payload"))?;
     *expected_sequence = expected_sequence
         .checked_add(1)
