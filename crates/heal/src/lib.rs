@@ -66,15 +66,11 @@ pub fn create_ahm_services_cancel_token() -> CancellationToken {
 
 /// Shutdown all heal services gracefully
 pub async fn shutdown_ahm_services() -> Result<()> {
-    if let Some(manager) = get_heal_manager() {
-        manager.stop().await?;
+    if let Some(runtime) = GLOBAL_HEAL_RUNTIME.get() {
+        return runtime.shutdown(GLOBAL_AHM_SERVICES_CANCEL_TOKEN.get()).await;
     }
     if let Some(cancel_token) = GLOBAL_AHM_SERVICES_CANCEL_TOKEN.get() {
         cancel_token.cancel();
-    }
-    if let Some(runtime) = GLOBAL_HEAL_RUNTIME.get() {
-        runtime.mrf_stop.cancel();
-        runtime.mrf_task.wait().await?;
     }
     Ok(())
 }
@@ -82,33 +78,87 @@ pub async fn shutdown_ahm_services() -> Result<()> {
 // The runtime retains the shared future that owns the actual consumer handle.
 // Each waiter only clones the completion receipt; dropping one cannot detach
 // the worker, and completed success/failure remains available to later waiters.
-struct MrfConsumerJoin {
-    completion: Option<Shared<BoxFuture<'static, std::result::Result<(), Arc<tokio::task::JoinError>>>>>,
+struct ConsumerJoin {
+    completion: Option<Shared<BoxFuture<'static, std::result::Result<(), Arc<Error>>>>>,
 }
 
-impl MrfConsumerJoin {
+impl ConsumerJoin {
     fn new(task: Option<tokio::task::JoinHandle<()>>) -> Self {
         Self {
-            completion: task.map(|task| async move { task.await.map_err(Arc::new) }.boxed().shared()),
+            completion: task.map(|task| {
+                async move {
+                    task.await
+                        .map_err(|error| Arc::new(Error::other(format!("Heal consumer failed to join: {error}"))))
+                }
+                .boxed()
+                .shared()
+            }),
+        }
+    }
+
+    fn from_result(task: tokio::task::JoinHandle<Result<()>>) -> Self {
+        Self {
+            completion: Some(
+                async move {
+                    task.await
+                        .map_err(|error| Arc::new(Error::other(format!("Heal consumer failed to join: {error}"))))?
+                        .map_err(Arc::new)
+                }
+                .boxed()
+                .shared(),
+            ),
         }
     }
 
     async fn wait(&self) -> Result<()> {
         let Some(completion) = &self.completion else {
-            return Err(Error::other("MRF consumer did not start with an owned handle"));
+            return Err(Error::other("Heal consumer did not start with an owned handle"));
         };
         completion
             .clone()
             .await
-            .map_err(|error| Error::other(format!("MRF consumer failed to join: {error}")))
+            .map_err(|error| Error::other(format!("Heal consumer failed: {error}")))
     }
 }
 
 struct HealRuntime {
     manager: Arc<HealManager>,
     channel_processor: Arc<Mutex<HealChannelProcessor>>,
+    channel_stop: CancellationToken,
+    channel_task: ConsumerJoin,
     mrf_stop: CancellationToken,
-    mrf_task: MrfConsumerJoin,
+    mrf_task: ConsumerJoin,
+}
+
+impl HealRuntime {
+    async fn shutdown(&self, ahm_stop: Option<&CancellationToken>) -> Result<()> {
+        let manager_result = self.manager.stop().await;
+        self.finish_shutdown(manager_result, ahm_stop).await
+    }
+
+    async fn finish_shutdown(&self, manager_result: Result<()>, ahm_stop: Option<&CancellationToken>) -> Result<()> {
+        if !self.manager.stop_handoff_completed() {
+            return manager_result.and_then(|()| Err(Error::other("Heal manager stop returned without durable handoff")));
+        }
+        let mut first_error = manager_result.err();
+        self.channel_stop.cancel();
+        if let Some(stop) = ahm_stop {
+            stop.cancel();
+        }
+        if let Err(error) = self.channel_task.wait().await {
+            first_error.get_or_insert(error);
+        }
+        // The active channel command must finish its final publication/reply
+        // before the MRF consumer closes its receivers.
+        self.mrf_stop.cancel();
+        if let Err(error) = self.mrf_task.wait().await {
+            first_error.get_or_insert(error);
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Process-wide heal runtime. Async single-flight initialization prevents two
@@ -327,19 +377,16 @@ pub async fn init_heal_manager_with_workload_provider(
         // Channel initialization can fail and be retried. Do not claim the
         // process-wide MRF channels before this recoverable boundary succeeds.
         let mrf_stop = CancellationToken::new();
-        let mrf_task = MrfConsumerJoin::new(heal::mrf_queue::spawn_owned_mrf_consumer(heal_manager.clone(), mrf_stop.clone()));
-        GLOBAL_HEAL_RUNTIME
-            .set(HealRuntime {
-                manager: heal_manager.clone(),
-                channel_processor: channel_processor.clone(),
-                mrf_stop,
-                mrf_task,
-            })
-            .map_err(|_| Error::Config("Heal manager already initialized".to_string()))?;
-
-        tokio::spawn(async move {
-            let mut processor = channel_processor.lock().await;
-            if let Err(e) = processor.start_with_receipts(receiver, receipt_receiver).await {
+        let mrf_task = ConsumerJoin::new(heal::mrf_queue::spawn_owned_mrf_consumer(heal_manager.clone(), mrf_stop.clone()));
+        let channel_stop = CancellationToken::new();
+        let processor_stop = channel_stop.clone();
+        let processor = channel_processor.clone();
+        let channel_task = ConsumerJoin::from_result(tokio::spawn(async move {
+            let mut processor = processor.lock().await;
+            let result = processor
+                .start_with_shutdown(receiver, receipt_receiver, processor_stop)
+                .await;
+            if let Err(e) = &result {
                 error!(
                     target: "rustfs::heal",
                     event = EVENT_HEAL_RUNTIME_STATE,
@@ -350,7 +397,18 @@ pub async fn init_heal_manager_with_workload_provider(
                     "Heal runtime channel processor failed"
                 );
             }
-        });
+            result
+        }));
+        GLOBAL_HEAL_RUNTIME
+            .set(HealRuntime {
+                manager: heal_manager.clone(),
+                channel_processor,
+                channel_stop,
+                channel_task,
+                mrf_stop,
+                mrf_task,
+            })
+            .map_err(|_| Error::Config("Heal manager already initialized".to_string()))?;
 
         info!(
             target: "rustfs::heal",
@@ -528,7 +586,7 @@ pub(crate) fn set_heal_queue_length(count: usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, HEAL_RUNTIME_INIT_TEST_HOOK, HealRuntimeInitTestHook, MrfConsumerJoin, get_heal_channel_processor,
+        ConsumerJoin, Error, HEAL_RUNTIME_INIT_TEST_HOOK, HealRuntime, HealRuntimeInitTestHook, get_heal_channel_processor,
         get_heal_manager, heal::DiskStore, heal::manager::HealConfig, heal::storage::HealListItem, heal::storage::HealObjectInfo,
         heal::storage::HealStorageAPI, init_heal_manager, run_owned_initialization,
     };
@@ -609,7 +667,7 @@ mod tests {
         let completed = Arc::new(AtomicBool::new(false));
         let worker_release = release.clone();
         let worker_completed = completed.clone();
-        let owner = Arc::new(MrfConsumerJoin::new(Some(tokio::spawn(async move {
+        let owner = Arc::new(ConsumerJoin::new(Some(tokio::spawn(async move {
             worker_release.notified().await;
             worker_completed.store(true, Ordering::Release);
         }))));
@@ -641,10 +699,10 @@ mod tests {
 
     #[tokio::test]
     async fn mrf_owned_join_failure_stays_failed() {
-        let owner = MrfConsumerJoin::new(Some(tokio::spawn(async { panic!("MRF owned-join test failure") })));
+        let owner = ConsumerJoin::new(Some(tokio::spawn(async { panic!("MRF owned-join test failure") })));
         assert!(owner.wait().await.is_err());
         assert!(owner.wait().await.is_err(), "a failed join must not become a successful receipt");
-        let unavailable = MrfConsumerJoin::new(None);
+        let unavailable = ConsumerJoin::new(None);
         assert!(unavailable.wait().await.is_err(), "a missing owned handle is not a successful receipt");
     }
 
@@ -739,5 +797,160 @@ mod tests {
                 .peek()
                 .is_some_and(|result| result.is_ok())
         );
+    }
+    #[tokio::test]
+    async fn channel_owned_join_inner_failure_stays_failed() {
+        let owner = ConsumerJoin::from_result(tokio::spawn(async { Err(Error::Config("channel loop failure".into())) }));
+        for _ in 0..2 {
+            assert!(owner.wait().await.unwrap_err().to_string().contains("channel loop failure"));
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_pre_handoff_error_keeps_all_consumer_tokens_open() {
+        let manager = Arc::new(crate::HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None));
+        let channel_stop = tokio_util::sync::CancellationToken::new();
+        let mrf_stop = tokio_util::sync::CancellationToken::new();
+        let ahm_stop = tokio_util::sync::CancellationToken::new();
+        let channel = channel_stop.clone();
+        let mrf = mrf_stop.clone();
+        let runtime = HealRuntime {
+            channel_processor: Arc::new(tokio::sync::Mutex::new(crate::HealChannelProcessor::new(manager.clone()))),
+            manager,
+            channel_stop,
+            channel_task: ConsumerJoin::from_result(tokio::spawn(async move {
+                channel.cancelled().await;
+                Ok(())
+            })),
+            mrf_stop,
+            mrf_task: ConsumerJoin::new(Some(tokio::spawn(async move { mrf.cancelled().await }))),
+        };
+        // Inject only the orchestration phase result; actual persistence failure
+        // and the witness ordering are exercised by the manager recovery test.
+        let error = runtime
+            .finish_shutdown(Err(Error::Config("handoff failed".into())), Some(&ahm_stop))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Config(ref message) if message == "handoff failed"));
+        assert!(!runtime.manager.stop_handoff_completed());
+        assert!(!runtime.channel_stop.is_cancelled());
+        assert!(!runtime.mrf_stop.is_cancelled());
+        assert!(!ahm_stop.is_cancelled());
+        runtime.shutdown(Some(&ahm_stop)).await.unwrap();
+        assert!(runtime.manager.stop_handoff_completed());
+    }
+
+    #[tokio::test]
+    async fn shutdown_failed_manager_waits_channel_before_mrf_and_survives_cancelled_waiter() {
+        let manager = Arc::new(crate::HealManager::new_without_root_recovery_for_test(
+            Arc::new(MockStorage),
+            Some(HealConfig {
+                heal_interval: std::time::Duration::ZERO,
+                enable_auto_heal: false,
+                event_driven_scheduler_enable: false,
+                ..Default::default()
+            }),
+        ));
+        manager.start().await.unwrap();
+        let manager_error = manager
+            .stop()
+            .await
+            .expect_err("actual scheduler interval panic is a sticky join failure")
+            .to_string();
+        assert!(manager.stop_handoff_completed());
+        let channel_stop = tokio_util::sync::CancellationToken::new();
+        let mrf_stop = tokio_util::sync::CancellationToken::new();
+        let ahm_stop = tokio_util::sync::CancellationToken::new();
+        let channel = channel_stop.clone();
+        let mrf = mrf_stop.clone();
+        let channel_mrf = mrf_stop.clone();
+        let completed = Arc::new(AtomicBool::new(false));
+        let mrf_completed = completed.clone();
+        let (selected_tx, selected_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let runtime = Arc::new(HealRuntime {
+            channel_processor: Arc::new(tokio::sync::Mutex::new(crate::HealChannelProcessor::new(manager.clone()))),
+            manager,
+            channel_stop,
+            channel_task: ConsumerJoin::from_result(tokio::spawn(async move {
+                channel.cancelled().await;
+                assert!(!channel_mrf.is_cancelled());
+                selected_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                assert!(!channel_mrf.is_cancelled(), "MRF stays open through final channel publication");
+                Ok(())
+            })),
+            mrf_stop,
+            mrf_task: ConsumerJoin::new(Some(tokio::spawn(async move {
+                mrf.cancelled().await;
+                mrf_completed.store(true, Ordering::Release);
+            }))),
+        });
+        let stopping = runtime.clone();
+        let ahm = ahm_stop.clone();
+        let waiter = tokio::spawn(async move { stopping.shutdown(Some(&ahm)).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), selected_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ahm_stop.is_cancelled());
+        assert!(!runtime.mrf_stop.is_cancelled());
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        let stopping = runtime.clone();
+        let retry = tokio::spawn(async move { stopping.shutdown(None).await });
+        tokio::task::yield_now().await;
+        assert!(!retry.is_finished(), "cancelled waiter cannot detach the held channel worker");
+        assert!(!runtime.mrf_stop.is_cancelled());
+        release_tx.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), retry)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err().to_string(), manager_error);
+        assert!(completed.load(Ordering::Acquire));
+        assert_eq!(runtime.shutdown(None).await.unwrap_err().to_string(), manager_error);
+    }
+
+    #[tokio::test]
+    async fn shutdown_channel_failure_still_awaits_actual_mrf_failure() {
+        let manager = Arc::new(crate::HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None));
+        let channel_stop = tokio_util::sync::CancellationToken::new();
+        let mrf_stop = tokio_util::sync::CancellationToken::new();
+        let channel = channel_stop.clone();
+        let mrf = mrf_stop.clone();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let runtime = Arc::new(HealRuntime {
+            channel_processor: Arc::new(tokio::sync::Mutex::new(crate::HealChannelProcessor::new(manager.clone()))),
+            manager,
+            channel_stop,
+            channel_task: ConsumerJoin::from_result(tokio::spawn(async move {
+                channel.cancelled().await;
+                Err(Error::Config("channel inner failure".into()))
+            })),
+            mrf_stop,
+            mrf_task: ConsumerJoin::new(Some(tokio::spawn(async move {
+                mrf.cancelled().await;
+                entered_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                panic!("actual MRF join failure");
+            }))),
+        });
+        let stopping = runtime.clone();
+        let waiter = tokio::spawn(async move { stopping.shutdown(None).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!waiter.is_finished(), "channel error cannot skip the actual MRF join");
+        release_tx.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.unwrap_err().to_string().contains("channel inner failure"));
+        assert!(runtime.channel_task.wait().await.is_err());
+        assert!(runtime.mrf_task.wait().await.is_err());
     }
 }

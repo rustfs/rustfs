@@ -28,6 +28,7 @@ use rustfs_madmin::heal_commands::HealResultItem;
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 const LOG_COMPONENT_HEAL: &str = "heal";
@@ -60,6 +61,8 @@ pub struct HealChannelProcessor {
     response_sender: mpsc::UnboundedSender<HealChannelResponse>,
     /// Response receiver
     response_receiver: mpsc::UnboundedReceiver<HealChannelResponse>,
+    #[cfg(test)]
+    command_pause: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
 }
 
 #[derive(Serialize)]
@@ -161,6 +164,8 @@ impl HealChannelProcessor {
             heal_manager,
             response_sender: response_tx,
             response_receiver: response_rx,
+            #[cfg(test)]
+            command_pause: None,
         }
     }
 
@@ -216,8 +221,18 @@ impl HealChannelProcessor {
     /// Start processing legacy and canonical-receipt heal channel requests.
     pub async fn start_with_receipts(
         &mut self,
+        receiver: HealChannelReceiver,
+        receipt_receiver: HealReceiptReceiver,
+    ) -> Result<()> {
+        self.start_with_shutdown(receiver, receipt_receiver, CancellationToken::new())
+            .await
+    }
+
+    pub(crate) async fn start_with_shutdown(
+        &mut self,
         mut receiver: HealChannelReceiver,
         mut receipt_receiver: HealReceiptReceiver,
+        stop: CancellationToken,
     ) -> Result<()> {
         info!(
             target: "rustfs::heal::channel",
@@ -230,10 +245,30 @@ impl HealChannelProcessor {
 
         let mut receipt_channel_open = true;
         loop {
+            if stop.is_cancelled() {
+                receiver.close();
+                receipt_receiver.close();
+                while let Some(command) = receiver.recv().await {
+                    Self::reject_stopped_command(command);
+                }
+                while let Some(HealReceiptCommand { response_tx, .. }) = receipt_receiver.recv().await {
+                    let _ = response_tx.send(Err(Error::other("Heal channel is stopping").to_string()));
+                }
+                self.response_receiver.close();
+                while self.response_receiver.try_recv().is_ok() {}
+                break;
+            }
             tokio::select! {
+                _ = stop.cancelled() => {}
                 command = receiver.recv() => {
                     match command {
                         Some(command) => {
+                            if stop.is_cancelled() {
+                                Self::reject_stopped_command(command);
+                                continue;
+                            }
+                            #[cfg(test)]
+                            self.pause_selected_command().await;
                             if let Err(e) = self.process_command(command).await {
                                 error!(
                                     target: "rustfs::heal::channel",
@@ -264,6 +299,12 @@ impl HealChannelProcessor {
                         receipt_channel_open = false;
                         continue;
                     };
+                    if stop.is_cancelled() {
+                        let _ = response_tx.send(Err(Error::other("Heal channel is stopping").to_string()));
+                        continue;
+                    }
+                    #[cfg(test)]
+                    self.pause_selected_command().await;
                     if let Err(e) = self.process_start_request(request, false, true, response_tx).await {
                         error!(
                             target: "rustfs::heal::channel",
@@ -303,6 +344,26 @@ impl HealChannelProcessor {
             "Heal channel stopped"
         );
         Ok(())
+    }
+
+    fn reject_stopped_command(command: HealChannelCommand) {
+        let error = Error::other("Heal channel is stopping").to_string();
+        match command {
+            HealChannelCommand::Start { response_tx, .. } => {
+                let _ = response_tx.send(Err(error));
+            }
+            HealChannelCommand::Query { response_tx, .. } | HealChannelCommand::Cancel { response_tx, .. } => {
+                let _ = response_tx.send(Err(error));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_selected_command(&mut self) {
+        if let Some((started, release)) = self.command_pause.take() {
+            let _ = started.send(());
+            let _ = release.await;
+        }
     }
 
     /// Process heal command
@@ -2458,5 +2519,127 @@ mod tests {
         assert!(!response.success);
         assert_eq!(response.request_id, "missing-token");
         assert!(response.error.unwrap_or_default().contains("Heal task not found"));
+    }
+    async fn stop_after_selected_start(canonical: bool) {
+        let manager = create_test_heal_manager();
+        let mut processor = HealChannelProcessor::new(manager.clone());
+        let (selected_tx, selected_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        processor.command_pause = Some((selected_tx, release_rx));
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (receipt_tx, receipt_rx) = mpsc::unbounded_channel();
+        let stop = CancellationToken::new();
+        let worker_stop = stop.clone();
+        let worker = tokio::spawn(async move { processor.start_with_shutdown(command_rx, receipt_rx, worker_stop).await });
+        let request = HealChannelRequest {
+            id: "active-shutdown-command".to_string(),
+            bucket: "bucket".to_string(),
+            object_prefix: Some("active".to_string()),
+            source: HealRequestSource::Admin,
+            ..Default::default()
+        };
+        let mut legacy_response = None;
+        let mut canonical_response = None;
+        if canonical {
+            let (response_tx, response_rx) = oneshot::channel();
+            receipt_tx.send(HealReceiptCommand { request, response_tx }).unwrap();
+            canonical_response = Some(response_rx);
+        } else {
+            let (response_tx, response_rx) = oneshot::channel();
+            command_tx.send(HealChannelCommand::Start { request, response_tx }).unwrap();
+            legacy_response = Some(response_rx);
+        }
+        tokio::time::timeout(Duration::from_secs(1), selected_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let pending = HealChannelRequest {
+            id: "queued-shutdown-command".to_string(),
+            bucket: "bucket".to_string(),
+            object_prefix: Some("pending".to_string()),
+            source: HealRequestSource::Admin,
+            ..Default::default()
+        };
+        let (start_tx, start_rx) = oneshot::channel();
+        command_tx
+            .send(HealChannelCommand::Start {
+                request: pending.clone(),
+                response_tx: start_tx,
+            })
+            .unwrap();
+        let (query_tx, query_rx) = oneshot::channel();
+        command_tx
+            .send(HealChannelCommand::Query {
+                heal_path: "bucket/active".to_string(),
+                client_token: "active-shutdown-command".to_string(),
+                since_seq: None,
+                response_tx: query_tx,
+            })
+            .unwrap();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        command_tx
+            .send(HealChannelCommand::Cancel {
+                heal_path: "bucket/active".to_string(),
+                client_token: "active-shutdown-command".to_string(),
+                response_tx: cancel_tx,
+            })
+            .unwrap();
+        let (receipt_response_tx, receipt_response_rx) = oneshot::channel();
+        receipt_tx
+            .send(HealReceiptCommand {
+                request: pending,
+                response_tx: receipt_response_tx,
+            })
+            .unwrap();
+        stop.cancel();
+        tokio::task::yield_now().await;
+        assert!(!worker.is_finished(), "stop cannot cancel the selected command");
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Some(response) = legacy_response {
+            assert_eq!(response.await.unwrap().unwrap(), HealAdmissionResult::Accepted);
+        }
+        if let Some(response) = canonical_response {
+            let receipt = response.await.unwrap().unwrap();
+            assert_eq!(receipt.result, HealAdmissionResult::Accepted);
+            assert_eq!(receipt.task_id, "active-shutdown-command");
+        }
+        let expected = Error::other("Heal channel is stopping").to_string();
+        assert_eq!(start_rx.await.unwrap().unwrap_err(), expected);
+        assert_eq!(query_rx.await.unwrap().unwrap_err(), expected);
+        assert_eq!(cancel_rx.await.unwrap().unwrap_err(), expected);
+        assert_eq!(receipt_response_rx.await.unwrap().unwrap_err(), expected);
+        assert!(command_tx.is_closed());
+        assert!(receipt_tx.is_closed());
+        assert_eq!(
+            manager
+                .get_task_status_for_path("bucket/active", "active-shutdown-command")
+                .await
+                .unwrap(),
+            HealTaskStatus::Pending,
+            "queued Cancel must not execute"
+        );
+        assert!(
+            manager
+                .get_task_status_for_path("bucket/pending", "queued-shutdown-command")
+                .await
+                .is_err(),
+            "queued starts must not be admitted"
+        );
+        manager.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn owned_channel_stop_finishes_legacy_command_and_rejects_all_queued_variants() {
+        stop_after_selected_start(false).await;
+    }
+
+    #[tokio::test]
+    async fn owned_channel_stop_finishes_receipt_command_and_rejects_all_queued_variants() {
+        stop_after_selected_start(true).await;
     }
 }

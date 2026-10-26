@@ -2010,6 +2010,11 @@ impl HealManager {
         Ok(())
     }
 
+    /// Durable stop handoff completed; owned workers may still be joining.
+    pub(crate) fn stop_handoff_completed(&self) -> bool {
+        self.cancel_token.is_cancelled()
+    }
+
     /// Stop HealManager
     pub async fn stop(&self) -> Result<()> {
         let _stop_intent = self.workers.begin_stop()?;

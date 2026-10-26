@@ -213,12 +213,14 @@ async fn owned_manager_failed_durable_handoff_remains_open_and_retryable() {
     manager.submit_heal_request(request).await.expect("real durable admission");
     std::fs::remove_dir_all(temp.path().join(RUSTFS_META_BUCKET)).expect("remove accepted owner volume");
     assert!(manager.stop().await.is_err(), "real durable handoff fails");
+    assert!(!manager.stop_handoff_completed());
     assert!(!manager.cancel_token.is_cancelled());
     assert!(manager.workers.registration.lock().unwrap().open);
     assert_eq!(manager.workers.registration.lock().unwrap().stopping, 0);
     assert!(manager.heal_queue.lock().await.requests().any(|request| request.id == id));
     disk.make_volume(RUSTFS_META_BUCKET).await.expect("restore original owner");
     manager.stop().await.expect("handoff retries on same disk and drains");
+    assert!(manager.stop_handoff_completed());
     assert!(!manager.workers.registration.lock().unwrap().open);
     assert_eq!(
         manager
@@ -301,6 +303,7 @@ async fn owned_manager_real_scheduler_panic_is_sticky_failure() {
     manager.start().await.expect("startup registered actual scheduler");
     until(async || manager.workers.failed.load(Ordering::Acquire)).await;
     assert!(manager.stop().await.is_err(), "actual interval panic cannot acknowledge joined success");
+    assert!(manager.stop_handoff_completed());
     assert!(manager.stop().await.is_err(), "repeat wait cannot erase failure");
     assert!(manager.workers.tasks.is_empty());
 }
