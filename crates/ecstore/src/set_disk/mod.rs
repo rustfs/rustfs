@@ -90,7 +90,7 @@ use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::multipart::MultipartOperations;
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
-    list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
+    list::{StorageObjectInfoOrErr, StorageWalkOptions},
     multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo},
     namespace::NamespaceLocking as _,
     object::{DeleteAccounting, DeletedObject, HTTPPreconditions, ObjectIO as _, ObjectToDelete},
@@ -310,8 +310,6 @@ impl SetDisks {
     }
 }
 
-type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
-type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 type InlineBitrotReader = coding::BitrotReader<crate::io_support::bitrot::ShardReader>;
@@ -8026,8 +8024,7 @@ mod tests {
     use crate::set_disk::core::io_primitives::rename_fanout_barrier;
     use crate::set_disk::ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
     use crate::storage_api_contracts::{
-        heal::HealOperations as _, lifecycle::TransitionedObject, list::ListOperations as _, multipart::CompletePart,
-        object::ObjectOperations as _,
+        heal::HealOperations as _, lifecycle::TransitionedObject, multipart::CompletePart, object::ObjectOperations as _,
     };
     use crate::store::init_format::save_format_file;
     use crate::store::list_objects::ListPathOptions;
@@ -15648,22 +15645,6 @@ mod tests {
             )
             .await
             .expect("object should be written");
-
-        let list_result = set_disks
-            .clone()
-            .list_objects_v2(bucket, "", None, None, 1000, false, None, false)
-            .await
-            .expect("set-level list_objects_v2 should succeed");
-        assert_eq!(list_result.objects.len(), 1);
-        assert_eq!(list_result.objects[0].name, "object");
-
-        let versions_result = set_disks
-            .clone()
-            .list_object_versions(bucket, "", None, None, None, 1000)
-            .await
-            .expect("set-level list_object_versions should succeed");
-        assert_eq!(versions_result.objects.len(), 1);
-        assert_eq!(versions_result.objects[0].name, "object");
 
         let (tx, mut rx) = mpsc::channel(4);
         set_disks
