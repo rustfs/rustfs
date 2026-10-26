@@ -16,6 +16,7 @@ use super::*;
 use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
 use crate::disk::STORAGE_FORMAT_FILE;
 use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo};
 use std::collections::BTreeMap;
 use std::pin::Pin;
@@ -153,9 +154,6 @@ impl Fixture {
                 fixture.write_metadata(disk_index, object).await;
             }
         }
-        if !fixture.objects.is_empty() {
-            observe_list_objects_mutations(&fixture.store, bucket, fixture.objects.len()).await;
-        }
         fixture
     }
 
@@ -265,11 +263,8 @@ impl Fixture {
                 truncated: actual.is_truncated,
             };
             assert_eq!(
-                observed,
-                expected,
-                "prefix={prefix}, delimiter={delimiter:?}, max={max}, page={page_number}, marker={marker:?}, mode={:?}, provider={:?}",
-                std::env::var(ENV_API_LIST_OBJECTS_INDEX_MODE).ok(),
-                std::env::var(ENV_API_LIST_OBJECTS_INDEX_PROVIDER).ok(),
+                observed, expected,
+                "prefix={prefix}, delimiter={delimiter:?}, max={max}, page={page_number}, marker={marker:?}",
             );
             seen.extend(observed.objects);
             seen.extend(observed.prefixes);
@@ -370,20 +365,6 @@ async fn list_objects_shared_corpus_max_and_max_plus_one() {
         let keys: Vec<_> = (0..count).map(|index| format!("bulk/key-{index:04}")).collect();
         let fixture = Fixture::new(&format!("list-corpus-max-{count}"), namespace(&keys), true).await;
         fixture.assert_walk("bulk/", None, None, max).await;
-        let index_dir = tempfile::tempdir().expect("maximum-boundary index fixture");
-        let index_path = index_dir.path().join("maximum.idx");
-        for mode in [ListSourceMode::IndexKeyOnly, ListSourceMode::IndexVerifiedPage] {
-            temp_env::async_with_vars(
-                [
-                    (ENV_API_LIST_OBJECTS_INDEX_MODE, Some(mode.cursor_value())),
-                    (ENV_API_LIST_OBJECTS_INDEX_PROVIDER, Some(LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY)),
-                    (ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, index_path.to_str()),
-                    (ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION, Some("maximum-corpus")),
-                ],
-                async { fixture.assert_walk("bulk/", None, None, max).await },
-            )
-            .await;
-        }
         let names: Vec<_> = fixture
             .disk_walk(WalkDirOptions {
                 bucket: fixture.bucket.clone(),
@@ -921,136 +902,4 @@ async fn list_objects_shared_corpus_cancelled_quorum_walk_releases_senders_and_d
     );
     assert!(set.disks.try_write().is_ok(), "listing cancellation must not retain the set's disk lock");
     fixture.assert_walk("", None, None, 3).await;
-}
-
-#[tokio::test]
-async fn list_objects_shared_corpus_enabled_index_contracts() {
-    let fixture = Fixture::new("list-corpus-index", namespace(&shared_keys()), true).await;
-    let index_dir = tempfile::tempdir().expect("index directory should exist");
-    let path = index_dir.path().join("namespace.idx");
-    let path_value = path.to_str().expect("test index path should be UTF-8");
-    for provider in [
-        LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY,
-        LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY,
-    ] {
-        for mode in [ListSourceMode::IndexKeyOnly, ListSourceMode::IndexVerifiedPage] {
-            temp_env::async_with_vars(
-                [
-                    (ENV_API_LIST_OBJECTS_INDEX_MODE, Some(mode.cursor_value())),
-                    (ENV_API_LIST_OBJECTS_INDEX_PROVIDER, Some(provider)),
-                    (ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, Some(path_value)),
-                    (ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION, Some("shared-corpus")),
-                ],
-                async {
-                    for prefix in ["", "a", "a/", "missing/"] {
-                        for delimiter in [None, Some("/")] {
-                            for max in [0, 1, 3, 4] {
-                                fixture.assert_walk(prefix, delimiter, None, max).await;
-                            }
-                        }
-                    }
-                    let result = fixture.page("", None, None, 1).await;
-                    let mut parsed = ListPathOptions {
-                        marker: result.next_marker,
-                        ..Default::default()
-                    };
-                    parsed.parse_marker();
-                    assert_eq!(parsed.cursor_source, Some(mode), "enabled adapter must actually serve the index path");
-                    assert_eq!(
-                        parsed.cursor_generation.as_deref(),
-                        Some(if provider == LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY {
-                            LIST_CURSOR_GENERATION_LIVE
-                        } else {
-                            "shared-corpus"
-                        })
-                    );
-                },
-            )
-            .await;
-        }
-    }
-    temp_env::async_with_vars(
-        [
-            (ENV_API_LIST_OBJECTS_INDEX_MODE, Some(ListSourceMode::IndexMetadataFast.cursor_value())),
-            (ENV_API_LIST_OBJECTS_INDEX_PROVIDER, Some(LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY)),
-            (ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, Some(path_value)),
-            (ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION, Some("shared-corpus")),
-            (ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, Some("true")),
-            (ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, Some("5000")),
-        ],
-        async {
-            fixture.assert_walk("", None, None, 3).await;
-            let first = fixture.page("", None, None, 1).await;
-            let mut cursor = ListPathOptions {
-                marker: first.next_marker.clone(),
-                ..Default::default()
-            };
-            cursor.parse_marker();
-            assert_eq!(cursor.cursor_source, Some(ListSourceMode::IndexMetadataFast));
-            assert_eq!(cursor.cursor_generation.as_deref(), Some("shared-corpus"));
-            assert!(
-                !ListSourceMode::IndexMetadataFast.can_satisfy_strong_listing(),
-                "snapshot mode carries an eventual-consistency contract"
-            );
-
-            let state = ListObjectsIndexProviderState::persistent_key_only(Some(path.clone()), Some("shared-corpus".to_owned()));
-            let mut expired = ListPathOptions {
-                bucket: fixture.bucket.clone(),
-                limit: 2,
-                marker: first.next_marker,
-                ..Default::default()
-            };
-            expired.parse_marker();
-            expired.cursor_generation = Some("expired-generation".to_owned());
-            assert!(
-                fixture
-                    .store
-                    .clone()
-                    .list_objects_from_metadata_fast_provider(&expired, &state, "persistent_key_only", 1, false)
-                    .await
-                    .expect("expired cursor must be handled")
-                    .is_none(),
-                "expired generation must fall back to walker"
-            );
-        },
-    )
-    .await;
-    temp_env::async_with_vars(
-        [
-            (ENV_API_LIST_OBJECTS_INDEX_MODE, Some(ListSourceMode::IndexKeyOnly.cursor_value())),
-            (ENV_API_LIST_OBJECTS_INDEX_PROVIDER, Some(LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY)),
-            (ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, index_dir.path().to_str()),
-            (ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION, Some("shared-corpus")),
-        ],
-        async {
-            let options = ListPathOptions {
-                bucket: fixture.bucket.clone(),
-                limit: 2,
-                ..Default::default()
-            };
-            assert!(
-                fixture
-                    .store
-                    .clone()
-                    .list_objects_from_opt_in_key_only_provider(&options, ListSourceMode::IndexKeyOnly, 1, false)
-                    .await
-                    .expect("unreadable provider must return a fallback decision")
-                    .is_none(),
-                "an index path that is a directory must fail the enabled provider"
-            );
-            fixture.assert_walk("", None, None, 3).await;
-            let result = fixture.page("", None, None, 1).await;
-            let mut cursor = ListPathOptions {
-                marker: result.next_marker,
-                ..Default::default()
-            };
-            cursor.parse_marker();
-            assert_ne!(
-                cursor.cursor_source,
-                Some(ListSourceMode::IndexKeyOnly),
-                "degraded provider must not advertise an index cursor"
-            );
-        },
-    )
-    .await;
 }

@@ -1344,7 +1344,7 @@ impl ECStore {
         let result =
             enqueue_transition_after_write(self.as_ref(), result, LcEventSrc::S3CompleteMultipartUpload, request_opts).await;
         if result.is_ok() {
-            list_objects::observe_list_objects_mutation(self.as_ref(), bucket).await;
+            list_objects::observe_scanner_namespace_mutations(bucket, 1);
         }
         result
     }
