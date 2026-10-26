@@ -426,7 +426,6 @@ const LIST_CURSOR_SOURCE_WALKER: &str = "walker";
 const LIST_CURSOR_SOURCE_INDEX_KEY_ONLY: &str = "index_key_only";
 const LIST_CURSOR_SOURCE_INDEX_VERIFIED_PAGE: &str = "index_verified_page";
 const LIST_CURSOR_SOURCE_INDEX_METADATA_FAST: &str = "index_metadata_fast";
-const LIST_CURSOR_GENERATION_LIVE: &str = "live";
 const DEFAULT_API_LIST_QUORUM: &str = "strict";
 const ENV_API_LIST_OBJECTS_QUORUM: &str = "RUSTFS_LIST_OBJECTS_QUORUM";
 const DEFAULT_API_LIST_OBJECTS_QUORUM: &str = "optimal";
@@ -446,15 +445,6 @@ pub enum ListSourceMode {
 }
 
 impl ListSourceMode {
-    fn cursor_value(self) -> &'static str {
-        match self {
-            Self::Walker => LIST_CURSOR_SOURCE_WALKER,
-            Self::IndexKeyOnly => LIST_CURSOR_SOURCE_INDEX_KEY_ONLY,
-            Self::IndexVerifiedPage => LIST_CURSOR_SOURCE_INDEX_VERIFIED_PAGE,
-            Self::IndexMetadataFast => LIST_CURSOR_SOURCE_INDEX_METADATA_FAST,
-        }
-    }
-
     fn from_cursor_value(source: &str) -> Option<Self> {
         match source {
             LIST_CURSOR_SOURCE_WALKER => Some(Self::Walker),
@@ -497,38 +487,6 @@ struct ListContinuationV2 {
 }
 
 impl ListContinuationV2 {
-    fn encode_marker(&self, marker: &str) -> String {
-        let mut marker_tag = String::with_capacity(marker.len() + 64);
-        marker_tag.push_str(marker);
-        marker_tag.push_str(LIST_CACHE_MARKER_PREFIX);
-        marker_tag.push_str(self.version);
-        match &self.id {
-            Some(id) => {
-                marker_tag.push_str(",id:");
-                marker_tag.push_str(id);
-            }
-            None => marker_tag.push_str(",return:"),
-        }
-        if let Some(pool_idx) = self.pool_idx {
-            marker_tag.push_str(",p:");
-            marker_tag.push_str(&pool_idx.to_string());
-        }
-        if let Some(set_idx) = self.set_idx {
-            marker_tag.push_str(",s:");
-            marker_tag.push_str(&set_idx.to_string());
-        }
-        if let Some(source) = &self.source {
-            marker_tag.push_str(",src:");
-            marker_tag.push_str(source.cursor_value());
-        }
-        if let Some(generation) = &self.generation {
-            marker_tag.push_str(",gen:");
-            marker_tag.push_str(generation);
-        }
-        marker_tag.push(']');
-        marker_tag
-    }
-
     fn parse(marker_tag: &str) -> Option<(Self, bool)> {
         let mut parsed = Self {
             version: MARKER_TAG_VERSION,
@@ -597,6 +555,11 @@ impl ListContinuationV2 {
     }
 }
 
+/// Returns the key part of a marker that may still carry the legacy cursor tag.
+/// The data-usage scanner compares successive version-listing markers through
+/// it so two differently tagged markers for the same key never count as progress.
+// RUSTFS_COMPAT_TODO(listing-cursor-legacy-tag): markers tagged by 1.0.x servers. Remove after every supported
+// direct-upgrade release issues plain key markers; callers can then compare markers directly.
 pub(crate) fn list_marker_key(marker: &str) -> &str {
     marker
         .rfind(LIST_CACHE_MARKER_PREFIX)
@@ -622,22 +585,6 @@ fn normalize_list_quorum(value: &str) -> &'static str {
 fn list_objects_quorum_from_env() -> String {
     let value = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_QUORUM, DEFAULT_API_LIST_OBJECTS_QUORUM);
     normalize_list_quorum(&value).to_owned()
-}
-
-fn append_list_cache_id_to_marker(marker: String, cache_id: Option<&str>) -> String {
-    let Some(id) = cache_id else {
-        return marker;
-    };
-
-    ListContinuationV2 {
-        version: MARKER_TAG_VERSION,
-        id: Some(id.to_owned()),
-        pool_idx: None,
-        set_idx: None,
-        source: Some(ListSourceMode::Walker),
-        generation: Some(LIST_CURSOR_GENERATION_LIVE.to_owned()),
-    }
-    .encode_marker(&marker)
 }
 
 /// Name of the last RAW entry the walker returned for this page (after
@@ -683,21 +630,17 @@ fn versioned_prefix_page_boundary_key<'a>(
     last_raw_key_for_prefix(raw_keys, &last_visible.name).map(str::to_owned)
 }
 
-fn build_list_next_marker(objects: &[ObjectInfo], prefixes: &[String], cache_id: Option<&str>) -> Option<String> {
-    if let Some(last) = objects.last() {
-        Some(append_list_cache_id_to_marker(last.name.clone(), cache_id))
-    } else {
-        prefixes
-            .last()
-            .map(|marker| append_list_cache_id_to_marker(marker.clone(), cache_id))
-    }
+/// The internal continuation marker is the plain last key (or last common
+/// prefix) of the page, exactly as AWS defines `NextMarker`; the API layer
+/// wraps it into the opaque V2 token.
+fn build_list_next_marker(objects: &[ObjectInfo], prefixes: &[String]) -> Option<String> {
+    objects
+        .last()
+        .map(|last| last.name.clone())
+        .or_else(|| prefixes.last().cloned())
 }
 
-fn build_list_versions_next_marker(
-    objects: &[ObjectInfo],
-    prefixes: &[String],
-    cache_id: Option<&str>,
-) -> (Option<String>, Option<String>) {
+fn build_list_versions_next_marker(objects: &[ObjectInfo], prefixes: &[String]) -> (Option<String>, Option<String>) {
     if let Some(last) = objects.last() {
         // A null version carries the synthesized `Some(Uuid::nil())` identity
         // here; advertise it as the literal `null` marker so a resumed listing
@@ -715,9 +658,9 @@ fn build_list_versions_next_marker(
                     .unwrap_or_else(|| "null".to_string()),
             )
         };
-        (Some(append_list_cache_id_to_marker(last.name.clone(), cache_id)), version_marker)
+        (Some(last.name.clone()), version_marker)
     } else if let Some(last_prefix) = prefixes.last() {
-        (Some(append_list_cache_id_to_marker(last_prefix.clone(), cache_id)), None)
+        (Some(last_prefix.clone()), None)
     } else {
         (None, None)
     }
@@ -728,7 +671,6 @@ fn list_objects_paginate(
     delimiter: &Option<String>,
     max_keys: i32,
     disk_has_more: bool,
-    cache_id: Option<&str>,
     include_version_id: bool,
     last_scanned_key: Option<&str>,
 ) -> (Vec<ObjectInfo>, Vec<String>, bool, Option<String>, Option<String>) {
@@ -746,9 +688,9 @@ fn list_objects_paginate(
 
     if is_truncated {
         if include_version_id {
-            (next_marker, next_version_idmarker) = build_list_versions_next_marker(&get_objects, &[], cache_id);
+            (next_marker, next_version_idmarker) = build_list_versions_next_marker(&get_objects, &[]);
         } else {
-            next_marker = build_list_next_marker(&get_objects, &[], cache_id);
+            next_marker = build_list_next_marker(&get_objects, &[]);
         }
     }
 
@@ -781,13 +723,13 @@ fn list_objects_paginate(
             && let Some(last_scanned) = last_scanned_key
         {
             is_truncated = true;
-            next_marker = Some(append_list_cache_id_to_marker(last_scanned.to_owned(), cache_id));
+            next_marker = Some(last_scanned.to_owned());
         } else if should_truncate {
             is_truncated = true;
             if include_version_id {
-                (next_marker, next_version_idmarker) = build_list_versions_next_marker(&objects, &prefixes, cache_id);
+                (next_marker, next_version_idmarker) = build_list_versions_next_marker(&objects, &prefixes);
             } else {
-                next_marker = build_list_next_marker(&objects, &prefixes, cache_id);
+                next_marker = build_list_next_marker(&objects, &prefixes);
             }
         } else if delimiter.is_some()
             && let Some(last_scanned) = last_scanned_key
@@ -806,7 +748,7 @@ fn list_objects_paginate(
             // forever. A real scanned key strictly advances past the already-scanned
             // window and guarantees finite pagination.
             is_truncated = true;
-            next_marker = Some(append_list_cache_id_to_marker(last_scanned.to_owned(), cache_id));
+            next_marker = Some(last_scanned.to_owned());
             // A bare key marker with no version id makes `forward_past` skip the whole
             // scanned window on the next page; its folded prefixes are already emitted.
         }
@@ -819,7 +761,6 @@ struct VersionedListPagination<'a, I> {
     delimiter: &'a Option<String>,
     max_keys: i32,
     disk_has_more: bool,
-    cache_id: Option<&'a str>,
     marker: Option<&'a str>,
     last_scanned_key: Option<&'a str>,
     raw_keys: I,
@@ -846,12 +787,11 @@ where
         pagination.delimiter,
         pagination.max_keys,
         pagination.disk_has_more,
-        pagination.cache_id,
         true,
         pagination.last_scanned_key,
     );
     if is_truncated && let Some(raw_key) = prefix_at_page_boundary {
-        next_marker = Some(append_list_cache_id_to_marker(raw_key, pagination.cache_id));
+        next_marker = Some(raw_key);
         next_version_idmarker = None;
     }
 
@@ -1481,6 +1421,23 @@ impl ListPathOptions {
         }
     }
 
+    /// Strips a trailing legacy cursor tag from the request marker.
+    ///
+    /// Releases up to 1.0.x appended `[rustfs_cache:v2,id:...,src:walker,gen:live]`
+    /// to every internal continuation marker and exposed it through the V2
+    /// continuation token and the ListObjectVersions `NextKeyMarker`. Current
+    /// servers emit plain keys, but a client that paginates across the upgrade
+    /// still sends the tagged form back as `continuation-token`, `key-marker`
+    /// or `marker`, and the opt-in index provider still carries its `src`/`gen`
+    /// cursor fields in the same tag.
+    ///
+    /// While the tag is accepted, a real object key that ends in a well-formed
+    /// tag, such as `b[rustfs_cache:v1,return:]`, cannot be told apart from a
+    /// tagged marker for the key `b`: such a marker resumes from `b` and replays
+    /// the literal key instead of skipping past it. The ambiguity ends when the
+    /// compat window closes and this stripping is removed.
+    // RUSTFS_COMPAT_TODO(listing-cursor-legacy-tag): accept markers tagged by 1.0.x servers. Remove after every supported
+    // direct-upgrade release issues plain key markers, so no client can still hold a tagged cursor.
     pub fn parse_marker(&mut self) {
         let Some(marker) = self.marker.clone() else {
             return;
@@ -1508,18 +1465,6 @@ impl ListPathOptions {
         if should_create {
             self.create = true;
         }
-    }
-
-    pub fn encode_marker(&mut self, marker: &str) -> String {
-        ListContinuationV2 {
-            version: MARKER_TAG_VERSION,
-            id: self.id.clone(),
-            pool_idx: self.pool_idx,
-            set_idx: self.set_idx,
-            source: Some(ListSourceMode::Walker),
-            generation: Some(LIST_CURSOR_GENERATION_LIVE.to_owned()),
-        }
-        .encode_marker(marker)
     }
 }
 
@@ -1589,7 +1534,7 @@ impl ECStore {
             ask_disks: list_objects_quorum_from_env(),
             ..Default::default()
         };
-        // The request marker still carries the `[rustfs_cache:...]` cursor tag;
+        // A marker from a 1.0.x client may still carry the legacy cursor tag;
         // strip it before any name comparison (notably `forward_past`), or every
         // key sorting between `<marker>` and `<marker>[` is silently skipped on
         // the continuation page (backlog#1047).
@@ -1599,7 +1544,6 @@ impl ECStore {
             .list_path(&opts)
             .await
             .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
-        let next_cache_id = page.entries.list_id.clone();
 
         let disk_has_more = !page.exhausted;
 
@@ -1612,15 +1556,8 @@ impl ECStore {
         let get_objects =
             ObjectInfo::from_meta_cache_entries_sorted_infos(&page.entries, bucket, prefix, delimiter.clone()).await;
 
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
-            get_objects,
-            &delimiter,
-            max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            false,
-            last_scanned_key.as_deref(),
-        );
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
+            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, false, last_scanned_key.as_deref());
         let _ = next_version_idmarker;
 
         let result = ListObjectsInfo {
@@ -1812,15 +1749,14 @@ impl ECStore {
             include_marker: has_version_marker,
             ..Default::default()
         };
-        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
-        // (notably `forward_past`) — see backlog#1047.
+        // Strip a legacy cursor tag before any name comparison (notably
+        // `forward_past`), see backlog#1047.
         opts.parse_marker();
 
         let mut page = self
             .list_path(&opts)
             .await
             .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
-        let next_cache_id = page.entries.list_id.clone();
 
         let disk_has_more = !page.exhausted;
 
@@ -1853,7 +1789,6 @@ impl ECStore {
                 delimiter: &delimiter,
                 max_keys,
                 disk_has_more,
-                cache_id: next_cache_id.as_deref(),
                 marker: opts.marker.as_deref(),
                 last_scanned_key: last_scanned_key.as_deref(),
                 raw_keys: entries.entries().iter().map(|entry| entry.name.as_str()),
@@ -1940,9 +1875,6 @@ impl ECStore {
 
         page.entries.reuse = true;
         page.entries.o.0.truncate(o.limit as usize);
-        if !o.transient {
-            page.entries.list_id = Some(o.id.unwrap_or_else(|| Uuid::new_v4().to_string()));
-        }
 
         rustfs_io_metrics::record_stage_duration(
             "store_list_objects_list_path",
@@ -3133,7 +3065,6 @@ impl SetDisks {
             .list_path_result(&opts)
             .await
             .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
-        let next_cache_id = page.entries.list_id.clone();
         let disk_has_more = !page.exhausted;
         if !has_version_marker {
             page.entries.forward_past(opts.marker.clone());
@@ -3149,15 +3080,8 @@ impl SetDisks {
             version_marker,
         )
         .await?;
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
-            get_objects,
-            &None,
-            max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            true,
-            last_scanned_key.as_deref(),
-        );
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
+            list_objects_paginate(get_objects, &None, max_keys, disk_has_more, true, last_scanned_key.as_deref());
         Ok(ListObjectVersionsInfo {
             is_truncated,
             next_marker,
@@ -3256,9 +3180,6 @@ impl SetDisks {
 
         page.entries.reuse = true;
         page.entries.o.0.truncate(o.limit as usize);
-        if !o.transient {
-            page.entries.list_id = Some(o.id.unwrap_or_else(|| Uuid::new_v4().to_string()));
-        }
 
         rustfs_io_metrics::record_stage_duration(
             "sets_list_objects_list_path",
@@ -5171,8 +5092,9 @@ mod test {
         assert_eq!(parsed.pool_idx, Some(3));
         assert_eq!(parsed.set_idx, Some(7));
 
+        // A 1.0.x server re-tagged the stripped key the same way on replay.
         let base_marker = parsed.marker.clone().expect("marker should parse");
-        let replay_marker = parsed.encode_marker(base_marker.as_str());
+        let replay_marker = format!("{base_marker}[rustfs_cache:v2,id:list-cache-id,p:3,s:7]");
         let mut replay = ListPathOptions {
             marker: Some(replay_marker),
             ..Default::default()
@@ -5245,12 +5167,105 @@ mod test {
             ..Default::default()
         };
 
-        let (next_marker, next_version_idmarker) = super::build_list_versions_next_marker(&[null_version], &[], None);
+        let (next_marker, next_version_idmarker) = super::build_list_versions_next_marker(&[null_version], &[]);
         assert_eq!(next_marker.as_deref(), Some("obj-a"));
         assert_eq!(next_version_idmarker.as_deref(), Some("null"));
 
-        let (_, next_version_idmarker) = super::build_list_versions_next_marker(&[real_version], &[], None);
+        let (_, next_version_idmarker) = super::build_list_versions_next_marker(&[real_version], &[]);
         assert_eq!(next_version_idmarker.as_deref(), Some(uuid::Uuid::from_u128(7).to_string().as_str()));
+    }
+
+    // The internal continuation marker is the plain last key. Earlier releases
+    // appended a metacache tag that no server component consumed and that leaked
+    // onto the wire as the ListObjectVersions NextKeyMarker.
+    #[test]
+    fn list_objects_paginate_next_marker_is_the_plain_last_key() {
+        let get_objects = vec![plain_object("obj-0001"), plain_object("obj-0002"), plain_object("obj-0003")];
+
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
+            list_objects_paginate(get_objects, &None, 2, false, false, None);
+
+        assert_eq!(objects.len(), 2);
+        assert!(prefixes.is_empty());
+        assert!(is_truncated);
+        assert_eq!(next_marker.as_deref(), Some("obj-0002"));
+        assert!(next_version_idmarker.is_none());
+    }
+
+    #[test]
+    fn list_objects_paginate_versions_next_key_marker_is_the_plain_last_key() {
+        let version = uuid::Uuid::from_u128(7);
+        let mut get_objects = vec![plain_object("obj-0001"), plain_object("obj-0002"), plain_object("obj-0003")];
+        get_objects[1].version_id = Some(version);
+
+        let (_, _, is_truncated, next_marker, next_version_idmarker) =
+            list_objects_paginate(get_objects, &None, 2, false, true, None);
+
+        assert!(is_truncated);
+        assert_eq!(next_marker.as_deref(), Some("obj-0002"));
+        assert_eq!(next_version_idmarker.as_deref(), Some(version.to_string().as_str()));
+    }
+
+    #[tokio::test]
+    async fn list_object_versions_next_key_marker_is_the_plain_last_key() {
+        use crate::storage_api_contracts::bucket::BucketOperations as _;
+        use crate::storage_api_contracts::object::ObjectIO as _;
+
+        let bucket = "plain-key-marker";
+        let (_dirs, store) = crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks().await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &crate::storage_api_contracts::bucket::MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        for key in ["obj-a", "obj-b", "obj-c"] {
+            store
+                .put_object(
+                    bucket,
+                    key,
+                    &mut crate::object_api::PutObjReader::from_vec(vec![1]),
+                    &crate::object_api::ObjectOptions::default(),
+                )
+                .await
+                .expect("seed object");
+        }
+
+        let versions = store
+            .clone()
+            .inner_list_object_versions(bucket, "", None, None, None, 2)
+            .await
+            .expect("list versions");
+        assert!(versions.is_truncated);
+        assert_eq!(versions.next_marker.as_deref(), Some("obj-b"));
+        assert_eq!(versions.next_version_idmarker.as_deref(), Some("null"));
+
+        let page = store
+            .clone()
+            .inner_list_objects_v2(bucket, "", None, None, 2, false, None, false)
+            .await
+            .expect("list objects");
+        assert!(page.is_truncated);
+        assert_eq!(page.next_continuation_token.as_deref(), Some("obj-b"));
+
+        // A client that paginated across the upgrade still hands back the
+        // marker with the legacy tag appended; the walker resumes after `obj-b`.
+        let resumed = store
+            .clone()
+            .inner_list_objects_v2(
+                bucket,
+                "",
+                Some("obj-b[rustfs_cache:v2,id:list-cache-id,src:walker,gen:live]".to_string()),
+                None,
+                2,
+                false,
+                None,
+                false,
+            )
+            .await
+            .expect("resume from a legacy tagged marker");
+        assert_eq!(resumed.objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["obj-c"]);
+        assert!(!resumed.is_truncated);
+        assert!(resumed.next_continuation_token.is_none());
     }
 
     // ECA-03 / #944: a page whose raw keys fully collapse into fewer than max_keys
@@ -5266,7 +5281,6 @@ mod test {
             &delimiter,
             1000,
             true, // disk_has_more: walker filled its raw candidate limit
-            None,
             false,
             Some("data-1001"), // last RAW scanned key
         );
@@ -5287,7 +5301,7 @@ mod test {
         let get_objects = vec![folded_prefix_object("data-")];
 
         let (_objects, prefixes, is_truncated, next_marker, _v) =
-            list_objects_paginate(get_objects, &delimiter, 1000, false, None, false, Some("data-1001"));
+            list_objects_paginate(get_objects, &delimiter, 1000, false, false, Some("data-1001"));
 
         assert_eq!(prefixes, vec!["data-".to_string()]);
         assert!(!is_truncated);
@@ -5301,7 +5315,7 @@ mod test {
         let get_objects = vec![plain_object("obj-0001"), plain_object("obj-0002")];
 
         let (objects, prefixes, is_truncated, next_marker, _v) =
-            list_objects_paginate(get_objects, &None, 1000, true, None, false, Some("zzz-unrelated"));
+            list_objects_paginate(get_objects, &None, 1000, true, false, Some("zzz-unrelated"));
 
         assert_eq!(objects.len(), 2);
         assert!(prefixes.is_empty());
@@ -5323,7 +5337,6 @@ mod test {
             &delimiter,
             1000,
             true, // disk_has_more: walker filled its raw candidate limit
-            None,
             true,
             Some("data-1001"), // last RAW scanned key
         );
@@ -5347,7 +5360,7 @@ mod test {
         let get_objects = vec![folded_prefix_object("data-")];
 
         let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
-            list_objects_paginate(get_objects, &delimiter, 1, true, None, true, Some("data-0002"));
+            list_objects_paginate(get_objects, &delimiter, 1, true, true, Some("data-0002"));
 
         assert!(objects.is_empty());
         assert_eq!(prefixes, vec!["data-".to_string()]);
@@ -5404,7 +5417,6 @@ mod test {
                     delimiter: &delimiter,
                     max_keys,
                     disk_has_more,
-                    cache_id: None,
                     marker: marker.as_deref(),
                     last_scanned_key: last_scanned.as_deref(),
                     raw_keys: window.iter().map(String::as_str),
@@ -5485,7 +5497,6 @@ mod test {
                     delimiter: &delimiter,
                     max_keys,
                     disk_has_more,
-                    cache_id: None,
                     marker: marker.as_deref(),
                     last_scanned_key: last_scanned.as_deref(),
                     raw_keys: window.iter().map(String::as_str),
@@ -5570,7 +5581,7 @@ mod test {
             let get_objects = fold_delimiter_page(&window, "", "-");
 
             let (objects, prefixes, is_truncated, next_marker, _v) =
-                list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, None, false, last_scanned.as_deref());
+                list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, false, last_scanned.as_deref());
 
             assert!(objects.is_empty(), "every key folds into a common prefix");
             for prefix in prefixes {
@@ -7425,19 +7436,11 @@ mod test {
 
     #[test]
     fn list_path_marker_round_trip_preserves_set_index() {
-        let mut opts = ListPathOptions {
-            id: Some("list-cache-id".to_string()),
-            pool_idx: Some(3),
-            set_idx: Some(7),
-            ..Default::default()
-        };
-
-        let marker = opts.encode_marker("photos/2026/image.jpg");
-        let expected_marker = format!(
+        // The exact tag shape a 1.0.x walker appended to its markers.
+        let marker = format!(
             "photos/2026/image.jpg[rustfs_cache:{},id:list-cache-id,p:3,s:7,src:walker,gen:live]",
             super::MARKER_TAG_VERSION
         );
-        assert_eq!(marker, expected_marker);
 
         let mut parsed = ListPathOptions {
             marker: Some(marker),

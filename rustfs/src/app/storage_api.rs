@@ -1138,8 +1138,8 @@ pub(crate) mod s3_api {
     pub(crate) mod bucket {
         pub(crate) use crate::storage::storage_api::s3_api_consumer::bucket::{
             ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-            build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params,
-            parse_list_objects_v2_params,
+            build_list_objects_output, build_list_objects_v2_output, encode_list_objects_v2_continuation_token,
+            parse_list_object_versions_params, parse_list_objects_v2_params,
         };
         pub(crate) use crate::storage::storage_api::s3_api_consumer::common::rustfs_owner;
     }

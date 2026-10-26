@@ -1129,12 +1129,14 @@ mod tests {
     /// and the marker plus the cursor tag.
     ///
     /// Bug Reference: backlog#1047
-    /// The V2 continuation token appends a `[rustfs_cache:...]` cursor tag to the
-    /// last returned key. The orchestration layer passed that raw string to
-    /// `forward_past`, so any key whose byte after the shared stem sorts below
-    /// `[` (0x5B) — `.`, `/`, `-`, digits, uppercase — was silently dropped on
-    /// the next page: with keys `a`, `a.txt`, `zz` and max_keys=1, page 2
-    /// returned `zz` and `a.txt` was never listed.
+    /// Earlier releases appended a `[rustfs_cache:...]` cursor tag to the last
+    /// returned key inside the V2 continuation token. The orchestration layer
+    /// passed that raw string to `forward_past`, so any key whose byte after the
+    /// shared stem sorts below `[` (0x5B) — `.`, `/`, `-`, digits, uppercase —
+    /// was silently dropped on the next page: with keys `a`, `a.txt`, `zz` and
+    /// max_keys=1, page 2 returned `zz` and `a.txt` was never listed. The token
+    /// is now base64 of the plain key, and this test keeps guarding the
+    /// continuation boundary.
     #[tokio::test]
     async fn test_list_objects_v2_continuation_keeps_keys_after_marker_stem() {
         init_logging();
