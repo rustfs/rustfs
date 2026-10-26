@@ -1235,7 +1235,13 @@ impl DiskHealthTracker {
     }
 
     pub(crate) fn metric_epoch_for_reconnect(&self) -> Self {
-        Self::new()
+        let health = Self::new();
+        // Explicit test faults stay attached to the drive across handle renewal.
+        #[cfg(test)]
+        if self.test_forced_offline.load(Ordering::Acquire) {
+            health.force_offline_for_test();
+        }
+        health
     }
 
     pub fn last_capacity_snapshot(&self) -> Option<(u64, u64, u64, u64)> {
@@ -2664,6 +2670,11 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn is_online(&self) -> bool {
+        // A matching format does not make a handle usable while its I/O gate is faulty.
+        // Reconnect must renew it even if its old recovery monitor has stopped.
+        if self.health.is_faulty() {
+            return false;
+        }
         let Ok(Some(disk_id)) = self.disk.get_disk_id().await else {
             return false;
         };
@@ -4693,6 +4704,38 @@ mod tests {
         let snapshot = wrapper.metrics_snapshot();
         assert_eq!(snapshot.api_calls.get("write_all"), Some(&1));
         assert_eq!(snapshot.total_errors_availability, 1);
+    }
+
+    #[tokio::test]
+    async fn local_online_status_matches_io_health_and_disk_identity() {
+        let dir = tempfile::tempdir().expect("create a drive root");
+        let mut endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 root")).expect("local endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let meta_dir = dir.path().join(RUSTFS_META_BUCKET);
+        tokio::fs::create_dir_all(&meta_dir).await.expect("create metadata directory");
+        let mut format = FormatV3::new(1, 1);
+        format.erasure.this = format.erasure.sets[0][0];
+        tokio::fs::write(meta_dir.join(FORMAT_CONFIG_FILE), format.to_json().expect("serialize format"))
+            .await
+            .expect("persist original identity");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("open formatted drive"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+        assert!(wrapper.is_online().await, "healthy formatted drive is online");
+        wrapper.health.force_runtime_state_for_test(RuntimeDriveHealthState::Suspect);
+        assert!(wrapper.is_online().await, "suspect drives still admit foreground I/O");
+        wrapper.health.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        assert!(!wrapper.is_online().await, "a readable format cannot make a faulty handle usable");
+        assert!(!wrapper.health.mark_recovery_success(&endpoint, "test_probe"));
+        assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Returning);
+        assert!(
+            !wrapper.is_online().await,
+            "returning drives retain the faulty I/O gate until recovery completes"
+        );
+        wrapper.reset_health_for_store_init_retry();
+        wrapper.set_disk_id_state(Some(Uuid::new_v4())).await;
+        assert!(!wrapper.is_online().await, "healthy state must not bypass a mismatched disk identity");
     }
 
     #[tokio::test]
