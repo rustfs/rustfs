@@ -138,6 +138,7 @@ impl StartupShutdownFailure {
                 .maintenance
                 .as_ref()
                 .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+            || self.fronts.as_ref().is_some_and(|error| error.deadline_missed())
         {
             std::io::ErrorKind::TimedOut
         } else {
@@ -292,7 +293,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
     StartupShutdownFailure {
         capacity: capacity_error,
         maintenance: maintenance_result.err(),
-        fronts: front_result.err(),
+        fronts: front_result.into_result().err(),
         observability: observability_error,
     }
     .into_result()
@@ -550,7 +551,7 @@ mod tests {
         let mut s3 = Some(crate::server::ShutdownHandle::new(tx, task));
         let mut console = None;
         let mut optional = Vec::new();
-        let mut fronts = crate::startup_shutdown::FrontShutdownFailure::default();
+        let mut fronts = crate::startup_shutdown::FrontShutdownReport::default();
         crate::startup_shutdown::join_startup_fronts(&mut s3, &mut console, &mut optional, &mut fronts).await;
         let error = StartupShutdownFailure {
             capacity: None,
@@ -595,7 +596,7 @@ mod tests {
         let mut s3 = Some(crate::server::ShutdownHandle::new(tx, front));
         let mut console = None;
         let mut optional = Vec::new();
-        let mut fronts = crate::startup_shutdown::FrontShutdownFailure::default();
+        let mut fronts = crate::startup_shutdown::FrontShutdownReport::default();
         crate::startup_shutdown::join_startup_fronts(&mut s3, &mut console, &mut optional, &mut fronts).await;
         let error = StartupShutdownFailure {
             capacity: Some(std::io::Error::new(std::io::ErrorKind::TimedOut, capacity)),
@@ -637,5 +638,43 @@ mod tests {
         assert_eq!(join.id(), front_id);
         assert!(failure.observability.is_some());
         assert!(s3.is_none() && console.is_none() && optional.is_empty());
+    }
+    #[tokio::test]
+    async fn startup_http12_deadline_keeps_typed_child_and_later_cleanup_errors() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+        let task = tokio::spawn(crate::server::test_retire_http12_scope(
+            async {
+                panic!("expected HTTP scoped child panic");
+            },
+            tokio::time::Instant::now(),
+        ));
+        let mut s3 = Some(crate::server::ShutdownHandle::new_http12(tx, task));
+        let mut console = None;
+        let mut optional = Vec::new();
+        let mut report = crate::startup_shutdown::FrontShutdownReport::default();
+        crate::startup_shutdown::join_startup_fronts(&mut s3, &mut console, &mut optional, &mut report).await;
+        let error = StartupShutdownFailure {
+            capacity: None,
+            maintenance: None,
+            fronts: report.into_result().err(),
+            observability: Some(Box::new(std::io::Error::other("later observation failure"))),
+        }
+        .into_result()
+        .expect_err("both causes retained");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let failure = error
+            .get_ref()
+            .expect("typed failure")
+            .downcast_ref::<StartupShutdownFailure>()
+            .expect("lifecycle type");
+        assert!(failure.fronts.as_ref().expect("front report").deadline_missed());
+        assert!(failure.observability.is_some(), "later cleanup failure cannot be skipped");
+        let source = std::error::Error::source(failure).expect("front failure");
+        let source = std::error::Error::source(source).expect("HTTP wait failure");
+        assert!(
+            std::error::Error::source(source)
+                .expect("actual child error")
+                .is::<tokio::task::JoinError>()
+        );
     }
 }

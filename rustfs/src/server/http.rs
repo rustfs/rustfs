@@ -19,7 +19,7 @@ use crate::auth::IAMAuth;
 use crate::auth_keystone;
 use crate::config;
 use crate::server::{
-    ReadinessGateLayer, RemoteAddr, ShutdownHandle,
+    Http12ShutdownOutcome, ReadinessGateLayer, RemoteAddr, ShutdownHandle,
     compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
@@ -48,10 +48,13 @@ use crate::storage_api::server::http::{
     tonic_boot_epoch_response_headers, verify_tonic_rpc_signature_with_bootstrap,
 };
 use bytes::Bytes;
+use futures::stream::FuturesUnordered;
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, Uri, Version, header::CONNECTION};
 use hyper::body::Incoming;
+#[cfg(test)]
+use hyper_util::rt::TokioExecutor;
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo, TokioTimer},
+    rt::{TokioIo, TokioTimer},
     server::conn::auto::Builder as ConnBuilder,
     server::graceful::{GracefulShutdown, Watcher},
     service::TowerToHyperService,
@@ -93,6 +96,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::task::TaskTracker;
 use tonic::service::Routes;
 use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Status};
@@ -741,15 +745,331 @@ where
     }
 }
 
+#[derive(Default)]
+struct HttpJoinState {
+    handles: FuturesUnordered<tokio::task::JoinHandle<()>>,
+    first_error: Option<Arc<tokio::task::JoinError>>,
+    failures: u64,
+}
+
+impl HttpJoinState {
+    fn record(&mut self, result: std::result::Result<(), tokio::task::JoinError>) -> Option<tokio::task::JoinError> {
+        if let Err(error) = result {
+            self.failures = self.failures.saturating_add(1);
+            if self.first_error.is_none() {
+                self.first_error = Some(Arc::new(error));
+            } else {
+                return Some(error);
+            }
+        }
+        None
+    }
+}
+
+struct HttpTasks {
+    tracker: TaskTracker,
+    joins: parking_lot::Mutex<HttpJoinState>,
+    registered: tokio::sync::Notify,
+    #[cfg(test)]
+    control: parking_lot::Mutex<Option<Arc<HttpLeafTestControl>>>,
+}
+
+/// Listener-local executor for original connection, H2 stream and body-drain futures.
+#[derive(Clone)]
+struct HttpTaskExecutor(Arc<HttpTasks>);
+
+impl HttpTaskExecutor {
+    fn new() -> Self {
+        Self(Arc::new(HttpTasks {
+            tracker: TaskTracker::new(),
+            joins: parking_lot::Mutex::new(HttpJoinState::default()),
+            registered: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            control: parking_lot::Mutex::new(None),
+        }))
+    }
+
+    #[cfg(test)]
+    fn test_control(&self) -> Option<Arc<HttpLeafTestControl>> {
+        self.0.control.lock().clone()
+    }
+
+    fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) -> tokio::task::Id {
+        let tracked = self.0.tracker.track_future(future);
+        self.reap_ready();
+        let joins = self.0.joins.lock();
+        let handle = tokio::spawn(tracked);
+        let id = handle.id();
+        joins.handles.push(handle);
+        drop(joins);
+        // FuturesUnordered::push does not poll a newly registered JoinHandle.
+        self.0.registered.notify_one();
+        id
+    }
+
+    fn record_join(&self, result: std::result::Result<(), tokio::task::JoinError>) {
+        let discarded = { self.0.joins.lock().record(result) };
+        // Drop all but the first panic payload outside the short collection lock.
+        drop(discarded);
+    }
+
+    fn reap_ready(&self) {
+        use futures::{FutureExt as _, StreamExt as _};
+        // Bound each synchronous sweep so stop observation cannot be starved by a
+        // continuous stream of ready children. Every submission also services this queue.
+        for _ in 0..64 {
+            let result = { self.0.joins.lock().handles.next().now_or_never().flatten() };
+            match result {
+                Some(result) => self.record_join(result),
+                None => break,
+            }
+        }
+    }
+
+    async fn reap_one(&self) {
+        use futures::StreamExt as _;
+        loop {
+            let registered = self.0.registered.notified();
+            tokio::pin!(registered);
+            registered.as_mut().enable();
+            let ready = std::future::poll_fn(|cx| {
+                let result = { self.0.joins.lock().handles.poll_next_unpin(cx) };
+                match result {
+                    Poll::Ready(Some(result)) => Poll::Ready(result),
+                    Poll::Ready(None) | Poll::Pending => Poll::Pending,
+                }
+            });
+            tokio::select! {
+                result = ready => { self.record_join(result); return; }
+                () = registered.as_mut() => {}
+            }
+        }
+    }
+
+    async fn join(&self) -> (Option<Arc<tokio::task::JoinError>>, u64) {
+        use futures::StreamExt as _;
+        // The accept root has stopped. Every remaining factory runs within a tracked
+        // parent, and registers a descendant before that parent's tracked future ends.
+        self.0.tracker.close();
+        self.0.tracker.wait().await;
+        let mut handles = {
+            let mut joins = self.0.joins.lock();
+            std::mem::take(&mut joins.handles)
+        };
+        // Tracker emptiness can precede Tokio's completed JoinHandle by a small window.
+        while let Some(result) = handles.next().await {
+            self.record_join(result);
+        }
+        let mut joins = self.0.joins.lock();
+        (joins.first_error.take(), joins.failures)
+    }
+}
+
+impl<F> hyper::rt::Executor<F> for HttpTaskExecutor
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    fn execute(&self, future: F) {
+        self.spawn(future);
+    }
+}
+
+async fn retire_http12_children(
+    graceful: impl std::future::Future<Output = ()>,
+    tasks: HttpTaskExecutor,
+    deadline: tokio::time::Instant,
+    unverified_h3: bool,
+    unverified_tls_reloader: bool,
+    active_connections: usize,
+) -> Http12ShutdownOutcome {
+    #[cfg(test)]
+    if let Some(control) = tasks.test_control() {
+        *control.deadline.lock() = Some(deadline);
+        control.shutdown_started.cancel();
+    }
+    let drain = async {
+        graceful.await;
+        #[cfg(test)]
+        if let Some(control) = tasks.test_control() {
+            control.graceful_finished.cancel();
+        }
+        tasks.join().await
+    };
+    tokio::pin!(drain);
+    let observed = tokio::time::timeout_at(deadline, drain.as_mut()).await;
+    let deadline_missed = observed.is_err() || tokio::time::Instant::now() >= deadline;
+    if deadline_missed {
+        warn!(
+            event = EVENT_HTTP_CONNECTION_DRAIN,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_TRANSPORT,
+            state = "timeout",
+            active_connections,
+            timeout_secs = 10,
+            "HTTP connection drain timed out"
+        );
+    }
+    let (first_child_error, child_failures) = match observed {
+        Ok(result) => result,
+        Err(_) => drain.as_mut().await,
+    };
+    Http12ShutdownOutcome {
+        deadline_missed,
+        first_child_error,
+        child_failures,
+        unverified_h3,
+        unverified_tls_reloader,
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn test_retire_http12_scope(
+    future: impl std::future::Future<Output = ()> + Send + 'static,
+    deadline: tokio::time::Instant,
+) -> Http12ShutdownOutcome {
+    let tasks = HttpTaskExecutor::new();
+    tasks.spawn(future);
+    retire_http12_children(std::future::ready(()), tasks, deadline, false, false, 0).await
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct HttpLeafTestControl {
+    body_entered: tokio_util::sync::CancellationToken,
+    body_release: tokio_util::sync::CancellationToken,
+    drain_entered: tokio_util::sync::CancellationToken,
+    drain_release: tokio_util::sync::CancellationToken,
+    hold_drains: std::sync::atomic::AtomicBool,
+    shutdown_started: tokio_util::sync::CancellationToken,
+    graceful_finished: tokio_util::sync::CancellationToken,
+    drain_started: tokio_util::sync::CancellationToken,
+    drain_ended: tokio_util::sync::CancellationToken,
+    connection_abort: parking_lot::Mutex<Option<tokio::task::AbortHandle>>,
+    deadline: parking_lot::Mutex<Option<tokio::time::Instant>>,
+    panic_task: parking_lot::Mutex<Option<tokio::task::Id>>,
+    connection_task: parking_lot::Mutex<Option<tokio::task::Id>>,
+    tasks: parking_lot::Mutex<std::sync::Weak<HttpTasks>>,
+}
+
+#[cfg(test)]
+struct HttpLeafTestBody<B> {
+    inner: Pin<Box<B>>,
+    control: Option<Arc<HttpLeafTestControl>>,
+    release: Option<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+    panic: bool,
+}
+
+#[cfg(test)]
+impl<B: http_body::Body> http_body::Body for HttpLeafTestBody<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.panic {
+            if let Some(control) = &this.control {
+                *control.panic_task.lock() = Some(tokio::task::id());
+            }
+            panic!("expected HTTP leaf body-task panic outside middleware catch");
+        }
+        if let Some(release) = &mut this.release {
+            if let Some(control) = &this.control {
+                control.body_entered.cancel();
+            }
+            if std::future::Future::poll(release.as_mut(), cx).is_pending() {
+                return Poll::Pending;
+            }
+            this.release = None;
+        }
+        this.inner.as_mut().poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        !self.panic && self.release.is_none() && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        if self.panic || self.release.is_some() {
+            http_body::SizeHint::default()
+        } else {
+            self.inner.size_hint()
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct HttpLeafTestService<S> {
+    inner: S,
+    control: Option<Arc<HttpLeafTestControl>>,
+}
+
+#[cfg(test)]
+impl<S, B, R> Service<HttpRequest<B>> for HttpLeafTestService<S>
+where
+    S: Service<HttpRequest<B>, Response = Response<R>>,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    R: http_body::Body + Send + 'static,
+{
+    type Response = Response<HttpLeafTestBody<R>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn std::future::Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
+        let hold = request.uri().path() == "/__http_leaf_hold";
+        let panic = request.uri().path() == "/__http_leaf_panic";
+        let control = self.control.clone();
+        let future = self.inner.call(request);
+        Box::pin(async move {
+            let mut response = future.await?;
+            if control.is_some() && (hold || panic) {
+                response.headers_mut().remove(http::header::CONTENT_LENGTH);
+                response.headers_mut().remove(http::header::TRANSFER_ENCODING);
+            }
+            Ok(response.map(|body| HttpLeafTestBody {
+                inner: Box::pin(body),
+                release: if hold {
+                    control.as_ref().map(|control| {
+                        Box::pin(control.body_release.clone().cancelled_owned())
+                            as Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                    })
+                } else {
+                    None
+                },
+                panic: control.is_some() && panic,
+                control,
+            }))
+        })
+    }
+}
+
 #[derive(Clone)]
 struct EarlyResponseBodyService<S> {
     inner: S,
     idle_timeout: Duration,
+    task_owner: Option<HttpTaskExecutor>,
 }
 
 impl<S> EarlyResponseBodyService<S> {
     fn new(inner: S, idle_timeout: Duration) -> Self {
-        Self { inner, idle_timeout }
+        Self {
+            inner,
+            idle_timeout,
+            task_owner: None,
+        }
+    }
+
+    fn with_task_owner(mut self, owner: HttpTaskExecutor) -> Self {
+        self.task_owner = Some(owner);
+        self
     }
 }
 
@@ -970,7 +1290,7 @@ where
     }
 }
 
-fn spawn_early_response_body_drain<B>(body: B, context: EarlyResponseBodyDrainContext)
+fn spawn_early_response_body_drain<B>(body: B, context: EarlyResponseBodyDrainContext, owner: Option<HttpTaskExecutor>)
 where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Send + 'static,
@@ -980,15 +1300,40 @@ where
         LABEL_HTTP_BODY_DRAIN_RESULT => "started"
     )
     .increment(1);
-    tokio::spawn(async move {
+    #[cfg(test)]
+    let control = owner.as_ref().and_then(HttpTaskExecutor::test_control);
+    let future = async move {
+        #[cfg(test)]
+        let _drain_lifetime = control.as_ref().map(|control| control.drain_ended.clone().drop_guard());
+        #[cfg(test)]
+        if let Some(control) = control.as_ref()
+            && control.hold_drains.load(Ordering::Acquire)
+        {
+            control.drain_started.cancel();
+        }
         let result = drain_early_response_body(body, context.idle_timeout).await;
+        #[cfg(test)]
+        if let Some(control) = control
+            && control.hold_drains.load(Ordering::Acquire)
+        {
+            // The original raw body has ended and been dropped. Hold only this
+            // actual task's final tail, independently of the connection lifetime.
+            control.drain_entered.cancel();
+            control.drain_release.cancelled().await;
+        }
         counter!(
             METRIC_HTTP_SERVER_EARLY_RESPONSE_BODY_DRAINS_TOTAL,
             LABEL_HTTP_BODY_DRAIN_RESULT => result.as_str()
         )
         .increment(1);
         log_early_response_body_drain(result, &context);
-    });
+    };
+    if let Some(owner) = owner {
+        owner.spawn(future);
+    } else {
+        // H3 and legacy standalone service construction have no HTTP/1-2 receipt.
+        tokio::spawn(future);
+    }
 }
 
 impl<S, B, ResBody, ServiceError> Service<HttpRequest<B>> for EarlyResponseBodyService<S>
@@ -1012,6 +1357,7 @@ where
     }
 
     fn call(&mut self, req: HttpRequest<B>) -> Self::Future {
+        let task_owner = self.task_owner.clone();
         let version = req.version();
         let preserve_on_drop = matches!(version, Version::HTTP_10 | Version::HTTP_11) && !req.body().is_end_stream();
         let mut inner = self.inner.clone();
@@ -1039,7 +1385,7 @@ where
                 Ok(mut response) => {
                     response.headers_mut().insert(CONNECTION, HeaderValue::from_static("close"));
                     drain_context.status_code = response.status().as_u16();
-                    spawn_early_response_body_drain(abandoned, drain_context);
+                    spawn_early_response_body_drain(abandoned, drain_context, task_owner);
                     Ok(response)
                 }
                 Err(err) => Err(err),
@@ -1277,6 +1623,22 @@ pub async fn start_http_server(
     config: &config::Config,
     readiness: Arc<GlobalReadiness>,
     server_ctx: Arc<ServerContextSlot>,
+) -> Result<(ShutdownHandle, SocketAddr)> {
+    #[cfg(test)]
+    {
+        start_http_server_inner(config, readiness, server_ctx, None).await
+    }
+    #[cfg(not(test))]
+    {
+        start_http_server_inner(config, readiness, server_ctx).await
+    }
+}
+
+async fn start_http_server_inner(
+    config: &config::Config,
+    readiness: Arc<GlobalReadiness>,
+    server_ctx: Arc<ServerContextSlot>,
+    #[cfg(test)] test_control: Option<Arc<HttpLeafTestControl>>,
 ) -> Result<(ShutdownHandle, SocketAddr)> {
     crate::server::init_console_prefix()?;
     let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
@@ -1859,7 +2221,15 @@ pub async fn start_http_server(
             "HTTP transport parameters configured"
         );
 
-        let mut conn_builder = ConnBuilder::new(TokioExecutor::new());
+        let tasks = HttpTaskExecutor::new();
+        #[cfg(test)]
+        {
+            if let Some(control) = &test_control {
+                *control.tasks.lock() = Arc::downgrade(&tasks.0);
+            }
+            *tasks.0.control.lock() = test_control;
+        }
+        let mut conn_builder = ConnBuilder::new(tasks.clone());
 
         // Optimize for HTTP/1.1 (S3 small files/management plane)
         conn_builder
@@ -1893,14 +2263,13 @@ pub async fn start_http_server(
             "HTTP accept loop started"
         );
 
-        loop {
+        'accept_root: loop {
+            tasks.reap_ready();
             trace!("Waiting for new connection");
-
-            // Connection cap: acquire a permit BEFORE accepting, so that at
-            // saturation the loop stops accepting and the kernel backlog
-            // absorbs bursts (TCP-native backpressure) instead of accept-then-
-            // close churn. The permit travels into the connection task and is
-            // released by RAII when the connection ends.
+            if !matches!(shutdown_rx.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)) {
+                break;
+            }
+            // Keep the original queued permit future while observing child completion.
             let connection_permit = match &connection_limiter {
                 None => None,
                 Some(semaphore) => match semaphore.clone().try_acquire_owned() {
@@ -1914,47 +2283,38 @@ pub async fn start_http_server(
                             state = "saturated",
                             "Connection cap state changed"
                         );
-                        tokio::select! {
-                            permit = semaphore.clone().acquire_owned() => match permit {
-                                Ok(permit) => Some(permit),
-                                // The semaphore is never closed; fail safe by
-                                // stopping the accept loop if it ever is.
-                                Err(_) => break,
-                            },
-                            _ = shutdown_rx.recv() => {
-                                info!(
-                                    event = EVENT_HTTP_ACCEPT_LOOP_STATE,
-                                    component = LOG_COMPONENT_SERVER,
-                                    subsystem = LOG_SUBSYSTEM_TRANSPORT,
-                                    state = "shutdown_signal_received",
-                                    "HTTP accept loop state changed"
-                                );
-                                break;
+                        let permit = semaphore.clone().acquire_owned();
+                        tokio::pin!(permit);
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = shutdown_rx.recv() => {
+                            info!(
+                                event = EVENT_HTTP_ACCEPT_LOOP_STATE,
+                                component = LOG_COMPONENT_SERVER,
+                                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                                state = "shutdown_signal_received",
+                                "HTTP accept loop state changed"
+                            );
+                                    break 'accept_root;
+                                }
+                                result = permit.as_mut() => match result {
+                                    Ok(permit) => break Some(permit),
+                                    Err(_) => break 'accept_root,
+                                },
+                                () = tasks.reap_one() => {}
                             }
                         }
                     }
                 },
             };
-
             let (socket, _) = {
                 #[cfg(unix)]
                 {
-                    tokio::select! {
-                        res = listener.accept() => match res {
-                            Ok(conn) => conn,
-                            Err(err) => {
-                                error!(
-                                    event = EVENT_HTTP_ACCEPT_LOOP_STATE,
-                                    component = LOG_COMPONENT_SERVER,
-                                    subsystem = LOG_SUBSYSTEM_TRANSPORT,
-                                    state = "accept_failed",
-                                    error = %err,
-                                    "HTTP accept loop state changed"
-                                );
-                                continue;
-                            }
-                        },
-                        _ = shutdown_rx.recv() => {
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown_rx.recv() => {
                             info!(
                                 event = EVENT_HTTP_ACCEPT_LOOP_STATE,
                                 component = LOG_COMPONENT_SERVER,
@@ -1962,28 +2322,32 @@ pub async fn start_http_server(
                                 state = "shutdown_signal_received",
                                 "HTTP accept loop state changed"
                             );
-                            break;
+                                break 'accept_root;
+                            }
+                            res = listener.accept() => match res {
+                                Ok(conn) => break conn,
+                                Err(err) => {
+                                    error!(
+                                        event = EVENT_HTTP_ACCEPT_LOOP_STATE,
+                                        component = LOG_COMPONENT_SERVER,
+                                        subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                                        state = "accept_failed",
+                                        error = %err,
+                                        "HTTP accept loop state changed"
+                                    );
+                                    continue 'accept_root;
+                                }
+                            },
+                            () = tasks.reap_one() => {}
                         }
                     }
                 }
                 #[cfg(not(unix))]
                 {
-                    tokio::select! {
-                        res = listener.accept() => match res {
-                            Ok(conn) => conn,
-                            Err(err) => {
-                                error!(
-                                    event = EVENT_HTTP_ACCEPT_LOOP_STATE,
-                                    component = LOG_COMPONENT_SERVER,
-                                    subsystem = LOG_SUBSYSTEM_TRANSPORT,
-                                    state = "accept_failed",
-                                    error = %err,
-                                    "HTTP accept loop state changed"
-                                );
-                                continue;
-                            }
-                        },
-                        _ = shutdown_rx.recv() => {
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown_rx.recv() => {
                             info!(
                                 event = EVENT_HTTP_ACCEPT_LOOP_STATE,
                                 component = LOG_COMPONENT_SERVER,
@@ -1991,11 +2355,30 @@ pub async fn start_http_server(
                                 state = "shutdown_signal_received",
                                 "HTTP accept loop state changed"
                             );
-                            break;
+                                break 'accept_root;
+                            }
+                            res = listener.accept() => match res {
+                                Ok(conn) => break conn,
+                                Err(err) => {
+                                    error!(
+                                        event = EVENT_HTTP_ACCEPT_LOOP_STATE,
+                                        component = LOG_COMPONENT_SERVER,
+                                        subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                                        state = "accept_failed",
+                                        error = %err,
+                                        "HTTP accept loop state changed"
+                                    );
+                                    continue 'accept_root;
+                                }
+                            },
+                            () = tasks.reap_one() => {}
                         }
                     }
                 }
             };
+            if !matches!(shutdown_rx.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)) {
+                break;
+            }
             #[allow(unused)]
             let socket_ref = SockRef::from(&socket);
 
@@ -2028,6 +2411,7 @@ pub async fn start_http_server(
 
             let connection_ctx = ConnectionContext {
                 http_server: http_server.clone(),
+                task_owner: tasks.clone(),
                 s3_service: s3_service.clone(),
                 compression_config: compression_config.clone(),
                 is_console,
@@ -2042,7 +2426,27 @@ pub async fn start_http_server(
                 request_body_idle_timeout: http_request_body_read_timeout,
             };
 
-            process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.watcher(), connection_permit);
+            let connection_task = tasks.spawn(process_connection(
+                socket,
+                tls_acceptor.clone(),
+                connection_ctx,
+                graceful.watcher(),
+                connection_permit,
+            ));
+            #[cfg(test)]
+            if let Some(control) = tasks.test_control() {
+                *control.connection_task.lock() = Some(connection_task);
+                *control.connection_abort.lock() = tasks
+                    .0
+                    .joins
+                    .lock()
+                    .handles
+                    .iter()
+                    .find(|handle| handle.id() == connection_task)
+                    .map(tokio::task::JoinHandle::abort_handle);
+            }
+            #[cfg(not(test))]
+            let _ = connection_task;
         }
 
         let active_connections = graceful.count();
@@ -2056,27 +2460,29 @@ pub async fn start_http_server(
                 "HTTP connection drain started"
             );
         }
-        tokio::select! {
-            () = graceful.shutdown() => {
-                debug!(
-                    event = EVENT_HTTP_CONNECTION_DRAIN,
-                    component = LOG_COMPONENT_SERVER,
-                    subsystem = LOG_SUBSYSTEM_TRANSPORT,
-                    state = "completed",
-                    "HTTP connection drain completed"
-                );
-            },
-            () = tokio::time::sleep(Duration::from_secs(10)) => {
-                warn!(
-                    event = EVENT_HTTP_CONNECTION_DRAIN,
-                    component = LOG_COMPONENT_SERVER,
-                    subsystem = LOG_SUBSYSTEM_TRANSPORT,
-                    state = "timeout",
-                    active_connections,
-                    timeout_secs = 10,
-                    "HTTP connection drain timed out"
-                );
-            }
+        drop(listener);
+        drop(http_server);
+        #[cfg(feature = "http3")]
+        let unverified_h3 = http3_server.is_some();
+        #[cfg(not(feature = "http3"))]
+        let unverified_h3 = false;
+        let outcome = retire_http12_children(
+            graceful.shutdown(),
+            tasks,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            unverified_h3,
+            tls_reload_task.is_some(),
+            active_connections,
+        )
+        .await;
+        if !outcome.deadline_missed() {
+            debug!(
+                event = EVENT_HTTP_CONNECTION_DRAIN,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                state = "completed",
+                "HTTP connection drain completed"
+            );
         }
 
         if let Some(task) = tls_reload_task {
@@ -2097,14 +2503,16 @@ pub async fn start_http_server(
                 "HTTP/3 server task failed during shutdown"
             );
         }
+        outcome
     });
 
-    Ok((ShutdownHandle::new(shutdown_tx, task_handle), local_addr))
+    Ok((ShutdownHandle::new_http12(shutdown_tx, task_handle), local_addr))
 }
 
 #[derive(Clone)]
 struct ConnectionContext {
-    http_server: Arc<ConnBuilder<TokioExecutor>>,
+    http_server: Arc<ConnBuilder<HttpTaskExecutor>>,
+    task_owner: HttpTaskExecutor,
     s3_service: S3Service,
     compression_config: HttpCompressionConfig,
     is_console: bool,
@@ -2271,13 +2679,14 @@ fn process_connection(
     context: ConnectionContext,
     graceful: Watcher,
     connection_permit: Option<OwnedSemaphorePermit>,
-) {
-    tokio::spawn(async move {
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    async move {
         // Hold the connection-cap permit for the lifetime of this task; RAII
         // release covers TLS handshake failures and normal close alike.
         let _connection_permit = connection_permit;
         let ConnectionContext {
             http_server,
+            task_owner,
             s3_service,
             compression_config,
             is_console,
@@ -2341,7 +2750,8 @@ fn process_connection(
         let http_service = SwiftService::new(true, None, s3_service);
         #[cfg(not(feature = "swift"))]
         let http_service = s3_service;
-        let http_service = EarlyResponseBodyService::new(http_service, request_body_idle_timeout);
+        let http_service =
+            EarlyResponseBodyService::new(http_service, request_body_idle_timeout).with_task_owner(task_owner.clone());
         let http_service = InternodeRpcService::new(http_service);
 
         let external_service = hybrid(http_service.clone(), rpc_service.clone());
@@ -2491,6 +2901,11 @@ fn process_connection(
         let internode_stack_service = build_internode_stack(internode_service);
         let hybrid_service = PathDispatchService::new(external_stack_service, internode_stack_service);
 
+        #[cfg(test)]
+        let hybrid_service = HttpLeafTestService {
+            inner: hybrid_service,
+            control: task_owner.test_control(),
+        };
         let hybrid_service = TowerToHyperService::new(hybrid_service);
 
         // Decide whether to handle HTTPS or HTTP connections based on the existence of TLS Acceptor
@@ -2544,7 +2959,7 @@ fn process_connection(
             }
             trace!("HTTP connection handling finished");
         };
-    });
+    }
 }
 
 /// Handles connection errors by logging them with appropriate severity
@@ -2877,7 +3292,7 @@ mod tests {
     use opentelemetry::propagation::Extractor;
     use std::collections::HashMap;
     use std::convert::Infallible;
-    use std::future::Ready;
+    use std::future::{Future, Ready};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
@@ -2932,6 +3347,358 @@ mod tests {
             false,
             Arc::default()
         ))
+    }
+
+    async fn http_leaf_fixture(control: Arc<HttpLeafTestControl>) -> (ShutdownHandle, SocketAddr) {
+        let mut config = config::Config::new("127.0.0.1:0", Vec::new());
+        config.console_enable = false;
+        let readiness = Arc::new(GlobalReadiness::new());
+        readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+        start_http_server_inner(&config, readiness, ServerContextSlot::new(), Some(control))
+            .await
+            .expect("actual production HTTP listener")
+    }
+
+    #[tokio::test]
+    async fn http12_actual_h2_held_body_panic_and_deadline_keep_same_join() {
+        let control = Arc::new(HttpLeafTestControl::default());
+        let (mut shutdown, address) = http_leaf_fixture(control.clone()).await;
+        let mut client: Option<tokio::task::JoinHandle<std::result::Result<(), hyper::Error>>> = None;
+        let observations = async {
+            let stream = TcpStream::connect(address).await?;
+            let (mut sender, connection) =
+                hyper::client::conn::http2::handshake::<_, _, Empty<Bytes>>(TokioExecutor::new(), TokioIo::new(stream))
+                    .await
+                    .map_err(Error::other)?;
+            client = Some(tokio::spawn(connection));
+            let request = HttpRequest::builder()
+                .uri("http://localhost/__http_leaf_hold")
+                .body(Empty::new())
+                .map_err(Error::other)?;
+            let held = tokio::time::timeout(Duration::from_secs(5), sender.send_request(request))
+                .await
+                .map_err(Error::other)?
+                .map_err(Error::other)?;
+            tokio::time::timeout(Duration::from_secs(5), control.body_entered.cancelled())
+                .await
+                .map_err(Error::other)?;
+            let panic_response = tokio::time::timeout(Duration::from_secs(5), async {
+                let request = HttpRequest::builder()
+                    .uri("http://localhost/__http_leaf_panic")
+                    .body(Empty::new())
+                    .map_err(Error::other)?;
+                Ok::<_, Error>(match sender.send_request(request).await {
+                    Ok(response) => response.into_body().collect().await.is_err(),
+                    Err(_) => true,
+                })
+            })
+            .await
+            .map_err(Error::other)??;
+            shutdown.signal();
+            tokio::time::timeout(Duration::from_secs(5), control.shutdown_started.cancelled())
+                .await
+                .map_err(Error::other)?;
+            let deadline = control
+                .deadline
+                .lock()
+                .ok_or_else(|| Error::other("missing owner deadline"))?;
+            let id = shutdown
+                .task_handle
+                .as_ref()
+                .ok_or_else(|| Error::other("missing original task"))?
+                .id();
+            let mut observer = Box::pin(shutdown.wait_checked());
+            let pending = std::future::poll_fn(|cx| Poll::Ready(observer.as_mut().poll(cx).is_pending())).await;
+            drop(observer);
+            tokio::time::sleep_until(deadline + Duration::from_millis(1)).await;
+            let same = shutdown.task_handle.as_ref().is_some_and(|task| task.id() == id);
+            drop(held);
+            drop(sender);
+            Ok::<_, Error>((panic_response, pending, same))
+        }
+        .await;
+        // Cleanup runs even when a readiness/API observation above failed.
+        control.body_release.cancel();
+        shutdown.signal();
+        let result = shutdown.wait_checked().await;
+        let mut client_timely = true;
+        if let Some(mut client) = client {
+            if tokio::time::timeout(Duration::from_secs(5), &mut client).await.is_err() {
+                client_timely = false;
+                let _ = client.await;
+            }
+        }
+        let (panic_response, pending, same) = observations.expect("actual held H2 fixture observations");
+        assert!(panic_response && pending && same && client_timely);
+        let error = result.expect_err("late scope and actual child panic cannot become success");
+        let outcome = error.http12_outcome().expect("retired HTTP12 scope retained on failure");
+        assert!(outcome.deadline_missed());
+        assert_eq!(outcome.child_failures, 1);
+        let panic_id = control.panic_task.lock().expect("actual Hyper stream task id");
+        assert_eq!(outcome.first_child_error.as_ref().expect("real JoinError").id(), panic_id);
+        let source = std::error::Error::source(&error).expect("typed child source");
+        assert_eq!(
+            source
+                .downcast_ref::<tokio::task::JoinError>()
+                .expect("original JoinError type")
+                .id(),
+            panic_id
+        );
+        assert!(
+            shutdown
+                .wait_checked()
+                .await
+                .expect_err("sticky failure")
+                .http12_outcome()
+                .expect("same outcome")
+                .deadline_missed()
+        );
+    }
+
+    #[tokio::test]
+    async fn http12_actual_early_body_drain_is_owned_until_release() {
+        let control = Arc::new(HttpLeafTestControl::default());
+        control.hold_drains.store(true, Ordering::Release);
+        let (mut shutdown, address) = http_leaf_fixture(control.clone()).await;
+        let mut client: Option<TcpStream> = None;
+        let mut early_result = None;
+        let observation = async {
+            client = Some(TcpStream::connect(address).await?);
+            client
+                .as_mut()
+                .ok_or_else(|| Error::other("missing socket"))?
+                .write_all(b"PUT /bucket/object HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\nx")
+                .await?;
+            tokio::time::timeout(Duration::from_secs(5), control.drain_started.cancelled())
+                .await
+                .map_err(Error::other)?;
+            // Finish the actual raw read before holding its original task tail;
+            // an unpolled raw receiver can otherwise keep Hyper's parent alive.
+            drop(client.take());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                control.drain_entered.cancelled().await;
+                loop {
+                    let task_id = *control.connection_task.lock();
+                    let original_finished = control
+                        .connection_abort
+                        .lock()
+                        .as_ref()
+                        .is_some_and(|handle| Some(handle.id()) == task_id && handle.is_finished());
+                    let actually_reaped = control.tasks.lock().upgrade().is_some_and(|tasks| {
+                        let joins = tasks.joins.lock();
+                        !joins.handles.iter().any(|handle| Some(handle.id()) == task_id)
+                    });
+                    if original_finished && actually_reaped {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .map_err(Error::other)?;
+            shutdown.signal();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                control.shutdown_started.cancelled().await;
+                control.graceful_finished.cancelled().await;
+            })
+            .await
+            .map_err(Error::other)?;
+            // This borrowed wait is actually polled across a scheduling interval;
+            // pending cannot be explained by an unpolled connection/graceful parent.
+            let pending_after_scheduling = match tokio::time::timeout(Duration::from_millis(30), shutdown.wait_checked()).await {
+                Err(_) => true,
+                Ok(result) => {
+                    early_result = Some(result);
+                    false
+                }
+            };
+            let drain_still_held = !control.drain_release.is_cancelled() && !control.drain_ended.is_cancelled();
+            Ok::<_, Error>((pending_after_scheduling, drain_still_held))
+        }
+        .await;
+        // Every failure path first releases and observes the same original work.
+        control.drain_release.cancel();
+        drop(client);
+        shutdown.signal();
+        let owner_ready = if early_result.is_some() {
+            // The observer already joined the actual original task in the faulty path.
+            Ok(())
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !shutdown.task_handle.as_ref().is_some_and(|task| task.is_finished()) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+        };
+        let original_deadline = *control.deadline.lock();
+        if let Some(deadline) = original_deadline {
+            // The real owner observed completion; later Root receipt cannot restart its clock.
+            tokio::time::sleep_until(deadline + Duration::from_millis(1)).await;
+        }
+        let result = match early_result {
+            Some(result) => result,
+            None => shutdown.wait_checked().await,
+        };
+        let drain_ended = tokio::time::timeout(Duration::from_secs(5), control.drain_ended.cancelled()).await;
+        let (pending_after_scheduling, drain_still_held) =
+            observation.expect("actual connection exit/reap and graceful completion");
+        // An ownership red is acceptable only after these independent cleanup
+        // and typed-result gates succeeded. Elapsed/unknown must emit no witness.
+        assert!(owner_ready.is_ok() && original_deadline.is_some() && drain_ended.is_ok());
+        let Ok(crate::server::ShutdownReceipt::Http12ChildrenRetired(outcome)) = result else {
+            panic!("actual retired HTTP owner result required");
+        };
+        assert!(!outcome.deadline_missed(), "Root late receipt must retain the owner's timely observation");
+        assert!(
+            outcome.verified_scope_complete(),
+            "compiled optional features alone cannot create configured instances"
+        );
+        println!(
+            "HTTP_EARLY_DRAIN_OWNER_WITNESS connection_finished_reaped=true graceful_completed=true tail_held={drain_still_held} stop_pending_30ms={pending_after_scheduling} root_joined=true tail_ended=true"
+        );
+        assert!(
+            pending_after_scheduling && drain_still_held,
+            "raw drainer must hold stop pending after the original connection and graceful parent have retired"
+        );
+    }
+
+    #[tokio::test]
+    async fn http12_actual_idle_h2_reaps_completed_stream_handles() {
+        let control = Arc::new(HttpLeafTestControl::default());
+        let (mut shutdown, address) = http_leaf_fixture(control.clone()).await;
+        let mut client: Option<tokio::task::JoinHandle<std::result::Result<(), hyper::Error>>> = None;
+        let observation = async {
+            let stream = TcpStream::connect(address).await?;
+            let (mut sender, connection) =
+                hyper::client::conn::http2::handshake::<_, _, Empty<Bytes>>(TokioExecutor::new(), TokioIo::new(stream))
+                    .await
+                    .map_err(Error::other)?;
+            client = Some(tokio::spawn(connection));
+            for _ in 0..64 {
+                let request = HttpRequest::builder()
+                    .uri("http://localhost/health/live")
+                    .body(Empty::new())
+                    .map_err(Error::other)?;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    sender
+                        .send_request(request)
+                        .await
+                        .map_err(Error::other)?
+                        .into_body()
+                        .collect()
+                        .await
+                        .map_err(Error::other)
+                })
+                .await
+                .map_err(Error::other)??;
+            }
+            // Keep the actual H2 connection live and submit no further work.
+            let idle_reaped = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let connection_id = *control.connection_task.lock();
+                    let only_original_connection = control.tasks.lock().upgrade().is_some_and(|tasks| {
+                        let joins = tasks.joins.lock();
+                        joins.handles.len() == 1
+                            && joins
+                                .handles
+                                .iter()
+                                .next()
+                                .is_some_and(|handle| Some(handle.id()) == connection_id && !handle.is_finished())
+                    });
+                    if only_original_connection {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+            drop(sender);
+            Ok::<_, Error>(idle_reaped)
+        }
+        .await;
+        control.body_release.cancel();
+        control.drain_release.cancel();
+        shutdown.signal();
+        let retired = shutdown.wait_checked().await;
+        let mut client_timely = true;
+        if let Some(mut client) = client {
+            if tokio::time::timeout(Duration::from_secs(5), &mut client).await.is_err() {
+                client_timely = false;
+                let _ = client.await;
+            }
+        }
+        assert!(
+            observation.expect("actual H2 requests"),
+            "idle accepted owner must reap its completed stream history"
+        );
+        assert!(client_timely && matches!(retired, Ok(crate::server::ShutdownReceipt::Http12ChildrenRetired(_))));
+    }
+
+    #[tokio::test]
+    async fn http12_late_ready_observation_uses_original_deadline() {
+        let tasks = HttpTaskExecutor::new();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tasks.spawn(async move {
+            let _ = release_rx.await;
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut drain = Box::pin(retire_http12_children(std::future::ready(()), tasks.clone(), deadline, false, false, 0));
+        let pending = std::future::poll_fn(|cx| Poll::Ready(drain.as_mut().poll(cx).is_pending())).await;
+        let _ = release_tx.send(());
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            while !tasks.0.joins.lock().handles.iter().all(tokio::task::JoinHandle::is_finished) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        // The actual original handles are ready; leave the same drain future unpolled.
+        tokio::time::sleep_until(deadline + Duration::from_millis(1)).await;
+        let outcome = drain.as_mut().await;
+        assert!(pending && ready.is_ok());
+        assert!(
+            outcome.deadline_missed(),
+            "timeout_at inner-ready-first must not wash away an unobserved deadline"
+        );
+        assert_eq!(outcome.child_failures, 0);
+        assert!(outcome.first_child_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn http12_executor_reaps_finished_history_and_retains_first_actual_failure() {
+        let tasks = HttpTaskExecutor::new();
+        let mut first_id = None;
+        let mut bounded = true;
+        let mut all_ready = true;
+        for index in 0..128 {
+            let id = tasks.spawn(async move {
+                if index < 4 {
+                    panic!("expected bounded HTTP task failure");
+                }
+            });
+            if index == 0 {
+                first_id = Some(id);
+            }
+            if tokio::time::timeout(Duration::from_secs(5), async {
+                while !tasks.0.joins.lock().handles.iter().all(tokio::task::JoinHandle::is_finished) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err()
+            {
+                all_ready = false;
+                break;
+            }
+            tasks.reap_ready();
+            bounded &= tasks.0.joins.lock().handles.is_empty();
+        }
+        let (error, failures) = tasks.join().await;
+        assert!(bounded && all_ready, "actual joins finish before asserting bounded history");
+        assert_eq!(failures, 4);
+        assert_eq!(error.expect("first actual failure retained").id(), first_id.expect("first task id"));
+        assert!(tasks.0.joins.lock().handles.is_empty());
     }
 
     #[tokio::test]

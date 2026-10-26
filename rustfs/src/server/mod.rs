@@ -45,6 +45,8 @@ pub(crate) use audit::apply_audit_module_switch_for_context;
 pub use audit::{is_audit_module_enabled, refresh_audit_module_enabled, start_audit_system, stop_audit_system};
 pub use event::{init_event_notifier, is_notify_module_enabled, refresh_notify_module_enabled, shutdown_event_notifier};
 pub use http::start_http_server;
+#[cfg(test)]
+pub(crate) use http::test_retire_http12_scope;
 pub use prefix::LOGO;
 pub use runtime::build_tokio_runtime;
 pub use service_state::SHUTDOWN_TIMEOUT;
@@ -106,11 +108,42 @@ pub(crate) fn strip_valid_port_suffix(host: &str) -> &str {
     }
 }
 
-/// Failure to observe the one task owned by a shutdown handle.
-#[derive(Debug)]
+/// Observations produced by the actual accepted HTTP/1-2 task owner.
+#[derive(Debug, Clone)]
+pub(crate) struct Http12ShutdownOutcome {
+    deadline_missed: bool,
+    first_child_error: Option<std::sync::Arc<tokio::task::JoinError>>,
+    child_failures: u64,
+    unverified_h3: bool,
+    unverified_tls_reloader: bool,
+}
+
+impl Http12ShutdownOutcome {
+    pub(crate) fn deadline_missed(&self) -> bool {
+        self.deadline_missed
+    }
+
+    pub(crate) fn verified_scope_complete(&self) -> bool {
+        !self.unverified_h3 && !self.unverified_tls_reloader
+    }
+
+    fn failed(&self) -> bool {
+        self.deadline_missed || self.child_failures != 0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ShutdownReceipt {
+    OuterTaskJoined,
+    Http12ChildrenRetired(Http12ShutdownOutcome),
+}
+
+/// A failed or unknown observation retains the actual task error, when known.
+#[derive(Debug, Clone)]
 pub(crate) enum ShutdownWaitError {
-    Join(tokio::task::JoinError),
+    Join(std::sync::Arc<tokio::task::JoinError>),
     MissingTask,
+    Http12(Http12ShutdownOutcome),
 }
 
 impl ShutdownWaitError {
@@ -119,35 +152,85 @@ impl ShutdownWaitError {
             Self::Join(error) if error.is_cancelled() => "join_cancelled",
             Self::Join(_) => "join_panicked",
             Self::MissingTask => "join_unconfirmed",
+            Self::Http12(outcome) if outcome.deadline_missed => "http12_deadline_missed",
+            Self::Http12(_) => "http12_child_join_failed",
+        }
+    }
+
+    pub(crate) fn http12_outcome(&self) -> Option<&Http12ShutdownOutcome> {
+        match self {
+            Self::Http12(outcome) => Some(outcome),
+            _ => None,
         }
     }
 }
 
 impl std::fmt::Display for ShutdownWaitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "server task shutdown {}", self.reason())
+        write!(f, "server task shutdown {}", self.reason())?;
+        if let Self::Http12(outcome) = self {
+            write!(f, " ({} child join failures)", outcome.child_failures)?;
+        }
+        Ok(())
     }
 }
 
 impl std::error::Error for ShutdownWaitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Join(error) => Some(error),
+            Self::Join(error) => Some(error.as_ref()),
+            Self::Http12(outcome) => outcome.first_child_error.as_ref().map(|error| error.as_ref() as _),
             Self::MissingTask => None,
+        }
+    }
+}
+
+enum ShutdownTask {
+    Outer(tokio::task::JoinHandle<()>),
+    Http12(tokio::task::JoinHandle<Http12ShutdownOutcome>),
+}
+
+impl ShutdownTask {
+    #[cfg(test)]
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::Outer(task) => task.is_finished(),
+            Self::Http12(task) => task.is_finished(),
+        }
+    }
+
+    #[cfg(test)]
+    fn id(&self) -> tokio::task::Id {
+        match self {
+            Self::Outer(task) => task.id(),
+            Self::Http12(task) => task.id(),
         }
     }
 }
 
 pub struct ShutdownHandle {
     shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
-    task_handle: Option<tokio::task::JoinHandle<()>>,
+    task_handle: Option<ShutdownTask>,
+    failure: Option<ShutdownWaitError>,
 }
 
 impl ShutdownHandle {
     pub fn new(shutdown_tx: tokio::sync::broadcast::Sender<()>, task_handle: tokio::task::JoinHandle<()>) -> Self {
         Self {
             shutdown_tx: Some(shutdown_tx),
-            task_handle: Some(task_handle),
+            task_handle: Some(ShutdownTask::Outer(task_handle)),
+            failure: None,
+        }
+    }
+
+    pub(crate) fn new_http12(
+        shutdown_tx: tokio::sync::broadcast::Sender<()>,
+        task_handle: tokio::task::JoinHandle<Http12ShutdownOutcome>,
+    ) -> Self {
+        Self {
+            shutdown_tx: Some(shutdown_tx),
+            task_handle: Some(ShutdownTask::Http12(task_handle)),
+            failure: None,
         }
     }
 
@@ -162,15 +245,29 @@ impl ShutdownHandle {
         self.wait().await;
     }
 
-    /// Observe only this outer task, not every connection or request it spawned.
-    /// Dropping a pending observer leaves the original task in this handle.
-    pub(crate) async fn wait_checked(&mut self) -> Result<(), ShutdownWaitError> {
-        let Some(task_handle) = self.task_handle.as_mut() else {
+    /// A cancelled borrowed observer leaves the same original task in this handle.
+    /// A legacy outer join never certifies HTTP children. Failed observations are sticky.
+    pub(crate) async fn wait_checked(&mut self) -> Result<ShutdownReceipt, ShutdownWaitError> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        let Some(task) = self.task_handle.as_mut() else {
             return Err(ShutdownWaitError::MissingTask);
         };
-        let result = task_handle.await;
+        let result = match task {
+            ShutdownTask::Outer(task) => task.await.map(|()| ShutdownReceipt::OuterTaskJoined),
+            ShutdownTask::Http12(task) => task.await.map(ShutdownReceipt::Http12ChildrenRetired),
+        }
+        .map_err(|error| ShutdownWaitError::Join(std::sync::Arc::new(error)))
+        .and_then(|receipt| match receipt {
+            ShutdownReceipt::Http12ChildrenRetired(outcome) if outcome.failed() => Err(ShutdownWaitError::Http12(outcome)),
+            receipt => Ok(receipt),
+        });
         let _ = self.task_handle.take();
-        result.map_err(ShutdownWaitError::Join)
+        if let Err(error) = &result {
+            self.failure = Some(error.clone());
+        }
+        result
     }
 
     pub async fn wait(mut self) {
@@ -275,6 +372,7 @@ mod shutdown_handle_tests {
         let mut missing = ShutdownHandle {
             shutdown_tx: None,
             task_handle: None,
+            failure: None,
         };
         assert!(matches!(missing.wait_checked().await, Err(ShutdownWaitError::MissingTask)));
         let (tx, _rx) = broadcast::channel(1);
