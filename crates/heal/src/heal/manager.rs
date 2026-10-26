@@ -239,43 +239,70 @@ where
     }
 }
 
-// Each page owns only its selected disk's reservation. The permanent ticker
-// retains the controller capability, never a node/physical permit between pages.
+// One bounded local metadata operation owns only its selected disk. Permanent
+// tickers retain the controller capability, never a permit between operations.
+async fn run_local_metadata<T>(
+    disk: &super::DiskStore,
+    admission: Option<&Arc<rustfs_concurrency::adaptive::NodeAdmission>>,
+    cancellation: &CancellationToken,
+    operation: impl Future<Output = T>,
+) -> Result<T> {
+    let Some(admission) = admission else {
+        return Ok(operation.await);
+    };
+    let plan = disk
+        .physical_admission()
+        .and_then(|binding| binding.plan())
+        .ok_or_else(|| Error::transient_skip("local metadata physical resource discovery unavailable"))?;
+    let permit = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(Error::transient_skip("local metadata admission cancelled")),
+        result = tokio::time::timeout(Duration::from_millis(250), plan.acquire(admission)) => {
+            result.ok().flatten()
+                .ok_or_else(|| Error::transient_skip("local metadata node or physical resource admission deferred"))?
+        }
+    };
+    if !plan.is_current() {
+        return Err(Error::transient_skip("local metadata physical resource discovery expired"));
+    }
+    use super::storage_api::owner::{
+        ecstore_with_background_disk_io, ecstore_with_background_resource_set, ecstore_with_rpc_background_request,
+    };
+    let mut operation = std::pin::pin!(ecstore_with_rpc_background_request(
+        false,
+        ecstore_with_background_disk_io(
+            cancellation.clone(),
+            ecstore_with_background_resource_set(permit.resources().clone(), operation),
+        ),
+    ));
+    let mut started = false;
+    let selected = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        result = std::future::poll_fn(|cx| {
+            started = true;
+            std::future::Future::poll(operation.as_mut(), cx)
+        }) => Some(result),
+    };
+    // Cancellation yields only the node unit; the same started operation owns
+    // its physical/native resources until it finishes. Never credit diagnostics.
+    drop(permit);
+    match selected {
+        Some(result) => Ok(result),
+        None if started => Ok(operation.await),
+        None => Err(Error::transient_skip("local metadata cancelled before first poll")),
+    }
+}
+
 async fn inspect_resume_disk(
     gc: &mut ResumeGc,
     disk: &super::DiskStore,
     admission: Option<&Arc<rustfs_concurrency::adaptive::NodeAdmission>>,
     cancellation: &CancellationToken,
 ) -> Result<()> {
-    let Some(admission) = admission else {
-        return gc.inspect_disk(disk).await.map(|_| ());
-    };
-    let plan = disk
-        .physical_admission()
-        .and_then(|binding| binding.plan())
-        .ok_or_else(|| Error::transient_skip("resume inspection physical resource discovery unavailable"))?;
-    let permit = tokio::time::timeout(Duration::from_millis(250), plan.acquire(admission))
-        .await
-        .ok()
-        .flatten()
-        .ok_or_else(|| Error::transient_skip("resume inspection node or physical resource admission deferred"))?;
-    if !plan.is_current() {
-        return Err(Error::transient_skip("resume inspection physical resource discovery expired"));
-    }
-    use super::storage_api::owner::{
-        ecstore_with_background_disk_io, ecstore_with_background_resource_set, ecstore_with_rpc_background_request,
-    };
-    let result = ecstore_with_rpc_background_request(
-        false,
-        ecstore_with_background_disk_io(
-            cancellation.clone(),
-            ecstore_with_background_resource_set(permit.resources().clone(), gc.inspect_disk(disk)),
-        ),
-    )
-    .await;
-    // Read-only diagnostics do not credit repair progress or completed units.
-    drop(permit);
-    result.map(|_| ())
+    run_local_metadata(disk, admission, cancellation, gc.inspect_disk(disk))
+        .await?
+        .map(|_| ())
 }
 
 const KEEP_HEAL_TASK_STATUS_DURATION: Duration = Duration::from_secs(10 * 60);

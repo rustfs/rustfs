@@ -615,9 +615,8 @@ struct ResumeAdmissionFixture {
 }
 
 #[cfg(not(windows))]
-fn resume_node(open: bool) -> Arc<rustfs_concurrency::adaptive::NodeAdmission> {
-    use rustfs_concurrency::adaptive::{FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure};
-    let node = NodeAdmission::new(std::num::NonZeroU16::MIN);
+fn publish_resume_node(node: &rustfs_concurrency::adaptive::NodeAdmission, open: bool) {
+    use rustfs_concurrency::adaptive::{FeedbackController, FeedbackObservation, ResourcePressure};
     node.update(
         &mut FeedbackController::new(),
         open.then_some(FeedbackObservation {
@@ -627,6 +626,12 @@ fn resume_node(open: bool) -> Arc<rustfs_concurrency::adaptive::NodeAdmission> {
             completed_units: None,
         }),
     );
+}
+
+#[cfg(not(windows))]
+fn resume_node(open: bool) -> Arc<rustfs_concurrency::adaptive::NodeAdmission> {
+    let node = rustfs_concurrency::adaptive::NodeAdmission::new(std::num::NonZeroU16::MIN);
+    publish_resume_node(&node, open);
     node
 }
 
@@ -848,5 +853,266 @@ fn resume_admission_cancel_returns_node_but_native_keeps_physical_and_memory() {
     assert_eq!(node.snapshot().active, 0);
     assert_eq!(node.completed(), Some(0));
     assert_eq!(Arc::strong_count(&memory), baseline_memory_owners);
+    drop(fixture);
+}
+
+#[cfg(not(windows))]
+async fn auto_format_fixture(
+    node: Option<Arc<rustfs_concurrency::adaptive::NodeAdmission>>,
+    physical: Option<Arc<rustfs_concurrency::adaptive::AdaptiveAdmission>>,
+    seed_unread_intent: bool,
+) -> (ResumeAdmissionFixture, Option<(String, Vec<u8>)>) {
+    // Preserve the constructor's explicit open/closed state before any fixture await.
+    let node_limit = node.as_ref().map(|node| node.snapshot().limit);
+    let fixture = resume_admission_fixture(node.clone()).await;
+    let disks = crate::heal::local_disk_map_read()
+        .await
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    let saved = if seed_unread_intent {
+        let volume = format!("{}/{}/ahm-replacement", crate::heal::RUSTFS_META_BUCKET, crate::heal::BUCKET_META_PREFIX);
+        match fixture.disk.make_volume(&volume).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(error) => panic!("intent fixture volume: {error}"),
+        }
+        let path = format!(
+            "{}/ahm-replacement/{}_ahm_replacement_intent.json",
+            crate::heal::BUCKET_META_PREFIX,
+            Uuid::new_v4()
+        );
+        let bytes = b"must not be interpreted as absence or corruption while admission defers".to_vec();
+        fixture
+            .disk
+            .write_all(crate::heal::RUSTFS_META_BUCKET, &path, bytes.clone().into())
+            .await
+            .unwrap();
+        Some((path, bytes))
+    } else {
+        None
+    };
+    assert!(
+        !fixture
+            .disk
+            .read_all(crate::heal::RUSTFS_META_BUCKET, "format.json")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // get_disk_id uses wall-clock seconds, not Tokio's paused clock. No cache API
+    // or invalidation hook is introduced; age its existing coarse one-second TTL.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Discovery itself has a separate three-second lease: publish the explicit
+    // component capacity only after aging the wall-clock format cache.
+    for disk in disks {
+        let binding = disk.physical_admission().expect("existing local binding");
+        if let Some(physical) = &physical {
+            // These directory-backed aliases deliberately share one synthetic leaf.
+            binding.set_test_capacity(vec![physical.clone()]).unwrap();
+        } else {
+            assert!(binding.plan().is_none());
+        }
+    }
+    // Cache aging also expires the node sample. Refresh the same owner's ordinary
+    // three-second sample only after aging, just as physical discovery is refreshed.
+    if let Some(node) = &node {
+        let expected = node_limit.expect("attached node has a recorded constructor limit");
+        assert!(expected <= 1, "the fixture constructor has one bounded scheduling slot");
+        publish_resume_node(node, expected == 1);
+        assert_eq!(node.snapshot().limit, expected, "preserve the intended open/closed sample before startup");
+        let attached = fixture
+            .manager
+            .storage
+            .background_node_admission()
+            .expect("attached fixture node");
+        assert!(Arc::ptr_eq(node, &attached), "refresh the same manager-attached controller");
+    } else {
+        assert!(fixture.manager.storage.background_node_admission().is_none());
+    }
+    (fixture, saved)
+}
+
+#[cfg(not(windows))]
+async fn assert_auto_format_deferral(mode: &str) {
+    use crate::heal::storage_api::{
+        EcstoreLocalPublicationPause as LocalPublicationPause, EcstoreLocalPublicationStage as LocalPublicationStage,
+    };
+    let node = (mode != "none").then(|| resume_node(mode != "node-closed"));
+    let physical = (mode != "none" && mode != "missing-plan").then(|| {
+        rustfs_concurrency::adaptive::AdaptiveAdmission::new(std::num::NonZeroU16::MIN, u32::from(mode != "physical-closed"))
+    });
+    let (fixture, saved) = auto_format_fixture(node.clone(), physical.clone(), mode != "none").await;
+    let mut pause = LocalPublicationPause::install(
+        fixture.disk.as_ref(),
+        crate::heal::RUSTFS_META_BUCKET,
+        "format.json",
+        LocalPublicationStage::NativeReadOpen,
+    )
+    .expect("actual cold format syscall pause");
+    fixture.manager.start_auto_disk_scanner().await.unwrap();
+    let entered = tokio::time::timeout(Duration::from_millis(400), pause.entered()).await;
+    let correct = if mode == "none" {
+        entered.is_ok_and(|r| r.is_ok())
+    } else {
+        entered.is_err()
+    };
+    let no_candidate = fixture.manager.get_queue_length().await == 0;
+    let no_corruption = fixture.manager.replacement_recovery_blocks().is_empty();
+    drop(pause);
+    tokio::time::timeout(Duration::from_secs(5), fixture.manager.stop())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(correct, "format native admission boundary failed: {mode}");
+    if mode != "none" {
+        assert!(no_candidate, "unavailable metadata cannot start replacement");
+        assert!(no_corruption, "quota deferral cannot interpret an unread intent as corruption");
+        let (path, bytes) = saved.unwrap();
+        assert_eq!(
+            fixture
+                .disk
+                .read_all(crate::heal::RUSTFS_META_BUCKET, &path)
+                .await
+                .unwrap()
+                .as_ref(),
+            bytes.as_slice()
+        );
+        assert_eq!(node.as_ref().unwrap().snapshot().active, 0);
+        assert_eq!(node.as_ref().unwrap().completed(), Some(0));
+        if let Some(physical) = physical {
+            assert_eq!(physical.snapshot().active, 0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn auto_format_admission_none_keeps_cold_native_probe() {
+    assert_auto_format_deferral("none").await;
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn auto_format_admission_closed_node_defers_set_before_native() {
+    assert_auto_format_deferral("node-closed").await;
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn auto_format_admission_closed_physical_defers_set_before_native() {
+    assert_auto_format_deferral("physical-closed").await;
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn auto_format_admission_missing_plan_skips_later_same_set_inventory() {
+    assert_auto_format_deferral("missing-plan").await;
+}
+
+#[cfg(not(windows))]
+#[test]
+#[serial_test::serial(replacement_auto_scan)]
+fn auto_format_admission_funded_probe_finishes_before_stop_and_releases_owners() {
+    const FLAG: &str = "RUSTFS_AUTO_FORMAT_ADMISSION_CHILD";
+    const NAME: &str =
+        "heal::manager::tests::auto_scan::auto_format_admission_funded_probe_finishes_before_stop_and_releases_owners";
+    if std::env::var(FLAG).ok().as_deref() != Some("1") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+            .env(FLAG, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed; 0 ignored;"),
+            "child failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        println!("AUTO_FORMAT_ADMISSION_CHILD_OK");
+        return;
+    }
+    use crate::heal::storage_api::{
+        EcstoreBackgroundMemoryBudget as BackgroundMemoryBudget, EcstoreLocalPublicationPause as LocalPublicationPause,
+        EcstoreLocalPublicationStage as LocalPublicationStage,
+    };
+    let memory = BackgroundMemoryBudget::new();
+    assert!(memory.install());
+    let memory_owners = Arc::strong_count(&memory);
+    let node = resume_node(true);
+    let physical = rustfs_concurrency::adaptive::AdaptiveAdmission::new(std::num::NonZeroU16::MIN, 1);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let fixture = runtime.block_on(async {
+        let (fixture, saved) = auto_format_fixture(Some(node.clone()), Some(physical.clone()), true).await;
+        let mut pause = LocalPublicationPause::install(
+            fixture.disk.as_ref(),
+            crate::heal::RUSTFS_META_BUCKET,
+            "format.json",
+            LocalPublicationStage::NativeReadOpen,
+        )
+        .unwrap();
+        fixture.manager.start_auto_disk_scanner().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), pause.entered())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.snapshot().active, 1);
+        assert_eq!(physical.snapshot().active, 1);
+        assert!(Arc::strong_count(&memory) > memory_owners);
+        let mut stop = Box::pin(fixture.manager.stop());
+        let first = tokio::time::timeout(Duration::from_millis(30), stop.as_mut()).await;
+        let held = first.is_err();
+        let yielded = tokio::time::timeout(Duration::from_secs(2), async {
+            while node.snapshot().active != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let cancelled_ownership = (
+            node.snapshot().active,
+            physical.snapshot().active,
+            Arc::strong_count(&memory) > memory_owners,
+        );
+        drop(pause);
+        let result = match first {
+            Ok(result) => Ok(result),
+            Err(_) => tokio::time::timeout(Duration::from_secs(5), stop.as_mut()).await,
+        };
+        drop(stop);
+        assert!(held, "an admitted native format probe must finish before actual slot1 join");
+        result.unwrap().unwrap();
+        assert!(yielded, "stop cancellation must return node capacity while native format I/O is paused");
+        assert_eq!(cancelled_ownership, (0, 1, true));
+        assert_eq!(node.snapshot().active, 0);
+        assert_eq!(physical.snapshot().active, 0);
+        assert_eq!(node.completed(), Some(0));
+        assert!(
+            fixture.manager.replacement_recovery_blocks().is_empty(),
+            "stop must not begin a later intent phase"
+        );
+        let (path, bytes) = saved.unwrap();
+        assert_eq!(
+            fixture
+                .disk
+                .read_all(crate::heal::RUSTFS_META_BUCKET, &path)
+                .await
+                .unwrap()
+                .as_ref(),
+            bytes.as_slice()
+        );
+        fixture
+    });
+    drop(runtime); // Outside Tokio: ordinary native executor finalization.
+    assert_eq!(physical.snapshot().active, 0);
+    assert_eq!(Arc::strong_count(&memory), memory_owners);
     drop(fixture);
 }

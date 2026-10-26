@@ -1701,6 +1701,7 @@ impl ErasureSetHealer {
                 let admin_identity = self.admin_identity(bucket, &object_name, version_id.as_deref(), incarnation);
                 let admin_task_id = self.admin_task.as_ref().map(|task| task.id.clone());
                 let execution = self.replacement_execution.clone();
+                let replacement_object = execution.is_some();
                 let work_parent = execution.as_ref().and(self.work_parent.as_ref()).cloned();
                 let failure_identity = execution
                     .as_ref()
@@ -1729,10 +1730,22 @@ impl ErasureSetHealer {
                     let result = if cancel_token.is_cancelled() {
                         (0, Err(Error::TaskCancelled))
                     } else {
-                        match storage
-                            .heal_object(&bucket_name, &object_name, version_id.as_deref(), &heal_opts)
-                            .await
-                        {
+                        let result = if replacement_object {
+                            storage
+                                .heal_object_with_task_cancel(
+                                    &bucket_name,
+                                    &object_name,
+                                    version_id.as_deref(),
+                                    &heal_opts,
+                                    &cancel_token,
+                                )
+                                .await
+                        } else {
+                            storage
+                                .heal_object(&bucket_name, &object_name, version_id.as_deref(), &heal_opts)
+                                .await
+                        };
+                        match result {
                             Ok((result, None)) if target_outcomes_complete(&result, &target_endpoints) => {
                                 let object_size = result_object_size_u64(&result);
                                 if !replacement_commit_evidence_required {

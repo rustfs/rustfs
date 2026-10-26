@@ -7153,6 +7153,8 @@ impl LocalDisk {
             let _mount_lease = mount_lease;
             #[cfg(test)]
             run_format_probe_hook(&path, false);
+            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+            os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::NativeReadOpen, &path);
             std::fs::metadata(path)
         })
         .await
@@ -7170,6 +7172,8 @@ impl LocalDisk {
             let _mount_lease = mount_lease;
             #[cfg(test)]
             run_format_probe_hook(&path, true);
+            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+            os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::NativeReadOpen, &path);
             std::fs::read(path)
         })
         .await

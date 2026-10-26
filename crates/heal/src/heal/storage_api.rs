@@ -25,12 +25,15 @@ pub(crate) use rustfs_ecstore::api::disk::{
     DiskStore as EcstoreDiskStore, HEALING_MARKER_PATH as ECSTORE_HEALING_MARKER_PATH,
     RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET, ReplacementExecutionLease as EcstoreReplacementExecutionLease,
 };
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 pub(crate) use rustfs_ecstore::api::disk::{
-    BackgroundMemoryBudget as EcstoreBackgroundMemoryBudget, LocalPublicationPause as EcstoreLocalPublicationPause,
-    LocalPublicationStage as EcstoreLocalPublicationStage,
+    BackgroundEncodeBuffer as EcstoreBackgroundEncodeBuffer, BackgroundMemoryBudget as EcstoreBackgroundMemoryBudget,
 };
 pub(crate) use rustfs_ecstore::api::disk::{DiskOption as EcstoreDiskOption, new_disk as ecstore_new_disk};
+#[cfg(all(test, not(windows)))]
+pub(crate) use rustfs_ecstore::api::disk::{
+    LocalPublicationPause as EcstoreLocalPublicationPause, LocalPublicationStage as EcstoreLocalPublicationStage,
+};
 pub(crate) use rustfs_ecstore::api::error::{Error as EcstoreErrorType, StorageError as EcstoreStorageError};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::layout::{
