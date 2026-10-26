@@ -458,7 +458,9 @@ async fn scanner_tick_blocks_only_the_conflicting_generation_of_a_set() {
 #[tokio::test]
 #[serial_test::serial(replacement_auto_scan)]
 async fn owned_auto_scan_waits_for_actual_native_intent_read() {
-    use rustfs_ecstore::api::disk::{LocalPublicationPause, LocalPublicationStage};
+    use crate::heal::storage_api::{
+        EcstoreLocalPublicationPause as LocalPublicationPause, EcstoreLocalPublicationStage as LocalPublicationStage,
+    };
 
     let fixture = ScannerFixture::new(false).await;
     let path = format!(
@@ -519,7 +521,9 @@ async fn owned_auto_scan_waits_for_actual_native_intent_read() {
 #[serial_test::serial(replacement_auto_scan)]
 fn owned_resume_gc_cancels_async_loop_before_native_open_tail() {
     use crate::heal::resume::ResumeState;
-    use rustfs_ecstore::api::disk::{LocalPublicationPause, LocalPublicationStage};
+    use crate::heal::storage_api::{
+        EcstoreLocalPublicationPause as LocalPublicationPause, EcstoreLocalPublicationStage as LocalPublicationStage,
+    };
 
     // This fixture owns its original executor, and drops it outside Tokio.
     // Its receipt is local to this runtime, not the service's other native pools.
@@ -598,5 +602,251 @@ fn owned_resume_gc_cancels_async_loop_before_native_open_tail() {
         original,
         "read-only cancellation preserves state"
     );
+    drop(fixture);
+}
+
+#[cfg(not(windows))]
+struct ResumeAdmissionFixture {
+    _root: TempDir,
+    _store: rustfs_test_utils::TestECStoreEnv,
+    manager: HealManager,
+    disk: DiskStore,
+    path: String,
+}
+
+#[cfg(not(windows))]
+fn resume_node(open: bool) -> Arc<rustfs_concurrency::adaptive::NodeAdmission> {
+    use rustfs_concurrency::adaptive::{FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure};
+    let node = NodeAdmission::new(std::num::NonZeroU16::MIN);
+    node.update(
+        &mut FeedbackController::new(),
+        open.then_some(FeedbackObservation {
+            generation: 1,
+            max_concurrency: 1,
+            pressure: ResourcePressure::Unknown,
+            completed_units: None,
+        }),
+    );
+    node
+}
+
+#[cfg(not(windows))]
+async fn resume_admission_fixture(node: Option<Arc<rustfs_concurrency::adaptive::NodeAdmission>>) -> ResumeAdmissionFixture {
+    use crate::heal::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET, resume::ResumeState, storage::ECStoreHealStorage};
+    let root = TempDir::new().expect("owned resume admission store");
+    let store = rustfs_test_utils::TestECStoreEnv::builder()
+        .base_dir(root.path())
+        .build()
+        .await;
+    let disk = crate::heal::local_disk_map_read()
+        .await
+        .values()
+        .flatten()
+        .next()
+        .cloned()
+        .expect("real local disk");
+    match disk.make_volume(&format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}")).await {
+        Ok(()) | Err(DiskError::VolumeExists) => {}
+        Err(error) => panic!("ordinary resume volume: {error}"),
+    }
+    let id = Uuid::new_v4().to_string();
+    let state = ResumeState::new(id.clone(), SET.into(), "disk".into(), vec![]);
+    let path = format!("{BUCKET_META_PREFIX}/{id}_ahm_resume_state.json");
+    let bytes = serde_json::to_vec(&state).expect("real nonempty resume state");
+    assert!(!bytes.is_empty());
+    disk.write_all(RUSTFS_META_BUCKET, &path, bytes.into())
+        .await
+        .expect("seed actual inspector input");
+    let storage = Arc::new(ECStoreHealStorage::new(store.ecstore.clone()).with_admission(node.clone()));
+    match (node.as_ref(), storage.background_node_admission()) {
+        (Some(expected), Some(actual)) => {
+            assert!(Arc::ptr_eq(expected, &actual), "getter must return the factory-attached instance")
+        }
+        (None, None) => {}
+        _ => panic!("storage capability changed"),
+    }
+    let manager = HealManager::new_without_root_recovery_for_test(
+        storage,
+        Some(HealConfig {
+            enable_auto_heal: false,
+            ..Default::default()
+        }),
+    );
+    ResumeAdmissionFixture {
+        _root: root,
+        _store: store,
+        manager,
+        disk,
+        path,
+    }
+}
+
+#[cfg(not(windows))]
+async fn assert_resume_admission(mode: &str) {
+    use crate::heal::storage_api::{
+        EcstoreLocalPublicationPause as LocalPublicationPause, EcstoreLocalPublicationStage as LocalPublicationStage,
+    };
+    let node = (mode != "none").then(|| resume_node(mode != "node-closed"));
+    let fixture = resume_admission_fixture(node.clone()).await;
+    let binding = fixture.disk.physical_admission().expect("existing public local binding");
+    let physical =
+        rustfs_concurrency::adaptive::AdaptiveAdmission::new(std::num::NonZeroU16::MIN, u32::from(mode != "physical-closed"));
+    if mode != "missing-plan" && mode != "none" {
+        binding
+            .set_test_capacity(vec![physical.clone()])
+            .expect("explicit synthetic physical capacity");
+    } else {
+        assert!(binding.plan().is_none(), "this fixture must not fabricate discovery");
+    }
+    let mut pause = LocalPublicationPause::install(
+        fixture.disk.as_ref(),
+        crate::heal::RUSTFS_META_BUCKET,
+        &fixture.path,
+        LocalPublicationStage::NativeReadOpen,
+    )
+    .expect("actual nonempty native-open witness");
+    fixture
+        .manager
+        .start_resume_gc()
+        .await
+        .expect("actual production slot-2 producer");
+    let entered = tokio::time::timeout(Duration::from_millis(400), pause.entered()).await;
+    if mode == "none" {
+        assert!(entered.is_ok_and(|r| r.is_ok()), "None preserves the original native path");
+    } else {
+        assert!(entered.is_err(), "enabled admission must defer before native entry: {mode}");
+        assert_eq!(node.as_ref().unwrap().snapshot().active, 0);
+        assert_eq!(physical.snapshot().active, 0);
+    }
+    drop(pause);
+    tokio::time::timeout(Duration::from_secs(5), fixture.manager.stop())
+        .await
+        .expect("real producer shutdown deadline")
+        .expect("real producer joined");
+    if let Some(node) = node {
+        assert_eq!(node.snapshot().active, 0);
+        assert_eq!(node.completed(), Some(0), "read-only inspection cannot invent repair progress");
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn resume_admission_none_keeps_real_native_path() {
+    assert_resume_admission("none").await;
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn resume_admission_closed_node_defers_before_native() {
+    assert_resume_admission("node-closed").await;
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn resume_admission_closed_physical_defers_before_native() {
+    assert_resume_admission("physical-closed").await;
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn resume_admission_missing_plan_defers_before_native() {
+    assert_resume_admission("missing-plan").await;
+}
+
+#[cfg(not(windows))]
+#[test]
+#[serial_test::serial(replacement_auto_scan)]
+fn resume_admission_cancel_returns_node_but_native_keeps_physical_and_memory() {
+    const CHILD: &str = "RUSTFS_RESUME_ADMISSION_NATIVE_CHILD";
+    const NAME: &str =
+        "heal::manager::tests::auto_scan::resume_admission_cancel_returns_node_but_native_keeps_physical_and_memory";
+    if std::env::var(CHILD).ok().as_deref() != Some("1") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .expect("fresh policy-owning test process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed; 0 ignored;"),
+            "child failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        println!("RESUME_ADMISSION_NATIVE_CHILD_OK");
+        return;
+    }
+    use crate::heal::storage_api::{
+        EcstoreBackgroundMemoryBudget as BackgroundMemoryBudget, EcstoreLocalPublicationPause as LocalPublicationPause,
+        EcstoreLocalPublicationStage as LocalPublicationStage,
+    };
+    let memory = BackgroundMemoryBudget::new();
+    assert!(memory.install(), "fresh child owns installed policy");
+    let baseline_memory_owners = Arc::strong_count(&memory);
+    let node = resume_node(true);
+    let physical = rustfs_concurrency::adaptive::AdaptiveAdmission::new(std::num::NonZeroU16::MIN, 1);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (fixture, pause) = runtime.block_on(async {
+        let fixture = resume_admission_fixture(Some(node.clone())).await;
+        fixture
+            .disk
+            .physical_admission()
+            .unwrap()
+            .set_test_capacity(vec![physical.clone()])
+            .expect("explicit native physical capacity");
+        let mut pause = LocalPublicationPause::install(
+            fixture.disk.as_ref(),
+            crate::heal::RUSTFS_META_BUCKET,
+            &fixture.path,
+            LocalPublicationStage::NativeReadOpen,
+        )
+        .unwrap();
+        fixture.manager.start_resume_gc().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), pause.entered())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.snapshot().active, 1);
+        assert_eq!(physical.snapshot().active, 1);
+        tokio::time::timeout(Duration::from_secs(5), fixture.manager.stop())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.snapshot().active, 0, "cancelled async work returns node capacity");
+        assert_eq!(physical.snapshot().active, 1, "accepted native work retains selected physical ownership");
+        assert!(
+            Arc::strong_count(&memory) > baseline_memory_owners,
+            "native unit retains its real memory capability"
+        );
+        (fixture, pause)
+    });
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let finish = std::thread::spawn(move || {
+        drop(runtime);
+        finished_tx.send(()).unwrap();
+    });
+    let held = matches!(
+        finished_rx.recv_timeout(Duration::from_millis(30)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
+    drop(pause);
+    if held {
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("original executor completed");
+    }
+    finish.join().unwrap();
+    assert!(held, "ordinary executor Drop waits for its accepted native open");
+    assert_eq!(physical.snapshot().active, 0);
+    assert_eq!(node.snapshot().active, 0);
+    assert_eq!(node.completed(), Some(0));
+    assert_eq!(Arc::strong_count(&memory), baseline_memory_owners);
     drop(fixture);
 }

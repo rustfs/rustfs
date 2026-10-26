@@ -1027,6 +1027,16 @@ impl HealTask {
     #[tracing::instrument(skip(self), fields(task_id = %self.id, heal_type = ?self.heal_type))]
     #[hotpath::measure]
     pub async fn execute(&self) -> Result<()> {
+        self.execute_with_owner(None).await
+    }
+
+    #[tracing::instrument(name = "execute", skip(self, parent), fields(task_id = %self.id, heal_type = ?self.heal_type))]
+    #[hotpath::measure]
+    pub(super) async fn execute_owned(&self, parent: Option<super::manager::HealWork>) -> Result<()> {
+        self.execute_with_owner(parent).await
+    }
+
+    async fn execute_with_owner(&self, parent: Option<super::manager::HealWork>) -> Result<()> {
         if self.source == HealRequestSource::AutoHeal
             && !self.heal_endpoints.is_empty()
             && matches!(self.heal_type, HealType::ErasureSet { .. })
@@ -1035,14 +1045,17 @@ impl HealTask {
             // blocking write. Keep the entire executor, including its leases,
             // alive until that write and failure persistence have finished.
             let task = self.clone();
-            return tokio::spawn(async move { task.execute_inner().await })
-                .await
-                .map_err(|error| Error::other(format!("replacement executor failed: {error}")))?;
+            return super::manager::spawn_heal_work(
+                parent.as_ref(),
+                move |parent| async move { task.execute_inner(parent).await },
+            )
+            .await
+            .map_err(|error| Error::other(format!("replacement executor failed: {error}")))?;
         }
-        self.execute_inner().await
+        self.execute_inner(parent).await
     }
 
-    async fn execute_inner(&self) -> Result<()> {
+    async fn execute_inner(&self, parent: Option<super::manager::HealWork>) -> Result<()> {
         self.outcome.write().await.start();
         // update status and timestamps atomically to avoid race conditions
         let now = SystemTime::now();
@@ -1111,7 +1124,8 @@ impl HealTask {
                     purge,
                 } => self.heal_delete_marker_purge(bucket, object, version_id, purge).await,
                 HealType::ErasureSet { buckets, set_disk_id } => {
-                    self.heal_erasure_set(buckets.clone(), set_disk_id.clone()).await
+                    self.heal_erasure_set_owned(buckets.clone(), set_disk_id.clone(), parent.as_ref())
+                        .await
                 }
             }
         }

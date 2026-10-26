@@ -426,6 +426,11 @@ pub struct HealListItem {
 /// Heal storage layer interface
 #[async_trait]
 pub trait HealStorageAPI: Send + Sync {
+    /// Existing process scheduling capability; snapshots alone do not admit I/O.
+    fn background_node_admission(&self) -> Option<Arc<NodeAdmission>> {
+        None
+    }
+
     /// Delete one exact marker from every member of its original erasure set.
     async fn purge_delete_marker(
         &self,
@@ -1022,6 +1027,10 @@ fn is_transient_object_exists_error(err: &StorageError) -> bool {
 
 #[async_trait]
 impl HealStorageAPI for ECStoreHealStorage {
+    fn background_node_admission(&self) -> Option<Arc<NodeAdmission>> {
+        self.admission.clone()
+    }
+
     async fn purge_delete_marker(
         &self,
         bucket: &str,

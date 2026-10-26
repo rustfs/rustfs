@@ -3132,7 +3132,9 @@ async fn root_recovery_conflicting_record_does_not_block_other_replays() {
 #[cfg(not(windows))]
 #[tokio::test]
 async fn owned_terminal_gc_waits_for_actual_native_receipt_read() {
-    use rustfs_ecstore::api::disk::{LocalPublicationPause, LocalPublicationStage};
+    use crate::heal::storage_api::{
+        EcstoreLocalPublicationPause as LocalPublicationPause, EcstoreLocalPublicationStage as LocalPublicationStage,
+    };
 
     let (_temp, disk) = recovery_disk().await;
     let manager = recovery_manager(vec![disk.clone()]);

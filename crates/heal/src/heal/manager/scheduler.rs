@@ -264,7 +264,7 @@ impl HealManager {
                         state = "task_started",
                         "Heal scheduler task started"
                     );
-                    let result = task.execute().await;
+                    let result = task.execute_owned(parent.clone()).await;
                     let retry_request = retry_request_for_result_with_budget(task.as_ref(), &result).await;
                     record_task_disposition(&disposition_cache_clone, task.as_ref(), &result, retry_request.is_some()).await;
                     match &result {
