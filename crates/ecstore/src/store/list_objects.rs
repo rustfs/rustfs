@@ -6066,7 +6066,14 @@ mod test {
             }
             for mode in ["optimal", "strict"] {
                 let (result, names) = collect_native_listing(&set, bucket, mode).await;
-                if online >= 8 {
+                if online == 16 && mode == "optimal" {
+                    // `optimal` asks a random half of the drives and needs four of
+                    // the nine copies in that sample, as MinIO's optimal mode does;
+                    // about one sample in six holds fewer, so the key may be
+                    // omitted. It must still never fail the page.
+                    result.expect("a sampled listing must not fail the page");
+                    assert!(names.is_empty() || names == ["readable.bin"], "online {online}, mode {mode}: {names:?}");
+                } else if online >= 8 {
                     result.expect("EC8 committed metadata must remain listable");
                     assert_eq!(names, ["readable.bin"], "online {online}, mode {mode}");
                 } else {
