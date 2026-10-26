@@ -29,6 +29,10 @@
 //! 3. Starting with the default `rustfsadmin` credentials emits the
 //!    default-credentials startup warning (observable operator signal).
 
+// Keep inventory acceptance in the admin-auth PR smoke selection.
+#[cfg(test)]
+mod target_inventory_test;
+
 #[cfg(test)]
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging, rustfs_binary_path};

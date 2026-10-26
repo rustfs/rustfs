@@ -25,6 +25,7 @@ workspace = true
 
 [features]
 default = []
+scanner-peer-mixed-version = []
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",
@@ -146,6 +147,7 @@ zip.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 
 [dev-dependencies]
+same-file.workspace = true
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["test-util"] }
 rustfs-heal.workspace = true
 tempfile.workspace = true

@@ -77,6 +77,249 @@ impl PeerBucketRun {
         Self::start_inner(label, true, true).await
     }
 
+    #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+    pub async fn replace_followers_with_old_binary(&mut self, old_binary: &Path, expected_old_sha256: &str) -> TestResult<Value> {
+        if expected_old_sha256.len() != 64 || !expected_old_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("mixed-version fixture requires the qualified old executable digest".into());
+        }
+        let old_binary = old_binary.canonicalize()?;
+        let (_, old_sha256) = mixed_executable_hash(&old_binary)?;
+        if old_sha256 != expected_old_sha256 {
+            return Err("old executable differs from the qualified mixed-version artifact".into());
+        }
+        let current = self.executable_identity()?;
+        let new_binary = PathBuf::from(current["path"].as_str().ok_or("current executable omitted its path")?);
+        let new_sha256 = current["sha256"].as_str().ok_or("current executable omitted its digest")?;
+        if old_sha256 == new_sha256 {
+            return Err("mixed-version fixture requires distinct old and new executables".into());
+        }
+        self.quiet_baseline().await?;
+        let leader = self.leader().await?;
+        let retained = self.dirty_snapshot(leader).await?;
+        let mut initial_processes = Vec::new();
+        for node in 0..4 {
+            initial_processes.push(self.process_executable_identity(node, &new_binary, new_sha256)?);
+        }
+        let drives_before = (0..4).map(|node| self.drive_identity(node)).collect::<TestResult<Vec<_>>>()?;
+        let mut replacements = Vec::new();
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        use std::os::unix::fs::MetadataExt as _;
+        for node in (0..4).filter(|node| *node != leader) {
+            let log_path = PathBuf::from(
+                self.dist.cluster.node_capture_log_paths[node]
+                    .as_deref()
+                    .ok_or("mixed-version node log is absent")?,
+            );
+            let previous_peer = self.dirty_snapshot(node).await?;
+            let log_before = std::fs::symlink_metadata(&log_path)?;
+            if !log_before.is_file() || log_before.file_type().is_symlink() {
+                return Err("mixed-version node log is not a regular captured file".into());
+            }
+            let log_offset = log_before.len();
+            self.dist.cluster.stop_node_gracefully(node).await?;
+            self.dist.cluster.start_node_from_binary(node, &old_binary).await?;
+            let process = self.process_executable_identity(node, &old_binary, expected_old_sha256)?;
+            if self.leader().await? != leader
+                || u64::from(self.pid(leader)?) != retained["pid"].as_u64().ok_or("leader omitted PID")?
+            {
+                return Err("mixed-version replacement lost the retained new coordinator".into());
+            }
+            let current_leader = self.dirty_snapshot(leader).await?;
+            if current_leader["owner_id"] != retained["owner_id"] || current_leader["instance_id"] != retained["instance_id"] {
+                return Err("mixed-version replacement changed the retained coordinator instance".into());
+            }
+            let expected_drives = std::mem::take(&mut self.drive_sets);
+            self.verify_topology().await?;
+            if self.drive_sets != expected_drives || self.drive_identity(node)? != drives_before[node] {
+                return Err("mixed-version replacement changed drive placement or format identity".into());
+            }
+            let mut log = std::fs::File::open(&log_path)?;
+            let log_after = log.metadata()?;
+            if log_after.dev() != log_before.dev() || log_after.ino() != log_before.ino() || log_after.len() < log_offset {
+                return Err("mixed-version node log was replaced or shortened".into());
+            }
+            log.seek(SeekFrom::Start(log_offset))?;
+            let mut startup = Vec::new();
+            log.by_ref().take(OBSERVATION_BYTES_LIMIT).read_to_end(&mut startup)?;
+            let current_log = std::fs::symlink_metadata(&log_path)?;
+            if !current_log.is_file()
+                || current_log.file_type().is_symlink()
+                || current_log.dev() != log_before.dev()
+                || current_log.ino() != log_before.ino()
+                || current_log.len() < log_offset
+            {
+                return Err("mixed-version node log changed during startup prefix inspection".into());
+            }
+            let last_line = startup
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .ok_or("replacement startup prefix has no complete log line")?;
+            startup.truncate(last_line + 1);
+            let startup_log = self.artifacts.join(format!("mixed-node-{node}-startup.jsonl"));
+            std::fs::write(&startup_log, &startup)?;
+            if assert_process_durability_strict(&[startup_log])? != 1 {
+                return Err("replacement process did not report strict durability in its bounded startup prefix".into());
+            }
+            let replacement_peer = self.mixed_replacement_snapshot(node, &previous_peer, &process).await?;
+            replacements.push(
+                json!({"node": node, "process": process, "previous_peer": previous_peer, "peer": replacement_peer,
+                "retained_leader": current_leader, "startup_log": {"path": log_path, "dev": log_before.dev(),
+                    "inode": log_before.ino(), "offset": log_offset, "prefix_bytes": startup.len(),
+                    "prefix_sha256": sha256_hex(&startup), "prefix_limit": OBSERVATION_BYTES_LIMIT}}),
+            );
+        }
+        self.quiet_baseline().await?;
+        let processes = self.mixed_process_identities(leader, &old_binary, expected_old_sha256)?;
+        if processes[leader] != initial_processes[leader]
+            || replacements.iter().any(|replacement| {
+                replacement["node"]
+                    .as_u64()
+                    .and_then(|node| usize::try_from(node).ok())
+                    .is_none_or(|node| processes.get(node) != Some(&replacement["process"]))
+            })
+        {
+            return Err("mixed-version setup replaced a previously measured process".into());
+        }
+        let mut peers = Vec::new();
+        for node in 0..4 {
+            peers.push(self.dirty_snapshot(node).await?);
+        }
+        let drives_after = (0..4).map(|node| self.drive_identity(node)).collect::<TestResult<Vec<_>>>()?;
+        if drives_before != drives_after {
+            return Err("mixed-version setup changed a retained drive identity".into());
+        }
+        let fleet = json!({"leader": leader, "leader_pid": self.pid(leader)?, "retained": retained,
+            "old_sha256": expected_old_sha256, "new_executable": current, "old_binary": old_binary,
+            "initial_processes": initial_processes, "processes": processes, "peers": peers,
+            "replacements": replacements, "drives_before": drives_before, "drives_after": drives_after});
+        self.assert_mixed_roles(&fleet).await?;
+        self.write_evidence("mixed-version-fleet", &fleet)?;
+        Ok(fleet)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+    async fn mixed_replacement_snapshot(&self, node: usize, previous: &Value, process: &Value) -> TestResult<Value> {
+        let mut attempts = 1;
+        let snapshot = match self.dirty_snapshot(node).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error.as_ref());
+                let mut epoch_changed = false;
+                for _ in 0..8 {
+                    let Some(current) = cause else { break };
+                    if let Some(status) = current.downcast_ref::<tonic::Status>() {
+                        epoch_changed = status.code() == tonic::Code::Unavailable && status.message() == "RPC boot epoch changed";
+                        break;
+                    }
+                    cause = current.source();
+                }
+                if !epoch_changed {
+                    return Err(error);
+                }
+                self.write_evidence(
+                    &format!("mixed-node-{node}-rpc-rejection"),
+                    &json!({"node": node, "pid": self.pid(node)?, "attempt": 1,
+                        "code": "Unavailable", "message": "RPC boot epoch changed"}),
+                )?;
+                // The authenticated rejection refreshes this peer's boot proof;
+                // one new read must then validate normally on the replacement.
+                attempts = 2;
+                self.dirty_snapshot(node).await?
+            }
+        };
+        if snapshot["pid"] != process["pid"]
+            || snapshot["pid"] == previous["pid"]
+            || snapshot["owner_id"] != previous["owner_id"]
+            || snapshot["instance_id"] == previous["instance_id"]
+            || snapshot["host"] != previous["host"]
+        {
+            return Err("mixed-version replacement did not bind a new process on the unchanged owner and endpoint".into());
+        }
+        self.write_evidence(
+            &format!("mixed-node-{node}-rpc-handshake"),
+            &json!({"attempts": attempts, "previous": previous,
+            "process": process, "snapshot": snapshot}),
+        )?;
+        Ok(snapshot)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+    pub fn mixed_process_identities(&mut self, leader: usize, old_binary: &Path, old_sha256: &str) -> TestResult<Vec<Value>> {
+        let current = self.executable_identity()?;
+        let new_binary = PathBuf::from(current["path"].as_str().ok_or("current executable omitted its path")?);
+        let new_sha256 = current["sha256"].as_str().ok_or("current executable omitted its digest")?;
+        let mut processes = Vec::new();
+        for node in 0..4 {
+            let (path, digest) = if node == leader {
+                (new_binary.as_path(), new_sha256)
+            } else {
+                (old_binary, old_sha256)
+            };
+            processes.push(self.process_executable_identity(node, path, digest)?);
+        }
+        Ok(processes)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+    pub async fn assert_mixed_roles(&self, fleet: &Value) -> TestResult<Value> {
+        let leader = usize::try_from(fleet["leader"].as_u64().ok_or("mixed fleet omitted coordinator")?)?;
+        if self.leader().await? != leader || fleet["leader_pid"].as_u64() != Some(u64::from(self.pid(leader)?)) {
+            return Err("mixed-version window lost the actual new coordinator".into());
+        }
+        let processes = fleet["processes"]
+            .as_array()
+            .filter(|entries| entries.len() == 4)
+            .ok_or("mixed fleet omitted four processes")?;
+        let peers = fleet["peers"]
+            .as_array()
+            .filter(|entries| entries.len() == 4)
+            .ok_or("mixed fleet omitted four peer identities")?;
+        let mut snapshots = Vec::new();
+        for node in 0..4 {
+            let pid = self.pid(node)?;
+            if processes[node]["pid"].as_u64() != Some(u64::from(pid))
+                || processes[node]["start_time_ticks"].as_u64() != Some(proc_start_time(pid)?)
+            {
+                return Err("mixed-version window replaced a measured process".into());
+            }
+            let peer = self.dirty_snapshot(node).await?;
+            if peer["owner_id"] != peers[node]["owner_id"] || peer["instance_id"] != peers[node]["instance_id"] {
+                return Err("mixed-version window changed an authenticated peer identity".into());
+            }
+            snapshots.push(peer);
+        }
+        if snapshots[leader]["instance_id"] != fleet["retained"]["instance_id"]
+            || snapshots[leader]["owner_id"] != fleet["retained"]["owner_id"]
+        {
+            return Err("mixed-version setup did not retain the original new coordinator".into());
+        }
+        Ok(json!({"leader": leader, "leader_pid": self.pid(leader)?, "peers": snapshots}))
+    }
+
+    #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+    fn process_executable_identity(&mut self, node: usize, expected_path: &Path, expected_sha256: &str) -> TestResult<Value> {
+        let child = self.dist.cluster.nodes[node]
+            .process
+            .as_mut()
+            .ok_or("mixed-version child is absent")?;
+        if child.try_wait()?.is_some() {
+            return Err("mixed-version child exited before executable inspection".into());
+        }
+        let pid = child.id();
+        let start_time = proc_start_time(pid)?;
+        let executable = PathBuf::from(format!("/proc/{pid}/exe"));
+        let path = std::fs::read_link(&executable)?;
+        if path != expected_path.canonicalize()? {
+            return Err(format!("process {pid} does not execute its expected mixed-version binary").into());
+        }
+        let (size, digest) = mixed_executable_hash(&executable)?;
+        if digest != expected_sha256 || proc_start_time(pid)? != start_time || child.try_wait()?.is_some() {
+            return Err(format!("process {pid} changed or failed its actual executable digest").into());
+        }
+        Ok(json!({"node": node, "pid": pid, "start_time_ticks": start_time, "path": path,
+            "size": size, "sha256": digest, "expected_sha256": expected_sha256}))
+    }
+
     async fn start_inner(label: &str, proxy_acks: bool, read_peer_snapshots: bool) -> TestResult<Self> {
         crate::common::rustfs_binary_path_with_features(Some("e2e-test-hooks"));
         let nonce = Uuid::new_v4().simple().to_string();
@@ -777,6 +1020,52 @@ impl PeerBucketRun {
         std::fs::write(self.artifacts.join(format!("{name}.json")), serde_json::to_vec_pretty(evidence)?)?;
         Ok(())
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+fn mixed_executable_hash(path: &Path) -> TestResult<(u64, String)> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let before = file.metadata()?;
+    if !before.is_file() || before.len() == 0 {
+        return Err("mixed-version executable is not a nonempty regular file".into());
+    }
+    let mut digest = Sha256::new();
+    let mut count = 0_u64;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        count = count.checked_add(u64::try_from(read)?).ok_or("executable size overflow")?;
+        digest.update(&buffer[..read]);
+    }
+    if count != before.len() || file.metadata()?.len() != before.len() {
+        return Err("mixed-version executable changed while being hashed".into());
+    }
+    Ok((count, hex_simd::encode_to_string(digest.finalize(), hex_simd::AsciiCase::Lower)))
+}
+
+#[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+fn proc_start_time(pid: u32) -> TestResult<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let (prefix, _) = stat.split_once('(').ok_or("process stat omitted its command")?;
+    if prefix.trim().parse::<u32>()? != pid {
+        return Err("process stat returned another PID".into());
+    }
+    let (_, tail) = stat.rsplit_once(')').ok_or("process stat has an unterminated command")?;
+    let fields = tail.split_ascii_whitespace().collect::<Vec<_>>();
+    if matches!(fields.first().copied(), None | Some("Z" | "X" | "x")) {
+        return Err("measured process is not live".into());
+    }
+    fields
+        .get(19)
+        .ok_or("process stat omitted start time")?
+        .parse::<u64>()
+        .map_err(Into::into)
 }
 
 fn read_bounded_file(path: &Path) -> TestResult<Vec<u8>> {

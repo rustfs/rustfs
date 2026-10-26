@@ -11,6 +11,7 @@ pub(crate) mod endpoint_index {
     pub(crate) use rustfs_ecstore::api::layout::EndpointServerPools;
     pub(crate) use rustfs_ecstore::api::layout::Endpoints;
     pub(crate) use rustfs_ecstore::api::layout::PoolEndpoints;
+    pub(crate) use rustfs_ecstore::api::runtime::local_disk_map_read;
     pub(crate) use rustfs_ecstore::api::storage::ECStore;
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
 }

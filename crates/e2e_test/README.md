@@ -64,6 +64,21 @@ Each build/run holds an exclusive `rustfs.e2e.lock` marker beside the binary; co
 
 The protocols suite has its own fixed-port and single-worker contract in [`src/protocols/README.md`](src/protocols/README.md). Use its command under [Troubleshooting](#troubleshooting).
 
+### Scanner mixed-version gate
+
+The Linux N/O scanner gate needs a separately qualified `33482bb` server, which supports scoped ACKs. Set `RUSTFS_SCANNER_COMPAT_OLD_BINARY` to that executable and `RUSTFS_SCANNER_COMPAT_OLD_SHA256` to its independently verified digest. The release binary used by ordinary upgrade CI is a different baseline. Missing or mismatched inputs fail the test.
+
+Enable the harness-only `scanner-peer-mixed-version` feature explicitly; keep the server wrapper features identical between build and run:
+
+```bash
+python3 scripts/e2e_binary.py build --features e2e-test-hooks
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- \
+  cargo nextest run --profile e2e-distributed -p e2e_test \
+  --features scanner-peer-mixed-version --ignore-default-filter \
+  -E 'test(=distributed::scanner_peer_bucket_test::scanner_peer_bucket_new_coordinator_certifies_old_peers_and_scopes_next_cycle)' \
+  --test-threads 1 --retries 0 --no-tests=fail
+```
+
 ### `#[ignore]` semantics
 
 Ignored tests are excluded from the default `cargo nextest run` pass because

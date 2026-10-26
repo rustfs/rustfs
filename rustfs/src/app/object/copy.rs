@@ -15,7 +15,9 @@
 //! CopyObject path.
 
 use super::*;
+use futures::FutureExt;
 use rustfs_utils::path::fold_object_name_path_separators;
+use tracing::Instrument;
 
 use crate::auth::{VerifiedPresignedRequest, reject_presigned_put_max_content_length_for_other_operation};
 use crate::error::ServerSideSourceReadError;
@@ -168,12 +170,21 @@ impl DefaultObjectUsecase {
     pub fn execute_copy_object(
         &self,
         req: S3Request<CopyObjectInput>,
-    ) -> impl std::future::Future<Output = S3Result<S3Response<CopyObjectOutput>>> + Send + '_ {
-        Box::pin(self.execute_copy_object_inner(req))
+    ) -> impl std::future::Future<Output = S3Result<S3Response<CopyObjectOutput>>> + Send + Unpin + '_ {
+        let body = self.execute_copy_object_body_boxed(req);
+        futures::future::lazy(move |_| body.instrument(tracing::debug_span!("execute_copy_object"))).flatten()
     }
 
-    #[instrument(name = "execute_copy_object", level = "debug", skip(self, req))]
-    async fn execute_copy_object_inner(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+    // Construct the large business future outside its caller's polling frame.
+    #[inline(never)]
+    fn execute_copy_object_body_boxed(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> impl std::future::Future<Output = S3Result<S3Response<CopyObjectOutput>>> + Send + Unpin + '_ {
+        Box::pin(self.execute_copy_object_body(req))
+    }
+
+    async fn execute_copy_object_body(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         reject_presigned_put_max_content_length_for_other_operation(
             &req.headers,
             req.uri.query(),

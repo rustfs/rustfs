@@ -104,7 +104,12 @@ async fn verified_get(
         stage = "response body";
         let mut digest = Sha256::new();
         while let Some(chunk) = output.body.next().await {
-            let chunk = chunk?;
+            let chunk = chunk.inspect_err(|error| {
+                eprintln!(
+                    "TLS acceptance: GET body failed: node={node}, key={}, range={:?}, concurrent={concurrent}, received={received}/{}, elapsed={:?}, error={error}",
+                    object.key, expected.range, expected.length, started.elapsed()
+                );
+            })?;
             received += u64::try_from(chunk.len())?;
             assert!(received <= expected.length, "node {node}: GET exceeded the requested length");
             digest.update(&chunk);

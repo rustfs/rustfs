@@ -14,7 +14,10 @@
 
 //! Periodic snapshots captured while nested traversal frames are still active.
 
+use super::super::enumeration_restart::{REQUEST_ENV, read_bounded};
 use super::*;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use tokio::sync::Notify;
 
 const OBJECTS: u64 = 8;
@@ -176,7 +179,10 @@ async fn nested_periodic_snapshot(
     (loaded, identity, scanner, guard)
 }
 
-async fn finish_resumed_walk(cache: DataUsageCache, original: &FolderScanner) -> (DataUsageCache, u64, TestGuard) {
+async fn finish_resumed_walk_scanner(
+    cache: DataUsageCache,
+    original: &FolderScanner,
+) -> (FolderScanner, DataUsageEntry, TestGuard) {
     let (mut scanner, unused_root) = build_test_scanner().await;
     let guard = TestGuard {
         temp_dir: Some(unused_root),
@@ -201,6 +207,11 @@ async fn finish_resumed_walk(cache: DataUsageCache, original: &FolderScanner) ->
         )
         .await
         .expect("finish resumed nested periodic walk");
+    (scanner, entry, guard)
+}
+
+async fn finish_resumed_walk(cache: DataUsageCache, original: &FolderScanner) -> (DataUsageCache, u64, TestGuard) {
+    let (scanner, _entry, guard) = finish_resumed_walk_scanner(cache, original).await;
     let visits = scanner.budget.progress().0;
     (scanner.new_cache, visits, guard)
 }
@@ -972,27 +983,306 @@ async fn periodic_failed_subtree_resumes_healthy_descendants_and_compacted_debt(
     }
 }
 
+const DEBT_FRONTIER: &str = "bucket/prefix/a中";
+const DEBT_COMPLETED_FRONTIER: &str = "bucket/prefix";
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointDebtRequest {
+    workspace: PathBuf,
+    round: u32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointDebtState {
+    writer_pid: u32,
+    root_id: Uuid,
+    disk_root: PathBuf,
+    cache_root: PathBuf,
+    identity: crate::DataUsageScanIdentity,
+}
+
+fn checkpoint_debt_observation(
+    cache: &DataUsageCache,
+    identity: crate::DataUsageScanIdentity,
+    frontier: &str,
+    failed_objects: usize,
+) -> serde_json::Value {
+    assert_eq!(cache.validated_scan_frontier(), Some(frontier));
+    assert_eq!(cache.info.scan_identity, Some(identity));
+    assert_eq!(cache.info.source, Some(SOURCE));
+    assert!(cache.info.failed_objects.is_empty(), "entry debt must not depend on diagnostic records");
+    assert!(!cache.info.snapshot_complete, "this fixture does not certify a complete sweep");
+    let totals = cache
+        .checked_flatten_complete_scope("bucket")
+        .expect("connected checkpoint accounting");
+    let healthy = usize::try_from(OBJECTS).expect("healthy originals plus Unicode sibling") + usize::from(failed_objects == 0);
+    assert_eq!((totals.objects, totals.size, totals.failed_objects), (healthy, healthy, failed_objects));
+    serde_json::json!({
+        "frontier": cache.validated_scan_frontier(),
+        "receipt": cache.info.scan_coverage_receipt,
+        "leader_epoch": cache.info.leader_epoch,
+        "objects": totals.objects, "bytes": totals.size, "failed_objects": totals.failed_objects,
+        "diagnostics": cache.info.failed_objects.len(), "snapshot_complete": cache.info.snapshot_complete,
+    })
+}
+
+/// The existing restart driver runs this exact test in four sequential processes:
+/// writer, two leader handoffs, and a final handoff that repairs the original file.
+async fn checkpoint_debt_restart_round(request: &CheckpointDebtRequest) -> serde_json::Value {
+    assert!(request.round < 4);
+    let workspace = tokio::fs::canonicalize(&request.workspace)
+        .await
+        .expect("existing restart workspace");
+    assert_eq!(workspace, request.workspace);
+    assert_eq!(
+        tokio::fs::canonicalize(std::env::temp_dir())
+            .await
+            .expect("worker temporary root"),
+        workspace,
+        "the driver must own every fixture directory"
+    );
+    let state_path = workspace.join("checkpoint-state.json");
+    let (state, mut original, mut root_guard, prepared, mut visits) = if request.round == 0 {
+        assert!(!state_path.exists(), "the writer requires a fresh workspace");
+        let (mut loaded, identity, mut original, guard) = nested_periodic_snapshot(true, (0, 0)).await;
+        loaded.info.failed_objects.clear();
+        original.failed_object_ttl_secs = 0;
+        original.failed_objects_max = 0;
+        write_checkpoint_object(Path::new(&original.root), "prefix/a中", &[(None, 1)]).await;
+        let (mut cache, visits, _walk_guard) = finish_resumed_walk(loaded, &original).await;
+        assert_eq!(visits, 7, "the writer must finish the original partial walk and Unicode sibling");
+        cache
+            .seal_scan_frontier(Some(DEBT_FRONTIER))
+            .expect("seal completed Unicode sibling");
+        let state = CheckpointDebtState {
+            writer_pid: std::process::id(),
+            root_id: Uuid::new_v4(),
+            disk_root: tokio::fs::canonicalize(&original.root).await.expect("original disk root"),
+            cache_root: workspace.join("cache"),
+            identity,
+        };
+        assert!(state.disk_root.starts_with(&workspace) && state.disk_root != workspace);
+        tokio::fs::write(state.disk_root.join("checkpoint-root-id"), state.root_id.to_string())
+            .await
+            .expect("persist original fixture identity");
+        (state, original, guard, Some(cache), visits)
+    } else {
+        let state: CheckpointDebtState =
+            serde_json::from_slice(&read_bounded(&state_path).await).expect("original fixture state");
+        assert_ne!(state.writer_pid, std::process::id(), "handoff must run after the writer process exits");
+        let (mut original, unused_root) = build_test_scanner().await;
+        let guard = TestGuard {
+            temp_dir: Some(unused_root),
+        };
+        assert_eq!(
+            tokio::fs::canonicalize(&state.disk_root).await.expect("reopen original disk"),
+            state.disk_root
+        );
+        let endpoint = Endpoint::try_from(state.disk_root.to_string_lossy().as_ref()).expect("original fixture endpoint");
+        original.root = state.disk_root.to_string_lossy().to_string();
+        original.local_disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("reopen original disk in a fresh process");
+        (state, original, guard, None, 0)
+    };
+    original.failed_object_ttl_secs = 0;
+    original.failed_objects_max = 0;
+    assert!(!state.root_id.is_nil());
+    assert!(state.disk_root.starts_with(&workspace) && state.disk_root != workspace);
+    assert_eq!(state.cache_root, workspace.join("cache"));
+    assert_eq!(
+        tokio::fs::canonicalize(&state.cache_root).await.expect("original cache root"),
+        state.cache_root
+    );
+    assert_eq!(
+        read_bounded(&state.disk_root.join("checkpoint-root-id")).await,
+        state.root_id.to_string().as_bytes(),
+        "each process must reopen the original fixture"
+    );
+    let store = FixtureStore::reopen(state.cache_root.clone());
+    let main_path = store.path(CACHE_NAME);
+    if request.round == 0 {
+        assert!(!main_path.exists(), "writer must not overwrite a previous checkpoint");
+    }
+    let mut cache = DataUsageCache::default();
+    let revisions = cache
+        .load_with_revisions(store.clone(), CACHE_NAME)
+        .await
+        .expect("reload actual checkpoint revisions");
+    let mut before = serde_json::Value::Null;
+    if let Some(prepared) = prepared {
+        cache = prepared;
+    } else {
+        let frontier = if request.round == 1 {
+            DEBT_FRONTIER
+        } else {
+            DEBT_COMPLETED_FRONTIER
+        };
+        before = checkpoint_debt_observation(&cache, state.identity, frontier, 1);
+        before["cache_sha256"] = serde_json::json!(Sha256::digest(read_bounded(&main_path).await).to_vec());
+        let previous: serde_json::Value =
+            serde_json::from_slice(&read_bounded(&workspace.join(format!("round-{}.json", request.round - 1))).await)
+                .expect("previous successful process report");
+        assert_eq!(previous["round"], request.round - 1);
+        assert_eq!(previous["root_id"], serde_json::json!(state.root_id));
+        assert_eq!(
+            previous["after"], before,
+            "serialized frontier, receipt, and entry debt must survive process exit"
+        );
+        assert_eq!(cache.info.leader_epoch, 7 + u64::from(request.round));
+        let receipt = cache.info.scan_coverage_receipt.clone();
+        assert_eq!(
+            cache.prepare_bucket_checkpoint("bucket", 11, 8 + u64::from(request.round), SOURCE, PLAN, state.identity),
+            crate::DataUsageCachePrepareOutcome::Reused,
+        );
+        assert_eq!(
+            cache.info.scan_coverage_receipt, receipt,
+            "leader adoption must retain the original receipt"
+        );
+        assert_eq!(cache.validated_scan_frontier(), Some(frontier));
+    }
+    let bad_metadata_path = state.disk_root.join("bucket/prefix/a/0000/xl.meta");
+    let metadata_before = read_bounded(&bad_metadata_path).await;
+    assert_eq!(
+        metadata_before, b"not-valid-filemeta",
+        "failure debt must refer to the original unrepaired file"
+    );
+    if request.round == 3 {
+        write_checkpoint_object(&state.disk_root, "prefix/a/0000", &[(None, 1)]).await;
+    }
+    if request.round > 0 {
+        let receipt = cache.info.scan_coverage_receipt.clone();
+        let (scanner, root, _walk_guard) = finish_resumed_walk_scanner(cache, &original).await;
+        visits = scanner.budget.progress().0;
+        assert_eq!(
+            visits,
+            match request.round {
+                1 => 4,
+                2 => 0,
+                3 => 1,
+                _ => unreachable!("bounded resumed round"),
+            },
+            "covered healthy descendants must skip reads"
+        );
+        assert!(!scanner.coverage_gap, "only proven completed coverage may be checkpointed");
+        assert_eq!(scanner.checkpoint_depth, 0, "the completed root has no suspended ancestors");
+        assert_eq!(scanner.coverage_frontier.as_deref(), Some(DEBT_COMPLETED_FRONTIER));
+        let totals = scanner
+            .new_cache
+            .checked_flatten_complete_scope("bucket")
+            .expect("resumed accounting before checkpoint sealing");
+        let healthy = usize::try_from(OBJECTS).expect("healthy originals plus Unicode sibling") + usize::from(request.round == 3);
+        assert_eq!(
+            (totals.objects, totals.size, totals.failed_objects),
+            (healthy, healthy, usize::from(request.round != 3))
+        );
+        // A low-level walk advances resume hints without sealing its mutable
+        // cache. Persist the same snapshot primitive used by periodic emission.
+        cache = scanner
+            .checkpoint_snapshot(
+                &CachedFolder {
+                    name: "bucket".to_string(),
+                    parent: None,
+                    object_heal_prob_div: 1,
+                },
+                &hash_path("bucket"),
+                &root,
+            )
+            .expect("seal the real completed root checkpoint");
+        if request.round == 2 {
+            assert_eq!(
+                cache.info.scan_coverage_receipt, receipt,
+                "an unchanged completed range must retain the same receipt"
+            );
+        } else {
+            assert_ne!(
+                cache.info.scan_coverage_receipt, receipt,
+                "new completed coverage or repaired entry accounting must change the receipt"
+            );
+        }
+    }
+    let failed_objects = usize::from(request.round != 3);
+    let frontier = if request.round == 0 {
+        DEBT_FRONTIER
+    } else {
+        DEBT_COMPLETED_FRONTIER
+    };
+    let expected = checkpoint_debt_observation(&cache, state.identity, frontier, failed_objects);
+    assert_eq!(cache.info.leader_epoch, 8 + u64::from(request.round));
+    cache
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .await
+        .expect("persist combined healthy coverage and failure debt with CAS");
+    let saved = store.strict_load().await;
+    let mut after = checkpoint_debt_observation(&saved, state.identity, frontier, failed_objects);
+    assert_eq!(after, expected, "the saved codec must retain the complete checkpoint observation");
+    after["cache_sha256"] = serde_json::json!(Sha256::digest(read_bounded(&main_path).await).to_vec());
+    let metadata_after = read_bounded(&bad_metadata_path).await;
+    if request.round == 3 {
+        assert_ne!(metadata_after, metadata_before, "repair must replace the actual bad metadata");
+    } else {
+        assert_eq!(metadata_after, metadata_before, "handoffs must leave the failed source unrepaired");
+    }
+    if request.round == 0 {
+        tokio::fs::write(&state_path, serde_json::to_vec(&state).expect("fixture state JSON"))
+            .await
+            .expect("persist original disk/cache identity");
+        root_guard.temp_dir = None; // The driver-owned workspace outlives this writer process.
+    }
+    serde_json::json!({
+        "schema": 1, "mode": "checkpoint_debt", "pid": std::process::id(), "round": request.round,
+        "writer_pid": state.writer_pid, "root_id": state.root_id,
+        "disk_root": state.disk_root, "cache_root": state.cache_root, "identity": state.identity,
+        "source": SOURCE, "before": before, "after": after, "objects_processed": visits,
+        "diagnostic_ttl_secs": original.failed_object_ttl_secs,
+        "metadata_repaired": request.round == 3,
+        "metadata_sha256_before": Sha256::digest(metadata_before).to_vec(),
+        "metadata_sha256_after": Sha256::digest(metadata_after).to_vec(),
+    })
+}
+
 #[tokio::test]
 #[serial]
 async fn periodic_resume_uses_traversal_order_for_punctuation_siblings() {
-    let (loaded, _, original, _guard) = nested_periodic_snapshot(true, (0, 0)).await;
-    write_checkpoint_object(std::path::Path::new(&original.root), "prefix/a-", &[(None, 1)]).await;
-    let (mut cache, _, _walk_guard) = finish_resumed_walk(loaded, &original).await;
-    cache.info.failed_objects.clear();
-    cache
-        .seal_scan_frontier(Some("bucket/prefix/a-"))
-        .expect("seal completed punctuation sibling");
-    let (finished, visits, _resumed_guard) = finish_resumed_walk(cache, &original).await;
-    assert_eq!(visits, 4, "healthy children of the earlier failed sibling must remain covered");
-    let totals = finished
-        .checked_flatten_complete_scope("bucket")
-        .expect("punctuation sibling accounting");
-    assert_eq!(
-        totals.objects,
-        usize::try_from(OBJECTS).expect("healthy originals plus punctuation sibling")
-    );
-    assert_eq!(totals.size, totals.objects);
-    assert_eq!(totals.failed_objects, 1);
+    if let Some(path) = std::env::var_os(REQUEST_ENV) {
+        let request: CheckpointDebtRequest =
+            serde_json::from_slice(&read_bounded(Path::new(&path)).await).expect("bounded checkpoint-debt restart request");
+        let report = checkpoint_debt_restart_round(&request).await;
+        tokio::fs::write(
+            request.workspace.join(format!("round-{}.json", request.round)),
+            serde_json::to_vec(&report).expect("checkpoint-debt report JSON"),
+        )
+        .await
+        .expect("write checkpoint-debt restart report");
+        return;
+    }
+    for sibling in ["prefix/a-", "prefix/a中"] {
+        let (loaded, _, original, _guard) = nested_periodic_snapshot(true, (0, 0)).await;
+        write_checkpoint_object(std::path::Path::new(&original.root), sibling, &[(None, 1)]).await;
+        let (mut cache, _, _walk_guard) = finish_resumed_walk(loaded, &original).await;
+        cache.info.failed_objects.clear();
+        let frontier = format!("bucket/{sibling}");
+        cache
+            .seal_scan_frontier(Some(&frontier))
+            .expect("seal completed punctuation or Unicode sibling");
+        assert_eq!(cache.validated_scan_frontier(), Some(frontier.as_str()));
+        let (finished, visits, _resumed_guard) = finish_resumed_walk(cache, &original).await;
+        assert_eq!(visits, 4, "healthy children of the earlier failed sibling must remain covered");
+        let totals = finished
+            .checked_flatten_complete_scope("bucket")
+            .expect("punctuation or Unicode sibling accounting");
+        assert_eq!(totals.objects, usize::try_from(OBJECTS).expect("healthy originals plus sibling"));
+        assert_eq!(totals.size, totals.objects);
+        assert_eq!(totals.failed_objects, 1);
+    }
 }
 
 #[tokio::test]

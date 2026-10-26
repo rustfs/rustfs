@@ -1302,18 +1302,65 @@ async fn reordered_scoped_acks(newer_generation: bool) -> TestResult {
 }
 
 async fn hot_window(fault: Option<ScopedAckFault>) -> TestResult {
+    hot_window_with_old_followers(fault, None).await
+}
+
+#[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn scanner_peer_bucket_new_coordinator_certifies_old_peers_and_scopes_next_cycle() -> TestResult {
+    let old_binary = std::env::var_os("RUSTFS_SCANNER_COMPAT_OLD_BINARY")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .ok_or("RUSTFS_SCANNER_COMPAT_OLD_BINARY must identify the qualified previous executable")?;
+    let old_sha256 = std::env::var("RUSTFS_SCANNER_COMPAT_OLD_SHA256")
+        .map_err(|error| format!("RUSTFS_SCANNER_COMPAT_OLD_SHA256 must identify that executable: {error}"))?;
+    mixed_version_n_over_o(&old_binary, &old_sha256).await
+}
+
+#[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+async fn mixed_version_n_over_o(old_binary: &std::path::Path, expected_old_sha256: &str) -> TestResult {
+    hot_window_with_old_followers(None, Some((old_binary, expected_old_sha256))).await
+}
+
+async fn hot_window_with_old_followers(
+    fault: Option<ScopedAckFault>,
+    old_followers: Option<(&std::path::Path, &str)>,
+) -> TestResult {
     init_logging();
+    let mixed = old_followers.is_some();
+    if mixed && fault.is_some() {
+        return Err("the mixed-version gate requires successful original ACK forwarding".into());
+    }
     let label = match fault {
+        None if mixed => "new-coordinator-old-peers",
         None => "hot-window",
         Some(ScopedAckFault::RequestLoss) => "ack-request-loss",
         Some(ScopedAckFault::ResponseLoss) => "ack-response-loss",
-        Some(ScopedAckFault::Forward) => return Err("fault scenario needs actual request or response loss".into()),
+        Some(ScopedAckFault::Forward) => {
+            return Err("fault scenario needs actual request or response loss".into());
+        }
     };
-    let mut run = if fault.is_some() {
+    let mut run = if mixed {
+        PeerBucketRun::start_for_crash(label).await?
+    } else if fault.is_some() {
         PeerBucketRun::start_with_ack_faults(label).await?
     } else {
         PeerBucketRun::start(label).await?
     };
+    let mixed_fleet = if let Some((old_binary, expected_old_sha256)) = old_followers {
+        #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+        {
+            run.replace_followers_with_old_binary(old_binary, expected_old_sha256).await?
+        }
+        #[cfg(not(all(target_os = "linux", feature = "scanner-peer-mixed-version")))]
+        {
+            let _ = (old_binary, expected_old_sha256);
+            return Err("mixed-version process evidence requires the dedicated Linux feature".into());
+        }
+    } else {
+        Value::Null
+    };
+    let mixed_initial_physical = if mixed { json!(converged_shards(&run)?) } else { Value::Null };
     let scheduler_config = run.assert_default_cadence().await?;
     let baseline = run.quiet_baseline().await?;
     let leader = run.leader().await?;
@@ -1324,6 +1371,12 @@ async fn hot_window(fault: Option<ScopedAckFault>) -> TestResult {
     } else {
         vec![producer]
     };
+    if mixed
+        && (mixed_fleet["leader"].as_u64() != Some(u64::try_from(leader)?)
+            || mixed_fleet["leader_pid"].as_u64() != Some(u64::from(leader_pid)))
+    {
+        return Err("the hot window did not retain its measured new coordinator".into());
+    }
     let producer_pid = run.pid(producer)?;
     let producer_address = run.peer_address(producer);
     let [cold_a, cold_b, hot] = run.buckets.clone();
@@ -1373,7 +1426,13 @@ async fn hot_window(fault: Option<ScopedAckFault>) -> TestResult {
     }
     let start_identities = peer_identities(&start["detail"]["peers"])?;
     for node in (0..4).filter(|node| *node != leader) {
-        peer_for_address(&start, &run.peer_address(node))?;
+        let peer = peer_for_address(&start, &run.peer_address(node))?;
+        if mixed
+            && (peer["owner_id"] != mixed_fleet["peers"][node]["owner_id"]
+                || peer["instance_id"] != mixed_fleet["peers"][node]["instance_id"])
+        {
+            return Err("the coordinator snapshot does not name the measured old peer instance".into());
+        }
     }
     let start_tuples = tuples(&start_peer["buckets"])?;
     if start_tuples.keys().cloned().collect::<BTreeSet<_>>() != all {
@@ -1456,6 +1515,20 @@ async fn hot_window(fault: Option<ScopedAckFault>) -> TestResult {
     {
         return Err(format!("root observation lacks a verified durable publication receipt: {root}").into());
     }
+    let mixed_physical_root = if mixed {
+        let physical = run.authoritative_root()?;
+        assert_physical_root(&root, &physical)?;
+        let usage: DataUsageInfo = serde_json::from_value(physical["usage"].clone())?;
+        if usage.usage_snapshot_converged != Some(false)
+            || usage.usage_snapshot_pending_buckets != vec![hot.clone()]
+            || !run.usage_matches(&usage, &[&cold_a, &cold_b])
+        {
+            return Err("mixed-version physical root did not certify cold and retain only hot".into());
+        }
+        physical
+    } else {
+        Value::Null
+    };
     let completed_at_root = hot_writer.completed();
     hot_writer.wait_for_completed(completed_at_root + producers.len()).await?;
     let hot_stream = hot_writer.finish().await?;
@@ -1474,7 +1547,27 @@ async fn hot_window(fault: Option<ScopedAckFault>) -> TestResult {
     for node in &producers {
         hot_after_root.push(run.put(*node, &hot, "after-root-before-ack", 257).await?);
     }
-    let ack_queue = if fault.is_some() {
+    let mixed_before_ack = if mixed {
+        #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+        run.assert_mixed_roles(&mixed_fleet).await?;
+        let snapshot = run.dirty_snapshot(producer).await?;
+        let entries = complete_dirty_tuples(&snapshot)?;
+        if snapshot["owner_id"] != start_peer["owner_id"]
+            || snapshot["instance_id"] != start_peer["instance_id"]
+            || entries.keys().cloned().collect::<BTreeSet<_>>() != all
+            || cold.iter().any(|bucket| entries.get(bucket) != start_tuples.get(bucket))
+            || entries
+                .get(&hot)
+                .is_none_or(|entry| entry.0 != hot_post.0 || entry.1 <= hot_post.1)
+        {
+            return Err("old receiver did not retain the original cold tuples and later hot write before ACK".into());
+        }
+        snapshot
+    } else {
+        Value::Null
+    };
+    let mixed_ack_started = mixed.then(std::time::Instant::now);
+    let ack_queue = if mixed || fault.is_some() {
         Some(run.scoped_ack_queue(producer, start_peer, cold.clone(), 1)?)
     } else {
         None
@@ -1507,7 +1600,63 @@ async fn hot_window(fault: Option<ScopedAckFault>) -> TestResult {
     {
         return Err(format!("sender did not preserve the certified remote cold tuples: {expected_ack}").into());
     }
-    let fault_receipt = if let (Some(queue), Some(fault)) = (&ack_queue, fault) {
+    let mut mixed_retained_ack = Value::Null;
+    let fault_receipt = if mixed {
+        let queue = ack_queue.as_ref().ok_or("mixed-version ACK queue is absent")?;
+        queue.wait_for_packets(1).await?;
+        let captured = queue
+            .receipts()
+            .into_iter()
+            .next()
+            .ok_or("old receiver ACK packet is absent")?;
+        assert_retained_ack(&captured, expected_ack, &run.dist.cluster.nodes[producer].address)?;
+        let started = mixed_ack_started.ok_or("mixed-version ACK clock is absent")?;
+        if started.elapsed() >= std::time::Duration::from_secs(5) {
+            return Err("old receiver ACK exceeded the unchanged sender budget before forwarding".into());
+        }
+        queue.settle(0, ScopedAckFault::Forward)?;
+        let receipt = queue.wait_for_completion(0).await?;
+        let ack_elapsed = started.elapsed();
+        if ack_elapsed >= std::time::Duration::from_secs(5) {
+            return Err("old receiver ACK exceeded the unchanged sender budget before completion".into());
+        }
+        assert_forwarded_ack(&receipt, expected_ack, 2)?;
+        for field in [
+            "request_sha256",
+            "request_headers_sha256",
+            "request_frame_hex",
+            "request_bytes",
+            "auth_nonce",
+            "replay_nonce",
+            "signature_sha256",
+            "replay_signature_sha256",
+            "receiver",
+            "session_nonce",
+            "request",
+        ] {
+            if captured[field] != receipt[field] {
+                return Err(format!("old receiver ACK changed original packet field {field}").into());
+            }
+        }
+        let frame = hex_simd::decode_to_vec(
+            captured["request_frame_hex"]
+                .as_str()
+                .ok_or("ACK frame is absent")?
+                .as_bytes(),
+        )?;
+        if captured["request_bytes"].as_u64() != Some(u64::try_from(frame.len())?)
+            || captured["request_sha256"].as_str() != Some(super::harness::sha256_hex(&frame).as_str())
+        {
+            return Err("old receiver ACK frame failed its original byte digest".into());
+        }
+        mixed_retained_ack = captured;
+        run.write_evidence(
+            "mixed-original-ack",
+            &json!({"retained": mixed_retained_ack, "transport": receipt,
+            "elapsed_millis": ack_elapsed.as_millis()}),
+        )?;
+        receipt
+    } else if let (Some(queue), Some(fault)) = (&ack_queue, fault) {
         queue.wait_for_packets(1).await?;
         let captured = queue
             .receipts()
@@ -1549,14 +1698,30 @@ async fn hot_window(fault: Option<ScopedAckFault>) -> TestResult {
                     && receipt["response"]["ack"]["response_proof_bytes"]
                         .as_u64()
                         .is_some_and(|count| count > 0) => {}
-            _ => return Err(format!("scoped ACK fault lacks its actual transport/backend outcome: {receipt}").into()),
+            _ => {
+                return Err(format!("scoped ACK fault lacks its actual transport/backend outcome: {receipt}").into());
+            }
         }
         receipt
     } else {
         Value::Null
     };
     let find_receiver = |stage: &str| receiver_observation(&run, stage, producer_pid, expected_ack);
-    let (before_ack, after_ack) = if fault == Some(ScopedAckFault::RequestLoss) {
+    let mut mixed_after_ack = Value::Null;
+    let (before_ack, after_ack) = if mixed {
+        let snapshot = run.dirty_snapshot(producer).await?;
+        let entries = complete_dirty_tuples(&snapshot)?;
+        let before = complete_dirty_tuples(&mixed_before_ack)?;
+        if snapshot["owner_id"] != start_peer["owner_id"]
+            || snapshot["instance_id"] != start_peer["instance_id"]
+            || entries.keys().cloned().collect::<BTreeSet<_>>() != BTreeSet::from([hot.clone()])
+            || entries.get(&hot) != before.get(&hot)
+        {
+            return Err("the authenticated old receiver did not clear precisely cold and preserve its later hot tuple".into());
+        }
+        mixed_after_ack = snapshot;
+        (Value::Null, Value::Null)
+    } else if fault == Some(ScopedAckFault::RequestLoss) {
         (Value::Null, Value::Null)
     } else {
         wait_until(
@@ -1680,8 +1845,16 @@ async fn hot_window(fault: Option<ScopedAckFault>) -> TestResult {
     } else {
         BTreeSet::from([hot.clone()])
     };
-    if fault.is_some() {
-        let actual = tuples(&peer_for_address(&next_start, &producer_address)?["buckets"])?;
+    if mixed || fault.is_some() {
+        let actual_peer = peer_for_address(&next_start, &producer_address)?;
+        let actual = tuples(&actual_peer["buckets"])?;
+        if mixed
+            && (actual_peer["owner_id"] != start_peer["owner_id"]
+                || actual_peer["instance_id"] != start_peer["instance_id"]
+                || actual != complete_dirty_tuples(&mixed_after_ack)?)
+        {
+            return Err("the next Normal cycle did not observe the actual old receiver's retained map".into());
+        }
         if actual.keys().cloned().collect::<BTreeSet<_>>() != next_scope
             || (fault == Some(ScopedAckFault::RequestLoss)
                 && cold.iter().any(|bucket| actual.get(bucket) != start_tuples.get(bucket)))
@@ -1700,6 +1873,26 @@ async fn hot_window(fault: Option<ScopedAckFault>) -> TestResult {
         .barrier
         .wait_stage("root_durable", leader_pid, Some(next_cycle), true)
         .await?;
+    let mixed_next_root = if mixed {
+        assert_root_binding(&next_candidate, &next_root)?;
+        let physical = run.authoritative_root()?;
+        assert_physical_root(&next_root, &physical)?;
+        let usage: DataUsageInfo = serde_json::from_value(physical["usage"].clone())?;
+        let buckets = run.buckets.iter().map(String::as_str).collect::<Vec<_>>();
+        if next_candidate["detail"]["converged"] != true
+            || !names(&next_candidate["detail"]["pending_buckets"])?.is_empty()
+            || usage.usage_snapshot_converged != Some(true)
+            || !usage.usage_snapshot_pending_buckets.is_empty()
+            || !run.usage_matches(&usage, &buckets)
+        {
+            return Err("mixed-version hot-only recovery did not converge every acknowledged version".into());
+        }
+        #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+        run.assert_mixed_roles(&mixed_fleet).await?;
+        physical
+    } else {
+        Value::Null
+    };
     let observations = run.barrier.observations(false)?;
     let next_walks = observations
         .iter()
@@ -1766,6 +1959,45 @@ async fn hot_window(fault: Option<ScopedAckFault>) -> TestResult {
     }
     run.barrier.stop_session()?;
     run.verify_objects().await?;
+    let mixed_final_processes = if let Some((old_binary, expected_old_sha256)) = old_followers {
+        #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+        {
+            run.assert_mixed_roles(&mixed_fleet).await?;
+            let processes = run.mixed_process_identities(leader, old_binary, expected_old_sha256)?;
+            if json!(processes) != mixed_fleet["processes"] {
+                return Err("mixed-version processes or executable bytes changed during the gate".into());
+            }
+            json!(processes)
+        }
+        #[cfg(not(all(target_os = "linux", feature = "scanner-peer-mixed-version")))]
+        {
+            let _ = (old_binary, expected_old_sha256);
+            return Err("mixed-version process evidence requires the dedicated Linux feature".into());
+        }
+    } else {
+        Value::Null
+    };
+    let mixed_final_drives = if mixed {
+        let drives = (0..4).map(|node| run.drive_identity(node)).collect::<TestResult<Vec<_>>>()?;
+        if json!(drives) != mixed_fleet["drives_after"] {
+            return Err("mixed-version measurement changed a retained drive identity".into());
+        }
+        json!(drives)
+    } else {
+        Value::Null
+    };
+    let mixed_final_physical = if mixed {
+        let physical = converged_shards(&run)?;
+        let initial = mixed_initial_physical
+            .as_array()
+            .ok_or("initial mixed-version shard oracle is absent")?;
+        if initial.iter().any(|row| !physical.contains(row)) {
+            return Err("mixed-version gate changed a previously acknowledged physical shard".into());
+        }
+        json!(physical)
+    } else {
+        Value::Null
+    };
     run.write_evidence(
         label,
         &json!({"topology": run.topology, "objects": run.objects, "baseline": baseline, "scheduler_config": scheduler_config,
@@ -1779,6 +2011,12 @@ async fn hot_window(fault: Option<ScopedAckFault>) -> TestResult {
             "candidate": candidate, "root": root, "ack_send": ack_send, "ack_before_apply": before_ack,
             "ack_after_apply": after_ack, "fault_receipt": fault_receipt, "next_scope": next_scope,
             "next_start": next_start, "next_candidate": next_candidate, "next_root": next_root,
-            "recovered_ack": recovered_ack, "recovered_usage": recovered_usage, "observations": run.barrier.observations(false)?}),
+            "recovered_ack": recovered_ack, "recovered_usage": recovered_usage,
+            "mixed_fleet": mixed_fleet, "mixed_initial_physical": mixed_initial_physical,
+            "mixed_physical_root": mixed_physical_root, "mixed_before_ack": mixed_before_ack,
+            "mixed_retained_ack": mixed_retained_ack, "mixed_after_ack": mixed_after_ack,
+            "mixed_next_root": mixed_next_root, "mixed_final_processes": mixed_final_processes,
+            "mixed_final_physical": mixed_final_physical, "mixed_final_drives": mixed_final_drives,
+            "observations": run.barrier.observations(false)?}),
     )
 }

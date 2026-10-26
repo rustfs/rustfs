@@ -21,7 +21,7 @@ mod tests {
     };
     use crate::common::{
         ClusterTopology, FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request,
-        init_logging, rustfs_binary_path,
+        init_logging, local_http_client, rustfs_binary_path,
     };
     use crate::storage_api::RUSTFS_META_BUCKET;
     use aws_sdk_s3::{
@@ -51,6 +51,196 @@ mod tests {
         replacement_format_path: PathBuf,
         replacement_format: Vec<u8>,
         expected_pool_metadata: Option<VersionShardCensus>,
+    }
+
+    fn pool_metadata_matches_republished_manifest(actual: &VersionShardCensus, expected: &VersionShardCensus) -> bool {
+        for data_dir in [&actual.data_dir, &expected.data_dir] {
+            if data_dir
+                .as_deref()
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                .is_none_or(|value| value.is_nil())
+            {
+                return false;
+            }
+        }
+        // The owning CAS republishes the same canonical payload with a fresh
+        // physical identity. Every shard and layout field must still match.
+        let mut republished = actual.clone();
+        republished.data_dir = expected.data_dir.clone();
+        republished.matches_manifest(expected)
+    }
+
+    fn pool_metadata_node_health_is_ready(status: u16, payload: &serde_json::Value) -> bool {
+        (200..300).contains(&status)
+            && payload["ready"] == true
+            && payload["details"]["poolMetadata"]["ready"] == true
+            && payload["details"]["storage"]["readQuorum"] == true
+            && payload["details"]["storage"]["writeQuorum"] == true
+    }
+
+    async fn all_nodes_pool_metadata_readiness(
+        cluster: &RustFSTestClusterEnvironment,
+        deadline: Instant,
+    ) -> (bool, serde_json::Value) {
+        let http = local_http_client();
+        let mut ready = !cluster.nodes.is_empty();
+        let mut observations = Vec::with_capacity(cluster.nodes.len());
+        for (node, environment) in cluster.nodes.iter().enumerate() {
+            let response = tokio::time::timeout_at(deadline, async {
+                let response = http
+                    .get(format!("{}/health/ready", environment.url))
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await?;
+                let status = response.status().as_u16();
+                let payload = response.json::<serde_json::Value>().await?;
+                Ok::<_, reqwest::Error>((status, payload))
+            })
+            .await;
+            let observation = match response {
+                Ok(Ok((status, payload))) => {
+                    let node_ready = pool_metadata_node_health_is_ready(status, &payload);
+                    ready &= node_ready;
+                    serde_json::json!({"node": node, "status": status, "ready": node_ready, "payload": payload})
+                }
+                Ok(Err(error)) => {
+                    ready = false;
+                    serde_json::json!({"node": node, "error": error.to_string()})
+                }
+                Err(_) => {
+                    ready = false;
+                    serde_json::json!({"node": node, "error": "pool metadata health deadline elapsed"})
+                }
+            };
+            observations.push(observation);
+        }
+        let deadline_elapsed = Instant::now() >= deadline;
+        (
+            ready && !deadline_elapsed,
+            serde_json::json!({"deadline_elapsed": deadline_elapsed, "nodes": observations}),
+        )
+    }
+
+    fn pool_metadata_manifest_fixture() -> VersionShardCensus {
+        VersionShardCensus {
+            version_id: None,
+            has_xl_meta: true,
+            data_dir: Some(uuid::Uuid::from_u128(1).to_string()),
+            erasure_index: Some(1),
+            erasure_distribution: Some(vec![1, 2, 3, 4]),
+            data_blocks: Some(2),
+            parity_blocks: Some(2),
+            expected_part_numbers: Default::default(),
+            present_part_fingerprints: Default::default(),
+            inline_data_fingerprint: Some(crate::chaos::PartShardFingerprint {
+                size: 7,
+                sha256: sha256_hex(b"payload"),
+            }),
+        }
+    }
+
+    #[test]
+    fn pool_metadata_republication_allows_only_valid_data_dir_change() {
+        let expected = pool_metadata_manifest_fixture();
+        let mut actual = expected.clone();
+        actual.data_dir = Some(uuid::Uuid::from_u128(2).to_string());
+        assert!(pool_metadata_matches_republished_manifest(&actual, &expected));
+        assert!(
+            !actual.matches_manifest(&expected),
+            "ordinary object manifests must retain their original identity"
+        );
+        for invalid in [
+            None,
+            Some(String::new()),
+            Some("invalid".to_string()),
+            Some(uuid::Uuid::nil().to_string()),
+        ] {
+            let mut changed = actual.clone();
+            changed.data_dir = invalid.clone();
+            assert!(!pool_metadata_matches_republished_manifest(&changed, &expected));
+            let mut changed_expected = expected.clone();
+            changed_expected.data_dir = invalid;
+            assert!(!pool_metadata_matches_republished_manifest(&actual, &changed_expected));
+        }
+        let mut changed = actual.clone();
+        changed
+            .inline_data_fingerprint
+            .as_mut()
+            .expect("fixture has inline payload")
+            .sha256 = sha256_hex(b"corrupt");
+        assert!(!pool_metadata_matches_republished_manifest(&changed, &expected));
+        let mut changed = actual.clone();
+        changed.erasure_index = Some(2);
+        assert!(!pool_metadata_matches_republished_manifest(&changed, &expected));
+        let mut changed = actual.clone();
+        changed.erasure_distribution = Some(vec![2, 1, 3, 4]);
+        assert!(!pool_metadata_matches_republished_manifest(&changed, &expected));
+        let mut changed = actual.clone();
+        changed.data_blocks = Some(1);
+        assert!(!pool_metadata_matches_republished_manifest(&changed, &expected));
+        let mut changed = actual.clone();
+        changed.parity_blocks = Some(3);
+        assert!(!pool_metadata_matches_republished_manifest(&changed, &expected));
+        let mut changed = actual.clone();
+        changed.version_id = Some(uuid::Uuid::from_u128(3).to_string());
+        assert!(!pool_metadata_matches_republished_manifest(&changed, &expected));
+        let mut changed = actual;
+        changed.has_xl_meta = false;
+        assert!(!pool_metadata_matches_republished_manifest(&changed, &expected));
+    }
+
+    #[test]
+    fn pool_metadata_republication_requires_exact_complete_part_fingerprints() {
+        let mut expected = pool_metadata_manifest_fixture();
+        expected.inline_data_fingerprint = None;
+        expected.expected_part_numbers.insert(1);
+        expected.present_part_fingerprints.insert(
+            1,
+            crate::chaos::PartShardFingerprint {
+                size: 7,
+                sha256: sha256_hex(b"payload"),
+            },
+        );
+        let mut actual = expected.clone();
+        actual.data_dir = Some(uuid::Uuid::from_u128(2).to_string());
+        assert!(pool_metadata_matches_republished_manifest(&actual, &expected));
+        let mut changed = actual.clone();
+        changed.present_part_fingerprints.remove(&1);
+        assert!(!pool_metadata_matches_republished_manifest(&changed, &expected));
+        let mut changed = actual;
+        changed
+            .present_part_fingerprints
+            .get_mut(&1)
+            .expect("fixture has part 1")
+            .sha256 = sha256_hex(b"corrupt");
+        assert!(!pool_metadata_matches_republished_manifest(&changed, &expected));
+    }
+
+    #[test]
+    fn pool_metadata_node_health_requires_explicit_metadata_and_both_quorums() {
+        let expected = serde_json::json!({"ready": true, "details": {
+            "poolMetadata": {"ready": true},
+            "storage": {"readQuorum": true, "writeQuorum": true}
+        }});
+        assert!(pool_metadata_node_health_is_ready(200, &expected));
+        assert!(!pool_metadata_node_health_is_ready(503, &expected));
+        assert!(!pool_metadata_node_health_is_ready(200, &serde_json::json!({"ready": true})));
+        for path in [
+            "/ready",
+            "/details/poolMetadata/ready",
+            "/details/storage/readQuorum",
+            "/details/storage/writeQuorum",
+        ] {
+            for value in [
+                serde_json::Value::Bool(false),
+                serde_json::Value::Null,
+                serde_json::json!("true"),
+            ] {
+                let mut changed = expected.clone();
+                *changed.pointer_mut(path).expect("fixture contains required health field") = value;
+                assert!(!pool_metadata_node_health_is_ready(200, &changed), "required health field {path}");
+            }
+        }
     }
 
     #[derive(serde::Deserialize)]
@@ -2232,6 +2422,7 @@ mod tests {
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(180);
         let heal_deadline = Instant::now() + Duration::from_secs(heal_timeout_secs);
+        let mut last_pool_metadata_readiness = serde_json::Value::Null;
         loop {
             if restart_recovery_admin_after_failure && !recovery_admin_task_restarted {
                 let task_state = timeout(
@@ -2273,14 +2464,23 @@ mod tests {
                 let outage_census = census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?;
                 let pool_metadata_matches = match &expected_pool_metadata {
                     Some(expected) => {
-                        census_object_version_on_disk(&replaced_disk, RUSTFS_META_BUCKET, POOL_METADATA_OBJECT, None)?
-                            .matches_manifest(expected)
+                        let actual =
+                            census_object_version_on_disk(&replaced_disk, RUSTFS_META_BUCKET, POOL_METADATA_OBJECT, None)?;
+                        pool_metadata_matches_republished_manifest(&actual, expected)
                     }
                     None => true,
+                };
+                let pool_metadata_ready = if expected_pool_metadata.is_some() && pool_metadata_matches {
+                    let (ready, observation) = all_nodes_pool_metadata_readiness(&cluster, heal_deadline).await;
+                    last_pool_metadata_readiness = observation;
+                    ready
+                } else {
+                    expected_pool_metadata.is_none()
                 };
                 if matching == expected_manifests.len()
                     && (!outage_target_manifest_required || outage_census.is_complete())
                     && pool_metadata_matches
+                    && pool_metadata_ready
                 {
                     break;
                 }
@@ -2290,6 +2490,15 @@ mod tests {
                 let outage_census = census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?;
                 let pool_metadata =
                     census_object_version_on_disk(&replaced_disk, RUSTFS_META_BUCKET, POOL_METADATA_OBJECT, None)?;
+                // This post-deadline observation is diagnostic only. It cannot
+                // make an expired recovery attempt satisfy the original budget.
+                let pool_metadata_readiness = if expected_pool_metadata.is_some() {
+                    let (_, observation) =
+                        all_nodes_pool_metadata_readiness(&cluster, Instant::now() + Duration::from_secs(3)).await;
+                    serde_json::json!({"last_eligible_check": last_pool_metadata_readiness, "timeout_check": observation})
+                } else {
+                    serde_json::Value::Null
+                };
                 let final_status = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key)
                     .await
                     .unwrap_or_else(|err| format!("status request failed: {err}"));
@@ -2313,7 +2522,7 @@ mod tests {
                     Err(_) => "replacement status request exceeded 5s diagnostic budget".to_string(),
                 };
                 return Err(format!(
-                    "root heal did not recover after {interruption_kind} within {heal_timeout_secs}s: baseline={matching}/{}, outage={outage_census:?}, pool_metadata={pool_metadata:?}, status={final_status}, task_status={task_status}, pre_interrupt_status={pre_interrupt_status}, pre_heal_replacement={pre_heal_replacement}, pre_interrupt_replacement={pre_interrupt_replacement}, replacement_status={replacement_status}",
+                    "root heal did not recover after {interruption_kind} within {heal_timeout_secs}s: baseline={matching}/{}, outage={outage_census:?}, pool_metadata_expected={expected_pool_metadata:?}, pool_metadata={pool_metadata:?}, pool_metadata_readiness={pool_metadata_readiness}, status={final_status}, task_status={task_status}, pre_interrupt_status={pre_interrupt_status}, pre_heal_replacement={pre_heal_replacement}, pre_interrupt_replacement={pre_interrupt_replacement}, replacement_status={replacement_status}",
                     expected_manifests.len()
                 )
                 .into());

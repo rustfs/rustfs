@@ -23,6 +23,7 @@ use std::{
 };
 
 use futures::StreamExt;
+use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -70,6 +71,7 @@ pub(crate) const EVENT_LIFECYCLE_TIER_DELETE_JOURNAL: &str = "lifecycle_tier_del
 // successful pages while its wall-clock budget remains.
 pub const DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT: usize = 8;
 const TIER_DELETE_JOURNAL_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
+const TIER_DELETE_JOURNAL_RECOVERY_MAX_IDLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
 const TIER_DELETE_JOURNAL_RECOVERY_PASS_BUDGET: Duration = Duration::from_secs(240);
 const TIER_DELETE_REMOTE_DEADLINE: Duration = Duration::from_secs(30);
@@ -6104,55 +6106,112 @@ pub(crate) async fn recover_test_tier_delete_journal_pass_with_budget(
     recover_tier_delete_journal_pass(api, cancel_token, manifest_marker, journal_marker, budget).await
 }
 
-pub async fn run_tier_delete_journal_recovery_loop(api: Arc<ECStore>, cancel_token: CancellationToken) {
+fn tier_delete_journal_recovery_pass_is_idle(stats: &TierDeleteJournalRecoveryPassStats) -> bool {
+    stats.manifest_pages > 0
+        && stats.journal_pages > 0
+        && stats.manifest_errors == 0
+        && stats.journal_errors == 0
+        && !stats.deadline_exhausted
+        && !stats.canceled
+        && stats.manifests == TierDeleteDispatchManifestRecoveryStats::default()
+        && stats.journals == TierDeleteJournalRecoveryStats::default()
+}
+
+fn bounded_tier_delete_journal_recovery_delay(delay: Duration, percent: u32) -> Duration {
+    (delay.saturating_mul(percent) / 100)
+        .clamp(TIER_DELETE_JOURNAL_RECOVERY_INTERVAL, TIER_DELETE_JOURNAL_RECOVERY_MAX_IDLE_INTERVAL)
+}
+
+fn jitter_tier_delete_journal_recovery_delay(delay: Duration) -> Duration {
+    bounded_tier_delete_journal_recovery_delay(delay, rand::rng().random_range(90..=110))
+}
+
+async fn drive_tier_delete_journal_recovery(
+    cancel_token: &CancellationToken,
+    wait_for_wakeup: impl AsyncFn(),
+    mut recover: impl AsyncFnMut() -> TierDeleteJournalRecoveryPassStats,
+    jitter_delay: fn(Duration) -> Duration,
+) {
     let mut interval = tokio::time::interval(TIER_DELETE_JOURNAL_RECOVERY_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut marker: Option<String> = None;
-    let mut manifest_marker: Option<String> = None;
+    let mut idle_interval = TIER_DELETE_JOURNAL_RECOVERY_INTERVAL;
 
     loop {
         tokio::select! {
             biased;
             _ = cancel_token.cancelled() => return,
+            _ = wait_for_wakeup() => {
+                idle_interval = TIER_DELETE_JOURNAL_RECOVERY_INTERVAL;
+                interval.reset();
+            },
             _ = interval.tick() => {},
-            _ = api.ctx.wait_for_tier_delete_journal_recovery() => {},
         }
 
-        let stats = recover_tier_delete_journal_pass(
-            api.clone(),
-            &cancel_token,
-            &mut manifest_marker,
-            &mut marker,
-            TIER_DELETE_JOURNAL_RECOVERY_PASS_BUDGET,
-        )
-        .await;
+        let stats = recover().await;
         if stats.canceled {
             return;
         }
-        debug!(
-            event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-            manifest_pages = stats.manifest_pages,
-            manifest_scanned = stats.manifests.scanned,
-            manifest_advanced = stats.manifests.advanced,
-            manifest_deleted = stats.manifests.deleted,
-            manifest_retained = stats.manifests.retained,
-            manifest_failed = stats.manifests.failed,
-            manifest_errors = stats.manifest_errors,
-            manifest_truncated = stats.manifests.truncated,
-            manifest_next_marker = ?manifest_marker,
-            journal_pages = stats.journal_pages,
-            journal_scanned = stats.journals.scanned,
-            journal_deleted = stats.journals.deleted,
-            journal_failed = stats.journals.failed,
-            journal_errors = stats.journal_errors,
-            journal_truncated = stats.journals.truncated,
-            journal_next_marker = ?marker,
-            deadline_exhausted = stats.deadline_exhausted,
-            "Recovered tier delete journal pass"
-        );
+        if tier_delete_journal_recovery_pass_is_idle(&stats) {
+            // Only a completed empty sweep may defer discovery. Retained,
+            // failed, or paginated work keeps the original retry tick budget.
+            interval.reset_after(jitter_delay(idle_interval));
+            idle_interval = idle_interval
+                .saturating_mul(2)
+                .min(TIER_DELETE_JOURNAL_RECOVERY_MAX_IDLE_INTERVAL);
+        } else {
+            idle_interval = TIER_DELETE_JOURNAL_RECOVERY_INTERVAL;
+        }
     }
+}
+
+pub async fn run_tier_delete_journal_recovery_loop(api: Arc<ECStore>, cancel_token: CancellationToken) {
+    let mut marker: Option<String> = None;
+    let mut manifest_marker: Option<String> = None;
+    let wake_context = api.ctx.clone();
+    let recovery_cancel_token = cancel_token.clone();
+    drive_tier_delete_journal_recovery(
+        &cancel_token,
+        async move || wake_context.wait_for_tier_delete_journal_recovery().await,
+        async move || {
+            let stats = recover_tier_delete_journal_pass(
+                api.clone(),
+                &recovery_cancel_token,
+                &mut manifest_marker,
+                &mut marker,
+                TIER_DELETE_JOURNAL_RECOVERY_PASS_BUDGET,
+            )
+            .await;
+            if stats.canceled {
+                return stats;
+            }
+            debug!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                manifest_pages = stats.manifest_pages,
+                manifest_scanned = stats.manifests.scanned,
+                manifest_advanced = stats.manifests.advanced,
+                manifest_deleted = stats.manifests.deleted,
+                manifest_retained = stats.manifests.retained,
+                manifest_failed = stats.manifests.failed,
+                manifest_errors = stats.manifest_errors,
+                manifest_truncated = stats.manifests.truncated,
+                manifest_next_marker = ?manifest_marker,
+                journal_pages = stats.journal_pages,
+                journal_scanned = stats.journals.scanned,
+                journal_deleted = stats.journals.deleted,
+                journal_failed = stats.journals.failed,
+                journal_errors = stats.journal_errors,
+                journal_truncated = stats.journals.truncated,
+                journal_next_marker = ?marker,
+                deadline_exhausted = stats.deadline_exhausted,
+                "Recovered tier delete journal pass"
+            );
+            stats
+        },
+        jitter_tier_delete_journal_recovery_delay,
+    )
+    .await;
 }
 
 async fn await_tier_delete_journal_recovery<T, F>(
@@ -6180,16 +6239,20 @@ mod tests {
     use super::{
         PersistedTierDeleteJournalEntry, TIER_DELETE_DISPATCH_MANIFEST_VERSION, TIER_DELETE_DISPATCH_PARENT_RECORD_TYPE,
         TIER_DELETE_DISPATCH_PARENT_VERSION, TIER_DELETE_JOURNAL_EXACT_VERSION, TIER_DELETE_JOURNAL_LEGACY_PREFIX,
+        TIER_DELETE_JOURNAL_RECOVERY_INTERVAL, TIER_DELETE_JOURNAL_RECOVERY_MAX_IDLE_INTERVAL,
         TIER_DELETE_JOURNAL_SOLE_OWNER_VERSION, TIER_DELETE_JOURNAL_STATE_VERSION, TIER_DELETE_JOURNAL_TRANSACTION_VERSION,
         TIER_DELETE_JOURNAL_V1_RECOVERY_SCHEMA, TIER_DELETE_JOURNAL_V2_RECOVERY_SCHEMA, TIER_DELETE_JOURNAL_V6_PREFIX,
-        TIER_DELETE_JOURNAL_VERSION, TierDeleteDispatchChunkBinding, TierDeleteDispatchManifest, TierDeleteDispatchManifestState,
-        TierDeleteDispatchParent, TierDeleteDispatchParentState, TierDeleteDispatchRecord, await_tier_delete_journal_recovery,
-        decode_tier_delete_dispatch_record, decode_tier_delete_journal_entry, encode_tier_delete_dispatch_manifest,
+        TIER_DELETE_JOURNAL_VERSION, TierDeleteDispatchChunkBinding, TierDeleteDispatchManifest,
+        TierDeleteDispatchManifestRecoveryStats, TierDeleteDispatchManifestState, TierDeleteDispatchParent,
+        TierDeleteDispatchParentState, TierDeleteDispatchRecord, TierDeleteJournalRecoveryPassStats,
+        await_tier_delete_journal_recovery, bounded_tier_delete_journal_recovery_delay, decode_tier_delete_dispatch_record,
+        decode_tier_delete_journal_entry, drive_tier_delete_journal_recovery, encode_tier_delete_dispatch_manifest,
         encode_tier_delete_dispatch_parent, encode_tier_delete_journal_entry, object_info_references_tier_delete,
         record_tier_delete_journal_backend_identity, same_tier_delete_authorization_identity, same_tier_delete_journal_identity,
         tier_delete_dispatch_child_matches_parent, tier_delete_dispatch_chunk_manifest_object_name,
         tier_delete_dispatch_journal_set_digest, tier_delete_dispatch_manifest_object_name, tier_delete_journal_object_name,
-        tier_delete_source_matches_dispatch_scope, validate_legacy_tier_delete_recovery_source,
+        tier_delete_journal_recovery_pass_is_idle, tier_delete_source_matches_dispatch_scope,
+        validate_legacy_tier_delete_recovery_source,
     };
     use crate::bucket::lifecycle::tier_sweeper::{
         Jentry, TierDeleteDispatchBinding, TierDeleteJournalState, TierDeleteSourceIdentity,
@@ -6831,6 +6894,213 @@ mod tests {
         let err = decode_tier_delete_journal_entry(payload).expect_err("truncated journal payload should be rejected");
 
         assert!(err.to_string().contains("decode tier delete journal failed"));
+    }
+
+    fn empty_recovery_pass() -> TierDeleteJournalRecoveryPassStats {
+        TierDeleteJournalRecoveryPassStats {
+            manifest_pages: 1,
+            journal_pages: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tier_delete_journal_recovery_requires_both_completed_empty_queues_for_idle() {
+        assert!(tier_delete_journal_recovery_pass_is_idle(&empty_recovery_pass()));
+        let mut cases = Vec::new();
+        cases.push(TierDeleteJournalRecoveryPassStats::default());
+        for change in [
+            |stats: &mut TierDeleteJournalRecoveryPassStats| stats.manifest_pages = 0,
+            |stats: &mut TierDeleteJournalRecoveryPassStats| stats.journal_pages = 0,
+            |stats: &mut TierDeleteJournalRecoveryPassStats| stats.manifest_errors = 1,
+            |stats: &mut TierDeleteJournalRecoveryPassStats| stats.journal_errors = 1,
+            |stats: &mut TierDeleteJournalRecoveryPassStats| stats.deadline_exhausted = true,
+            |stats: &mut TierDeleteJournalRecoveryPassStats| stats.canceled = true,
+            |stats: &mut TierDeleteJournalRecoveryPassStats| stats.manifests.scanned = 1,
+            |stats: &mut TierDeleteJournalRecoveryPassStats| stats.manifests.retained = 1,
+            |stats: &mut TierDeleteJournalRecoveryPassStats| stats.manifests.failed = 1,
+            |stats: &mut TierDeleteJournalRecoveryPassStats| stats.manifests.truncated = true,
+            |stats: &mut TierDeleteJournalRecoveryPassStats| stats.manifests.next_marker = Some("next".to_owned()),
+            |stats: &mut TierDeleteJournalRecoveryPassStats| stats.journals.scanned = 1,
+            |stats: &mut TierDeleteJournalRecoveryPassStats| stats.journals.failed = 1,
+            |stats: &mut TierDeleteJournalRecoveryPassStats| stats.journals.truncated = true,
+            |stats: &mut TierDeleteJournalRecoveryPassStats| stats.journals.next_marker = Some("next".to_owned()),
+        ] {
+            let mut stats = empty_recovery_pass();
+            change(&mut stats);
+            cases.push(stats);
+        }
+        for stats in cases {
+            assert!(
+                !tier_delete_journal_recovery_pass_is_idle(&stats),
+                "unfinished recovery was considered idle: {stats:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_delete_journal_recovery_jitter_preserves_discovery_bounds() {
+        for delay in [
+            Duration::ZERO,
+            Duration::from_secs(60),
+            Duration::from_secs(120),
+            Duration::from_secs(300),
+            Duration::MAX,
+        ] {
+            for percent in [90, 100, 110] {
+                let jittered = bounded_tier_delete_journal_recovery_delay(delay, percent);
+                assert!(jittered >= TIER_DELETE_JOURNAL_RECOVERY_INTERVAL);
+                assert!(jittered <= TIER_DELETE_JOURNAL_RECOVERY_MAX_IDLE_INTERVAL);
+                if delay == Duration::from_secs(120) {
+                    assert!((Duration::from_secs(108)..=Duration::from_secs(132)).contains(&jittered));
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier_delete_journal_recovery_loop_starts_immediately_backs_off_and_wakes() {
+        let cancel = CancellationToken::new();
+        let wake = tokio::sync::Notify::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let started = tokio::time::Instant::now();
+        let recovery = drive_tier_delete_journal_recovery(
+            &cancel,
+            async || wake.notified().await,
+            async || {
+                tx.send(tokio::time::Instant::now()).expect("test must observe each pass");
+                empty_recovery_pass()
+            },
+            |delay| bounded_tier_delete_journal_recovery_delay(delay, 110),
+        );
+        let exercise = async {
+            assert_eq!(rx.recv().await.expect("startup recovery must run"), started);
+            let mut elapsed = Duration::ZERO;
+            for delay in [66, 132, 264, 300, 300] {
+                tokio::time::advance(Duration::from_secs(delay - 1)).await;
+                tokio::task::yield_now().await;
+                assert!(rx.try_recv().is_err(), "idle pass ran before its backoff");
+                tokio::time::advance(Duration::from_secs(1)).await;
+                elapsed += Duration::from_secs(delay);
+                assert_eq!(rx.recv().await.expect("bounded idle recovery must run"), started + elapsed);
+            }
+            wake.notify_one();
+            assert_eq!(rx.recv().await.expect("notification must bypass idle delay"), started + elapsed);
+            let first_idle_delay = Duration::from_secs(66);
+            tokio::time::advance(first_idle_delay).await;
+            assert_eq!(
+                rx.recv().await.expect("wakeup must reset idle backoff"),
+                started + elapsed + first_idle_delay
+            );
+            cancel.cancel();
+        };
+        tokio::join!(recovery, exercise);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier_delete_journal_recovery_loop_preserves_known_work_tick_deadline() {
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let started = tokio::time::Instant::now();
+        let mut pass = 0;
+        let recovery = drive_tier_delete_journal_recovery(
+            &cancel,
+            async || std::future::pending::<()>().await,
+            async || {
+                tx.send(tokio::time::Instant::now()).expect("test must observe each pass");
+                pass += 1;
+                if pass <= 3 {
+                    return empty_recovery_pass();
+                }
+                if pass == 4 {
+                    tokio::time::sleep(Duration::from_secs(40)).await;
+                }
+                let mut stats = empty_recovery_pass();
+                match pass {
+                    4 => {
+                        stats.manifests = TierDeleteDispatchManifestRecoveryStats {
+                            retained: 1,
+                            scanned: 1,
+                            ..Default::default()
+                        }
+                    }
+                    5 => stats.manifest_errors = 1,
+                    6 => stats.journal_errors = 1,
+                    7 => stats.manifests.truncated = true,
+                    8 => stats.journals.failed = 1,
+                    9 => stats.deadline_exhausted = true,
+                    _ => stats.journals.next_marker = Some("next-page".to_owned()),
+                }
+                stats
+            },
+            std::convert::identity,
+        );
+        let exercise = async {
+            for expected in [0, 60, 180, 420] {
+                assert_eq!(
+                    rx.recv().await.expect("idle and work passes must run"),
+                    started + Duration::from_secs(expected)
+                );
+            }
+            tokio::time::advance(Duration::from_secs(59)).await;
+            tokio::task::yield_now().await;
+            assert!(rx.try_recv().is_err(), "known work ran before the next tick");
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for expected in [480, 540, 600, 660, 720, 780, 840] {
+                assert_eq!(
+                    rx.recv().await.expect("unfinished work must retain the base tick deadline"),
+                    started + Duration::from_secs(expected)
+                );
+            }
+            cancel.cancel();
+        };
+        tokio::join!(recovery, exercise);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier_delete_journal_recovery_loop_keeps_wakeup_received_during_a_pass() {
+        let cancel = CancellationToken::new();
+        let wake = tokio::sync::Notify::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let started = tokio::time::Instant::now();
+        let mut first = true;
+        let recovery = drive_tier_delete_journal_recovery(
+            &cancel,
+            async || wake.notified().await,
+            async || {
+                tx.send(tokio::time::Instant::now()).expect("test must observe each pass");
+                if first {
+                    first = false;
+                    tokio::time::sleep(Duration::from_secs(40)).await;
+                }
+                empty_recovery_pass()
+            },
+            std::convert::identity,
+        );
+        let exercise = async {
+            assert_eq!(rx.recv().await.expect("startup recovery must run"), started);
+            wake.notify_one();
+            tokio::time::advance(Duration::from_secs(40)).await;
+            assert_eq!(
+                rx.recv().await.expect("a notification during recovery must remain pending"),
+                started + Duration::from_secs(40)
+            );
+            cancel.cancel();
+        };
+        tokio::join!(recovery, exercise);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier_delete_journal_recovery_loop_cancellation_wins_over_ready_wakeup() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        drive_tier_delete_journal_recovery(
+            &cancel,
+            async || {},
+            async || panic!("shutdown must prevent admission even when a wakeup and startup tick are ready"),
+            std::convert::identity,
+        )
+        .await;
     }
 
     #[tokio::test]

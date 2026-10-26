@@ -347,6 +347,9 @@ fn relocate_pool_storage(cluster: &mut RustFSTestClusterEnvironment, node_idx: u
 }
 
 pub(super) fn configure_node_logs(cluster: &mut RustFSTestClusterEnvironment, capture_dir: Option<&Path>) -> TestResult {
+    if let Ok(filter) = std::env::var("RUSTFS_E2E_LOG_FILTER") {
+        cluster.set_env("RUST_LOG", filter);
+    }
     if let Some(directory) = capture_dir {
         std::fs::create_dir_all(directory)?;
         for node_idx in 0..cluster.nodes.len() {
