@@ -302,13 +302,6 @@ pub(crate) fn build_json_response(
 }
 
 /// Owned-boundary form of [`build_json_response`].
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-    )
-)]
 pub(crate) fn owned_build_json_response(
     status: StatusCode,
     body: rustfs_s3_types::Body,

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::authorize_admin_envelope;
+use super::profile::authorize_profile_envelope;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::current_outbound_tls_state;
@@ -22,8 +22,7 @@ use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
 use hyper::Method;
 use matchit::Params;
-use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result};
 use rustfs_tls_runtime::{OutboundOnlySnapshotArgs, TlsConsumerStatusItem, TlsDebugStatusResponse, TlsRuntimeStatusSnapshot};
 
 pub fn register_tls_debug_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -41,22 +40,10 @@ const PROTOS_GRPC_CHANNEL_CONSUMER: &str = "protos_grpc_channel";
 const RIO_HTTP_READER_CONSUMER: &str = "rio_http_reader";
 const ECSTORE_TRANSITION_CLIENT_CONSUMER: &str = "ecstore_transition_client";
 
-/// Owned-boundary form of `super::profile::authorize_profile_request`. The
-/// pre-check keeps this endpoint's historical `AccessDenied` missing-credentials
-/// response; the shared gate reports `InvalidRequest` "get cred failed".
-async fn authorize_profile_request(req: &AdminRequest) -> S3Result<()> {
-    if req.credentials().is_none() {
-        return Err(s3_error!(AccessDenied, "Signature is required"));
-    }
-
-    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ProfilingAdminAction)]).await?;
-    Ok(())
-}
-
 #[async_trait::async_trait]
 impl Operation for TlsStatusHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
-        authorize_profile_request(&req).await?;
+        authorize_profile_envelope(req.envelope()).await?;
 
         let tls_path = rustfs_utils::get_env_opt_str(rustfs_config::ENV_RUSTFS_TLS_PATH).unwrap_or_default();
         let outbound = current_outbound_tls_state().await;
@@ -131,7 +118,7 @@ mod tests {
     #[tokio::test]
     async fn tls_status_handler_rejects_missing_credentials() {
         let result = TlsStatusHandler {}.call(build_tls_status_request(), Params::new()).await;
-        let err = result.err().expect("tls status handler must reject unauthenticated requests");
+        let err = result.expect_err("tls status handler must reject unauthenticated requests");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 

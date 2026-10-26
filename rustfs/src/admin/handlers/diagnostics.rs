@@ -27,6 +27,7 @@ use crate::admin::auth::authorize_admin_envelope;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::storage_api::access::spawn_traced;
+use crate::admin::utils::owned_json_response;
 use crate::server::ADMIN_PREFIX;
 use crate::storage::storage_api::get_global_lock_clients;
 use bytes::Bytes;
@@ -38,7 +39,7 @@ use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_lock::{LockLeaseInfo, LockMode, LockType, ObjectKey, get_global_lock_manager};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, StdError, s3_error};
+use rustfs_s3_types::{Body, S3Error, S3Result, StdError, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -141,16 +142,6 @@ pub fn register_diagnostics_route(r: &mut S3Router<AdminOperation>) -> std::io::
 // ---------------------------------------------------------------------------
 // Shared auth helper
 // ---------------------------------------------------------------------------
-
-/// Owned-boundary form of `crate::admin::utils::json_response`, which still
-/// answers with the s3s response type.
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<AdminResponse> {
-    let data = serde_json::to_vec(value)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    Ok(AdminResponse::with_headers(status, Body::from(data), headers))
-}
 
 /// The pre-check keeps these endpoints' historical `AccessDenied` missing-credentials
 /// response; the shared gate reports `InvalidRequest` "get cred failed".
@@ -425,7 +416,7 @@ impl Operation for TopLocksHandler {
         authorize(&req, AdminAction::TopLocksAdminAction).await?;
         let limit = parse_top_locks_limit(req.uri());
         let response = collect_top_locks(limit).await;
-        json_response(StatusCode::OK, &response)
+        owned_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -500,7 +491,7 @@ impl Operation for ForceUnlockHandler {
                     "namespace lock subsystem is disabled (RUSTFS_LOCK_ENABLED=false); nothing to unlock".to_string(),
                 ),
             };
-            return json_response(StatusCode::OK, &response);
+            return owned_json_response(StatusCode::OK, &response);
         };
 
         let mut results = Vec::with_capacity(resources.len());
@@ -522,7 +513,7 @@ impl Operation for ForceUnlockHandler {
             total_released,
             capability_note: None,
         };
-        json_response(StatusCode::OK, &response)
+        owned_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -698,7 +689,7 @@ impl Operation for HealthInfoHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize(&req, AdminAction::HealthInfoAdminAction).await?;
         let response = collect_health_info().await;
-        json_response(StatusCode::OK, &response)
+        owned_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -1036,7 +1027,7 @@ impl Operation for SpeedtestHandler {
                 duration_secs: None,
             },
         };
-        json_response(StatusCode::OK, &response)
+        owned_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -1153,7 +1144,7 @@ impl Operation for SpeedtestClientDevnullHandler {
             rx_bytes: Some(total),
             duration_secs: Some(elapsed.as_secs_f64()),
         };
-        json_response(StatusCode::OK, &response)
+        owned_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -1223,8 +1214,7 @@ mod tests {
         let err = TopLocksHandler {}
             .call(build_request(Method::GET, "/rustfs/admin/v3/top/locks"), Params::new())
             .await
-            .err()
-            .expect("must reject anonymous requests");
+            .expect_err("must reject anonymous requests");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 
@@ -1233,8 +1223,7 @@ mod tests {
         let err = ForceUnlockHandler {}
             .call(build_request(Method::POST, "/rustfs/admin/v3/force-unlock"), Params::new())
             .await
-            .err()
-            .expect("must reject anonymous requests");
+            .expect_err("must reject anonymous requests");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 
@@ -1243,8 +1232,7 @@ mod tests {
         let err = HealthInfoHandler {}
             .call(build_request(Method::GET, "/rustfs/admin/v3/healthinfo"), Params::new())
             .await
-            .err()
-            .expect("must reject anonymous requests");
+            .expect_err("must reject anonymous requests");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 
@@ -1253,8 +1241,7 @@ mod tests {
         let err = SpeedtestHandler {}
             .call(build_request(Method::POST, "/rustfs/admin/v3/speedtest/drive"), Params::new())
             .await
-            .err()
-            .expect("must reject anonymous requests");
+            .expect_err("must reject anonymous requests");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 

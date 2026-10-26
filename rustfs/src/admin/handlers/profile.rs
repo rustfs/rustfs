@@ -37,13 +37,6 @@ pub(super) async fn authorize_profile_request(req: &S3Request<Body>) -> S3Result
 
 /// Owned-boundary form of [`authorize_profile_request`] with the same
 /// `AccessDenied` pre-check.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-    )
-)]
 pub(super) async fn authorize_profile_envelope(envelope: &RequestEnvelope) -> S3Result<()> {
     if envelope.credentials().is_none() {
         return Err(s3_error!(AccessDenied, "Signature is required"));

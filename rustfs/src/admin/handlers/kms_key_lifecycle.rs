@@ -20,7 +20,7 @@ use crate::admin::auth::validate_admin_request_with_kms_key;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::current_kms_runtime_service_manager;
-use crate::admin::utils::extract_query_params;
+use crate::admin::utils::{extract_query_params, owned_json_response};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};
@@ -31,7 +31,7 @@ use rustfs_kms::{
     types::{DescribeKeyRequest, KeyMetadata, OperationContext},
 };
 use rustfs_policy::policy::action::{Action, KmsAction};
-use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_s3_types::{S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -235,7 +235,7 @@ async fn execute_lifecycle(
 }
 
 fn unavailable_response(message: &str, key_id: String) -> S3Result<AdminResponse> {
-    json_response(
+    owned_json_response(
         StatusCode::SERVICE_UNAVAILABLE,
         &KmsKeyLifecycleResponse {
             success: false,
@@ -285,7 +285,7 @@ async fn handle_lifecycle_request(
     let request: KmsKeyLifecycleRequest = if body.is_empty() {
         let query_params = extract_query_params(req.uri());
         let Some(key_id) = query_params.get("keyId") else {
-            return json_response(
+            return owned_json_response(
                 StatusCode::BAD_REQUEST,
                 &KmsKeyLifecycleResponse {
                     success: false,
@@ -309,7 +309,7 @@ async fn handle_lifecycle_request(
     };
 
     let (status, response) = execute_lifecycle(&manager, &request.key_id, operation, audit.context()).await;
-    json_response(status, &response)
+    owned_json_response(status, &response)
 }
 
 fn kms_service_manager_from_context() -> Option<Arc<rustfs_kms::KmsServiceManager>> {
@@ -318,16 +318,6 @@ fn kms_service_manager_from_context() -> Option<Arc<rustfs_kms::KmsServiceManage
 
 /// Enable a disabled KMS key
 pub struct EnableKmsKeyHandler;
-
-/// Owned-boundary form of `crate::admin::utils::json_response`, which still
-/// answers with the s3s response type.
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<AdminResponse> {
-    let data = serde_json::to_vec(value)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
-    let mut headers = http::HeaderMap::new();
-    headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
-    Ok(AdminResponse::with_headers(status, Body::from(data), headers))
-}
 
 #[async_trait::async_trait]
 impl Operation for EnableKmsKeyHandler {
