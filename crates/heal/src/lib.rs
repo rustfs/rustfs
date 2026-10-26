@@ -18,6 +18,10 @@ mod error;
 pub mod heal;
 
 pub use error::{Error, Result};
+use futures::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
 pub use heal::{
     HealAdmissionTelemetry, HealManager, HealOperationsSnapshot, HealOptions, HealPriority, HealPriorityCounts, HealRequest,
     HealSourceCounts, HealType,
@@ -68,12 +72,43 @@ pub async fn shutdown_ahm_services() -> Result<()> {
     if let Some(cancel_token) = GLOBAL_AHM_SERVICES_CANCEL_TOKEN.get() {
         cancel_token.cancel();
     }
+    if let Some(runtime) = GLOBAL_HEAL_RUNTIME.get() {
+        runtime.mrf_stop.cancel();
+        runtime.mrf_task.wait().await?;
+    }
     Ok(())
+}
+
+// The runtime retains the shared future that owns the actual consumer handle.
+// Each waiter only clones the completion receipt; dropping one cannot detach
+// the worker, and completed success/failure remains available to later waiters.
+struct MrfConsumerJoin {
+    completion: Option<Shared<BoxFuture<'static, std::result::Result<(), Arc<tokio::task::JoinError>>>>>,
+}
+
+impl MrfConsumerJoin {
+    fn new(task: Option<tokio::task::JoinHandle<()>>) -> Self {
+        Self {
+            completion: task.map(|task| async move { task.await.map_err(Arc::new) }.boxed().shared()),
+        }
+    }
+
+    async fn wait(&self) -> Result<()> {
+        let Some(completion) = &self.completion else {
+            return Err(Error::other("MRF consumer did not start with an owned handle"));
+        };
+        completion
+            .clone()
+            .await
+            .map_err(|error| Error::other(format!("MRF consumer failed to join: {error}")))
+    }
 }
 
 struct HealRuntime {
     manager: Arc<HealManager>,
     channel_processor: Arc<Mutex<HealChannelProcessor>>,
+    mrf_stop: CancellationToken,
+    mrf_task: MrfConsumerJoin,
 }
 
 /// Process-wide heal runtime. Async single-flight initialization prevents two
@@ -267,10 +302,6 @@ pub async fn init_heal_manager_with_workload_provider(
             return Err(err);
         }
 
-        // Start the MRF intent consumer (error-path repair intents + durable
-        // journal replay) now that the manager can accept submissions.
-        heal::mrf_queue::spawn_mrf_consumer(heal_manager.clone());
-
         #[cfg(test)]
         test_hook_after_manager_start().await;
 
@@ -293,10 +324,16 @@ pub async fn init_heal_manager_with_workload_provider(
             }
         };
         let channel_processor = Arc::new(Mutex::new(HealChannelProcessor::new(heal_manager.clone())));
+        // Channel initialization can fail and be retried. Do not claim the
+        // process-wide MRF channels before this recoverable boundary succeeds.
+        let mrf_stop = CancellationToken::new();
+        let mrf_task = MrfConsumerJoin::new(heal::mrf_queue::spawn_owned_mrf_consumer(heal_manager.clone(), mrf_stop.clone()));
         GLOBAL_HEAL_RUNTIME
             .set(HealRuntime {
                 manager: heal_manager.clone(),
                 channel_processor: channel_processor.clone(),
+                mrf_stop,
+                mrf_task,
             })
             .map_err(|_| Error::Config("Heal manager already initialized".to_string()))?;
 
@@ -491,8 +528,8 @@ pub(crate) fn set_heal_queue_length(count: usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, HEAL_RUNTIME_INIT_TEST_HOOK, HealRuntimeInitTestHook, get_heal_channel_processor, get_heal_manager,
-        heal::DiskStore, heal::manager::HealConfig, heal::storage::HealListItem, heal::storage::HealObjectInfo,
+        Error, HEAL_RUNTIME_INIT_TEST_HOOK, HealRuntimeInitTestHook, MrfConsumerJoin, get_heal_channel_processor,
+        get_heal_manager, heal::DiskStore, heal::manager::HealConfig, heal::storage::HealListItem, heal::storage::HealObjectInfo,
         heal::storage::HealStorageAPI, init_heal_manager, run_owned_initialization,
     };
     use crate::heal::storage_api::status::BucketInfo;
@@ -564,6 +601,51 @@ mod tests {
         async fn get_disk_for_resume(&self, _set_disk_id: &str) -> Result<DiskStore, Error> {
             Err(Error::other("not implemented in tests"))
         }
+    }
+
+    #[tokio::test]
+    async fn mrf_owned_join_survives_cancelled_shutdown_waiter() {
+        let release = Arc::new(Notify::new());
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_release = release.clone();
+        let worker_completed = completed.clone();
+        let owner = Arc::new(MrfConsumerJoin::new(Some(tokio::spawn(async move {
+            worker_release.notified().await;
+            worker_completed.store(true, Ordering::Release);
+        }))));
+        let waiting_owner = owner.clone();
+        let (started, entered) = oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let _ = started.send(());
+            waiting_owner.wait().await
+        });
+        entered.await.expect("shutdown waiter polls the shared actual handle");
+        waiter.abort();
+        let _ = waiter.await;
+        assert!(!completed.load(Ordering::Acquire));
+        assert!(owner.completion.as_ref().expect("owned handle").peek().is_none());
+        let second_owner = owner.clone();
+        let second = tokio::spawn(async move { second_owner.wait().await });
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), owner.wait())
+            .await
+            .expect("owned MRF worker completes after release")
+            .expect("successful real join");
+        second
+            .await
+            .expect("concurrent waiter completes")
+            .expect("same successful receipt");
+        assert!(completed.load(Ordering::Acquire));
+        owner.wait().await.expect("repeat join receipt remains successful");
+    }
+
+    #[tokio::test]
+    async fn mrf_owned_join_failure_stays_failed() {
+        let owner = MrfConsumerJoin::new(Some(tokio::spawn(async { panic!("MRF owned-join test failure") })));
+        assert!(owner.wait().await.is_err());
+        assert!(owner.wait().await.is_err(), "a failed join must not become a successful receipt");
+        let unavailable = MrfConsumerJoin::new(None);
+        assert!(unavailable.wait().await.is_err(), "a missing owned handle is not a successful receipt");
     }
 
     #[tokio::test]
@@ -644,5 +726,18 @@ mod tests {
         assert_eq!(hook.stops.load(Ordering::SeqCst), 1);
 
         manager.stop().await.expect("manager should stop cleanly");
+        super::shutdown_ahm_services()
+            .await
+            .expect("retried initialization retains an actual MRF join receipt");
+        let runtime = super::GLOBAL_HEAL_RUNTIME.get().expect("published complete runtime");
+        assert!(
+            runtime
+                .mrf_task
+                .completion
+                .as_ref()
+                .expect("actual owned handle")
+                .peek()
+                .is_some_and(|result| result.is_ok())
+        );
     }
 }

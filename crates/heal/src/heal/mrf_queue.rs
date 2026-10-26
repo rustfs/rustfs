@@ -995,6 +995,33 @@ struct MrfRuntime {
 }
 
 impl MrfRuntime {
+    fn admit_best_effort(&mut self, intent: MrfIntent) {
+        if intent.kind.is_durable() {
+            if self.admit_partial_write(intent.clone(), None).is_err() {
+                rustfs_common::mrf_channel::release_mrf_intent(&intent);
+                counter!("rustfs_heal_mrf_dropped_total", "reason" => "queue_overflow").increment(1);
+            }
+            return;
+        }
+        if !self.queue.pending_keys.contains(&queue_key(&intent))
+            && (self.queue.depth() + self.partial_writes.depth() >= self.queue.capacity
+                || self.queue.bytes() + self.partial_writes.bytes() + intent.estimated_bytes() > self.queue.byte_budget)
+        {
+            rustfs_common::mrf_channel::release_mrf_intent(&intent);
+            counter!("rustfs_heal_mrf_dropped_total", "reason" => "queue_overflow").increment(1);
+            return;
+        }
+        match self.queue.try_push_typed(intent.clone()) {
+            MrfQueuePushResult::Enqueued => {
+                self.new_since_flush += 1;
+                self.dirty = true;
+            }
+            MrfQueuePushResult::Coalesced | MrfQueuePushResult::Rejected => {
+                rustfs_common::mrf_channel::release_mrf_intent(&intent);
+            }
+        }
+    }
+
     fn adopt_replayed_partial_writes(&mut self, intents: Vec<(MrfIntent, Option<ResponsibilityCheckpoint>)>) {
         // The decoded checkpoint bounds replay; live admission subsequently
         // shares these limits with the ordinary pending queue.
@@ -1550,6 +1577,20 @@ fn map_mrf_lifecycle_state_error(error: &'static str) -> MrfLifecycleControlErro
 /// ordinary MRF kill-switch.
 /// Public for integration tests that drive the real consumer loop.
 pub fn spawn_mrf_consumer(manager: Arc<HealManager>) {
+    let _ = spawn_mrf_consumer_with_stop(manager, None);
+}
+
+pub(crate) fn spawn_owned_mrf_consumer(
+    manager: Arc<HealManager>,
+    stop: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    spawn_mrf_consumer_with_stop(manager, Some(stop))
+}
+
+fn spawn_mrf_consumer_with_stop(
+    manager: Arc<HealManager>,
+    stop: Option<tokio_util::sync::CancellationToken>,
+) -> Option<tokio::task::JoinHandle<()>> {
     let enabled = rustfs_utils::get_env_bool(rustfs_config::ENV_HEAL_MRF_ENABLE, rustfs_config::DEFAULT_HEAL_MRF_ENABLE);
     rustfs_common::mrf_channel::set_mrf_delivery_enabled(enabled);
     if !enabled {
@@ -1571,13 +1612,21 @@ pub fn spawn_mrf_consumer(manager: Arc<HealManager>) {
                     error = err,
                     "MRF channel initialization failed; intents will be dropped at producers"
                 );
-                return;
+                return None;
             }
         };
-    tokio::spawn(async move {
-        run_mrf_consumer(manager, receiver, durable_receiver, lifecycle_receiver).await;
-    });
+    let task = match stop {
+        Some(stop) => tokio::spawn(run_mrf_consumer_with_stop(
+            manager,
+            receiver,
+            durable_receiver,
+            lifecycle_receiver,
+            Some(stop),
+        )),
+        None => tokio::spawn(run_mrf_consumer(manager, receiver, durable_receiver, lifecycle_receiver)),
+    };
     tracing::info!(target: "rustfs::heal::mrf", "MRF intent consumer started");
+    Some(task)
 }
 
 /// Replay the journal once for integration tests, publishing a durable
@@ -1937,9 +1986,19 @@ async fn replay_into(
 /// while persisting the pending snapshot.
 async fn run_mrf_consumer(
     manager: Arc<HealManager>,
+    receiver: mpsc::Receiver<MrfIntent>,
+    durable_receiver: mpsc::Receiver<MrfDurableSubmission>,
+    lifecycle_receiver: mpsc::Receiver<MrfLifecycleCommand>,
+) {
+    run_mrf_consumer_with_stop(manager, receiver, durable_receiver, lifecycle_receiver, None).await;
+}
+
+async fn run_mrf_consumer_with_stop(
+    manager: Arc<HealManager>,
     mut receiver: mpsc::Receiver<MrfIntent>,
     mut durable_receiver: mpsc::Receiver<MrfDurableSubmission>,
     mut lifecycle_receiver: mpsc::Receiver<MrfLifecycleCommand>,
+    stop: Option<tokio_util::sync::CancellationToken>,
 ) {
     let config = MrfConsumerConfig::default();
     let mut runtime = MrfRuntime {
@@ -1991,9 +2050,25 @@ async fn run_mrf_consumer(
     let mut durable_batch = Vec::with_capacity(runtime.config.replay_batch);
 
     loop {
+        if stop.as_ref().is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            finalize_mrf_consumer(&mut runtime, &mut receiver, &mut durable_receiver, &mut lifecycle_receiver).await;
+            return;
+        }
         tokio::select! {
+            _ = async {
+                match &stop {
+                    Some(stop) => stop.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                finalize_mrf_consumer(&mut runtime, &mut receiver, &mut durable_receiver, &mut lifecycle_receiver).await;
+                return;
+            }
             received = durable_receiver.recv_many(&mut durable_batch, runtime.config.replay_batch) => {
                 if received == 0 {
+                    if stop.is_some() {
+                        finalize_mrf_consumer(&mut runtime, &mut receiver, &mut durable_receiver, &mut lifecycle_receiver).await;
+                    }
                     return;
                 }
                 let mut responses = Vec::with_capacity(received);
@@ -2013,6 +2088,9 @@ async fn run_mrf_consumer(
             }
             command = lifecycle_receiver.recv() => {
                 let Some(command) = command else {
+                    if stop.is_some() {
+                        finalize_mrf_consumer(&mut runtime, &mut receiver, &mut durable_receiver, &mut lifecycle_receiver).await;
+                    }
                     return;
                 };
                 match command {
@@ -2056,6 +2134,10 @@ async fn run_mrf_consumer(
             }
             received = receiver.recv_many(&mut batch, runtime.config.replay_batch) => {
                 if received == 0 {
+                    if stop.is_some() {
+                        finalize_mrf_consumer(&mut runtime, &mut receiver, &mut durable_receiver, &mut lifecycle_receiver).await;
+                        return;
+                    }
                     // Channel closed: flush once more unless the snapshot is
                     // provably current AND idle (a dirty or pending state
                     // gets one last persist attempt, matching the shutdown
@@ -2070,30 +2152,7 @@ async fn run_mrf_consumer(
                     return;
                 }
                 for intent in batch.drain(..) {
-                    if intent.kind.is_durable() {
-                        if runtime.admit_partial_write(intent.clone(), None).is_err() {
-                            rustfs_common::mrf_channel::release_mrf_intent(&intent);
-                            counter!("rustfs_heal_mrf_dropped_total", "reason" => "queue_overflow").increment(1);
-                        }
-                        continue;
-                    }
-                    if !runtime.queue.pending_keys.contains(&queue_key(&intent))
-                        && (runtime.queue.depth() + runtime.partial_writes.depth() >= runtime.queue.capacity
-                            || runtime.queue.bytes() + runtime.partial_writes.bytes() + intent.estimated_bytes() > runtime.queue.byte_budget)
-                    {
-                        rustfs_common::mrf_channel::release_mrf_intent(&intent);
-                        counter!("rustfs_heal_mrf_dropped_total", "reason" => "queue_overflow").increment(1);
-                        continue;
-                    }
-                    match runtime.queue.try_push_typed(intent.clone()) {
-                        MrfQueuePushResult::Enqueued => {
-                            runtime.new_since_flush += 1;
-                            runtime.dirty = true;
-                        }
-                        MrfQueuePushResult::Coalesced | MrfQueuePushResult::Rejected => {
-                            rustfs_common::mrf_channel::release_mrf_intent(&intent);
-                        }
-                    }
+                    runtime.admit_best_effort(intent);
                 }
                 if runtime.dirty && runtime.partial_writes.depth() > 0 {
                     runtime.flush().await;
@@ -2137,6 +2196,64 @@ async fn run_mrf_consumer(
             }
         }
     }
+}
+
+// Closing the receivers fences new ingress while preserving all messages that
+// were already accepted by these channels. Existing admission limits and replies
+// remain unchanged; a failed checkpoint keeps this runtime alive for retry.
+async fn finalize_mrf_consumer(
+    runtime: &mut MrfRuntime,
+    receiver: &mut mpsc::Receiver<MrfIntent>,
+    durable_receiver: &mut mpsc::Receiver<MrfDurableSubmission>,
+    lifecycle_receiver: &mut mpsc::Receiver<MrfLifecycleCommand>,
+) {
+    receiver.close();
+    durable_receiver.close();
+    lifecycle_receiver.close();
+    while let Some(command) = lifecycle_receiver.recv().await {
+        match command {
+            MrfLifecycleCommand::List { response, .. } => {
+                let _ = response.send(Err(MrfLifecycleControlError::Unavailable));
+            }
+            MrfLifecycleCommand::Recheck { response, .. }
+            | MrfLifecycleCommand::Refresh { response, .. }
+            | MrfLifecycleCommand::AcceptUnverifiedRisk { response, .. } => {
+                let _ = response.send(Err(MrfLifecycleControlError::Unavailable));
+            }
+        }
+    }
+    while let Some(intent) = receiver.recv().await {
+        runtime.admit_best_effort(intent);
+    }
+    let mut responses = Vec::new();
+    while let Some(submission) = durable_receiver.recv().await {
+        match runtime.admit_partial_write(submission.intent, submission.source_bucket_incarnation_id) {
+            Ok(()) => responses.push(submission.response),
+            Err(error) => {
+                let _ = submission.response.send(Err(error));
+            }
+        }
+    }
+    let needs_flush = runtime.dirty || runtime.queue.depth() > 0 || runtime.partial_writes.depth() > 0;
+    let persisted = !needs_flush || runtime.flush().await;
+    for response in responses {
+        let _ = response.send(if persisted {
+            Ok(())
+        } else {
+            Err(MrfDurableAdmissionError::Persistence)
+        });
+    }
+    if !persisted {
+        let mut retry = tokio::time::interval(runtime.config.flush_interval);
+        retry.tick().await;
+        loop {
+            retry.tick().await;
+            if runtime.flush().await {
+                break;
+            }
+        }
+    }
+    runtime.publish_metrics();
 }
 
 /// What the periodic tick should do, as a pure function of the runtime state
@@ -2185,6 +2302,7 @@ mod tests {
     mod empty_events_tests;
     mod lifecycle_replay_tests;
     mod lifecycle_v2_reader_tests;
+    mod owned_shutdown_tests;
 
     #[tokio::test(start_paused = true)]
     async fn journal_disk_io_bounds_fanout_and_collects_every_result() {
