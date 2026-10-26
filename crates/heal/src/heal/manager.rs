@@ -825,6 +825,21 @@ fn admin_heal_options_compatible(left: &HealOptions, right: &HealOptions) -> boo
         && left.no_lock == right.no_lock
 }
 
+fn replacement_request_compatible(
+    request: &HealRequest,
+    owner_type: &HealType,
+    owner_options: &HealOptions,
+    owner_source: HealRequestSource,
+) -> bool {
+    request.source == HealRequestSource::AutoHeal
+        && owner_source == HealRequestSource::AutoHeal
+        && matches!(request.heal_type, HealType::ErasureSet { .. })
+        && request.heal_type == *owner_type
+        && request.options.pool_index == owner_options.pool_index
+        && request.options.set_index == owner_options.set_index
+        && admin_heal_options_compatible(&request.options, owner_options)
+}
+
 fn admin_overlap_rejection(
     request: &HealRequest,
     owner_type: &HealType,
@@ -1283,6 +1298,23 @@ impl HealManager {
         let per_object_request = request.heal_type.is_per_object();
         let best_effort_reserve = best_effort_queue_reserve(queue_capacity);
         let best_effort_source_reserves = best_effort_source_reserves(queue_capacity);
+
+        // Scanner and retry admission bypass submit_heal_request's duplicate
+        // checks. Keep their target ownership checks ahead of queue capacity.
+        if !request.force_start
+            && request.source == HealRequestSource::AutoHeal
+            && !request.heal_endpoints.is_empty()
+            && let Some(owner_id) = queue
+                .queued_request_id_for_dedup_key(&PriorityHealQueue::make_dedup_key(&request))
+                .map(ToOwned::to_owned)
+        {
+            let mut admission = Self::duplicate_admission_for_request(&request, config);
+            if admission == HealAdmissionResult::Merged && !queue.merge_replacement_targets(&owner_id, &request, true) {
+                admission = HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning);
+            }
+            Self::record_admission_metric(request.source, admission, context);
+            return HealAdmissionDecision::new(admission);
+        }
 
         if queue_len >= queue_capacity && !request.force_start {
             if Self::can_displace_queued_work(&request)
@@ -2260,7 +2292,7 @@ impl HealManager {
             // HS-06: under the minio_error overlap policy an exact duplicate
             // admin start reports the typed AlreadyRunning rejection instead
             // of the silent merge (MinIO's ErrHealAlreadyRunning).
-            let admission = if (request.source == HealRequestSource::Admin
+            let mut admission = if (request.source == HealRequestSource::Admin
                 && config.overlap_policy == HealOverlapPolicy::MinioError)
                 || (duplicate_state != "queued" && mrf_notice_target.as_ref().is_some_and(|target| target.kind.is_durable()))
             {
@@ -2270,6 +2302,43 @@ impl HealManager {
             } else {
                 Self::duplicate_admission_for_request(&request, &config)
             };
+            if matches!(admission, HealAdmissionResult::Merged)
+                && request.source == HealRequestSource::AutoHeal
+                && !request.heal_endpoints.is_empty()
+            {
+                let (owner_recovered, incoming_recovered) = {
+                    // Match queue -> recovery-anchor ordering in the scanner.
+                    let anchors = self
+                        .replacement_recovery_anchors
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    (anchors.contains_key(&merged_task_id), anchors.contains_key(&request.id))
+                };
+                let covered = if (incoming_recovered || request.replacement_targets_frozen) && request.id != merged_task_id {
+                    false
+                } else if duplicate_state == "queued" {
+                    queue.merge_replacement_targets(&merged_task_id, &request, !owner_recovered && !incoming_recovered)
+                } else {
+                    let owner = active_heals
+                        .get(&merged_task_id)
+                        .map(|task| (&task.heal_type, &task.options, task.source, &task.heal_endpoints))
+                        .or_else(|| {
+                            retrying_heals.get(&merged_task_id).map(|retry| {
+                                let owner = &retry.request;
+                                (&owner.heal_type, &owner.options, owner.source, &owner.heal_endpoints)
+                            })
+                        });
+                    owner.is_some_and(|(heal_type, options, source, endpoints)| {
+                        replacement_request_compatible(&request, heal_type, options, source)
+                            && request.heal_endpoints.iter().all(|endpoint| endpoints.contains(endpoint))
+                    })
+                };
+                if !covered {
+                    // A frozen generation cannot certify newly arriving disks.
+                    // Leave them discoverable by the scanner for the next pass.
+                    admission = HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning);
+                }
+            }
             if matches!(admission, HealAdmissionResult::Merged)
                 && let Some(target) = mrf_notice_target
             {

@@ -590,6 +590,7 @@ impl HealManager {
             req.id = task_id;
             req.source = HealRequestSource::AutoHeal;
             req.heal_endpoints = heal_endpoints;
+            req.replacement_targets_frozen = true;
             let request_id = req.id.clone();
             self.replacement_recovery_anchors
                 .lock()

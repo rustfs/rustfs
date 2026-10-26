@@ -680,6 +680,44 @@ impl PriorityHealQueue {
         self.heap.iter().map(|item| &item.request)
     }
 
+    pub(super) fn merge_replacement_targets(&mut self, owner_id: &str, request: &HealRequest, allow_expand: bool) -> bool {
+        let Some(owner) = self.requests().find(|owner| owner.id == owner_id) else {
+            return false;
+        };
+        if !replacement_request_compatible(request, &owner.heal_type, &owner.options, owner.source)
+            || (request.replacement_targets_frozen && request.id != owner.id)
+        {
+            return false;
+        }
+        if request
+            .heal_endpoints
+            .iter()
+            .all(|endpoint| owner.heal_endpoints.contains(endpoint))
+        {
+            return true;
+        }
+        if !allow_expand
+            || owner.replacement_targets_frozen
+            || request.replacement_targets_frozen
+            || owner.retry_attempts != 0
+            || request.retry_attempts != 0
+            || owner.heal_endpoints.is_empty()
+        {
+            return false;
+        }
+
+        // Only targets change; preserve priority, FIFO sequence and the dedup
+        // representative. Rebuilding the heap avoids mutating an ordering key.
+        let mut items = std::mem::take(&mut self.heap).into_vec();
+        if let Some(item) = items.iter_mut().find(|item| item.request.id == owner_id) {
+            item.request.heal_endpoints.extend(request.heal_endpoints.iter().cloned());
+            item.request.heal_endpoints.sort_unstable();
+            item.request.heal_endpoints.dedup();
+        }
+        self.heap = BinaryHeap::from(items);
+        true
+    }
+
     #[cfg(test)]
     pub(super) fn contains_request_id(&self, request_id: &str) -> bool {
         self.heap.iter().any(|item| item.request.id == request_id)

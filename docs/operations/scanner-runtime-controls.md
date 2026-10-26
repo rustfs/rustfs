@@ -727,6 +727,8 @@ Stale-upload cleanup differs in one crash-recovery detail. RustFS's stale multip
 
 ## Replacement Recovery Completion
 
+One reconnect sweep submits all newly attached blank disks in a set together. Compatible automatic requests can add targets while the owner is still queued and has never executed or recovered a durable generation. Once execution or recovery fixes the target scope, later disks cannot join that generation or receive a merged receipt from it. Blank disks outside the frozen scope remain discoverable for the next automatic scan after the owner finishes.
+
 `POST /v3/background-heal/status` is an execution-queue view. `state=idle`, zero queue and active counts, an online disk, a readable object, or acceptance of an admin deep-heal request do not independently prove that a replacement disk contains every erasure shard.
 
 Treat replacement recovery as verified only after the repair task has completed for the exact replacement instance and an operator has confirmed the target disk contains the expected `xl.meta` and data parts for every relevant object version. A replacement that is not mounted, is unsafe to format, loses its marker, or returns a partial target outcome must be treated as deferred or incomplete. Do not automate destructive replacement actions from an `idle` observation alone. A new node must not infer replacement completion from an old or unavailable peer; regard that information as unknown or degraded until every required peer can report the same replacement instance and verified completion.

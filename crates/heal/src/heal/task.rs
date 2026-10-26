@@ -336,6 +336,9 @@ pub struct HealRequest {
     /// empty when the trigger doesn't know the specific disks (admin API,
     /// unclean-shutdown verification).
     pub heal_endpoints: Vec<String>,
+    /// A prior executor or durable recovery already fixed this target scope.
+    /// This is independent of the failure retry budget, which grace waits keep.
+    pub replacement_targets_frozen: bool,
     /// Created time
     pub created_at: SystemTime,
     /// Queue admission time used for scheduler delay metrics
@@ -356,6 +359,7 @@ impl HealRequest {
             force_start: false,
             retry_attempts: 0,
             heal_endpoints: Vec::new(),
+            replacement_targets_frozen: false,
             created_at: now,
             enqueued_at: now,
         }
@@ -541,6 +545,7 @@ impl HealTask {
             force_start: false,
             retry_attempts: self.retry_attempts.saturating_add(1),
             heal_endpoints: self.heal_endpoints.clone(),
+            replacement_targets_frozen: true,
             created_at: self.created_at,
             enqueued_at: SystemTime::now(),
         }

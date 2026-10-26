@@ -684,6 +684,7 @@ impl HealManager {
                             let recovery_anchor = recovery.as_ref().map(|(_, _, _, anchor)| anchor.clone());
                             if let Some((task_id, _, _, _)) = recovery {
                                 req.id = task_id;
+                                req.replacement_targets_frozen = true;
                             }
                             req.source = HealRequestSource::AutoHeal;
                             req.heal_endpoints = endpoints.iter().map(ToString::to_string).collect();
