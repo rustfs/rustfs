@@ -50,6 +50,16 @@ on:
         type: string
         required: false
         default: ''
+      validation_retain_evidence_run_id:
+        description: Upload existing persistent evidence from one interrupted validation run without fleet access
+        type: string
+        required: false
+        default: ''
+      validation_retain_evidence_run_attempt:
+        description: Exact interrupted run attempt to retain
+        type: string
+        required: false
+        default: '1'
       validation_runner_inspect_only:
         description: Inspect GitHub runner registration and queued jobs on a hosted runner without fleet access
         type: boolean
@@ -125,8 +135,42 @@ jobs:
           name: validation-runner-inspection-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/validation-runner-inspection/report.json
           if-no-files-found: error
+  validation-evidence-retention:
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id != '' }}
+    # The original interrupted evidence exists only on this long-lived runner.
+    runs-on: smoke-testing
+    timeout-minutes: 15
+    concurrency:
+      group: rustfs-shared-functional-tests-v2
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - name: Verify existing interrupted evidence without changing it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_RETAIN_INPUTS: ${{ toJSON(inputs) }}
+        run: >-
+          python3 -B scripts/retain_validation_evidence.py
+          --report "${RUNNER_TEMP}/validation-evidence-retention/report.json"
+      - name: Upload admitted original evidence under collection provenance
+        if: ${{ env.VALIDATION_RETAIN_ROOT != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustfs-validation-retained-${{ env.VALIDATION_RETAIN_SOURCE_RUN }}-${{ env.VALIDATION_RETAIN_SOURCE_ATTEMPT }}-by-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.VALIDATION_RETAIN_ROOT }}
+          if-no-files-found: error
+          include-hidden-files: true
+      - name: Upload retention receipt including incomplete reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: validation-evidence-retention-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/validation-evidence-retention/report.json
+          if-no-files-found: error
   validation-package-request:
-    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_package_sha != '' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id == '' && inputs.validation_package_sha != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -141,7 +185,7 @@ jobs:
           value = json.loads(os.environ["PACKAGE_INPUTS"])
           if re.fullmatch(r"[0-9a-f]{40}", value["validation_package_sha"]) is None:
               raise ValueError("package build requires an exact source SHA")
-          exclusive = ("validation_runner_inspect_only", "build_run_id", "build_run_attempt", "validation_case", "auto_testing_sha",
+          exclusive = ("validation_retain_evidence_run_id", "validation_runner_inspect_only", "build_run_id", "build_run_attempt", "validation_case", "auto_testing_sha",
                        "validation_tools_only", "validation_native_tools", "validation_shared_tools",
                        "validation_manager_tools", "validation_cleanup_run_id", "validation_tools_run_id")
           if any(value.get(name) for name in exclusive):
@@ -150,7 +194,7 @@ jobs:
 
   validation-package:
     needs: validation-package-request
-    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_package_sha != '' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id == '' && inputs.validation_package_sha != '' }}
     uses: ./.github/workflows/rustfs-validation-package.yml
     with:
       source_sha: ${{ inputs.validation_package_sha }}
@@ -161,7 +205,7 @@ jobs:
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
 
   prepare:
-    if: ${{ (github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_package_sha == '' && inputs.validation_case == '' && !inputs.validation_tools_only && !inputs.validation_native_tools && !inputs.validation_shared_tools && !inputs.validation_manager_tools && inputs.validation_cleanup_run_id == '') || github.event.workflow_run.event == 'schedule' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id == '' && inputs.validation_package_sha == '' && inputs.validation_case == '' && !inputs.validation_tools_only && !inputs.validation_native_tools && !inputs.validation_shared_tools && !inputs.validation_manager_tools && inputs.validation_cleanup_run_id == '') || github.event.workflow_run.event == 'schedule' }}
     runs-on: smoke-testing
     timeout-minutes: 10
     outputs:
@@ -210,7 +254,7 @@ jobs:
           fi
 
   validation:
-    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_package_sha == '' && (inputs.validation_case != '' || inputs.validation_tools_only || inputs.validation_native_tools || inputs.validation_shared_tools || inputs.validation_manager_tools || inputs.validation_cleanup_run_id != '') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id == '' && inputs.validation_package_sha == '' && (inputs.validation_case != '' || inputs.validation_tools_only || inputs.validation_native_tools || inputs.validation_shared_tools || inputs.validation_manager_tools || inputs.validation_cleanup_run_id != '') }}
     runs-on: ${{ inputs.validation_tools_only && 'ubuntu-latest' || 'smoke-testing' }}
     timeout-minutes: 90
     outputs:
