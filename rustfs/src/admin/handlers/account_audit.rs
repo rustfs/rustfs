@@ -28,10 +28,7 @@
 //! of static strings, so no caller-supplied bytes can reach a log target
 //! through this module.
 
-use crate::admin::storage_api::s3::{Body, S3Request};
 use crate::app::RequestEnvelope;
-use crate::server::RemoteAddr;
-use crate::storage::access::request_context_from_extensions;
 use crate::storage::helper::spawn_background_with_context;
 use crate::storage::request_context::RequestContext;
 use hashbrown::HashMap;
@@ -183,23 +180,7 @@ pub(crate) struct AccountAuditContext {
 }
 
 impl AccountAuditContext {
-    pub(crate) fn from_request(req: &S3Request<Body>) -> Self {
-        let user_agent = get_request_user_agent(&req.headers);
-        let request_context = request_context_from_extensions(&req.extensions);
-
-        Self {
-            remote_host: req
-                .extensions
-                .get::<Option<RemoteAddr>>()
-                .and_then(|opt| opt.map(|addr| addr.0.ip().to_string())),
-            request_id: request_context.as_ref().map(|ctx| ctx.request_id.clone()),
-            user_agent: (!user_agent.is_empty()).then_some(user_agent),
-            req_path: Some(req.uri.path().to_string()),
-            request_context,
-        }
-    }
-
-    /// Envelope form of [`Self::from_request`] for handlers on the owned boundary.
+    /// The request facts an audit entry carries, read from the owned envelope.
     pub(crate) fn from_envelope(envelope: &RequestEnvelope) -> Self {
         let user_agent = get_request_user_agent(envelope.headers());
         let request_context = envelope.request_context().cloned();
@@ -350,6 +331,8 @@ fn entry_tags(record: &AccountAuditRecord<'_>) -> HashMap<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::operation::test_support::TestRequest;
+    use crate::server::RemoteAddr;
 
     fn context() -> AccountAuditContext {
         AccountAuditContext {
@@ -362,33 +345,24 @@ mod tests {
     }
 
     #[test]
-    fn from_envelope_reads_the_same_facts_as_from_request() {
+    fn from_envelope_reads_the_request_facts() {
         let peer: std::net::SocketAddr = "203.0.113.7:5000".parse().expect("socket address");
         let mut headers = http::HeaderMap::new();
         headers.insert(http::header::USER_AGENT, http::HeaderValue::from_static("rc/0.1"));
-        let mut extensions = http::Extensions::new();
-        extensions.insert(Some(RemoteAddr(peer)));
-        extensions.insert(crate::storage::request_context::RequestContext::from_headers(&headers));
-        let req = S3Request {
-            input: Body::empty(),
-            method: http::Method::POST,
-            uri: "/rustfs/admin/v3/account/password".parse().expect("uri"),
-            headers,
-            extensions,
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let request_context = RequestContext::from_headers(&headers);
+        let req = TestRequest::new(http::Method::POST, "/rustfs/admin/v3/account/password")
+            .headers(headers)
+            .extension(Some(RemoteAddr(peer)))
+            .extension(request_context.clone())
+            .build();
 
-        let from_request = AccountAuditContext::from_request(&req);
-        let from_envelope = AccountAuditContext::from_envelope(&RequestEnvelope::from_s3s(&req));
+        let from_envelope = AccountAuditContext::from_envelope(req.envelope());
 
-        assert_eq!(format!("{from_envelope:?}"), format!("{from_request:?}"));
         assert_eq!(from_envelope.remote_host.as_deref(), Some("203.0.113.7"));
         assert_eq!(from_envelope.user_agent.as_deref(), Some("rc/0.1"));
         assert_eq!(from_envelope.req_path.as_deref(), Some("/rustfs/admin/v3/account/password"));
-        assert!(from_envelope.request_id.is_some());
+        assert_eq!(from_envelope.request_id.as_deref(), Some(request_context.request_id.as_str()));
+        assert!(from_envelope.request_context.is_some());
     }
 
     #[test]
