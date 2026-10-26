@@ -10,13 +10,12 @@ use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::object_store_from_envelope;
 use crate::admin::storage_api::integrity as service;
 use crate::admin::storage_api::s3::{S3Error, S3ErrorCode, S3Result, error as admin_s3_error};
-use crate::admin::utils::{extract_query_params, read_compatible_admin_body};
+use crate::admin::utils::{extract_query_params, owned_json_response, read_compatible_admin_body};
 use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::Body;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use uuid::Uuid;
 
 #[derive(Clone, Copy)]
@@ -89,22 +88,12 @@ fn map_error(error: service::IntegrityError) -> S3Error {
     }
 }
 
-/// Owned-boundary form of `crate::admin::utils::json_response`, which still
-/// answers with the s3s response type.
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<AdminResponse> {
-    let data = serde_json::to_vec(value)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
-    let mut headers = http::HeaderMap::new();
-    headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
-    Ok(AdminResponse::with_headers(status, Body::from(data), headers))
-}
-
 #[async_trait::async_trait]
 impl Operation for Handler {
     async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let credentials = authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(permission(self.0))]).await?;
         if matches!(self.0, Route::Readiness) {
-            return json_response(StatusCode::OK, &service::readiness());
+            return owned_json_response(StatusCode::OK, &service::readiness());
         }
         let store = object_store_from_envelope(req.envelope())
             .ok_or_else(|| admin_s3_error(S3ErrorCode::InternalError, "object store is not initialized"))?;
@@ -134,7 +123,7 @@ impl Operation for Handler {
                 )
                 .await
                 .map_err(map_error)?;
-                json_response(StatusCode::OK, &page)
+                owned_json_response(StatusCode::OK, &page)
             }
             Route::Create => {
                 let body =
@@ -142,7 +131,7 @@ impl Operation for Handler {
                 let request: service::JobRequest = serde_json::from_slice(&body)
                     .map_err(|_| admin_s3_error(S3ErrorCode::InvalidArgument, "invalid integrity job request"))?;
                 let job = service::create_job(store, bucket, request).await.map_err(map_error)?;
-                json_response(StatusCode::CREATED, &job)
+                owned_json_response(StatusCode::CREATED, &job)
             }
             Route::Status | Route::Control => {
                 let id = params
@@ -164,9 +153,9 @@ impl Operation for Handler {
                     }
                     .map_err(map_error)?
                 };
-                json_response(StatusCode::OK, &job)
+                owned_json_response(StatusCode::OK, &job)
             }
-            Route::Readiness => json_response(StatusCode::OK, &service::readiness()),
+            Route::Readiness => owned_json_response(StatusCode::OK, &service::readiness()),
         }
     }
 }
@@ -204,13 +193,12 @@ async fn integrity_routes_reject_unauthenticated_requests_before_storage_access(
             crate::admin::operation::test_support::TestRequest::new(Method::POST, "/rustfs/admin/v3/integrity/example/jobs")
                 .headers(http::HeaderMap::new())
                 .extensions(http::Extensions::new())
-                .body(Body::from(String::new()))
+                .body(rustfs_s3_types::Body::from(String::new()))
                 .build();
         let error = Handler(route)
             .call(req, router.at("/example").expect("params").params)
             .await
-            .err()
-            .expect("credentials required");
+            .expect_err("credentials required");
         assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(error.message(), Some("get cred failed"));
     }

@@ -25,13 +25,14 @@ use crate::admin::auth::authorize_admin_envelope;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::current_object_data_cache;
+use crate::admin::utils::owned_json_response;
 use crate::app::object_data_cache::ObjectDataCacheAdapter;
 use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_object_data_cache::{ObjectDataCacheIdentity, ObjectDataCacheInvalidationReason, ObjectDataCacheInvalidationResult};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_s3_types::{S3Result, s3_error};
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -100,16 +101,6 @@ fn invalidation_outcome(result: &ObjectDataCacheInvalidationResult) -> (&'static
 
 pub struct ObjectDataCacheStatsHandler {}
 
-/// Owned-boundary form of `crate::admin::utils::json_response`, which still
-/// answers with the s3s response type.
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<AdminResponse> {
-    let data = serde_json::to_vec(value)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
-    let mut headers = http::HeaderMap::new();
-    headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
-    Ok(AdminResponse::with_headers(status, Body::from(data), headers))
-}
-
 #[async_trait::async_trait]
 impl Operation for ObjectDataCacheStatsHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
@@ -145,7 +136,7 @@ impl Operation for ObjectDataCacheStatsHandler {
             },
         };
 
-        json_response(StatusCode::OK, &response)
+        owned_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -180,7 +171,7 @@ impl Operation for ObjectDataCacheFlushHandler {
         };
 
         let (outcome, removed_keys) = invalidation_outcome(&result);
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &ObjectDataCacheFlushResponse {
                 scope,
@@ -217,7 +208,7 @@ mod tests {
             crate::admin::operation::test_support::TestRequest::new(Method::GET, "/rustfs/admin/v3/object-data-cache/stats")
                 .headers(HeaderMap::new())
                 .extensions(http::Extensions::new())
-                .body(Body::from(String::new()))
+                .body(rustfs_s3_types::Body::from(String::new()))
                 .build();
 
         let err = authorize(&req, AdminAction::ServerInfoAdminAction)

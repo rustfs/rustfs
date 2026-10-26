@@ -41,7 +41,7 @@ use crate::admin::storage_api::contract::bucket::{
     BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp,
 };
 use crate::admin::storage_api::error::{Error as StorageError, is_err_bucket_not_found};
-use crate::admin::utils::read_compatible_admin_body;
+use crate::admin::utils::{owned_empty_response, owned_json_response, read_compatible_admin_body};
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
 use crate::site_replication::identity::{
@@ -627,21 +627,6 @@ fn write_go_gob_uint(out: &mut Vec<u8>, value: u64) {
     let used = &bytes[first_non_zero..];
     out.push((0u8).wrapping_sub(used.len() as u8));
     out.extend_from_slice(used);
-}
-
-/// Owned-boundary form of `crate::admin::utils::json_response`, which still
-/// answers with the s3s response type.
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<AdminResponse> {
-    let data = serde_json::to_vec(value)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
-    let mut headers = http::HeaderMap::new();
-    headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
-    Ok(AdminResponse::with_headers(status, Body::from(data), headers))
-}
-
-/// Owned-boundary form of `crate::admin::utils::empty_response`.
-fn empty_response(status: StatusCode) -> AdminResponse {
-    AdminResponse::new(status, Body::empty())
 }
 
 async fn read_plain_admin_body(mut input: Body) -> S3Result<Vec<u8>> {
@@ -7137,7 +7122,7 @@ impl Operation for SiteReplicationAddHandler {
         // response below (BUG2) rather than swallowed; they do not abort the overall add.
         initial_sync_errors.extend(backfill_existing_buckets_after_add(&state, &local_peer, None).await);
 
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &ReplicateAddStatus {
                 success: true,
@@ -7220,7 +7205,7 @@ impl Operation for SiteReplicationRemoveHandler {
             site_replication_remove_status(&peer_errors)
         };
 
-        json_response(StatusCode::OK, &status)
+        owned_json_response(StatusCode::OK, &status)
     }
 }
 
@@ -7251,7 +7236,7 @@ impl Operation for SiteReplicationInfoHandler {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationInfoAction).await?;
         let state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
-        json_response(StatusCode::OK, &site_replication_info_for(&state, &local_peer))
+        owned_json_response(StatusCode::OK, &site_replication_info_for(&state, &local_peer))
     }
 }
 
@@ -7265,7 +7250,7 @@ impl Operation for SiteReplicationMetaInfoHandler {
         let local_peer = current_local_peer(&req, &state);
         let opts = sr_status_options(req.uri());
         let info = filter_sr_info(build_sr_info(&state, &local_peer).await?, &opts);
-        json_response(StatusCode::OK, &info)
+        owned_json_response(StatusCode::OK, &info)
     }
 }
 
@@ -7278,7 +7263,7 @@ impl Operation for SiteReplicationStatusHandler {
         let state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
         let status = build_status_info(&state, &local_peer, req.uri()).await?;
-        json_response(StatusCode::OK, &status)
+        owned_json_response(StatusCode::OK, &status)
     }
 }
 
@@ -7301,7 +7286,7 @@ impl Operation for SiteReplicationDevNullHandler {
     async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         drain_site_replication_devnull(req.take_body()).await?;
-        Ok(empty_response(StatusCode::NO_CONTENT))
+        Ok(owned_empty_response(StatusCode::NO_CONTENT))
     }
 }
 
@@ -7573,14 +7558,14 @@ impl Operation for SRPeerJoinHandler {
                     result = "join_superseded",
                     "admin site replication state"
                 );
-                return json_response(StatusCode::OK, &superseded_join_response(peer));
+                return owned_json_response(StatusCode::OK, &superseded_join_response(peer));
             }
         };
         if defer_initial_sync && !initial_sync_only {
             let mut response =
                 applied_join_response(state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer), String::new());
             response.initial_sync_deferred = true;
-            return json_response(StatusCode::OK, &response);
+            return owned_json_response(StatusCode::OK, &response);
         }
         // Fix 1 (receiving side): ensure the joining peer also sets up replication for any
         // buckets it already owns so the reverse direction works from the start. Per-bucket
@@ -7598,7 +7583,7 @@ impl Operation for SRPeerJoinHandler {
                 "admin site replication state"
             );
         }
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &applied_join_response(
                 state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
@@ -7737,7 +7722,7 @@ impl Operation for SRPeerBucketOpsHandler {
             _ => return Err(s3_error!(InvalidRequest, "unsupported site replication bucket operation")),
         }
 
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -7749,7 +7734,7 @@ impl Operation for SRPeerReplicateIAMItemHandler {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         let item: SRIAMItem = read_site_replication_json(req, "", false).await?;
         apply_iam_item(item).await?;
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -7761,7 +7746,7 @@ impl Operation for SRPeerReplicateBucketItemHandler {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         let item: SRBucketMeta = read_site_replication_json(req, "", false).await?;
         apply_bucket_meta_item(item).await?;
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -7772,7 +7757,7 @@ impl Operation for SRPeerGetIDPSettingsHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
 
-        json_response(StatusCode::OK, &local_idp_settings())
+        owned_json_response(StatusCode::OK, &local_idp_settings())
     }
 }
 
@@ -8058,7 +8043,7 @@ impl Operation for SiteReplicationEditHandler {
             }
         }
 
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &ReplicateEditStatus {
                 success: true,
@@ -8076,7 +8061,7 @@ pub struct SRPeerEditCapabilitiesHandler {}
 impl Operation for SRPeerEditCapabilitiesHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &ReplicateEditStatus {
                 success: query_pairs(req.uri())
@@ -8208,7 +8193,7 @@ impl Operation for SRPeerEditHandler {
         let service_account_access_key = match outcome {
             PeerEditOutcome::Applied(service_account_access_key) => service_account_access_key,
             PeerEditOutcome::Acked => {
-                return json_response(
+                return owned_json_response(
                     StatusCode::OK,
                     &ReplicateEditStatus {
                         success: true,
@@ -8219,7 +8204,7 @@ impl Operation for SRPeerEditHandler {
                 );
             }
             PeerEditOutcome::Rejected(err_detail) => {
-                return json_response(
+                return owned_json_response(
                     StatusCode::OK,
                     &ReplicateEditStatus {
                         success: false,
@@ -8232,7 +8217,7 @@ impl Operation for SRPeerEditHandler {
         };
         if endpoint_refresh_requested {
             if service_account_access_key.is_empty() {
-                return json_response(
+                return owned_json_response(
                     StatusCode::OK,
                     &ReplicateEditStatus {
                         success: false,
@@ -8258,7 +8243,7 @@ impl Operation for SRPeerEditHandler {
             })
             .await?;
             if !committed {
-                return json_response(
+                return owned_json_response(
                     StatusCode::OK,
                     &ReplicateEditStatus {
                         success: false,
@@ -8268,7 +8253,7 @@ impl Operation for SRPeerEditHandler {
                     },
                 );
             }
-            return json_response(
+            return owned_json_response(
                 StatusCode::OK,
                 &ReplicateEditStatus {
                     success: true,
@@ -8278,7 +8263,7 @@ impl Operation for SRPeerEditHandler {
                 },
             );
         }
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -8319,7 +8304,7 @@ impl Operation for SRPeerRemoveHandler {
             );
         }
 
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -8483,7 +8468,7 @@ impl Operation for SiteReplicationResyncOpHandler {
             .buckets
             .sort_by(|left, right| left.bucket.cmp(&right.bucket).then(left.target_arn.cmp(&right.target_arn)));
         let (limit, offset) = parse_site_resync_page(&query, &status)?;
-        json_response(StatusCode::OK, &site_resync_page(&status, limit, offset)?)
+        owned_json_response(StatusCode::OK, &site_resync_page(&status, limit, offset)?)
     }
 }
 
@@ -8500,7 +8485,7 @@ impl Operation for SRStateEditHandler {
             Ok(())
         })
         .await?;
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -8529,7 +8514,7 @@ impl Operation for SiteReplicationRepairHandler {
             if body.preflight_token.is_some() || body.operation_id.is_some() {
                 return Err(s3_error!(InvalidRequest, "dry-run does not accept preflightToken or operationId"));
             }
-            return json_response(
+            return owned_json_response(
                 StatusCode::OK,
                 &SiteReplicationRepairPreflight {
                     mode: "dry-run",
@@ -8600,7 +8585,7 @@ impl Operation for SiteReplicationRepairStatusHandler {
             .get(&operation_id)
             .cloned()
             .ok_or_else(|| s3_error!(InvalidRequest, "repair operation was not found"))?;
-        json_response(StatusCode::OK, &site_replication_repair_operation_response(&operation))
+        owned_json_response(StatusCode::OK, &site_replication_repair_operation_response(&operation))
     }
 }
 
@@ -8695,7 +8680,7 @@ impl Operation for SRRotateServiceAccountHandler {
             peer_errors.push("service account rotation is still pending".to_string());
         }
 
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &ReplicateEditStatus {
                 success: complete && peer_errors.is_empty(),

@@ -86,13 +86,6 @@ pub(crate) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Re
 
 /// Owned-boundary form of [`json_response`]: the same single `Content-Type`
 /// header and the same serialized bytes, as an [`AdminResponse`].
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-    )
-)]
 pub(crate) fn owned_json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<AdminResponse> {
     let data = serde_json::to_vec(value)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
@@ -102,13 +95,6 @@ pub(crate) fn owned_json_response<T: Serialize>(status: StatusCode, value: &T) -
 }
 
 /// Owned-boundary form of [`empty_response`].
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-    )
-)]
 pub(crate) fn owned_empty_response(status: StatusCode) -> AdminResponse {
     AdminResponse::new(status, rustfs_s3_types::Body::empty())
 }
