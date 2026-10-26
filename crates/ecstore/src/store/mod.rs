@@ -1447,6 +1447,15 @@ impl BucketOperations for ECStore {
     }
 }
 
+// Keep the large inherent COPY future out of the trait wrapper's polling frame.
+#[inline(never)]
+fn box_copy_object_handler<F>(make_future: impl FnOnce() -> F) -> std::pin::Pin<Box<F>>
+where
+    F: std::future::Future,
+{
+    Box::pin(make_future())
+}
+
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
     type Error = Error;
@@ -1481,8 +1490,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
     ) -> Result<ObjectInfo> {
         let result = enqueue_transition_after_write(
             self,
-            self.handle_copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
-                .await,
+            box_copy_object_handler(move || {
+                self.handle_copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+            })
+            .await,
             LcEventSrc::S3CopyObject,
             dst_opts,
         )
