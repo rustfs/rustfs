@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 use crate::disk::DiskAPI;
 use crate::error::{Error, Result};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
@@ -76,6 +76,21 @@ pub async fn test_store_with_persisted_rebalance_meta(
         .await
         .expect("rebalance test metadata should be persisted");
     let endpoint_pools: crate::layout::endpoints::EndpointServerPools = vec![pool.endpoints.clone()].into();
+    let authority = ctx
+        .bind_multipart_proof_topology(&endpoint_pools)
+        .expect("single-pool fixture must register its complete local topology");
+    for set in &pool.disk_set {
+        let disks = set.disks.read().await;
+        crate::disk::multipart_source::bind_multipart_proof_snapshot(&disks, &authority)
+            .expect("single-pool native handles must bind to their actual instance");
+        for (slot, disk) in disks.iter().enumerate() {
+            assert_eq!(
+                disk.as_ref().expect("single-pool fixture disk").get_disk_id().await.unwrap(),
+                Some(pool.format.erasure.sets[set.set_index][slot]),
+                "single-pool fixture must bind every formatted physical slot"
+            );
+        }
+    }
     let store = std::sync::Arc::new(crate::store::ECStore {
         id: uuid::Uuid::new_v4(),
         disk_map: std::collections::HashMap::new(),
@@ -145,6 +160,19 @@ pub(crate) async fn test_three_pool_stores_with_isolated_node_contexts(
     std::sync::Arc<crate::store::ECStore>,
 ) {
     test_pool_stores_with_contexts(rebalance_meta, true, 3, 2).await
+}
+
+/// Four drives per set, so a set can hold metadata on fewer than its read
+/// quorum of drives while each drive stays online.
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) async fn test_three_pool_stores_with_four_disk_sets_with_isolated_node_contexts(
+    rebalance_meta: Option<RebalanceMeta>,
+) -> (
+    Vec<tempfile::TempDir>,
+    std::sync::Arc<crate::store::ECStore>,
+    std::sync::Arc<crate::store::ECStore>,
+) {
+    test_pool_stores_with_contexts(rebalance_meta, true, 3, 4).await
 }
 
 #[cfg(all(test, feature = "test-util"))]
@@ -226,18 +254,75 @@ async fn test_pool_stores_with_contexts(
     }
     let endpoint_pools: EndpointServerPools = pools.iter().map(|pool| pool.endpoints.clone()).collect::<Vec<_>>().into();
     ctx.set_endpoints(endpoint_pools.clone());
+    let multipart_authority = ctx
+        .bind_multipart_proof_topology(&endpoint_pools)
+        .expect("the fixture's complete topology should contain only its local disks");
+    for pool in &pools {
+        for set in &pool.disk_set {
+            let disks = set.disks.read().await;
+            crate::disk::multipart_source::bind_multipart_proof_snapshot(&disks, &multipart_authority)
+                .expect("fixture disks should bind to their complete instance topology");
+            for (slot, disk) in disks.iter().enumerate() {
+                assert_eq!(
+                    disk.as_ref().expect("fixture disk").get_disk_id().await.unwrap(),
+                    Some(pool.format.erasure.sets[set.set_index][slot]),
+                    "fixture must bind its actual formatted cohort"
+                );
+            }
+        }
+    }
     let other_ctx = if isolate_node_contexts {
         let other_ctx = std::sync::Arc::new(crate::runtime::instance::InstanceContext::new());
         other_ctx.update_erasure_type(SetupType::DistErasure).await;
         other_ctx.set_deployment_id(deployment_id);
-        *other_ctx.local_disk_map().write().await = ctx.local_disk_map().read().await.clone();
         other_ctx.set_endpoints(endpoint_pools.clone());
         other_ctx
     } else {
         std::sync::Arc::clone(&ctx)
     };
-    let make_store = |store_ctx: std::sync::Arc<crate::runtime::instance::InstanceContext>| {
-        let mut store_pools = pools.clone();
+    let other_pools = if isolate_node_contexts {
+        let peer_authority = other_ctx
+            .bind_multipart_proof_topology(&endpoint_pools)
+            .expect("the simulated peer should validate the same complete physical topology");
+        let mut peer_pools = pools.clone();
+        let mut peer_disk_map = std::collections::HashMap::new();
+        for pool in &mut peer_pools {
+            let pool = std::sync::Arc::make_mut(pool);
+            pool.set_instance_ctx_for_test(std::sync::Arc::clone(&other_ctx));
+            for set in &mut pool.disk_set {
+                let set = std::sync::Arc::make_mut(set);
+                let mut peer_disks = Vec::with_capacity(set.set_endpoints.len());
+                let source_disks = set.disks.read().await;
+                for (slot, endpoint) in set.set_endpoints.iter().enumerate() {
+                    // Share durable contents and lock clients, while each node
+                    // context owns its independently opened native handles.
+                    let disk = crate::disk::new_disk(
+                        endpoint,
+                        &crate::disk::DiskOption {
+                            cleanup: false,
+                            health_check: false,
+                        },
+                    )
+                    .await
+                    .expect("open the peer's independent local disk handle");
+                    assert!(!std::sync::Arc::ptr_eq(&disk, source_disks[slot].as_ref().expect("source fixture disk")));
+                    assert_eq!(disk.get_disk_id().await.unwrap(), Some(pool.format.erasure.sets[set.set_index][slot]));
+                    peer_disk_map.insert(endpoint.to_string(), Some(disk.clone()));
+                    peer_disks.push(Some(disk));
+                }
+                drop(source_disks);
+                crate::disk::multipart_source::bind_multipart_proof_snapshot(&peer_disks, &peer_authority)
+                    .expect("independent peer handles should bind only to their own instance");
+                set.disks = std::sync::Arc::new(tokio::sync::RwLock::new(peer_disks));
+            }
+        }
+        *other_ctx.local_disk_map().write().await = peer_disk_map;
+        peer_pools
+    } else {
+        pools.clone()
+    };
+    let make_store = |store_ctx: std::sync::Arc<crate::runtime::instance::InstanceContext>,
+                      mut store_pools: Vec<std::sync::Arc<crate::core::sets::Sets>>| {
         for pool in &mut store_pools {
             std::sync::Arc::make_mut(pool).set_instance_ctx_for_test(std::sync::Arc::clone(&store_ctx));
         }
@@ -255,8 +340,8 @@ async fn test_pool_stores_with_contexts(
             bucket_fence_registry: std::sync::Arc::default(),
         })
     };
-    let store = make_store(ctx);
-    let other_store = make_store(other_ctx);
+    let store = make_store(ctx, pools);
+    let other_store = make_store(other_ctx, other_pools);
     if isolate_node_contexts {
         crate::bucket::metadata_sys::init_bucket_metadata_sys(std::sync::Arc::clone(&store), Vec::new()).await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(std::sync::Arc::clone(&other_store), Vec::new()).await;

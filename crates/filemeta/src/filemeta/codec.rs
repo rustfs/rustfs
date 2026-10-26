@@ -603,7 +603,7 @@ impl FileMeta {
                 return false;
             }
 
-            let mut is_delete_marker = false;
+            let mut is_delete_marker = true;
 
             let _ = Self::decode_versions(meta, versions, |_: usize, hdr: &[u8], _: &[u8]| {
                 let mut header = FileMetaVersionHeader::default();
@@ -611,6 +611,9 @@ impl FileMeta {
                     return Err(Error::DoneForNow);
                 }
 
+                if header.free_version() {
+                    return Ok(());
+                }
                 is_delete_marker = header.version_type == VersionType::Delete;
 
                 Err(Error::DoneForNow)

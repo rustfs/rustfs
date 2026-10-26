@@ -27,6 +27,10 @@ use crate::diagnostics::object_lock::ObjectLockAttempt;
 use crate::set_disk::{ObjectLockDiagGuard, is_object_lock_diag_enabled};
 use std::sync::Arc;
 
+#[cfg(test)]
+#[path = "heal_lock_wait_tests.rs"]
+mod heal_lock_wait_tests;
+
 #[derive(Clone, Copy)]
 struct ExplicitVersionHeal<'a> {
     opts: &'a HealOpts,
@@ -35,6 +39,14 @@ struct ExplicitVersionHeal<'a> {
     commit_fence: Option<&'a (dyn Fn() -> bool + Sync)>,
     namespace_owner: Option<&'a Arc<dyn Send + Sync>>,
     retirement: Option<&'a MarkerRetirementContext<'a>>,
+}
+
+// Keep the large heal state machine and its construction temporary out of
+// each dispatch caller's poll frame. Ordinary object writes do not use this
+// heal-only allocation boundary.
+#[inline(never)]
+fn pin_object_heal_future<F: std::future::Future>(build: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    Box::pin(build())
 }
 
 use crate::disk::DataDirDeleteStatus;
@@ -51,6 +63,49 @@ const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_HEAL_OBJECT_RENAME: &str = "heal_object_rename";
 const HEAL_RENAME_INCOMPLETE: &str = "heal rename incomplete";
 const READ_REPAIR_DATA_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+// Observation state never owns a namespace guard. A dropped pending future
+// records a censored wait separately from completed acquisitions.
+struct HealObjectLockWait {
+    started_at: std::time::Instant,
+    op: &'static str,
+    mode: &'static str,
+    result: &'static str,
+}
+
+impl Drop for HealObjectLockWait {
+    fn drop(&mut self) {
+        let elapsed = self.started_at.elapsed();
+        metrics::histogram!(
+            "rustfs_heal_object_lock_wait_seconds",
+            "op" => self.op,
+            "mode" => self.mode,
+            "result" => self.result,
+        )
+        .record(elapsed.as_secs_f64());
+    }
+}
+
+async fn measure_heal_object_lock(
+    op: &'static str,
+    kind: HealObjectLockKind,
+    acquire: impl std::future::Future<Output = std::result::Result<rustfs_lock::NamespaceLockGuard, rustfs_lock::LockError>>,
+) -> std::result::Result<rustfs_lock::NamespaceLockGuard, rustfs_lock::LockError> {
+    let mut wait = HealObjectLockWait {
+        started_at: std::time::Instant::now(),
+        op,
+        mode: kind.as_str(),
+        result: "cancelled",
+    };
+    let result = acquire.await;
+    wait.result = match &result {
+        Ok(rustfs_lock::NamespaceLockGuard::Fast(guard)) if guard.is_disabled() => "disabled",
+        Ok(_) => "acquired",
+        Err(_) => "failed",
+    };
+    drop(wait);
+    result
+}
 
 /// Exact set-local absence, established while the object mutation lock is held.
 #[derive(Debug)]
@@ -850,10 +905,13 @@ impl SetDisks {
             .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
         let timeout = get_lock_acquire_timeout();
         let mut attempt = ObjectLockAttempt::start(op, bucket, object, Some(version_id), &ns_lock, kind.as_str(), timeout);
-        let lock_result = match kind {
-            HealObjectLockKind::Read => ns_lock.get_read_lock(timeout).await,
-            HealObjectLockKind::Write => ns_lock.get_write_lock(timeout).await,
-        };
+        let lock_result = measure_heal_object_lock(op, kind, async {
+            match kind {
+                HealObjectLockKind::Read => ns_lock.get_read_lock(timeout).await,
+                HealObjectLockKind::Write => ns_lock.get_write_lock(timeout).await,
+            }
+        })
+        .await;
         attempt.observe(&lock_result);
         let guard = lock_result.map_err(|e| {
             self.map_namespace_lock_error(bucket, object, kind.as_str(), e)
@@ -3086,12 +3144,16 @@ impl SetDisks {
         dry_run: bool,
         remove: bool,
     ) -> Result<(HealResultItem, Option<DiskError>)> {
-        let _write_lock_guard = self
-            .new_ns_lock(bucket, object)
-            .await?
-            .get_write_lock(get_lock_acquire_timeout())
+        let _write_lock_guard = {
+            let ns_lock = self.new_ns_lock(bucket, object).await?;
+            measure_heal_object_lock(
+                "heal_object_dir",
+                HealObjectLockKind::Write,
+                ns_lock.get_write_lock(get_lock_acquire_timeout()),
+            )
             .await
-            .map_err(|e| DiskError::other(self.map_namespace_lock_error(bucket, object, "write", e).to_string()))?;
+            .map_err(|e| DiskError::other(self.map_namespace_lock_error(bucket, object, "write", e).to_string()))?
+        };
 
         self.heal_object_dir_locked(bucket, object, dry_run, remove).await
     }
@@ -3409,11 +3471,19 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
                 .new_ns_lock(bucket, object)
                 .await
                 .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
-            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                self.map_namespace_lock_error(bucket, object, "write", e)
-                    .narrow_to_disk()
-                    .unwrap_or_else(DiskError::other)
-            })?)
+            Some(
+                measure_heal_object_lock(
+                    "check_abandoned_parts",
+                    HealObjectLockKind::Write,
+                    ns_lock.get_write_lock(get_lock_acquire_timeout()),
+                )
+                .await
+                .map_err(|e| {
+                    self.map_namespace_lock_error(bucket, object, "write", e)
+                        .narrow_to_disk()
+                        .unwrap_or_else(DiskError::other)
+                })?,
+            )
         } else {
             None
         };
@@ -3560,11 +3630,19 @@ impl SetDisks {
                 .new_ns_lock(bucket, object)
                 .await
                 .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
-            Some(Arc::new(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                self.map_namespace_lock_error(bucket, object, "write", e)
-                    .narrow_to_disk()
-                    .unwrap_or_else(DiskError::other)
-            })?))
+            Some(Arc::new(
+                measure_heal_object_lock(
+                    "heal_object",
+                    HealObjectLockKind::Write,
+                    ns_lock.get_write_lock(get_lock_acquire_timeout()),
+                )
+                .await
+                .map_err(|e| {
+                    self.map_namespace_lock_error(bucket, object, "write", e)
+                        .narrow_to_disk()
+                        .unwrap_or_else(DiskError::other)
+                })?,
+            ))
         } else {
             None
         };
@@ -3709,8 +3787,8 @@ impl SetDisks {
         inner_opts.no_lock = true;
         let commit_fence = || !_write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost());
         let namespace_owner = _write_lock_guard.as_ref().map(|guard| guard.clone() as Arc<dyn Send + Sync>);
-        let (result, err) = self
-            .heal_object_with_explicit_version_regen(
+        let (result, err) = pin_object_heal_future(|| {
+            self.heal_object_with_explicit_version_regen(
                 bucket,
                 object,
                 version_id,
@@ -3724,16 +3802,17 @@ impl SetDisks {
                 },
                 absence,
             )
-            .await
-            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+        })
+        .await
+        .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
         if let Some(err) = err.as_ref() {
             match err {
                 &DiskError::FileCorrupt if opts.scan_mode != HealScanMode::Deep => {
                     // Instead of returning an error when a bitrot error is detected
                     // during a normal heal scan, heal again with bitrot flag enabled.
                     inner_opts.scan_mode = HealScanMode::Deep;
-                    let (result, err) = self
-                        .heal_object_with_explicit_version_regen(
+                    let (result, err) = pin_object_heal_future(|| {
+                        self.heal_object_with_explicit_version_regen(
                             bucket,
                             object,
                             version_id,
@@ -3747,8 +3826,9 @@ impl SetDisks {
                             },
                             absence,
                         )
-                        .await
-                        .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+                    })
+                    .await
+                    .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
                     return Ok(finalize_object_heal_result(
                         result,
                         err.map(Into::into),

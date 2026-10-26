@@ -958,6 +958,26 @@ fn is_data_movement_rewritten_transition_metadata(object_info: &ObjectInfo, key:
     })
 }
 
+fn data_movement_publication_marker_valid(object_info: &ObjectInfo) -> bool {
+    use crate::disk::multipart_source::{SourceConditionV1, publication_identity_from_metadata};
+
+    let publication = match publication_identity_from_metadata(&object_info.user_defined) {
+        Ok(Some(publication)) => publication,
+        Ok(None) => return true,
+        Err(_) => return false,
+    };
+    if publication.final_data_dir.is_nil() {
+        return false;
+    }
+    SourceConditionV1 {
+        lineage: publication.lineage,
+        generation: publication.source_generation,
+        attempt: publication.attempt,
+    }
+    .validate()
+    .is_ok()
+}
+
 fn is_data_movement_rewritten_metadata(object_info: &ObjectInfo, key: &str, normalize_compression_size: bool) -> bool {
     [
         SUFFIX_DATA_MOVED,
@@ -972,6 +992,7 @@ fn is_data_movement_rewritten_metadata(object_info: &ObjectInfo, key: &str, norm
     ]
     .iter()
     .any(|suffix| is_data_movement_internal_metadata(key, suffix))
+        || crate::disk::multipart_source::is_publication_metadata_key(key)
         || is_data_movement_rewritten_transition_metadata(object_info, key)
         || key == rustfs_rio::RUSTFS_MULTIPART_CHECKSUM
         || key == rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE
@@ -994,6 +1015,14 @@ pub(crate) fn is_equivalent_data_movement_metadata(
         return false;
     }
 
+    // Copy can retain a native publication after changing the current key,
+    // version or placement. Validate that historical record's structure, then
+    // exclude only this per-copy provenance from content equivalence. Actual
+    // current scope/content remain independently compared below; this grants
+    // no native write-quorum proof or Complete replay authority.
+    if !data_movement_publication_marker_valid(source) || !data_movement_publication_marker_valid(target) {
+        return false;
+    }
     let normalize_compression_size = source.is_compressed() && target.is_compressed();
     if normalize_compression_size
         && !is_compatible_data_movement_marker_presence(
@@ -1029,6 +1058,25 @@ pub(crate) fn is_equivalent_data_movement_metadata(
 }
 
 pub(crate) fn is_equivalent_data_movement_object_identity(
+    source: &ObjectInfo,
+    target: &ObjectInfo,
+    compare_mod_time: bool,
+    compare_part_checksums: bool,
+) -> bool {
+    source.bucket == target.bucket
+        && source.name == target.name
+        && is_equivalent_data_movement_object_fields(source, target, compare_mod_time, compare_part_checksums)
+}
+
+// Exact-delete capacity reconciliation reads a target at a fixed physical key.
+// Keep its checked encoded-name contract separate from logical-key equality.
+pub(crate) fn is_equivalent_data_movement_capacity_target(source: &ObjectInfo, target: &ObjectInfo) -> bool {
+    source.bucket == target.bucket
+        && source.name == rustfs_utils::path::decode_dir_object(&target.name)
+        && is_equivalent_data_movement_object_fields(source, target, true, false)
+}
+
+fn is_equivalent_data_movement_object_fields(
     source: &ObjectInfo,
     target: &ObjectInfo,
     compare_mod_time: bool,
@@ -3547,6 +3595,268 @@ mod tests {
         let mut delete_marker = target;
         delete_marker.delete_marker = true;
         assert!(!can_replace_stale_data_movement_target(&delete_marker, &opts));
+    }
+
+    #[test]
+    fn data_movement_identity_keeps_logical_directory_and_literal_suffix_distinct() {
+        let fi = FileInfo {
+            version_id: Some(Uuid::from_u128(1)),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            size: 10,
+            metadata: HashMap::from([("etag".to_owned(), "directory-etag".to_owned())]),
+            ..Default::default()
+        };
+        let source = ObjectInfo::from_file_info(&fi, "bucket", "directory/", true);
+        let target = ObjectInfo::from_file_info(&fi, "bucket", &encode_dir_object("directory/"), true);
+        assert_eq!(target.name, "directory/", "real metadata construction returns the logical name");
+        assert!(is_equivalent_data_movement_object_identity(&source, &target, true, false));
+        assert!(is_equivalent_data_movement_capacity_target(&source, &target));
+
+        let literal = ObjectInfo {
+            name: "directory__XLDIR__".to_owned(),
+            ..target
+        };
+        assert!(crate::bucket::utils::is_valid_object_name(&literal.name));
+        assert!(crate::bucket::utils::is_valid_object_name(&source.name));
+        assert!(!is_equivalent_data_movement_object_identity(&source, &literal, true, false));
+    }
+
+    #[tokio::test]
+    async fn data_movement_equivalence_validates_each_real_native_multipart_publication() {
+        use crate::disk::DiskAPI as _;
+        use crate::disk::multipart_source::{is_publication_metadata_key, publication_identity_from_metadata};
+        use crate::storage_api_contracts::multipart::MultipartOperations as _;
+        use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+
+        let (_source_dirs, source_disks, source_set) = crate::set_disk::hermetic_set_disks_isolated(4).await;
+        let (_target_dirs, target_disks, target_set) = crate::set_disk::hermetic_set_disks_isolated(4).await;
+        let bucket = "native-multipart-migration-equivalence";
+        let object = "native-multipart-migration-equivalence-object";
+        for disk in source_disks.iter().chain(&target_disks) {
+            disk.make_volume(bucket).await.expect("create both real bucket volumes");
+        }
+        let body = vec![0x39; 1 << 20];
+        let upload = source_set
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("real source upload");
+        let part = source_set
+            .put_object_part(
+                bucket,
+                object,
+                &upload.upload_id,
+                1,
+                &mut PutObjReader::from_vec(body.clone()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("real source part");
+        source_set
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("real native source publication");
+        let source = source_set
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("actual committed source metadata");
+        let create_opts = data_movement_new_multipart_opts(&source, 0);
+        let moved_upload = target_set
+            .new_multipart_upload(bucket, object, &create_opts)
+            .await
+            .expect("real temporary transfer upload");
+        let part_opts = ObjectOptions {
+            part_number: Some(source.parts[0].number),
+            preserve_etag: Some(source.parts[0].etag.clone()),
+            data_movement: true,
+            ..Default::default()
+        };
+        let part = target_set
+            .put_object_part(
+                bucket,
+                object,
+                &moved_upload.upload_id,
+                1,
+                &mut PutObjReader::from_vec(body.clone()),
+                &part_opts,
+            )
+            .await
+            .expect("real transfer part");
+        let complete_opts = data_movement_complete_multipart_opts(&source, 0, false).expect("compatible transfer options");
+        target_set
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &moved_upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &complete_opts,
+            )
+            .await
+            .expect("real native migration publication");
+        let target = target_set
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("actual committed target metadata");
+        let source_publication = publication_identity_from_metadata(&source.user_defined)
+            .expect("source tuple decodes")
+            .expect("source producer retained its native tuple");
+        let target_publication = publication_identity_from_metadata(&target.user_defined)
+            .expect("target tuple decodes")
+            .expect("target producer retained its own native tuple");
+        assert_ne!(
+            source_publication, target_publication,
+            "physical publications have distinct attempts and directories"
+        );
+        assert_ne!(source.data_dir, target.data_dir);
+        assert!(
+            are_equivalent_data_movement_parts(&source.parts, &target.parts),
+            "the real transport preserves each part ETag"
+        );
+        assert!(is_equivalent_data_movement_object(&source, &target));
+        assert_eq!(
+            resolve_data_movement_overwrite_resume_copy(
+                &Error::PreconditionFailed,
+                Ok(Some(target.clone())),
+                &source,
+                0,
+                1,
+                false,
+            )
+            .expect("actual equivalent target resolves the failed create-only condition"),
+            Some(DataMovementCopy::Committed)
+        );
+        for set in [&source_set, &target_set] {
+            let mut reader = set
+                .get_object_reader(bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("actual source and target bodies");
+            let mut actual = Vec::new();
+            reader.stream.read_to_end(&mut actual).await.expect("read full actual body");
+            assert_eq!(actual, body);
+        }
+        for changed in [
+            "data-dir",
+            "version",
+            "mtime",
+            "bucket",
+            "key",
+            "user-metadata",
+            "etag",
+            "checksum",
+            "parts",
+            "condition",
+            "status",
+            "unknown",
+        ] {
+            let mut invalid = target.clone();
+            match changed {
+                "data-dir" => {
+                    let mut historical = publication_identity_from_metadata(&invalid.user_defined)
+                        .expect("real tuple decodes")
+                        .expect("real tuple exists");
+                    historical.final_data_dir = Uuid::nil();
+                    let encoded = hex_simd::encode_to_string(
+                        rmp_serde::to_vec_named(&historical).expect("encode structurally invalid historical tuple"),
+                        hex_simd::AsciiCase::Lower,
+                    );
+                    for (key, value) in Arc::make_mut(&mut invalid.user_defined).iter_mut() {
+                        if is_publication_metadata_key(key) {
+                            value.clone_from(&encoded);
+                        }
+                    }
+                }
+                "version" => invalid.version_id = Some(Uuid::new_v4()),
+                "mtime" => invalid.mod_time = invalid.mod_time.map(|time| time + time::Duration::seconds(1)),
+                "bucket" => invalid.bucket.push_str("-other"),
+                "key" => invalid.name.push_str("-other"),
+                "etag" => invalid.etag = Some("different-current-etag".to_owned()),
+                "checksum" => invalid.checksum = Some(Bytes::from_static(b"different-current-checksum")),
+                "parts" => Arc::make_mut(&mut invalid.parts)[0].etag.push_str("-other"),
+                "user-metadata" => {
+                    Arc::make_mut(&mut invalid.user_defined).insert("x-amz-meta-extra".to_owned(), "changed".to_owned());
+                }
+                suffix => rustfs_utils::http::insert_str(
+                    Arc::make_mut(&mut invalid.user_defined),
+                    &format!("multipart-source-{suffix}"),
+                    "unexpected".to_owned(),
+                ),
+            }
+            assert!(
+                !is_equivalent_data_movement_object(&source, &invalid),
+                "{changed} cannot bypass metadata equivalence"
+            );
+        }
+        let mut malformed = target.clone();
+        for (key, value) in Arc::make_mut(&mut malformed.user_defined).iter_mut() {
+            if is_publication_metadata_key(key) {
+                *value = "malformed".to_owned();
+            }
+        }
+        assert!(
+            !is_equivalent_data_movement_object(&source, &malformed),
+            "malformed publication cannot be ignored"
+        );
+        let mut conflicting = target.clone();
+        let aliases = conflicting
+            .user_defined
+            .keys()
+            .filter(|key| is_publication_metadata_key(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), 2, "actual writer stores both canonical publication aliases");
+        Arc::make_mut(&mut conflicting.user_defined).insert(aliases[0].clone(), "conflicting".to_owned());
+        assert!(
+            !is_equivalent_data_movement_object(&source, &conflicting),
+            "conflicting aliases cannot be ignored"
+        );
+        let mut malformed_source = source.clone();
+        for (key, value) in Arc::make_mut(&mut malformed_source.user_defined).iter_mut() {
+            if is_publication_metadata_key(key) {
+                *value = "malformed-source".to_owned();
+            }
+        }
+        assert!(
+            !is_equivalent_data_movement_object(&malformed_source, &target),
+            "a malformed present source publication cannot be projected away"
+        );
+        let mut takeover = target.clone();
+        takeover.mod_time = source.mod_time.map(|time| time + time::Duration::seconds(1));
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut takeover.user_defined),
+            SUFFIX_DATA_MOVEMENT_UPLOAD,
+            data_movement_upload_identity(&source),
+        );
+        assert!(is_data_movement_upload_takeover_target(&source, &takeover, true));
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut takeover.user_defined),
+            SUFFIX_DATA_MOVEMENT_UPLOAD,
+            "different-transfer-identity".to_owned(),
+        );
+        assert!(
+            !is_data_movement_upload_takeover_target(&source, &takeover, true),
+            "historical publication cannot bypass the exact current transfer identity"
+        );
+        let mut legacy = target.clone();
+        Arc::make_mut(&mut legacy.user_defined).retain(|key, _| !is_publication_metadata_key(key));
+        assert!(
+            is_equivalent_data_movement_object(&source, &legacy),
+            "a legacy destination may lack per-copy provenance"
+        );
     }
 
     #[test]

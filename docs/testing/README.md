@@ -34,6 +34,8 @@ The [Scanner/Heal topology protection gates](scanner-heal-topology-gates.md) map
 
 The [immutable validation candidate reference](validation-candidates.md) describes isolated package builds and exact candidate resolution for the current auto-testing fleet.
 
+The [distributed multipart RPC delay gates](multipart-rpc-delay.md) define authenticated method-entry barriers, latency and peer-loss oracles, and the boundary between hook evidence and production incident attribution.
+
 ## Naming conventions
 
 ### Reserved test-name substrings (migration gate)
@@ -59,6 +61,13 @@ A deliberate reduction lowers the floor in the same PR. The list above mirrors t
 ## nextest and `#[serial]`
 
 `cargo-nextest` is the runner: `make test` requires it and CI installs it. nextest runs every test in its own process, so `serial_test`'s in-process `#[serial]` mutex does **not** serialize tests against each other; it only affects the plain `cargo test` fallback. Cross-test serialization under nextest comes from a `[test-groups]` entry with `max-threads = 1` in `.config/nextest.toml` (for example `ecstore-serial-flaky`, `e2e-reliability`) or from a `-j 1` lane. Prefer making tests self-isolating (per-test instance context, random port, own temp dir) over adding serialization. `RUSTFS_ALLOW_CARGO_TEST_FALLBACK=1 make test` runs plain `cargo test`; its results are not authoritative because `[test-groups]` do not apply.
+
+Package-scoped ECStore runs do not inherit workspace feature unification. The native decommission lock, capacity-lease and restart fixtures in `core::pools_test::decommission_lock_order_tests` require `test-util`. Select that module separately and fail an empty run, so unrelated tests matching another branch of a combined filter cannot hide its absence:
+
+```bash
+cargo nextest run --profile ci -p rustfs-ecstore --lib --features test-util \
+  --no-tests fail -E 'test(/^core::pools_test::decommission_lock_order_tests::/)'
+```
 
 Time-driven tests use paused tokio time (`start_paused` plus `tokio::time::advance`) or explicit synchronization instead of fixed `sleep` windows.
 

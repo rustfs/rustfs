@@ -78,6 +78,9 @@ mod workload_admission;
 
 pub use data_usage_define::*;
 pub use error::ScannerError;
+pub use heal_completion::{
+    ScannerHealObservationStatus, ScannerHealTerminalObservation, ScannerHealUnknownObservation, scanner_heal_observation_status,
+};
 pub use prefix_usage::{BucketPrefixUsageResponse, bucket_prefix_usage, invalidate_prefix_usage_cache};
 pub use remote_scanner::{
     NS_SCANNER_MAX_REQUEST_BODY_SIZE, RemoteScannerAdmission, RemoteScannerRequest, admit_remote_scanner_request,
@@ -223,18 +226,39 @@ impl ScannerActivityGuard {
     }
 }
 
-pub(crate) struct ScannerRuntimeGuard;
+pub(crate) struct ScannerRuntimeGuard {
+    startup: rustfs_scanner_metrics::startup::ScannerStartupToken,
+    initialized: bool,
+}
 
 impl ScannerRuntimeGuard {
     pub(crate) fn new() -> Self {
-        SCANNER_RUNTIME_INSTANCES.fetch_add(1, Ordering::Relaxed);
-        Self
+        Self {
+            startup: rustfs_scanner_metrics::metrics::global_metrics().startup().begin(),
+            initialized: false,
+        }
+    }
+
+    pub(crate) fn mark_initialized(&mut self) {
+        if !self.initialized {
+            SCANNER_RUNTIME_INSTANCES.fetch_add(1, Ordering::Relaxed);
+            self.initialized = true;
+        }
+    }
+
+    pub(crate) fn startup_token(&self) -> rustfs_scanner_metrics::startup::ScannerStartupToken {
+        self.startup
     }
 }
 
 impl Drop for ScannerRuntimeGuard {
     fn drop(&mut self) {
-        let _ = SCANNER_RUNTIME_INSTANCES.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1));
+        rustfs_scanner_metrics::metrics::global_metrics()
+            .startup()
+            .finish(self.startup);
+        if self.initialized {
+            let _ = SCANNER_RUNTIME_INSTANCES.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1));
+        }
     }
 }
 
@@ -1199,7 +1223,13 @@ mod tests {
         assert!(!scanner_runtime_initialized());
 
         {
-            let _guard = ScannerRuntimeGuard::new();
+            let mut guard = ScannerRuntimeGuard::new();
+            assert!(
+                !scanner_runtime_initialized(),
+                "observation must not change admission before initialization"
+            );
+            guard.mark_initialized();
+            guard.mark_initialized();
             assert!(scanner_runtime_initialized());
         }
 

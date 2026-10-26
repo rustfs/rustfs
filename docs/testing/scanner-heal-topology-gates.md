@@ -58,7 +58,8 @@ The barrier directory is set for every node of a run; only the process whose ope
 |---|---|---|
 | movement active | 30 s | matches the existing decommission and rebalance cases |
 | movement complete | 240 s | the existing cases allow 180 s for 96 objects of 128-256 KiB; this inventory adds 1 MiB externals, multipart and version history (about 45 MiB) |
-| resumed decommission complete | 360 s | recovery includes the fleet-proof retry before migration resumes; a healthy CI restart completed after 253 s while still making progress, below the distributed lane's 720 s process limit |
+| decommission kill before source cleanup | 240 s | preserves the original completion gate for backlog #2924; fleet-proof recovery must wake when proof becomes available rather than wait out the general failure backoff |
+| decommission kill before start ACK | 360 s | includes restarting before any worker was admitted and proving the persisted responsibility resumes, below the distributed lane's 720 s process limit |
 | movement barrier reach | 240 s (the movement budget) | a window can sit deep in the object order; on Linux CI a busy target capacity gate (160 inline retries, entries deferred to round end) delayed the first fault object by about 2 minutes. The wait fails at once if the operation completes, fails or is canceled without entering the window. Each status probe is bounded to 5 s and a slow probe counts as "still running", because the admin status request can wait on the held mover until the barrier itself times out. The server releases a held barrier on its own after 120 s |
 | pre-ACK window reach | 60 s | the decommission start normally reaches its durable save in about a second (POST to response ~0.8 s locally); exceeding 60 s is reported as a stalled start path, not retried with a longer budget |
 | cancel, stop and terminal transitions | 90 s | stop and cancel are acknowledged before every in-flight entry finishes its cleanup, so terminal state and placement are polled within this budget |
@@ -77,3 +78,5 @@ python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run
 ```
 
 Set `RUSTFS_SCANNER_HEAL_TOPOLOGY_EVIDENCE_DIR` to keep node logs, barrier observations and the per-case evidence JSON after the run; without it the fixture keeps them under `RUSTFS_E2E_LOG_DIR`, which the distributed workflow uploads. On macOS, `hdiutil attach -nomount ram://2097152` followed by `diskutil erasevolume APFS` yields the distinct filesystems that `RUSTFS_E2E_POOL_ROOTS` requires.
+
+The `pool_meta_native_` and `pool_meta_codec_` focused tests cover native predecessor CAS, stale undo, owned rollback cleanup, malformed/changed identity and backup evidence, inline bitrot/erasure reconstruction, and conditional recovery planning. The distributed kill-before-cleanup case remains the end-to-end gate; successful unit tests alone do not establish its 240-second completion requirement.

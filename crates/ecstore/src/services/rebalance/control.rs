@@ -1450,12 +1450,13 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::com::delete_config;
+    use crate::config::com::read_config_no_lock_preserve_empty_with_metadata;
     use crate::core::pools::{
         DecommissionErasureLayout, DecommissionPoolCapacityInfo, POOL_META_NAME, PoolActivationDurableSaveBarrier,
         PoolActivationStartKind, PoolActivationStartProbe, PoolMetaWriteState, persist_pool_meta_identity_for_startup,
         set_decommission_capacity_info_overrides_for_test,
     };
+    use crate::disk::DiskAPI;
     use crate::object_api::NamespaceLockFence;
     use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause, hermetic_set_disks_isolated};
 
@@ -1679,10 +1680,38 @@ mod tests {
             .await
             .expect("initialized pool metadata identity should persist");
         *store.pool_meta_save_gate.lock().await = write_state;
+        // Simulate physical loss; raw deletion of authoritative pool.bin is
+        // deliberately rejected by the native metadata mutation guard.
         for pool in &store.pools {
-            delete_config(pool.clone(), POOL_META_NAME)
-                .await
-                .expect("every pool metadata replica should be removed");
+            let (original_identity, _) =
+                read_config_no_lock_preserve_empty_with_metadata(pool.clone(), crate::core::pools::POOL_META_IDENTITY_NAME)
+                    .await
+                    .expect("initialized identity before physical pool metadata loss");
+            let metadata_set = pool.get_disks_by_key(POOL_META_NAME);
+            let disks = metadata_set.disks.read().await.clone();
+            assert!(disks.iter().all(Option::is_some), "metadata-loss fixture requires every replica online");
+            for disk in disks.iter().flatten() {
+                assert!(disk.is_local(), "metadata-loss fixture requires local disks");
+                let metadata = std::path::PathBuf::from(disk.endpoint().get_file_path())
+                    .join(crate::disk::RUSTFS_META_BUCKET)
+                    .join(POOL_META_NAME);
+                tokio::fs::remove_dir_all(&metadata)
+                    .await
+                    .expect("remove the actual pool metadata shard");
+                assert!(
+                    !tokio::fs::try_exists(&metadata)
+                        .await
+                        .expect("inspect physically absent metadata")
+                );
+            }
+            let (identity_after, _) =
+                read_config_no_lock_preserve_empty_with_metadata(pool.clone(), crate::core::pools::POOL_META_IDENTITY_NAME)
+                    .await
+                    .expect("initialized identity survives physical metadata loss");
+            assert!(
+                identity_after == original_identity,
+                "fault injection must preserve the initialized identity bytes"
+            );
         }
     }
 

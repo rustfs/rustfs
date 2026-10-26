@@ -15,6 +15,9 @@ cat >"$BIN_DIR/mc" <<'STUB'
 set -euo pipefail
 
 printf '%s\n' "$*" >>"${MC_LOG:?}"
+if [[ "${CONFIG_EXIT_CODE:-0}" != "0" ]]; then
+  exit "$CONFIG_EXIT_CODE"
+fi
 if [[ "$*" == "admin config get rustfs-local scanner" ]]; then
   printf 'scanner delay="30" max_wait="15"\n'
 elif [[ "$*" == "admin config get rustfs-local heal" ]]; then
@@ -28,6 +31,19 @@ STUB
 cat >"$BIN_DIR/awscurl" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
+
+if [[ "${SCANNER_STATUS_EXIT_CODE:-0}" != "0" && "$*" == */scanner/status* ]]; then
+  for attempt in {1..100}; do
+    [[ -s "${IOSTAT_PID_FILE:?}" ]] && break
+    sleep 0.05
+  done
+  test -s "$IOSTAT_PID_FILE"
+  if [[ -n "${SCANNER_STATUS_WRITE_FAIL_FILE:-}" ]]; then
+    rm -f "$SCANNER_STATUS_WRITE_FAIL_FILE"
+    mkdir "$SCANNER_STATUS_WRITE_FAIL_FILE"
+  fi
+  exit "$SCANNER_STATUS_EXIT_CODE"
+fi
 
 printf '%s\n' "$*" >>"${AWSCURL_LOG:?}"
 printf 'access-env-present=%s\n' "${AWS_ACCESS_KEY_ID:+yes}" >>"${AWSCURL_LOG:?}"
@@ -72,11 +88,16 @@ JSON
   exit 0
 fi
 
-if [[ "$url" == *"/rustfs/admin/v3/metrics?types=1&by-host=true&n=1" ]]; then
+if [[ "$url" == *"/rustfs/admin/v3/realtime?types=1&by-host=true&n=1" ]]; then
   cat <<'JSON'
 {"node":"node-a","metrics":{"scanner":{"maintenanceControl":{"primaryControl":"active"}}}}
 JSON
   exit 0
+fi
+
+if [[ "$url" != *"/rustfs/admin/v3/scanner/status" ]]; then
+  printf 'unexpected admin URL: %s\n' "$url" >&2
+  exit 1
 fi
 
 cat <<'JSON'
@@ -128,9 +149,19 @@ cat >"$BIN_DIR/pidof" <<'STUB'
 exit 1
 STUB
 
+cat >"$BIN_DIR/uname" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "${TEST_UNAME:-Linux}"
+STUB
+
 cat >"$BIN_DIR/iostat" <<'STUB'
 #!/usr/bin/env bash
-printf 'iostat sample\n'
+printf 'iostat args: %s\n' "$*"
+if [[ -n "${IOSTAT_PID_FILE:-}" ]]; then
+  printf '%s\n' "$$" >"$IOSTAT_PID_FILE"
+  exec sleep 60
+fi
+exit "${IOSTAT_EXIT_CODE:-0}"
 STUB
 
 cat >"$BIN_DIR/mpstat" <<'STUB'
@@ -179,7 +210,7 @@ printf 'unexpected jq args: %s\n' "$*" >&2
 exit 1
 STUB
 
-chmod +x "$BIN_DIR/mc" "$BIN_DIR/awscurl" "$BIN_DIR/pidof" "$BIN_DIR/iostat" "$BIN_DIR/mpstat" "$BIN_DIR/jq"
+chmod +x "$BIN_DIR/uname" "$BIN_DIR/mc" "$BIN_DIR/awscurl" "$BIN_DIR/pidof" "$BIN_DIR/iostat" "$BIN_DIR/mpstat" "$BIN_DIR/jq"
 
 mc_log="$TMP_DIR/mc.log"
 awscurl_log="$TMP_DIR/awscurl.log"
@@ -248,8 +279,8 @@ fi
 grep -q -- 'http://127.0.0.1:9000/rustfs/admin/v3/scanner/status' "$awscurl_log"
 grep -q -- 'http://node-a:9000/rustfs/admin/v3/background-heal/status' "$awscurl_log"
 grep -q -- 'http://node-b:9000/rustfs/admin/v3/background-heal/status' "$awscurl_log"
-grep -q -- 'http://node-a:9000/rustfs/admin/v3/metrics?types=1&by-host=true&n=1' "$awscurl_log"
-grep -q -- 'http://node-b:9000/rustfs/admin/v3/metrics?types=1&by-host=true&n=1' "$awscurl_log"
+grep -q -- 'http://node-a:9000/rustfs/admin/v3/realtime?types=1&by-host=true&n=1' "$awscurl_log"
+grep -q -- 'http://node-b:9000/rustfs/admin/v3/realtime?types=1&by-host=true&n=1' "$awscurl_log"
 
 missing_pid_out="$TMP_DIR/out-missing-pid"
 RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" PATH="$BIN_DIR:$PATH" "$SCRIPT" \
@@ -265,6 +296,100 @@ RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" PATH="
 test -s "$missing_pid_out/status/scanner-status.1."*.json
 test -s "$missing_pid_out/iostat.txt"
 test -s "$missing_pid_out/mpstat.txt"
+
+grep -q 'iostat args: -xz 1 1' "$missing_pid_out/iostat.txt"
+
+for platform in Darwin Linux; do
+  platform_out="$TMP_DIR/out-$platform"
+  TEST_UNAME="$platform" RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" \
+    PATH="$BIN_DIR:$PATH" "$SCRIPT" --alias rustfs-local --endpoint http://127.0.0.1:9000 \
+    --access-key rustfsadmin --samples 1 --interval-secs 1 --out-dir "$platform_out"
+  if [[ "$platform" == Darwin ]]; then
+    grep -q 'iostat args: -d -w 1 -c 1' "$platform_out/iostat.txt"
+  else
+    grep -q 'iostat args: -xz 1 1' "$platform_out/iostat.txt"
+  fi
+  test "$(grep -cx $'iostat\t0' "$platform_out/host-telemetry-status.tsv")" -eq 1
+done
+
+failed_config_out="$TMP_DIR/out-failed-config"
+mkdir -p "$failed_config_out"
+cp "$TMP_DIR/out-Linux/iostat.txt" "$TMP_DIR/out-Linux/mpstat.txt" \
+  "$TMP_DIR/out-Linux/host-telemetry-status.tsv" "$failed_config_out/"
+printf 'previous pidstat sample\n' >"$failed_config_out/pidstat.txt"
+config_status=0
+CONFIG_EXIT_CODE=43 RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" \
+  PATH="$BIN_DIR:$PATH" "$SCRIPT" --alias rustfs-local --endpoint http://127.0.0.1:9000 \
+  --access-key rustfsadmin --samples 1 --interval-secs 1 --out-dir "$failed_config_out" \
+  >"$TMP_DIR/failed-config.log" 2>&1 || config_status=$?
+test "$config_status" -eq 43
+if [[ "$(cat "$failed_config_out/host-telemetry-status.tsv")" != $'collector\texit_status' ]]; then
+  echo "Expected output initialization to reset host telemetry before config capture" >&2
+  exit 1
+fi
+test ! -e "$failed_config_out/pidstat.txt"
+test ! -e "$failed_config_out/iostat.txt"
+test ! -e "$failed_config_out/mpstat.txt"
+
+for status_sink in file directory; do
+  failed_request_out="$TMP_DIR/out-failed-request-$status_sink"
+  collector_pid_file="$TMP_DIR/collector-$status_sink.pid"
+  status_write_fail_file=""
+  if [[ "$status_sink" == directory ]]; then
+    status_write_fail_file="$failed_request_out/host-telemetry-status.tsv"
+  fi
+  request_status=0
+  SCANNER_STATUS_EXIT_CODE=42 IOSTAT_PID_FILE="$collector_pid_file" \
+    SCANNER_STATUS_WRITE_FAIL_FILE="$status_write_fail_file" \
+    RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" \
+    PATH="$BIN_DIR:$PATH" "$SCRIPT" --alias rustfs-local --endpoint http://127.0.0.1:9000 \
+    --access-key rustfsadmin --samples 1 --interval-secs 1 --out-dir "$failed_request_out" \
+    >"$TMP_DIR/failed-request-$status_sink.log" 2>&1 || request_status=$?
+  test "$request_status" -eq 42
+  collector_pid="$(cat "$collector_pid_file")"
+  if kill -0 "$collector_pid" 2>/dev/null; then
+    kill "$collector_pid" 2>/dev/null || true
+    echo "Expected a failed status request to stop and reap its host collector" >&2
+    exit 1
+  fi
+  if [[ "$status_sink" == file ]]; then
+    grep -q $'iostat\t143' "$failed_request_out/host-telemetry-status.tsv"
+  else
+    test -d "$failed_request_out/host-telemetry-status.tsv"
+  fi
+  grep -q 'host telemetry collector iostat exited with status 143' "$TMP_DIR/failed-request-$status_sink.log"
+done
+
+# Reuse both populated OS outputs with collection disabled in different ways.
+for platform in Darwin Linux; do
+  platform_out="$TMP_DIR/out-$platform"
+  if [[ "$platform" == Darwin ]]; then
+    disabled_args=(--interval-secs 1 --skip-host-telemetry)
+  else
+    disabled_args=(--interval-secs 0)
+  fi
+  printf 'previous pidstat sample\n' >"$platform_out/pidstat.txt"
+  TEST_UNAME="$platform" RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" \
+    PATH="$BIN_DIR:$PATH" "$SCRIPT" --alias rustfs-local --endpoint http://127.0.0.1:9000 \
+    --access-key rustfsadmin --samples 1 "${disabled_args[@]}" --out-dir "$platform_out"
+  if [[ "$(cat "$platform_out/host-telemetry-status.tsv")" != $'collector\texit_status' ]]; then
+    echo "Expected disabled collection to reset the previous run's collector statuses" >&2
+    exit 1
+  fi
+  test ! -e "$platform_out/pidstat.txt"
+  test ! -e "$platform_out/iostat.txt"
+  test ! -e "$platform_out/mpstat.txt"
+  test -s "$platform_out/scanner-summary.csv"
+done
+
+failed_collector_out="$TMP_DIR/out-failed-collector"
+IOSTAT_EXIT_CODE=7 RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" \
+  PATH="$BIN_DIR:$PATH" "$SCRIPT" --alias rustfs-local --endpoint http://127.0.0.1:9000 \
+  --access-key rustfsadmin --samples 1 --interval-secs 1 --out-dir "$failed_collector_out" \
+  2>"$TMP_DIR/collector-warning.txt"
+grep -q $'iostat\t7' "$failed_collector_out/host-telemetry-status.tsv"
+grep -q 'host telemetry collector iostat exited with status 7' "$TMP_DIR/collector-warning.txt"
+test -s "$failed_collector_out/scanner-summary.csv"
 
 missing_args_log="$TMP_DIR/missing-args.log"
 if PATH="$BIN_DIR:$PATH" "$SCRIPT" --alias rustfs-local >"$missing_args_log" 2>&1; then
@@ -305,6 +430,8 @@ fi
 
 grep -q -- 'missing value for --alias' "$missing_value_log"
 
+"$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_version_oracle.py"
+
 secret_arg_log="$TMP_DIR/secret-arg.log"
 if PATH="$BIN_DIR:$PATH" "$SCRIPT" --secret-key rustfsadmin >"$secret_arg_log" 2>&1; then
   echo "Expected --secret-key argv to be rejected" >&2
@@ -313,4 +440,7 @@ fi
 
 grep -q -- 'unknown arg: --secret-key' "$secret_arg_log"
 
+"$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_service.py"
+"$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_process_receipt.py"
 "$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_abba.py"
+"$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_otlp_window.py"

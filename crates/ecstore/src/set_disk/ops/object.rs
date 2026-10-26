@@ -537,6 +537,7 @@ const GET_MID_SIZE_STREAMING_MAX_SIZE: usize = 512 * 1024;
 const EVENT_LIFECYCLE_TRANSITION_CLEANUP: &str = "lifecycle_transition_cleanup";
 const EVENT_LIFECYCLE_TRANSITIONED_DELETE_CLEANUP_OWNER: &str = "lifecycle_transitioned_delete_cleanup_owner";
 const EVENT_LIFECYCLE_RESTORE_CLEANUP: &str = "lifecycle_restore_cleanup";
+const EVENT_DELETE_VERSION_QUORUM: &str = "delete_version_quorum";
 
 fn replication_status_writeback_is_current(object_info: &ObjectInfo, condition: &ReplicationStatusWritebackCondition) -> bool {
     let current = object_info.replication_generation_snapshot();
@@ -4821,6 +4822,63 @@ impl SetDisks {
                 return Err(err);
             }
 
+            if bucket == RUSTFS_META_BUCKET
+                && object == "pool.bin"
+                && rustfs_utils::http::metadata_compat::contains_key_str(
+                    &opts.user_defined,
+                    crate::disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+                )
+            {
+                // The logical If-Match above remains authoritative. Bind each
+                // disk mutation to its actual physical predecessor as well, so
+                // a lagging replica can converge without admitting late tails.
+                let condition = rustfs_utils::http::metadata_compat::get_consistent_str(
+                    &opts.user_defined,
+                    crate::disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+                )
+                .ok_or(DiskError::FileCorrupt)?;
+                let condition: crate::disk::PoolMetaNativeCasCondition =
+                    serde_json::from_str(condition).map_err(|_| DiskError::FileCorrupt)?;
+                let (parents, errors) =
+                    Self::read_all_fileinfo(&shuffle_disks, bucket, bucket, object, "", false, false, false).await?;
+                for (index, ((metadata, parent), error)) in parts_metadatas.iter_mut().zip(&parents).zip(&errors).enumerate() {
+                    let mut parent_raw_sha256 = None;
+                    let parent = match error {
+                        None => Some(crate::disk::PoolMetaNativeFileIdentity::from_file_info(parent)?),
+                        Some(DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound) => None,
+                        // An unavailable disk keeps the exact logical parent;
+                        // reconnecting cannot turn an unknown head into absence.
+                        Some(
+                            DiskError::DiskNotFound | DiskError::FaultyDisk | DiskError::DiskAccessDenied | DiskError::Timeout,
+                        ) => condition.parent.clone(),
+                        Some(DiskError::FileCorrupt) => {
+                            use sha2::Digest as _;
+                            let disk = shuffle_disks[index].as_ref().ok_or(DiskError::DiskNotFound)?;
+                            match disk
+                                .pool_meta_native_recovery(crate::disk::PoolMetaNativeRecoveryRequest::Inspect {
+                                    object: crate::disk::PoolMetaNativeObject::PoolBin,
+                                })
+                                .await?
+                            {
+                                crate::disk::PoolMetaNativeRecoveryResponse::Inspected(snapshot) => {
+                                    let raw = snapshot.current.ok_or(DiskError::ConditionalDeleteConflict)?;
+                                    parent_raw_sha256 = Some(sha2::Sha256::digest(&raw).into());
+                                    None
+                                }
+                                _ => return Err(DiskError::FileCorrupt.into()),
+                            }
+                        }
+                        Some(err) => return Err(err.clone().into()),
+                    };
+                    crate::disk::PoolMetaNativeCasCondition {
+                        attempt_id: condition.attempt_id,
+                        parent,
+                        parent_raw_sha256,
+                    }
+                    .insert_into(&mut metadata.metadata)?;
+                }
+            }
+
             // Generate ordinary PUT timestamps under the commit lock so version
             // ordering follows durable commit ordering when writers queued on
             // the same object. Internal callers with an explicit timestamp keep
@@ -8991,6 +9049,23 @@ impl SetDisks {
             quorum_result = Err(DiskError::UnsupportedDisk.into());
         }
         let should_rollback = quorum_result.is_err();
+        if should_rollback {
+            // Each drive's own error is the only record of why the write lost
+            // quorum; the rollback that follows logs symptoms, not this cause.
+            warn!(
+                event = EVENT_DELETE_VERSION_QUORUM,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                result = "rollback",
+                bucket,
+                object,
+                pool_index = self.pool_index,
+                set_index = self.set_index,
+                write_quorum,
+                drive_errors = ?errs,
+                "Delete version lost write quorum; rolling back"
+            );
+        }
         let structured_cleanup = !is_meta_bucketname(bucket) && !should_rollback;
         if structured_cleanup {
             self.publish_delete_commit(
@@ -9908,15 +9983,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 delete_marker_purge_candidates[i] =
                     delete_marker_purge_candidate(&authoritative_file_info, opts.expected_bucket_incarnation_id);
             }
-            // Response-side only for the null identity: a delete request marked
-            // `deleted` with `version_id == None` makes `FileMeta::delete_version`
-            // re-create the marker it just removed (the suspended-bucket
-            // "delete mints a marker" write path), so the write shape must stay
-            // untouched for explicit null-marker removals.
-            if removed_delete_marker && version_id.is_some() {
-                vr.deleted = true;
-                vr.mod_time = goi.mod_time;
-            }
+            // Explicit marker removals use the same storage mutation as other
+            // version removals. `deleted` selects marker writes in FileMeta and
+            // batch grouping; marker response metadata stays separate below.
 
             if let Some(incarnation) = opts.expected_bucket_incarnation_id {
                 vr.set_delete_marker_incarnation(incarnation);
@@ -9934,8 +10003,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     } else {
                         vr.version_id
                     },
-                    // For a null-marker removal `vr` stays undeleted (write
-                    // shape), so take the marker's mtime from the source.
+                    // Explicit removals carry the source marker's timestamp.
                     delete_marker_mtime: vr.mod_time.or(goi.mod_time),
                     object_name: vr.name.clone(),
                     replication_state: vr.replication_state_internal.clone(),
@@ -12863,6 +12931,21 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
             disks.push(Some(disk));
         }
 
+        // This fixture owns a complete physical topology even when it shares
+        // the bootstrap service context with other independent hermetic sets.
+        let topology = crate::layout::endpoints::EndpointServerPools(vec![crate::layout::endpoints::PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: disk_count,
+            endpoints: endpoints.clone().into(),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]);
+        let (_, multipart_authority) = crate::disk::multipart_source::ProofVerificationContext::for_topology(&topology)
+            .expect("hermetic fixture should have a complete local topology");
+        crate::disk::multipart_source::bind_multipart_proof_snapshot(&disks, &multipart_authority)
+            .expect("hermetic local disks should bind to their fixture authority");
+
         let set_disks = SetDisks::new_with_instance_ctx(
             "hermetic-ops-test-owner".to_string(),
             Arc::new(RwLock::new(disks)),
@@ -12877,6 +12960,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         )
         .await;
 
+        set_disks.set_multipart_proof_authority_for_test(multipart_authority);
         (temp_dirs, disk_stores, set_disks)
     }
 }
@@ -24770,7 +24854,20 @@ mod delete_objects_lock_gating_tests {
         for disk in &disks {
             disk.make_volume(bucket).await.expect("create fixture volume");
         }
-        put_plain_object(&set, bucket, object).await;
+        // This fixture inspects a specific drive and then takes it offline.
+        // A quorum ACK alone does not mean that drive's rename has completed.
+        let mut reader = PutObjReader::from_vec(vec![3u8; 1024]);
+        set.put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("fixture rename fan-out should finish before injecting a drive fault");
         let disk_info = disks[0]
             .read_version(bucket, bucket, object, "", &crate::disk::ReadOptions::default())
             .await
@@ -26965,6 +27062,352 @@ mod cleanup_receipt_admission_tests {
         assert!(!SetDisks::needs_old_data_cleanup_receipt(old, Some(old), Some(epoch)));
         assert!(SetDisks::needs_old_data_cleanup_receipt(old, Some(current), Some(epoch)));
         assert!(SetDisks::needs_old_data_cleanup_receipt(old, None, Some(epoch)));
+    }
+}
+
+#[cfg(test)]
+mod batch_delete_marker_tests {
+    use super::*;
+    use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+    use crate::storage_api_contracts::bucket::{BucketOperations, DeleteBucketOptions, MakeBucketOptions};
+    use crate::storage_api_contracts::list::ListOperations;
+
+    async fn marker_history(store: &Arc<ECStore>, bucket: &str) -> (Vec<Uuid>, Vec<Uuid>) {
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned bucket");
+        let mut data_versions = Vec::new();
+        let mut markers = Vec::new();
+        for body in [b"first".as_slice(), b"second".as_slice()] {
+            let uploaded = store
+                .put_object(
+                    bucket,
+                    "object",
+                    &mut PutObjReader::from_vec(body.to_vec()),
+                    &ObjectOptions {
+                        versioned: true,
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write a data version");
+            data_versions.push(uploaded.version_id.expect("versioned PUT returns an ID"));
+            let marker = store
+                .delete_object(
+                    bucket,
+                    "object",
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create a delete marker");
+            assert!(marker.delete_marker);
+            markers.push(marker.version_id.expect("delete marker has a version ID"));
+        }
+        (data_versions, markers)
+    }
+
+    #[tokio::test]
+    async fn batch_delete_indexed_marker_history_unblocks_bucket_delete() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "batch-indexed-marker-history";
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned bucket");
+        let uploaded = store
+            .put_object(
+                bucket,
+                "object",
+                &mut PutObjReader::from_vec(vec![42; 1024 * 1024]),
+                &ObjectOptions {
+                    versioned: true,
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write a physical data version behind the markers");
+        let mut requests = Vec::with_capacity(17);
+        requests.push(ObjectToDelete {
+            object_name: "object".to_string(),
+            version_id: Some(uploaded.version_id.expect("data version")),
+            ..Default::default()
+        });
+        for _ in 0..16 {
+            let marker = store
+                .delete_object(
+                    bucket,
+                    "object",
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("append a marker to the same key");
+            requests.push(ObjectToDelete {
+                object_name: "object".to_string(),
+                version_id: Some(marker.version_id.expect("marker version")),
+                ..Default::default()
+            });
+        }
+        let (deleted, errors) = store.delete_objects(bucket, requests, ObjectOptions::default()).await;
+        assert_eq!(deleted.len(), 17);
+        assert!(errors.iter().all(Option::is_none), "indexed marker batch must commit: {errors:?}");
+        assert!(!deleted[0].delete_marker);
+        assert!(deleted[1..].iter().all(|result| result.delete_marker));
+        let listed = store
+            .clone()
+            .list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list immediately after indexed deletion");
+        assert!(listed.objects.is_empty());
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("indexed deletion leaves an immediately deletable bucket");
+    }
+
+    #[tokio::test]
+    async fn batch_delete_explicit_marker_does_not_wait_for_pending_replication() {
+        use s3s::dto::{
+            BucketVersioningStatus, DeleteReplication, DeleteReplicationStatus, Destination, ReplicationConfiguration,
+            ReplicationRule, ReplicationRuleStatus, VersioningConfiguration,
+        };
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "batch-marker-replication";
+        let (data_versions, markers) = marker_history(&store, bucket).await;
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
+            VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                ..Default::default()
+            },
+            Some(ReplicationConfiguration {
+                role: String::new(),
+                rules: vec![ReplicationRule {
+                    delete_marker_replication: None,
+                    delete_replication: Some(DeleteReplication {
+                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                    }),
+                    destination: Destination {
+                        bucket: arn.to_string(),
+                        ..Default::default()
+                    },
+                    existing_object_replication: None,
+                    filter: None,
+                    id: Some("delete".to_string()),
+                    prefix: Some(String::new()),
+                    priority: Some(1),
+                    source_selection_criteria: None,
+                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                }],
+            }),
+        ));
+        let (deleted, errors) = store
+            .delete_objects(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: "object".to_owned(),
+                    version_id: Some(markers[1]),
+                    ..Default::default()
+                }],
+                ObjectOptions {
+                    delete_replication_config_snapshot: Some(snapshot),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(errors[0].is_none(), "marker purge must succeed: {errors:?}");
+        assert!(deleted[0].delete_marker);
+        assert_eq!(deleted[0].delete_marker_version_id, Some(markers[1]));
+        assert_eq!(
+            deleted[0]
+                .replication_state
+                .as_ref()
+                .and_then(|state| state.version_purge_status_internal.as_deref()),
+            Some("arn:rustfs:replication:us-east-1:target:bucket=PENDING;")
+        );
+        let current = store
+            .get_object_info(bucket, "object", &ObjectOptions::default())
+            .await
+            .expect("source data must be visible before remote replication completes");
+        assert_eq!(current.version_id, Some(data_versions[1]));
+    }
+
+    #[tokio::test]
+    async fn batch_delete_all_explicit_versions_unblocks_bucket_delete() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "batch-marker-empty-bucket";
+        let (data_versions, markers) = marker_history(&store, bucket).await;
+        let requested = [markers[1], data_versions[0], markers[0], data_versions[1]];
+        let (deleted, errors) = store
+            .delete_objects(
+                bucket,
+                requested
+                    .into_iter()
+                    .map(|version_id| ObjectToDelete {
+                        object_name: "object".to_owned(),
+                        version_id: Some(version_id),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ObjectOptions::default(),
+            )
+            .await;
+        assert!(errors.iter().all(Option::is_none), "all explicit deletes must succeed: {errors:?}");
+        for (index, version) in requested.iter().enumerate() {
+            assert_eq!(deleted[index].delete_marker, markers.contains(version));
+            if markers.contains(version) {
+                assert_eq!(deleted[index].delete_marker_version_id, Some(*version));
+            } else {
+                assert_eq!(deleted[index].version_id, Some(*version));
+            }
+        }
+        let listed = store
+            .clone()
+            .list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list immediately after the successful batch");
+        assert!(listed.objects.is_empty(), "no version or marker may survive: {:?}", listed.objects);
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete the empty bucket immediately without retries or force");
+        for dir in dirs {
+            assert!(!dir.path().join(bucket).exists(), "bucket must be removed on every disk");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_delete_explicit_markers_preserves_data_and_duplicate_idempotency() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "batch-marker-keep-data";
+        let (data_versions, markers) = marker_history(&store, bucket).await;
+        let requested = [markers[0], markers[0], markers[1], markers[1]];
+        let (deleted, errors) = store
+            .delete_objects(
+                bucket,
+                requested
+                    .into_iter()
+                    .map(|version_id| ObjectToDelete {
+                        object_name: "object".to_owned(),
+                        version_id: Some(version_id),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ObjectOptions::default(),
+            )
+            .await;
+        assert!(errors.iter().all(Option::is_none), "duplicate explicit deletes must succeed: {errors:?}");
+        for (result, version) in deleted.iter().zip(requested) {
+            assert!(result.delete_marker);
+            assert_eq!(result.delete_marker_version_id, Some(version));
+        }
+        let listed = store
+            .clone()
+            .list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list remaining data versions immediately");
+        assert_eq!(listed.objects.len(), data_versions.len());
+        assert!(
+            listed
+                .objects
+                .iter()
+                .all(|info| !info.delete_marker && data_versions.contains(&info.version_id.expect("version ID")))
+        );
+        let current = store
+            .get_object_info(bucket, "object", &ObjectOptions::default())
+            .await
+            .expect("removing the markers restores the latest data version");
+        assert_eq!(current.version_id, Some(data_versions[1]));
+        for dir in dirs {
+            let bytes = tokio::fs::read(dir.path().join(bucket).join("object").join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("read committed metadata from each disk");
+            let mut metadata = FileMeta::default();
+            metadata.unmarshal_msg(&bytes).expect("decode committed metadata");
+            assert_eq!(metadata.versions.len(), data_versions.len());
+            assert!(
+                metadata
+                    .versions
+                    .iter()
+                    .all(|version| version.header.version_type == rustfs_filemeta::VersionType::Object)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_delete_mixed_null_and_uuid_markers_preserves_their_identities() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "batch-marker-null-version";
+        let (data_versions, markers) = marker_history(&store, bucket).await;
+        crate::bucket::metadata_sys::update_in(
+            &store.ctx,
+            bucket,
+            crate::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("suspend versioning");
+        store
+            .delete_object(
+                bucket,
+                "object",
+                ObjectOptions {
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the null delete marker");
+        let requested = [markers[1], Uuid::nil(), markers[0]];
+        let (deleted, errors) = store
+            .delete_objects(
+                bucket,
+                requested
+                    .into_iter()
+                    .map(|version_id| ObjectToDelete {
+                        object_name: "object".to_owned(),
+                        version_id: Some(version_id),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ObjectOptions::default(),
+            )
+            .await;
+        assert!(errors.iter().all(Option::is_none), "mixed marker deletes must succeed: {errors:?}");
+        for (result, version) in deleted.iter().zip(requested) {
+            assert!(result.delete_marker);
+            assert_eq!(result.delete_marker_version_id, Some(version));
+        }
+        let listed = store
+            .clone()
+            .list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list immediately after mixed marker deletion");
+        assert_eq!(listed.objects.len(), data_versions.len());
+        assert!(listed.objects.iter().all(|info| !info.delete_marker));
     }
 }
 

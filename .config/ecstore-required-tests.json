@@ -242,11 +242,6 @@
       "name": "store::list_objects::differential_tests::list_objects_shared_corpus_cancelled_quorum_walk_releases_senders_and_disk_lock"
     },
     {
-      "invariant": "list-objects-shared-corpus-enabled-index-contracts",
-      "suite": "rustfs-ecstore",
-      "name": "store::list_objects::differential_tests::list_objects_shared_corpus_enabled_index_contracts"
-    },
-    {
       "invariant": "borrowed-context-boundary",
       "suite": "rustfs-ecstore",
       "name": "set_disk::ops::object::put_object_tmp_cleanup_tests::borrowed_write_context_rejects_wrong_namespace_and_cache_flag"

@@ -14,13 +14,14 @@
 
 use crate::common::{
     RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request, init_logging, replication_fast_env, rustfs_binary_path,
-    signed_request,
+    signal_process, signed_request,
 };
 use crate::fake_s3_target::{BucketMode, FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, Operation as FakeTargetOperation};
 use crate::on_demand_migration::common::{ODM_SERVER_ENV, OdmTestEnv, SeedObject, fake_source_client};
 use crate::replication_extension_test::{
     LOOPBACK_REPLICATION_TARGET_ENV, ReplicationTargetOptions, put_bucket_replication, set_replication_target_with_options,
 };
+use crate::storage_api::upgrade_compatibility::RUSTFS_META_MULTIPART_BUCKET;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -52,6 +53,8 @@ const SSE_MASTER_KEY: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
 const PLAIN_BUCKET: &str = "upgrade-plain-data";
 const VERSIONED_BUCKET: &str = "upgrade-versioned-data";
 const MIXED_BUCKET: &str = "upgrade-mixed-version-data";
+const PENDING_MULTIPART_BUCKET: &str = "upgrade-mpu-continuity";
+const PENDING_MULTIPART_KEY: &str = "pending/legacy-multipart.bin";
 const MIXED_NODE_COUNT: usize = 4;
 const UPGRADE_READINESS_BODY: &[u8] = b"upgrade write readiness";
 // Written by the "previous-seed" readiness probe through node 0 before any
@@ -301,18 +304,27 @@ async fn read_object(
     Ok((encryption, body))
 }
 
-async fn write_multipart(client: &Client, bucket: &str, key: &str, parts: &[Vec<u8>]) -> TestResult {
-    let created = client.create_multipart_upload().bucket(bucket).key(key).send().await?;
-    let upload_id = created.upload_id().ok_or("CreateMultipartUpload omitted upload ID")?;
-    let mut completed_parts = Vec::with_capacity(parts.len());
+struct PendingMultipart {
+    upload_id: String,
+    completed_parts: Vec<CompletedPart>,
+    part_sizes: Vec<i64>,
+}
 
+async fn stage_multipart(client: &Client, bucket: &str, key: &str, parts: &[Vec<u8>]) -> Result<PendingMultipart, BoxError> {
+    let created = client.create_multipart_upload().bucket(bucket).key(key).send().await?;
+    let upload_id = created
+        .upload_id()
+        .ok_or("CreateMultipartUpload omitted upload ID")?
+        .to_owned();
+    let mut completed_parts = Vec::with_capacity(parts.len());
+    let mut part_sizes = Vec::with_capacity(parts.len());
     for (index, part) in parts.iter().enumerate() {
         let part_number = i32::try_from(index + 1)?;
         let uploaded = client
             .upload_part()
             .bucket(bucket)
             .key(key)
-            .upload_id(upload_id)
+            .upload_id(&upload_id)
             .part_number(part_number)
             .body(ByteStream::from(part.clone()))
             .send()
@@ -323,16 +335,38 @@ async fn write_multipart(client: &Client, bucket: &str, key: &str, parts: &[Vec<
                 .e_tag(uploaded.e_tag().ok_or("UploadPart omitted ETag")?)
                 .build(),
         );
+        part_sizes.push(i64::try_from(part.len())?);
     }
+    Ok(PendingMultipart {
+        upload_id,
+        completed_parts,
+        part_sizes,
+    })
+}
 
-    client
+async fn complete_pending_multipart(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    pending: &PendingMultipart,
+) -> Result<aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput, BoxError> {
+    Ok(client
         .complete_multipart_upload()
         .bucket(bucket)
         .key(key)
-        .upload_id(upload_id)
-        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed_parts)).build())
+        .upload_id(&pending.upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(pending.completed_parts.clone()))
+                .build(),
+        )
         .send()
-        .await?;
+        .await?)
+}
+
+async fn write_multipart(client: &Client, bucket: &str, key: &str, parts: &[Vec<u8>]) -> TestResult {
+    let pending = stage_multipart(client, bucket, key, parts).await?;
+    complete_pending_multipart(client, bucket, key, &pending).await?;
     Ok(())
 }
 
@@ -377,6 +411,330 @@ async fn write_multipart_load(clients: &[Client], phase: &str) -> Result<Vec<Str
         keys.extend(result??);
     }
     Ok(keys)
+}
+
+async fn write_mixed_put_load(clients: &[Client], phase: &str) -> Result<Vec<String>, BoxError> {
+    let mut tasks = JoinSet::new();
+    for worker in 0..MULTIPART_WORKERS {
+        let node = worker % clients.len();
+        let client = clients[node].clone();
+        let phase = phase.to_owned();
+        tasks.spawn(async move {
+            let mut keys = Vec::with_capacity(MULTIPART_UPLOADS_PER_WORKER);
+            for upload in 0..MULTIPART_UPLOADS_PER_WORKER {
+                let key = format!("{phase}/put/{worker:02}/{upload:02}");
+                tokio::time::timeout(
+                    MIXED_MULTIPART_UPLOAD_TIMEOUT,
+                    client
+                        .put_object()
+                        .bucket(MIXED_BUCKET)
+                        .key(&key)
+                        .body(ByteStream::from(vec![u8::try_from(worker)?; 64 * 1024]))
+                        .send(),
+                )
+                .await
+                .map_err(|_| format!("node {node}: PUT {key} acknowledgement deadline exceeded"))??;
+                keys.push(key);
+            }
+            Ok::<_, BoxError>(keys)
+        });
+    }
+    let mut keys = Vec::with_capacity(MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER);
+    while let Some(result) = tasks.join_next().await {
+        keys.extend(result??);
+    }
+    Ok(keys)
+}
+
+async fn verify_load_bodies(clients: &[Client], phase: &str, operation: &str) -> TestResult {
+    for worker in 0..MULTIPART_WORKERS {
+        let reader = &clients[(worker + 1) % clients.len()];
+        for upload in 0..MULTIPART_UPLOADS_PER_WORKER {
+            let key = format!("{phase}/{operation}/{worker:02}/{upload:02}");
+            assert_eq!(
+                read_object(reader, MIXED_BUCKET, &key, None).await?.1,
+                vec![u8::try_from(worker)?; 64 * 1024],
+                "{phase}: acknowledged {key} body"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn exercise_homogeneous_multipart(cluster: &RustFSTestClusterEnvironment, phase: &str) -> TestResult {
+    let clients = cluster.create_all_clients()?;
+    wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, phase, LISTING_CONVERGENCE_TIMEOUT).await?;
+    wait_for_drive_readmission(&clients, MIXED_BUCKET, phase, DRIVE_READMISSION_TIMEOUT).await?;
+    let keys = match write_multipart_load(&clients, phase).await {
+        Ok(keys) => keys,
+        Err(error) => {
+            let log_dir = std::env::var_os("RUSTFS_E2E_LOG_DIR");
+            return observe_mixed_multipart_failure(cluster, phase, error, log_dir.as_deref().map(Path::new)).await;
+        }
+    };
+    assert_eq!(keys.len(), MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER);
+    verify_load_bodies(&clients, phase, "multipart").await?;
+    for (reader, client) in clients.iter().enumerate() {
+        wait_for_phase_listing(client, phase, keys.len(), &format!("homogeneous reader {reader}")).await?;
+    }
+    Ok(())
+}
+
+struct PendingSourceBytes {
+    root: PathBuf,
+    files: Vec<(PathBuf, Vec<u8>)>,
+}
+
+fn pending_source_bytes(
+    cluster: &RustFSTestClusterEnvironment,
+    pending: &PendingMultipart,
+) -> Result<Vec<PendingSourceBytes>, BoxError> {
+    let source_hash =
+        rustfs_utils::hex_sha256(format!("{PENDING_MULTIPART_BUCKET}/{PENDING_MULTIPART_KEY}").as_bytes(), str::to_owned);
+    let mut sources = Vec::new();
+    for volume in cluster.nodes.iter().flat_map(|node| &node.data_dirs) {
+        let hash_root = Path::new(volume).join(RUSTFS_META_MULTIPART_BUCKET).join(&source_hash);
+        let roots = std::fs::read_dir(&hash_root)?
+            .map(|entry| {
+                let entry = entry?;
+                Ok(entry.file_type()?.is_dir().then(|| entry.path()))
+            })
+            .collect::<Result<Vec<_>, std::io::Error>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if roots.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "pending upload source has not settled").into());
+        }
+        assert_eq!(roots.len(), 1, "the dedicated key has exactly one real pending upload");
+        let root = roots.into_iter().next().ok_or("pending upload source missing")?;
+        let mut files = vec![(PathBuf::from("xl.meta"), std::fs::read(root.join("xl.meta"))?)];
+        let data_dirs = std::fs::read_dir(&root)?
+            .map(|entry| {
+                let entry = entry?;
+                Ok((entry.file_type()?.is_dir() && entry.path().join("part.1").is_file()).then(|| entry.path()))
+            })
+            .collect::<Result<Vec<_>, std::io::Error>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if data_dirs.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "selected part publication has not settled").into());
+        }
+        assert_eq!(data_dirs.len(), 1, "the upload has one actual selected-part directory");
+        let data_dir = data_dirs.into_iter().next().ok_or("pending upload parts missing")?;
+        for part in &pending.completed_parts {
+            let number = part.part_number().ok_or("acknowledged part omitted its number")?;
+            for name in [format!("part.{number}"), format!("part.{number}.meta")] {
+                let path = data_dir.join(name);
+                files.push((path.strip_prefix(&root)?.to_owned(), std::fs::read(path)?));
+            }
+        }
+        sources.push(PendingSourceBytes { root, files });
+    }
+    assert_eq!(
+        sources.len(),
+        MIXED_NODE_COUNT,
+        "the controlled legacy fixture requires every physical source"
+    );
+    Ok(sources)
+}
+
+async fn wait_for_pending_source_bytes(
+    cluster: &RustFSTestClusterEnvironment,
+    pending: &PendingMultipart,
+) -> Result<Vec<PendingSourceBytes>, BoxError> {
+    let deadline = Instant::now() + DRIVE_READMISSION_TIMEOUT;
+    loop {
+        match pending_source_bytes(cluster, pending) {
+            Ok(sources) => return Ok(sources),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    && Instant::now() < deadline =>
+            {
+                sleep(Duration::from_millis(500)).await
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn assert_pending_parts(client: &Client, pending: &PendingMultipart) -> TestResult {
+    let listed = client
+        .list_parts()
+        .bucket(PENDING_MULTIPART_BUCKET)
+        .key(PENDING_MULTIPART_KEY)
+        .upload_id(&pending.upload_id)
+        .send()
+        .await?;
+    assert_eq!(listed.upload_id(), Some(pending.upload_id.as_str()));
+    assert_ne!(listed.is_truncated(), Some(true));
+    assert_eq!(listed.parts().len(), pending.completed_parts.len());
+    for ((actual, expected), expected_size) in listed.parts().iter().zip(&pending.completed_parts).zip(&pending.part_sizes) {
+        assert_eq!(actual.part_number(), expected.part_number());
+        assert_eq!(actual.e_tag(), expected.e_tag());
+        assert_eq!(actual.size(), Some(*expected_size));
+    }
+    Ok(())
+}
+
+async fn assert_mixed_pending_refusal(
+    cluster: &RustFSTestClusterEnvironment,
+    pending: &PendingMultipart,
+    sources: &[PendingSourceBytes],
+) -> TestResult {
+    let clients = cluster.create_all_clients()?;
+    assert_pending_parts(&clients[0], pending).await?;
+    let error = upgrade_probe_client(&clients[0])
+        .complete_multipart_upload()
+        .bucket(PENDING_MULTIPART_BUCKET)
+        .key(PENDING_MULTIPART_KEY)
+        .upload_id(&pending.upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(pending.completed_parts.clone()))
+                .build(),
+        )
+        .send()
+        .await
+        .expect_err("one native participant cannot authorize a legacy MPU completion");
+    assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(503), "{error:?}");
+    assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("ServiceUnavailable"));
+    for client in &clients {
+        assert_pending_parts(client, pending).await?;
+        let error = client
+            .get_object()
+            .bucket(PENDING_MULTIPART_BUCKET)
+            .key(PENDING_MULTIPART_KEY)
+            .send()
+            .await
+            .expect_err("the rejected Complete must not publish a target");
+        assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
+    }
+    for source in sources {
+        for entry in std::fs::read_dir(&source.root)? {
+            assert!(
+                !entry?.file_name().to_string_lossy().starts_with(".mpu-"),
+                "the failed preflight must not upgrade one physical legacy source"
+            );
+        }
+        for (relative, expected) in &source.files {
+            let actual = std::fs::read(source.root.join(relative))?;
+            assert!(actual == *expected, "rejected Complete changed actual source {}", relative.display());
+        }
+    }
+    Ok(())
+}
+
+struct CompletedPendingMultipart {
+    version_id: String,
+    etag: String,
+    body: Vec<u8>,
+}
+
+async fn assert_resumed_multipart(clients: &[Client], completed: &CompletedPendingMultipart) -> TestResult {
+    for (node, client) in clients.iter().enumerate() {
+        let response = client
+            .get_object()
+            .bucket(PENDING_MULTIPART_BUCKET)
+            .key(PENDING_MULTIPART_KEY)
+            .version_id(&completed.version_id)
+            .send()
+            .await?;
+        assert_eq!(response.version_id(), Some(completed.version_id.as_str()), "reader {node}");
+        assert_eq!(response.e_tag(), Some(completed.etag.as_str()), "reader {node}");
+        assert_eq!(
+            response.body.collect().await?.into_bytes().as_ref(),
+            completed.body.as_slice(),
+            "reader {node}"
+        );
+        assert_eq!(
+            read_object(client, PENDING_MULTIPART_BUCKET, PENDING_MULTIPART_KEY, None)
+                .await?
+                .1,
+            completed.body
+        );
+        let versions = client
+            .list_object_versions()
+            .bucket(PENDING_MULTIPART_BUCKET)
+            .prefix(PENDING_MULTIPART_KEY)
+            .send()
+            .await?;
+        assert_eq!(versions.versions().len(), 1, "same-upload replay must not add a version");
+        assert_eq!(versions.versions()[0].version_id(), Some(completed.version_id.as_str()));
+        assert!(versions.delete_markers().is_empty());
+    }
+    Ok(())
+}
+
+async fn finish_pending_multipart(
+    clients: &[Client],
+    pending: &PendingMultipart,
+    body: Vec<u8>,
+) -> Result<CompletedPendingMultipart, BoxError> {
+    let complete = complete_pending_multipart(&clients[0], PENDING_MULTIPART_BUCKET, PENDING_MULTIPART_KEY, pending).await?;
+    let version_id = complete
+        .version_id()
+        .filter(|version| !version.is_empty() && *version != "null")
+        .ok_or("versioned legacy upload completion omitted a concrete version")?
+        .to_owned();
+    let etag = complete.e_tag().ok_or("CompleteMultipartUpload omitted ETag")?.to_owned();
+    let replay = complete_pending_multipart(&clients[0], PENDING_MULTIPART_BUCKET, PENDING_MULTIPART_KEY, pending).await?;
+    assert_eq!(replay.version_id(), Some(version_id.as_str()));
+    assert_eq!(replay.e_tag(), Some(etag.as_str()));
+    let completed = CompletedPendingMultipart { version_id, etag, body };
+    assert_resumed_multipart(clients, &completed).await?;
+    Ok(completed)
+}
+
+async fn wait_for_multipart_quiescence(cluster: &RustFSTestClusterEnvironment, sources: &[PendingSourceBytes]) -> TestResult {
+    let deadline = Instant::now() + LISTING_CONVERGENCE_TIMEOUT;
+    loop {
+        let pending_roots = sources.iter().filter(|source| source.root.exists()).count();
+        let mut native_controls = 0;
+        let mut remaining_upload_roots = 0;
+        for volume in cluster.nodes.iter().flat_map(|node| &node.data_dirs) {
+            let root = Path::new(volume).join(RUSTFS_META_MULTIPART_BUCKET);
+            if !root.exists() {
+                continue;
+            }
+            for entry in walkdir::WalkDir::new(root) {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error)
+                        if error
+                            .io_error()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                    {
+                        native_controls += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                // Every fixture upload lives at MPI/<SHA>/<upload>. A born-only
+                // source can contain just xl.meta and its data directory, with
+                // no .mpu-* record. Only empty SHA parents may survive rollback.
+                if entry.depth() == 2 || (entry.depth() == 1 && !entry.file_type().is_dir()) {
+                    remaining_upload_roots += 1;
+                }
+                if entry.file_name().to_string_lossy().starts_with(".mpu-") {
+                    native_controls += 1;
+                }
+            }
+        }
+        if pending_roots == 0 && remaining_upload_roots == 0 && native_controls == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "downgrade requires settled native MPU state: {pending_roots} fixed pending roots, {remaining_upload_roots} inventoried upload roots, {native_controls} native controls"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
 }
 
 async fn mixed_multipart_before(
@@ -625,14 +983,11 @@ async fn exercise_mixed_cluster(
         .await?;
     assert_eq!(read_object(current_client, MIXED_BUCKET, &previous_key, None).await?.1, previous_body);
 
-    let multipart_keys = match write_multipart_load(&clients, phase).await {
-        Ok(keys) => keys,
-        Err(error) => {
-            let log_dir = std::env::var_os("RUSTFS_E2E_LOG_DIR");
-            return observe_mixed_multipart_failure(cluster, phase, error, log_dir.as_deref().map(Path::new)).await;
-        }
-    };
-    let expected_count = multipart_keys.len() + 2;
+    // Native MPU mutations are operationally paused while RPC generations
+    // differ. Keep the same mixed traffic volume with ordinary PUT instead.
+    let written_keys = write_mixed_put_load(&clients, phase).await?;
+    let expected_count = written_keys.len() + 2;
+    verify_load_bodies(&clients, phase, "put").await?;
     for (label, client) in [("current", current_client), ("previous", previous_client)] {
         assert_eq!(
             read_object(client, MIXED_BUCKET, PREVIOUS_RELEASE_SEED_KEY, None).await?.1,
@@ -648,9 +1003,9 @@ async fn exercise_mixed_cluster(
         .await?;
     }
 
-    let last_multipart_key = format!("{phase}/multipart/{:02}/{:02}", MULTIPART_WORKERS - 1, MULTIPART_UPLOADS_PER_WORKER - 1);
+    let last_put_key = format!("{phase}/put/{:02}/{:02}", MULTIPART_WORKERS - 1, MULTIPART_UPLOADS_PER_WORKER - 1);
     assert_eq!(
-        read_object(previous_client, MIXED_BUCKET, &last_multipart_key, None).await?.1,
+        read_object(previous_client, MIXED_BUCKET, &last_put_key, None).await?.1,
         vec![u8::try_from(MULTIPART_WORKERS - 1)?; 64 * 1024]
     );
 
@@ -790,12 +1145,20 @@ fn previous_baseline_writers(clients: &[Client], restarted_node: usize) -> &[Cli
 }
 
 async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnvironment, previous_binary: &Path) -> TestResult {
+    prepare_release_baseline(cluster, previous_binary, "previous").await
+}
+
+async fn prepare_release_baseline(
+    cluster: &mut RustFSTestClusterEnvironment,
+    previous_binary: &Path,
+    prefix: &str,
+) -> TestResult {
     let clients: Vec<_> = cluster.create_all_clients()?.iter().map(upgrade_probe_client).collect();
     // rc.5 can latch a non-elected node's write fence while its first startup
     // waits for pool metadata (#7473). First prove the elected writer can
     // persist data, then restart each old process once with three peers still
-    // readable. This preparation ends before any current binary is started.
-    wait_for_upgrade_write_readiness(&clients[..1], MIXED_BUCKET, "previous-seed", LISTING_CONVERGENCE_TIMEOUT).await?;
+    // readable. The same preparation is reused only after a quiescent homogeneous rollback.
+    wait_for_upgrade_write_readiness(&clients[..1], MIXED_BUCKET, &format!("{prefix}-seed"), LISTING_CONVERGENCE_TIMEOUT).await?;
     // A node that just came back is still replaying its startup traffic against
     // every peer. Killing the next node during that burst gives the fresh node
     // two failures in a row and it drops that peer's drive to Offline, where
@@ -805,7 +1168,7 @@ async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnviro
     for node in [1, 2, 3, 0] {
         cluster.stop_node(node)?;
         cluster.start_node_from_binary(node, previous_binary).await?;
-        let context = format!("previous-restart-{node}");
+        let context = format!("{prefix}-restart-{node}");
         wait_for_upgrade_write_readiness(
             std::slice::from_ref(&clients[node]),
             MIXED_BUCKET,
@@ -822,15 +1185,17 @@ async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnviro
         .await?;
     }
 
-    wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, "previous-baseline", LISTING_CONVERGENCE_TIMEOUT).await?;
+    wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, &format!("{prefix}-baseline"), LISTING_CONVERGENCE_TIMEOUT).await?;
     for (reader, client) in clients.iter().enumerate() {
         assert_eq!(
-            read_object(client, MIXED_BUCKET, PREVIOUS_RELEASE_SEED_KEY, None).await?.1,
+            read_object(client, MIXED_BUCKET, &format!(".upgrade-readiness/{prefix}-seed/node-0"), None)
+                .await?
+                .1,
             UPGRADE_READINESS_BODY,
             "previous-release node {reader} must retain the seed across its rolling restart"
         );
         for writer in 0..clients.len() {
-            let key = format!(".upgrade-readiness/previous-baseline/node-{writer}");
+            let key = format!(".upgrade-readiness/{prefix}-baseline/node-{writer}");
             assert_eq!(
                 read_object(client, MIXED_BUCKET, &key, None).await?.1,
                 UPGRADE_READINESS_BODY,
@@ -1372,6 +1737,353 @@ async fn rc5_rollback_requires_restoring_odm_configuration() -> TestResult {
     Ok(())
 }
 
+struct Rc5CheckpointCapture {
+    disk: PathBuf,
+    path: PathBuf,
+    task_id: String,
+    bytes: Vec<u8>,
+}
+
+async fn capture_rc5_checkpoint(drives: &[PathBuf], writer_pid: u32) -> Result<Rc5CheckpointCapture, BoxError> {
+    let has_signed_progress = |value: &Value| {
+        value["schema_version"].as_u64() == Some(6)
+            && value["successful_objects"].as_u64().is_some_and(|count| count > 0)
+            && value["processed_objects"]
+                .as_array()
+                .is_some_and(|objects| !objects.is_empty())
+            && value["integrity_digest"].as_str().is_some_and(|digest| !digest.is_empty())
+    };
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            for drive in drives {
+                let mut entries = match tokio::fs::read_dir(drive.join(".rustfs.sys/buckets")).await {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                while let Some(entry) = entries.next_entry().await? {
+                    if !entry.file_name().to_string_lossy().ends_with("_ahm_checkpoint.json") {
+                        continue;
+                    }
+                    let metadata = entry.metadata().await?;
+                    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+                        return Err("the old checkpoint is not a bounded regular file".into());
+                    }
+                    let bytes = match tokio::fs::read(entry.path()).await {
+                        Ok(bytes) => bytes,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error.into()),
+                    };
+                    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+                        continue;
+                    };
+                    if !has_signed_progress(&value) {
+                        continue;
+                    }
+
+                    // Freeze only this fixture's writer before copying its actual
+                    // bytes. The environment's normal stop path kills a stopped child.
+                    signal_process(writer_pid, "STOP")?;
+                    let bytes = tokio::fs::read(entry.path()).await?;
+                    let value: Value = serde_json::from_slice(&bytes)?;
+                    if !has_signed_progress(&value) {
+                        return Err("the stopped rc.5 writer did not retain signed checkpoint progress".into());
+                    }
+                    let task_id = value["task_id"].as_str().ok_or("the old checkpoint has no task id")?;
+                    uuid::Uuid::parse_str(task_id)?;
+                    if entry.file_name() != std::ffi::OsStr::new(&format!("{task_id}_ahm_checkpoint.json")) {
+                        return Err("the old checkpoint task id does not match its filename".into());
+                    }
+                    return Ok(Rc5CheckpointCapture {
+                        disk: drive.clone(),
+                        path: entry.path(),
+                        task_id: task_id.to_owned(),
+                        bytes,
+                    });
+                }
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| "rc.5 did not produce a signed checkpoint with progress within 60 seconds")?
+}
+
+fn rc5_checkpoint_object(index: usize) -> (String, Vec<u8>) {
+    (
+        format!("object-{index:05}.bin"),
+        format!("rc.5 checkpoint upgrade object {index:05}\n")
+            .repeat(256)
+            .into_bytes(),
+    )
+}
+
+fn checkpoint_binary_sha256(path: &Path) -> Result<String, BoxError> {
+    use sha2::Digest;
+    use std::io::Read;
+
+    let mut input = std::fs::File::open(path)?;
+    let mut digest = sha2::Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(hex_simd::encode_to_string(digest.finalize(), hex_simd::AsciiCase::Lower))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the pinned 1.0.0-rc.5 release binary"]
+async fn rc5_checkpoint_upgrade_rewinds_signed_progress_without_losing_objects() -> TestResult {
+    use crate::storage_api::upgrade_compatibility::{DiskOption, Endpoint, new_disk};
+    use futures::{StreamExt, TryStreamExt, stream};
+    use rustfs_heal::heal::CheckpointManager;
+
+    const BUCKET: &str = "upgrade-rc5-checkpoint";
+    const OBJECTS: usize = 1600;
+
+    init_logging();
+    let previous_binary = source_binary()?;
+    assert_eq!(binary_source_revision(&previous_binary).await?, RC5_COMMIT);
+    let current_binary = rustfs_binary_path();
+    let evidence_dir = std::env::var_os(G09_EVIDENCE_DIR_ENV)
+        .map(|root| PathBuf::from(root).join(format!("rc5-checkpoint-upgrade-{}", uuid::Uuid::new_v4())));
+    if let Some(directory) = &evidence_dir {
+        std::fs::create_dir_all(directory)?;
+    }
+
+    // Declare the server after its extra drives so error unwinding stops it
+    // before the fixture directories are removed.
+    let fixture = tempfile::TempDir::new()?;
+    let extra_drives = (0..3)
+        .map(|index| {
+            let path = fixture.path().join(format!("drive-{index}"));
+            std::fs::create_dir(&path)?;
+            Ok(path.to_str().ok_or("fixture drive path is not UTF-8")?.to_owned())
+        })
+        .collect::<Result<Vec<_>, BoxError>>()?;
+    let mut env = RustFSTestEnvironment::new().await?;
+    let log_path = evidence_dir.as_deref().unwrap_or(fixture.path()).join("server.log");
+    env.capture_log_path = Some(log_path.to_str().ok_or("fixture log path is not UTF-8")?.to_owned());
+    let server_env = [
+        ("RUSTFS_UNSAFE_BYPASS_DISK_CHECK", "true"),
+        ("RUSTFS_DURABILITY_MODE", "strict"),
+        ("RUSTFS_NEW_BUCKET_DURABILITY_MODE", "strict"),
+        ("RUST_LOG", "warn,rustfs::heal=debug"),
+    ];
+    env.start_rustfs_server_from_binary(&previous_binary, extra_drives.iter().map(String::as_str).collect(), &server_env)
+        .await?;
+    env.create_test_bucket(BUCKET).await?;
+    let (status, durability) = admin_request(
+        &env.url,
+        Method::GET,
+        &format!("/rustfs/admin/v3/bucket-durability/{BUCKET}"),
+        None,
+        &env.access_key,
+        &env.secret_key,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "old bucket durability: {durability}");
+    assert_eq!(serde_json::from_str::<Value>(&durability)?["mode"], "strict");
+
+    let old_client = env.create_s3_client();
+    let manifest = stream::iter(0..OBJECTS)
+        .map(|index| {
+            let client = old_client.clone();
+            async move {
+                let (key, body) = rc5_checkpoint_object(index);
+                let entry = serde_json::json!({
+                    "bucket": BUCKET,
+                    "key": key,
+                    "length": body.len(),
+                    "sha256": rustfs_utils::hex_sha256(&body, str::to_owned),
+                });
+                client
+                    .put_object()
+                    .bucket(BUCKET)
+                    .key(&key)
+                    .body(ByteStream::from(body))
+                    .send()
+                    .await?;
+                Ok::<_, BoxError>(entry)
+            }
+        })
+        .buffered(4)
+        .try_collect::<Vec<_>>()
+        .await?;
+    let drives = extra_drives
+        .iter()
+        .map(PathBuf::from)
+        .chain(std::iter::once(PathBuf::from(&env.temp_dir)))
+        .collect::<Vec<_>>();
+    let writer_pid = env.process.as_ref().ok_or("rc.5 writer is not running")?.id();
+    let start_heal = async {
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(15),
+            admin_request(
+                &env.url,
+                Method::POST,
+                "/rustfs/admin/v3/heal/",
+                Some(
+                    serde_json::json!({
+                        "recursive": true, "dryRun": false, "remove": false, "recreate": false,
+                        "scanMode": 2, "updateParity": false, "nolock": false, "pool": 0, "set": 0,
+                    })
+                    .to_string(),
+                ),
+                &env.access_key,
+                &env.secret_key,
+            ),
+        )
+        .await??;
+        if status != StatusCode::OK {
+            return Err(format!("rc.5 root heal was not accepted: {status} {body}").into());
+        }
+        Ok::<_, BoxError>(body)
+    };
+    let (capture, heal_start) = tokio::try_join!(capture_rc5_checkpoint(&drives, writer_pid), start_heal)?;
+    env.stop_server();
+    assert_eq!(
+        std::fs::read(&capture.path)?,
+        capture.bytes,
+        "stopping the old writer must preserve captured bytes"
+    );
+    let checkpoint_dir = capture.disk.join(".rustfs.sys/buckets");
+    let resume_path = checkpoint_dir.join(format!("{}_ahm_resume_state.json", capture.task_id));
+    let resume_bytes = std::fs::read(&resume_path)?;
+    let old_checkpoint: Value = serde_json::from_slice(&capture.bytes)?;
+    if let Some(directory) = &evidence_dir {
+        std::fs::write(directory.join("checkpoint.rc5.json"), &capture.bytes)?;
+        std::fs::write(directory.join("resume.rc5.json"), &resume_bytes)?;
+        std::fs::write(directory.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
+        std::fs::write(
+            directory.join("source.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "kind": "old-release-checkpoint-reader-upgrade",
+                "scope": "schema-6 reader authentication, safe rewind and object reads; not full G09 qualification",
+                "writer_revision": RC5_COMMIT,
+                "writer_binary_sha256": checkpoint_binary_sha256(&previous_binary)?,
+                "candidate_revision": current_source_revision()?,
+                "candidate_binary_sha256": checkpoint_binary_sha256(&current_binary)?,
+                "layout": "one process and four logical drives; not physical fault qualification",
+                "task_id": capture.task_id,
+                "checkpoint_sha256": rustfs_utils::hex_sha256(&capture.bytes, str::to_owned),
+                "resume_sha256": rustfs_utils::hex_sha256(&resume_bytes, str::to_owned),
+                "acknowledged_objects": manifest.len(),
+                "bucket_durability": serde_json::from_str::<Value>(&durability)?,
+                "heal_start": serde_json::from_str::<Value>(&heal_start)?,
+            }))?,
+        )?;
+    }
+
+    let blocked_path = checkpoint_dir.join(format!("{}_ahm_checkpoint.blocked", capture.task_id));
+    assert!(!blocked_path.try_exists()?, "the original checkpoint must not already be blocked");
+    let disk_options = DiskOption {
+        cleanup: false,
+        health_check: false,
+    };
+    // Reopen with the same member order passed to the old writer.
+    let disk_index = drives
+        .iter()
+        .position(|drive| drive == &capture.disk)
+        .ok_or("captured disk is not a fixture member")?;
+    let mut endpoint = Endpoint::try_from(capture.disk.to_str().ok_or("captured drive path is not UTF-8")?)?;
+    endpoint.set_pool_index(0);
+    endpoint.set_set_index(0);
+    endpoint.set_disk_index(disk_index);
+    let disk = new_disk(&endpoint, &disk_options).await?;
+    let manager = CheckpointManager::load_from_disk(disk.clone(), &capture.task_id).await?;
+    let rewound = manager.get_checkpoint().await;
+    assert_eq!(rewound.schema_version, 7);
+    assert_eq!(rewound.task_id, capture.task_id);
+    assert_eq!((rewound.current_bucket_index, rewound.current_object_index), (0, 0));
+    assert!(rewound.processed_objects.is_empty() && rewound.failed_objects.is_empty() && rewound.skipped_objects.is_empty());
+    assert_eq!(rewound.successful_objects, 0);
+    assert_eq!(rewound.failed_object_count, 0);
+    assert_eq!(rewound.skipped_object_count, 0);
+    assert_eq!(rewound.processed_bytes, 0);
+    assert_eq!((rewound.total_objects, rewound.total_bytes), (0, 0));
+    assert!(rewound.baseline_generation.is_none() && !rewound.baseline_known && !rewound.counter_unknown);
+    assert!(!blocked_path.try_exists()?, "an authentic old checkpoint must not be quarantined");
+    assert_eq!(
+        std::fs::read(&capture.path)?,
+        capture.bytes,
+        "the reader must not rewrite the old checkpoint"
+    );
+    assert_eq!(std::fs::read(&resume_path)?, resume_bytes, "the reader must not take over the old task");
+    drop(manager);
+    drop(disk);
+
+    // A separate copy with one digest byte changed proves that successful
+    // rewind above did not bypass authentication of the original wire bytes.
+    let corrupt_root = fixture.path().join("corrupt-reader-control");
+    let corrupt_metadata = corrupt_root.join(".rustfs.sys/buckets");
+    std::fs::create_dir_all(&corrupt_metadata)?;
+    let mut corrupted = capture.bytes.clone();
+    let digest = old_checkpoint["integrity_digest"]
+        .as_str()
+        .ok_or("old checkpoint digest is not a string")?;
+    let offset = corrupted
+        .windows(digest.len())
+        .position(|bytes| bytes == digest.as_bytes())
+        .ok_or("the digest is absent from the captured bytes")?;
+    corrupted[offset] = if corrupted[offset] == b'A' { b'B' } else { b'A' };
+    let corrupt_path = corrupt_metadata.join(format!("{}_ahm_checkpoint.json", capture.task_id));
+    std::fs::write(&corrupt_path, &corrupted)?;
+    let endpoint = Endpoint::try_from(corrupt_root.to_str().ok_or("control disk path is not UTF-8")?)?;
+    let corrupt_disk = new_disk(&endpoint, &disk_options).await?;
+    let Err(error) = CheckpointManager::load_from_disk(corrupt_disk.clone(), &capture.task_id).await else {
+        return Err("the current checkpoint reader accepted a corrupted signature".into());
+    };
+    assert!(matches!(error, rustfs_heal::Error::InvalidCheckpoint(ref reason) if reason.contains("digest")));
+    let corrupt_blocked = corrupt_metadata.join(format!("{}_ahm_checkpoint.blocked", capture.task_id));
+    assert!(corrupt_blocked.try_exists()?, "the corrupted copy must retain a blocked marker");
+    assert_eq!(std::fs::read(&corrupt_path)?, corrupted, "quarantine must preserve the invalid bytes");
+    if let Some(directory) = &evidence_dir {
+        std::fs::write(directory.join("checkpoint.corrupted.json"), &corrupted)?;
+        std::fs::copy(&corrupt_blocked, directory.join("checkpoint.corrupted.blocked"))?;
+    }
+    drop(corrupt_disk);
+
+    env.restart_server_preserving_data(extra_drives.iter().map(String::as_str).collect(), &server_env)
+        .await?;
+    let current_client = env.create_s3_client();
+    stream::iter(0..OBJECTS)
+        .map(|index| {
+            let client = current_client.clone();
+            async move {
+                let (key, expected) = rc5_checkpoint_object(index);
+                let (_, actual) = read_object(&client, BUCKET, &key, None).await?;
+                assert_eq!(actual, expected, "old object {key} changed during the upgrade");
+                Ok::<_, BoxError>(())
+            }
+        })
+        .buffer_unordered(4)
+        .try_collect::<Vec<_>>()
+        .await?;
+    env.stop_server();
+    if let Some(directory) = &evidence_dir {
+        std::fs::write(
+            directory.join("result.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "status": "passed",
+                "scope": "old-release checkpoint reader and object-data upgrade only",
+                "authenticated_original_bytes": true,
+                "original_checkpoint_unchanged_after_read": true,
+                "old_successful_objects": old_checkpoint["successful_objects"],
+                "rewound_schema": rewound.schema_version,
+                "rewound_successful_objects": rewound.successful_objects,
+                "corrupt_digest_rejected_and_retained": true,
+                "verified_objects": OBJECTS,
+            }))?,
+        )?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires a pinned previous RustFS release binary"]
 async fn direct_upgrade_from_previous_release_preserves_object_contracts() -> TestResult {
@@ -1536,10 +2248,21 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
     cluster.start_with_binary(&previous_binary).await?;
     cluster.create_test_bucket(MIXED_BUCKET).await?;
     prepare_previous_release_baseline(&mut cluster, &previous_binary).await?;
+    exercise_homogeneous_multipart(&cluster, "homogeneous-previous").await?;
+    cluster.create_test_bucket(PENDING_MULTIPART_BUCKET).await?;
+    let previous_clients = cluster.create_all_clients()?;
+    enable_versioning(&previous_clients[0], PENDING_MULTIPART_BUCKET).await?;
+    let pending_parts = vec![vec![0x63; 5 * 1024 * 1024], vec![0x7d; 4096]];
+    let pending = stage_multipart(&previous_clients[0], PENDING_MULTIPART_BUCKET, PENDING_MULTIPART_KEY, &pending_parts).await?;
+    let sources = wait_for_pending_source_bytes(&cluster, &pending).await?;
+    assert_pending_parts(&previous_clients[0], &pending).await?;
 
     cluster.stop_node(0)?;
     cluster.start_node_from_binary(0, &current_binary).await?;
     exercise_mixed_cluster(&cluster, "one-current-node", 0, 1).await?;
+    // One controlled out-of-policy attempt proves fail-closed behavior below
+    // native write quorum; positive MPU writers remain paused while mixed.
+    assert_mixed_pending_refusal(&cluster, &pending, &sources).await?;
 
     for (node_idx, phase) in [(1, "two-current-nodes"), (2, "one-previous-node")] {
         cluster.stop_node(node_idx)?;
@@ -1551,6 +2274,9 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
     cluster.start_node_from_binary(3, &current_binary).await?;
     let clients = cluster.create_all_clients()?;
     wait_for_drive_readmission(&clients, MIXED_BUCKET, "homogeneous-current", DRIVE_READMISSION_TIMEOUT).await?;
+    let completed_pending = finish_pending_multipart(&clients, &pending, pending_parts.concat()).await?;
+    exercise_homogeneous_multipart(&cluster, "homogeneous-current").await?;
+    verify_load_bodies(&clients, "homogeneous-previous", "multipart").await?;
 
     for (node_idx, client) in clients.iter().enumerate() {
         assert_eq!(
@@ -1567,47 +2293,6 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
             )
             .await?;
         }
-    }
-
-    if let Some(context) = evidence_context.as_ref() {
-        let phases = ["one-current-node", "two-current-nodes", "one-previous-node"];
-        let objects_per_phase = MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER + 2;
-        write_g09_evidence(
-            context,
-            "mixed_version_reader_evidence",
-            "mixed-version-reader",
-            &["old-writer-new-reader", "new-writer-old-reader"],
-            "upgrade_compatibility_test::rolling_upgrade_from_previous_release_preserves_mixed_version_contracts",
-            serde_json::json!({
-                "bucket": MIXED_BUCKET,
-                "phases": phases,
-                "objects_per_phase": objects_per_phase,
-                "assertions": [
-                    "current node reads objects written through previous-release client",
-                    "previous-release node reads objects written through current client",
-                    "all nodes list every mixed-version object after homogeneous-current convergence",
-                    "the previous-release seed survives the baseline restart and every upgrade phase"
-                ],
-            }),
-        )?;
-        write_g09_evidence(
-            context,
-            "mixed_version_writer_evidence",
-            "mixed-version-writer",
-            &["old-reader-new-writer", "new-reader-old-writer"],
-            "upgrade_compatibility_test::rolling_upgrade_from_previous_release_preserves_mixed_version_contracts",
-            serde_json::json!({
-                "bucket": MIXED_BUCKET,
-                "phases": phases,
-                "objects_per_phase": objects_per_phase,
-                "assertions": [
-                    "current writer publishes objects readable by previous-release node",
-                    "previous-release writer publishes objects readable by current node",
-                    "multipart writers continue at every individual node upgrade",
-                    "modern DELETE fails closed and preserves every byte while old peers remain"
-                ],
-            }),
-        )?;
     }
 
     let clients = cluster.create_all_clients()?;
@@ -1631,6 +2316,115 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
             Some("NoSuchKey"),
             "node {node}"
         );
+    }
+
+    wait_for_multipart_quiescence(&cluster, &sources).await?;
+    // No MPU mutation runs during a heterogeneous downgrade. All current
+    // callbacks and source controls settle before old binaries reopen volumes.
+    cluster.stop();
+    cluster.start_with_binary(&previous_binary).await?;
+    prepare_release_baseline(&mut cluster, &previous_binary, "rollback").await?;
+    let old_clients = cluster.create_all_clients()?;
+    assert_resumed_multipart(&old_clients, &completed_pending).await?;
+    for phase in ["homogeneous-previous", "homogeneous-current"] {
+        verify_load_bodies(&old_clients, phase, "multipart").await?;
+        for client in &old_clients {
+            wait_for_phase_listing(
+                client,
+                phase,
+                MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER,
+                "previous reader after rollback",
+            )
+            .await?;
+        }
+    }
+    for phase in ["one-current-node", "two-current-nodes", "one-previous-node"] {
+        verify_load_bodies(&old_clients, phase, "put").await?;
+        for client in &old_clients {
+            wait_for_phase_listing(
+                client,
+                phase,
+                MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER + 2,
+                "previous reader after rollback",
+            )
+            .await?;
+            for (key, body) in [
+                ("written-by-current", format!("{phase}: current RustFS build")),
+                ("written-by-previous", format!("{phase}: previous RustFS release")),
+            ] {
+                assert_eq!(
+                    read_object(client, MIXED_BUCKET, &format!("{phase}/{key}"), None).await?.1,
+                    body.as_bytes()
+                );
+            }
+        }
+    }
+    for (node, client) in old_clients.iter().enumerate() {
+        let error = client
+            .get_object()
+            .bucket(MIXED_BUCKET)
+            .key(PREVIOUS_RELEASE_SEED_KEY)
+            .send()
+            .await
+            .expect_err("current DELETE must remain visible to previous readers after rollback");
+        assert_eq!(
+            error.as_service_error().and_then(ProvideErrorMetadata::code),
+            Some("NoSuchKey"),
+            "reader {node}"
+        );
+    }
+    exercise_homogeneous_multipart(&cluster, "homogeneous-rollback").await?;
+
+    if let Some(context) = evidence_context.as_ref() {
+        let phases = ["one-current-node", "two-current-nodes", "one-previous-node"];
+        let objects_per_phase = MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER + 2;
+        write_g09_evidence(
+            context,
+            "mixed_version_reader_evidence",
+            "mixed-version-reader",
+            &["old-writer-new-reader", "new-writer-old-reader"],
+            "upgrade_compatibility_test::rolling_upgrade_from_previous_release_preserves_mixed_version_contracts",
+            serde_json::json!({
+                "bucket": MIXED_BUCKET,
+                "phases": phases,
+                "objects_per_phase": objects_per_phase,
+                "mixed_load": "plain-put",
+                "homogeneous_multipart_phases": ["homogeneous-previous", "homogeneous-current", "homogeneous-rollback"],
+                "multipart_objects_per_homogeneous_phase": MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER,
+                "assertions": [
+                    "current node reads objects written through previous-release client",
+                    "previous-release node reads objects written through current client",
+                    "all nodes list every mixed-version object after homogeneous-current convergence",
+                    "the previous-release seed survives the baseline restart and every upgrade phase",
+                    "previous readers read every current-native MPU body after quiescent rollback",
+                    "same legacy upload resumes with identical body, ETag and version after full upgrade"
+                ],
+            }),
+        )?;
+        write_g09_evidence(
+            context,
+            "mixed_version_writer_evidence",
+            "mixed-version-writer",
+            &["old-reader-new-writer", "new-reader-old-writer"],
+            "upgrade_compatibility_test::rolling_upgrade_from_previous_release_preserves_mixed_version_contracts",
+            serde_json::json!({
+                "bucket": MIXED_BUCKET,
+                "phases": phases,
+                "objects_per_phase": objects_per_phase,
+                "mixed_load": "plain-put",
+                "homogeneous_multipart_phases": ["homogeneous-previous", "homogeneous-current", "homogeneous-rollback"],
+                "multipart_objects_per_homogeneous_phase": MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER,
+                "assertions": [
+                    "current writer publishes objects readable by previous-release node",
+                    "previous-release writer publishes objects readable by current node",
+                    "mixed phases retain 16x16 plain PUT writers while positive multipart writers are paused",
+                    "16x16 multipart load runs in homogeneous previous, current and rollback phases",
+                    "one-current-node Complete returns typed 503 and preserves actual source authority and parts",
+                    "the same legacy upload completes and replays once fully upgraded without adding a version",
+                    "modern DELETE fails closed and preserves every byte while old peers remain"
+                ],
+            }),
+        )?;
     }
 
     Ok(())

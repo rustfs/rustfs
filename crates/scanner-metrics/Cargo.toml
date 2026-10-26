@@ -34,11 +34,11 @@ metrics = { workspace = true }
 rmp-serde = { workspace = true }
 rustfs-heal-contracts = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-tokio = { workspace = true, features = ["sync","rt"] }
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [lib]

@@ -128,6 +128,94 @@ Adapter responsibilities:
    Preserve data and artifacts for diagnosis. An adapter may restore previous
    settings but must not delete arbitrary paths or stop unrelated deployments.
 
+#### Linux service control
+
+`scripts/scanner_service.py` supplies node-local `start`, `status`, `resize`
+and `stop` operations for an adapter on Linux with Python 3.11+, systemd 255+
+and cgroup v2. Run it as the benchmark user with noninteractive sudo access.
+It is a service primitive, not a complete deployment or measurement adapter.
+The caller still owns topology, data isolation, readiness, load, fault actions,
+the independent oracle and metric provenance.
+
+Before starting any node, retain its immutable JSON plan on the controller and
+node. Use a new UUID for each node/service and a private, user-owned directory
+(mode `0700`). Provision a verified executable and a separate environment file
+(mode `0600`) inside it. Keep credentials out of the plan, arguments and archived
+artifacts. The plan has exactly these fields; replace the example digest with
+the actual binary SHA-256:
+
+```json
+{
+  "run_id": "20718acd-9e81-4697-a0b5-8ac3207f6aef",
+  "root": "/srv/rustfs-bench/run",
+  "binary": "/srv/rustfs-bench/run/rustfs",
+  "binary_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "environment_file": "/srv/rustfs-bench/run/private.env",
+  "args": ["/data/isolated-benchmark"],
+  "runtime_seconds": 10800,
+  "cpu_percent": 200,
+  "memory_bytes": 4294967296
+}
+```
+
+```bash
+python3 scripts/scanner_service.py start node-plan.json
+python3 scripts/scanner_service.py status node-plan.json
+python3 scripts/scanner_service.py resize node-plan.json --cpu-percent 100 --memory-bytes 3221225472
+python3 scripts/scanner_service.py stop node-plan.json
+```
+
+The plan determines the transient unit's name and ownership identity. Recovery
+uses that same plan after SSH loss, including when the start response was lost.
+An existing service is never restarted by `start`; reconcile with `status` or
+`stop`. Stop every planned node after partial preparation, including nodes that
+never started. Stop is idempotent and does not delete binaries, data or evidence;
+retain the private root and plan until cleanup completes. File locking serializes
+controllers, and operations reject a unit with a different plan, user or root.
+Inputs must remain immutable while starting; this is not a sandbox against a
+compromised benchmark user or privileged host administrator.
+
+The finite `runtime_seconds` limit is enforced by systemd independently of SSH.
+Choose it to cover preparation, the entire required measurement and the oracle;
+expiration fails the cell and must not shorten its required duration. The unit
+does not restart automatically. Shutdown targets the whole cgroup, allows 30
+seconds for termination, then kills remaining processes, including descendants
+that changed sessions. Resize reports the kernel CPU/memory limits and rejects
+a changed PID or mismatched limits. Applying limits alone does not demonstrate
+RustFS adaptation or pass the resource hot-shrink gate.
+
+#### Running-process evidence
+
+After readiness and before each measurement, run `scripts/scanner_process_receipt.py`
+as the same benchmark user. Supply the immutable service plan, a JSON object with
+the expected non-secret environment, and one `--data-root` per dedicated local
+data directory. The environment must exactly match the script's supported
+configuration keys present in the process; an unknown `RUSTFS_` key fails closed.
+Credential variables are excluded. Keep both input files private and archive
+only the resulting receipt, never the environment file or raw `/proc` contents.
+
+```bash
+python3 scripts/scanner_process_receipt.py node-plan.json public-environment.json --data-root /data/isolated-benchmark
+```
+
+The receipt binds the boot ID, PID/start ticks, actual `/proc/PID/exe` SHA-256 and
+inode, expected arguments/configuration hashes, service identity, observed kernel
+CPU/memory limits, and directory device/inode/capacity. It rejects changes seen
+between its two process observations or replacement of the executable or data
+directories. Configuration values and raw process arguments are not emitted.
+The observations span a reported interval, not an atomic snapshot; they do not
+protect against a compromised benchmark user or administrator. Resource limits
+are observations, including legitimate hot-shrink changes, and must be checked
+against the workload plan by the adapter.
+
+Environment bytes do not establish which configuration the server accepted.
+Listed directories are caller-selected, not proof of the server's open volumes,
+device isolation or SSD/HDD class. Those claims, the binary's source/build
+provenance and the independent data oracle still need separate evidence. The
+receipt explicitly leaves effective configuration, directory-to-server binding
+and storage acceptance unverified. A failed observation produces no receipt;
+retain the failure and reconcile the service before continuing.
+
 The `measure` response echoes the observed `evidence`, `fixed`, `build`,
 `data_dir`, and `background`, plus `sample_count` (1..3600), `elapsed_seconds`,
 and `metrics`. All metrics must be finite nonnegative numbers: `p99_ms`,
@@ -138,6 +226,7 @@ The adapter also reports the measurement-window delta of
 `rustfs_heal_mainline_throttle_total{source="admin",result="delayed"}` as
 `heal_mainline_throttle_delayed`; a cumulative process-lifetime value is not a
 valid input.
+
 The clone, encode, and save byte fields are also deltas from the same window.
 Requests, throughput, and p99 must be positive; errors must be zero. Repair
 counts must match the manifest when background work is on. Keep underlying
@@ -145,6 +234,69 @@ request samples, counter reset checks, profiler captures, and per-node telemetry
 in the cell artifact directory; aggregate values alone do not establish their
 measurement provenance. Missing production instrumentation is a pending gate,
 not permission to report a fabricated zero.
+
+For usage-cache saves, `encode_bytes` uses the window delta of
+`rustfs_scanner_cache_serialized_bytes_total`. `save_bytes` uses the sum of
+`rustfs_scanner_cache_save_payload_bytes_total` deltas for `cache="main"` and
+`cache="backup"`.
+The latter counts each full encoded payload submitted to the save interface
+after publication admission, including retries, failed writes, and timeouts.
+A rejected admission, skipped backup, or read-after-error reconciliation adds
+no save bytes. These are submitted application bytes: a failed attempt may
+consume only part of its body, and lower-layer retries, erasure parity, metadata,
+and physical disk writes are outside this counter. Keep the same definition on
+both builds; retain disk counters separately. Neither counter measures cache
+clone allocations, and an absent series is not a measured zero.
+
+`walk_objects` can use the aligned window delta of
+`rustfs_scanner_object_metadata_visits_total`, summed across the declared
+`bucket` and `disk` identities. Each visit starts after scanner I/O admission,
+immediately before reading an `xl.meta` entry. Failed or cancelled reads still
+count; payload entries, cached summaries, and paths skipped before admission do
+not. Re-reading an object counts again, including on another drive. This measures
+scanner metadata visits, not unique S3 objects, versions, successful repairs, or
+physical disk operations. The counter handle is registered once per bucket/drive
+walker and reused without per-object label allocation; recording still has a cost.
+
+For a workload with distinct hot and cold buckets, `cold_walk_objects` selects
+only the cold bucket identities declared in the independent workload manifest.
+Do not infer coldness from the observed counts or multiply bucket-walk counts by
+cached object totals. This metric cannot separate hot and cold prefixes within
+one bucket; that attribution remains unverified. Warm up the required series,
+retain node/drive identities, reject resets or missing window boundaries, and
+use the same visit definition on both builds. Bucket labels follow the existing
+bucket/drive scanner metrics and have bucket-scale cardinality; no key or version
+is a label. An absent or dropped series is not zero.
+
+On Linux with a readable cgroup v2 hierarchy, the existing memory observation
+worker also samples the process's current cgroup and effective CPU affinity.
+`rustfs_background_resource_cpu_millis`, `memory_limit_bytes`, and
+`memory_headroom_bytes` (all with the `rustfs_background_resource_` prefix)
+reflect visible ancestor limits, sibling memory use, and host available memory.
+Ancestors hidden by the mount/cgroup namespace are not observable; these values
+are not a reservation or proof of every enclosing resource limit. The
+startup-only container gauges retain their existing meaning. These new gauges
+are observations; they do not resize scanner/heal workers or prove hot-shrink
+acceptance.
+
+Require `rustfs_background_resource_sample_available = 1` and a fresh
+`rustfs_background_resource_observed_timestamp_seconds`. Sampling follows
+`RUSTFS_MEMORY_OBSERVABILITY_INTERVAL_SECS` (15 seconds by default), not a
+one-second control loop. A failed sample clears availability and leaves the
+last successful timestamp and values unchanged. Missing/invalid limits, invisible
+membership, or oversized files must not be interpreted as host capacity or zero
+pressure. Other platforms and cgroup v1 have no sample from this observer.
+
+The `cpu_usage_microseconds`, `cpu_throttled_microseconds`, `cpu_stall_microseconds`,
+`memory_stall_microseconds`, and `io_stall_microseconds` gauges, under the same
+prefix, expose cumulative leaf-cgroup counters. Each requires its own
+`rustfs_background_resource_counter_available{resource=...}` flag (`cpu_usage`,
+`cpu_throttled`, `cpu_stall`, `memory_stall`, or `io_stall`). They do not summarize
+ancestor throttling. `identity_high` and `identity_low` preserve the cgroup
+generation hash in two exact 32-bit gauge values; a change invalidates counter
+differences. Floating-point counter exports cannot establish exact large-integer
+deltas. These series are not an atomic cross-instrument snapshot: retain the raw
+sample times and do not manufacture a common acceptance window.
 
 Each comparison records a `w22` section with clone, encode, and save bytes per
 walked object, clone/encode and save/encode byte ratios, and candidate changes.
@@ -183,6 +335,101 @@ The nightly heal workflow clones **`rustfs/auto-testing`** separately and invoke
 entry point. If an adapter uses it, record and verify the external checkout's
 owner and full commit before use. The current workflow clones the default branch,
 so its contents must not be attributed to a RustFS source SHA.
+
+#### Independent version oracle
+
+`scripts/scanner_version_oracle.py` supplies the read-only S3 oracle portion of
+an adapter. Stop workload mutations first. Prepare an inventory independently
+from deterministic payloads and acknowledged PUT/DELETE receipts; do not derive
+the expected keys, bytes or hashes from the listing being checked. Its JSON
+contains `buckets` (the complete owned bucket scope, including empty buckets)
+and `versions` with these fields per retained version:
+
+| Field | Meaning |
+|---|---|
+| `bucket`, `key` | Owned bucket and exact object key. |
+| `generation` | Stable logical generation from the workload plan, such as `1`, `2`, or `delete-3`. Unique per key. |
+| `version_id` | Actual server ID from the write receipt, including literal `null` for an unversioned/null version. Unique per key. |
+| `is_latest`, `delete_marker` | Boolean expected final state. Exactly one latest entry per key. |
+| `bytes`, `sha256` | Independently computed full payload length and SHA-256. Delete markers use `0` and JSON `null`. |
+
+The comparable canonical digest sorts by bucket, key and logical generation,
+then hashes compact, key-sorted UTF-8 JSON of those records without `version_id`.
+Server-assigned IDs differ across isolated legs. They are still checked exactly
+against every endpoint's listing and version GET, and bound in a separate
+`version_bindings_sha256` receipt. Removing an overwritten null version or a
+permanently deleted version from the expected inventory must follow the actual
+planned mutation and its receipt, not an observed omission.
+
+```bash
+python3 scripts/scanner_version_oracle.py expected-inventory.json \
+  --endpoint node-a=http://192.0.2.10:9000 \
+  --endpoint node-b=http://192.0.2.11:9000 \
+  --output new-oracle-evidence.json
+```
+
+The CLI needs boto3, reads credentials through the AWS credential provider chain,
+uses path-style SigV4 requests and disables SDK retries. It never writes S3 data.
+For Python workload seeding with pooled S3 connections, use botocore 1.43.77 or
+newer: older versions can retain a zero-length PUT's response state and misparse
+the next PUT, causing a read timeout even with valid server response framing.
+See the [upstream fix](https://github.com/boto/botocore/pull/3784).
+Record the exact SDK and transitive dependency versions, package hashes and
+effective checksum settings, and use the same client environment for both legs.
+Retain failures from older clients; do not hide them with retries or a larger
+timeout. A client fix does not establish that server-side 503s are resolved.
+
+Every endpoint gets independently paginated version and current-object listings,
+full streamed GETs for every data version and every current live object, and
+explicit/current delete-marker checks. A hidden old version, extra key, wrong
+latest flag, corrupt/truncated body, unexpected error or changing namespace
+fails the oracle. Expected delete-marker GET responses follow the
+[S3 GET contract](https://docs.aws.amazon.com/boto3/latest/reference/services/s3/client/get_object.html);
+a 503 is never treated as a deleted object.
+
+The evidence file retains observed version records and per-endpoint summaries.
+`actual.objects` counts current live keys, `actual.versions` includes data
+versions and delete markers, and `actual.bytes` sums all retained data-version
+bytes once. The stdout summary can feed the adapter's `oracle` response after
+checking the exit code; retain the full evidence file separately. Output must
+be a new file, and failure never produces a passing response. Workers and queued
+GETs are bounded (`--workers`, default 8, maximum 64); each body is read in 1 MiB
+chunks. This checks S3-visible content and versions, not every on-disk erasure
+fragment, and does not replace the seeded repair or performance gates.
+
+#### In-Process Foreground Windows
+
+When scanner or heal is enabled, a one-second process-local sampler tracks external S3 requests from the outer service call through response-body completion, stream failure or cancellation. It runs independently of the metrics export switch and stops with background services. Requests and their existing body buffers are not copied or moved to another task. The start boundary is `Service::call`; connection establishment and Tower readiness waits before that call are outside this window. A successful body observation means the server produced its final frame, not that the client received or acknowledged it. HEAD and bodyless HTTP statuses finish at response headers. Admin, health, console, STS and internal RPC traffic are excluded by the existing external S3 route classifier.
+
+Windows preserve request starts, in-flight requests and completed, failed and cancelled counts in four fixed classes: `read`, `write`, `metadata` and `other`. Cancellation is a censored observation and contributes no completed-latency sample. P99 is an inclusive nanosecond interval over non-cancelled completions, including errors, and is unavailable below 100 samples; 100 samples permit rank calculation but do not establish statistical confidence. The overflow bucket has no upper bound. The sampler brackets each atomic window cut with two monotonic clock readings. A writer delayed across a cut delays publication without changing those readings. Consumers must check validity, age and cut uncertainty; a missing or low-sample window does not prove that foreground work is idle.
+
+With metrics export enabled, `rustfs_background_foreground_window_*` gauges expose validity, cut uncertainty, duration, starts, in-flight work and per-class counts and percentile bounds. Check the class and percentile availability gauges before reading retained numeric values. Exported floating-point gauges are diagnostic; the in-process counters retain integer precision. These local windows neither align different nodes nor provide the exact client-side percentile required by the SSD ABBA gate. They supply observations, without enabling an adaptive admission policy or completing performance acceptance.
+
+#### Histogram Window Evidence
+
+Use `scripts/scanner_otlp_window.py` to subtract two cumulative explicit-histogram or monotonic integer-counter snapshots before deriving window evidence. It reads OTLP JSON, or binary OTLP with `--format protobuf` when `opentelemetry-proto` is installed in the active Python environment. Pin and record that dependency in the adapter environment. Keep each original export and its source-node association; output includes the SHA-256 of both inputs.
+
+```bash
+python3 scripts/scanner_otlp_window.py \
+  --before before.json --after after.json \
+  --metric rustfs_heal_admission_start_duration_seconds \
+  --start-ns "$WINDOW_START_NS" --end-ns "$WINDOW_END_NS" \
+  --out histogram-window.json
+```
+
+The command requires matching resource, scope, unit, labels, bucket boundaries and cumulative start time at both boundaries. It rejects missing series, resets, decreasing bucket counters, no-recorded-value flags and duplicate series. Warm up every required label combination before taking the first snapshot; an absent series is not an implicit zero. The optional window arguments must both be present and match every selected point's collection timestamps exactly. Without them, `window_checked` is false and each series retains its actual interval; this is diagnostic output, not same-window release evidence. Independently timed exports from different nodes must not be presented as synchronized samples.
+
+The p95/p99 outputs are bucket intervals, in the metric's original unit, with an exclusive lower and inclusive upper bound. A null endpoint is unbounded; a null percentile means no observations. Historical maxima and minima cannot be subtracted to obtain window maxima or minima. The tool does not interpolate, average per-node percentiles, or turn interval endpoints into the scalar percentiles required by the ABBA gate. Obtain aligned observations with sufficient resolution before reporting those scalars. It also does not change the meaning of the underlying metric: `rustfs_heal_admission_lock_phase_seconds` includes lock acquisition waits and is not an exact lock-hold measurement.
+
+Integer counters use the same `--metric` selection and identity/window checks. Their rows have `kind: "sum"` and an exact integer `delta`; histogram rows have `kind: "histogram"`. Counters must be cumulative, monotonic, and nonnegative OTLP `asInt` values within signed int64 range. Floating-point sums, resets, decreases, type changes and absent values are rejected. A present unchanged counter produces a measured zero delta; missing observations never do. No summation across nodes or labels is implicit: retain those identities when aggregating a counter such as `rustfs_scanner_cache_serialized_bytes_total` across a proven common window.
+
+#### Heal Object Lock Wait
+
+`rustfs_heal_object_lock_wait_seconds` measures namespace acquisition in the set-local heal paths. Timing starts when the acquisition future is first polled, after namespace construction and existing diagnostic setup, and stops when acquisition returns or the pending future is dropped. It excludes repair work and lock hold time. Observation returns the original guard and error; it does not change release points, timeouts or retries.
+
+The fixed labels are `op` (`heal_object`, `read_repair_data`, `read_repair_commit`, `heal_object_dir`, `check_abandoned_parts`), `mode` (`read`, `write`) and `result` (`acquired`, `failed`, `cancelled`, `disabled`). The ordinary outer heal lock and explicit-version helper both use `heal_object`; these count actual acquisitions, not logical repair tasks. `no_lock` and errors constructing a namespace produce no acquisition sample. No bucket, key, version or owner is a label, and the metric does not require object-lock diagnostic logging.
+
+Keep acquired and failed completed-attempt distributions, cancellation counts, and disabled-lock observations distinguishable in W11 evidence. A cancelled sample is elapsed wait before cancellation, not a completed acquisition; a disabled guard does not establish real contention. Do not discard failed waits to improve a percentile, infer task-attempt counts from acquisitions, or substitute admission mutex timing for this metric. Window differences and histogram resolution still need independent verification; this instrument alone does not supply exact scalar percentiles or complete SSD acceptance.
 
 #### Evidence Gates
 
@@ -310,6 +557,8 @@ scripts/run_scanner_validation_harness.sh \
 ```
 
 For ad hoc per-node snapshots outside the harness window, use the by-host `awscurl` loop in [Reading Distributed Metrics](scanner-runtime-controls.md#reading-distributed-metrics); the metrics endpoint reports only the node that handles the request.
+
+Host collectors are optional. Check `host-telemetry-status.tsv` before using their output: each started collector records its exit status, and a failure emits a warning while scanner status collection remains available. A missing collector row is not a zero measurement. Each run resets its host telemetry artifacts, including when collection is skipped or the interval is zero. If a scanner status request fails, the harness stops and waits for its started collectors while preserving the request failure exit code; collector statuses are recorded when the output file remains writable. On macOS the harness uses `iostat -d -w <interval> -c <samples>`; Linux retains `iostat -xz <interval> <samples>`. These are host/device aggregates, not RustFS process I/O or filesystem syscall counts. The initial iostat report may cover time since boot; do not treat it as an aligned workload interval. `fs_usage` still requires the appropriate macOS privileges. Without it, report filesystem-event counts as unavailable and keep CPU/progress observations separate from production-burst attribution.
 
 ### Bucket metrics freshness validation
 

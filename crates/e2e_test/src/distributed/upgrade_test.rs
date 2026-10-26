@@ -60,7 +60,7 @@ struct UpgradeSeed {
     iam_secret: &'static str,
 }
 
-fn source_binary() -> TestResult<PathBuf> {
+pub(super) fn source_binary() -> TestResult<PathBuf> {
     let path = std::env::var_os(SOURCE_BINARY_ENV).map(PathBuf::from).ok_or_else(|| {
         format!(
             "{SOURCE_BINARY_ENV} must point to the pinned previous release binary (the e2e-distributed workflow downloads it)"

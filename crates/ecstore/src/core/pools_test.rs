@@ -473,7 +473,6 @@ mod decommission_lock_order_tests {
         let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         ctx.update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
             .await;
-        *ctx.local_disk_map().write().await = other_store.ctx.local_disk_map().read().await.clone();
         let endpoints = other_store
             .ctx
             .endpoints()
@@ -482,9 +481,43 @@ mod decommission_lock_order_tests {
         if let Some(deployment_id) = other_store.ctx.deployment_id() {
             ctx.set_deployment_id(deployment_id);
         }
+        let authority = ctx
+            .bind_multipart_proof_topology(&endpoints)
+            .expect("lease-loss fixture must own its complete native proof topology");
+        let mut local_disk_map = HashMap::new();
         for pool in &mut pools {
-            Arc::make_mut(pool).set_instance_ctx_for_test(Arc::clone(&ctx));
+            let pool = Arc::make_mut(pool);
+            pool.set_instance_ctx_for_test(Arc::clone(&ctx));
+            for set in &mut pool.disk_set {
+                let set = Arc::make_mut(set);
+                let source_disks = set.disks.read().await.clone();
+                let mut disks = Vec::with_capacity(set.set_endpoints.len());
+                for (slot, endpoint) in set.set_endpoints.iter().enumerate() {
+                    // The logical node clone shares durable contents, never a
+                    // native handle already owned by another instance scope.
+                    let disk = crate::disk::new_disk(
+                        endpoint,
+                        &crate::disk::DiskOption {
+                            cleanup: false,
+                            health_check: false,
+                        },
+                    )
+                    .await
+                    .expect("open the lease-loss node's independently owned native handle");
+                    assert!(!Arc::ptr_eq(&disk, source_disks[slot].as_ref().expect("source fixture disk")));
+                    assert_eq!(
+                        crate::disk::DiskAPI::get_disk_id(disk.as_ref()).await.unwrap(),
+                        Some(pool.format.erasure.sets[set.set_index][slot])
+                    );
+                    local_disk_map.insert(endpoint.to_string(), Some(disk.clone()));
+                    disks.push(Some(disk));
+                }
+                crate::disk::multipart_source::bind_multipart_proof_snapshot(&disks, &authority)
+                    .expect("lease-loss native handles must bind only to this fixture instance");
+                set.disks = Arc::new(tokio::sync::RwLock::new(disks));
+            }
         }
+        *ctx.local_disk_map().write().await = local_disk_map;
         let store = Arc::new(crate::store::ECStore {
             id: uuid::Uuid::new_v4(),
             disk_map: other_store.disk_map.clone(),
@@ -2444,6 +2477,481 @@ mod decommission_lock_order_tests {
             assert_eq!(exact_versions(&store, 0, &bucket, object).await.len(), 1, "the source is retained");
             assert!(exact_versions(&store, 1, &bucket, object).await.is_empty());
             assert!(exact_versions(&store, 2, &bucket, object).await.is_empty());
+        });
+    }
+
+    /// Seed `object` in pool 0 with three 2 KiB data versions and a newest
+    /// delete marker; returns the data versions oldest first.
+    async fn seed_versioned_entry_with_marker(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+    ) -> Vec<crate::object_api::ObjectInfo> {
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the versioned bucket");
+        let mut written = Vec::new();
+        for index in 0..3u8 {
+            written.push(
+                store.pools[0]
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![index; 2048]),
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("write a source version"),
+            );
+        }
+        store.pools[0]
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write the source delete marker");
+        written
+    }
+
+    /// Fail every target write of `object` after the first, before it
+    /// commits, while `armed` is set.
+    fn fail_target_writes_after_the_first(
+        bucket: &str,
+        object: &'static str,
+        armed: Arc<AtomicBool>,
+    ) -> DecommissionTestFaultGuard {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let bucket = bucket.to_owned();
+        DecommissionTestFaultGuard::install_with_error(
+            Arc::new(move |stage, entry_bucket, entry_object, _, _| {
+                stage == "before_target_commit"
+                    && entry_bucket == bucket
+                    && entry_object == object
+                    && armed.load(Ordering::Acquire)
+                    && writes.fetch_add(1, Ordering::AcqRel) >= 1
+            }),
+            Some(Arc::new(|_, bucket, object| {
+                crate::error::Error::InsufficientWriteQuorum(bucket.to_owned(), object.to_owned())
+            })),
+        )
+    }
+
+    async fn assert_every_version_readable(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        written: &[crate::object_api::ObjectInfo],
+    ) {
+        for (index, version) in written.iter().enumerate() {
+            let opts = ObjectOptions {
+                versioned: true,
+                version_id: version.version_id.map(|id| id.to_string()),
+                ..Default::default()
+            };
+            let mut reader = store
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                .await
+                .unwrap_or_else(|err| panic!("version {:?} must stay readable: {err:?}", version.version_id));
+            let mut body = Vec::new();
+            reader.stream.read_to_end(&mut body).await.expect("read the version body");
+            assert_eq!(body, vec![index as u8; 2048], "version {:?}", version.version_id);
+        }
+    }
+
+    fn decommission_info(pool_meta: &crate::core::pools::PoolMeta) -> crate::core::pools::PoolDecommissionInfo {
+        pool_meta.pools[0]
+            .decommission
+            .clone()
+            .expect("the decommission state should remain present")
+    }
+
+    /// Replace the in-memory pool metadata with what the replicas persisted,
+    /// as a restarted leader would load it.
+    async fn reload_persisted_pool_meta(store: &Arc<crate::store::ECStore>) {
+        let mut persisted = crate::core::pools::PoolMeta::default();
+        persisted
+            .load_no_lock_from_replicas(store.pools.clone())
+            .await
+            .expect("reload the persisted pool metadata");
+        *store.pool_meta.write().await = persisted;
+    }
+
+    /// Wait until the relaunched routine recorded its `repeats`-th pause and
+    /// released its worker slot.
+    async fn wait_for_relaunched_pause(store: &Arc<crate::store::ECStore>, repeats: u32) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let paused = store
+                    .ctx
+                    .decommission_pause(0)
+                    .is_some_and(|record| record.repeats >= repeats);
+                if paused && !store.has_active_local_decommission_worker().await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the relaunched routine should pause again: record={:?}", store.ctx.decommission_pause(0)));
+    }
+
+    /// A partially moved entry pauses the decommission, and the resumed
+    /// routine, started from the persisted metadata, finds its first versions
+    /// already on the target. Every version is counted exactly once
+    /// (rustfs/backlog#2873, defect F follow-up).
+    #[test]
+    #[serial_test::serial]
+    fn decommission_counts_each_version_once_across_a_pause_and_resume() {
+        run_large_stack_async_test("decommission-pause-resume-count", || async {
+            // Serialize this accounting fixture so the deferred entry precedes
+            // the later checkpoint, regardless of worker scheduling.
+            let env = [
+                ("RUSTFS_DECOMMISSION_BUCKET_CONCURRENCY", Some("1")),
+                ("RUSTFS_DECOMMISSION_ENTRY_CONCURRENCY", Some("1")),
+            ];
+            temp_env::async_with_vars(env, async {
+                let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+                let bucket = test_bucket("pause-resume-count");
+                let object = "versioned/03.bin";
+                let written = seed_versioned_entry_with_marker(&store, &bucket, object).await;
+                // Listed after the partially moved entry: its completion saves
+                // a progress checkpoint while that entry's first versions are
+                // moved and its later ones are still deferred.
+                let source_set = store.pools[0].get_disks_by_key(object).set_index;
+                let later = (0..1024)
+                    .map(|index| format!("z/after-{index:04}.bin"))
+                    .find(|key| store.pools[0].get_disks_by_key(key).set_index == source_set)
+                    .expect("a later key in the same source set");
+                store.pools[0]
+                    .put_object(
+                        &bucket,
+                        &later,
+                        &mut PutObjReader::from_vec(vec![0x7a; 16]),
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("write the later entry");
+
+                // Counters when the test bucket's first entry starts: only the
+                // system objects are in them.
+                let baseline = Arc::new(StdMutex::new(None::<(String, usize, usize)>));
+                let armed = Arc::new(AtomicBool::new(true));
+                let writes = Arc::new(AtomicUsize::new(0));
+                let _fault = DecommissionTestFaultGuard::install_with_error(
+                    Arc::new({
+                        let store = Arc::clone(&store);
+                        let bucket = bucket.clone();
+                        let baseline = Arc::clone(&baseline);
+                        let armed = Arc::clone(&armed);
+                        move |stage, entry_bucket, entry_object, _, _| {
+                            if entry_bucket != bucket {
+                                return false;
+                            }
+                            if stage == "exact_versions_read" {
+                                let mut baseline = baseline.lock().expect("baseline lock");
+                                if baseline.is_none() {
+                                    // This synchronous fault hook must not miss
+                                    // the baseline when metadata is briefly busy.
+                                    let pool_meta = tokio::task::block_in_place(|| store.pool_meta.blocking_read());
+                                    let info = pool_meta.pools[0].decommission.as_ref().expect("active decommission");
+                                    *baseline = Some((entry_object.to_owned(), info.items_decommissioned, info.bytes_done));
+                                }
+                                return false;
+                            }
+                            stage == "before_target_commit"
+                                && entry_object == object
+                                && armed.load(Ordering::Acquire)
+                                && writes.fetch_add(1, Ordering::AcqRel) >= 1
+                        }
+                    }),
+                    Some(Arc::new(|_, bucket, object| {
+                        crate::error::Error::InsufficientWriteQuorum(bucket.to_owned(), object.to_owned())
+                    })),
+                );
+                let _checkpoint = crate::core::pools::DecommissionCleanupMutationGuard::install(Arc::new({
+                    let store = Arc::clone(&store);
+                    let bucket = bucket.clone();
+                    move |hook_bucket, hook_object, _| {
+                        let store = Arc::clone(&store);
+                        let due = hook_bucket == bucket && hook_object == later;
+                        Box::pin(async move {
+                            if due {
+                                let stale = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+                                let mut pool_meta = store.pool_meta.write().await;
+                                pool_meta.pools[0].last_update = stale;
+                                if let Some(info) = pool_meta.pools[0].decommission.as_mut() {
+                                    info.progress_save_last_at = Some(stale);
+                                }
+                            }
+                        })
+                    }
+                }));
+
+                start_transitioned_entry_decommission(&store, &bucket).await;
+                spawn_decommission_routine(&store, 1)
+                    .await
+                    .expect("the decommission routine task should join")
+                    .expect("a paused decommission routine returns without an error");
+                let paused = decommission_info(&*store.pool_meta.read().await);
+                assert!(!paused.complete && !paused.failed, "{paused:?}");
+                assert!(paused.capacity_blocked_reason.is_some(), "{paused:?}");
+                assert_eq!(paused.items_decommission_failed, 0, "{paused:?}");
+                let (first_entry, base_items, base_bytes) = baseline
+                    .lock()
+                    .expect("baseline lock")
+                    .clone()
+                    .expect("the test bucket's first entry started");
+                assert_eq!(first_entry, object, "the baseline precedes every entry of the test bucket");
+
+                reload_persisted_pool_meta(&store).await;
+                armed.store(false, Ordering::Release);
+                spawn_decommission_routine(&store, 1)
+                    .await
+                    .expect("the resumed routine task should join")
+                    .expect("the resumed routine should return");
+                let done = decommission_info(&*store.pool_meta.read().await);
+                assert!(done.complete && !done.failed && done.capacity_blocked_reason.is_none(), "{done:?}");
+                assert_eq!(
+                    (done.items_decommissioned, done.bytes_done),
+                    (base_items + 5, base_bytes + 3 * 2048 + 16),
+                    "the entry's four versions and the later entry, each counted once: {done:?}"
+                );
+                assert_eq!(done.items_decommission_failed, 0, "{done:?}");
+                assert!(exact_versions(&store, 0, &bucket, object).await.is_empty(), "the source is cleaned up");
+                assert_every_version_readable(&store, &bucket, object, &written).await;
+            })
+            .await;
+        });
+    }
+
+    /// Leave `object`'s target metadata unusable on two of the target set's
+    /// four drives, below the read and write quorum of EC 3+1: a directory
+    /// where `xl.meta` belongs fails every read and write there.
+    async fn break_target_metadata_on_two_drives(
+        temp_dirs: &[tempfile::TempDir],
+        store: &Arc<crate::store::ECStore>,
+        target: usize,
+        bucket: &str,
+        object: &str,
+    ) {
+        let set_index = store.pools[target].get_disks_by_key(object).set_index;
+        for disk in 0..2 {
+            let meta = temp_dirs[target * 8 + set_index * 4 + disk]
+                .path()
+                .join(bucket)
+                .join(object)
+                .join("xl.meta");
+            tokio::fs::remove_file(&meta)
+                .await
+                .unwrap_or_else(|err| panic!("remove {}: {err}", meta.display()));
+            tokio::fs::create_dir(&meta)
+                .await
+                .unwrap_or_else(|err| panic!("block {}: {err}", meta.display()));
+        }
+    }
+
+    /// A target that holds the entry's metadata on fewer drives than its
+    /// quorum is unreadable. The intact source keeps serving every version,
+    /// and a pass that meets the sub-quorum target defers the entry: it pauses
+    /// without a failed item and counts nothing of the entry.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_half_written_target_never_shadows_the_source() {
+        run_large_stack_async_test("decommission-half-written-target", || async {
+            let (temp_dirs, store, _other_store) =
+                crate::services::rebalance::test_three_pool_stores_with_four_disk_sets_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("half-written-target");
+            let object = "versioned/03.bin";
+            let written = seed_versioned_entry_with_marker(&store, &bucket, object).await;
+            let armed = Arc::new(AtomicBool::new(true));
+            let _fault = fail_target_writes_after_the_first(&bucket, object, Arc::clone(&armed));
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("a paused decommission routine returns without an error");
+            let mut target = None;
+            for pool in [1, 2] {
+                if !exact_versions(&store, pool, &bucket, object).await.is_empty() {
+                    target = Some(pool);
+                }
+            }
+            let target = target.expect("the marker and the newest version reached a target");
+            break_target_metadata_on_two_drives(&temp_dirs, &store, target, &bucket, object).await;
+            let moved = store.pools[target]
+                .get_object_info(
+                    &bucket,
+                    object,
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: written[2].version_id.map(|id| id.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(moved.is_err(), "the target copy must be unreadable: {moved:?}");
+            assert_every_version_readable(&store, &bucket, object, &written).await;
+
+            // No injected fault any more: only the sub-quorum target remains.
+            armed.store(false, Ordering::Release);
+            let before = decommission_info(&*store.pool_meta.read().await);
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the resumed routine task should join")
+                .expect("a paused decommission routine returns without an error");
+            let info = decommission_info(&*store.pool_meta.read().await);
+            assert!(!info.complete && !info.failed, "the entry is deferred, not settled: {info:?}");
+            let reason = info.capacity_blocked_reason.as_deref().unwrap_or_default();
+            assert!(reason.contains("lost drive quorum"), "{reason}");
+            assert_eq!(info.items_decommission_failed, 0, "{info:?}");
+            assert_eq!(
+                (info.items_decommissioned, info.bytes_done),
+                (before.items_decommissioned, before.bytes_done),
+                "a deferred entry counts nothing: {info:?}"
+            );
+            assert_eq!(exact_versions(&store, 0, &bucket, object).await.len(), 4, "the source is retained");
+            assert_every_version_readable(&store, &bucket, object, &written).await;
+        });
+    }
+
+    /// A bucket holding a permanently retained entry and an entry that keeps
+    /// losing target quorum pauses on the same cause every pass. The retained
+    /// entry is not counted again, so the watchdog's relaunch backs off; a
+    /// first pause is relaunched by the watchdog path and a repeated one is
+    /// held (rustfs/backlog#2873, defect F follow-up).
+    #[test]
+    #[serial_test::serial]
+    fn decommission_relaunch_backs_off_while_a_retained_entry_is_relisted() {
+        assert_retained_entry_relaunch_backoff(false);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_full_count_ledger_preserves_failure_and_relaunch_backoff() {
+        assert_retained_entry_relaunch_backoff(true);
+    }
+
+    fn assert_retained_entry_relaunch_backoff(full_ledger: bool) {
+        run_large_stack_async_test("decommission-retained-backoff", move || async move {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("retained-backoff");
+            let object = "versioned/03.bin";
+            let retained = "a/retained.bin";
+            seed_versioned_entry_with_marker(&store, &bucket, object).await;
+            store.pools[0]
+                .put_object(
+                    &bucket,
+                    retained,
+                    &mut PutObjReader::from_vec(vec![0x52; 64]),
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write the retained entry");
+            let _fault = DecommissionTestFaultGuard::install_with_error(
+                Arc::new({
+                    let bucket = bucket.clone();
+                    move |stage, entry_bucket, entry_object, _, _| {
+                        entry_bucket == bucket
+                            && ((stage == "object_read" && entry_object == retained)
+                                || (stage == "before_target_commit" && entry_object == object))
+                    }
+                }),
+                Some(Arc::new(|stage, bucket, object| {
+                    if stage == "object_read" {
+                        crate::error::Error::other("injected permanent source read failure")
+                    } else {
+                        crate::error::Error::InsufficientWriteQuorum(bucket.to_owned(), object.to_owned())
+                    }
+                })),
+            );
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            if full_ledger {
+                let generation = decommission_info(&*store.pool_meta.read().await)
+                    .start_time
+                    .expect("generation");
+                store.ctx.with_decommission_count_ledger(0, generation, |ledger| {
+                    for index in 0..2048 {
+                        ledger.admit("retained-ledger-fixture", &format!("key-{index}"), (None, false), false);
+                    }
+                    assert!(!ledger.admit("retained-ledger-fixture", "overflow", (None, false), false));
+                });
+            }
+            let pause_round = |round: u32| {
+                let store = Arc::clone(&store);
+                async move {
+                    let info = decommission_info(&*store.pool_meta.read().await);
+                    assert!(!info.complete && !info.failed, "round {round} pauses: {info:?}");
+                    assert!(info.capacity_blocked_reason.is_some(), "round {round}: {info:?}");
+                    assert_eq!(
+                        info.items_decommission_failed, 1,
+                        "the retained version is counted once (round {round}): {info:?}"
+                    );
+                    let record = store.ctx.decommission_pause(0).expect("the pause is recorded");
+                    assert_eq!(record.repeats, round, "round {round}: {record:?}");
+                    info
+                }
+            };
+
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("a paused decommission routine returns without an error");
+            let first = pause_round(1).await;
+            // The test helper keeps its worker slot; a finished routine frees it.
+            store.decommission_cancelers.write().await[0] = None;
+
+            // A first pause holds nothing: the watchdog path relaunches it.
+            store
+                .spawn_missing_local_decommission_routines()
+                .await
+                .expect("the watchdog relaunches a first pause");
+            assert!(
+                store.has_active_local_decommission_worker().await
+                    || store.ctx.decommission_pause(0).is_some_and(|record| record.repeats == 2),
+                "the first pause must be relaunched"
+            );
+            wait_for_relaunched_pause(&store, 2).await;
+            let second = pause_round(2).await;
+            assert_eq!(second.items_decommissioned, first.items_decommissioned, "{second:?}");
+
+            // A repeated pause is held: the watchdog path starts no worker.
+            store
+                .spawn_missing_local_decommission_routines()
+                .await
+                .expect("a held relaunch is not an error");
+            assert!(!store.has_active_local_decommission_worker().await, "a repeated pause must be held");
+            assert_eq!(store.ctx.decommission_pause(0).map(|record| record.repeats), Some(2));
+
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the third routine task should join")
+                .expect("a paused decommission routine returns without an error");
+            let third = pause_round(3).await;
+            assert_eq!(third.items_decommissioned, first.items_decommissioned, "{third:?}");
+            assert_eq!(exact_versions(&store, 0, &bucket, retained).await.len(), 1, "the retained source stays");
         });
     }
 
@@ -6411,7 +6919,6 @@ mod decommission_lock_order_tests {
         };
         owner.apply_to(&mut abort_opts);
         let barrier = MultipartCommitBarrier::install(&bucket, object, MultipartCommitPause::AbortAfterDelete);
-        tokio::time::pause();
         let abort = tokio::spawn({
             let abort_store = Arc::clone(&lossy_store);
             let abort_bucket = bucket.clone();
@@ -6431,6 +6938,9 @@ mod decommission_lock_order_tests {
             }
         });
         barrier.wait_until_paused().await;
+        // Native cleanup performs real filesystem I/O. Pause time only after
+        // durable deletion, when the abort is blocked before its release save.
+        tokio::time::pause();
         tokio::task::yield_now().await;
         refresh_calls.arm();
         tokio::time::advance(Duration::from_secs(11)).await;

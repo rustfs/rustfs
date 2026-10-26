@@ -3055,6 +3055,123 @@ impl RenameRollbackReceipt {
     }
 }
 
+/// Physical callbacks retain this holder, never independent logical-guard
+/// references. A verified quorum success can release those references without
+/// revoking native mutation leases, accounting or resource ownership.
+pub(in crate::set_disk) struct MultipartLogicalGuards {
+    payload: parking_lot::Mutex<Option<Box<dyn Send + Sync>>>,
+}
+
+impl MultipartLogicalGuards {
+    pub(in crate::set_disk) fn new(payload: impl Send + Sync + 'static) -> Arc<Self> {
+        Arc::new(Self {
+            payload: parking_lot::Mutex::new(Some(Box::new(payload))),
+        })
+    }
+
+    fn release_after_native_quorum(&self) {
+        let payload = self.payload.lock().take();
+        drop(payload);
+    }
+}
+
+/// The only owner of the original native publication capabilities. The full
+/// non-early-ACK fanout has no producer after `join_all`; consuming this owner
+/// makes the success decision irreversible even if a later quota/tail step fails.
+struct PublishingMultipartCapabilities {
+    publications: Vec<Option<crate::disk::multipart_source::MultipartPublicationResult>>,
+    authority: crate::disk::multipart_source::ProofVerificationContext,
+    commit_owner: Option<Arc<dyn Send + Sync>>,
+    logical_guards: Option<Arc<MultipartLogicalGuards>>,
+}
+
+impl PublishingMultipartCapabilities {
+    fn new(
+        slots: usize,
+        authority: crate::disk::multipart_source::ProofVerificationContext,
+        commit_owner: Option<Arc<dyn Send + Sync>>,
+        logical_guards: Option<Arc<MultipartLogicalGuards>>,
+    ) -> Self {
+        Self {
+            publications: (0..slots).map(|_| None).collect(),
+            authority,
+            commit_owner,
+            logical_guards,
+        }
+    }
+
+    fn succeeded(self) {
+        // This consumes the only failed-owner capability collection before
+        // logical locks can become available to a subsequent operation.
+        drop(self.publications);
+        if let Some(logical_guards) = self.logical_guards {
+            logical_guards.release_after_native_quorum();
+        }
+    }
+
+    async fn failed_owned(
+        self,
+        disks: &[Option<DiskStore>],
+        file_infos: &[FileInfo],
+        source: &str,
+        target: (&str, &str),
+        namespace_commit_guard: Option<Arc<crate::runtime::instance::NamespaceCommitGuard>>,
+    ) {
+        let Some(info) = disks.iter().zip(file_infos).find_map(|(disk, info)| {
+            (disk.is_some() && info.has_valid_erasure_geometry() && info.erasure.distribution.len() == disks.len())
+                .then_some(info)
+        }) else {
+            return;
+        };
+        let has_capability = self.publications.iter().any(Option::is_some);
+        let mut capabilities = self.publications;
+        let mut physical_disks = vec![None; disks.len()];
+        let mut physical_capabilities = (0..disks.len()).map(|_| None).collect::<Vec<_>>();
+        for (physical, logical) in info.erasure.distribution.iter().copied().enumerate() {
+            let Some(logical) = logical.checked_sub(1).filter(|slot| *slot < disks.len()) else { return };
+            physical_disks[physical] = disks[logical].clone();
+            physical_capabilities[physical] = capabilities[logical].take();
+        }
+        let source = source.to_owned();
+        let target = (target.0.to_owned(), target.1.to_owned());
+        let authority = self.authority;
+        let namespace_owner = self
+            .commit_owner
+            .or_else(|| namespace_commit_guard.map(|owner| owner as Arc<dyn Send + Sync>));
+        let recovery = tokio::spawn(crate::disk::with_optional_resource_unit(
+            crate::disk::current_resource_unit(),
+            async move {
+                // Own the capabilities, accounting and physical recovery tails
+                // independently of both the request and its undo waiter.
+                let _namespace_owner = namespace_owner.clone();
+                let _ = super::multipart_source::recover_source(
+                    &physical_disks,
+                    &target.0,
+                    &target.1,
+                    &source,
+                    Some(physical_capabilities),
+                    &authority,
+                    namespace_owner,
+                )
+                .await;
+            },
+        ));
+        if has_capability {
+            let timeout = crate::disk::disk_store::get_max_timeout_duration();
+            if timeout.is_zero() {
+                let _ = recovery.await;
+            } else {
+                let _ = tokio::time::timeout(timeout, recovery).await;
+            }
+        }
+        // Zero acknowledged capabilities cannot authorize synchronous Undo.
+        // Inspecting unknown outcomes must not add another full disk deadline
+        // to the original publication timeout. Dropping the JoinHandle only
+        // detaches its owner; a later retry can confirm a completed target.
+        // The original write-quorum error remains the API result in every case.
+    }
+}
+
 struct RenameRollbackOwnership {
     receipt: Option<RenameRollbackReceipt>,
     namespace_commit_guard: Option<Arc<crate::runtime::instance::NamespaceCommitGuard>>,
@@ -3290,6 +3407,8 @@ pub(in crate::set_disk) struct RenameDataFenceOptions<'a> {
     scanner_publication_commit_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
     namespace_commit_guard: Option<Arc<crate::runtime::instance::NamespaceCommitGuard>>,
     rollback_receipt: Option<RenameRollbackReceipt>,
+    multipart_proof_authority: Option<crate::disk::multipart_source::ProofVerificationContext>,
+    multipart_commit_owner: Option<Arc<MultipartLogicalGuards>>,
 }
 
 impl<'a> RenameDataFenceOptions<'a> {
@@ -3303,7 +3422,22 @@ impl<'a> RenameDataFenceOptions<'a> {
             scanner_publication_commit_scope: None,
             namespace_commit_guard: None,
             rollback_receipt: None,
+            multipart_proof_authority: None,
+            multipart_commit_owner: None,
         }
+    }
+
+    pub(in crate::set_disk) fn with_multipart_commit_owner(mut self, owner: Arc<MultipartLogicalGuards>) -> Self {
+        self.multipart_commit_owner = Some(owner);
+        self
+    }
+
+    pub(in crate::set_disk) fn with_multipart_proof_authority(
+        mut self,
+        authority: crate::disk::multipart_source::ProofVerificationContext,
+    ) -> Self {
+        self.multipart_proof_authority = Some(authority);
+        self
     }
 
     pub(in crate::set_disk) fn with_rollback_receipt(mut self, receipt: RenameRollbackReceipt) -> Self {
@@ -3779,6 +3913,8 @@ impl SetDisks {
             scanner_publication_commit_scope: _scanner_publication_commit_scope,
             namespace_commit_guard,
             rollback_receipt,
+            multipart_proof_authority: _,
+            multipart_commit_owner: _,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4168,6 +4304,16 @@ impl SetDisks {
     ) -> disk::error::Result<RenameDataCommit> {
         let (src_bucket, src_object) = src;
         let (dst_bucket, dst_object) = dst;
+        let protected_multipart = src_bucket == RUSTFS_META_MULTIPART_BUCKET
+            && file_infos.iter().any(|info| {
+                rustfs_utils::http::contains_key_str(
+                    &info.metadata,
+                    crate::disk::multipart_source::MULTIPART_SOURCE_CONDITION_SUFFIX,
+                )
+            });
+        if protected_multipart && allow_early_ack {
+            return Err(DiskError::UnsupportedDisk);
+        }
         if allow_early_ack && put_rename_early_ack_enabled() {
             return Self::rename_data_owned_early_ack_with_fence(
                 disks,
@@ -4186,6 +4332,8 @@ impl SetDisks {
             scanner_publication_commit_scope,
             namespace_commit_guard,
             rollback_receipt,
+            multipart_proof_authority,
+            multipart_commit_owner,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4202,6 +4350,11 @@ impl SetDisks {
                 file_info.validate_for_erasure_write()?;
             }
         }
+        let multipart_proof_authority = if protected_multipart {
+            Some(multipart_proof_authority.ok_or(DiskError::UnsupportedDisk)?)
+        } else {
+            None
+        };
         let mut errs = Vec::with_capacity(disks.len());
 
         let src_bucket = Arc::new(src_bucket.to_string());
@@ -4218,12 +4371,19 @@ impl SetDisks {
         let fanout_dst_bucket = dst_bucket.clone();
         let fanout_dst_object = dst_object.clone();
         let fanout_publication_scope = scanner_publication_commit_scope.clone();
+        let logical_guards = multipart_commit_owner;
+        let multipart_commit_owner = logical_guards
+            .as_ref()
+            .map(|owner| Arc::new((namespace_commit_guard.clone(), owner.clone())) as Arc<dyn Send + Sync>);
+        let fanout_namespace_owner = multipart_commit_owner
+            .clone()
+            .or_else(|| namespace_commit_guard.clone().map(|owner| owner as Arc<dyn Send + Sync>));
         let fanout_namespace_commit_guard = namespace_commit_guard.clone();
         // Keep one coordinator task so a cancelled caller cannot drop partially
         // completed disk mutations. Per-disk futures stay ordered in `join_all`,
         // preserving slot-indexed quorum and convergence accounting without a
         // scheduler task for every disk.
-        let fanout = tokio::spawn(async move {
+        let fanout_future = async move {
             // Keep the storage-owned movement permit attached to the actual
             // fan-out owner, even if the caller future is cancelled.
             let _fanout_publication_scope = fanout_publication_scope;
@@ -4242,7 +4402,7 @@ impl SetDisks {
                     let dst_bucket = fanout_dst_bucket.clone();
                     let successful_rename_completion_rank = successful_rename_completion_rank.clone();
                     let publication_scope = scanner_publication_commit_scope.clone();
-                    let namespace_commit_guard = fanout_namespace_commit_guard.clone();
+                    let namespace_owner = fanout_namespace_owner.clone();
 
                     async move {
                         let mut dispatch_state = RenameDispatchState::NotDispatched;
@@ -4303,9 +4463,7 @@ impl SetDisks {
                                     &dst_object,
                                     disk::RenameDataGuards {
                                         scanner_publication_lease_token,
-                                        namespace_owner: namespace_commit_guard
-                                            .clone()
-                                            .map(|owner| owner as Arc<dyn Send + Sync>),
+                                        namespace_owner: namespace_owner.clone(),
                                         ..Default::default()
                                     },
                                 )
@@ -4352,7 +4510,15 @@ impl SetDisks {
             #[cfg(test)]
             rollback_fault_injection::after_fanout(&fanout_dst_object);
             (results, fanout_file_infos)
-        });
+        };
+        let fanout = if protected_multipart {
+            tokio::spawn(crate::disk::with_optional_resource_unit(
+                crate::disk::current_resource_unit(),
+                fanout_future,
+            ))
+        } else {
+            tokio::spawn(fanout_future)
+        };
 
         let mut disk_versions = vec![None; disk_count];
         let mut data_dirs = vec![None; disk_count];
@@ -4399,21 +4565,54 @@ impl SetDisks {
             );
         }
 
+        let mut multipart_capabilities = multipart_proof_authority.map(|authority| {
+            PublishingMultipartCapabilities::new(results.len(), authority, multipart_commit_owner, logical_guards)
+        });
         let mut dispatch_states = Vec::with_capacity(results.len());
-        for (idx, (dispatch_state, result)) in results.iter().enumerate() {
-            dispatch_states.push(*dispatch_state);
+        for (idx, (dispatch_state, result)) in results.into_iter().enumerate() {
+            dispatch_states.push(dispatch_state);
             match result {
-                Ok(Ok(res)) => {
+                Ok(Ok(mut res)) => {
+                    if let Some(owner) = multipart_capabilities.as_mut() {
+                        let publication = res.multipart_source.take().map(|result| *result);
+                        let valid = publication.as_ref().is_some_and(|publication| {
+                            publication.verify_with_authority(&owner.authority).is_ok()
+                                && publication.proof.snapshot.lineage == publication.publication.lineage
+                                && publication.proof.snapshot.generation == publication.publication.source_generation
+                                && publication.proof.snapshot.phase
+                                    == crate::disk::multipart_source::MultipartSourcePhase::ConsumedUnsealed
+                                && !owner
+                                    .publications
+                                    .iter()
+                                    .flatten()
+                                    .any(|existing| existing.proof.snapshot.disk_id == publication.proof.snapshot.disk_id)
+                                && crate::disk::multipart_source::publication_identity(&file_infos[idx])
+                                    .ok()
+                                    .flatten()
+                                    .as_ref()
+                                    == Some(&publication.publication)
+                                && file_infos[idx]
+                                    .erasure
+                                    .distribution
+                                    .get(publication.proof.snapshot.physical_slot)
+                                    == Some(&(idx + 1))
+                        });
+                        if !valid {
+                            errs.push(Some(DiskError::FileCorrupt));
+                            continue;
+                        }
+                        owner.publications[idx] = publication;
+                    }
                     data_dirs[idx] = res.rollback_data_dir.or(res.old_data_dir);
                     cleanup_data_dirs[idx] = res.cleanup_data_dir;
-                    disk_versions[idx].clone_from(&res.sign);
+                    disk_versions[idx] = res.sign;
                     old_current_sizes[idx] = res.old_current_size;
                     old_current_source_checked[idx] = res.old_current_source_checked;
-                    old_current_sources[idx] = res.old_current_source.clone();
+                    old_current_sources[idx] = res.old_current_source;
                     errs.push(None);
                 }
                 Ok(Err(e)) => {
-                    errs.push(Some(e.clone()));
+                    errs.push(Some(e));
                 }
                 Err(_) => {
                     errs.push(Some(DiskError::Unexpected));
@@ -4465,20 +4664,31 @@ impl SetDisks {
                 );
             }
 
-            rollback_failed_rename(
-                disks,
-                file_infos,
-                &errs,
-                &dispatch_states,
-                &data_dirs,
-                (&dst_bucket, &dst_object),
-                RenameRollbackOwnership {
-                    receipt: rollback_receipt,
-                    namespace_commit_guard,
-                },
-            )
-            .await;
+            if let Some(owner) = multipart_capabilities {
+                // Destination-only Undo cannot restore a consumed MPU head.
+                // Only this failed owner can spend the original native caps.
+                owner
+                    .failed_owned(disks, &file_infos, &src_object, (&dst_bucket, &dst_object), namespace_commit_guard)
+                    .await;
+            } else {
+                rollback_failed_rename(
+                    disks,
+                    file_infos,
+                    &errs,
+                    &dispatch_states,
+                    &data_dirs,
+                    (&dst_bucket, &dst_object),
+                    RenameRollbackOwnership {
+                        receipt: rollback_receipt,
+                        namespace_commit_guard,
+                    },
+                )
+                .await;
+            }
             return Err(ret_err);
+        }
+        if let Some(owner) = multipart_capabilities {
+            owner.succeeded();
         }
 
         // The write is authoritatively committed, so the per-disk rollback
@@ -4560,7 +4770,10 @@ impl SetDisks {
         };
         let online_disks = Self::eval_disks(disks, &errs);
         let committed_slot = online_disks.iter().position(Option::is_some).ok_or(DiskError::Unexpected)?;
-        let committed_file_info = std::mem::take(&mut file_infos[committed_slot]);
+        let mut committed_file_info = std::mem::take(&mut file_infos[committed_slot]);
+        if protected_multipart {
+            crate::disk::multipart_source::strip_transport_condition(&mut committed_file_info.metadata);
+        }
         let cleanup_disks = if let Some(data_dir) = data_dir {
             disks
                 .iter()
@@ -11345,7 +11558,7 @@ mod tests {
                 let mut hooks = Vec::new();
                 let mut entered = Vec::new();
                 let mut releases = Vec::new();
-                let mut publication_paths = Vec::new();
+                let mut mutation_keys = Vec::new();
                 for (disk, info) in disks.iter().flatten().zip(&mut infos) {
                     disk.write_metadata(bucket, bucket, object, old.clone())
                         .await
@@ -11356,11 +11569,16 @@ mod tests {
                     let disk::Disk::Local(local) = disk.as_ref() else {
                         panic!("physical publication fixture requires local disks");
                     };
-                    // Linux IO paths use a mount FD, which is also the namespace lock key.
+                    // Hooks use pinned I/O paths; serialization uses the configured
+                    // object key shared by independently reopened disk handles.
                     let destination = local
                         .get_disk()
                         .get_object_path_for_io(bucket, object)
                         .expect("the publication path must resolve through the disk's mount lease");
+                    let mutation_key = local
+                        .get_disk()
+                        .get_object_path(bucket, object)
+                        .expect("the configured publication mutation key must resolve");
                     let (entered_tx, entered_rx) = oneshot::channel();
                     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
                     hooks.push(os::prepared_publication_test_hooks::install(
@@ -11373,7 +11591,7 @@ mod tests {
                     ));
                     entered.push(entered_rx);
                     releases.push(release_tx);
-                    publication_paths.push(destination);
+                    mutation_keys.push(mutation_key);
                 }
                 let namespace_owner = ctx.begin_namespace_commit();
                 let namespace_probe = Arc::downgrade(&namespace_owner);
@@ -11420,10 +11638,10 @@ mod tests {
                 let pending_before_release = ctx.namespace_commits_pending();
                 let owner_alive_before_release = namespace_probe.upgrade().is_some();
                 let old_snapshot_generation = ctx.namespace_commit_generation();
-                for (disk, destination) in disks.iter().flatten().zip(&publication_paths) {
+                for (disk, mutation_key) in disks.iter().flatten().zip(&mutation_keys) {
                     let root = disk.path();
                     assert!(
-                        os::acquire_rename_data_mutation_lease(&root, bucket, destination)
+                        os::acquire_rename_data_mutation_lease(&root, bucket, mutation_key)
                             .now_or_never()
                             .is_none(),
                         "the physical publication must still own object serialization after the async timeout"
@@ -11454,11 +11672,11 @@ mod tests {
 
                 // Drain real syscalls before checking the regression, including on the RED run.
                 drop(releases);
-                for (disk, destination) in disks.iter().flatten().zip(&publication_paths) {
+                for (disk, mutation_key) in disks.iter().flatten().zip(&mutation_keys) {
                     let root = disk.path();
                     let lease = tokio::time::timeout(
                         Duration::from_secs(5),
-                        os::acquire_rename_data_mutation_lease(&root, bucket, destination),
+                        os::acquire_rename_data_mutation_lease(&root, bucket, mutation_key),
                     )
                     .await
                     .expect("released physical publishers must drain");

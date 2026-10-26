@@ -90,7 +90,7 @@ use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::multipart::MultipartOperations;
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
-    list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
+    list::{StorageObjectInfoOrErr, StorageWalkOptions},
     multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo},
     namespace::NamespaceLocking as _,
     object::{DeleteAccounting, DeletedObject, HTTPPreconditions, ObjectIO as _, ObjectToDelete},
@@ -310,8 +310,6 @@ impl SetDisks {
     }
 }
 
-type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
-type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 type InlineBitrotReader = coding::BitrotReader<crate::io_support::bitrot::ShardReader>;
@@ -4514,6 +4512,9 @@ pub struct SetDisks {
     /// listings of such a prefix are frequent and the scan reads the whole
     /// subtree, so it is not repeated within `ORPHAN_PURGE_BACKOFF` (#6898).
     orphan_purge_backoff: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    /// Hermetic sets may retain shared services while owning isolated proof scopes.
+    #[cfg(test)]
+    multipart_proof_authority_override: Arc<std::sync::RwLock<Option<crate::disk::multipart_source::ProofVerificationContext>>>,
     #[cfg(test)]
     storage_class_config_override: Arc<std::sync::RwLock<Option<Arc<storageclass::Config>>>>,
     #[cfg(test)]
@@ -5461,6 +5462,8 @@ impl SetDisks {
             tier_free_version_rename_data_source_capable: Arc::new(AtomicBool::new(false)),
             orphan_purge_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
+            multipart_proof_authority_override: Arc::new(std::sync::RwLock::new(None)),
+            #[cfg(test)]
             storage_class_config_override: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(test)]
             rename_tail_heal_capture: Arc::new(std::sync::Mutex::new(None)),
@@ -5471,6 +5474,30 @@ impl SetDisks {
     #[allow(dead_code)] // Read by tests; consumed by later slices.
     pub(crate) fn instance_ctx(&self) -> &Arc<InstanceContext> {
         &self.ctx
+    }
+
+    pub(crate) fn multipart_proof_verification_context(&self) -> crate::disk::multipart_source::ProofVerificationContext {
+        #[cfg(test)]
+        if let Some(authority) = self
+            .multipart_proof_authority_override
+            .read()
+            .expect("hermetic multipart authority lock should not be poisoned")
+            .clone()
+        {
+            return authority;
+        }
+        self.ctx.multipart_proof_verification_context()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_multipart_proof_authority_for_test(
+        &self,
+        authority: crate::disk::multipart_source::ProofVerificationContext,
+    ) {
+        *self
+            .multipart_proof_authority_override
+            .write()
+            .expect("hermetic multipart authority lock should not be poisoned") = Some(authority);
     }
 
     pub(in crate::set_disk) fn tier_free_version_rename_data_source_capable(&self) -> bool {
@@ -8028,8 +8055,7 @@ mod tests {
     use crate::set_disk::core::io_primitives::rename_fanout_barrier;
     use crate::set_disk::ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
     use crate::storage_api_contracts::{
-        heal::HealOperations as _, lifecycle::TransitionedObject, list::ListOperations as _, multipart::CompletePart,
-        object::ObjectOperations as _,
+        heal::HealOperations as _, lifecycle::TransitionedObject, multipart::CompletePart, object::ObjectOperations as _,
     };
     use crate::store::init_format::save_format_file;
     use crate::store::list_objects::ListPathOptions;
@@ -12755,7 +12781,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn test_get_disks_info_probes_drives_concurrently() {
         use crate::disk::disk_store::DISK_INFO_PROBE_DELAY_FOR_TEST;
 
@@ -12770,6 +12796,8 @@ mod tests {
             disks.push(Some(disk));
         }
 
+        // Complete real filesystem setup before measuring virtual probe delays.
+        tokio::time::pause();
         let probe_delay = std::time::Duration::from_secs(2);
         let started = tokio::time::Instant::now();
         let info = DISK_INFO_PROBE_DELAY_FOR_TEST
@@ -15527,6 +15555,26 @@ mod tests {
 
         let instance_ctx = Arc::new(InstanceContext::new());
         instance_ctx.update_erasure_type(SetupType::Erasure).await;
+        let topology = crate::layout::endpoints::EndpointServerPools(vec![crate::layout::endpoints::PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: drive_count,
+            endpoints: endpoints.clone().into(),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]);
+        let authority = instance_ctx
+            .bind_multipart_proof_topology(&topology)
+            .expect("standalone set fixture owns the complete local topology");
+        crate::disk::multipart_source::bind_multipart_proof_snapshot(&disks, &authority)
+            .expect("standalone fixture native handles should bind to its own instance");
+        for (slot, disk) in disks.iter().enumerate() {
+            assert_eq!(
+                disk.as_ref().expect("fixture disk").get_disk_id().await.unwrap(),
+                Some(format.erasure.sets[0][slot]),
+                "fixture must use the full actual formatted cohort"
+            );
+        }
         let set_disks = SetDisks::new_with_instance_ctx(
             "test-owner".to_string(),
             Arc::new(RwLock::new(disks)),
@@ -15648,22 +15696,6 @@ mod tests {
             )
             .await
             .expect("object should be written");
-
-        let list_result = set_disks
-            .clone()
-            .list_objects_v2(bucket, "", None, None, 1000, false, None, false)
-            .await
-            .expect("set-level list_objects_v2 should succeed");
-        assert_eq!(list_result.objects.len(), 1);
-        assert_eq!(list_result.objects[0].name, "object");
-
-        let versions_result = set_disks
-            .clone()
-            .list_object_versions(bucket, "", None, None, None, 1000)
-            .await
-            .expect("set-level list_object_versions should succeed");
-        assert_eq!(versions_result.objects.len(), 1);
-        assert_eq!(versions_result.objects[0].name, "object");
 
         let (tx, mut rx) = mpsc::channel(4);
         set_disks

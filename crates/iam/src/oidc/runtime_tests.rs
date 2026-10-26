@@ -364,6 +364,31 @@ async fn assert_complete_console_login(initially_unavailable: bool) {
             assert_eq!(auth["redirect_uri"], redirect);
             assert_eq!(auth["code_challenge_method"], "S256");
             assert!(auth["scope"].split_whitespace().any(|scope| scope == "openid"));
+            let second_url = sys
+                .authorize_url("console", redirect, None)
+                .await
+                .expect("second authorization session");
+            let second: HashMap<String, String> = Url::parse(&second_url)
+                .expect("second authorization URL")
+                .query_pairs()
+                .into_owned()
+                .collect();
+            for name in ["state", "nonce", "code_challenge"] {
+                assert_ne!(auth[name], second[name], "independent sessions need distinct {name}");
+            }
+            let session = sys
+                .state_store
+                .take(&second["state"])
+                .await
+                .expect("independent second session");
+            assert_eq!(session.nonce, second["nonce"]);
+            assert_eq!(session.provider_id, "console");
+            let verifier = openidconnect::PkceCodeVerifier::new(session.pkce_verifier);
+            assert_eq!(
+                openidconnect::PkceCodeChallenge::from_code_verifier_sha256(&verifier).as_str(),
+                second["code_challenge"]
+            );
+            assert!(sys.state_store.take(&second["state"]).await.is_none(), "state is single use");
             let state = auth["state"].clone();
             auth_tx.send(auth).unwrap();
             let exchange = adapter

@@ -44,6 +44,37 @@ pub type NodeServiceClientType = NodeServiceClient<
 >;
 
 pub use generated::*;
+
+impl std::fmt::Debug for proto_gen::node_service::RenameDataResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RenameDataResponse")
+            .field("success", &self.success)
+            .field("payload", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for proto_gen::node_service::RecoverMultipartSourceRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoverMultipartSourceRequest")
+            .field("protocol_version", &self.protocol_version)
+            .field("operation", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for proto_gen::node_service::RecoverMultipartSourceResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoverMultipartSourceResponse")
+            .field("success", &self.success)
+            .field("protocol_version", &self.protocol_version)
+            .field("result", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
 pub use rustfs_common::ConnectionEvictionLogLevel;
 
 // Default 100 MB
@@ -217,6 +248,7 @@ pub const BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION: u32 = 2;
 pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v4\0";
 pub const REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-tier-remote-version-state-capability-v1\0";
 pub const CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-cross-pool-fence-capability-v1\0";
+pub const MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-mrf-lifecycle-reader-capability-v1\0";
 pub const ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-ilm-recovery-export-capability-v1\0";
 pub const TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX: &[u8] =
     b"rustfs-transition-transaction-compaction-capability-v1\0";
@@ -286,6 +318,30 @@ pub fn transition_transaction_compaction_capability_probe(nonce: &[u8; 16]) -> V
 pub fn is_transition_transaction_compaction_capability_probe(command: &[u8]) -> bool {
     command.len() == TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX.len() + 16
         && command.starts_with(TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn mrf_lifecycle_reader_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_mrf_lifecycle_reader_capability_probe(command: &[u8]) -> bool {
+    command.len() == MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn encode_mrf_lifecycle_reader_capability(
+    maximum_format_version: u8,
+    topology_member: &str,
+    process_epoch: &[u8; 16],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let identity = encode_remote_version_state_capability(topology_member, process_epoch)?;
+    let mut result = Vec::with_capacity(1 + identity.len());
+    result.push(maximum_format_version);
+    result.extend_from_slice(&identity);
+    Ok(result)
 }
 
 pub fn encode_remote_version_state_capability(
@@ -1057,6 +1113,207 @@ pub fn canonical_rename_data_request_body(
         body.push_bytes(&request.bucket_incarnation_id)?;
     }
     Ok(body.finish())
+}
+
+/// The fixed-MPU recovery method authenticates every wire field in its own domain.
+pub fn canonical_recover_multipart_source_request_body(
+    request: &proto_gen::node_service::RecoverMultipartSourceRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-recover-multipart-source-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.path)?;
+    body.push_u32(request.protocol_version);
+    body.push_bytes(&request.operation)?;
+    Ok(body.finish())
+}
+
+pub const MULTIPART_SOURCE_RECOVERY_MAX_PAYLOAD_BYTES: usize = DEFAULT_GRPC_SERVER_MESSAGE_LEN;
+
+/// Recovery transports exactly one bounded, typed operation or response.
+pub fn decode_multipart_source_recovery_payload<T: serde::de::DeserializeOwned>(payload: &[u8]) -> std::io::Result<T> {
+    if payload.is_empty() || payload.len() > MULTIPART_SOURCE_RECOVERY_MAX_PAYLOAD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid multipart source recovery payload length",
+        ));
+    }
+    let mut cursor = std::io::Cursor::new(payload);
+    let value = rmp_serde::from_read(&mut cursor)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid multipart source recovery payload"))?;
+    if cursor.position() != u64::try_from(payload.len()).map_err(std::io::Error::other)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "trailing multipart source recovery payload",
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod multipart_source_rpc_tests {
+    use super::*;
+
+    #[test]
+    fn multipart_source_recovery_canonical_body_binds_all_wire_fields_and_domain() {
+        let request = proto_gen::node_service::RecoverMultipartSourceRequest {
+            disk: "disk".into(),
+            path: "upload".into(),
+            protocol_version: 1,
+            operation: vec![0x80].into(),
+        };
+        let canonical = canonical_recover_multipart_source_request_body(&request).expect("canonical recovery body");
+        let mut bodies = std::collections::HashSet::from([canonical.clone()]);
+        for change in [
+            |request: &mut proto_gen::node_service::RecoverMultipartSourceRequest| request.disk = "other".into(),
+            |request: &mut proto_gen::node_service::RecoverMultipartSourceRequest| request.path = "other".into(),
+            |request: &mut proto_gen::node_service::RecoverMultipartSourceRequest| request.protocol_version = 2,
+            |request: &mut proto_gen::node_service::RecoverMultipartSourceRequest| request.operation = vec![0x81].into(),
+        ] {
+            let mut changed = request.clone();
+            change(&mut changed);
+            assert!(bodies.insert(canonical_recover_multipart_source_request_body(&changed).expect("changed recovery body")));
+        }
+        let delete = proto_gen::node_service::RecoverDeleteTransactionRequest {
+            disk: request.disk,
+            volume: request.path,
+            protocol_version: request.protocol_version,
+            operation: request.operation,
+        };
+        assert_ne!(
+            canonical,
+            canonical_recover_delete_transaction_request_body(&delete).expect("other recovery domain")
+        );
+    }
+
+    #[test]
+    fn multipart_source_recovery_payload_requires_one_bounded_value() {
+        let encoded = rmp_serde::to_vec_named(&vec![1_u32, 2]).expect("encoded operation");
+        assert_eq!(
+            decode_multipart_source_recovery_payload::<Vec<u32>>(&encoded).expect("one value"),
+            vec![1, 2]
+        );
+        let mut trailing = encoded;
+        trailing.push(0xc0);
+        assert!(decode_multipart_source_recovery_payload::<Vec<u32>>(&trailing).is_err());
+        assert!(decode_multipart_source_recovery_payload::<Vec<u32>>(&[]).is_err());
+        assert!(decode_multipart_source_recovery_payload::<Vec<u32>>(&[0xc1]).is_err());
+        assert!(
+            decode_multipart_source_recovery_payload::<Vec<u32>>(&vec![0xc0; MULTIPART_SOURCE_RECOVERY_MAX_PAYLOAD_BYTES + 1])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn multipart_source_wire_debug_redacts_capability_payloads() {
+        let secret = "private-undo-capability";
+        let rename = proto_gen::node_service::RenameDataResponse {
+            success: true,
+            rename_data_resp: secret.into(),
+            rename_data_resp_bin: secret.as_bytes().to_vec().into(),
+            error: None,
+        };
+        assert_eq!(
+            format!("{rename:?}"),
+            r#"RenameDataResponse { success: true, payload: "[REDACTED]", .. }"#
+        );
+        let request = proto_gen::node_service::RecoverMultipartSourceRequest {
+            disk: secret.into(),
+            path: secret.into(),
+            protocol_version: 1,
+            operation: secret.as_bytes().to_vec().into(),
+        };
+        assert_eq!(
+            format!("{request:?}"),
+            r#"RecoverMultipartSourceRequest { protocol_version: 1, operation: "[REDACTED]", .. }"#
+        );
+        let response = proto_gen::node_service::RecoverMultipartSourceResponse {
+            success: true,
+            protocol_version: 1,
+            result: secret.as_bytes().to_vec().into(),
+            error: None,
+        };
+        assert_eq!(
+            format!("{response:?}"),
+            r#"RecoverMultipartSourceResponse { success: true, protocol_version: 1, result: "[REDACTED]", .. }"#
+                .replace("\\\"", "\"")
+        );
+    }
+}
+
+pub fn canonical_pool_meta_native_recovery_request_body(
+    request: &proto_gen::node_service::PoolMetaNativeRecoveryRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-pool-meta-native-recovery-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_bytes(&request.payload)?;
+    Ok(body.finish())
+}
+
+/// The native recovery RPC accepts exactly one bounded MessagePack value.
+pub const POOL_META_NATIVE_RECOVERY_MAX_PAYLOAD_BYTES: usize = DEFAULT_GRPC_SERVER_MESSAGE_LEN;
+
+pub fn decode_pool_meta_native_recovery_payload<T: serde::de::DeserializeOwned>(payload: &[u8]) -> std::io::Result<T> {
+    if payload.is_empty() || payload.len() > POOL_META_NATIVE_RECOVERY_MAX_PAYLOAD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid pool metadata recovery payload length",
+        ));
+    }
+    let mut cursor = std::io::Cursor::new(payload);
+    let value = rmp_serde::from_read(&mut cursor)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid pool metadata recovery payload"))?;
+    if cursor.position() != u64::try_from(payload.len()).map_err(std::io::Error::other)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "trailing pool metadata recovery payload",
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod pool_meta_native_rpc_tests {
+    use super::*;
+
+    #[test]
+    fn pool_meta_native_recovery_body_binds_disk_and_payload_without_field_aliasing() {
+        use proto_gen::node_service::PoolMetaNativeRecoveryRequest;
+        let baseline = PoolMetaNativeRecoveryRequest {
+            disk: "disk-a".to_owned(),
+            payload: vec![1, 2].into(),
+        };
+        let body = canonical_pool_meta_native_recovery_request_body(&baseline).expect("body must encode");
+        for changed in [
+            PoolMetaNativeRecoveryRequest {
+                disk: "disk-b".to_owned(),
+                ..baseline.clone()
+            },
+            PoolMetaNativeRecoveryRequest {
+                payload: vec![1, 3].into(),
+                ..baseline
+            },
+            PoolMetaNativeRecoveryRequest {
+                disk: "disk-a\u{1}".to_owned(),
+                payload: vec![2].into(),
+            },
+        ] {
+            assert_ne!(
+                body,
+                canonical_pool_meta_native_recovery_request_body(&changed).expect("changed body must encode")
+            );
+        }
+    }
+
+    #[test]
+    fn pool_meta_native_recovery_codec_rejects_empty_malformed_and_trailing_values() {
+        for payload in [vec![], vec![0xc1], vec![0x90, 0xc0]] {
+            assert!(decode_pool_meta_native_recovery_payload::<Vec<u8>>(&payload).is_err());
+        }
+        assert_eq!(
+            decode_pool_meta_native_recovery_payload::<Vec<u8>>(&[0x90]).expect("one empty array is valid"),
+            Vec::<u8>::new()
+        );
+    }
 }
 
 pub const QUOTA_MUTATION_TOPOLOGY_HEADER: &str = "x-rustfs-quota-topology";
@@ -2477,6 +2734,39 @@ mod heal_control_tests {
     };
     use crate::heal_control;
     use std::time::Duration;
+
+    #[test]
+    fn mrf_lifecycle_reader_capability_probe_is_distinct_and_strict() {
+        let probe = super::mrf_lifecycle_reader_capability_probe(&[7; 16]);
+        let mut expected = b"rustfs-mrf-lifecycle-reader-capability-v1\0".to_vec();
+        expected.extend_from_slice(&[7; 16]);
+        assert_eq!(probe, expected);
+        assert!(super::is_mrf_lifecycle_reader_capability_probe(&probe));
+        assert!(!is_heal_control_capability_probe(&probe));
+        assert!(!is_cross_pool_fence_capability_probe(&probe));
+        assert!(!is_remote_version_state_capability_probe(&probe));
+        for length in 0..probe.len() {
+            assert!(!super::is_mrf_lifecycle_reader_capability_probe(&probe[..length]));
+        }
+        let mut trailing = probe.clone();
+        trailing.push(0);
+        assert!(!super::is_mrf_lifecycle_reader_capability_probe(&trailing));
+        let mut unknown = probe;
+        unknown[0] ^= 1;
+        assert!(!super::is_mrf_lifecycle_reader_capability_probe(&unknown));
+        assert!(!super::is_mrf_lifecycle_reader_capability_probe(&heal_control_capability_probe(&[7; 16])));
+    }
+
+    #[test]
+    fn mrf_lifecycle_reader_capability_carries_the_reported_format_and_identity() {
+        let epoch = [9; 16];
+        let result = super::encode_mrf_lifecycle_reader_capability(2, "node-a:9000", &epoch).expect("reader capability");
+        assert_eq!(result[0], 2);
+        assert_eq!(result.len(), 1 + 8 + "node-a:9000".len() + 16);
+        let (member, decoded_epoch) = decode_remote_version_state_capability(&result[1..]).expect("capability identity");
+        assert_eq!(member, "node-a:9000");
+        assert_eq!(decoded_epoch, &epoch);
+    }
 
     #[test]
     fn canonical_heal_control_body_binds_every_field_and_boundary() {

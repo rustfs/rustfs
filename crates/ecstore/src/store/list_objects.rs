@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// Narrow a store error into the filemeta vocabulary for `MetaCacheEntriesSortedResult.err`.
-/// Faithful port of the retired blanket `From<StorageError> for rustfs_filemeta::Error`:
-/// unmatched variants fold into the io-backed `other()`, whose boxed identity the io bridge
-/// recovers on the way back (see conversion_roundtrip_tests).
+/// Narrow a store error into the filemeta vocabulary used inside the per-set
+/// walk closures. Faithful port of the retired blanket
+/// `From<StorageError> for rustfs_filemeta::Error`: unmatched variants fold
+/// into the io-backed `other()`, whose boxed identity the io bridge recovers
+/// on the way back (see conversion_roundtrip_tests).
 fn to_filemeta_err(err: Error) -> rustfs_filemeta::Error {
     err.narrow_to_filemeta().unwrap_or_else(rustfs_filemeta::Error::other)
 }
@@ -27,9 +28,9 @@ use crate::bucket::metadata_sys::{
 use crate::bucket::utils::{check_list_objs_args, has_bad_path_component};
 use crate::bucket::versioning::VersioningApi;
 use crate::cache_value::metacache_set::{
-    FallbackClaimTracker, ListPathRawOptions, list_path_raw_with_claim_tracker, list_path_raw_with_partial_result,
+    FallbackClaimTracker, ListPathRawOptions, ListPathRawOutcome, list_path_raw_with_claim_tracker,
+    list_path_raw_with_partial_result,
 };
-use crate::core::sets::Sets;
 use crate::disk::error::DiskError;
 use crate::disk::{DiskAPI, DiskInfo, DiskStore, RUSTFS_META_BUCKET, WalkDirOptions};
 use crate::error::{
@@ -37,40 +38,35 @@ use crate::error::{
 };
 use crate::object_api::{ObjectInfo, ObjectOptions};
 use crate::set_disk::SetDisks;
-use crate::storage_api_contracts::{
-    list::{
-        ListObjectsInfo as StorageListObjectsInfo, StorageListObjectVersionsInfo, StorageListObjectsV2Info,
-        StorageObjectInfoOrErr, StorageWalkOptions, VersionMarker, WalkVersionsSortOrder,
-    },
-    object::ObjectOperations as _,
+use crate::storage_api_contracts::list::{
+    ListObjectsInfo as StorageListObjectsInfo, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr,
+    StorageWalkOptions, VersionMarker, WalkVersionsSortOrder,
 };
 use crate::store::ECStore;
 use crate::store::utils::is_reserved_or_invalid_bucket;
-use base64_simd::STANDARD as BASE64_STANDARD;
-use bytes::Bytes;
 use futures::future::join_all;
 use rand::seq::SliceRandom;
 use rustfs_filemeta::{
-    FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry,
-    MetacacheReader, MetadataResolutionParams, is_io_eof,
+    FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry,
+    MetaCacheEntryResolution as ListingEntryResolution, MetacacheReader, MetadataResolutionParams, is_io_eof,
+    resolve_agreed_entry as resolve_agreed_listing_entry,
 };
 use rustfs_io_metrics::{
     LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED, LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED, LIST_OBJECTS_SOURCE_WALKER,
-    ListObjectsGatherCaller, ListObjectsGatherObservation, ListObjectsIndexPageObservation,
+    ListObjectsGatherCaller, ListObjectsGatherObservation,
 };
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::future::Future;
-use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::io::duplex;
+use tokio::sync::OnceCell;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::sync::{OnceCell, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
@@ -170,7 +166,7 @@ fn walk_result_from_set_errors(errs: &[Option<Error>]) -> Result<()> {
     }
 
     for err in errs.iter().flatten() {
-        if err == &Error::Unexpected || err.is_not_found() {
+        if err.is_not_found() {
             continue;
         }
 
@@ -212,6 +208,23 @@ enum GatherResultsState {
     /// (the `list_path` wrapper future) having been dropped — e.g. the client
     /// disconnected mid-listing. This is a benign completion, not an error.
     ConsumerGone,
+}
+
+/// One page of merged listing entries.
+#[derive(Debug, Default)]
+pub struct ListPage {
+    pub entries: MetaCacheEntriesSorted,
+    /// Every producer reached the end of the requested namespace while this
+    /// page was collected, so no continuation page can exist. A page cut at
+    /// the collector's limit, or fed by a producer that stopped at its own
+    /// per-disk limit, is never exhausted even when it is empty.
+    pub exhausted: bool,
+}
+
+/// Which page worker finished, with what it knows about the stream end.
+enum ListWorkerExit {
+    Producer(ListPathRawOutcome),
+    Gather(GatherResultsState),
 }
 
 #[derive(Clone)]
@@ -342,18 +355,6 @@ pub struct ListPathOptions {
     pub cursor_generation: Option<String>,
     pub walkdir_timeout: Option<Duration>,
     pub walkdir_stall_timeout: Option<Duration>,
-    /// Shared by the collector and raw producers to preserve bounded-walk
-    /// completion when filtering removes all entries from a batch.
-    pub producer_limit_reached: Option<Arc<AtomicBool>>,
-}
-
-fn ensure_producer_limit_state(options: &mut ListPathOptions) -> Arc<AtomicBool> {
-    let state = options
-        .producer_limit_reached
-        .clone()
-        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-    options.producer_limit_reached = Some(state.clone());
-    state
 }
 
 fn list_path_folds_common_prefixes(options: &ListPathOptions) -> bool {
@@ -388,7 +389,9 @@ fn should_purge_empty_directory_listing(
     incl_deleted: bool,
     result: &ListObjectsInfo,
 ) -> bool {
+    // list_path rejects leading slashes, so an empty result cannot justify cleanup.
     !prefix.is_empty()
+        && !prefix.starts_with(SLASH_SEPARATOR)
         && prefix.ends_with(SLASH_SEPARATOR)
         && marker.is_none()
         && max_keys > 0
@@ -427,43 +430,6 @@ const LIST_CURSOR_GENERATION_LIVE: &str = "live";
 const DEFAULT_API_LIST_QUORUM: &str = "strict";
 const ENV_API_LIST_OBJECTS_QUORUM: &str = "RUSTFS_LIST_OBJECTS_QUORUM";
 const DEFAULT_API_LIST_OBJECTS_QUORUM: &str = "optimal";
-const ENV_API_LIST_OBJECTS_INDEX_MODE: &str = "RUSTFS_LIST_OBJECTS_INDEX_MODE";
-const ENV_API_LIST_OBJECTS_INDEX_PROVIDER: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER";
-const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_PATH";
-const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_GENERATION";
-const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH";
-// The chaos machinery below is compiled only for tests and the opt-in
-// `list-chaos` feature (backlog#1832): a production binary without the
-// feature carries no chaos symbols, so the two env vars cannot silently
-// rewrite a bucket's namespace-journal state.
-#[cfg(any(test, feature = "list-chaos"))]
-const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED";
-#[cfg(any(test, feature = "list-chaos"))]
-const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET";
-#[cfg(any(test, feature = "list-chaos"))]
-const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE";
-#[cfg(any(test, feature = "list-chaos"))]
-const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS";
-const ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED: &str = "RUSTFS_LIST_OBJECTS_METADATA_FAST_ENABLED";
-const ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS: &str = "RUSTFS_LIST_OBJECTS_METADATA_FAST_STALENESS_MS";
-const MAX_LIST_OBJECTS_METADATA_FAST_STALENESS_MS: u64 = 60_000;
-const LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY: &str = "walker_key_only";
-const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY: &str = "persistent_key_only";
-const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION: &str = "persistent-key-only";
-const PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION: u8 = 3;
-const PERSISTENT_KEY_ONLY_INDEX_HEADER: &str = "# rustfs-listobjects-key-only-v3";
-const PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER: &str = "# bucket=";
-const PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER: &str = "# generation=";
-const PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER: &str = "# checkpoint_high_water_mark=";
-const PERSISTENT_KEY_ONLY_INDEX_OBJECT_PREFIX: &str = "# object\t";
-const LIST_OBJECTS_NAMESPACE_JOURNAL_HEADER: &str = "# rustfs-listobjects-namespace-journal-v1";
-const LIST_OBJECTS_NAMESPACE_JOURNAL_BUCKET_HEADER: &str = "# bucket=";
-const LIST_OBJECTS_NAMESPACE_JOURNAL_HIGH_WATER_MARK_HEADER: &str = "# high_water_mark=";
-const LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEADER: &str = "# status=";
-const LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEALTHY: &str = "healthy";
-const LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_DEGRADED: &str = "degraded";
-const LIST_OBJECTS_NAMESPACE_JOURNAL_DEFAULT_DIR: &str = "namespace-mutation-journal";
-const LIST_OBJECTS_NAMESPACE_JOURNAL_SYSTEM_PREFIX: &str = "listobjects/ns-journal/v1";
 
 /// Identifies the source that produced a ListObjects page.
 ///
@@ -498,261 +464,9 @@ impl ListSourceMode {
             _ => None,
         }
     }
-
-    fn metadata_authority(self) -> ListMetadataAuthority {
-        match self {
-            Self::Walker => ListMetadataAuthority::LiveXlMeta,
-            Self::IndexKeyOnly | Self::IndexVerifiedPage => ListMetadataAuthority::LiveVerifiedIndexCandidate,
-            Self::IndexMetadataFast => ListMetadataAuthority::IndexSnapshotEventuallyConsistent,
-        }
-    }
-
-    fn requires_live_metadata_verification(self) -> bool {
-        matches!(self, Self::IndexKeyOnly | Self::IndexVerifiedPage)
-    }
-
-    fn can_satisfy_strong_listing(self) -> bool {
-        !matches!(self.metadata_authority(), ListMetadataAuthority::IndexSnapshotEventuallyConsistent)
-    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListMetadataAuthority {
-    /// Object metadata was read from live xl.meta and can be authoritative for
-    /// strong ListObjects results.
-    LiveXlMeta,
-    /// The index provided candidate keys/pages; live xl.meta validation still
-    /// owns authoritative object metadata.
-    LiveVerifiedIndexCandidate,
-    /// Metadata came from an index snapshot and must not be treated as strong
-    /// consistency-equivalent to live xl.meta.
-    IndexSnapshotEventuallyConsistent,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListIndexFallbackReason {
-    Disabled,
-    Rebuilding,
-    Unhealthy,
-    Lagging,
-    Degraded,
-    MissingGeneration,
-    GenerationMismatch,
-    UnsupportedRequest,
-    MetadataFastUnavailable,
-}
-
-impl ListIndexFallbackReason {
-    fn metric_label(self) -> &'static str {
-        match self {
-            Self::Disabled => "disabled",
-            Self::Rebuilding => "rebuilding",
-            Self::Unhealthy => "unhealthy",
-            Self::Lagging => "lagging",
-            Self::Degraded => "degraded",
-            Self::MissingGeneration => "missing_generation",
-            Self::GenerationMismatch => "generation_mismatch",
-            Self::UnsupportedRequest => "unsupported_request",
-            Self::MetadataFastUnavailable => "metadata_fast_unavailable",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListObjectsIndexProviderKind {
-    WalkerKeyOnly,
-    PersistentKeyOnly,
-}
-
-impl ListObjectsIndexProviderKind {
-    fn metric_label(self) -> &'static str {
-        match self {
-            Self::WalkerKeyOnly => LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY,
-            Self::PersistentKeyOnly => LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY,
-        }
-    }
-}
-
-fn list_objects_index_provider_metric_label(provider: Option<ListObjectsIndexProviderKind>) -> &'static str {
-    provider.map(ListObjectsIndexProviderKind::metric_label).unwrap_or("none")
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ListObjectsIndexProviderState {
-    kind: ListObjectsIndexProviderKind,
-    lifecycle: ListIndexLifecycle,
-    persistent_path: Option<PathBuf>,
-    persistent_generation: Option<String>,
-}
-
-impl ListObjectsIndexProviderState {
-    fn walker_key_only() -> Self {
-        let mut lifecycle = ListIndexLifecycle::disabled(0);
-        lifecycle.begin_rebuild(LIST_CURSOR_GENERATION_LIVE, 0);
-        lifecycle.checkpoint_rebuild(0);
-        let _ = lifecycle.publish_rebuild();
-        Self {
-            kind: ListObjectsIndexProviderKind::WalkerKeyOnly,
-            lifecycle,
-            persistent_path: None,
-            persistent_generation: None,
-        }
-    }
-
-    fn persistent_key_only(path: Option<PathBuf>, generation: Option<String>) -> Self {
-        let mut lifecycle = ListIndexLifecycle::disabled(0);
-        if path.as_ref().is_some_and(|path| !path.as_os_str().is_empty()) {
-            lifecycle.begin_rebuild(
-                generation
-                    .as_deref()
-                    .unwrap_or(LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION),
-                0,
-            );
-        } else {
-            lifecycle.mark_degraded();
-        }
-
-        Self {
-            kind: ListObjectsIndexProviderKind::PersistentKeyOnly,
-            lifecycle,
-            persistent_path: path,
-            persistent_generation: generation,
-        }
-    }
-
-    fn health_snapshot(&self) -> ListIndexHealthSnapshot {
-        self.lifecycle.health_snapshot()
-    }
-}
-
-#[derive(Debug, Clone)]
-struct PersistentKeyOnlyIndexCache {
-    path: PathBuf,
-    len: u64,
-    modified: Option<SystemTime>,
-    index: Arc<PersistentKeyOnlyIndex>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PersistentKeyOnlyIndex {
-    format_version: u8,
-    bucket: Option<String>,
-    generation: String,
-    checkpoint_high_water_mark: u64,
-    keys: Arc<Vec<String>>,
-    objects: Arc<Vec<PersistentListMetadataObject>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PersistentListMetadataObject {
-    name: String,
-    size: i64,
-    mod_time: Option<time::OffsetDateTime>,
-    etag: Option<String>,
-    storage_class: Option<String>,
-}
-
-impl PersistentListMetadataObject {
-    fn from_object_info(object: &ObjectInfo) -> Self {
-        Self {
-            name: object.name.clone(),
-            size: object.size,
-            mod_time: object.mod_time,
-            etag: object
-                .etag
-                .clone()
-                .filter(|_| rustfs_utils::http::etag_can_be_listed(&object.user_defined)),
-            storage_class: object.storage_class.clone(),
-        }
-    }
-
-    fn to_object_info(&self, bucket: &str) -> ObjectInfo {
-        ObjectInfo {
-            bucket: bucket.to_owned(),
-            name: self.name.clone(),
-            size: self.size,
-            mod_time: self.mod_time,
-            etag: self.etag.clone(),
-            storage_class: self.storage_class.clone(),
-            is_latest: true,
-            ..Default::default()
-        }
-    }
-}
-
-static PERSISTENT_KEY_ONLY_INDEX_CACHE: OnceCell<RwLock<Option<PersistentKeyOnlyIndexCache>>> = OnceCell::const_new();
-static LIST_OBJECTS_NAMESPACE_JOURNAL_LOCK: OnceCell<RwLock<()>> = OnceCell::const_new();
-static LIST_OBJECTS_MUTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static SCANNER_NAMESPACE_MUTATION_GENERATION: AtomicU64 = AtomicU64::new(0);
-static LIST_OBJECTS_BUCKET_MUTATION_SEQUENCE: OnceCell<RwLock<HashMap<String, u64>>> = OnceCell::const_new();
-static LIST_OBJECTS_NAMESPACE_JOURNAL_DEGRADED_BUCKETS: OnceCell<RwLock<HashSet<String>>> = OnceCell::const_new();
-#[cfg(any(test, feature = "list-chaos"))]
-static LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_CONFIG: OnceCell<Option<NamespaceMutationJournalChaosConfig>> = OnceCell::const_new();
-#[cfg(any(test, feature = "list-chaos"))]
-static LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_APPLIED: OnceCell<RwLock<HashSet<String>>> = OnceCell::const_new();
-
-async fn persistent_key_only_index_cache() -> &'static RwLock<Option<PersistentKeyOnlyIndexCache>> {
-    PERSISTENT_KEY_ONLY_INDEX_CACHE
-        .get_or_init(|| async { RwLock::new(None) })
-        .await
-}
-
-async fn list_objects_namespace_journal_lock() -> &'static RwLock<()> {
-    LIST_OBJECTS_NAMESPACE_JOURNAL_LOCK
-        .get_or_init(|| async { RwLock::new(()) })
-        .await
-}
-
-async fn list_objects_bucket_mutation_sequence() -> &'static RwLock<HashMap<String, u64>> {
-    LIST_OBJECTS_BUCKET_MUTATION_SEQUENCE
-        .get_or_init(|| async { RwLock::new(HashMap::new()) })
-        .await
-}
-
-async fn list_objects_namespace_journal_degraded_buckets() -> &'static RwLock<HashSet<String>> {
-    LIST_OBJECTS_NAMESPACE_JOURNAL_DEGRADED_BUCKETS
-        .get_or_init(|| async { RwLock::new(HashSet::new()) })
-        .await
-}
-
-#[cfg(any(test, feature = "list-chaos"))]
-async fn list_objects_namespace_journal_chaos_config() -> Option<&'static NamespaceMutationJournalChaosConfig> {
-    LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_CONFIG
-        .get_or_init(|| async { namespace_mutation_journal_chaos_config_from_env() })
-        .await
-        .as_ref()
-}
-
-#[cfg(any(test, feature = "list-chaos"))]
-async fn list_objects_namespace_journal_chaos_applied() -> &'static RwLock<HashSet<String>> {
-    LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_APPLIED
-        .get_or_init(|| async { RwLock::new(HashSet::new()) })
-        .await
-}
-
-fn advance_global_list_objects_mutation_sequence(sequence: u64) -> u64 {
-    let mut current = LIST_OBJECTS_MUTATION_SEQUENCE.load(Ordering::Acquire);
-    loop {
-        if current >= sequence {
-            return current;
-        }
-        match LIST_OBJECTS_MUTATION_SEQUENCE.compare_exchange(current, sequence, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return sequence,
-            Err(observed) => current = observed,
-        }
-    }
-}
-
-async fn advance_list_objects_mutation_sequence(bucket: &str, sequence: u64) -> u64 {
-    let sequence = advance_global_list_objects_mutation_sequence(sequence);
-    let sequences = list_objects_bucket_mutation_sequence().await;
-    let mut sequences = sequences.write().await;
-    sequences
-        .entry(bucket.to_owned())
-        .and_modify(|current| *current = (*current).max(sequence))
-        .or_insert(sequence);
-    sequence
-}
 
 pub(super) fn scanner_namespace_mutation_generation() -> u64 {
     SCANNER_NAMESPACE_MUTATION_GENERATION.load(Ordering::Acquire)
@@ -767,1197 +481,9 @@ pub(crate) fn observe_scanner_namespace_mutations(bucket: &str, delta: u64) {
         .try_update(Ordering::AcqRel, Ordering::Acquire, |current| Some(current.saturating_add(delta)));
 }
 
-pub(crate) async fn observe_list_objects_mutation(store: &ECStore, bucket: &str) -> u64 {
-    observe_list_objects_mutations(store, bucket, 1).await.unwrap_or_default()
-}
-
-pub(super) async fn observe_list_objects_mutations(store: &ECStore, bucket: &str, count: usize) -> Option<u64> {
-    observe_list_objects_mutations_with_store(Some(store), bucket, count).await
-}
-
-async fn observe_list_objects_mutations_with_store(store: Option<&ECStore>, bucket: &str, count: usize) -> Option<u64> {
-    if count == 0 {
-        return None;
-    }
-
-    let delta = u64::try_from(count).unwrap_or(u64::MAX);
-    observe_scanner_namespace_mutations(bucket, delta);
-    let next = LIST_OBJECTS_MUTATION_SEQUENCE
-        .fetch_add(delta, Ordering::AcqRel)
-        .saturating_add(delta);
-    let sequences = list_objects_bucket_mutation_sequence().await;
-    let mut sequences = sequences.write().await;
-    sequences
-        .entry(bucket.to_owned())
-        .and_modify(|current| *current = (*current).max(next))
-        .or_insert(next);
-    persist_observed_list_objects_mutation(store, bucket, next).await;
-    Some(next)
-}
-
-// Test-only observer over the live mutation snapshot; production reads go
-// through `current_list_objects_mutation_snapshot` directly.
 #[cfg(test)]
-async fn current_list_objects_mutation_sequence(bucket: &str) -> u64 {
-    current_list_objects_mutation_snapshot(None, bucket).await.high_water_mark
-}
-
-#[cfg(test)]
-async fn reset_list_objects_mutation_sequences_for_test() {
-    LIST_OBJECTS_MUTATION_SEQUENCE.store(0, Ordering::Release);
+fn reset_scanner_namespace_mutation_generation_for_test() {
     SCANNER_NAMESPACE_MUTATION_GENERATION.store(0, Ordering::Release);
-    let sequences = list_objects_bucket_mutation_sequence().await;
-    sequences.write().await.clear();
-    let degraded = list_objects_namespace_journal_degraded_buckets().await;
-    degraded.write().await.clear();
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NamespaceMutationJournalStatus {
-    Healthy,
-    Degraded,
-}
-
-impl NamespaceMutationJournalStatus {
-    #[cfg(any(test, feature = "list-chaos"))]
-    fn from_env_value(value: &str) -> Option<Self> {
-        if value.eq_ignore_ascii_case(LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEALTHY) {
-            Some(Self::Healthy)
-        } else if value.eq_ignore_ascii_case(LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_DEGRADED) {
-            Some(Self::Degraded)
-        } else {
-            None
-        }
-    }
-
-    #[cfg(any(test, feature = "list-chaos"))]
-    fn env_value(self) -> &'static str {
-        match self {
-            Self::Healthy => LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEALTHY,
-            Self::Degraded => LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_DEGRADED,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct NamespaceMutationJournalState {
-    bucket: Option<String>,
-    high_water_mark: u64,
-    status: NamespaceMutationJournalStatus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NamespaceMutationJournalSnapshot {
-    high_water_mark: u64,
-    degraded: bool,
-}
-
-#[cfg(any(test, feature = "list-chaos"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct NamespaceMutationJournalChaosConfig {
-    bucket: String,
-    status: NamespaceMutationJournalStatus,
-    sequence: Option<u64>,
-}
-
-#[derive(Clone)]
-enum NamespaceMutationJournalBackend<'a> {
-    System(&'a ECStore),
-    LocalPath(PathBuf),
-}
-
-fn parse_namespace_mutation_journal_state(contents: &str) -> Option<NamespaceMutationJournalState> {
-    let mut bucket = None;
-    let mut high_water_mark = None;
-    let mut status = NamespaceMutationJournalStatus::Healthy;
-
-    for line in contents.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() || line == LIST_OBJECTS_NAMESPACE_JOURNAL_HEADER {
-            continue;
-        }
-        if let Some(value) = line.strip_prefix(LIST_OBJECTS_NAMESPACE_JOURNAL_BUCKET_HEADER) {
-            if !value.is_empty() {
-                bucket = Some(value.to_owned());
-            }
-            continue;
-        }
-        if let Some(value) = line.strip_prefix(LIST_OBJECTS_NAMESPACE_JOURNAL_HIGH_WATER_MARK_HEADER) {
-            high_water_mark = value.parse::<u64>().ok();
-            continue;
-        }
-        if let Some(value) = line.strip_prefix(LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEADER) {
-            status = match value {
-                LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEALTHY => NamespaceMutationJournalStatus::Healthy,
-                LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_DEGRADED => NamespaceMutationJournalStatus::Degraded,
-                _ => return None,
-            };
-        }
-    }
-
-    high_water_mark.map(|high_water_mark| NamespaceMutationJournalState {
-        bucket,
-        high_water_mark,
-        status,
-    })
-}
-
-fn encode_namespace_mutation_journal_state(bucket: &str, sequence: u64, degraded: bool) -> String {
-    let mut contents = String::new();
-    contents.push_str(LIST_OBJECTS_NAMESPACE_JOURNAL_HEADER);
-    contents.push('\n');
-    contents.push_str(LIST_OBJECTS_NAMESPACE_JOURNAL_BUCKET_HEADER);
-    contents.push_str(bucket);
-    contents.push('\n');
-    contents.push_str(LIST_OBJECTS_NAMESPACE_JOURNAL_HIGH_WATER_MARK_HEADER);
-    contents.push_str(&sequence.to_string());
-    contents.push('\n');
-    contents.push_str(LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEADER);
-    contents.push_str(if degraded {
-        LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_DEGRADED
-    } else {
-        LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEALTHY
-    });
-    contents.push('\n');
-    contents
-}
-
-fn namespace_mutation_journal_path(root: &Path, bucket: &str) -> PathBuf {
-    root.join(format!("{bucket}.state"))
-}
-
-fn namespace_mutation_journal_system_path(bucket: &str) -> String {
-    format!("{LIST_OBJECTS_NAMESPACE_JOURNAL_SYSTEM_PREFIX}/{bucket}/state")
-}
-
-fn list_objects_namespace_journal_root_from_env() -> Option<PathBuf> {
-    std::env::var_os(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH)
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-}
-
-#[cfg(any(test, feature = "list-chaos"))]
-fn namespace_mutation_journal_chaos_enabled_from_env() -> bool {
-    std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED)
-        .ok()
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true"))
-}
-
-#[cfg(any(test, feature = "list-chaos"))]
-fn namespace_mutation_journal_chaos_bucket_from_env() -> Option<String> {
-    std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET)
-        .ok()
-        .filter(|bucket| !bucket.is_empty())
-}
-
-#[cfg(any(test, feature = "list-chaos"))]
-fn namespace_mutation_journal_chaos_sequence_from_env() -> Option<u64> {
-    std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-}
-
-#[cfg(any(test, feature = "list-chaos"))]
-fn namespace_mutation_journal_chaos_status_from_env() -> Option<NamespaceMutationJournalStatus> {
-    std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS)
-        .ok()
-        .and_then(|value| NamespaceMutationJournalStatus::from_env_value(&value))
-}
-
-#[cfg(any(test, feature = "list-chaos"))]
-fn namespace_mutation_journal_chaos_config_from_env() -> Option<NamespaceMutationJournalChaosConfig> {
-    if !namespace_mutation_journal_chaos_enabled_from_env() {
-        return None;
-    }
-
-    let Some(bucket) = namespace_mutation_journal_chaos_bucket_from_env() else {
-        warn!(
-            bucket_env = ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET,
-            "list objects namespace journal chaos is enabled without a target bucket; skipping injection"
-        );
-        return None;
-    };
-    let Some(status) = namespace_mutation_journal_chaos_status_from_env() else {
-        warn!(
-            status_env = ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS,
-            "list objects namespace journal chaos is enabled with an invalid status; skipping injection"
-        );
-        return None;
-    };
-
-    Some(NamespaceMutationJournalChaosConfig {
-        bucket,
-        status,
-        sequence: namespace_mutation_journal_chaos_sequence_from_env(),
-    })
-}
-
-#[cfg(any(test, feature = "list-chaos"))]
-fn namespace_mutation_journal_chaos_applied_key(bucket: &str, status: NamespaceMutationJournalStatus) -> String {
-    let mut key = String::with_capacity(bucket.len() + 1 + status.env_value().len());
-    key.push_str(bucket);
-    key.push(':');
-    key.push_str(status.env_value());
-    key
-}
-
-/// Production no-op twin of the chaos injector: without `list-chaos` the
-/// injection point compiles to nothing (backlog#1832).
-#[cfg(not(any(test, feature = "list-chaos")))]
-#[inline]
-async fn maybe_apply_system_namespace_mutation_journal_chaos(_store: &ECStore, _bucket: &str, _default_sequence: u64) {}
-
-#[cfg(any(test, feature = "list-chaos"))]
-async fn maybe_apply_system_namespace_mutation_journal_chaos(store: &ECStore, bucket: &str, default_sequence: u64) {
-    let Some(config) = list_objects_namespace_journal_chaos_config().await else {
-        return;
-    };
-    if config.bucket != bucket {
-        return;
-    };
-
-    if list_objects_namespace_journal_root_from_env().is_some() {
-        warn!(
-            bucket = %bucket,
-            status = config.status.env_value(),
-            "list objects namespace journal chaos requires the quorum-backed system journal; skipping local journal override"
-        );
-        return;
-    }
-
-    let applied_key = namespace_mutation_journal_chaos_applied_key(bucket, config.status);
-    let applied = list_objects_namespace_journal_chaos_applied().await;
-    {
-        let applied = applied.read().await;
-        if applied.contains(&applied_key) {
-            return;
-        }
-    }
-
-    let sequence = config.sequence.unwrap_or(default_sequence);
-    let result = match config.status {
-        NamespaceMutationJournalStatus::Healthy => {
-            write_namespace_mutation_journal_state(NamespaceMutationJournalBackend::System(store), bucket, sequence, true)
-                .await
-                .map(|_| ())
-        }
-        NamespaceMutationJournalStatus::Degraded => {
-            write_namespace_mutation_journal_degraded_state(NamespaceMutationJournalBackend::System(store), bucket, sequence)
-                .await
-        }
-    };
-
-    match result {
-        Ok(()) => {
-            applied.write().await.insert(applied_key);
-            warn!(
-                bucket = %bucket,
-                sequence,
-                status = config.status.env_value(),
-                "applied controlled list objects namespace journal chaos state"
-            );
-        }
-        Err(err) => {
-            warn!(
-                bucket = %bucket,
-                sequence,
-                status = config.status.env_value(),
-                error = %err,
-                "failed to apply controlled list objects namespace journal chaos state"
-            );
-        }
-    }
-}
-
-fn list_objects_namespace_journal_root_from_provider_path(provider_path: &Path) -> Option<PathBuf> {
-    provider_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map(|parent| parent.join(LIST_OBJECTS_NAMESPACE_JOURNAL_DEFAULT_DIR))
-}
-
-fn list_objects_namespace_journal_backend<'a>(
-    store: Option<&'a ECStore>,
-    provider_path: Option<&Path>,
-) -> Option<NamespaceMutationJournalBackend<'a>> {
-    if let Some(root) = list_objects_namespace_journal_root_from_env() {
-        return Some(NamespaceMutationJournalBackend::LocalPath(root));
-    }
-    if let Some(store) = store {
-        return Some(NamespaceMutationJournalBackend::System(store));
-    }
-    provider_path
-        .and_then(list_objects_namespace_journal_root_from_provider_path)
-        .map(NamespaceMutationJournalBackend::LocalPath)
-}
-
-fn list_objects_namespace_journal_write_quorum(total_disks: usize) -> usize {
-    (total_disks / 2) + 1
-}
-
-fn validate_namespace_mutation_journal_state(bucket: &str, contents: &str) -> Result<NamespaceMutationJournalState> {
-    let Some(state) = parse_namespace_mutation_journal_state(contents) else {
-        return Err(Error::other("list objects namespace mutation journal state is corrupt"));
-    };
-    if state
-        .bucket
-        .as_deref()
-        .is_some_and(|persisted_bucket| persisted_bucket != bucket)
-    {
-        return Err(Error::other("list objects namespace mutation journal bucket mismatch"));
-    }
-    Ok(state)
-}
-
-async fn system_namespace_mutation_journal_state_candidates(
-    store: &ECStore,
-    bucket: &str,
-) -> Result<Vec<Option<NamespaceMutationJournalState>>> {
-    if store.pools.is_empty() {
-        return Err(Error::other("list objects namespace mutation journal has no storage pools"));
-    }
-
-    let path = namespace_mutation_journal_system_path(bucket);
-    let mut states = Vec::with_capacity(store.pools.len());
-
-    for pool in &store.pools {
-        let set = pool.get_disks_by_key(bucket);
-        let disks = set.disk_inventory().await;
-        let quorum = list_objects_namespace_journal_write_quorum(set.set_drive_count);
-        let mut successes = 0usize;
-        let mut pool_state: Option<NamespaceMutationJournalState> = None;
-        let mut futures = Vec::with_capacity(disks.len());
-
-        for disk in disks.into_iter().flatten() {
-            let path = path.clone();
-            futures.push(async move { disk.read_all(RUSTFS_META_BUCKET, &path).await });
-        }
-
-        for result in join_all(futures).await {
-            match result {
-                Ok(bytes) => {
-                    successes += 1;
-                    let contents = String::from_utf8_lossy(&bytes);
-                    let state = validate_namespace_mutation_journal_state(bucket, contents.as_ref())?;
-                    match pool_state.as_ref() {
-                        Some(current)
-                            if current.high_water_mark > state.high_water_mark
-                                || (current.high_water_mark == state.high_water_mark
-                                    && current.status == NamespaceMutationJournalStatus::Degraded) => {}
-                        _ => {
-                            pool_state = Some(state);
-                        }
-                    }
-                }
-                Err(DiskError::FileNotFound) => {
-                    successes += 1;
-                }
-                Err(err) => {
-                    debug!(
-                        bucket = %bucket,
-                        path = %path,
-                        error = %err,
-                        "failed to read namespace mutation journal state from disk"
-                    );
-                }
-            }
-        }
-
-        if successes < quorum {
-            return Err(Error::other("list objects namespace mutation journal read quorum was not met"));
-        }
-        states.push(pool_state);
-    }
-
-    Ok(states)
-}
-
-async fn load_system_namespace_mutation_journal_state(
-    store: &ECStore,
-    bucket: &str,
-) -> Result<Option<NamespaceMutationJournalState>> {
-    let mut merged: Option<NamespaceMutationJournalState> = None;
-    let mut saw_state = false;
-
-    for state in system_namespace_mutation_journal_state_candidates(store, bucket).await? {
-        let Some(state) = state else {
-            continue;
-        };
-        saw_state = true;
-        match merged.as_ref() {
-            Some(current)
-                if current.high_water_mark > state.high_water_mark
-                    || (current.high_water_mark == state.high_water_mark
-                        && current.status == NamespaceMutationJournalStatus::Degraded) => {}
-            _ => merged = Some(state),
-        }
-    }
-
-    Ok(saw_state.then_some(merged).flatten())
-}
-
-async fn write_system_namespace_mutation_journal_state(
-    store: &ECStore,
-    bucket: &str,
-    sequence: u64,
-    degraded: bool,
-) -> Result<()> {
-    if store.pools.is_empty() {
-        return Err(Error::other("list objects namespace mutation journal has no storage pools"));
-    }
-
-    let path = namespace_mutation_journal_system_path(bucket);
-    let contents = Bytes::from(encode_namespace_mutation_journal_state(bucket, sequence, degraded));
-
-    for pool in &store.pools {
-        let set = pool.get_disks_by_key(bucket);
-        let disks = set.disk_inventory().await;
-        let quorum = list_objects_namespace_journal_write_quorum(set.set_drive_count);
-        let mut futures = Vec::with_capacity(disks.len());
-
-        for disk in disks.into_iter().flatten() {
-            let path = path.clone();
-            let contents = contents.clone();
-            futures.push(async move { disk.write_all(RUSTFS_META_BUCKET, &path, contents).await });
-        }
-
-        let successes = join_all(futures).await.into_iter().filter(|result| result.is_ok()).count();
-        if successes < quorum {
-            return Err(Error::other("list objects namespace mutation journal write quorum was not met"));
-        }
-    }
-
-    Ok(())
-}
-
-async fn load_local_namespace_mutation_journal_state(root: &Path, bucket: &str) -> Result<Option<NamespaceMutationJournalState>> {
-    let journal_path = namespace_mutation_journal_path(root, bucket);
-    let lock = list_objects_namespace_journal_lock().await;
-    // Journal IO is serialized and does not take provider/index locks, preserving high-water monotonicity.
-    let _guard = lock.read().await;
-    let contents = match tokio::fs::read_to_string(&journal_path).await {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(Error::Io(err)),
-    };
-    validate_namespace_mutation_journal_state(bucket, &contents).map(Some)
-}
-
-async fn load_namespace_mutation_journal_state(
-    backend: NamespaceMutationJournalBackend<'_>,
-    bucket: &str,
-) -> Result<Option<NamespaceMutationJournalState>> {
-    match backend {
-        NamespaceMutationJournalBackend::System(store) => load_system_namespace_mutation_journal_state(store, bucket).await,
-        NamespaceMutationJournalBackend::LocalPath(root) => load_local_namespace_mutation_journal_state(&root, bucket).await,
-    }
-}
-
-async fn write_local_namespace_mutation_journal_state(
-    root: &Path,
-    bucket: &str,
-    sequence: u64,
-    clear_degraded: bool,
-) -> Result<NamespaceMutationJournalSnapshot> {
-    let journal_path = namespace_mutation_journal_path(root, bucket);
-    let lock = list_objects_namespace_journal_lock().await;
-    // Journal IO is serialized and does not take provider/index locks, preserving high-water monotonicity.
-    let guard = lock.write().await;
-
-    let persisted_state = match tokio::fs::read_to_string(&journal_path).await {
-        Ok(contents) => {
-            let state = validate_namespace_mutation_journal_state(bucket, &contents)?;
-            Some(state)
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => return Err(Error::Io(err)),
-    };
-    let persisted_sequence = persisted_state.as_ref().map(|state| state.high_water_mark).unwrap_or(0);
-    let degraded = persisted_state
-        .as_ref()
-        .is_some_and(|state| state.status == NamespaceMutationJournalStatus::Degraded)
-        && !clear_degraded;
-    let sequence = sequence.max(persisted_sequence);
-
-    if let Some(parent) = journal_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        tokio::fs::create_dir_all(parent).await.map_err(Error::Io)?;
-    }
-
-    let contents = encode_namespace_mutation_journal_state(bucket, sequence, degraded);
-
-    let tmp_path = journal_path.with_extension("tmp");
-    tokio::fs::write(&tmp_path, contents).await.map_err(Error::Io)?;
-    tokio::fs::rename(&tmp_path, &journal_path).await.map_err(Error::Io)?;
-    drop(guard);
-    if clear_degraded {
-        let degraded = list_objects_namespace_journal_degraded_buckets().await;
-        degraded.write().await.remove(bucket);
-    }
-    Ok(NamespaceMutationJournalSnapshot {
-        high_water_mark: sequence,
-        degraded,
-    })
-}
-
-async fn write_namespace_mutation_journal_state(
-    backend: NamespaceMutationJournalBackend<'_>,
-    bucket: &str,
-    sequence: u64,
-    clear_degraded: bool,
-) -> Result<NamespaceMutationJournalSnapshot> {
-    let persisted_state = load_namespace_mutation_journal_state(backend.clone(), bucket).await?;
-    let persisted_sequence = persisted_state.as_ref().map(|state| state.high_water_mark).unwrap_or(0);
-    let degraded = persisted_state
-        .as_ref()
-        .is_some_and(|state| state.status == NamespaceMutationJournalStatus::Degraded)
-        && !clear_degraded;
-    let sequence = sequence.max(persisted_sequence);
-
-    match backend {
-        NamespaceMutationJournalBackend::System(store) => {
-            write_system_namespace_mutation_journal_state(store, bucket, sequence, degraded).await?;
-        }
-        NamespaceMutationJournalBackend::LocalPath(root) => {
-            return write_local_namespace_mutation_journal_state(&root, bucket, sequence, clear_degraded).await;
-        }
-    }
-
-    if clear_degraded {
-        let degraded = list_objects_namespace_journal_degraded_buckets().await;
-        degraded.write().await.remove(bucket);
-    }
-
-    Ok(NamespaceMutationJournalSnapshot {
-        high_water_mark: sequence,
-        degraded,
-    })
-}
-
-async fn mark_namespace_mutation_journal_degraded(store: Option<&ECStore>, bucket: &str, sequence: u64) {
-    let degraded = list_objects_namespace_journal_degraded_buckets().await;
-    degraded.write().await.insert(bucket.to_owned());
-
-    if let Some(backend) = list_objects_namespace_journal_backend(store, None)
-        && let Err(err) = write_namespace_mutation_journal_degraded_state(backend, bucket, sequence).await
-    {
-        warn!(
-            bucket = %bucket,
-            sequence,
-            error = %err,
-            "failed to persist degraded namespace mutation journal state"
-        );
-    }
-}
-
-async fn write_local_namespace_mutation_journal_degraded_state(root: &Path, bucket: &str, sequence: u64) -> Result<()> {
-    let journal_path = namespace_mutation_journal_path(root, bucket);
-    let lock = list_objects_namespace_journal_lock().await;
-    // Journal IO is serialized and does not take provider/index locks, preserving high-water monotonicity.
-    let _guard = lock.write().await;
-
-    let persisted_sequence = match tokio::fs::read_to_string(&journal_path).await {
-        Ok(contents) => parse_namespace_mutation_journal_state(&contents)
-            .filter(|state| {
-                state
-                    .bucket
-                    .as_deref()
-                    .is_none_or(|persisted_bucket| persisted_bucket == bucket)
-            })
-            .map(|state| state.high_water_mark)
-            .unwrap_or(0),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(err) => return Err(Error::Io(err)),
-    };
-    let sequence = sequence.max(persisted_sequence);
-
-    if let Some(parent) = journal_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        tokio::fs::create_dir_all(parent).await.map_err(Error::Io)?;
-    }
-
-    let contents = encode_namespace_mutation_journal_state(bucket, sequence, true);
-
-    let tmp_path = journal_path.with_extension("tmp");
-    tokio::fs::write(&tmp_path, contents).await.map_err(Error::Io)?;
-    tokio::fs::rename(&tmp_path, &journal_path).await.map_err(Error::Io)?;
-    Ok(())
-}
-
-async fn write_namespace_mutation_journal_degraded_state(
-    backend: NamespaceMutationJournalBackend<'_>,
-    bucket: &str,
-    sequence: u64,
-) -> Result<()> {
-    let persisted_state = load_namespace_mutation_journal_state(backend.clone(), bucket).await?;
-    let sequence = sequence.max(persisted_state.map(|state| state.high_water_mark).unwrap_or(0));
-
-    match backend {
-        NamespaceMutationJournalBackend::System(store) => {
-            write_system_namespace_mutation_journal_state(store, bucket, sequence, true).await
-        }
-        NamespaceMutationJournalBackend::LocalPath(root) => {
-            write_local_namespace_mutation_journal_degraded_state(&root, bucket, sequence).await
-        }
-    }
-}
-
-async fn current_list_objects_mutation_snapshot(store: Option<&ECStore>, bucket: &str) -> NamespaceMutationJournalSnapshot {
-    let sequences = list_objects_bucket_mutation_sequence().await;
-    let in_memory_sequence = {
-        let sequences = sequences.read().await;
-        sequences.get(bucket).copied().unwrap_or(0)
-    };
-
-    let degraded = list_objects_namespace_journal_degraded_buckets().await;
-    let in_memory_degraded = {
-        let degraded = degraded.read().await;
-        degraded.contains(bucket)
-    };
-
-    let Some(backend) = list_objects_namespace_journal_backend(store, None) else {
-        return NamespaceMutationJournalSnapshot {
-            high_water_mark: in_memory_sequence,
-            degraded: in_memory_degraded,
-        };
-    };
-
-    match load_namespace_mutation_journal_state(backend, bucket).await {
-        Ok(Some(state)) => {
-            advance_list_objects_mutation_sequence(bucket, state.high_water_mark).await;
-            NamespaceMutationJournalSnapshot {
-                high_water_mark: in_memory_sequence.max(state.high_water_mark),
-                degraded: in_memory_degraded || state.status == NamespaceMutationJournalStatus::Degraded,
-            }
-        }
-        Ok(None) => NamespaceMutationJournalSnapshot {
-            high_water_mark: in_memory_sequence,
-            degraded: in_memory_degraded,
-        },
-        Err(err) => {
-            warn!(
-                bucket = %bucket,
-                error = %err,
-                "list objects namespace mutation journal could not be loaded; falling back to walker"
-            );
-            let degraded = list_objects_namespace_journal_degraded_buckets().await;
-            degraded.write().await.insert(bucket.to_owned());
-            NamespaceMutationJournalSnapshot {
-                high_water_mark: in_memory_sequence,
-                degraded: true,
-            }
-        }
-    }
-}
-
-async fn invalidate_persistent_key_only_index(path: &Path) {
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            warn!(
-                index_path = %path.display(),
-                error = %err,
-                "failed to remove persistent key-only index after mutation checkpoint persist failure"
-            );
-        }
-    }
-
-    let cache = persistent_key_only_index_cache().await;
-    let mut cached = cache.write().await;
-    if cached.as_ref().is_some_and(|cached| cached.path == path) {
-        *cached = None;
-    }
-}
-
-async fn persist_observed_list_objects_mutation(store: Option<&ECStore>, bucket: &str, sequence: u64) {
-    if is_reserved_or_invalid_bucket(bucket, false) {
-        return;
-    }
-
-    let Some(path) = list_objects_index_provider_path_from_env().filter(|_| {
-        matches!(
-            list_objects_index_provider_from_env(),
-            Some(ListObjectsIndexProviderKind::PersistentKeyOnly)
-        )
-    }) else {
-        return;
-    };
-
-    let Some(backend) = list_objects_namespace_journal_backend(store, Some(&path)) else {
-        return;
-    };
-
-    if let Err(err) = write_namespace_mutation_journal_state(backend, bucket, sequence, false).await {
-        warn!(
-            bucket = %bucket,
-            sequence,
-            error = %err,
-            "namespace mutation journal commit failed; degrading persistent key-only provider"
-        );
-        mark_namespace_mutation_journal_degraded(store, bucket, sequence).await;
-        invalidate_persistent_key_only_index(&path).await;
-    }
-}
-
-fn encode_persistent_list_metadata_string(value: &str) -> String {
-    BASE64_STANDARD.encode_to_string(value.as_bytes())
-}
-
-fn decode_persistent_list_metadata_string(value: &str) -> Option<String> {
-    let bytes = BASE64_STANDARD.decode_to_vec(value).ok()?;
-    String::from_utf8(bytes).ok()
-}
-
-fn encode_optional_persistent_list_metadata_string(value: Option<&str>) -> String {
-    value
-        .map(encode_persistent_list_metadata_string)
-        .unwrap_or_else(|| "-".to_owned())
-}
-
-fn decode_optional_persistent_list_metadata_string(value: &str) -> Option<Option<String>> {
-    if value == "-" {
-        Some(None)
-    } else {
-        decode_persistent_list_metadata_string(value).map(Some)
-    }
-}
-
-fn encode_persistent_list_metadata_object(object: &PersistentListMetadataObject) -> String {
-    let mut line = String::new();
-    line.push_str(PERSISTENT_KEY_ONLY_INDEX_OBJECT_PREFIX);
-    line.push_str(&encode_persistent_list_metadata_string(&object.name));
-    line.push('\t');
-    line.push_str(&object.size.to_string());
-    line.push('\t');
-    line.push_str(
-        &object
-            .mod_time
-            .map(|mod_time| mod_time.unix_timestamp_nanos().to_string())
-            .unwrap_or_else(|| "-".to_owned()),
-    );
-    line.push('\t');
-    line.push_str(&encode_optional_persistent_list_metadata_string(object.etag.as_deref()));
-    line.push('\t');
-    line.push_str(&encode_optional_persistent_list_metadata_string(object.storage_class.as_deref()));
-    line
-}
-
-fn parse_persistent_list_metadata_object(line: &str) -> Option<PersistentListMetadataObject> {
-    let value = line.strip_prefix(PERSISTENT_KEY_ONLY_INDEX_OBJECT_PREFIX)?;
-    let mut fields = value.split('\t');
-    let name = decode_persistent_list_metadata_string(fields.next()?)?;
-    let size = fields.next()?.parse::<i64>().ok()?;
-    let mod_time = match fields.next()? {
-        "-" => None,
-        value => Some(time::OffsetDateTime::from_unix_timestamp_nanos(value.parse::<i128>().ok()?).ok()?),
-    };
-    let etag = decode_optional_persistent_list_metadata_string(fields.next()?)?;
-    let storage_class = decode_optional_persistent_list_metadata_string(fields.next()?)?;
-    if fields.next().is_some() {
-        return None;
-    }
-
-    Some(PersistentListMetadataObject {
-        name,
-        size,
-        mod_time,
-        etag,
-        storage_class,
-    })
-}
-
-fn parse_persistent_key_only_index(contents: &str) -> PersistentKeyOnlyIndex {
-    let mut format_version = 0;
-    let mut bucket = None;
-    let mut generation = None;
-    let mut checkpoint_high_water_mark = None;
-    let mut keys = Vec::new();
-    let mut objects = Vec::new();
-
-    for line in contents.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() {
-            continue;
-        }
-        if line == PERSISTENT_KEY_ONLY_INDEX_HEADER {
-            format_version = PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION;
-            continue;
-        }
-        if let Some(object) = parse_persistent_list_metadata_object(line) {
-            keys.push(object.name.clone());
-            objects.push(object);
-            continue;
-        }
-        if let Some(value) = line.strip_prefix(PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER) {
-            if !value.is_empty() {
-                bucket = Some(value.to_owned());
-            }
-            continue;
-        }
-        if let Some(value) = line.strip_prefix(PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER) {
-            if is_valid_list_objects_index_generation(value) {
-                generation = Some(value.to_owned());
-            }
-            continue;
-        }
-        if let Some(value) = line.strip_prefix(PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER) {
-            checkpoint_high_water_mark = value.parse::<u64>().ok();
-            continue;
-        }
-        if line.starts_with('#') {
-            continue;
-        }
-        keys.push(line.to_owned());
-    }
-
-    keys.sort_unstable();
-    keys.dedup();
-    objects.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-    objects.dedup_by(|left, right| left.name == right.name);
-    let checkpoint_high_water_mark = checkpoint_high_water_mark.unwrap_or_else(|| u64::try_from(keys.len()).unwrap_or(u64::MAX));
-
-    PersistentKeyOnlyIndex {
-        format_version,
-        bucket,
-        generation: generation.unwrap_or_else(|| LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION.to_owned()),
-        checkpoint_high_water_mark,
-        keys: Arc::new(keys),
-        objects: Arc::new(objects),
-    }
-}
-
-fn persistent_key_only_index_health(
-    index: &PersistentKeyOnlyIndex,
-    mutation_snapshot: NamespaceMutationJournalSnapshot,
-) -> ListIndexHealthSnapshot {
-    let mut lifecycle = ListIndexLifecycle::disabled(0);
-    let mutation_high_water_mark = mutation_snapshot.high_water_mark.max(index.checkpoint_high_water_mark);
-    lifecycle.begin_rebuild(&index.generation, mutation_high_water_mark);
-    lifecycle.checkpoint_rebuild(index.checkpoint_high_water_mark);
-    let _ = lifecycle.publish_rebuild();
-    if mutation_snapshot.degraded {
-        lifecycle.mark_degraded();
-        return lifecycle.health_snapshot();
-    }
-    lifecycle.observe_mutation_high_water_mark(mutation_high_water_mark);
-    lifecycle.health_snapshot()
-}
-
-fn persistent_key_only_index_matches_provider(
-    index: &PersistentKeyOnlyIndex,
-    bucket: &str,
-    provider_state: &ListObjectsIndexProviderState,
-) -> bool {
-    if index.format_version != PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION {
-        return false;
-    }
-    if index.bucket.as_deref().is_some_and(|index_bucket| index_bucket != bucket) {
-        return false;
-    }
-    provider_state
-        .persistent_generation
-        .as_deref()
-        .is_none_or(|generation| index.generation == generation)
-}
-
-fn persistent_key_only_index_has_complete_metadata_snapshot(index: &PersistentKeyOnlyIndex) -> bool {
-    index.keys.len() == index.objects.len()
-        && index
-            .keys
-            .iter()
-            .zip(index.objects.iter())
-            .all(|(key, object)| key == &object.name)
-}
-
-fn generated_persistent_key_only_generation(configured: Option<&str>) -> String {
-    if let Some(configured) = configured
-        && is_valid_list_objects_index_generation(configured)
-    {
-        return configured.to_owned();
-    }
-
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    format!("{LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION}-{millis}")
-}
-
-async fn write_persistent_key_only_index_with_metadata(
-    store: Option<&ECStore>,
-    path: &Path,
-    bucket: &str,
-    generation: &str,
-    checkpoint_high_water_mark: u64,
-    keys: &[String],
-    objects: &[PersistentListMetadataObject],
-) -> Result<PersistentKeyOnlyIndex> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        tokio::fs::create_dir_all(parent).await.map_err(Error::Io)?;
-    }
-
-    let mut keys = keys.to_vec();
-    keys.sort_unstable();
-    keys.dedup();
-    let mut objects = objects.to_vec();
-    objects.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-    objects.dedup_by(|left, right| left.name == right.name);
-    let mut contents = String::new();
-    contents.push_str(PERSISTENT_KEY_ONLY_INDEX_HEADER);
-    contents.push('\n');
-    contents.push_str(PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER);
-    contents.push_str(bucket);
-    contents.push('\n');
-    contents.push_str(PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER);
-    contents.push_str(generation);
-    contents.push('\n');
-    contents.push_str(PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER);
-    contents.push_str(&checkpoint_high_water_mark.to_string());
-    contents.push('\n');
-    for key in &keys {
-        contents.push_str(key);
-        contents.push('\n');
-    }
-    for object in &objects {
-        contents.push_str(&encode_persistent_list_metadata_object(object));
-        contents.push('\n');
-    }
-
-    let Some(journal_backend) = list_objects_namespace_journal_backend(store, Some(path)) else {
-        return Err(Error::other("list objects namespace mutation journal path is not configured"));
-    };
-    let tmp_path = path.with_extension("tmp");
-    tokio::fs::write(&tmp_path, contents).await.map_err(Error::Io)?;
-    write_namespace_mutation_journal_state(journal_backend, bucket, checkpoint_high_water_mark, true).await?;
-    tokio::fs::rename(&tmp_path, path).await.map_err(Error::Io)?;
-
-    Ok(PersistentKeyOnlyIndex {
-        format_version: PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
-        bucket: Some(bucket.to_owned()),
-        generation: generation.to_owned(),
-        checkpoint_high_water_mark,
-        keys: Arc::new(keys),
-        objects: Arc::new(objects),
-    })
-}
-
-async fn load_persistent_key_only_index(store: Option<&ECStore>, path: &Path) -> Result<Arc<PersistentKeyOnlyIndex>> {
-    let metadata = tokio::fs::metadata(path).await.map_err(Error::Io)?;
-    let len = metadata.len();
-    let modified = metadata.modified().ok();
-    let cache = persistent_key_only_index_cache().await;
-
-    {
-        let cached = cache.read().await;
-        if let Some(cached) = cached.as_ref()
-            && cached.path == path
-            && cached.len == len
-            && cached.modified == modified
-        {
-            return Ok(cached.index.clone());
-        }
-    }
-
-    let contents = tokio::fs::read_to_string(path).await.map_err(Error::Io)?;
-    let index = Arc::new(parse_persistent_key_only_index(&contents));
-    if let Some(bucket) = index.bucket.as_deref() {
-        let restored_sequence = match list_objects_namespace_journal_backend(store, Some(path)) {
-            Some(journal_backend) => load_namespace_mutation_journal_state(journal_backend, bucket)
-                .await?
-                .map(|state| state.high_water_mark)
-                .unwrap_or(index.checkpoint_high_water_mark)
-                .max(index.checkpoint_high_water_mark),
-            None => index.checkpoint_high_water_mark,
-        };
-        advance_list_objects_mutation_sequence(bucket, restored_sequence).await;
-    }
-    let mut cached = cache.write().await;
-    *cached = Some(PersistentKeyOnlyIndexCache {
-        path: path.to_path_buf(),
-        len,
-        modified,
-        index: index.clone(),
-    });
-    Ok(index)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListIndexSourceDecision {
-    UseIndex(ListSourceMode),
-    FallbackToWalker(ListIndexFallbackReason),
-}
-
-trait ListMetadataIndexHealth {
-    fn fallback_reason(&self) -> Option<ListIndexFallbackReason>;
-}
-
-fn select_list_index_provider_source_mode(
-    opts: &ListPathOptions,
-    requested: ListSourceMode,
-    health: &ListIndexHealthSnapshot,
-) -> ListIndexSourceDecision {
-    let mut parsed_opts = opts.clone();
-    parsed_opts.parse_marker();
-
-    if parsed_opts
-        .cursor_source
-        .is_some_and(|source| source != requested && source != ListSourceMode::Walker)
-    {
-        return ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::UnsupportedRequest);
-    }
-
-    if let Some(cursor_generation) = parsed_opts.cursor_generation.as_deref()
-        && health
-            .active_generation
-            .as_deref()
-            .is_some_and(|active_generation| cursor_generation != active_generation)
-    {
-        return ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::GenerationMismatch);
-    }
-
-    select_list_index_source_mode(Some(requested), health.active_generation.as_deref(), health)
-}
-
-fn select_list_index_source_mode(
-    requested: Option<ListSourceMode>,
-    generation: Option<&str>,
-    health: &dyn ListMetadataIndexHealth,
-) -> ListIndexSourceDecision {
-    let Some(mode) = requested else {
-        return ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Disabled);
-    };
-
-    if mode == ListSourceMode::Walker {
-        return ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Disabled);
-    }
-
-    if generation.is_none_or(str::is_empty) {
-        return ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::MissingGeneration);
-    }
-
-    if let Some(reason) = health.fallback_reason() {
-        return ListIndexSourceDecision::FallbackToWalker(reason);
-    }
-
-    ListIndexSourceDecision::UseIndex(mode)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListIndexLifecycleState {
-    Disabled,
-    Rebuilding,
-    Healthy,
-    Lagging,
-    Degraded,
-}
-
-impl ListIndexLifecycleState {
-    fn fallback_reason(self) -> Option<ListIndexFallbackReason> {
-        match self {
-            Self::Disabled => Some(ListIndexFallbackReason::Disabled),
-            Self::Rebuilding => Some(ListIndexFallbackReason::Rebuilding),
-            Self::Healthy => None,
-            Self::Lagging => Some(ListIndexFallbackReason::Lagging),
-            Self::Degraded => Some(ListIndexFallbackReason::Degraded),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ListIndexHealthSnapshot {
-    state: ListIndexLifecycleState,
-    active_generation: Option<String>,
-    staging_generation: Option<String>,
-    checkpoint_high_water_mark: u64,
-    mutation_high_water_mark: u64,
-    mutation_lag: u64,
-    fallback_reason: Option<ListIndexFallbackReason>,
-}
-
-impl ListMetadataIndexHealth for ListIndexHealthSnapshot {
-    fn fallback_reason(&self) -> Option<ListIndexFallbackReason> {
-        self.fallback_reason
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ListIndexLifecycle {
-    state: ListIndexLifecycleState,
-    active_generation: Option<String>,
-    staging_generation: Option<String>,
-    checkpoint_high_water_mark: u64,
-    mutation_high_water_mark: u64,
-    max_allowed_lag: u64,
-}
-
-impl ListIndexLifecycle {
-    fn disabled(max_allowed_lag: u64) -> Self {
-        Self {
-            state: ListIndexLifecycleState::Disabled,
-            active_generation: None,
-            staging_generation: None,
-            checkpoint_high_water_mark: 0,
-            mutation_high_water_mark: 0,
-            max_allowed_lag,
-        }
-    }
-
-    fn begin_rebuild(&mut self, generation: impl Into<String>, current_high_water_mark: u64) {
-        self.state = ListIndexLifecycleState::Rebuilding;
-        self.staging_generation = Some(generation.into());
-        self.mutation_high_water_mark = current_high_water_mark;
-    }
-
-    fn checkpoint_rebuild(&mut self, checkpoint_high_water_mark: u64) {
-        if self.state == ListIndexLifecycleState::Rebuilding && self.staging_generation.is_some() {
-            self.checkpoint_high_water_mark = checkpoint_high_water_mark;
-        }
-    }
-
-    fn publish_rebuild(&mut self) -> bool {
-        let Some(generation) = self.staging_generation.take() else {
-            return false;
-        };
-
-        self.active_generation = Some(generation);
-        self.state = ListIndexLifecycleState::Healthy;
-        self.mutation_high_water_mark = self.checkpoint_high_water_mark;
-        true
-    }
-
-    fn observe_mutation_high_water_mark(&mut self, mutation_high_water_mark: u64) {
-        self.mutation_high_water_mark = self.mutation_high_water_mark.max(mutation_high_water_mark);
-        if matches!(self.state, ListIndexLifecycleState::Healthy | ListIndexLifecycleState::Lagging)
-            && self.mutation_lag() > self.max_allowed_lag
-        {
-            self.state = ListIndexLifecycleState::Lagging;
-        }
-    }
-
-    fn mark_degraded(&mut self) {
-        self.state = ListIndexLifecycleState::Degraded;
-    }
-
-    fn mutation_lag(&self) -> u64 {
-        self.mutation_high_water_mark.saturating_sub(self.checkpoint_high_water_mark)
-    }
-
-    fn health_snapshot(&self) -> ListIndexHealthSnapshot {
-        ListIndexHealthSnapshot {
-            state: self.state,
-            active_generation: self.active_generation.clone(),
-            staging_generation: self.staging_generation.clone(),
-            checkpoint_high_water_mark: self.checkpoint_high_water_mark,
-            mutation_high_water_mark: self.mutation_high_water_mark,
-            mutation_lag: self.mutation_lag(),
-            fallback_reason: self.state.fallback_reason(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2098,83 +624,6 @@ fn list_objects_quorum_from_env() -> String {
     normalize_list_quorum(&value).to_owned()
 }
 
-fn list_objects_index_mode_from_env() -> Option<ListSourceMode> {
-    let value = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_INDEX_MODE, "");
-    let value = value.trim();
-    if value.eq_ignore_ascii_case(LIST_CURSOR_SOURCE_INDEX_KEY_ONLY) || value.eq_ignore_ascii_case("key_only") {
-        Some(ListSourceMode::IndexKeyOnly)
-    } else if value.eq_ignore_ascii_case(LIST_CURSOR_SOURCE_INDEX_VERIFIED_PAGE) || value.eq_ignore_ascii_case("verified_page") {
-        Some(ListSourceMode::IndexVerifiedPage)
-    } else if value.eq_ignore_ascii_case(LIST_CURSOR_SOURCE_INDEX_METADATA_FAST) || value.eq_ignore_ascii_case("metadata_fast") {
-        Some(ListSourceMode::IndexMetadataFast)
-    } else {
-        None
-    }
-}
-
-fn list_objects_metadata_fast_guardrails_from_env() -> Option<u64> {
-    let enabled = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, "");
-    let enabled = enabled.trim();
-    if !(enabled == "1"
-        || enabled.eq_ignore_ascii_case("true")
-        || enabled.eq_ignore_ascii_case("yes")
-        || enabled.eq_ignore_ascii_case("on"))
-    {
-        return None;
-    }
-
-    let staleness = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, "");
-    let staleness_ms = staleness.trim().parse::<u64>().ok()?;
-    (1..=MAX_LIST_OBJECTS_METADATA_FAST_STALENESS_MS)
-        .contains(&staleness_ms)
-        .then_some(staleness_ms)
-}
-
-fn list_objects_index_provider_from_env() -> Option<ListObjectsIndexProviderKind> {
-    let value = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_INDEX_PROVIDER, "");
-    let value = value.trim();
-    if value.eq_ignore_ascii_case(LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY) {
-        Some(ListObjectsIndexProviderKind::WalkerKeyOnly)
-    } else if value.eq_ignore_ascii_case(LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY)
-        || value.eq_ignore_ascii_case("persisted_key_only")
-    {
-        Some(ListObjectsIndexProviderKind::PersistentKeyOnly)
-    } else {
-        None
-    }
-}
-
-fn list_objects_index_provider_path_from_env() -> Option<PathBuf> {
-    let value = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, "");
-    let value = value.trim();
-    if value.is_empty() { None } else { Some(PathBuf::from(value)) }
-}
-
-fn is_valid_list_objects_index_generation(value: &str) -> bool {
-    let value = value.trim();
-    !value.is_empty() && !value.contains([',', ':', '[', ']'])
-}
-
-fn list_objects_index_provider_generation_from_env() -> Option<String> {
-    let value = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION, "");
-    let value = value.trim();
-    is_valid_list_objects_index_generation(value).then(|| value.to_owned())
-}
-
-fn list_objects_index_provider_state_from_env() -> Option<ListObjectsIndexProviderState> {
-    list_objects_index_provider_from_env().map(|kind| match kind {
-        ListObjectsIndexProviderKind::WalkerKeyOnly => ListObjectsIndexProviderState::walker_key_only(),
-        ListObjectsIndexProviderKind::PersistentKeyOnly => ListObjectsIndexProviderState::persistent_key_only(
-            list_objects_index_provider_path_from_env(),
-            list_objects_index_provider_generation_from_env(),
-        ),
-    })
-}
-
-fn record_list_objects_index_fallback(mode: ListSourceMode, reason: ListIndexFallbackReason) {
-    rustfs_io_metrics::record_list_objects_index_fallback(mode.cursor_value(), reason.metric_label());
-}
-
 fn append_list_cache_id_to_marker(marker: String, cache_id: Option<&str>) -> String {
     let Some(id) = cache_id else {
         return marker;
@@ -2195,8 +644,8 @@ fn append_list_cache_id_to_marker(marker: String, cache_id: Option<&str>) -> Str
 /// `forward_past`), captured before delimiter folding collapses many keys into a
 /// few common prefixes. Used as a continuation marker so a fully re-folded page
 /// can still advance past its scan window (ECA-03 / #944).
-fn last_scanned_entry_name(entries: Option<&MetaCacheEntriesSorted>) -> Option<String> {
-    entries.and_then(|entries| entries.entries().last().map(|entry| entry.name.clone()))
+fn last_scanned_entry_name(entries: &MetaCacheEntriesSorted) -> Option<String> {
+    entries.entries().last().map(|entry| entry.name.clone())
 }
 
 fn filter_versions_common_prefixes_after_marker(objects: &mut Vec<ObjectInfo>, delimiter: Option<&str>, marker: Option<&str>) {
@@ -2409,296 +858,6 @@ where
     (objects, prefixes, is_truncated, next_marker, next_version_idmarker)
 }
 
-enum VerifiedIndexVisibleEntry {
-    Object(Box<ObjectInfo>),
-    Prefix(String),
-}
-
-impl VerifiedIndexVisibleEntry {
-    fn marker(&self) -> &str {
-        match self {
-            Self::Object(object) => &object.name,
-            Self::Prefix(prefix) => prefix,
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct VerifiedIndexCandidateStats {
-    candidate_keys: usize,
-    skipped_keys: usize,
-    common_prefixes: usize,
-    live_verify_attempts: usize,
-    live_verify_hits: usize,
-    live_verify_misses: usize,
-}
-
-struct VerifiedIndexCandidateResult {
-    info: ListObjectsInfo,
-    stats: VerifiedIndexCandidateStats,
-}
-
-// Test-only convenience over the live `_with_optional_stats` implementation.
-#[cfg(test)]
-async fn list_objects_from_verified_index_candidates<F, Fut>(
-    prefix: &str,
-    marker: Option<&str>,
-    delimiter: &Option<String>,
-    max_keys: i32,
-    candidate_keys: &[String],
-    live_verify: F,
-) -> Result<ListObjectsInfo>
-where
-    F: FnMut(String) -> Fut,
-    Fut: Future<Output = Result<Option<ObjectInfo>>>,
-{
-    Ok(list_objects_from_verified_index_candidates_with_optional_stats(
-        prefix,
-        marker,
-        delimiter,
-        max_keys,
-        candidate_keys,
-        false,
-        live_verify,
-    )
-    .await?
-    .info)
-}
-
-// Test-only convenience over the live `_with_optional_stats` implementation.
-#[cfg(test)]
-async fn list_objects_from_verified_index_candidates_with_stats<F, Fut>(
-    prefix: &str,
-    marker: Option<&str>,
-    delimiter: &Option<String>,
-    max_keys: i32,
-    candidate_keys: &[String],
-    live_verify: F,
-) -> Result<VerifiedIndexCandidateResult>
-where
-    F: FnMut(String) -> Fut,
-    Fut: Future<Output = Result<Option<ObjectInfo>>>,
-{
-    list_objects_from_verified_index_candidates_with_optional_stats(
-        prefix,
-        marker,
-        delimiter,
-        max_keys,
-        candidate_keys,
-        true,
-        live_verify,
-    )
-    .await
-}
-
-async fn list_objects_from_verified_index_candidates_with_optional_stats<F, Fut>(
-    prefix: &str,
-    marker: Option<&str>,
-    delimiter: &Option<String>,
-    max_keys: i32,
-    candidate_keys: &[String],
-    collect_stats: bool,
-    mut live_verify: F,
-) -> Result<VerifiedIndexCandidateResult>
-where
-    F: FnMut(String) -> Fut,
-    Fut: Future<Output = Result<Option<ObjectInfo>>>,
-{
-    let max_keys = normalize_max_keys(max_keys);
-    let mut stats = if collect_stats {
-        VerifiedIndexCandidateStats {
-            candidate_keys: candidate_keys.len(),
-            ..Default::default()
-        }
-    } else {
-        VerifiedIndexCandidateStats::default()
-    };
-    if max_keys <= 0 {
-        return Ok(VerifiedIndexCandidateResult {
-            info: ListObjectsInfo::default(),
-            stats,
-        });
-    }
-
-    let page_limit = usize::try_from(max_keys_plus_one(max_keys, true)).unwrap_or(usize::MAX);
-    let mut visible_entries = Vec::new();
-    let mut prefix_set = HashSet::new();
-
-    for key in candidate_keys {
-        if marker.is_some_and(|marker| key.as_str() <= marker) || !key.starts_with(prefix) {
-            if collect_stats {
-                stats.skipped_keys += 1;
-            }
-            continue;
-        }
-
-        if let Some(separator) = delimiter
-            && !separator.is_empty()
-        {
-            let suffix = key.trim_start_matches(prefix);
-            if let Some((common_prefix, _)) = suffix.split_once(separator) {
-                let common_prefix = format!("{prefix}{common_prefix}{separator}");
-                if marker.is_some_and(|marker| common_prefix.as_str() <= marker) {
-                    if collect_stats {
-                        stats.skipped_keys += 1;
-                    }
-                    continue;
-                }
-                if prefix_set.insert(common_prefix.clone()) {
-                    if collect_stats {
-                        stats.common_prefixes += 1;
-                    }
-                    visible_entries.push(VerifiedIndexVisibleEntry::Prefix(common_prefix));
-                }
-                if visible_entries.len() >= page_limit {
-                    break;
-                }
-                continue;
-            }
-        }
-
-        if collect_stats {
-            stats.live_verify_attempts += 1;
-        }
-        match live_verify(key.clone()).await? {
-            Some(object) => {
-                if collect_stats {
-                    stats.live_verify_hits += 1;
-                }
-                visible_entries.push(VerifiedIndexVisibleEntry::Object(Box::new(object)));
-                if visible_entries.len() >= page_limit {
-                    break;
-                }
-            }
-            None => {
-                if collect_stats {
-                    stats.live_verify_misses += 1;
-                }
-            }
-        }
-    }
-
-    let max_keys_len = usize::try_from(max_keys).unwrap_or(usize::MAX);
-    let is_truncated = visible_entries.len() > max_keys_len;
-    if is_truncated {
-        visible_entries.truncate(max_keys_len);
-    }
-
-    let next_marker = if is_truncated {
-        visible_entries.last().map(|entry| entry.marker().to_owned())
-    } else {
-        None
-    };
-
-    let mut objects = Vec::new();
-    let mut prefixes = Vec::new();
-    for entry in visible_entries {
-        match entry {
-            VerifiedIndexVisibleEntry::Object(object) => objects.push(*object),
-            VerifiedIndexVisibleEntry::Prefix(prefix) => prefixes.push(prefix),
-        }
-    }
-
-    Ok(VerifiedIndexCandidateResult {
-        info: ListObjectsInfo {
-            is_truncated,
-            next_marker,
-            objects,
-            prefixes,
-        },
-        stats,
-    })
-}
-
-fn list_objects_from_metadata_snapshot_candidates(
-    bucket: &str,
-    prefix: &str,
-    marker: Option<&str>,
-    delimiter: &Option<String>,
-    max_keys: i32,
-    candidate_objects: &[PersistentListMetadataObject],
-) -> VerifiedIndexCandidateResult {
-    let max_keys = normalize_max_keys(max_keys);
-    let mut stats = VerifiedIndexCandidateStats {
-        candidate_keys: candidate_objects.len(),
-        ..Default::default()
-    };
-    if max_keys <= 0 {
-        return VerifiedIndexCandidateResult {
-            info: ListObjectsInfo::default(),
-            stats,
-        };
-    }
-
-    let page_limit = usize::try_from(max_keys_plus_one(max_keys, true)).unwrap_or(usize::MAX);
-    let mut visible_entries = Vec::new();
-    let mut prefix_set = HashSet::new();
-
-    for object in candidate_objects {
-        if marker.is_some_and(|marker| object.name.as_str() <= marker) || !object.name.starts_with(prefix) {
-            stats.skipped_keys += 1;
-            continue;
-        }
-
-        if let Some(separator) = delimiter
-            && !separator.is_empty()
-        {
-            let suffix = object.name.trim_start_matches(prefix);
-            if let Some((common_prefix, _)) = suffix.split_once(separator) {
-                let common_prefix = format!("{prefix}{common_prefix}{separator}");
-                if marker.is_some_and(|marker| common_prefix.as_str() <= marker) {
-                    stats.skipped_keys += 1;
-                    continue;
-                }
-                if prefix_set.insert(common_prefix.clone()) {
-                    stats.common_prefixes += 1;
-                    visible_entries.push(VerifiedIndexVisibleEntry::Prefix(common_prefix));
-                }
-                if visible_entries.len() >= page_limit {
-                    break;
-                }
-                continue;
-            }
-        }
-
-        visible_entries.push(VerifiedIndexVisibleEntry::Object(Box::new(object.to_object_info(bucket))));
-        if visible_entries.len() >= page_limit {
-            break;
-        }
-    }
-
-    let max_keys_len = usize::try_from(max_keys).unwrap_or(usize::MAX);
-    let is_truncated = visible_entries.len() > max_keys_len;
-    if is_truncated {
-        visible_entries.truncate(max_keys_len);
-    }
-
-    let next_marker = if is_truncated {
-        visible_entries.last().map(|entry| entry.marker().to_owned())
-    } else {
-        None
-    };
-
-    let mut objects = Vec::new();
-    let mut prefixes = Vec::new();
-    for entry in visible_entries {
-        match entry {
-            VerifiedIndexVisibleEntry::Object(object) => objects.push(*object),
-            VerifiedIndexVisibleEntry::Prefix(prefix) => prefixes.push(prefix),
-        }
-    }
-
-    VerifiedIndexCandidateResult {
-        info: ListObjectsInfo {
-            is_truncated,
-            next_marker,
-            objects,
-            prefixes,
-        },
-        stats,
-    }
-}
-
 fn list_metadata_resolution_params(
     bucket: String,
     listing_quorum: usize,
@@ -2736,12 +895,6 @@ fn resolve_listing_entries(
     } else {
         entries.resolve(resolver)
     }
-}
-
-enum ListingEntryResolution {
-    Resolved(MetaCacheEntry),
-    NeedsSupplement(MetaCacheEntry, Option<MetaCacheEntry>),
-    Rejected,
 }
 
 #[derive(Clone)]
@@ -2798,7 +951,7 @@ struct ListingSupplement {
     options: ListingSupplementOptions,
     fallback_disks: Arc<Vec<DiskStore>>,
     claim_tracker: FallbackClaimTracker,
-    entries: Option<Arc<OnceCell<FallbackListingEntries>>>,
+    entries: Option<OnceCell<FallbackListingEntries>>,
     reconciler: Option<ListingReconciler>,
 }
 
@@ -2834,8 +987,8 @@ impl ListingSupplement {
         claim_tracker: FallbackClaimTracker,
         reconciler: Option<ListingReconciler>,
     ) -> Arc<Self> {
-        let entries: Option<Arc<OnceCell<FallbackListingEntries>>> = if options.per_disk_limit > 0 {
-            Some(Arc::new(OnceCell::new()))
+        let entries = if options.per_disk_limit > 0 && !fallback_disks.is_empty() {
+            Some(OnceCell::new())
         } else {
             None
         };
@@ -3070,46 +1223,6 @@ async fn read_fallback_object_disk(
     }
 }
 
-fn version_requires_supplement(
-    version_required_quorum: usize,
-    reader_disks: usize,
-    selected_object_versions: usize,
-    requested_versions: usize,
-) -> bool {
-    reader_disks < version_required_quorum && (requested_versions == 0 || selected_object_versions < requested_versions)
-}
-
-fn cached_entry_needs_supplement(
-    cached: &FileMeta,
-    reader_disks: usize,
-    resolver: &MetadataResolutionParams,
-    enforce_write_quorum: bool,
-) -> bool {
-    if !enforce_write_quorum {
-        return false;
-    }
-
-    let mut selected_object_versions = 0;
-    for version in cached.versions.iter() {
-        let required_quorum = version
-            .write_quorum(resolver.obj_quorum)
-            .saturating_sub(resolver.write_quorum_slack)
-            .max(resolver.obj_quorum);
-        if version_requires_supplement(required_quorum, reader_disks, selected_object_versions, resolver.requested_versions) {
-            return true;
-        }
-
-        if !version.header.free_version() {
-            selected_object_versions += 1;
-        }
-        if resolver.requested_versions > 0 && selected_object_versions == resolver.requested_versions {
-            break;
-        }
-    }
-
-    false
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum ListingSupplementTarget {
     Directory(String),
@@ -3168,20 +1281,22 @@ fn listing_entries_supplement_target(
                     .is_some_and(|candidate| candidate.name == entry.name && candidate.is_object())
             })
             .count();
-        let entries_disagree = entries.0.iter().flatten().any(|candidate| {
-            candidate.name == entry.name && candidate.is_object() && !entry.matches(Some(candidate), resolver.strict).1
-        });
+        let entries_disagree = !entry.headers_agree(
+            entries
+                .0
+                .iter()
+                .flatten()
+                .filter(|candidate| candidate.name == entry.name && candidate.is_object()),
+            resolver.strict,
+        );
         // A split primary sample can fall back to an older version even when a
         // newer version reaches write quorum only after the fallback disks join.
         if entries_disagree {
             return Some(ListingSupplementTarget::Object(entry.name.clone()));
         }
 
-        let mut entry = entry.clone();
-        if let Ok(cached) = entry.xl_meta()
-            && cached_entry_needs_supplement(&cached, reader_disks, resolver, enforce_write_quorum)
-        {
-            return Some(ListingSupplementTarget::Object(entry.name));
+        if entry.needs_quorum_supplement(reader_disks, resolver).unwrap_or(false) {
+            return Some(ListingSupplementTarget::Object(entry.name.clone()));
         }
     }
 
@@ -3215,173 +1330,35 @@ async fn resolve_agreed_listing_entry_with_supplement(
     entry: MetaCacheEntry,
     reader_disks: usize,
     resolver: MetadataResolutionParams,
-    enforce_write_quorum: bool,
     supplement: Arc<ListingSupplement>,
-) -> Option<MetaCacheEntry> {
-    if supplement.is_empty() {
-        return None;
+) -> std::result::Result<Option<MetaCacheEntry>, DiskError> {
+    let fallback = supplement.entries_for(&entry.name).await;
+    let mut candidates = Vec::with_capacity(reader_disks + fallback.len());
+    candidates.resize(reader_disks, Some(&entry));
+    candidates.extend(fallback.iter().map(Option::as_ref));
+    if let Some(resolved) = MetaCacheEntries::resolve_borrowed_with_write_quorum(&candidates, resolver.clone()) {
+        return Ok(Some(resolved));
     }
-
-    let mut candidates = Vec::with_capacity(reader_disks);
-    candidates.resize(reader_disks, Some(entry.clone()));
-    candidates.extend(supplement.entries_for(&entry.name).await);
-    resolve_listing_entries(MetaCacheEntries(candidates), resolver, enforce_write_quorum)
-}
-
-fn listing_entry_with_selected_versions(
-    mut entry: MetaCacheEntry,
-    meta_ver: u8,
-    data: rustfs_filemeta::InlineData,
-    selected_versions: Vec<FileMetaShallowVersion>,
-) -> Option<MetaCacheEntry> {
-    let merged_cached = FileMeta {
-        meta_ver,
-        data,
-        versions: selected_versions,
-    };
-    let metadata = merged_cached.marshal_msg().ok()?;
-
-    entry.metadata = metadata;
-    entry.cached = Some(merged_cached);
-    Some(entry)
-}
-
-fn resolve_agreed_listing_entry(
-    mut entry: MetaCacheEntry,
-    reader_disks: usize,
-    resolver: MetadataResolutionParams,
-    enforce_write_quorum: bool,
-) -> ListingEntryResolution {
-    if !enforce_write_quorum {
-        return ListingEntryResolution::Resolved(entry);
-    }
-
     if entry.is_dir() {
-        return if reader_disks >= resolver.dir_quorum {
-            ListingEntryResolution::Resolved(entry)
-        } else {
-            ListingEntryResolution::Rejected
-        };
+        return Ok(None);
     }
-
-    if reader_disks < resolver.obj_quorum {
-        return ListingEntryResolution::Rejected;
-    }
-
-    let cached = match entry.xl_meta_ref() {
-        Ok(cached) => cached,
-        Err(_) if resolver.obj_quorum <= 1 => return ListingEntryResolution::Resolved(entry),
-        Err(_) => return ListingEntryResolution::Rejected,
-    };
-    if resolver.requested_versions == 1
-        && let Some(first) = cached.versions.first()
-        && !first.header.free_version()
-        && reader_disks
-            >= first
-                .write_quorum(resolver.obj_quorum)
-                .saturating_sub(resolver.write_quorum_slack)
-                .max(resolver.obj_quorum)
-    {
-        return ListingEntryResolution::Resolved(entry);
-    }
-    let cached = cached.clone();
-    let mut selected_versions = Vec::new();
-    let mut selected_object_versions = 0;
-    let mut first_selected_idx = None;
-    let mut needs_supplement = false;
-
-    for (idx, version) in cached.versions.iter().enumerate() {
-        let required_quorum = version
-            .write_quorum(resolver.obj_quorum)
-            .saturating_sub(resolver.write_quorum_slack)
-            .max(resolver.obj_quorum);
-        if reader_disks < required_quorum {
-            needs_supplement |=
-                version_requires_supplement(required_quorum, reader_disks, selected_object_versions, resolver.requested_versions);
-            continue;
-        }
-
-        if first_selected_idx.is_none() {
-            first_selected_idx = Some(idx);
-        }
-        if !version.header.free_version() {
-            selected_object_versions += 1;
-        }
-        selected_versions.push(version.clone());
-
-        if resolver.requested_versions > 0 && selected_object_versions == resolver.requested_versions {
-            break;
-        }
-    }
-
-    if needs_supplement {
-        let fallback = if selected_versions.is_empty() {
-            None
-        } else if selected_versions.len() == cached.versions.len() {
-            Some(entry.clone())
-        } else {
-            listing_entry_with_selected_versions(entry.clone(), cached.meta_ver, cached.data, selected_versions)
-        };
-        return ListingEntryResolution::NeedsSupplement(entry, fallback);
-    }
-
-    if selected_versions.is_empty() {
-        return ListingEntryResolution::Rejected;
-    }
-
-    let selected_latest = first_selected_idx == Some(0)
-        && resolver.requested_versions == 1
-        && selected_versions
-            .first()
-            .is_some_and(|version| !version.header.free_version());
-    if selected_latest || selected_versions.len() == cached.versions.len() {
-        return ListingEntryResolution::Resolved(entry);
-    }
-
-    listing_entry_with_selected_versions(entry, cached.meta_ver, cached.data, selected_versions)
-        .map(ListingEntryResolution::Resolved)
-        .unwrap_or(ListingEntryResolution::Rejected)
+    supplement.reconcile_object(&entry.name, resolver, true).await
 }
 
+/// The walk must discover every supported payload layout, including objects
+/// written before a storage-class change. Per-version checks enforce the actual
+/// data/write quorum; the topology default cannot stand in for object metadata.
 fn latest_listing_object_quorum(
     listing_quorum: usize,
     drive_count: usize,
-    parity_count: usize,
-    enforce_write_quorum: bool,
-    unreachable_disks: usize,
-) -> usize {
-    latest_listing_required_object_quorum(listing_quorum, drive_count, parity_count, enforce_write_quorum, unreachable_disks)
-}
-
-/// Object quorum a listed "latest" version must reach among the drives the
-/// listing can actually consult.
-///
-/// An object legally committed at write quorum can have up to
-/// `unreachable_disks` of its metadata copies on drives that are offline for
-/// this listing, so the write-quorum requirement is relaxed by that amount.
-/// The result is floored at the erasure read quorum (data drives): below that
-/// the object could not be read back either, and a quorum-deleted object
-/// leaves at most `drive_count - write_quorum < read_quorum` stale copies, so
-/// the floor also keeps deleted objects from resurfacing.
-///
-/// Trade-off: while a drive is offline, a torn overwrite that reached only
-/// `write_quorum - 1` drives becomes indistinguishable from a committed write
-/// whose missing copy sits on the offline drive, so it can be listed as
-/// latest. GET at read quorum serves that same version in that state, so the
-/// listing stays consistent with reads instead of hiding readable objects.
-fn latest_listing_required_object_quorum(
-    listing_quorum: usize,
-    drive_count: usize,
-    parity_count: usize,
     enforce_write_quorum: bool,
     unreachable_disks: usize,
 ) -> usize {
     if !enforce_write_quorum {
         return listing_quorum;
     }
-
-    let read_quorum = drive_count.saturating_sub(parity_count);
-    write_quorum_for_drive_count(drive_count, parity_count)
+    let read_quorum = drive_count.div_ceil(2);
+    write_quorum_for_drive_count(drive_count, drive_count / 2)
         .saturating_sub(unreachable_disks)
         .max(read_quorum)
         .max(listing_quorum)
@@ -3426,6 +1403,21 @@ fn clamp_ask_disks_to_available(ask_disks: i32, available_disks: usize) -> i32 {
     ask_disks.min(bounded_usize_to_i32(available_disks))
 }
 
+// Keep the usual payload layout on the primary readers without making that
+// layout a visibility requirement for older or differently configured objects.
+fn preferred_listing_quorum(
+    metadata_quorum: usize,
+    drive_count: usize,
+    parity_count: usize,
+    enforce_write_quorum: bool,
+) -> usize {
+    if enforce_write_quorum {
+        metadata_quorum.max(write_quorum_for_drive_count(drive_count, parity_count))
+    } else {
+        metadata_quorum
+    }
+}
+
 fn expand_ask_disks_for_object_quorum(ask_disks: i32, available_disks: usize, object_quorum: usize) -> i32 {
     let Some(asked_disks) = positive_ask_disks(ask_disks) else {
         return ask_disks;
@@ -3452,7 +1444,7 @@ fn parse_version_marker(marker: String) -> Result<VersionMarker> {
 }
 
 fn version_marker_for_entries(
-    entries: Option<&MetaCacheEntriesSorted>,
+    entries: &MetaCacheEntriesSorted,
     key_marker: Option<&str>,
     version_marker: Option<VersionMarker>,
 ) -> Option<VersionMarker> {
@@ -3462,8 +1454,9 @@ fn version_marker_for_entries(
     };
 
     entries
-        .and_then(|entries| entries.entries().first().map(|entry| entry.name.as_str() == key_marker))
-        .unwrap_or_default()
+        .entries()
+        .first()
+        .is_some_and(|entry| entry.name.as_str() == key_marker)
         .then_some(marker)
 }
 
@@ -3531,556 +1524,6 @@ impl ListPathOptions {
 }
 
 impl ECStore {
-    async fn collect_persistent_key_only_index_objects(
-        self: Arc<Self>,
-        opts: &ListPathOptions,
-    ) -> Result<Vec<PersistentListMetadataObject>> {
-        let mut marker = None;
-        let mut objects = Vec::new();
-
-        loop {
-            let previous_marker = marker.clone();
-            let page_opts = ListPathOptions {
-                bucket: opts.bucket.clone(),
-                prefix: String::new(),
-                marker: marker.clone(),
-                separator: None,
-                limit: max_keys_plus_one(MAX_OBJECT_LIST, true),
-                ask_disks: list_objects_quorum_from_env(),
-                incl_deleted: false,
-                cursor_source: Some(ListSourceMode::Walker),
-                cursor_generation: Some(LIST_CURSOR_GENERATION_LIVE.to_owned()),
-                ..Default::default()
-            };
-            let mut list_result = self
-                .clone()
-                .list_path(&page_opts)
-                .await
-                .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                    err: Some(to_filemeta_err(err)),
-                    ..Default::default()
-                });
-            let reached_end = match list_result.err.take() {
-                Some(rustfs_filemeta::Error::Unexpected) => true,
-                Some(err) => return Err(Error::from(err)),
-                None => false,
-            };
-
-            if let Some(result) = list_result.entries.as_mut() {
-                result.forward_past(marker.clone());
-            }
-
-            let page_keys = list_result
-                .entries
-                .as_ref()
-                .map(|entries| {
-                    entries
-                        .entries()
-                        .into_iter()
-                        .map(|entry| entry.name.clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-
-            if page_keys.is_empty() {
-                break;
-            }
-            if let Some(entries) = list_result.entries.as_ref() {
-                let page_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(entries, &opts.bucket, "", None).await;
-                objects.extend(page_objects.iter().map(PersistentListMetadataObject::from_object_info));
-            }
-
-            marker = page_keys.last().cloned();
-            if marker == previous_marker {
-                return Err(Error::other("persistent key-only index rebuild marker did not advance"));
-            }
-
-            if reached_end {
-                break;
-            }
-        }
-
-        Ok(objects)
-    }
-
-    async fn rebuild_persistent_key_only_index(
-        self: Arc<Self>,
-        opts: &ListPathOptions,
-        path: &Path,
-        configured_generation: Option<&str>,
-    ) -> Result<Arc<PersistentKeyOnlyIndex>> {
-        let generation = generated_persistent_key_only_generation(configured_generation);
-        const MAX_REBUILD_ATTEMPTS: usize = 3;
-
-        for attempt in 1..=MAX_REBUILD_ATTEMPTS {
-            let start_sequence = current_list_objects_mutation_snapshot(Some(self.as_ref()), &opts.bucket).await;
-            if start_sequence.degraded {
-                return Err(Error::other("list objects namespace mutation journal is degraded"));
-            }
-            let objects = self.clone().collect_persistent_key_only_index_objects(opts).await?;
-            let keys = objects.iter().map(|object| object.name.clone()).collect::<Vec<_>>();
-            let end_sequence = current_list_objects_mutation_snapshot(Some(self.as_ref()), &opts.bucket).await;
-            if end_sequence.degraded {
-                return Err(Error::other("list objects namespace mutation journal is degraded"));
-            }
-            if start_sequence.high_water_mark == end_sequence.high_water_mark {
-                write_persistent_key_only_index_with_metadata(
-                    Some(self.as_ref()),
-                    path,
-                    &opts.bucket,
-                    &generation,
-                    end_sequence.high_water_mark,
-                    &keys,
-                    &objects,
-                )
-                .await?;
-                return load_persistent_key_only_index(Some(self.as_ref()), path).await;
-            }
-
-            debug!(
-                bucket = %opts.bucket,
-                attempt,
-                start_sequence = start_sequence.high_water_mark,
-                end_sequence = end_sequence.high_water_mark,
-                "persistent key-only index rebuild raced with object mutations"
-            );
-        }
-
-        Err(Error::other(
-            "persistent key-only index rebuild could not reach a stable mutation checkpoint",
-        ))
-    }
-
-    async fn prepare_persistent_key_only_index(
-        self: Arc<Self>,
-        opts: &ListPathOptions,
-        provider_state: &ListObjectsIndexProviderState,
-    ) -> Result<Arc<PersistentKeyOnlyIndex>> {
-        let Some(path) = provider_state.persistent_path.as_ref() else {
-            return Err(Error::other("persistent key-only provider path is not configured"));
-        };
-
-        match load_persistent_key_only_index(Some(self.as_ref()), path).await {
-            Ok(index) if persistent_key_only_index_matches_provider(&index, &opts.bucket, provider_state) => {
-                let current_sequence = current_list_objects_mutation_snapshot(Some(self.as_ref()), &opts.bucket).await;
-                if !current_sequence.degraded && current_sequence.high_water_mark <= index.checkpoint_high_water_mark {
-                    Ok(index)
-                } else {
-                    self.rebuild_persistent_key_only_index(opts, path, provider_state.persistent_generation.as_deref())
-                        .await
-                }
-            }
-            Ok(_) => {
-                self.rebuild_persistent_key_only_index(opts, path, provider_state.persistent_generation.as_deref())
-                    .await
-            }
-            Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
-                self.rebuild_persistent_key_only_index(opts, path, provider_state.persistent_generation.as_deref())
-                    .await
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    async fn list_objects_from_metadata_fast_provider(
-        self: Arc<Self>,
-        provider_opts: &ListPathOptions,
-        provider_state: &ListObjectsIndexProviderState,
-        provider_label: &'static str,
-        max_keys: i32,
-        list_metrics_enabled: bool,
-    ) -> Result<Option<ListObjectsInfo>> {
-        let staleness_ms = match list_objects_metadata_fast_guardrails_from_env() {
-            Some(staleness_ms) => staleness_ms,
-            None => {
-                if list_metrics_enabled {
-                    record_list_objects_index_fallback(ListSourceMode::IndexMetadataFast, ListIndexFallbackReason::Disabled);
-                }
-                return Ok(None);
-            }
-        };
-
-        if provider_state.kind != ListObjectsIndexProviderKind::PersistentKeyOnly {
-            if list_metrics_enabled {
-                record_list_objects_index_fallback(
-                    ListSourceMode::IndexMetadataFast,
-                    ListIndexFallbackReason::UnsupportedRequest,
-                );
-            }
-            return Ok(None);
-        }
-
-        let Some(path) = provider_state.persistent_path.as_ref() else {
-            if list_metrics_enabled {
-                record_list_objects_index_fallback(ListSourceMode::IndexMetadataFast, ListIndexFallbackReason::Degraded);
-            }
-            return Ok(None);
-        };
-
-        let index = match self
-            .clone()
-            .prepare_persistent_key_only_index(provider_opts, provider_state)
-            .await
-        {
-            Ok(index) => index,
-            Err(err) => {
-                if list_metrics_enabled {
-                    record_list_objects_index_fallback(ListSourceMode::IndexMetadataFast, ListIndexFallbackReason::Unhealthy);
-                }
-                debug!(
-                    bucket = %provider_opts.bucket,
-                    prefix = %provider_opts.prefix,
-                    source = ListSourceMode::IndexMetadataFast.cursor_value(),
-                    provider = provider_state.kind.metric_label(),
-                    path = %path.display(),
-                    error = %err,
-                    "list_objects metadata-fast provider failed to prepare snapshot"
-                );
-                return Ok(None);
-            }
-        };
-
-        if !persistent_key_only_index_has_complete_metadata_snapshot(&index) {
-            if list_metrics_enabled {
-                record_list_objects_index_fallback(
-                    ListSourceMode::IndexMetadataFast,
-                    ListIndexFallbackReason::MetadataFastUnavailable,
-                );
-            }
-            debug!(
-                bucket = %provider_opts.bucket,
-                prefix = %provider_opts.prefix,
-                source = ListSourceMode::IndexMetadataFast.cursor_value(),
-                provider = provider_state.kind.metric_label(),
-                indexed_keys = index.keys.len(),
-                snapshot_objects = index.objects.len(),
-                "list_objects metadata-fast provider has no complete metadata snapshot"
-            );
-            return Ok(None);
-        }
-
-        maybe_apply_system_namespace_mutation_journal_chaos(
-            self.as_ref(),
-            &provider_opts.bucket,
-            index.checkpoint_high_water_mark,
-        )
-        .await;
-
-        let current_sequence = current_list_objects_mutation_snapshot(Some(self.as_ref()), &provider_opts.bucket).await;
-        let health = persistent_key_only_index_health(&index, current_sequence);
-        match select_list_index_provider_source_mode(provider_opts, ListSourceMode::IndexMetadataFast, &health) {
-            ListIndexSourceDecision::FallbackToWalker(reason) => {
-                if list_metrics_enabled {
-                    record_list_objects_index_fallback(ListSourceMode::IndexMetadataFast, reason);
-                }
-                debug!(
-                    bucket = %provider_opts.bucket,
-                    prefix = %provider_opts.prefix,
-                    source = ListSourceMode::IndexMetadataFast.cursor_value(),
-                    provider = provider_state.kind.metric_label(),
-                    staleness_ms,
-                    reason = reason.metric_label(),
-                    "list_objects metadata-fast provider fell back to walker"
-                );
-                return Ok(None);
-            }
-            ListIndexSourceDecision::UseIndex(_) => {}
-        }
-
-        let verified = list_objects_from_metadata_snapshot_candidates(
-            &provider_opts.bucket,
-            &provider_opts.prefix,
-            provider_opts.marker.as_deref(),
-            &provider_opts.separator,
-            max_keys,
-            index.objects.as_slice(),
-        );
-        let stats = verified.stats;
-        let mut result = verified.info;
-
-        if list_metrics_enabled {
-            rustfs_io_metrics::record_list_objects_index_served(ListObjectsIndexPageObservation {
-                source: ListSourceMode::IndexMetadataFast.cursor_value(),
-                provider: provider_label,
-                candidate_keys: stats.candidate_keys,
-                live_verify_attempts: 0,
-                live_verify_hits: 0,
-                live_verify_misses: 0,
-                returned_objects: result.objects.len(),
-                returned_prefixes: result.prefixes.len(),
-                is_truncated: result.is_truncated,
-            });
-        }
-
-        if let Some(next_marker) = result.next_marker.take() {
-            result.next_marker = Some(
-                ListContinuationV2 {
-                    version: MARKER_TAG_VERSION,
-                    id: None,
-                    pool_idx: None,
-                    set_idx: None,
-                    source: Some(ListSourceMode::IndexMetadataFast),
-                    generation: health.active_generation,
-                }
-                .encode_marker(&next_marker),
-            );
-        }
-
-        Ok(Some(result))
-    }
-
-    async fn list_objects_from_opt_in_key_only_provider(
-        self: Arc<Self>,
-        opts: &ListPathOptions,
-        mode: ListSourceMode,
-        max_keys: i32,
-        incl_deleted: bool,
-    ) -> Result<Option<ListObjectsInfo>> {
-        let list_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
-        let provider_state = list_objects_index_provider_state_from_env();
-        let provider = provider_state.as_ref().map(|state| state.kind);
-        let provider_label = if list_metrics_enabled {
-            list_objects_index_provider_metric_label(provider)
-        } else {
-            "none"
-        };
-        if list_metrics_enabled {
-            rustfs_io_metrics::record_list_objects_index_attempt(
-                mode.cursor_value(),
-                provider_label,
-                !opts.prefix.is_empty(),
-                opts.separator.as_ref().is_some_and(|separator| !separator.is_empty()),
-                opts.marker.is_some(),
-            );
-        }
-
-        if incl_deleted
-            || (mode != ListSourceMode::IndexMetadataFast
-                && (!mode.can_satisfy_strong_listing() || !mode.requires_live_metadata_verification()))
-        {
-            if list_metrics_enabled {
-                record_list_objects_index_fallback(mode, ListIndexFallbackReason::UnsupportedRequest);
-            }
-            return Ok(None);
-        }
-
-        if is_reserved_or_invalid_bucket(&opts.bucket, false) {
-            if list_metrics_enabled {
-                record_list_objects_index_fallback(mode, ListIndexFallbackReason::UnsupportedRequest);
-            }
-            return Ok(None);
-        }
-
-        let Some(provider_state) = provider_state else {
-            if list_metrics_enabled {
-                record_list_objects_index_fallback(mode, ListIndexFallbackReason::Disabled);
-            }
-            return Ok(None);
-        };
-
-        let mut provider_opts = opts.clone();
-        provider_opts.parse_marker();
-
-        if mode == ListSourceMode::IndexMetadataFast {
-            return self
-                .list_objects_from_metadata_fast_provider(
-                    &provider_opts,
-                    &provider_state,
-                    provider_label,
-                    max_keys,
-                    list_metrics_enabled,
-                )
-                .await;
-        }
-
-        let (candidate_keys, health) = match provider_state.kind {
-            ListObjectsIndexProviderKind::WalkerKeyOnly => {
-                let health = provider_state.health_snapshot();
-                match select_list_index_provider_source_mode(&provider_opts, mode, &health) {
-                    ListIndexSourceDecision::FallbackToWalker(reason) => {
-                        if list_metrics_enabled {
-                            record_list_objects_index_fallback(mode, reason);
-                        }
-                        debug!(
-                            bucket = %opts.bucket,
-                            prefix = %opts.prefix,
-                            source = mode.cursor_value(),
-                            reason = reason.metric_label(),
-                            "list_objects opt-in index path fell back to walker"
-                        );
-                        return Ok(None);
-                    }
-                    ListIndexSourceDecision::UseIndex(_) => {}
-                }
-                provider_opts.cursor_source = Some(mode);
-                provider_opts.cursor_generation = health.active_generation.clone();
-
-                let mut list_result =
-                    self.clone()
-                        .list_path(&provider_opts)
-                        .await
-                        .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                            err: Some(to_filemeta_err(err)),
-                            ..Default::default()
-                        });
-
-                if let Some(err) = list_result.err.take()
-                    && err != rustfs_filemeta::Error::Unexpected
-                {
-                    if list_metrics_enabled {
-                        record_list_objects_index_fallback(mode, ListIndexFallbackReason::Unhealthy);
-                    }
-                    return Ok(None);
-                }
-
-                if let Some(result) = list_result.entries.as_mut() {
-                    result.forward_past(provider_opts.marker.clone());
-                }
-
-                let candidate_keys = Arc::new(
-                    list_result
-                        .entries
-                        .as_ref()
-                        .map(|entries| {
-                            entries
-                                .entries()
-                                .into_iter()
-                                .map(|entry| entry.name.clone())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default(),
-                );
-                (candidate_keys, health)
-            }
-            ListObjectsIndexProviderKind::PersistentKeyOnly => {
-                let Some(path) = provider_state.persistent_path.as_ref() else {
-                    if list_metrics_enabled {
-                        record_list_objects_index_fallback(mode, ListIndexFallbackReason::Degraded);
-                    }
-                    return Ok(None);
-                };
-                match self
-                    .clone()
-                    .prepare_persistent_key_only_index(&provider_opts, &provider_state)
-                    .await
-                {
-                    Ok(index) => {
-                        let current_sequence =
-                            current_list_objects_mutation_snapshot(Some(self.as_ref()), &provider_opts.bucket).await;
-                        let health = persistent_key_only_index_health(&index, current_sequence);
-                        match select_list_index_provider_source_mode(&provider_opts, mode, &health) {
-                            ListIndexSourceDecision::FallbackToWalker(reason) => {
-                                if list_metrics_enabled {
-                                    record_list_objects_index_fallback(mode, reason);
-                                }
-                                debug!(
-                                    bucket = %opts.bucket,
-                                    prefix = %opts.prefix,
-                                    source = mode.cursor_value(),
-                                    provider = provider_state.kind.metric_label(),
-                                    reason = reason.metric_label(),
-                                    "list_objects persistent key-only provider fell back to walker"
-                                );
-                                return Ok(None);
-                            }
-                            ListIndexSourceDecision::UseIndex(_) => {}
-                        }
-                        provider_opts.cursor_source = Some(mode);
-                        provider_opts.cursor_generation = health.active_generation.clone();
-                        (index.keys.clone(), health)
-                    }
-                    Err(err) => {
-                        if list_metrics_enabled {
-                            record_list_objects_index_fallback(mode, ListIndexFallbackReason::Unhealthy);
-                        }
-                        debug!(
-                            bucket = %opts.bucket,
-                            prefix = %opts.prefix,
-                            source = mode.cursor_value(),
-                            provider = provider_state.kind.metric_label(),
-                            path = %path.display(),
-                            error = %err,
-                            "list_objects persistent key-only provider failed to load candidates"
-                        );
-                        return Ok(None);
-                    }
-                }
-            }
-        };
-
-        let bucket = provider_opts.bucket.clone();
-        let verified = list_objects_from_verified_index_candidates_with_optional_stats(
-            &provider_opts.prefix,
-            provider_opts.marker.as_deref(),
-            &provider_opts.separator,
-            max_keys,
-            candidate_keys.as_slice(),
-            list_metrics_enabled,
-            |key| {
-                let store = self.clone();
-                let bucket = bucket.clone();
-                async move {
-                    match store
-                        .get_object_info(
-                            &bucket,
-                            &key,
-                            &ObjectOptions {
-                                no_lock: true,
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                    {
-                        Ok(object) => Ok(Some(object)),
-                        Err(err) if err.is_not_found() => Ok(None),
-                        Err(err) => {
-                            if list_metrics_enabled {
-                                rustfs_io_metrics::record_list_objects_index_live_verify_failure(
-                                    mode.cursor_value(),
-                                    "read_error",
-                                );
-                            }
-                            Err(err)
-                        }
-                    }
-                }
-            },
-        )
-        .await?;
-        let stats = verified.stats;
-        let mut result = verified.info;
-
-        if list_metrics_enabled {
-            rustfs_io_metrics::record_list_objects_index_served(ListObjectsIndexPageObservation {
-                source: mode.cursor_value(),
-                provider: provider_label,
-                candidate_keys: stats.candidate_keys,
-                live_verify_attempts: stats.live_verify_attempts,
-                live_verify_hits: stats.live_verify_hits,
-                live_verify_misses: stats.live_verify_misses,
-                returned_objects: result.objects.len(),
-                returned_prefixes: result.prefixes.len(),
-                is_truncated: result.is_truncated,
-            });
-        }
-
-        if let Some(next_marker) = result.next_marker.take() {
-            result.next_marker = Some(
-                ListContinuationV2 {
-                    version: MARKER_TAG_VERSION,
-                    id: None,
-                    pool_idx: None,
-                    set_idx: None,
-                    source: Some(mode),
-                    generation: health.active_generation,
-                }
-                .encode_marker(&next_marker),
-            );
-        }
-
-        Ok(Some(result))
-    }
-
     #[allow(clippy::too_many_arguments)]
     // @continuation_token marker
     // @start_after as marker when continuation_token empty
@@ -4151,69 +1594,40 @@ impl ECStore {
         // key sorting between `<marker>` and `<marker>[` is silently skipped on
         // the continuation page (backlog#1047).
         opts.parse_marker();
-        let key_only_result = if let Some(mode) = list_objects_index_mode_from_env() {
-            self.clone()
-                .list_objects_from_opt_in_key_only_provider(&opts, mode, max_keys, incl_deleted)
-                .await?
-        } else {
-            None
-        };
+        let mut page = self
+            .clone()
+            .list_path(&opts)
+            .await
+            .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
+        let next_cache_id = page.entries.list_id.clone();
 
-        let result = if let Some(result) = key_only_result {
-            result
-        } else {
-            let mut list_result = self
-                .clone()
-                .list_path(&opts)
-                .await
-                .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                    err: Some(to_filemeta_err(err)),
-                    ..Default::default()
-                });
-            let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
+        let disk_has_more = !page.exhausted;
 
-            // err=None means gather_results filled its limit → disk has more data
-            let disk_has_more = list_result.err.is_none();
+        page.entries.forward_past(opts.marker.clone());
 
-            if let Some(err) = list_result.err.take()
-                && err != rustfs_filemeta::Error::Unexpected
-            {
-                return Err(to_object_err(err.into(), vec![bucket, prefix]));
-            }
+        // Last RAW scanned key, captured before folding, so `list_objects_paginate`
+        // can advance past a fully-collapsed common-prefix page (ECA-03 / #944).
+        let last_scanned_key = last_scanned_entry_name(&page.entries);
 
-            if let Some(result) = list_result.entries.as_mut() {
-                result.forward_past(opts.marker.clone());
-            }
+        let get_objects =
+            ObjectInfo::from_meta_cache_entries_sorted_infos(&page.entries, bucket, prefix, delimiter.clone()).await;
 
-            // Last RAW scanned key, captured before folding, so `list_objects_paginate`
-            // can advance past a fully-collapsed common-prefix page (ECA-03 / #944).
-            let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+            get_objects,
+            &delimiter,
+            max_keys,
+            disk_has_more,
+            next_cache_id.as_deref(),
+            false,
+            last_scanned_key.as_deref(),
+        );
+        let _ = next_version_idmarker;
 
-            let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
-                &list_result.entries.unwrap_or_default(),
-                bucket,
-                prefix,
-                delimiter.clone(),
-            )
-            .await;
-
-            let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
-                get_objects,
-                &delimiter,
-                max_keys,
-                disk_has_more,
-                next_cache_id.as_deref(),
-                false,
-                last_scanned_key.as_deref(),
-            );
-            let _ = next_version_idmarker;
-
-            ListObjectsInfo {
-                is_truncated,
-                next_marker,
-                objects,
-                prefixes,
-            }
+        let result = ListObjectsInfo {
+            is_truncated,
+            next_marker,
+            objects,
+            prefixes,
         };
 
         let purge_exact_prefix =
@@ -4402,36 +1816,24 @@ impl ECStore {
         // (notably `forward_past`) — see backlog#1047.
         opts.parse_marker();
 
-        let mut list_result = self
+        let mut page = self
             .list_path(&opts)
             .await
-            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(to_filemeta_err(err)),
-                ..Default::default()
-            });
-        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
+            .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
+        let next_cache_id = page.entries.list_id.clone();
 
-        // err=None means gather_results filled its limit → disk has more data
-        let disk_has_more = list_result.err.is_none();
+        let disk_has_more = !page.exhausted;
 
-        if let Some(err) = list_result.err.take()
-            && err != rustfs_filemeta::Error::Unexpected
-        {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
+        if !has_version_marker {
+            page.entries.forward_past(opts.marker.clone());
         }
 
-        if let Some(result) = list_result.entries.as_mut()
-            && !has_version_marker
-        {
-            result.forward_past(opts.marker.clone());
-        }
-
-        let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
+        let version_marker = version_marker_for_entries(&page.entries, opts.marker.as_deref(), version_marker);
 
         // Last RAW scanned key, captured before folding (ECA-03 / #944).
-        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+        let last_scanned_key = last_scanned_entry_name(&page.entries);
 
-        let entries = list_result.entries.unwrap_or_default();
+        let entries = page.entries;
         let get_objects = if include_version_purge {
             ObjectInfo::from_meta_cache_entries_sorted_versions_for_lifecycle(
                 &entries,
@@ -4467,7 +1869,7 @@ impl ECStore {
         })
     }
 
-    pub async fn list_path(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSortedResult> {
+    pub async fn list_path(self: Arc<Self>, o: &ListPathOptions) -> Result<ListPage> {
         // tracing::warn!("list_path opt {:?}", &o);
 
         let list_path_started = std::time::Instant::now();
@@ -4480,19 +1882,17 @@ impl ECStore {
         let mut o = o.clone();
         o.marker = o.marker.filter(|v| v >= &o.prefix);
 
-        if let Some(marker) = &o.marker
-            && !o.prefix.is_empty()
-            && !marker.starts_with(&o.prefix)
-        {
-            return Err(Error::Unexpected);
-        }
-
-        if o.limit == 0 {
-            return Err(Error::Unexpected);
-        }
-
-        if o.prefix.starts_with(SLASH_SEPARATOR) {
-            return Err(Error::Unexpected);
+        // Nothing can match these requests; answer with an exhausted empty
+        // page instead of walking.
+        let marker_outside_prefix = o
+            .marker
+            .as_deref()
+            .is_some_and(|marker| !o.prefix.is_empty() && !marker.starts_with(&o.prefix));
+        if marker_outside_prefix || o.limit == 0 || o.prefix.starts_with(SLASH_SEPARATOR) {
+            return Ok(ListPage {
+                entries: MetaCacheEntriesSorted::default(),
+                exhausted: true,
+            });
         }
 
         let slash_separator = Some(SLASH_SEPARATOR.to_owned());
@@ -4523,36 +1923,25 @@ impl ECStore {
 
         // cancel channel
         let cancel = CancellationToken::new();
-        ensure_producer_limit_state(&mut o);
 
         let (sender, recv) = mpsc::channel(o.limit as usize);
         let store = self.clone();
         let mut opts = o.clone();
         opts.stop_disk_at_limit = true;
         let producer_cancel = cancel.clone();
-        let producer = async move { store.list_merged(producer_cancel, opts, sender).await.map(|_| ()) };
-        let mut result = collect_list_path_results("store", &log_context, cancel, o.clone(), recv, producer).await;
-
-        if result.err.is_some() {
-            log_list_path_finished("store", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
-            return Ok(result);
-        }
-
-        if let Some(entries) = result.entries.as_mut() {
-            entries.reuse = true;
-            let truncated = !entries.entries().is_empty() || result.err.is_none();
-            entries.o.0.truncate(o.limit as usize);
-            if !o.transient && truncated {
-                entries.list_id = if let Some(id) = o.id {
-                    Some(id)
-                } else {
-                    Some(Uuid::new_v4().to_string())
-                }
+        let producer = async move { store.list_merged(producer_cancel, opts, sender).await };
+        let mut page = match collect_list_path_results("store", &log_context, cancel, o.clone(), recv, producer).await {
+            Ok(page) => page,
+            Err(err) => {
+                log_list_path_finished("store", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
+                return Err(err);
             }
+        };
 
-            if !truncated {
-                result.err = Some(rustfs_filemeta::Error::Unexpected);
-            }
+        page.entries.reuse = true;
+        page.entries.o.0.truncate(o.limit as usize);
+        if !o.transient {
+            page.entries.list_id = Some(o.id.unwrap_or_else(|| Uuid::new_v4().to_string()));
         }
 
         rustfs_io_metrics::record_stage_duration(
@@ -4564,15 +1953,11 @@ impl ECStore {
             "store",
             &log_context,
             list_path_started.elapsed().as_secs_f64() * 1000.0,
-            result
-                .entries
-                .as_ref()
-                .map(|entries| entries.entries().len())
-                .unwrap_or_default(),
-            result.err.is_some(),
+            page.entries.entries().len(),
+            false,
         );
 
-        Ok(result)
+        Ok(page)
     }
 
     // Read all
@@ -4581,7 +1966,7 @@ impl ECStore {
         rx: CancellationToken,
         opts: ListPathOptions,
         sender: Sender<MetaCacheEntry>,
-    ) -> Result<Vec<ObjectInfo>> {
+    ) -> Result<ListPathRawOutcome> {
         // warn!("list_merged ops {:?}", &opts);
         let merge_started = std::time::Instant::now();
 
@@ -4614,15 +1999,15 @@ impl ECStore {
         let results = join_all(futures).await;
         merge_task.await.map_err(Error::from)??;
 
-        let mut all_at_eof = true;
-
+        let mut outcome = ListPathRawOutcome::default();
         let mut errs = Vec::new();
         for result in results {
-            if let Err(err) = result {
-                all_at_eof = false;
-                errs.push(Some(err));
-            } else {
-                errs.push(None);
+            match result {
+                Ok(set_outcome) => {
+                    outcome.limit_reached |= set_outcome.limit_reached;
+                    errs.push(None);
+                }
+                Err(err) => errs.push(Some(err)),
             }
         }
 
@@ -4633,23 +2018,12 @@ impl ECStore {
         // VolumeNotFound check caused spurious errors when a pool had not
         // yet created the bucket prefix on every set.
         if is_all_not_found(&errs) {
-            return Ok(Vec::new());
+            return Ok(outcome);
         }
 
-        for err in errs.iter() {
-            if let Some(err) = err {
-                if err == &Error::Unexpected {
-                    continue;
-                }
-
-                return Err(err.clone());
-            } else {
-                all_at_eof = false;
-                continue;
-            }
+        if let Some(err) = errs.iter().flatten().next() {
+            return Err(err.clone());
         }
-
-        // check all_at_eof
 
         rustfs_io_metrics::record_stage_duration(
             "store_list_objects_list_merged",
@@ -4658,14 +2032,12 @@ impl ECStore {
 
         debug!(
             set_pair_count = self.pools.len(),
-            all_at_eof = all_at_eof,
+            limit_reached = outcome.limit_reached,
             error_count = errs.iter().filter(|err| err.is_some()).count(),
             "store list_merged finished"
         );
 
-        _ = all_at_eof;
-
-        Ok(Vec::new())
+        Ok(outcome)
     }
 
     #[allow(unused_assignments)]
@@ -4713,17 +2085,24 @@ impl ECStore {
 
                     let listing_quorum = listing_quorum_from_ask_disks(ask_disks);
                     let enforce_write_quorum = enforce_latest_listing_write_quorum(opts.latest_only, &opts.ask_disks);
-                    let write_quorum_parity = set.default_parity_count;
                     let write_quorum_slack =
                         latest_listing_write_quorum_slack(enforce_write_quorum, set.set_drive_count, online_disks);
-                    let required_obj_quorum = latest_listing_required_object_quorum(
+                    let required_obj_quorum = latest_listing_object_quorum(
                         listing_quorum,
                         set.set_drive_count,
-                        write_quorum_parity,
                         enforce_write_quorum,
                         write_quorum_slack,
                     );
-                    ask_disks = expand_ask_disks_for_object_quorum(ask_disks, disks.len(), required_obj_quorum);
+                    ask_disks = expand_ask_disks_for_object_quorum(
+                        ask_disks,
+                        disks.len(),
+                        preferred_listing_quorum(
+                            required_obj_quorum,
+                            set.set_drive_count,
+                            set.default_parity_count,
+                            enforce_write_quorum,
+                        ),
+                    );
                     let fallback_disks = {
                         if let Some(asked_disks) = positive_ask_disks(ask_disks)
                             && disks.len() > asked_disks
@@ -4739,13 +2118,7 @@ impl ECStore {
                     let disks = Arc::new(disks);
                     let claim_tracker = FallbackClaimTracker::default();
 
-                    let obj_quorum = latest_listing_object_quorum(
-                        listing_quorum,
-                        set.set_drive_count,
-                        write_quorum_parity,
-                        enforce_write_quorum,
-                        write_quorum_slack,
-                    );
+                    let obj_quorum = required_obj_quorum;
                     let raw_min_disks = latest_listing_raw_min_disks(listing_quorum, obj_quorum, enforce_write_quorum);
 
                     let resolver = list_metadata_resolution_params(
@@ -4830,32 +2203,32 @@ impl ECStore {
                                         let entry = match resolve_agreed_listing_entry(
                                             entry,
                                             reader_disks,
-                                            resolver.clone(),
+                                            &resolver,
                                             enforce_write_quorum,
                                         ) {
                                             ListingEntryResolution::Resolved(entry) => entry,
-                                            ListingEntryResolution::NeedsSupplement(entry, fallback) => {
+                                            ListingEntryResolution::NeedsSupplement(entry) => {
                                                 let Some(entry) = resolve_agreed_listing_entry_with_supplement(
                                                     entry,
                                                     reader_disks,
                                                     resolver,
-                                                    enforce_write_quorum,
                                                     supplement,
                                                 )
-                                                .await
-                                                .or(fallback) else {
-                                                    return;
+                                                .await?
+                                                else {
+                                                    return Ok(());
                                                 };
                                                 entry
                                             }
-                                            ListingEntryResolution::Rejected => return,
+                                            ListingEntryResolution::Rejected => return Ok(()),
                                         };
                                         if entry.is_dir() {
-                                            return;
+                                            return Ok(());
                                         }
                                         if let Err(err) = value.send(entry).await {
                                             error!("list_path send fail {:?}", err);
                                         }
+                                        Ok(())
                                     }
                                 })
                             })),
@@ -4890,160 +2263,11 @@ impl ECStore {
             }
         }
 
-        let (merge_tx, mut merge_rx) = mpsc::channel::<MetaCacheEntry>(100);
-
+        let (merge_tx, merge_rx) = mpsc::channel::<MetaCacheEntry>(100);
         let bucket = bucket.to_owned();
-        let bucket_clone = bucket.clone();
-
-        let vcf = match get_versioning_config(&bucket).await {
-            Ok((res, _)) => Some(res),
-            Err(_) => None,
-        };
-
-        tokio::spawn(
-            async move {
-                let mut sent_err = false;
-                while let Some(entry) = merge_rx.recv().await {
-                    if opts.latest_only {
-                        let fi = match entry.to_fileinfo(&bucket_clone) {
-                            Ok(res) => res,
-                            Err(err) => {
-                                if !sent_err {
-                                    let item = ObjectInfoOrErr {
-                                        item: None,
-                                        err: Some(err.into()),
-                                    };
-
-                                    if let Err(err) = result.send(item).await {
-                                        error!("walk result send err {:?}", err);
-                                    }
-
-                                    sent_err = true;
-
-                                    return;
-                                }
-
-                                continue;
-                            }
-                        };
-
-                        if let Some(filter) = opts.filter {
-                            if filter(&fi) {
-                                let item = ObjectInfoOrErr {
-                                    item: Some(ObjectInfo::from_file_info(&fi, &bucket_clone, &fi.name, {
-                                        if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                    })),
-                                    err: None,
-                                };
-
-                                if let Err(err) = result.send(item).await {
-                                    error!("walk result send err {:?}", err);
-                                }
-                            }
-                        } else {
-                            let item = ObjectInfoOrErr {
-                                item: Some(ObjectInfo::from_file_info(&fi, &bucket_clone, &fi.name, {
-                                    if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                })),
-                                err: None,
-                            };
-
-                            if let Err(err) = result.send(item).await {
-                                error!("walk result send err {:?}", err);
-                            }
-                        }
-                        continue;
-                    }
-
-                    let mut fvs = match if opts.include_free_versions {
-                        entry.file_info_versions_with_free_versions(&bucket_clone)
-                    } else {
-                        entry.file_info_versions(&bucket_clone)
-                    } {
-                        Ok(res) => res,
-                        Err(err) => {
-                            let item = ObjectInfoOrErr {
-                                item: None,
-                                err: Some(err.into()),
-                            };
-
-                            if let Err(err) = result.send(item).await {
-                                error!("walk result send err {:?}", err);
-                            }
-                            return;
-                        }
-                    };
-
-                    // `FileMeta` keeps versions newest-first (`sort_by_mod_time`
-                    // sorts descending), so ascending emission is the exact
-                    // reverse. Callers such as replication resync walk with the
-                    // default (ascending) order so that re-applied versions
-                    // preserve the original version-stack order.
-                    if opts.versions_sort == WalkVersionsSortOrder::Ascending {
-                        fvs.versions.reverse();
-                    }
-
-                    for fi in fvs.versions.iter() {
-                        if let Some(filter) = opts.filter {
-                            if filter(fi) {
-                                let item = ObjectInfoOrErr {
-                                    item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                        if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                    })),
-                                    err: None,
-                                };
-
-                                if let Err(err) = result.send(item).await {
-                                    error!("walk result send err {:?}", err);
-                                }
-                            }
-                        } else {
-                            let item = ObjectInfoOrErr {
-                                item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                    if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                })),
-                                err: None,
-                            };
-
-                            if let Err(err) = result.send(item).await {
-                                error!("walk result send err {:?}", err);
-                            }
-                        }
-                    }
-
-                    if opts.include_free_versions {
-                        for fi in fvs.free_versions.iter() {
-                            if let Some(filter) = opts.filter {
-                                if filter(fi) {
-                                    let item = ObjectInfoOrErr {
-                                        item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                            if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                        })),
-                                        err: None,
-                                    };
-
-                                    if let Err(err) = result.send(item).await {
-                                        error!("walk result send err {:?}", err);
-                                    }
-                                }
-                            } else {
-                                let item = ObjectInfoOrErr {
-                                    item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                        if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                    })),
-                                    err: None,
-                                };
-
-                                if let Err(err) = result.send(item).await {
-                                    error!("walk result send err {:?}", err);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
+        // Not awaited: callers may drain `result` only after this returns, so
+        // waiting on the forwarder here could stall them on the channel bound.
+        let _forwarder = spawn_walk_entry_forwarder(rx.clone(), merge_rx, result, opts, bucket.clone());
 
         let merge_task = spawn_listing_merge(rx, inputs, merge_tx);
 
@@ -5053,7 +2277,7 @@ impl ECStore {
         let mut errs = Vec::new();
         for walk_result in walk_results {
             match walk_result {
-                Ok(()) => errs.push(None),
+                Ok(_) => errs.push(None),
                 Err(err) => errs.push(Some(err.into())),
             }
         }
@@ -5077,6 +2301,123 @@ impl ECStore {
     }
 }
 
+/// Forwards merged raw entries to a walk consumer as `ObjectInfoOrErr`,
+/// applying the walk's version projection, sort order and filter. The first
+/// entry that fails to decode ends the stream with that error; a consumer that
+/// stopped reading ends it silently. Either exit cancels the walk's producers.
+fn spawn_walk_entry_forwarder(
+    rx: CancellationToken,
+    mut entries: Receiver<MetaCacheEntry>,
+    result: Sender<ObjectInfoOrErr>,
+    opts: WalkOptions,
+    bucket: String,
+) -> tokio::task::JoinHandle<()> {
+    // Capture before spawning so even an abort before the first poll cancels
+    // the producers. Callers pass a child token to isolate request cancellation.
+    let cancel_on_drop = rx.clone().drop_guard();
+    tokio::spawn(
+        async move {
+            let _cancel_on_drop = cancel_on_drop;
+            let versioning = tokio::select! {
+                _ = rx.cancelled() => return,
+                _ = result.closed() => return,
+                versioning = get_versioning_config(&bucket) => versioning.ok().map(|(config, _)| config),
+            };
+            let to_object_info = |fi: &rustfs_filemeta::FileInfo| {
+                let versioned = versioning.as_ref().is_some_and(|config| config.versioned(&fi.name));
+                ObjectInfo::from_file_info(fi, &bucket, &fi.name, versioned)
+            };
+            let passes_filter = |fi: &rustfs_filemeta::FileInfo| opts.filter.is_none_or(|filter| filter(fi));
+            let decode_failed = |err: rustfs_filemeta::Error| ObjectInfoOrErr {
+                item: None,
+                err: Some(err.into()),
+            };
+
+            loop {
+                let entry = tokio::select! {
+                    _ = rx.cancelled() => return,
+                    _ = result.closed() => return,
+                    entry = entries.recv() => match entry {
+                        Some(entry) => entry,
+                        None => return,
+                    },
+                };
+                if entry.is_dir() {
+                    continue;
+                }
+                if opts.latest_only {
+                    let fi = match entry.to_fileinfo(&bucket) {
+                        Ok(fi) => fi,
+                        Err(err) => {
+                            let _ = send_or_cancel(&rx, &result, decode_failed(err)).await;
+                            return;
+                        }
+                    };
+                    if passes_filter(&fi)
+                        && !matches!(
+                            send_or_cancel(
+                                &rx,
+                                &result,
+                                ObjectInfoOrErr {
+                                    item: Some(to_object_info(&fi)),
+                                    err: None,
+                                }
+                            )
+                            .await,
+                            Ok(true)
+                        )
+                    {
+                        return;
+                    }
+                    continue;
+                }
+
+                let mut versions = match if opts.include_free_versions {
+                    entry.file_info_versions_with_free_versions(&bucket)
+                } else {
+                    entry.file_info_versions(&bucket)
+                } {
+                    Ok(versions) => versions,
+                    Err(err) => {
+                        let _ = send_or_cancel(&rx, &result, decode_failed(err)).await;
+                        return;
+                    }
+                };
+                // `FileMeta` keeps versions newest-first, so ascending emission is
+                // the exact reverse. Replication resync walks ascending so that
+                // re-applied versions keep the original version-stack order.
+                if opts.versions_sort == WalkVersionsSortOrder::Ascending {
+                    versions.versions.reverse();
+                }
+                let free_versions = if opts.include_free_versions {
+                    versions.free_versions.as_slice()
+                } else {
+                    &[]
+                };
+                for fi in versions.versions.iter().chain(free_versions) {
+                    if passes_filter(fi)
+                        && !matches!(
+                            send_or_cancel(
+                                &rx,
+                                &result,
+                                ObjectInfoOrErr {
+                                    item: Some(to_object_info(fi)),
+                                    err: None,
+                                }
+                            )
+                            .await,
+                            Ok(true)
+                        )
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+        .instrument(tracing::Span::current()),
+    )
+}
+
 /// Own every page worker until completion, including when the request is dropped.
 async fn collect_list_path_results<P>(
     component: &'static str,
@@ -5085,9 +2426,9 @@ async fn collect_list_path_results<P>(
     opts: ListPathOptions,
     recv: Receiver<MetaCacheEntry>,
     producer: P,
-) -> MetaCacheEntriesSortedResult
+) -> Result<ListPage>
 where
-    P: Future<Output = Result<()>> + Send + 'static,
+    P: Future<Output = Result<ListPathRawOutcome>> + Send + 'static,
 {
     let _cancel_guard = cancel.clone().drop_guard();
     let (result_tx, mut result_rx) = mpsc::channel(1);
@@ -5114,7 +2455,7 @@ where
     {
         diagnostic_context.caller = request_caller;
     }
-    let producer = async move { producer.await.map(|()| None) };
+    let producer = async move { producer.await.map(ListWorkerExit::Producer) };
     #[cfg(feature = "diagnostic-read-version-caller")]
     let producer = crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
         diagnostic_context,
@@ -5123,7 +2464,11 @@ where
     );
     workers.spawn(producer.instrument(tracing::Span::current()));
     let gather_cancel = cancel.clone();
-    let gather = async move { gather_results(gather_cancel, opts, recv, result_tx).await.map(Some) };
+    let gather = async move {
+        gather_results(gather_cancel, opts, recv, result_tx)
+            .await
+            .map(ListWorkerExit::Gather)
+    };
     #[cfg(feature = "diagnostic-read-version-caller")]
     let gather = crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
         diagnostic_context,
@@ -5134,14 +2479,22 @@ where
 
     let mut failure = None;
     let mut stopping = false;
+    let mut gather_state = None;
+    let mut producer_outcome = None;
     while let Some(completion) = workers.join_next().await {
         let error = match completion {
-            Ok(Ok(Some(GatherResultsState::LimitReached | GatherResultsState::ConsumerGone))) => {
-                stopping = true;
+            Ok(Ok(ListWorkerExit::Gather(state))) => {
+                if matches!(state, GatherResultsState::LimitReached | GatherResultsState::ConsumerGone) {
+                    stopping = true;
+                }
+                gather_state = Some(state);
                 None
             }
             // EOF is only authoritative after the producer also succeeds.
-            Ok(Ok(None | Some(GatherResultsState::InputClosed))) => None,
+            Ok(Ok(ListWorkerExit::Producer(outcome))) => {
+                producer_outcome = Some(outcome);
+                None
+            }
             Ok(Err(err)) => Some(err),
             Err(err) if stopping && err.is_cancelled() => None,
             // Do not expose a panic payload through the S3 error or logs.
@@ -5160,24 +2513,30 @@ where
         // by a page limit becoming ready at the same time.
     }
 
-    // gather_results sends at most one page into a capacity-1 channel, so it
-    // never needs this receiver to make progress. Read only after both joins.
-    let mut result = result_rx.try_recv().unwrap_or_else(|_| MetaCacheEntriesSortedResult {
-        entries: None,
-        err: Some(rustfs_filemeta::Error::other("listing worker exited without a page")),
-    });
     if let Some(error) = failure {
         log_list_path_worker_error(component, "worker_error", context, &error);
-        result.err = Some(to_filemeta_err(error));
+        return Err(error);
     }
-    result
+
+    // gather_results sends at most one page into a capacity-1 channel, so it
+    // never needs this receiver to make progress. Read only after both joins.
+    let Ok(entries) = result_rx.try_recv() else {
+        return Err(Error::other("listing worker exited without a page"));
+    };
+    // The page is complete only when the collector drained a closed input and
+    // every producer stopped at the end of its namespace rather than at a
+    // per-disk limit: a bounded producer can close the input after spending
+    // its budget on entries this page filtered out.
+    let exhausted = matches!(gather_state, Some(GatherResultsState::InputClosed))
+        && producer_outcome.is_some_and(|outcome| !outcome.limit_reached);
+    Ok(ListPage { entries, exhausted })
 }
 
 async fn gather_results(
     rx: CancellationToken,
     opts: ListPathOptions,
     recv: Receiver<MetaCacheEntry>,
-    results_tx: Sender<MetaCacheEntriesSortedResult>,
+    results_tx: Sender<MetaCacheEntriesSorted>,
 ) -> Result<GatherResultsState> {
     let mut recv = recv;
     let mut entries = Vec::new();
@@ -5293,12 +2652,9 @@ async fn gather_results(
             // performs at most one send per call, so a send failure here means
             // the receiver was dropped (consumer gone), never a full buffer.
             if results_tx
-                .send(MetaCacheEntriesSortedResult {
-                    entries: Some(MetaCacheEntriesSorted {
-                        o: MetaCacheEntries(entries),
-                        ..Default::default()
-                    }),
-                    err: None,
+                .send(MetaCacheEntriesSorted {
+                    o: MetaCacheEntries(entries),
+                    ..Default::default()
                 })
                 .await
                 .is_err()
@@ -5314,16 +2670,9 @@ async fn gather_results(
         }
     }
 
-    // A producer can close its stream after exhausting its own scan budget
-    // before this collector reaches its output limit.  In that case the input
-    // channel closing is not authoritative EOF: the caller must advertise a
-    // continuation page even when every remaining entry was filtered out.
-    let producer_limit_reached = opts
-        .producer_limit_reached
-        .as_ref()
-        .is_some_and(|reached| reached.load(Ordering::Acquire));
-
-    // finish not full, return eof
+    // The input closed before the limit. Whether that is the end of the
+    // namespace is decided by `collect_list_path_results`, which also sees how
+    // the producers stopped.
     let filtered = scanned_entries.saturating_sub(candidate_entries);
     if let Some(started) = gather_started {
         let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -5355,12 +2704,9 @@ async fn gather_results(
     // at most one send per call, so a send failure here means the receiver was
     // dropped (consumer gone), never a full buffer.
     if results_tx
-        .send(MetaCacheEntriesSortedResult {
-            entries: Some(MetaCacheEntriesSorted {
-                o: MetaCacheEntries(entries),
-                ..Default::default()
-            }),
-            err: (!producer_limit_reached).then_some(rustfs_filemeta::Error::Unexpected),
+        .send(MetaCacheEntriesSorted {
+            o: MetaCacheEntries(entries),
+            ..Default::default()
         })
         .await
         .is_err()
@@ -5454,7 +2800,7 @@ async fn poll_merge_head(rx: &CancellationToken, in_channels: &mut [Receiver<Met
     }
 }
 
-async fn send_or_cancel(rx: &CancellationToken, out_channel: &Sender<MetaCacheEntry>, entry: MetaCacheEntry) -> Result<bool> {
+async fn send_or_cancel<T: Send>(rx: &CancellationToken, out_channel: &Sender<T>, entry: T) -> Result<bool> {
     tokio::select! {
         result = out_channel.send(entry) => Ok(result.is_ok()),
         _ = rx.cancelled() => Ok(false),
@@ -5753,746 +3099,6 @@ async fn merge_entry_channels(
     Ok(())
 }
 
-impl Sets {
-    #[allow(clippy::too_many_arguments)]
-    pub async fn inner_list_objects_v2(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        continuation_token: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-        _fetch_owner: bool,
-        start_after: Option<String>,
-        incl_deleted: bool,
-    ) -> Result<ListObjectsV2Info> {
-        let marker = if continuation_token.is_none() {
-            start_after
-        } else {
-            continuation_token.clone()
-        };
-
-        let loi = self
-            .list_objects_generic(bucket, prefix, marker, delimiter, max_keys, incl_deleted)
-            .await?;
-        Ok(ListObjectsV2Info {
-            is_truncated: loi.is_truncated,
-            continuation_token,
-            next_continuation_token: loi.next_marker,
-            objects: loi.objects,
-            prefixes: loi.prefixes,
-        })
-    }
-
-    pub async fn list_objects_generic(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        marker: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-        incl_deleted: bool,
-    ) -> Result<ListObjectsInfo> {
-        let max_keys = normalize_max_keys(max_keys);
-        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
-        let mut opts = ListPathOptions {
-            bucket: bucket.to_owned(),
-            prefix: prefix.to_owned(),
-            separator: delimiter.clone(),
-            limit: effective_max_keys,
-            marker,
-            incl_deleted,
-            ask_disks: list_objects_quorum_from_env(),
-            ..Default::default()
-        };
-        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
-        // (notably `forward_past`) — see backlog#1047.
-        opts.parse_marker();
-
-        let mut list_result = self
-            .list_path(&opts)
-            .await
-            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(to_filemeta_err(err)),
-                ..Default::default()
-            });
-        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
-
-        let disk_has_more = list_result.err.is_none();
-
-        if let Some(err) = list_result.err.take()
-            && err != rustfs_filemeta::Error::Unexpected
-        {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
-        }
-
-        if let Some(result) = list_result.entries.as_mut() {
-            result.forward_past(opts.marker);
-        }
-
-        // Last RAW scanned key, captured before folding (ECA-03 / #944).
-        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
-
-        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
-            &list_result.entries.unwrap_or_default(),
-            bucket,
-            prefix,
-            delimiter.clone(),
-        )
-        .await;
-
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
-            get_objects,
-            &delimiter,
-            max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            false,
-            last_scanned_key.as_deref(),
-        );
-        let _ = next_version_idmarker;
-
-        Ok(ListObjectsInfo {
-            is_truncated,
-            next_marker,
-            objects,
-            prefixes,
-        })
-    }
-
-    pub async fn inner_list_object_versions(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        marker: Option<String>,
-        version_marker: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-    ) -> Result<ListObjectVersionsInfo> {
-        let max_keys = normalize_max_keys(max_keys);
-        if marker.is_none() && version_marker.is_some() {
-            return Err(StorageError::NotImplemented);
-        }
-
-        let has_version_marker = version_marker.is_some();
-        let version_marker = if let Some(marker) = version_marker {
-            Some(parse_version_marker(marker)?)
-        } else {
-            None
-        };
-
-        let effective_max_keys = list_versions_scan_limit(max_keys, has_version_marker);
-        let mut opts = ListPathOptions {
-            bucket: bucket.to_owned(),
-            prefix: prefix.to_owned(),
-            separator: delimiter.clone(),
-            limit: effective_max_keys,
-            marker,
-            incl_deleted: true,
-            ask_disks: list_objects_quorum_from_env(),
-            versioned: true,
-            include_marker: has_version_marker,
-            ..Default::default()
-        };
-        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
-        // (notably `forward_past`) — see backlog#1047.
-        opts.parse_marker();
-
-        let mut list_result = self
-            .list_path(&opts)
-            .await
-            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(to_filemeta_err(err)),
-                ..Default::default()
-            });
-        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
-
-        let disk_has_more = list_result.err.is_none();
-
-        if let Some(err) = list_result.err.take()
-            && err != rustfs_filemeta::Error::Unexpected
-        {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
-        }
-
-        if let Some(result) = list_result.entries.as_mut()
-            && !has_version_marker
-        {
-            result.forward_past(opts.marker.clone());
-        }
-
-        let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
-
-        // Last RAW scanned key, captured before folding (ECA-03 / #944).
-        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
-
-        let entries = list_result.entries.unwrap_or_default();
-        let get_objects =
-            ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, bucket, prefix, delimiter.clone(), version_marker)
-                .await;
-
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate_versions(
-            get_objects,
-            VersionedListPagination {
-                delimiter: &delimiter,
-                max_keys,
-                disk_has_more,
-                cache_id: next_cache_id.as_deref(),
-                marker: opts.marker.as_deref(),
-                last_scanned_key: last_scanned_key.as_deref(),
-                raw_keys: entries.entries().iter().map(|entry| entry.name.as_str()),
-            },
-        );
-
-        Ok(ListObjectVersionsInfo {
-            is_truncated,
-            next_marker,
-            next_version_idmarker,
-            objects,
-            prefixes,
-        })
-    }
-
-    pub async fn list_path(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSortedResult> {
-        check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
-        let list_path_started = std::time::Instant::now();
-
-        let mut o = o.clone();
-        o.marker = o.marker.filter(|v| v >= &o.prefix);
-
-        if let Some(marker) = &o.marker
-            && !o.prefix.is_empty()
-            && !marker.starts_with(&o.prefix)
-        {
-            return Err(Error::Unexpected);
-        }
-
-        if o.limit == 0 {
-            return Err(Error::Unexpected);
-        }
-
-        if o.prefix.starts_with(SLASH_SEPARATOR) {
-            return Err(Error::Unexpected);
-        }
-
-        let slash_separator = Some(SLASH_SEPARATOR.to_owned());
-        o.include_directories = o.separator == slash_separator;
-
-        if (o.separator == slash_separator || o.separator.is_none()) && !o.recursive {
-            o.recursive = o.separator != slash_separator;
-            o.separator = slash_separator;
-        } else {
-            o.recursive = true;
-        }
-
-        o.skip_hidden_prefix_check = can_skip_hidden_prefix_check(&o).await;
-
-        o.parse_marker();
-
-        if o.base_dir.is_empty() {
-            o.base_dir = base_dir_from_prefix(&o.prefix);
-        }
-
-        o.transient = o.transient || is_reserved_or_invalid_bucket(&o.bucket, false);
-        o.set_filter();
-        if o.transient {
-            o.create = false;
-        }
-        let log_context = ListPathLogContext::from_options(&o);
-
-        let cancel = CancellationToken::new();
-        ensure_producer_limit_state(&mut o);
-        let (sender, recv) = mpsc::channel(o.limit as usize);
-        let sets = self.clone();
-        let mut opts = o.clone();
-        opts.stop_disk_at_limit = true;
-        let producer_cancel = cancel.clone();
-        let producer = async move { sets.list_merged(producer_cancel, opts, sender).await.map(|_| ()) };
-        let mut result = collect_list_path_results("sets", &log_context, cancel, o.clone(), recv, producer).await;
-
-        if result.err.is_some() {
-            log_list_path_finished("sets", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
-            return Ok(result);
-        }
-
-        if let Some(entries) = result.entries.as_mut() {
-            entries.reuse = true;
-            let truncated = !entries.entries().is_empty() || result.err.is_none();
-            entries.o.0.truncate(o.limit as usize);
-            if !o.transient && truncated {
-                entries.list_id = if let Some(id) = o.id {
-                    Some(id)
-                } else {
-                    Some(Uuid::new_v4().to_string())
-                };
-            }
-
-            if !truncated {
-                result.err = Some(rustfs_filemeta::Error::Unexpected);
-            }
-        }
-
-        log_list_path_finished(
-            "sets",
-            &log_context,
-            list_path_started.elapsed().as_secs_f64() * 1000.0,
-            result
-                .entries
-                .as_ref()
-                .map(|entries| entries.entries().len())
-                .unwrap_or_default(),
-            result.err.is_some(),
-        );
-
-        Ok(result)
-    }
-
-    async fn list_merged(
-        &self,
-        rx: CancellationToken,
-        opts: ListPathOptions,
-        sender: Sender<MetaCacheEntry>,
-    ) -> Result<Vec<ObjectInfo>> {
-        let merge_started = std::time::Instant::now();
-
-        debug!(
-            list_path_limit = opts.limit,
-            recursive = opts.recursive,
-            set_count = self.disk_set.len(),
-            requested_marker = %opts.marker.as_deref().unwrap_or(""),
-            "sets list_merged started"
-        );
-
-        let rx = rx.child_token();
-        let mut futures = Vec::new();
-        let mut inputs = Vec::new();
-
-        for set in &self.disk_set {
-            let (send, recv) = list_merged_entry_channel();
-            inputs.push(recv);
-            let opts = opts.clone();
-            let rx_clone = rx.clone();
-            let set = set.clone();
-            futures.push(async move { set.list_path(rx_clone, opts, send).await });
-        }
-
-        let merge_task = spawn_listing_merge(rx, inputs, sender);
-
-        let results = join_all(futures).await;
-        merge_task.await.map_err(Error::from)??;
-        let mut all_at_eof = true;
-        let mut errs = Vec::new();
-        for result in results {
-            if let Err(err) = result {
-                all_at_eof = false;
-                errs.push(Some(err));
-            } else {
-                errs.push(None);
-            }
-        }
-
-        if is_all_not_found(&errs) {
-            return Ok(Vec::new());
-        }
-
-        for err in &errs {
-            if let Some(err) = err {
-                if err == &Error::Unexpected {
-                    continue;
-                }
-                return Err(err.clone());
-            } else {
-                all_at_eof = false;
-            }
-        }
-
-        rustfs_io_metrics::record_stage_duration("sets_list_objects_list_merged", merge_started.elapsed().as_secs_f64() * 1000.0);
-
-        debug!(
-            set_count = self.disk_set.len(),
-            all_at_eof = all_at_eof,
-            error_count = errs.iter().filter(|err| err.is_some()).count(),
-            "sets list_merged finished"
-        );
-
-        _ = all_at_eof;
-        Ok(Vec::new())
-    }
-
-    #[allow(unused_assignments)]
-    pub async fn walk_internal(
-        self: Arc<Self>,
-        rx: CancellationToken,
-        bucket: &str,
-        prefix: &str,
-        result: Sender<ObjectInfoOrErr>,
-        opts: WalkOptions,
-    ) -> Result<()> {
-        check_list_objs_args(bucket, prefix, &None)?;
-
-        let rx = rx.child_token();
-        let mut futures = Vec::new();
-        let mut inputs = Vec::new();
-
-        for set in &self.disk_set {
-            let (mut disks, infos, _) = set.get_online_disks_with_healing_and_info(true).await;
-            // Captured before any quorum-based filtering: only genuinely
-            // unreachable drives may relax the write-quorum requirement.
-            let online_disks = disks.len();
-            let opts = opts.clone();
-            let (sender, list_out_rx) = mpsc::channel::<MetaCacheEntry>(1);
-            inputs.push(list_out_rx);
-            let rx_clone = rx.clone();
-            let set = set.clone();
-            futures.push(async move {
-                let mut ask_disks = get_list_quorum(&opts.ask_disks, set.set_drive_count as i32);
-                if ask_disks == -1 {
-                    let new_disks = get_quorum_disks(&disks, &infos, disks.len().div_ceil(2));
-                    if !new_disks.is_empty() {
-                        disks = new_disks;
-                    } else {
-                        ask_disks = get_list_quorum("strict", set.set_drive_count as i32);
-                    }
-                }
-
-                if set.set_drive_count == 4 {
-                    ask_disks = bounded_usize_to_i32(disks.len());
-                } else if ask_disks > bounded_usize_to_i32(disks.len()) {
-                    ask_disks = clamp_ask_disks_to_available(ask_disks, disks.len());
-                }
-
-                let listing_quorum = listing_quorum_from_ask_disks(ask_disks);
-                let enforce_write_quorum = enforce_latest_listing_write_quorum(opts.latest_only, &opts.ask_disks);
-                let write_quorum_parity = set.default_parity_count;
-                let write_quorum_slack =
-                    latest_listing_write_quorum_slack(enforce_write_quorum, set.set_drive_count, online_disks);
-                let required_obj_quorum = latest_listing_required_object_quorum(
-                    listing_quorum,
-                    set.set_drive_count,
-                    write_quorum_parity,
-                    enforce_write_quorum,
-                    write_quorum_slack,
-                );
-                ask_disks = expand_ask_disks_for_object_quorum(ask_disks, disks.len(), required_obj_quorum);
-                let fallback_disks = if let Some(asked_disks) = positive_ask_disks(ask_disks)
-                    && disks.len() > asked_disks
-                {
-                    let mut rand = rand::rng();
-                    disks.shuffle(&mut rand);
-                    disks.split_off(asked_disks)
-                } else {
-                    Vec::new()
-                };
-                let fallback_disks = Arc::new(fallback_disks);
-                let disks = Arc::new(disks);
-                let claim_tracker = FallbackClaimTracker::default();
-
-                let obj_quorum = latest_listing_object_quorum(
-                    listing_quorum,
-                    set.set_drive_count,
-                    write_quorum_parity,
-                    enforce_write_quorum,
-                    write_quorum_slack,
-                );
-                let raw_min_disks = latest_listing_raw_min_disks(listing_quorum, obj_quorum, enforce_write_quorum);
-                let resolver = list_metadata_resolution_params(
-                    bucket.to_owned(),
-                    listing_quorum,
-                    obj_quorum,
-                    !opts.latest_only,
-                    write_quorum_slack,
-                );
-                let agreed_resolver = resolver.clone();
-                let partial_resolver = resolver.clone();
-                let reader_disks = disks.len();
-
-                let path = base_dir_from_prefix(prefix);
-                ensure_non_empty_listing_disks(bucket, &path, &disks).map_err(to_filemeta_err)?;
-
-                let mut filter_prefix = prefix
-                    .trim_start_matches(&path)
-                    .trim_start_matches(SLASH_SEPARATOR)
-                    .trim_end_matches(SLASH_SEPARATOR)
-                    .to_owned();
-                if filter_prefix == path {
-                    filter_prefix = "".to_owned();
-                }
-
-                let tx1 = sender.clone();
-                let tx2 = sender.clone();
-                let supplement = ListingSupplement::new_with_reconciler(
-                    ListingSupplementOptions {
-                        bucket: bucket.to_owned(),
-                        path: path.clone(),
-                        recursive: true,
-                        incl_deleted: !opts.latest_only,
-                        skip_hidden_prefix_check: false,
-                        filter_prefix: Some(filter_prefix.clone()),
-                        forward_to: opts.marker.clone(),
-                        per_disk_limit: bounded_usize_to_i32(opts.limit),
-                        skip_total_timeout: opts.walkdir_timeout.is_none(),
-                        walkdir_timeout: opts.walkdir_timeout,
-                        walkdir_stall_timeout: opts.walkdir_stall_timeout,
-                    },
-                    fallback_disks.clone(),
-                    claim_tracker.clone(),
-                    set.as_ref().clone(),
-                    disks.clone(),
-                );
-                let agreed_supplement = supplement.clone();
-                let partial_supplement = supplement;
-
-                list_path_raw_with_partial_result(
-                    rx_clone,
-                    ListPathRawOptions {
-                        disks: disks.iter().cloned().map(Some).collect(),
-                        fallback_disks: fallback_disks.iter().cloned().map(Some).collect(),
-                        bucket: bucket.to_owned(),
-                        path,
-                        recursive: true,
-                        incl_deleted: !opts.latest_only,
-                        filter_prefix: Some(filter_prefix),
-                        forward_to: opts.marker.clone(),
-                        min_disks: raw_min_disks,
-                        per_disk_limit: bounded_usize_to_i32(opts.limit),
-                        // Skip the total walkdir timeout for listing operations.
-                        // Large buckets (millions of objects) can take longer than
-                        // the default 5s walkdir timeout to produce the first page
-                        // of results. The stall timeout still protects against
-                        // drives that stop making forward progress.
-                        skip_walkdir_total_timeout: opts.walkdir_timeout.is_none(),
-                        walkdir_timeout: opts.walkdir_timeout,
-                        walkdir_stall_timeout: opts.walkdir_stall_timeout,
-                        agreed: Some(Box::new(move |entry: MetaCacheEntry| {
-                            Box::pin({
-                                let value = tx1.clone();
-                                let resolver = agreed_resolver.clone();
-                                let supplement = agreed_supplement.clone();
-                                async move {
-                                    let entry = match resolve_agreed_listing_entry(
-                                        entry,
-                                        reader_disks,
-                                        resolver.clone(),
-                                        enforce_write_quorum,
-                                    ) {
-                                        ListingEntryResolution::Resolved(entry) => entry,
-                                        ListingEntryResolution::NeedsSupplement(entry, fallback) => {
-                                            let Some(entry) = resolve_agreed_listing_entry_with_supplement(
-                                                entry,
-                                                reader_disks,
-                                                resolver,
-                                                enforce_write_quorum,
-                                                supplement,
-                                            )
-                                            .await
-                                            .or(fallback) else {
-                                                return;
-                                            };
-                                            entry
-                                        }
-                                        ListingEntryResolution::Rejected => return,
-                                    };
-                                    if entry.is_dir() {
-                                        return;
-                                    }
-                                    if let Err(err) = value.send(entry).await {
-                                        error!("list_path send fail {:?}", err);
-                                    }
-                                }
-                            })
-                        })),
-                        finished: None,
-                        ..Default::default()
-                    },
-                    claim_tracker,
-                    Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
-                        Box::pin({
-                            let value = tx2.clone();
-                            let resolver = partial_resolver.clone();
-                            let supplement = partial_supplement.clone();
-                            async move {
-                                if let Some(entry) =
-                                    resolve_listing_entries_with_supplement(entries, resolver, enforce_write_quorum, supplement)
-                                        .await?
-                                    && let Err(err) = value.send(entry).await
-                                {
-                                    error!("list_path send fail {:?}", err);
-                                }
-                                Ok(())
-                            }
-                        })
-                    }),
-                )
-                .await
-            });
-        }
-
-        let (merge_tx, mut merge_rx) = mpsc::channel::<MetaCacheEntry>(100);
-        let bucket = bucket.to_owned();
-        let bucket_clone = bucket.clone();
-
-        let vcf = match get_versioning_config(&bucket).await {
-            Ok((res, _)) => Some(res),
-            Err(_) => None,
-        };
-
-        tokio::spawn(
-            async move {
-                let mut sent_err = false;
-                while let Some(entry) = merge_rx.recv().await {
-                    if opts.latest_only {
-                        let fi = match entry.to_fileinfo(&bucket_clone) {
-                            Ok(res) => res,
-                            Err(err) => {
-                                if !sent_err {
-                                    let item = ObjectInfoOrErr {
-                                        item: None,
-                                        err: Some(err.into()),
-                                    };
-                                    if let Err(err) = result.send(item).await {
-                                        error!("walk result send err {:?}", err);
-                                    }
-                                    sent_err = true;
-                                    return;
-                                }
-                                continue;
-                            }
-                        };
-
-                        if let Some(filter) = opts.filter {
-                            if filter(&fi) {
-                                let item = ObjectInfoOrErr {
-                                    item: Some(ObjectInfo::from_file_info(&fi, &bucket_clone, &fi.name, {
-                                        if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                    })),
-                                    err: None,
-                                };
-                                if let Err(err) = result.send(item).await {
-                                    error!("walk result send err {:?}", err);
-                                }
-                            }
-                        } else {
-                            let item = ObjectInfoOrErr {
-                                item: Some(ObjectInfo::from_file_info(&fi, &bucket_clone, &fi.name, {
-                                    if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                })),
-                                err: None,
-                            };
-                            if let Err(err) = result.send(item).await {
-                                error!("walk result send err {:?}", err);
-                            }
-                        }
-                        continue;
-                    }
-
-                    let fvs = match if opts.include_free_versions {
-                        entry.file_info_versions_with_free_versions(&bucket_clone)
-                    } else {
-                        entry.file_info_versions(&bucket_clone)
-                    } {
-                        Ok(res) => res,
-                        Err(err) => {
-                            let item = ObjectInfoOrErr {
-                                item: None,
-                                err: Some(err.into()),
-                            };
-                            if let Err(err) = result.send(item).await {
-                                error!("walk result send err {:?}", err);
-                            }
-                            return;
-                        }
-                    };
-
-                    for fi in &fvs.versions {
-                        if let Some(filter) = opts.filter {
-                            if filter(fi) {
-                                let item = ObjectInfoOrErr {
-                                    item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                        if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                    })),
-                                    err: None,
-                                };
-                                if let Err(err) = result.send(item).await {
-                                    error!("walk result send err {:?}", err);
-                                }
-                            }
-                        } else {
-                            let item = ObjectInfoOrErr {
-                                item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                    if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                })),
-                                err: None,
-                            };
-                            if let Err(err) = result.send(item).await {
-                                error!("walk result send err {:?}", err);
-                            }
-                        }
-                    }
-
-                    if opts.include_free_versions {
-                        for fi in &fvs.free_versions {
-                            if let Some(filter) = opts.filter {
-                                if filter(fi) {
-                                    let item = ObjectInfoOrErr {
-                                        item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                            if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                        })),
-                                        err: None,
-                                    };
-                                    if let Err(err) = result.send(item).await {
-                                        error!("walk result send err {:?}", err);
-                                    }
-                                }
-                            } else {
-                                let item = ObjectInfoOrErr {
-                                    item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
-                                        if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
-                                    })),
-                                    err: None,
-                                };
-                                if let Err(err) = result.send(item).await {
-                                    error!("walk result send err {:?}", err);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
-
-        let merge_task = spawn_listing_merge(rx, inputs, merge_tx);
-
-        let walk_started = std::time::Instant::now();
-        let walk_results = join_all(futures).await;
-        merge_task.await.map_err(Error::from)??;
-        let mut errs = Vec::new();
-        for walk_result in walk_results {
-            match walk_result {
-                Ok(()) => errs.push(None),
-                Err(err) => errs.push(Some(err.into())),
-            }
-        }
-        rustfs_io_metrics::record_stage_duration(
-            "sets_list_objects_walk_internal",
-            walk_started.elapsed().as_secs_f64() * 1000.0,
-        );
-
-        let result = walk_result_from_set_errors(&errs);
-        if let Err(err) = &result {
-            error!(
-                bucket = %bucket,
-                prefix = %prefix,
-                error = ?err,
-                set_errors = ?errs,
-                "walk_internal list_path_raw tasks failed"
-            );
-        }
-
-        result
-    }
-}
-
 impl SetDisks {
     pub(crate) async fn inner_list_object_versions_for_recursive_delete(
         self: Arc<Self>,
@@ -6523,28 +3129,18 @@ impl SetDisks {
         };
         opts.parse_marker();
 
-        let mut list_result = self
+        let mut page = self
             .list_path_result(&opts)
             .await
-            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(to_filemeta_err(err)),
-                ..Default::default()
-            });
-        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
-        let disk_has_more = list_result.err.is_none();
-        if let Some(err) = list_result.err.take()
-            && err != rustfs_filemeta::Error::Unexpected
-        {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
+            .map_err(|err| to_object_err(err, vec![bucket, prefix]))?;
+        let next_cache_id = page.entries.list_id.clone();
+        let disk_has_more = !page.exhausted;
+        if !has_version_marker {
+            page.entries.forward_past(opts.marker.clone());
         }
-        if let Some(result) = list_result.entries.as_mut()
-            && !has_version_marker
-        {
-            result.forward_past(opts.marker.clone());
-        }
-        let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
-        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
-        let entries = list_result.entries.unwrap_or_default();
+        let version_marker = version_marker_for_entries(&page.entries, opts.marker.as_deref(), version_marker);
+        let last_scanned_key = last_scanned_entry_name(&page.entries);
+        let entries = page.entries;
         let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions_for_recursive_delete(
             &entries,
             bucket,
@@ -6572,203 +3168,6 @@ impl SetDisks {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn inner_list_objects_v2(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        continuation_token: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-        _fetch_owner: bool,
-        start_after: Option<String>,
-        incl_deleted: bool,
-    ) -> Result<ListObjectsV2Info> {
-        let marker = if continuation_token.is_none() {
-            start_after
-        } else {
-            continuation_token.clone()
-        };
-
-        let loi = self
-            .list_objects_generic(bucket, prefix, marker, delimiter, max_keys, incl_deleted)
-            .await?;
-        Ok(ListObjectsV2Info {
-            is_truncated: loi.is_truncated,
-            continuation_token,
-            next_continuation_token: loi.next_marker,
-            objects: loi.objects,
-            prefixes: loi.prefixes,
-        })
-    }
-
-    pub async fn list_objects_generic(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        marker: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-        incl_deleted: bool,
-    ) -> Result<ListObjectsInfo> {
-        let max_keys = normalize_max_keys(max_keys);
-        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
-        let mut opts = ListPathOptions {
-            bucket: bucket.to_owned(),
-            prefix: prefix.to_owned(),
-            separator: delimiter.clone(),
-            limit: effective_max_keys,
-            marker,
-            incl_deleted,
-            ask_disks: list_objects_quorum_from_env(),
-            ..Default::default()
-        };
-        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
-        // (notably `forward_past`) — see backlog#1047.
-        opts.parse_marker();
-
-        let mut list_result = self
-            .list_path_result(&opts)
-            .await
-            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(to_filemeta_err(err)),
-                ..Default::default()
-            });
-        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
-
-        let disk_has_more = list_result.err.is_none();
-
-        if let Some(err) = list_result.err.take()
-            && err != rustfs_filemeta::Error::Unexpected
-        {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
-        }
-
-        if let Some(result) = list_result.entries.as_mut() {
-            result.forward_past(opts.marker);
-        }
-
-        // Last RAW scanned key, captured before folding (ECA-03 / #944).
-        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
-
-        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
-            &list_result.entries.unwrap_or_default(),
-            bucket,
-            prefix,
-            delimiter.clone(),
-        )
-        .await;
-
-        let (objects, prefixes, is_truncated, next_marker, _next_version_idmarker) = list_objects_paginate(
-            get_objects,
-            &delimiter,
-            max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            false,
-            last_scanned_key.as_deref(),
-        );
-
-        Ok(ListObjectsInfo {
-            is_truncated,
-            next_marker,
-            objects,
-            prefixes,
-        })
-    }
-
-    pub async fn inner_list_object_versions(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        marker: Option<String>,
-        version_marker: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-    ) -> Result<ListObjectVersionsInfo> {
-        let max_keys = normalize_max_keys(max_keys);
-        if marker.is_none() && version_marker.is_some() {
-            return Err(StorageError::NotImplemented);
-        }
-
-        let has_version_marker = version_marker.is_some();
-        let version_marker = if let Some(marker) = version_marker {
-            Some(parse_version_marker(marker)?)
-        } else {
-            None
-        };
-
-        let effective_max_keys = list_versions_scan_limit(max_keys, has_version_marker);
-        let mut opts = ListPathOptions {
-            bucket: bucket.to_owned(),
-            prefix: prefix.to_owned(),
-            separator: delimiter.clone(),
-            limit: effective_max_keys,
-            marker,
-            incl_deleted: true,
-            ask_disks: list_objects_quorum_from_env(),
-            versioned: true,
-            include_marker: has_version_marker,
-            ..Default::default()
-        };
-        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
-        // (notably `forward_past`) — see backlog#1047.
-        opts.parse_marker();
-
-        let mut list_result = self
-            .list_path_result(&opts)
-            .await
-            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(to_filemeta_err(err)),
-                ..Default::default()
-            });
-        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
-
-        let disk_has_more = list_result.err.is_none();
-
-        if let Some(err) = list_result.err.take()
-            && err != rustfs_filemeta::Error::Unexpected
-        {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
-        }
-
-        if let Some(result) = list_result.entries.as_mut()
-            && !has_version_marker
-        {
-            result.forward_past(opts.marker.clone());
-        }
-
-        let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
-
-        // Last RAW scanned key, captured before folding (ECA-03 / #944).
-        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
-
-        let entries = list_result.entries.unwrap_or_default();
-        let get_objects =
-            ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, bucket, prefix, delimiter.clone(), version_marker)
-                .await;
-
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate_versions(
-            get_objects,
-            VersionedListPagination {
-                delimiter: &delimiter,
-                max_keys,
-                disk_has_more,
-                cache_id: next_cache_id.as_deref(),
-                marker: opts.marker.as_deref(),
-                last_scanned_key: last_scanned_key.as_deref(),
-                raw_keys: entries.entries().iter().map(|entry| entry.name.as_str()),
-            },
-        );
-
-        Ok(ListObjectVersionsInfo {
-            is_truncated,
-            next_marker,
-            next_version_idmarker,
-            objects,
-            prefixes,
-        })
-    }
-
     pub async fn walk_internal(
         self: Arc<Self>,
         rx: CancellationToken,
@@ -6779,125 +3178,22 @@ impl SetDisks {
     ) -> Result<()> {
         check_list_objs_args(bucket, prefix, &None)?;
 
-        let (entry_tx, mut entry_rx) = mpsc::channel::<MetaCacheEntry>(100);
-        let bucket_name = bucket.to_owned();
-        let bucket_name_for_list = bucket_name.clone();
+        let rx = rx.child_token();
+        let (entry_tx, entry_rx) = mpsc::channel::<MetaCacheEntry>(100);
+        let forwarder = spawn_walk_entry_forwarder(rx.clone(), entry_rx, result, opts.clone(), bucket.to_owned());
 
-        let versioning_config = match get_versioning_config(&bucket_name).await {
-            Ok((res, _)) => Some(res),
-            Err(_) => None,
-        };
-
-        let result_task = tokio::spawn(
-            async move {
-                while let Some(entry) = entry_rx.recv().await {
-                    if opts.latest_only {
-                        let fi = match entry.to_fileinfo(&bucket_name) {
-                            Ok(res) => res,
-                            Err(err) => {
-                                let item = ObjectInfoOrErr {
-                                    item: None,
-                                    err: Some(err.into()),
-                                };
-                                let _ = result.send(item).await;
-                                return;
-                            }
-                        };
-
-                        if let Some(filter) = opts.filter
-                            && !filter(&fi)
-                        {
-                            continue;
-                        }
-
-                        let item = ObjectInfoOrErr {
-                            item: Some(ObjectInfo::from_file_info(&fi, &bucket_name, &fi.name, {
-                                if let Some(v) = &versioning_config {
-                                    v.versioned(&fi.name)
-                                } else {
-                                    false
-                                }
-                            })),
-                            err: None,
-                        };
-                        let _ = result.send(item).await;
-                        continue;
-                    }
-
-                    let versions = match if opts.include_free_versions {
-                        entry.file_info_versions_with_free_versions(&bucket_name)
-                    } else {
-                        entry.file_info_versions(&bucket_name)
-                    } {
-                        Ok(res) => res,
-                        Err(err) => {
-                            let item = ObjectInfoOrErr {
-                                item: None,
-                                err: Some(err.into()),
-                            };
-                            let _ = result.send(item).await;
-                            return;
-                        }
-                    };
-
-                    for fi in &versions.versions {
-                        if let Some(filter) = opts.filter
-                            && !filter(fi)
-                        {
-                            continue;
-                        }
-
-                        let item = ObjectInfoOrErr {
-                            item: Some(ObjectInfo::from_file_info(fi, &bucket_name, &fi.name, {
-                                if let Some(v) = &versioning_config {
-                                    v.versioned(&fi.name)
-                                } else {
-                                    false
-                                }
-                            })),
-                            err: None,
-                        };
-                        let _ = result.send(item).await;
-                    }
-
-                    if opts.include_free_versions {
-                        for fi in &versions.free_versions {
-                            if let Some(filter) = opts.filter
-                                && !filter(fi)
-                            {
-                                continue;
-                            }
-
-                            let item = ObjectInfoOrErr {
-                                item: Some(ObjectInfo::from_file_info(fi, &bucket_name, &fi.name, {
-                                    if let Some(v) = &versioning_config {
-                                        v.versioned(&fi.name)
-                                    } else {
-                                        false
-                                    }
-                                })),
-                                err: None,
-                            };
-                            let _ = result.send(item).await;
-                        }
-                    }
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
-
-        let list_options = recursive_walk_list_path_options(bucket_name_for_list, prefix, &opts);
+        let list_options = recursive_walk_list_path_options(bucket.to_owned(), prefix, &opts);
         let list_result = self.list_path(rx, list_options, entry_tx).await;
 
-        let _ = result_task.await;
+        let _ = forwarder.await;
 
         match list_result {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
             Err(err) => walk_result_from_set_errors(&[Some(err)]),
         }
     }
 
-    pub async fn list_path_result(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSortedResult> {
+    pub async fn list_path_result(self: Arc<Self>, o: &ListPathOptions) -> Result<ListPage> {
         check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
 
         let list_path_started = std::time::Instant::now();
@@ -6905,19 +3201,17 @@ impl SetDisks {
         let mut o = o.clone();
         o.marker = o.marker.filter(|v| v >= &o.prefix);
 
-        if let Some(marker) = &o.marker
-            && !o.prefix.is_empty()
-            && !marker.starts_with(&o.prefix)
-        {
-            return Err(Error::Unexpected);
-        }
-
-        if o.limit == 0 {
-            return Err(Error::Unexpected);
-        }
-
-        if o.prefix.starts_with(SLASH_SEPARATOR) {
-            return Err(Error::Unexpected);
+        // Nothing can match these requests; answer with an exhausted empty
+        // page instead of walking.
+        let marker_outside_prefix = o
+            .marker
+            .as_deref()
+            .is_some_and(|marker| !o.prefix.is_empty() && !marker.starts_with(&o.prefix));
+        if marker_outside_prefix || o.limit == 0 || o.prefix.starts_with(SLASH_SEPARATOR) {
+            return Ok(ListPage {
+                entries: MetaCacheEntriesSorted::default(),
+                exhausted: true,
+            });
         }
 
         let slash_separator = Some(SLASH_SEPARATOR.to_owned());
@@ -6946,35 +3240,24 @@ impl SetDisks {
         let log_context = ListPathLogContext::from_options(&o);
 
         let cancel = CancellationToken::new();
-        ensure_producer_limit_state(&mut o);
         let (sender, recv) = mpsc::channel(o.limit as usize);
         let set = self.clone();
         let mut opts = o.clone();
         opts.stop_disk_at_limit = true;
         let producer_cancel = cancel.clone();
-        let producer = async move { set.list_path(producer_cancel, opts, sender).await.map(|_| ()) };
-        let mut result = collect_list_path_results("set_disks", &log_context, cancel, o.clone(), recv, producer).await;
-
-        if result.err.is_some() {
-            log_list_path_finished("set_disks", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
-            return Ok(result);
-        }
-
-        if let Some(entries) = result.entries.as_mut() {
-            entries.reuse = true;
-            let truncated = !entries.entries().is_empty() || result.err.is_none();
-            entries.o.0.truncate(o.limit as usize);
-            if !o.transient && truncated {
-                entries.list_id = if let Some(id) = o.id {
-                    Some(id)
-                } else {
-                    Some(Uuid::new_v4().to_string())
-                };
+        let producer = async move { set.list_path(producer_cancel, opts, sender).await };
+        let mut page = match collect_list_path_results("set_disks", &log_context, cancel, o.clone(), recv, producer).await {
+            Ok(page) => page,
+            Err(err) => {
+                log_list_path_finished("set_disks", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
+                return Err(err);
             }
+        };
 
-            if !truncated {
-                result.err = Some(rustfs_filemeta::Error::Unexpected);
-            }
+        page.entries.reuse = true;
+        page.entries.o.0.truncate(o.limit as usize);
+        if !o.transient {
+            page.entries.list_id = Some(o.id.unwrap_or_else(|| Uuid::new_v4().to_string()));
         }
 
         rustfs_io_metrics::record_stage_duration(
@@ -6986,15 +3269,11 @@ impl SetDisks {
             "set_disks",
             &log_context,
             list_path_started.elapsed().as_secs_f64() * 1000.0,
-            result
-                .entries
-                .as_ref()
-                .map(|entries| entries.entries().len())
-                .unwrap_or_default(),
-            result.err.is_some(),
+            page.entries.entries().len(),
+            false,
         );
 
-        Ok(result)
+        Ok(page)
     }
 
     async fn list_versions_authoritatively(
@@ -7002,7 +3281,7 @@ impl SetDisks {
         rx: CancellationToken,
         opts: ListPathOptions,
         sender: Sender<MetaCacheEntry>,
-    ) -> Result<()> {
+    ) -> Result<ListPathRawOutcome> {
         let (disks, _, _) = self.get_online_disks_with_healing_and_info(true).await;
         let disk_count = self.set_drive_count;
         let parity = self.default_parity_count;
@@ -7061,7 +3340,14 @@ impl SetDisks {
         result.map_err(Into::into)
     }
 
-    pub async fn list_path(&self, rx: CancellationToken, opts: ListPathOptions, sender: Sender<MetaCacheEntry>) -> Result<()> {
+    /// Streams the merged raw entries of this set into `sender` and reports
+    /// how the producers stopped.
+    pub async fn list_path(
+        &self,
+        rx: CancellationToken,
+        opts: ListPathOptions,
+        sender: Sender<MetaCacheEntry>,
+    ) -> Result<ListPathRawOutcome> {
         if opts.versioned {
             return self.list_versions_authoritatively(rx, opts, sender).await;
         }
@@ -7093,16 +3379,14 @@ impl SetDisks {
         ensure_non_empty_listing_disks(&opts.bucket, &opts.base_dir, &disks)?;
 
         let enforce_write_quorum = enforce_latest_listing_write_quorum(!opts.versioned, &opts.ask_disks);
-        let write_quorum_parity = self.default_parity_count;
         let write_quorum_slack = latest_listing_write_quorum_slack(enforce_write_quorum, self.set_drive_count, online_disks);
-        let required_obj_quorum = latest_listing_required_object_quorum(
-            listing_quorum,
-            self.set_drive_count,
-            write_quorum_parity,
-            enforce_write_quorum,
-            write_quorum_slack,
+        let required_obj_quorum =
+            latest_listing_object_quorum(listing_quorum, self.set_drive_count, enforce_write_quorum, write_quorum_slack);
+        ask_disks = expand_ask_disks_for_object_quorum(
+            ask_disks,
+            disks.len(),
+            preferred_listing_quorum(required_obj_quorum, self.set_drive_count, self.default_parity_count, enforce_write_quorum),
         );
-        ask_disks = expand_ask_disks_for_object_quorum(ask_disks, disks.len(), required_obj_quorum);
         let mut fallback_disks = Vec::new();
 
         if let Some(asked_disks) = positive_ask_disks(ask_disks)
@@ -7119,13 +3403,7 @@ impl SetDisks {
 
         let bucket = opts.bucket.clone();
         let base_dir = opts.base_dir.clone();
-        let latest_object_quorum = latest_listing_object_quorum(
-            listing_quorum,
-            self.set_drive_count,
-            write_quorum_parity,
-            enforce_write_quorum,
-            write_quorum_slack,
-        );
+        let latest_object_quorum = required_obj_quorum;
         let raw_min_disks = latest_listing_raw_min_disks(listing_quorum, latest_object_quorum, enforce_write_quorum);
         let resolver = list_metadata_resolution_params(
             bucket.clone(),
@@ -7203,7 +3481,6 @@ impl SetDisks {
                 forward_to: opts.marker,
                 min_disks: raw_min_disks,
                 per_disk_limit: limit,
-                producer_limit_reached: opts.producer_limit_reached.clone(),
                 // A foreground listing is bounded by lack of drive progress (the walk
                 // stall timeout) and by the page limit, never by how long a healthy
                 // walk takes — a large prefix on slow media is not a fault (#4644).
@@ -7218,38 +3495,33 @@ impl SetDisks {
                         let supplement = agreed_supplement.clone();
                         async move {
                             if cancel_token.is_cancelled() {
-                                return;
+                                return Ok(());
                             }
 
-                            let entry =
-                                match resolve_agreed_listing_entry(entry, reader_disks, resolver.clone(), enforce_write_quorum) {
-                                    ListingEntryResolution::Resolved(entry) => entry,
-                                    ListingEntryResolution::NeedsSupplement(entry, fallback) => {
-                                        if cancel_token.is_cancelled() {
-                                            return;
-                                        }
-
-                                        let Some(entry) = resolve_agreed_listing_entry_with_supplement(
-                                            entry,
-                                            reader_disks,
-                                            resolver,
-                                            enforce_write_quorum,
-                                            supplement,
-                                        )
-                                        .await
-                                        .or(fallback) else {
-                                            return;
-                                        };
-                                        entry
+                            let entry = match resolve_agreed_listing_entry(entry, reader_disks, &resolver, enforce_write_quorum) {
+                                ListingEntryResolution::Resolved(entry) => entry,
+                                ListingEntryResolution::NeedsSupplement(entry) => {
+                                    if cancel_token.is_cancelled() {
+                                        return Ok(());
                                     }
-                                    ListingEntryResolution::Rejected => return,
-                                };
+
+                                    let Some(entry) =
+                                        resolve_agreed_listing_entry_with_supplement(entry, reader_disks, resolver, supplement)
+                                            .await?
+                                    else {
+                                        return Ok(());
+                                    };
+                                    entry
+                                }
+                                ListingEntryResolution::Rejected => return Ok(()),
+                            };
 
                             if let Err(err) = send_or_cancel(&cancel_token, &value, entry).await
                                 && !cancel_token.is_cancelled()
                             {
                                 error!("list_path send fail {:?}", err);
                             }
+                            Ok(())
                         }
                     })
                 })),
@@ -7390,45 +3662,20 @@ mod lifecycle_exact_tests;
 #[cfg(test)]
 mod test {
     use super::{
-        ENV_API_LIST_OBJECTS_INDEX_MODE, ENV_API_LIST_OBJECTS_INDEX_PROVIDER, ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION,
-        ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED,
-        ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET,
-        ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE,
-        ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS, ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH,
-        ENV_API_LIST_OBJECTS_QUORUM, FallbackListingEntries, FallbackListingEntry, GatherResultsState,
-        LIST_CURSOR_GENERATION_LIVE, LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY,
-        LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY, ListIndexFallbackReason, ListIndexLifecycle, ListIndexLifecycleState,
-        ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexHealth, ListObjectsIndexProviderKind,
-        ListObjectsIndexProviderState, ListObjectsInfo, ListPathOptions, ListPathRawOptions, ListSourceMode,
-        ListingEntryResolution, ListingSupplement, ListingSupplementOptions, ListingSupplementTarget, MAX_OBJECT_LIST,
-        NamespaceMutationJournalBackend, NamespaceMutationJournalSnapshot, NamespaceMutationJournalStatus,
-        PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER, PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER,
-        PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION, PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER, PERSISTENT_KEY_ONLY_INDEX_HEADER,
-        PersistentKeyOnlyIndex, PersistentListMetadataObject, RUSTFS_META_BUCKET, VerifiedIndexCandidateStats, VersionMarker,
-        cached_entry_needs_supplement, current_list_objects_mutation_sequence, encode_persistent_list_metadata_object,
-        enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results,
-        latest_listing_allow_agreed_objects, latest_listing_object_quorum, latest_listing_raw_min_disks,
-        latest_listing_required_object_quorum, latest_listing_write_quorum_slack, list_marker_key, list_merged_entry_channel,
-        list_metadata_resolution_params, list_objects_from_metadata_snapshot_candidates,
-        list_objects_from_verified_index_candidates, list_objects_from_verified_index_candidates_with_optional_stats,
-        list_objects_from_verified_index_candidates_with_stats, list_objects_index_mode_from_env,
-        list_objects_index_provider_from_env, list_objects_index_provider_state_from_env,
-        list_objects_metadata_fast_guardrails_from_env, list_objects_paginate, list_objects_quorum_from_env,
-        listing_entries_supplement_target, load_namespace_mutation_journal_state, load_persistent_key_only_index,
-        max_keys_plus_one, merge_entry_channels, namespace_mutation_journal_chaos_bucket_from_env,
-        namespace_mutation_journal_chaos_config_from_env, namespace_mutation_journal_chaos_enabled_from_env,
-        namespace_mutation_journal_chaos_sequence_from_env, namespace_mutation_journal_chaos_status_from_env,
-        normalize_list_quorum, observe_list_objects_mutations_with_store, parse_namespace_mutation_journal_state,
-        parse_persistent_key_only_index, parse_persistent_list_metadata_object, parse_version_marker,
-        persist_observed_list_objects_mutation, persistent_key_only_index_has_complete_metadata_snapshot,
-        persistent_key_only_index_health, persistent_key_only_index_matches_provider, recursive_walk_list_path_options,
-        reset_list_objects_mutation_sequences_for_test, resolve_agreed_listing_entry, resolve_listing_entries,
-        resolve_listing_entries_with_supplement, scanner_namespace_mutation_generation, select_list_index_provider_source_mode,
-        select_list_index_source_mode, send_or_cancel, should_purge_empty_directory_listing, version_marker_for_entries,
-        walk_result_from_set_errors, write_namespace_mutation_journal_state, write_persistent_key_only_index_with_metadata,
+        ENV_API_LIST_OBJECTS_QUORUM, FallbackListingEntries, FallbackListingEntry, GatherResultsState, ListObjectsInfo,
+        ListPathOptions, ListPathRawOptions, ListSourceMode, ListingEntryResolution, ListingSupplement, ListingSupplementOptions,
+        ListingSupplementTarget, MAX_OBJECT_LIST, RUSTFS_META_BUCKET, VersionMarker, enforce_latest_listing_write_quorum,
+        expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects,
+        latest_listing_object_quorum, latest_listing_raw_min_disks, latest_listing_write_quorum_slack, list_marker_key,
+        list_merged_entry_channel, list_metadata_resolution_params, list_objects_paginate, list_objects_quorum_from_env,
+        listing_entries_supplement_target, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
+        observe_scanner_namespace_mutations, parse_version_marker, recursive_walk_list_path_options,
+        reset_scanner_namespace_mutation_generation_for_test, resolve_agreed_listing_entry, resolve_listing_entries,
+        resolve_listing_entries_with_supplement, scanner_namespace_mutation_generation, send_or_cancel,
+        should_purge_empty_directory_listing, version_marker_for_entries, walk_result_from_set_errors,
     };
     use crate::bucket::replication::ReplicationState;
-    use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
+    use crate::cache_value::metacache_set::{FallbackClaimTracker, ListPathRawOutcome, TestReaderBehavior, list_path_raw};
     use crate::disk::{DeleteOptions, DiskAPI, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, error::DiskError, new_disk};
     use crate::error::{Result, StorageError};
     use crate::object_api::ObjectInfo;
@@ -7439,8 +3686,6 @@ mod test {
         ObjectPartInfo, VersionType,
     };
     use std::collections::{HashMap, HashSet};
-    use std::path::PathBuf;
-    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -7511,16 +3756,6 @@ mod test {
     }
     use uuid::Uuid;
 
-    struct TestIndexHealth {
-        reason: Option<ListIndexFallbackReason>,
-    }
-
-    impl ListMetadataIndexHealth for TestIndexHealth {
-        fn fallback_reason(&self) -> Option<ListIndexFallbackReason> {
-            self.reason
-        }
-    }
-
     fn test_meta_entry(name: &str) -> MetaCacheEntry {
         MetaCacheEntry {
             name: name.to_owned(),
@@ -7542,17 +3777,6 @@ mod test {
         assert_eq!(rx.recv().await.expect("first merge head should remain available").name, "object-a");
         tx.try_send(test_meta_entry("object-b"))
             .expect("input buffer should accept the next head after refill");
-    }
-
-    fn test_live_object_info(name: &str, etag: &str) -> ObjectInfo {
-        let mut fi = FileInfo {
-            name: name.to_owned(),
-            size: 1,
-            mod_time: Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp")),
-            ..Default::default()
-        };
-        fi.metadata.insert("etag".to_string(), etag.to_string());
-        ObjectInfo::from_file_info(&fi, "bucket", name, false)
     }
 
     fn test_object_meta_entry(name: &str) -> MetaCacheEntry {
@@ -7582,6 +3806,169 @@ mod test {
             cached: Some(meta),
             reusable: false,
         }
+    }
+
+    #[tokio::test]
+    async fn walk_forwarder_skips_synthetic_directories_and_keeps_directory_objects() {
+        for latest_only in [true, false] {
+            let (entry_tx, entry_rx) = mpsc::channel(4);
+            entry_tx
+                .send(MetaCacheEntry {
+                    name: "synthetic/".to_owned(),
+                    ..Default::default()
+                })
+                .await
+                .expect("queue synthetic directory");
+            for name in ["marker/", "object"] {
+                entry_tx.send(test_object_meta_entry(name)).await.expect("queue real object");
+            }
+            drop(entry_tx);
+            let (result_tx, mut result_rx) = mpsc::channel(4);
+            let parent = CancellationToken::new();
+            let cancel = parent.child_token();
+            let forwarder = super::spawn_walk_entry_forwarder(
+                cancel.clone(),
+                entry_rx,
+                result_tx,
+                super::WalkOptions {
+                    latest_only,
+                    ..Default::default()
+                },
+                "bucket".to_owned(),
+            );
+            timeout(Duration::from_secs(5), forwarder)
+                .await
+                .expect("finite walk should finish")
+                .expect("forwarder should not panic");
+            let mut names = Vec::new();
+            while let Some(result) = result_rx.recv().await {
+                assert!(result.err.is_none(), "directory projection must not produce a decoding error");
+                names.push(result.item.expect("real object should be projected").name);
+            }
+            assert_eq!(names, ["marker/", "object"], "latest_only={latest_only}");
+            assert!(cancel.is_cancelled(), "finished forwarder must stop its producers");
+            assert!(!parent.is_cancelled(), "walk completion must not cancel its caller");
+        }
+    }
+
+    #[tokio::test]
+    async fn walk_forwarder_cancels_idle_producers_when_consumer_closes() {
+        let (entry_tx, entry_rx) = mpsc::channel(1);
+        let (result_tx, result_rx) = mpsc::channel(1);
+        let parent = CancellationToken::new();
+        let cancel = parent.child_token();
+        let forwarder = super::spawn_walk_entry_forwarder(
+            cancel.clone(),
+            entry_rx,
+            result_tx,
+            super::WalkOptions {
+                filter: Some(|_| false),
+                ..Default::default()
+            },
+            "bucket".to_owned(),
+        );
+        drop(result_rx);
+        timeout(Duration::from_secs(5), forwarder)
+            .await
+            .expect("consumer closure must stop the walk even without an emitted entry")
+            .expect("forwarder should not panic");
+        assert!(entry_tx.is_closed(), "producer channel must close without scanning more entries");
+        assert!(cancel.is_cancelled(), "consumer closure must cancel disk scans");
+        assert!(!parent.is_cancelled(), "consumer closure must not cancel its caller");
+    }
+
+    #[tokio::test]
+    async fn walk_forwarder_cancellation_interrupts_output_backpressure() {
+        let (entry_tx, entry_rx) = mpsc::channel(2);
+        entry_tx
+            .send(test_object_meta_entry("first"))
+            .await
+            .expect("queue first object");
+        entry_tx
+            .send(test_object_meta_entry("second"))
+            .await
+            .expect("queue second object");
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+        let parent = CancellationToken::new();
+        let cancel = parent.child_token();
+        let forwarder = super::spawn_walk_entry_forwarder(
+            cancel.clone(),
+            entry_rx,
+            result_tx,
+            super::WalkOptions::default(),
+            "bucket".to_owned(),
+        );
+        timeout(Duration::from_secs(5), async {
+            while entry_tx.capacity() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("forwarder should read the second entry while its output is full");
+        cancel.cancel();
+        timeout(Duration::from_secs(5), forwarder)
+            .await
+            .expect("cancellation must interrupt a blocked output send")
+            .expect("forwarder should not panic");
+        assert_eq!(result_rx.recv().await.expect("first output").item.expect("first object").name, "first");
+        assert!(
+            result_rx.recv().await.is_none(),
+            "second entry must not pass the full output after cancellation"
+        );
+        assert!(entry_tx.is_closed());
+        assert!(!parent.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn walk_forwarder_abort_before_poll_cancels_producers() {
+        let (entry_tx, entry_rx) = mpsc::channel(1);
+        let (result_tx, _result_rx) = mpsc::channel(1);
+        let parent = CancellationToken::new();
+        let cancel = parent.child_token();
+        let forwarder = super::spawn_walk_entry_forwarder(
+            cancel.clone(),
+            entry_rx,
+            result_tx,
+            super::WalkOptions::default(),
+            "bucket".to_owned(),
+        );
+        forwarder.abort();
+        assert!(forwarder.await.expect_err("task should be aborted").is_cancelled());
+        assert!(cancel.is_cancelled(), "unpolled task must retain the producer cancellation guard");
+        assert!(entry_tx.is_closed());
+        assert!(!parent.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn walk_forwarder_reports_corruption_before_cancelling_producers() {
+        let (entry_tx, entry_rx) = mpsc::channel(1);
+        entry_tx
+            .send(MetaCacheEntry {
+                name: "corrupt".to_owned(),
+                metadata: vec![0xff],
+                ..Default::default()
+            })
+            .await
+            .expect("queue corrupt metadata");
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let forwarder = super::spawn_walk_entry_forwarder(
+            cancel.clone(),
+            entry_rx,
+            result_tx,
+            super::WalkOptions::default(),
+            "bucket".to_owned(),
+        );
+        timeout(Duration::from_secs(5), forwarder)
+            .await
+            .expect("corruption must terminate the walk")
+            .expect("forwarder should not panic");
+        let result = result_rx.recv().await.expect("corruption must be reported");
+        assert!(result.item.is_none());
+        assert!(result.err.is_some(), "corruption must not become a successful end of stream");
+        assert!(result_rx.recv().await.is_none());
+        assert!(cancel.is_cancelled());
+        assert!(entry_tx.is_closed());
     }
 
     fn test_unversioned_object_meta_entry(
@@ -7718,8 +4105,10 @@ mod test {
         assert_eq!(candidates[0].as_ref().map(|entry| entry.name.as_str()), Some("object"));
     }
 
-    #[test]
-    fn listing_supplement_uses_page_cache_only_for_bounded_walks() {
+    #[tokio::test]
+    async fn listing_supplement_uses_page_cache_only_for_bounded_walks() {
+        let (_dirs, disks, _set) = hermetic_set_disks_isolated(4).await;
+        let fallback = Arc::new(vec![disks[0].clone()]);
         let bounded = ListingSupplement::new(
             ListingSupplementOptions {
                 bucket: "bucket".to_string(),
@@ -7734,7 +4123,7 @@ mod test {
                 walkdir_timeout: None,
                 walkdir_stall_timeout: None,
             },
-            Arc::new(Vec::new()),
+            fallback.clone(),
             FallbackClaimTracker::default(),
         );
         let unbounded = ListingSupplement::new(
@@ -7751,10 +4140,12 @@ mod test {
                 walkdir_timeout: None,
                 walkdir_stall_timeout: None,
             },
-            Arc::new(Vec::new()),
+            fallback,
             FallbackClaimTracker::default(),
         );
 
+        let empty = ListingSupplement::new(bounded.options.clone(), Arc::new(Vec::new()), FallbackClaimTracker::default());
+        assert!(empty.entries.is_none(), "no fallback readers need no page cache");
         assert!(bounded.entries.is_some());
         assert!(bounded.options.skip_total_timeout);
         assert!(unbounded.entries.is_none());
@@ -8002,7 +4393,7 @@ mod test {
             .await
             .expect("limited result should be sent promptly")
             .expect("limited result should be present");
-        assert_eq!(result.entries.unwrap().entries().len(), 1);
+        assert_eq!(result.entries().len(), 1);
 
         let state = timeout(Duration::from_secs(1), handle)
             .await
@@ -8047,7 +4438,7 @@ mod test {
             .await
             .expect("limited result should be sent promptly")
             .expect("limited result should be present");
-        let entries = result.entries.unwrap();
+        let entries = result;
         let names = entries
             .entries()
             .into_iter()
@@ -8113,8 +4504,6 @@ mod test {
                 }
                 assert_eq!(
                     result
-                        .entries
-                        .expect("delimiter entries should exist")
                         .entries()
                         .into_iter()
                         .map(|entry| entry.name.clone())
@@ -8122,14 +4511,14 @@ mod test {
                     expected,
                     "delimiter={separator}, extra={extra_object}"
                 );
-                assert_eq!(result.err.is_none(), extra_object, "n=max must reach EOF; max+1 must retain lookahead");
                 assert_eq!(
                     state,
                     if extra_object {
                         GatherResultsState::LimitReached
                     } else {
                         GatherResultsState::InputClosed
-                    }
+                    },
+                    "n=max must reach EOF; max+1 must retain lookahead"
                 );
             }
         }
@@ -8160,12 +4549,7 @@ mod test {
             )
             .await
             .expect("logical marker collection should succeed");
-            let entries = result_rx
-                .recv()
-                .await
-                .expect("logical marker page should arrive")
-                .entries
-                .expect("logical marker entries should exist");
+            let entries = result_rx.recv().await.expect("logical marker page should arrive");
             let projected = ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, "bucket", "", Some("/".to_owned())).await;
             let names: Vec<_> = projected.into_iter().map(|object| object.name).collect();
             assert_eq!(
@@ -8242,7 +4626,7 @@ mod test {
             let delimiter = (kind == "delimiter").then(|| "/".to_owned());
             // Exercise each public/internal entry point with the reported page size.
             // The store entry point also covers exact and one-over limit boundaries.
-            for (layer, max_keys) in [(0, 0), (0, 1), (0, 5), (0, 9), (0, 10), (0, 11), (1, 5), (2, 5), (3, 5)] {
+            for (layer, max_keys) in [(0, 0), (0, 1), (0, 5), (0, 9), (0, 10), (0, 11), (3, 5)] {
                 if layer == 3 && delimiter.is_some() {
                     continue;
                 }
@@ -8258,18 +4642,6 @@ mod test {
                     let result = match layer {
                         0 => {
                             store
-                                .clone()
-                                .inner_list_object_versions(bucket, &prefix, marker, version_marker, delimiter.clone(), max_keys)
-                                .await
-                        }
-                        1 => {
-                            store.pools[0]
-                                .clone()
-                                .inner_list_object_versions(bucket, &prefix, marker, version_marker, delimiter.clone(), max_keys)
-                                .await
-                        }
-                        2 => {
-                            store.pools[0].disk_set[0]
                                 .clone()
                                 .inner_list_object_versions(bucket, &prefix, marker, version_marker, delimiter.clone(), max_keys)
                                 .await
@@ -8333,13 +4705,13 @@ mod test {
 
         let listed_after_deleted_marker = sorted_entries(&["obj-b", "obj-c"]);
         assert_eq!(
-            version_marker_for_entries(Some(&listed_after_deleted_marker), Some("obj-a"), version_marker),
+            version_marker_for_entries(&listed_after_deleted_marker, Some("obj-a"), version_marker),
             None
         );
 
         let listed_with_marker = sorted_entries(&["obj-a", "obj-b"]);
         assert_eq!(
-            version_marker_for_entries(Some(&listed_with_marker), Some("obj-a"), version_marker),
+            version_marker_for_entries(&listed_with_marker, Some("obj-a"), version_marker),
             version_marker
         );
     }
@@ -8377,7 +4749,7 @@ mod test {
             .await
             .expect("eof result should be sent promptly")
             .expect("eof result should be present");
-        let entries = result.entries.unwrap();
+        let entries = result;
         let names = entries
             .entries()
             .into_iter()
@@ -8385,7 +4757,6 @@ mod test {
             .collect::<Vec<_>>();
 
         assert_eq!(names, ["obj-b"]);
-        assert!(result.err.is_some());
 
         let state = timeout(Duration::from_secs(1), handle)
             .await
@@ -8430,7 +4801,7 @@ mod test {
             .await
             .expect("result should be sent promptly")
             .expect("result should be present");
-        let entries = result.entries.unwrap();
+        let entries = result;
         let names = entries
             .entries()
             .into_iter()
@@ -8482,7 +4853,7 @@ mod test {
             .await
             .expect("eof result should be sent promptly")
             .expect("eof result should be present");
-        let entries = result.entries.expect("result entries should be present");
+        let entries = result;
         let names = entries
             .entries()
             .into_iter()
@@ -8571,58 +4942,55 @@ mod test {
         assert!(!cancel.is_cancelled());
     }
 
+    /// A bounded producer can spend its whole per-disk budget on entries this
+    /// page filters out. The closed input is then not the end of the namespace:
+    /// the page must stay non-exhausted so the caller advertises a continuation.
     #[tokio::test]
-    async fn list_path_gather_results_preserves_bounded_producer_after_filtering() {
-        let (entry_tx, entry_rx) = mpsc::channel(4);
-        let (result_tx, mut result_rx) = mpsc::channel(1);
-        let cancel = CancellationToken::new();
-        let producer_limit_reached = Arc::new(AtomicBool::new(true));
-
-        entry_tx
-            .send(test_meta_entry("outside-prefix"))
+    async fn list_path_bounded_producer_keeps_filtered_empty_page_non_exhausted() {
+        for limit_reached in [true, false] {
+            let (sender, recv) = mpsc::channel(4);
+            let page = collect_list_path_results(
+                CancellationToken::new(),
+                ListPathOptions {
+                    bucket: "bucket".to_owned(),
+                    prefix: "requested/".to_owned(),
+                    limit: 8,
+                    incl_deleted: true,
+                    ..Default::default()
+                },
+                recv,
+                async move {
+                    sender
+                        .send(test_meta_entry("outside-prefix"))
+                        .await
+                        .expect("filtered test entry should be queued");
+                    drop(sender);
+                    Ok(ListPathRawOutcome { limit_reached })
+                },
+            )
             .await
-            .expect("filtered test entry should be queued");
-        drop(entry_tx);
+            .expect("a fully filtered page is still a successful page");
 
-        let handle = tokio::spawn(gather_results(
-            cancel,
-            ListPathOptions {
-                bucket: "bucket".to_owned(),
-                prefix: "requested/".to_owned(),
-                limit: 8,
-                incl_deleted: true,
-                producer_limit_reached: Some(producer_limit_reached),
-                ..Default::default()
-            },
-            entry_rx,
-            result_tx,
-        ));
-
-        let result = result_rx.recv().await.expect("bounded producer result should be delivered");
-        assert!(result.entries.expect("entries should be present").entries().is_empty());
-        assert!(result.err.is_none(), "bounded producer must not be reported as EOF");
-        assert_eq!(
-            handle
-                .await
-                .expect("gather task should not panic")
-                .expect("gather should succeed"),
-            GatherResultsState::InputClosed
-        );
+            assert!(page.entries.entries().is_empty(), "the only entry lies outside the prefix");
+            assert_eq!(
+                page.exhausted, !limit_reached,
+                "limit_reached={limit_reached}: a producer that stopped at its limit must not yield an exhausted page"
+            );
+        }
     }
 
     /// A-1 guard (rustfs/backlog#1306): pin that a *successful* send is never
     /// misclassified as `ConsumerGone`. With the receiver alive, gather_results
-    /// must return the real drain state and deliver the payload carrying the
-    /// state-specific `err` sentinel the wrappers depend on (limit reached =>
-    /// err None so the wrapper knows the disk may hold more; input closed =>
-    /// err Some so the wrapper knows the disk was fully drained). Together with
-    /// the receiver-dropped ConsumerGone tests above, this locks in
-    /// "ConsumerGone is returned only on send failure": a broken send-failure
-    /// check that classified a successful send as ConsumerGone would drop the
-    /// delivered payload (and its err sentinel) and trip this test.
+    /// must deliver the page and return the real drain state that
+    /// `collect_list_path_results` turns into `ListPage::exhausted` (limit
+    /// reached => the disk may hold more; input closed => everything offered
+    /// was drained). Together with the receiver-dropped ConsumerGone tests
+    /// above, this locks in "ConsumerGone is returned only on send failure": a
+    /// broken send-failure check that classified a successful send as
+    /// ConsumerGone would drop the delivered page and trip this test.
     #[tokio::test]
-    async fn list_path_gather_results_send_success_delivers_state_specific_err_sentinel() {
-        // Limit reached with the receiver alive: LimitReached + err None.
+    async fn list_path_gather_results_send_success_returns_real_drain_state() {
+        // Limit reached with the receiver alive: LimitReached.
         {
             let (entry_tx, entry_rx) = mpsc::channel(4);
             let (result_tx, mut result_rx) = mpsc::channel(1);
@@ -8648,8 +5016,7 @@ mod test {
                 .await
                 .expect("limited result should be sent promptly")
                 .expect("limited result should be present");
-            assert_eq!(result.entries.expect("limit payload delivers entries").entries().len(), 1);
-            assert!(result.err.is_none(), "limit-reached payload must carry no err sentinel");
+            assert_eq!(result.entries().len(), 1, "the limit page must be delivered");
 
             let state = timeout(Duration::from_secs(1), handle)
                 .await
@@ -8659,7 +5026,7 @@ mod test {
             assert_eq!(state, GatherResultsState::LimitReached);
         }
 
-        // Input closed with the receiver alive: InputClosed + err Some (eof sentinel).
+        // Input closed with the receiver alive: InputClosed.
         {
             let (entry_tx, entry_rx) = mpsc::channel(4);
             let (result_tx, mut result_rx) = mpsc::channel(1);
@@ -8686,8 +5053,7 @@ mod test {
                 .await
                 .expect("eof result should be sent promptly")
                 .expect("eof result should be present");
-            assert_eq!(result.entries.expect("eof payload delivers entries").entries().len(), 1);
-            assert!(result.err.is_some(), "eof payload must carry the sentinel err the wrapper relies on");
+            assert_eq!(result.entries().len(), 1, "the drained page must be delivered");
 
             let state = timeout(Duration::from_secs(1), handle)
                 .await
@@ -9270,764 +5636,14 @@ mod test {
 
     #[test]
     #[serial_test::serial]
-    fn list_objects_index_mode_from_env_defaults_to_walker() {
-        temp_env::with_var_unset(ENV_API_LIST_OBJECTS_INDEX_MODE, || {
-            assert_eq!(list_objects_index_mode_from_env(), None);
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn list_objects_index_mode_from_env_accepts_key_only_aliases() {
-        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("key_only"), || {
-            assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexKeyOnly));
-        });
-        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("index_key_only"), || {
-            assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexKeyOnly));
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn list_objects_index_mode_from_env_accepts_verified_page_aliases() {
-        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("verified_page"), || {
-            assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexVerifiedPage));
-        });
-        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("index_verified_page"), || {
-            assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexVerifiedPage));
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn list_objects_index_mode_from_env_accepts_metadata_fast_without_guardrails() {
-        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("index_metadata_fast"), || {
-            temp_env::with_var_unset(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, || {
-                temp_env::with_var_unset(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, || {
-                    assert_eq!(list_objects_metadata_fast_guardrails_from_env(), None);
-                    assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexMetadataFast));
-                });
-            });
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn list_objects_index_mode_from_env_accepts_metadata_fast_without_sla() {
-        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("metadata_fast"), || {
-            temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, Some("true"), || {
-                temp_env::with_var_unset(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, || {
-                    assert_eq!(list_objects_metadata_fast_guardrails_from_env(), None);
-                    assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexMetadataFast));
-                });
-            });
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn list_objects_index_mode_from_env_accepts_metadata_fast_with_sla_guardrails() {
-        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("index_metadata_fast"), || {
-            temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, Some("true"), || {
-                temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, Some("5000"), || {
-                    assert_eq!(list_objects_metadata_fast_guardrails_from_env(), Some(5000));
-                    assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexMetadataFast));
-                });
-            });
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn list_objects_index_mode_from_env_accepts_metadata_fast_over_sla_budget() {
-        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("index_metadata_fast"), || {
-            temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, Some("true"), || {
-                temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, Some("60001"), || {
-                    assert_eq!(list_objects_metadata_fast_guardrails_from_env(), None);
-                    assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexMetadataFast));
-                });
-            });
-        });
-    }
-
-    #[test]
-    fn persistent_list_metadata_object_round_trips_encoded_snapshot() {
-        let object = PersistentListMetadataObject {
-            name: "photos/2026/img\t01.jpg".to_string(),
-            size: 42,
-            mod_time: Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp")),
-            etag: Some("etag-42".to_string()),
-            storage_class: Some("STANDARD".to_string()),
-        };
-
-        let encoded = encode_persistent_list_metadata_object(&object);
-        let parsed = parse_persistent_list_metadata_object(&encoded).expect("metadata object should parse");
-
-        assert_eq!(parsed, object);
-    }
-
-    #[test]
-    fn persistent_listing_snapshots_cannot_restore_legacy_encrypted_fingerprints() {
-        let mut object = ObjectInfo {
-            name: "encrypted".to_owned(),
-            etag: Some("fbfcbcc6d2f035411e6268c8b119593e".to_owned()),
-            user_defined: Arc::new(HashMap::from([(
-                "x-amz-server-side-encryption-customer-algorithm".to_owned(),
-                "AES256".to_owned(),
-            )])),
-            ..Default::default()
-        };
-        let snapshot = PersistentListMetadataObject::from_object_info(&object);
-        assert!(snapshot.to_object_info("bucket").etag.is_none());
-        let mut old_snapshot = snapshot;
-        old_snapshot.etag = object.etag.clone();
-        let old_contents = format!(
-            "# rustfs-listobjects-key-only-v2\n{}\n",
-            encode_persistent_list_metadata_object(&old_snapshot)
-        );
-        let old_index = parse_persistent_key_only_index(&old_contents);
-        assert_ne!(old_index.format_version, PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION);
-
-        rustfs_utils::http::metadata_compat::insert_str(
-            Arc::make_mut(&mut object.user_defined),
-            rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG,
-            "v1".to_owned(),
-        );
-        assert_eq!(PersistentListMetadataObject::from_object_info(&object).etag, object.etag);
-        object.user_defined = Arc::new(HashMap::new());
-        assert_eq!(PersistentListMetadataObject::from_object_info(&object).etag, object.etag);
-    }
-
-    #[test]
-    fn persistent_key_only_index_parses_legacy_keys_and_metadata_snapshots() {
-        let object = PersistentListMetadataObject {
-            name: "object-b".to_string(),
-            size: 7,
-            mod_time: None,
-            etag: Some("etag-b".to_string()),
-            storage_class: None,
-        };
-        let contents = format!(
-            "{PERSISTENT_KEY_ONLY_INDEX_HEADER}\n\
-             {PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER}bucket\n\
-             {PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER}generation-42\n\
-             {PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER}9\n\
-             object-a\n\
-             {}\n",
-            encode_persistent_list_metadata_object(&object)
-        );
-
-        let index = parse_persistent_key_only_index(&contents);
-
-        assert_eq!(index.bucket.as_deref(), Some("bucket"));
-        assert_eq!(index.generation, "generation-42");
-        assert_eq!(index.checkpoint_high_water_mark, 9);
-        assert_eq!(index.keys.as_slice(), &["object-a".to_string(), "object-b".to_string()]);
-        assert_eq!(index.objects.as_slice(), &[object]);
-        assert!(!persistent_key_only_index_has_complete_metadata_snapshot(&index));
-    }
-
-    #[test]
-    fn metadata_snapshot_candidates_page_without_live_verification() {
-        let objects = vec![
-            PersistentListMetadataObject {
-                name: "photos/2026/a.jpg".to_string(),
-                size: 1,
-                mod_time: None,
-                etag: Some("etag-a".to_string()),
-                storage_class: Some("STANDARD".to_string()),
-            },
-            PersistentListMetadataObject {
-                name: "photos/2026/nested/b.jpg".to_string(),
-                size: 2,
-                mod_time: None,
-                etag: Some("etag-b".to_string()),
-                storage_class: Some("STANDARD".to_string()),
-            },
-            PersistentListMetadataObject {
-                name: "photos/2026/z.jpg".to_string(),
-                size: 3,
-                mod_time: None,
-                etag: Some("etag-z".to_string()),
-                storage_class: Some("STANDARD".to_string()),
-            },
-        ];
-
-        let result = list_objects_from_metadata_snapshot_candidates(
-            "bucket",
-            "photos/2026/",
-            Some("photos/2026/a.jpg"),
-            &Some("/".to_string()),
-            2,
-            &objects,
-        );
-
-        assert_eq!(result.stats.candidate_keys, 3);
-        assert_eq!(result.stats.live_verify_attempts, 0);
-        assert_eq!(
-            result
-                .info
-                .objects
-                .iter()
-                .map(|object| object.name.as_str())
-                .collect::<Vec<_>>(),
-            ["photos/2026/z.jpg"]
-        );
-        assert_eq!(result.info.objects[0].etag.as_deref(), Some("etag-z"));
-        assert_eq!(result.info.prefixes, vec!["photos/2026/nested/".to_string()]);
-        assert!(!result.info.is_truncated);
-
-        let resumed = list_objects_from_metadata_snapshot_candidates(
-            "bucket",
-            "photos/2026/",
-            Some("photos/2026/nested/"),
-            &Some("/".to_string()),
-            1,
-            &objects,
-        );
-        assert!(
-            resumed.info.prefixes.is_empty(),
-            "metadata-fast cursors must not replay an emitted prefix"
-        );
-        assert_eq!(
-            resumed
-                .info
-                .objects
-                .iter()
-                .map(|object| object.name.as_str())
-                .collect::<Vec<_>>(),
-            ["photos/2026/z.jpg"]
-        );
-        assert!(!resumed.info.is_truncated);
-    }
-
-    #[test]
-    fn metadata_fast_requires_complete_metadata_snapshot() {
-        let index = PersistentKeyOnlyIndex {
-            format_version: PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
-            bucket: Some("bucket".to_string()),
-            generation: "generation-42".to_string(),
-            checkpoint_high_water_mark: 42,
-            keys: Arc::new(vec!["a".to_string(), "b".to_string()]),
-            objects: Arc::new(vec![PersistentListMetadataObject {
-                name: "a".to_string(),
-                size: 1,
-                mod_time: None,
-                etag: None,
-                storage_class: None,
-            }]),
-        };
-
-        assert!(!persistent_key_only_index_has_complete_metadata_snapshot(&index));
-
-        let complete = PersistentKeyOnlyIndex {
-            format_version: PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
-            bucket: Some("bucket".to_string()),
-            generation: "generation-42".to_string(),
-            checkpoint_high_water_mark: 42,
-            keys: Arc::new(vec!["a".to_string()]),
-            objects: Arc::new(vec![PersistentListMetadataObject {
-                name: "a".to_string(),
-                size: 1,
-                mod_time: None,
-                etag: None,
-                storage_class: None,
-            }]),
-        };
-
-        assert!(persistent_key_only_index_has_complete_metadata_snapshot(&complete));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn list_objects_index_provider_from_env_is_default_off() {
-        temp_env::with_var_unset(ENV_API_LIST_OBJECTS_INDEX_PROVIDER, || {
-            assert_eq!(list_objects_index_provider_from_env(), None);
-            assert_eq!(list_objects_index_provider_state_from_env(), None);
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn list_objects_index_provider_from_env_publishes_live_generation_when_enabled() {
-        temp_env::with_var(
-            ENV_API_LIST_OBJECTS_INDEX_PROVIDER,
-            Some(LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY),
-            || {
-                assert_eq!(list_objects_index_provider_from_env(), Some(ListObjectsIndexProviderKind::WalkerKeyOnly));
-                let health = list_objects_index_provider_state_from_env()
-                    .expect("walker provider should be configured")
-                    .health_snapshot();
-                assert_eq!(health.state, ListIndexLifecycleState::Healthy);
-                assert_eq!(health.active_generation.as_deref(), Some(LIST_CURSOR_GENERATION_LIVE));
-                assert_eq!(health.fallback_reason, None);
-            },
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn list_objects_index_provider_from_env_accepts_persistent_key_only() {
-        temp_env::with_var(
-            ENV_API_LIST_OBJECTS_INDEX_PROVIDER,
-            Some(LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY),
-            || {
-                assert_eq!(
-                    list_objects_index_provider_from_env(),
-                    Some(ListObjectsIndexProviderKind::PersistentKeyOnly)
-                );
-            },
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn list_objects_index_provider_state_degrades_persistent_without_path() {
-        temp_env::with_var(
-            ENV_API_LIST_OBJECTS_INDEX_PROVIDER,
-            Some(LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY),
-            || {
-                temp_env::with_var_unset(ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, || {
-                    let provider = list_objects_index_provider_state_from_env().expect("persistent provider should be selected");
-                    let health = provider.health_snapshot();
-
-                    assert_eq!(provider.kind, ListObjectsIndexProviderKind::PersistentKeyOnly);
-                    assert_eq!(provider.persistent_path, None);
-                    assert_eq!(health.state, ListIndexLifecycleState::Degraded);
-                    assert_eq!(health.fallback_reason, Some(ListIndexFallbackReason::Degraded));
-                });
-            },
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn list_objects_index_provider_state_rebuilds_persistent_until_index_is_loaded() {
-        let index_path = "/tmp/rustfs-listobjects-key-only.index";
-        temp_env::with_var(
-            ENV_API_LIST_OBJECTS_INDEX_PROVIDER,
-            Some(LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY),
-            || {
-                temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, Some(index_path), || {
-                    temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION, Some("bench-20260706"), || {
-                        let provider =
-                            list_objects_index_provider_state_from_env().expect("persistent provider should be selected");
-                        let health = provider.health_snapshot();
-
-                        assert_eq!(provider.kind, ListObjectsIndexProviderKind::PersistentKeyOnly);
-                        assert_eq!(provider.persistent_path.as_deref(), Some(std::path::Path::new(index_path)));
-                        assert_eq!(provider.persistent_generation.as_deref(), Some("bench-20260706"));
-                        assert_eq!(health.state, ListIndexLifecycleState::Rebuilding);
-                        assert_eq!(health.staging_generation.as_deref(), Some("bench-20260706"));
-                        assert_eq!(health.fallback_reason, Some(ListIndexFallbackReason::Rebuilding));
-                    });
-                });
-            },
-        );
-    }
-
-    #[test]
-    fn parse_persistent_key_only_index_sorts_and_deduplicates_keys() {
-        let index = parse_persistent_key_only_index(
-            "# rustfs-listobjects-key-only-v1\n\
-             # bucket=photos\n\
-             # generation=bench-20260706\n\
-             # checkpoint_high_water_mark=99\n\
-             photos/c.jpg\n\
-             photos/a.jpg\r\n\
-             \n\
-             photos/b.jpg\n\
-             photos/a.jpg\n",
-        );
-
-        assert_eq!(index.bucket.as_deref(), Some("photos"));
-        assert_eq!(index.generation, "bench-20260706");
-        assert_eq!(index.checkpoint_high_water_mark, 99);
-        assert_eq!(
-            index.keys.as_slice(),
-            vec![
-                "photos/a.jpg".to_string(),
-                "photos/b.jpg".to_string(),
-                "photos/c.jpg".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_namespace_mutation_journal_state_reads_bucket_and_high_water_mark() {
-        let state = parse_namespace_mutation_journal_state(
-            "# rustfs-listobjects-namespace-journal-v1\n\
-             # bucket=photos\n\
-             # high_water_mark=123\n\
-             # status=healthy\n",
-        )
-        .expect("journal state should parse");
-
-        assert_eq!(state.bucket.as_deref(), Some("photos"));
-        assert_eq!(state.high_water_mark, 123);
-        assert_eq!(state.status, NamespaceMutationJournalStatus::Healthy);
-    }
-
-    #[test]
-    fn namespace_mutation_journal_chaos_env_accepts_controlled_status() {
-        temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS, Some("degraded"), || {
-            assert_eq!(
-                namespace_mutation_journal_chaos_status_from_env(),
-                Some(NamespaceMutationJournalStatus::Degraded)
-            );
-        });
-        temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS, Some("HEALTHY"), || {
-            assert_eq!(
-                namespace_mutation_journal_chaos_status_from_env(),
-                Some(NamespaceMutationJournalStatus::Healthy)
-            );
-        });
-        temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS, Some("unknown"), || {
-            assert_eq!(namespace_mutation_journal_chaos_status_from_env(), None);
-        });
-    }
-
-    #[test]
-    fn namespace_mutation_journal_chaos_env_requires_explicit_enable() {
-        temp_env::with_var_unset(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, || {
-            assert!(!namespace_mutation_journal_chaos_enabled_from_env());
-        });
-        temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, Some("true"), || {
-            assert!(namespace_mutation_journal_chaos_enabled_from_env());
-        });
-        temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, Some("1"), || {
-            assert!(namespace_mutation_journal_chaos_enabled_from_env());
-        });
-        temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, Some("on"), || {
-            assert!(namespace_mutation_journal_chaos_enabled_from_env());
-        });
-        temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, Some("false"), || {
-            assert!(!namespace_mutation_journal_chaos_enabled_from_env());
-        });
-    }
-
-    #[test]
-    fn namespace_mutation_journal_chaos_env_reads_bucket_and_sequence() {
-        temp_env::with_vars(
-            [
-                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET, Some("bench-bucket")),
-                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE, Some("42")),
-            ],
-            || {
-                assert_eq!(namespace_mutation_journal_chaos_bucket_from_env().as_deref(), Some("bench-bucket"));
-                assert_eq!(namespace_mutation_journal_chaos_sequence_from_env(), Some(42));
-            },
-        );
-        temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE, Some("not-a-number"), || {
-            assert_eq!(namespace_mutation_journal_chaos_sequence_from_env(), None);
-        });
-    }
-
-    #[test]
-    fn namespace_mutation_journal_chaos_config_requires_enable_bucket_and_status() {
-        temp_env::with_vars(
-            [
-                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, Some("true")),
-                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET, Some("bench-bucket")),
-                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS, Some("degraded")),
-                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE, Some("42")),
-            ],
-            || {
-                let config = namespace_mutation_journal_chaos_config_from_env().expect("enabled chaos config should parse");
-                assert_eq!(config.bucket, "bench-bucket");
-                assert_eq!(config.status, NamespaceMutationJournalStatus::Degraded);
-                assert_eq!(config.sequence, Some(42));
-            },
-        );
-        temp_env::with_vars(
-            [
-                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, Some("false")),
-                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET, Some("bench-bucket")),
-                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS, Some("degraded")),
-            ],
-            || {
-                assert_eq!(namespace_mutation_journal_chaos_config_from_env(), None);
-            },
-        );
-        temp_env::with_vars(
-            [
-                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, Some("true")),
-                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET, Some("bench-bucket")),
-                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS, Some("invalid")),
-            ],
-            || {
-                assert_eq!(namespace_mutation_journal_chaos_config_from_env(), None);
-            },
-        );
-        temp_env::with_vars(
-            [
-                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, Some("true")),
-                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET, None::<&str>),
-                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS, Some("degraded")),
-            ],
-            || {
-                assert_eq!(namespace_mutation_journal_chaos_config_from_env(), None);
-            },
-        );
-    }
-
-    #[tokio::test]
-    async fn namespace_mutation_journal_write_never_regresses() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let journal_root = tempdir.path().join("namespace-mutation-journal");
-
-        assert_eq!(
-            write_namespace_mutation_journal_state(
-                NamespaceMutationJournalBackend::LocalPath(journal_root.clone()),
-                "bucket",
-                7,
-                false,
-            )
-            .await
-            .expect("journal sequence should be written")
-            .high_water_mark,
-            7
-        );
-        assert_eq!(
-            write_namespace_mutation_journal_state(
-                NamespaceMutationJournalBackend::LocalPath(journal_root.clone()),
-                "bucket",
-                3,
-                false,
-            )
-            .await
-            .expect("journal sequence should not regress")
-            .high_water_mark,
-            7
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn observed_mutation_persists_namespace_journal_high_water() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let index_path = tempdir.path().join("persistent-key-only.index");
-        let journal_root = tempdir.path().join("namespace-mutation-journal");
-        let index_path = index_path.to_str().expect("index path should be utf8");
-        let journal_root = journal_root.to_str().expect("journal path should be utf8");
-
-        temp_env::with_var(
-            ENV_API_LIST_OBJECTS_INDEX_PROVIDER,
-            Some(LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY),
-            || {
-                temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, Some(index_path), || {
-                    temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH, Some(journal_root), || {
-                        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should start");
-                        runtime.block_on(async {
-                            reset_list_objects_mutation_sequences_for_test().await;
-
-                            persist_observed_list_objects_mutation(None, "bucket", 11).await;
-                            let state = load_namespace_mutation_journal_state(
-                                NamespaceMutationJournalBackend::LocalPath(std::path::PathBuf::from(journal_root)),
-                                "bucket",
-                            )
-                            .await
-                            .expect("journal state should load")
-                            .expect("journal state should exist");
-
-                            assert_eq!(state.high_water_mark, 11);
-                            assert_eq!(state.status, NamespaceMutationJournalStatus::Healthy);
-                            assert_eq!(current_list_objects_mutation_sequence("bucket").await, 11);
-                        });
-                    });
-                });
-            },
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn persistent_key_only_index_load_recovers_mutation_sequence_from_journal() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let index_path = tempdir.path().join("persistent-key-only.index");
-        let journal_root = tempdir.path().join("namespace-mutation-journal");
-        let keys = vec!["object-a".to_string(), "object-b".to_string()];
-
-        write_persistent_key_only_index_with_metadata(None, &index_path, "bucket", "generation-42", 5, &keys, &[])
-            .await
-            .expect("index should be written");
-        write_namespace_mutation_journal_state(NamespaceMutationJournalBackend::LocalPath(journal_root), "bucket", 9, false)
-            .await
-            .expect("journal sequence should be written");
-        reset_list_objects_mutation_sequences_for_test().await;
-
-        let index = load_persistent_key_only_index(None, &index_path)
-            .await
-            .expect("index should load");
-
-        assert_eq!(index.checkpoint_high_water_mark, 5);
-        assert_eq!(current_list_objects_mutation_sequence("bucket").await, 9);
-    }
-
-    #[test]
-    fn persistent_key_only_index_provider_match_rejects_configured_generation_mismatch() {
-        let index = PersistentKeyOnlyIndex {
-            format_version: PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
-            bucket: Some("bucket".to_string()),
-            generation: "generation-old".to_string(),
-            checkpoint_high_water_mark: 42,
-            keys: Arc::new(vec!["a".to_string(), "b".to_string()]),
-            objects: Arc::new(Vec::new()),
-        };
-        let matching_provider = ListObjectsIndexProviderState::persistent_key_only(
-            Some(PathBuf::from("/tmp/persistent-key-only.index")),
-            Some("generation-old".to_string()),
-        );
-        let mismatching_provider = ListObjectsIndexProviderState::persistent_key_only(
-            Some(PathBuf::from("/tmp/persistent-key-only.index")),
-            Some("generation-new".to_string()),
-        );
-
-        assert!(persistent_key_only_index_matches_provider(&index, "bucket", &matching_provider));
-        assert!(!persistent_key_only_index_matches_provider(&index, "bucket", &mismatching_provider));
-        assert!(!persistent_key_only_index_matches_provider(&index, "other-bucket", &matching_provider));
-    }
-
-    #[test]
-    fn persistent_key_only_index_provider_match_rejects_legacy_format_without_configured_generation() {
-        let legacy = parse_persistent_key_only_index(&format!(
-            "# rustfs-listobjects-key-only-v1\n\
-             {PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER}bucket\n\
-             {PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER}generation-old\n\
-             {PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER}42\n\
-             # object\tbGVnYWN5\t1\t-\t-\tU1RBTkRBUkRfSUE=\n"
-        ));
-        let provider =
-            ListObjectsIndexProviderState::persistent_key_only(Some(PathBuf::from("/tmp/persistent-key-only.index")), None);
-
-        assert_eq!(legacy.format_version, 0);
-        assert!(!persistent_key_only_index_matches_provider(&legacy, "bucket", &provider));
-    }
-
-    #[test]
-    fn current_persistent_snapshot_preserves_an_effective_transition_tier_name() {
-        let object = PersistentListMetadataObject::from_object_info(&ObjectInfo {
-            bucket: "bucket".to_string(),
-            name: "transitioned".to_string(),
-            storage_class: Some("STANDARD_IA".to_string()),
-            ..Default::default()
-        });
-        let index = parse_persistent_key_only_index(&format!(
-            "{PERSISTENT_KEY_ONLY_INDEX_HEADER}\n\
-             {PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER}bucket\n\
-             {PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER}generation-current\n\
-             {PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER}42\n\
-             {}\n",
-            encode_persistent_list_metadata_object(&object)
-        ));
-        let provider =
-            ListObjectsIndexProviderState::persistent_key_only(Some(PathBuf::from("/tmp/persistent-key-only.index")), None);
-
-        assert_eq!(index.format_version, PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION);
-        assert!(persistent_key_only_index_matches_provider(&index, "bucket", &provider));
-        assert_eq!(index.objects[0].to_object_info("bucket").storage_class.as_deref(), Some("STANDARD_IA"));
-    }
-
-    #[test]
-    fn persistent_key_only_index_health_uses_snapshot_generation_and_checkpoint() {
-        let index = PersistentKeyOnlyIndex {
-            format_version: PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
-            bucket: Some("bucket".to_string()),
-            generation: "generation-42".to_string(),
-            checkpoint_high_water_mark: 42,
-            keys: Arc::new(vec!["a".to_string(), "b".to_string()]),
-            objects: Arc::new(Vec::new()),
-        };
-
-        let health = persistent_key_only_index_health(
-            &index,
-            NamespaceMutationJournalSnapshot {
-                high_water_mark: 42,
-                degraded: false,
-            },
-        );
-
-        assert_eq!(health.state, ListIndexLifecycleState::Healthy);
-        assert_eq!(health.active_generation.as_deref(), Some("generation-42"));
-        assert_eq!(health.checkpoint_high_water_mark, 42);
-        assert_eq!(health.mutation_high_water_mark, 42);
-        assert_eq!(health.fallback_reason, None);
-    }
-
-    #[test]
-    fn persistent_key_only_index_health_reports_lagging_mutation_checkpoint() {
-        let index = PersistentKeyOnlyIndex {
-            format_version: PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
-            bucket: Some("bucket".to_string()),
-            generation: "generation-42".to_string(),
-            checkpoint_high_water_mark: 42,
-            keys: Arc::new(vec!["a".to_string(), "b".to_string()]),
-            objects: Arc::new(Vec::new()),
-        };
-
-        let health = persistent_key_only_index_health(
-            &index,
-            NamespaceMutationJournalSnapshot {
-                high_water_mark: 43,
-                degraded: false,
-            },
-        );
-
-        assert_eq!(health.state, ListIndexLifecycleState::Lagging);
-        assert_eq!(health.active_generation.as_deref(), Some("generation-42"));
-        assert_eq!(health.checkpoint_high_water_mark, 42);
-        assert_eq!(health.mutation_high_water_mark, 43);
-        assert_eq!(health.mutation_lag, 1);
-        assert_eq!(health.fallback_reason, Some(ListIndexFallbackReason::Lagging));
-    }
-
-    #[test]
-    fn persistent_key_only_index_health_reports_degraded_journal() {
-        let index = PersistentKeyOnlyIndex {
-            format_version: PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
-            bucket: Some("bucket".to_string()),
-            generation: "generation-42".to_string(),
-            checkpoint_high_water_mark: 42,
-            keys: Arc::new(vec!["a".to_string(), "b".to_string()]),
-            objects: Arc::new(Vec::new()),
-        };
-
-        let health = persistent_key_only_index_health(
-            &index,
-            NamespaceMutationJournalSnapshot {
-                high_water_mark: 42,
-                degraded: true,
-            },
-        );
-
-        assert_eq!(health.state, ListIndexLifecycleState::Degraded);
-        assert_eq!(health.fallback_reason, Some(ListIndexFallbackReason::Degraded));
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn list_objects_mutation_sequence_advances_per_bucket() {
-        reset_list_objects_mutation_sequences_for_test().await;
-
-        assert_eq!(current_list_objects_mutation_sequence("bucket-a").await, 0);
-        assert_eq!(observe_list_objects_mutations_with_store(None, "bucket-a", 1).await, Some(1));
-        assert_eq!(observe_list_objects_mutations_with_store(None, "bucket-a", 2).await, Some(3));
-        assert_eq!(current_list_objects_mutation_sequence("bucket-a").await, 3);
-        assert_eq!(current_list_objects_mutation_sequence("bucket-b").await, 0);
-        assert_eq!(observe_list_objects_mutations_with_store(None, "bucket-b", 0).await, None);
-        assert_eq!(current_list_objects_mutation_sequence("bucket-b").await, 0);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn scanner_namespace_generation_tracks_only_user_namespace_mutations() {
-        reset_list_objects_mutation_sequences_for_test().await;
+    fn scanner_namespace_generation_tracks_only_user_namespace_mutations() {
+        reset_scanner_namespace_mutation_generation_for_test();
 
         assert_eq!(scanner_namespace_mutation_generation(), 0);
-        assert_eq!(observe_list_objects_mutations_with_store(None, RUSTFS_META_BUCKET, 3).await, Some(3));
+        observe_scanner_namespace_mutations(RUSTFS_META_BUCKET, 3);
         assert_eq!(scanner_namespace_mutation_generation(), 0);
 
-        assert_eq!(observe_list_objects_mutations_with_store(None, "photos", 2).await, Some(5));
+        observe_scanner_namespace_mutations("photos", 2);
         assert_eq!(scanner_namespace_mutation_generation(), 2);
     }
 
@@ -10054,6 +5670,18 @@ mod test {
             ..Default::default()
         };
         assert!(!should_purge_empty_directory_listing("ghost/", None, 1, false, &truncated));
+    }
+
+    #[test]
+    fn empty_directory_listing_does_not_purge_rejected_leading_slash_prefixes() {
+        let empty = ListObjectsInfo::default();
+        for prefix in ["/", "//", "/ghost/"] {
+            assert!(
+                !should_purge_empty_directory_listing(prefix, None, 1000, false, &empty),
+                "rejected prefix {prefix:?} must not initiate orphan cleanup"
+            );
+        }
+        assert!(should_purge_empty_directory_listing("ghost/", None, 1000, false, &empty));
     }
 
     #[test]
@@ -10307,43 +5935,25 @@ mod test {
             assert!(!info.delete_marker && info.version_purge_status.is_empty());
         }
 
-        for layer in 0..3 {
-            for (prefix, expected) in [("a", vec!["a", "ab"]), ("ab", vec!["ab"]), ("missing", vec![])] {
-                let mut marker = None;
-                for page in 0..expected.len().max(1) {
-                    let result = match layer {
-                        0 => {
-                            store
-                                .clone()
-                                .list_objects_generic(bucket, prefix, marker.clone(), None, 1, false)
-                                .await
-                        }
-                        1 => {
-                            store.pools[0]
-                                .clone()
-                                .list_objects_generic(bucket, prefix, marker.clone(), None, 1, false)
-                                .await
-                        }
-                        _ => {
-                            store.pools[0].disk_set[0]
-                                .clone()
-                                .list_objects_generic(bucket, prefix, marker.clone(), None, 1, false)
-                                .await
-                        }
-                    }
+        for (prefix, expected) in [("a", vec!["a", "ab"]), ("ab", vec!["ab"]), ("missing", vec![])] {
+            let mut marker = None;
+            for page in 0..expected.len().max(1) {
+                let result = store
+                    .clone()
+                    .list_objects_generic(bucket, prefix, marker.clone(), None, 1, false)
+                    .await
                     .expect("exact-prefix page should list successfully");
-                    let names: Vec<_> = result.objects.iter().map(|object| object.name.as_str()).collect();
-                    let expected_page: Vec<_> = expected.get(page).copied().into_iter().collect();
-                    assert_eq!(names, expected_page, "layer {layer}, prefix {prefix}, page {page}");
-                    assert!(result.prefixes.is_empty(), "recursive listing should not return common prefixes");
-                    let has_more = page + 1 < expected.len();
-                    assert_eq!(result.is_truncated, has_more, "layer {layer}, prefix {prefix}, page {page}");
-                    assert_eq!(result.next_marker.is_some(), has_more, "only non-final pages should carry a marker");
-                    if has_more {
-                        assert_ne!(result.next_marker, marker, "pagination marker must advance");
-                    }
-                    marker = result.next_marker;
+                let names: Vec<_> = result.objects.iter().map(|object| object.name.as_str()).collect();
+                let expected_page: Vec<_> = expected.get(page).copied().into_iter().collect();
+                assert_eq!(names, expected_page, "prefix {prefix}, page {page}");
+                assert!(result.prefixes.is_empty(), "recursive listing should not return common prefixes");
+                let has_more = page + 1 < expected.len();
+                assert_eq!(result.is_truncated, has_more, "prefix {prefix}, page {page}");
+                assert_eq!(result.next_marker.is_some(), has_more, "only non-final pages should carry a marker");
+                if has_more {
+                    assert_ne!(result.next_marker, marker, "pagination marker must advance");
                 }
+                marker = result.next_marker;
             }
         }
     }
@@ -10607,303 +6217,6 @@ mod test {
     }
 
     #[test]
-    fn list_objects_index_provider_state_uses_lifecycle_active_generation() {
-        let provider = ListObjectsIndexProviderState::walker_key_only();
-        let health = provider.health_snapshot();
-
-        assert_eq!(provider.kind, ListObjectsIndexProviderKind::WalkerKeyOnly);
-        assert_eq!(health.state, ListIndexLifecycleState::Healthy);
-        assert_eq!(health.staging_generation, None);
-        assert_eq!(health.active_generation.as_deref(), Some(LIST_CURSOR_GENERATION_LIVE));
-        assert_eq!(
-            select_list_index_source_mode(Some(ListSourceMode::IndexKeyOnly), health.active_generation.as_deref(), &health),
-            ListIndexSourceDecision::UseIndex(ListSourceMode::IndexKeyOnly)
-        );
-    }
-
-    #[tokio::test]
-    async fn list_objects_verified_index_candidates_use_live_metadata_only() {
-        let candidates = vec![
-            "photos/2026/a.jpg".to_string(),
-            "photos/2026/b.jpg".to_string(),
-            "photos/2026/c.jpg".to_string(),
-        ];
-
-        let result =
-            list_objects_from_verified_index_candidates("photos/2026/", None, &None, 100, &candidates, |key| async move {
-                Ok(Some(test_live_object_info(&key, "live-etag")))
-            })
-            .await
-            .expect("verified candidate listing should succeed");
-
-        assert_eq!(result.objects.len(), 3);
-        assert!(
-            result
-                .objects
-                .iter()
-                .all(|object| object.etag.as_deref() == Some("live-etag"))
-        );
-        assert!(result.prefixes.is_empty());
-        assert!(!result.is_truncated);
-    }
-
-    #[tokio::test]
-    async fn list_objects_verified_index_candidates_apply_marker_and_delimiter_boundaries() {
-        let candidates = vec![
-            "photos/2025/old.jpg".to_string(),
-            "photos/2026/a.jpg".to_string(),
-            "photos/2026/archive/b.jpg".to_string(),
-            "photos/2026/archive/c.jpg".to_string(),
-            "photos/2026/d.jpg".to_string(),
-        ];
-
-        let result = list_objects_from_verified_index_candidates(
-            "photos/2026/",
-            Some("photos/2026/a.jpg"),
-            &Some("/".to_string()),
-            100,
-            &candidates,
-            |key| async move { Ok(Some(test_live_object_info(&key, "live-etag"))) },
-        )
-        .await
-        .expect("verified candidate listing should succeed");
-
-        assert_eq!(
-            result.objects.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(),
-            vec!["photos/2026/d.jpg"]
-        );
-        assert_eq!(result.prefixes, vec!["photos/2026/archive/".to_string()]);
-        assert!(!result.is_truncated);
-    }
-
-    #[tokio::test]
-    async fn list_objects_verified_index_candidates_use_common_prefix_as_page_marker() {
-        let candidates = vec![
-            "photos/2026/archive/b.jpg".to_string(),
-            "photos/2026/archive/c.jpg".to_string(),
-            "photos/2026/d.jpg".to_string(),
-        ];
-
-        let result = list_objects_from_verified_index_candidates(
-            "photos/2026/",
-            None,
-            &Some("/".to_string()),
-            1,
-            &candidates,
-            |key| async move { Ok(Some(test_live_object_info(&key, "live-etag"))) },
-        )
-        .await
-        .expect("verified candidate listing should succeed");
-
-        assert!(result.objects.is_empty());
-        assert_eq!(result.prefixes, vec!["photos/2026/archive/".to_string()]);
-        assert!(result.is_truncated);
-        assert_eq!(result.next_marker.as_deref(), Some("photos/2026/archive/"));
-
-        let resumed = list_objects_from_verified_index_candidates(
-            "photos/2026/",
-            result.next_marker.as_deref(),
-            &Some("/".to_string()),
-            1,
-            &candidates,
-            |key| async move { Ok(Some(test_live_object_info(&key, "live-etag"))) },
-        )
-        .await
-        .expect("verified prefix continuation should succeed");
-        assert!(resumed.prefixes.is_empty(), "verified cursors must not replay an emitted prefix");
-        assert_eq!(
-            resumed.objects.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(),
-            ["photos/2026/d.jpg"]
-        );
-        assert!(!resumed.is_truncated);
-    }
-
-    #[tokio::test]
-    async fn list_objects_verified_index_candidates_drop_deleted_or_failed_live_verifications() {
-        let candidates = vec!["photos/2026/a.jpg".to_string(), "photos/2026/deleted.jpg".to_string()];
-
-        let result =
-            list_objects_from_verified_index_candidates("photos/2026/", None, &None, 100, &candidates, |key| async move {
-                if key.ends_with("deleted.jpg") {
-                    Ok(None)
-                } else {
-                    Ok(Some(test_live_object_info(&key, "live-etag")))
-                }
-            })
-            .await
-            .expect("verified candidate listing should succeed");
-
-        assert_eq!(result.objects.len(), 1);
-        assert_eq!(result.objects[0].name, "photos/2026/a.jpg");
-    }
-
-    #[tokio::test]
-    async fn list_objects_verified_index_candidates_ignore_stale_delete_markers() {
-        let candidates = vec![
-            "photos/2026/live.jpg".to_string(),
-            "photos/2026/stale-delete-marker.jpg".to_string(),
-        ];
-
-        let result =
-            list_objects_from_verified_index_candidates("photos/2026/", None, &None, 100, &candidates, |key| async move {
-                if key.ends_with("stale-delete-marker.jpg") {
-                    Ok(None)
-                } else {
-                    Ok(Some(test_live_object_info(&key, "live-etag")))
-                }
-            })
-            .await
-            .expect("verified candidate listing should succeed");
-
-        assert_eq!(
-            result.objects.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(),
-            vec!["photos/2026/live.jpg"]
-        );
-    }
-
-    #[tokio::test]
-    async fn list_objects_verified_index_candidates_return_overwritten_live_metadata() {
-        let candidates = vec!["photos/2026/overwritten.jpg".to_string()];
-
-        let result =
-            list_objects_from_verified_index_candidates("photos/2026/", None, &None, 100, &candidates, |key| async move {
-                Ok(Some(test_live_object_info(&key, "new-live-etag")))
-            })
-            .await
-            .expect("verified candidate listing should succeed");
-
-        assert_eq!(result.objects.len(), 1);
-        assert_eq!(result.objects[0].etag.as_deref(), Some("new-live-etag"));
-    }
-
-    #[tokio::test]
-    async fn list_objects_verified_index_candidates_include_completed_multipart_after_live_verify() {
-        let candidates = vec!["photos/2026/multipart-complete.bin".to_string()];
-
-        let result =
-            list_objects_from_verified_index_candidates("photos/2026/", None, &None, 100, &candidates, |key| async move {
-                Ok(Some(test_live_object_info(&key, "completed-multipart-etag")))
-            })
-            .await
-            .expect("verified candidate listing should succeed");
-
-        assert_eq!(result.objects.len(), 1);
-        assert_eq!(result.objects[0].name, "photos/2026/multipart-complete.bin");
-        assert_eq!(result.objects[0].etag.as_deref(), Some("completed-multipart-etag"));
-    }
-
-    #[tokio::test]
-    async fn list_objects_verified_index_candidates_report_verification_stats() {
-        let candidates = vec![
-            "photos/2025/old.jpg".to_string(),
-            "photos/2026/a.jpg".to_string(),
-            "photos/2026/archive/b.jpg".to_string(),
-            "photos/2026/deleted.jpg".to_string(),
-        ];
-
-        let result = list_objects_from_verified_index_candidates_with_stats(
-            "photos/2026/",
-            Some("photos/2026/a.jpg"),
-            &Some("/".to_string()),
-            100,
-            &candidates,
-            |key| async move {
-                if key.ends_with("deleted.jpg") {
-                    Ok(None)
-                } else {
-                    Ok(Some(test_live_object_info(&key, "live-etag")))
-                }
-            },
-        )
-        .await
-        .expect("verified candidate listing should succeed");
-
-        assert!(result.info.objects.is_empty());
-        assert_eq!(result.info.prefixes, vec!["photos/2026/archive/".to_string()]);
-        assert_eq!(result.stats.candidate_keys, 4);
-        assert_eq!(result.stats.skipped_keys, 2);
-        assert_eq!(result.stats.common_prefixes, 1);
-        assert_eq!(result.stats.live_verify_attempts, 1);
-        assert_eq!(result.stats.live_verify_hits, 0);
-        assert_eq!(result.stats.live_verify_misses, 1);
-    }
-
-    #[tokio::test]
-    async fn list_objects_verified_index_candidates_skip_stats_when_disabled() {
-        let candidates = vec!["photos/2026/a.jpg".to_string(), "photos/2026/deleted.jpg".to_string()];
-
-        let result = list_objects_from_verified_index_candidates_with_optional_stats(
-            "photos/2026/",
-            None,
-            &None,
-            100,
-            &candidates,
-            false,
-            |key| async move {
-                if key.ends_with("deleted.jpg") {
-                    Ok(None)
-                } else {
-                    Ok(Some(test_live_object_info(&key, "live-etag")))
-                }
-            },
-        )
-        .await
-        .expect("verified candidate listing should succeed");
-
-        assert_eq!(result.info.objects.len(), 1);
-        assert_eq!(result.stats, VerifiedIndexCandidateStats::default());
-    }
-
-    #[test]
-    fn list_index_provider_selection_rejects_generation_mismatch() {
-        let mut lifecycle = ListIndexLifecycle::disabled(10);
-        lifecycle.begin_rebuild("generation-2", 100);
-        lifecycle.checkpoint_rebuild(100);
-        assert!(lifecycle.publish_rebuild());
-        let health = lifecycle.health_snapshot();
-
-        let opts = ListPathOptions {
-            marker: Some("photos/2026/a.jpg[rustfs_cache:v2,id:list-cache-id,src:index_key_only,gen:generation-1]".to_string()),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            select_list_index_provider_source_mode(&opts, ListSourceMode::IndexKeyOnly, &health),
-            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::GenerationMismatch)
-        );
-    }
-
-    #[test]
-    fn list_index_provider_selection_falls_back_when_degraded() {
-        let mut lifecycle = ListIndexLifecycle::disabled(10);
-        lifecycle.begin_rebuild("generation-1", 100);
-        lifecycle.checkpoint_rebuild(100);
-        assert!(lifecycle.publish_rebuild());
-        lifecycle.mark_degraded();
-        let health = lifecycle.health_snapshot();
-
-        assert_eq!(
-            select_list_index_provider_source_mode(&ListPathOptions::default(), ListSourceMode::IndexKeyOnly, &health),
-            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Degraded)
-        );
-    }
-
-    #[test]
-    fn metadata_fast_provider_selection_falls_back_when_checkpoint_lags() {
-        let mut lifecycle = ListIndexLifecycle::disabled(0);
-        lifecycle.begin_rebuild("generation-1", 100);
-        lifecycle.checkpoint_rebuild(100);
-        assert!(lifecycle.publish_rebuild());
-        lifecycle.observe_mutation_high_water_mark(101);
-        let health = lifecycle.health_snapshot();
-
-        assert_eq!(
-            select_list_index_provider_source_mode(&ListPathOptions::default(), ListSourceMode::IndexMetadataFast, &health),
-            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Lagging)
-        );
-    }
-
-    #[test]
     fn list_metadata_resolution_params_limits_plain_listing_to_latest_version() {
         let resolver = list_metadata_resolution_params("bucket".to_string(), 2, 3, false, 0);
 
@@ -11085,24 +6398,283 @@ mod test {
         assert_eq!(resolver.requested_versions, 0);
     }
 
+    async fn collect_native_listing(set: &SetDisks, bucket: &str, mode: &str) -> (Result<ListPathRawOutcome>, Vec<String>) {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let walk = set.list_path(
+            CancellationToken::new(),
+            ListPathOptions {
+                bucket: bucket.to_owned(),
+                ask_disks: mode.to_owned(),
+                recursive: true,
+                limit: 100,
+                ..Default::default()
+            },
+            sender,
+        );
+        let drain = async {
+            let mut names = Vec::new();
+            while let Some(entry) = receiver.recv().await {
+                if !entry.is_dir() {
+                    names.push(entry.name);
+                }
+            }
+            names
+        };
+        timeout(Duration::from_secs(10), async { tokio::join!(walk, drain) })
+            .await
+            .expect("native listing must terminate")
+    }
+
+    #[tokio::test]
+    async fn issue_8828_lists_ec8_at_half_of_a_default_ec4_set() {
+        let bucket = "issue-8828";
+        let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks(16, 4).await;
+        let entry = test_object_meta_entry_with_erasure_versions(
+            "readable.bin",
+            &[(
+                time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixture time"),
+                "etag",
+                8,
+                8,
+            )],
+        );
+        for (slot, dir) in dirs.iter().enumerate() {
+            let path = dir.path().join(bucket);
+            tokio::fs::create_dir_all(&path).await.expect("create bucket directory");
+            if slot < 9 {
+                let path = path.join(&entry.name);
+                tokio::fs::create_dir_all(&path).await.expect("create object directory");
+                tokio::fs::write(path.join(STORAGE_FORMAT_FILE), &entry.metadata)
+                    .await
+                    .expect("write metadata");
+            }
+        }
+        // A legal EC8 commit can occupy nine drives even while all sixteen are online.
+        for online in [16, 8, 7] {
+            {
+                let mut disks = set.disks.write().await;
+                for disk in disks.iter_mut().skip(online) {
+                    *disk = None;
+                }
+            }
+            for mode in ["optimal", "strict"] {
+                let (result, names) = collect_native_listing(&set, bucket, mode).await;
+                if online >= 8 {
+                    result.expect("EC8 committed metadata must remain listable");
+                    assert_eq!(names, ["readable.bin"], "online {online}, mode {mode}");
+                } else {
+                    assert!(matches!(result, Err(StorageError::ErasureReadQuorum)), "mode {mode}: {result:?}");
+                    assert!(names.is_empty(), "below read quorum must not publish objects");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_8828_rejects_unreadable_and_stale_agreed_versions() {
+        for (data, parity, copies, leading_free) in [(12, 4, 8, false), (8, 8, 7, false), (12, 4, 8, true)] {
+            let bucket = "issue-8828-unreadable";
+            let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks(16, 4).await;
+            let mut entry = test_object_meta_entry_with_erasure_versions(
+                "unreadable.bin",
+                &[(
+                    time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixture time"),
+                    "etag",
+                    data,
+                    parity,
+                )],
+            );
+            if leading_free {
+                let mut transitioned = test_transitioned_meta_entry(&entry.name, "remote-key", true);
+                let mut metadata = transitioned.cached.take().expect("free-version fixture");
+                metadata
+                    .versions
+                    .extend(entry.cached.take().expect("object fixture").versions);
+                assert!(metadata.versions[0].header.free_version());
+                entry.metadata = metadata.marshal_msg().expect("free and object metadata");
+                entry.cached = None;
+            }
+            for (slot, dir) in dirs.iter().enumerate() {
+                let path = dir.path().join(bucket);
+                tokio::fs::create_dir_all(&path).await.expect("create bucket directory");
+                if slot < copies {
+                    let path = path.join(&entry.name);
+                    tokio::fs::create_dir_all(&path).await.expect("create object directory");
+                    tokio::fs::write(path.join(STORAGE_FORMAT_FILE), &entry.metadata)
+                        .await
+                        .expect("write metadata");
+                }
+            }
+            {
+                let mut disks = set.disks.write().await;
+                for disk in disks.iter_mut().skip(8) {
+                    *disk = None;
+                }
+            }
+            for mode in ["optimal", "strict"] {
+                let (result, names) = collect_native_listing(&set, bucket, mode).await;
+                assert!(
+                    matches!(result, Err(StorageError::ErasureReadQuorum)),
+                    "layout {data}+{parity}, mode {mode}: {result:?}"
+                );
+                assert!(names.is_empty(), "unreadable/stale metadata must not publish an object");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_8828_collector_uses_the_latest_user_version_after_cleanup_records() {
+        for kind in ["object", "delete-marker", "free-only"] {
+            let bucket = "issue-8828-cleanup";
+            let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks(16, 4).await;
+            let mut entry = test_transitioned_meta_entry("key", "remote-key", true);
+            let metadata = entry.cached.as_mut().expect("cleanup fixture");
+            assert!(metadata.versions[0].header.free_version());
+            let time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("older user version");
+            match kind {
+                "object" => metadata.versions.extend(
+                    test_object_meta_entry_with_erasure_versions("key", &[(time, "etag", 8, 8)])
+                        .cached
+                        .expect("object fixture")
+                        .versions,
+                ),
+                "delete-marker" => metadata.versions.extend(
+                    test_delete_marker_meta_entry("key", time)
+                        .cached
+                        .expect("delete marker fixture")
+                        .versions,
+                ),
+                _ => {}
+            }
+            entry.metadata = metadata.marshal_msg().expect("cleanup and user metadata");
+            for cached in [true, false] {
+                for legacy in [false, true] {
+                    let mut candidate = entry.clone();
+                    if !cached {
+                        candidate.cached = None;
+                    }
+                    if legacy {
+                        candidate.metadata[6..8].copy_from_slice(&2u16.to_le_bytes());
+                    }
+                    assert_eq!(
+                        candidate.is_latest_delete_marker(),
+                        kind != "object",
+                        "{kind}, cached={cached}, legacy={legacy}"
+                    );
+                }
+            }
+            for dir in &dirs {
+                let path = dir.path().join(bucket).join(&entry.name);
+                tokio::fs::create_dir_all(&path).await.expect("create metadata directory");
+                tokio::fs::write(path.join(STORAGE_FORMAT_FILE), &entry.metadata)
+                    .await
+                    .expect("write cleanup history");
+            }
+            {
+                let mut disks = set.disks.write().await;
+                for disk in disks.iter_mut().skip(8) {
+                    *disk = None;
+                }
+            }
+            let result = set
+                .clone()
+                .list_path_result(&ListPathOptions {
+                    bucket: bucket.to_owned(),
+                    recursive: true,
+                    ask_disks: "strict".to_owned(),
+                    limit: 100,
+                    ..Default::default()
+                })
+                .await
+                .expect("collector should finish");
+            assert!(result.exhausted, "a complete metacache page is reported as exhausted");
+            let names: Vec<_> = result
+                .entries
+                .o
+                .0
+                .into_iter()
+                .flatten()
+                .filter(|entry| !entry.is_dir())
+                .map(|entry| entry.name)
+                .collect();
+            if kind == "object" {
+                assert_eq!(names, ["key"], "cleanup records must not hide a readable user version");
+            } else {
+                assert!(names.is_empty(), "real deletion and cleanup-only records remain hidden");
+            }
+        }
+    }
+
+    #[test]
+    fn agreed_filtered_history_preserves_selected_bodies_and_inline_data() {
+        for warm in [false, true] {
+            let mut entry = test_transitioned_meta_entry("key", "remote-key", true);
+            let time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("older version");
+            let history = test_object_meta_entry_with_erasure_versions(
+                "key",
+                &[(time, "visible", 8, 8), (time - time::Duration::seconds(1), "older", 8, 8)],
+            );
+            let cached = entry.cached.as_mut().expect("free record fixture");
+            cached.versions.extend(history.cached.expect("user history").versions);
+            let mut inline = vec![1];
+            rmp::encode::write_map_len(&mut inline, 1).expect("inline map");
+            rmp::encode::write_str(&mut inline, &cached.versions[1].header.version_id.expect("visible id").to_string())
+                .expect("inline key");
+            rmp::encode::write_bin(&mut inline, b"inline-payload").expect("inline value");
+            cached.data.update(&inline);
+            let body = cached.versions[1].meta.as_ptr();
+            entry.metadata = cached.marshal_msg().expect("complete history");
+            if !warm {
+                entry.cached = None;
+            }
+            let resolver = list_metadata_resolution_params("bucket".to_owned(), 4, 8, false, 8);
+            let ListingEntryResolution::Resolved(entry) = resolve_agreed_listing_entry(entry, 8, &resolver, true) else {
+                panic!("readable free-headed history must resolve");
+            };
+            let info = entry.to_fileinfo("bucket").expect("filtered visible version");
+            assert_eq!(info.metadata.get("etag").map(String::as_str), Some("visible"));
+            let cached = entry.cached.expect("filtered cache");
+            assert_eq!(cached.versions.len(), 2, "one free record and latest user version");
+            if warm {
+                assert_eq!(cached.versions[1].meta.as_ptr(), body, "selected cached body must move");
+            }
+            assert_eq!(cached.data.as_slice(), inline.as_slice(), "inline payload is preserved");
+            let decoded = FileMeta::load(&entry.metadata).expect("filtered serialized history");
+            assert_eq!(decoded.versions, cached.versions);
+            assert_eq!(decoded.data.as_slice(), inline.as_slice());
+        }
+    }
+
+    #[test]
+    fn latest_listing_primary_sizing_preserves_default_layout_and_sampling_modes() {
+        assert_eq!(super::preferred_listing_quorum(9, 16, 4, true), 12);
+        assert_eq!(super::preferred_listing_quorum(8, 16, 4, true), 12);
+        assert_eq!(
+            expand_ask_disks_for_object_quorum(8, 8, super::preferred_listing_quorum(8, 16, 4, true)),
+            8
+        );
+        assert_eq!(super::preferred_listing_quorum(1, 16, 4, false), 1);
+        assert_eq!(super::preferred_listing_quorum(2, 16, 4, false), 2);
+    }
+
     #[test]
     fn latest_listing_object_quorum_uses_write_quorum_for_strict_latest_listing() {
-        let required_quorum = latest_listing_required_object_quorum(2, 8, 4, true, 0);
+        let required_quorum = latest_listing_object_quorum(2, 8, true, 0);
         let ask_disks = expand_ask_disks_for_object_quorum(4, 8, required_quorum);
 
         assert_eq!(required_quorum, 5);
         assert_eq!(ask_disks, 5);
-        assert_eq!(latest_listing_object_quorum(2, 8, 4, true, 0), 5);
+        assert_eq!(latest_listing_object_quorum(2, 8, true, 0), 5);
     }
 
     #[test]
-    fn latest_listing_object_quorum_calculates_low_parity_write_quorum() {
-        let required_quorum = latest_listing_required_object_quorum(2, 8, 1, true, 0);
+    fn latest_listing_object_quorum_is_independent_of_payload_storage_class() {
+        let required_quorum = latest_listing_object_quorum(2, 8, true, 0);
         let ask_disks = expand_ask_disks_for_object_quorum(4, 8, required_quorum);
 
-        assert_eq!(required_quorum, 7);
-        assert_eq!(ask_disks, 7);
-        assert_eq!(latest_listing_object_quorum(2, 8, 1, true, 0), 7);
+        assert_eq!(required_quorum, 5);
+        assert_eq!(ask_disks, 5);
+        assert_eq!(latest_listing_object_quorum(2, 8, true, 0), 5);
     }
 
     #[test]
@@ -11111,10 +6683,10 @@ mod test {
         assert!(!enforce_latest_listing_write_quorum(true, "disk"));
         assert!(enforce_latest_listing_write_quorum(true, "optimal"));
         assert!(!enforce_latest_listing_write_quorum(false, "optimal"));
-        assert_eq!(latest_listing_required_object_quorum(1, 4, 2, false, 0), 1);
-        assert_eq!(latest_listing_object_quorum(1, 4, 2, false, 0), 1);
-        assert_eq!(latest_listing_required_object_quorum(2, 4, 2, false, 0), 2);
-        assert_eq!(latest_listing_object_quorum(2, 4, 2, false, 0), 2);
+        assert_eq!(latest_listing_object_quorum(1, 4, false, 0), 1);
+        assert_eq!(latest_listing_object_quorum(1, 4, false, 0), 1);
+        assert_eq!(latest_listing_object_quorum(2, 4, false, 0), 2);
+        assert_eq!(latest_listing_object_quorum(2, 4, false, 0), 2);
         assert_eq!(expand_ask_disks_for_object_quorum(2, 4, 2), 2);
     }
 
@@ -11124,15 +6696,15 @@ mod test {
         // write quorum 3 can only ever show 2 metadata copies to the listing.
         let slack = latest_listing_write_quorum_slack(true, 4, 3);
         assert_eq!(slack, 1);
-        assert_eq!(latest_listing_required_object_quorum(2, 4, 2, true, slack), 2);
-        assert_eq!(latest_listing_required_object_quorum(2, 4, 2, true, 0), 3);
+        assert_eq!(latest_listing_object_quorum(2, 4, true, slack), 2);
+        assert_eq!(latest_listing_object_quorum(2, 4, true, 0), 3);
 
         // The relaxed quorum never drops below the erasure read quorum, so a
         // quorum-deleted object (at most one stale copy) stays hidden even
         // with half the set unreachable.
         let slack = latest_listing_write_quorum_slack(true, 4, 2);
         assert_eq!(slack, 2);
-        assert_eq!(latest_listing_required_object_quorum(1, 4, 2, true, slack), 2);
+        assert_eq!(latest_listing_object_quorum(1, 4, true, slack), 2);
 
         assert_eq!(latest_listing_write_quorum_slack(false, 4, 2), 0);
     }
@@ -11144,7 +6716,7 @@ mod test {
         let entries = || MetaCacheEntries(vec![Some(entry.clone()), Some(entry.clone()), None]);
 
         let slack = latest_listing_write_quorum_slack(true, 4, 3);
-        let obj_quorum = latest_listing_object_quorum(2, 4, 2, true, slack);
+        let obj_quorum = latest_listing_object_quorum(2, 4, true, slack);
         assert_eq!(obj_quorum, 2);
         let resolver = list_metadata_resolution_params("bucket".to_string(), 2, obj_quorum, false, slack);
         let resolved = resolve_listing_entries(entries(), resolver, true)
@@ -11153,7 +6725,7 @@ mod test {
 
         // Without the unreachable-drive slack the same sample is dropped even
         // though the object still satisfies read quorum for GET.
-        let strict_quorum = latest_listing_object_quorum(2, 4, 2, true, 0);
+        let strict_quorum = latest_listing_object_quorum(2, 4, true, 0);
         let strict_resolver = list_metadata_resolution_params("bucket".to_string(), 2, strict_quorum, false, 0);
         assert!(resolve_listing_entries(entries(), strict_resolver, true).is_none());
     }
@@ -11165,14 +6737,14 @@ mod test {
         let mut resolver = list_metadata_resolution_params("bucket".to_string(), 2, 2, false, 1);
 
         assert!(matches!(
-            resolve_agreed_listing_entry(entry.clone(), 2, resolver.clone(), true),
+            resolve_agreed_listing_entry(entry.clone(), 2, &resolver, true),
             ListingEntryResolution::Resolved(_)
         ));
 
         resolver.write_quorum_slack = 0;
         assert!(matches!(
-            resolve_agreed_listing_entry(entry, 2, resolver, true),
-            ListingEntryResolution::NeedsSupplement(_, _)
+            resolve_agreed_listing_entry(entry, 2, &resolver, true),
+            ListingEntryResolution::NeedsSupplement(_)
         ));
     }
 
@@ -11185,24 +6757,24 @@ mod test {
         // 1. enforce_write_quorum = false immediately resolves without inspecting quorum or metadata.
         let strict_resolver = list_metadata_resolution_params("bucket".to_string(), 4, 4, false, 0);
         assert!(matches!(
-            resolve_agreed_listing_entry(obj_entry.clone(), 1, strict_resolver.clone(), false),
+            resolve_agreed_listing_entry(obj_entry.clone(), 1, &strict_resolver, false),
             ListingEntryResolution::Resolved(_)
         ));
 
         // 2. Directory entry resolves when reader_disks >= dir_quorum and rejects below dir_quorum.
         let dir_entry = test_dir_meta_entry("prefix/");
         assert!(matches!(
-            resolve_agreed_listing_entry(dir_entry.clone(), 4, strict_resolver.clone(), true),
+            resolve_agreed_listing_entry(dir_entry.clone(), 4, &strict_resolver, true),
             ListingEntryResolution::Resolved(_)
         ));
         assert!(matches!(
-            resolve_agreed_listing_entry(dir_entry, 3, strict_resolver.clone(), true),
+            resolve_agreed_listing_entry(dir_entry, 3, &strict_resolver, true),
             ListingEntryResolution::Rejected
         ));
 
         // 3. reader_disks < obj_quorum rejects before decoding xl.meta.
         assert!(matches!(
-            resolve_agreed_listing_entry(obj_entry, 3, strict_resolver, true),
+            resolve_agreed_listing_entry(obj_entry, 3, &strict_resolver, true),
             ListingEntryResolution::Rejected
         ));
 
@@ -11215,12 +6787,12 @@ mod test {
         };
         let q1_resolver = list_metadata_resolution_params("bucket".to_string(), 1, 1, false, 0);
         assert!(matches!(
-            resolve_agreed_listing_entry(corrupt_entry.clone(), 1, q1_resolver, true),
+            resolve_agreed_listing_entry(corrupt_entry.clone(), 1, &q1_resolver, true),
             ListingEntryResolution::Resolved(_)
         ));
         let q2_resolver = list_metadata_resolution_params("bucket".to_string(), 2, 2, false, 0);
         assert!(matches!(
-            resolve_agreed_listing_entry(corrupt_entry, 2, q2_resolver.clone(), true),
+            resolve_agreed_listing_entry(corrupt_entry, 2, &q2_resolver, true),
             ListingEntryResolution::Rejected
         ));
 
@@ -11244,12 +6816,11 @@ mod test {
         // `!first.header.free_version()` guard the fast-path would falsely resolve; instead
         // the loop inspects the 2+2 object version (write quorum 3) and requests a supplement.
         assert!(matches!(
-            resolve_agreed_listing_entry(transitioned.clone(), 2, q2_resolver.clone(), true),
-            ListingEntryResolution::NeedsSupplement(_, Some(_))
+            resolve_agreed_listing_entry(transitioned.clone(), 2, &q2_resolver, true),
+            ListingEntryResolution::NeedsSupplement(_)
         ));
 
-        let ListingEntryResolution::Resolved(resolved) = resolve_agreed_listing_entry(transitioned, 3, q2_resolver.clone(), true)
-        else {
+        let ListingEntryResolution::Resolved(resolved) = resolve_agreed_listing_entry(transitioned, 3, &q2_resolver, true) else {
             panic!("expected Resolved for free-version + committed object");
         };
         let info = resolved.to_fileinfo("bucket").expect("decode resolved entry");
@@ -11260,7 +6831,7 @@ mod test {
         let mut free_only = test_transitioned_meta_entry("free-only-obj", "remote-key", true);
         free_only.cached = None;
         assert!(matches!(
-            resolve_agreed_listing_entry(free_only, 3, q2_resolver, true),
+            resolve_agreed_listing_entry(free_only, 3, &q2_resolver, true),
             ListingEntryResolution::Resolved(_)
         ));
     }
@@ -11269,23 +6840,23 @@ mod test {
     fn cached_entry_supplement_check_honors_write_quorum_slack() {
         let mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
         let mut entry = test_object_meta_entry_with_erasure_versions("object", &[(mod_time, "etag", 2, 2)]);
-        let cached = entry.xl_meta().expect("test entry should decode");
+        entry.xl_meta_ref().expect("test entry should decode");
         let mut resolver = list_metadata_resolution_params("bucket".to_string(), 2, 2, false, 1);
 
-        assert!(!cached_entry_needs_supplement(&cached, 2, &resolver, true));
+        assert!(!entry.needs_quorum_supplement(2, &resolver).expect("valid metadata"));
 
         resolver.write_quorum_slack = 0;
-        assert!(cached_entry_needs_supplement(&cached, 2, &resolver, true));
+        assert!(entry.needs_quorum_supplement(2, &resolver).expect("valid metadata"));
     }
 
     #[test]
     fn latest_listing_object_quorum_requires_write_quorum_when_degraded_cannot_satisfy_it() {
-        let required_quorum = latest_listing_required_object_quorum(2, 8, 4, true, 0);
+        let required_quorum = latest_listing_object_quorum(2, 8, true, 0);
         let ask_disks = expand_ask_disks_for_object_quorum(4, 4, required_quorum);
 
         assert_eq!(required_quorum, 5);
         assert_eq!(ask_disks, 4);
-        assert_eq!(latest_listing_object_quorum(2, 8, 4, true, 0), 5);
+        assert_eq!(latest_listing_object_quorum(2, 8, true, 0), 5);
     }
 
     #[tokio::test]
@@ -11365,7 +6936,7 @@ mod test {
 
     #[tokio::test]
     async fn latest_listing_fails_closed_for_unversioned_two_by_two_metadata_split() {
-        async fn collect_listing(set: &Arc<SetDisks>, bucket: &str) -> (crate::error::Result<()>, Vec<String>) {
+        async fn collect_listing(set: &Arc<SetDisks>, bucket: &str) -> (crate::error::Result<ListPathRawOutcome>, Vec<String>) {
             let (sender, mut receiver) = mpsc::channel(4);
             let walk = set.list_path(
                 CancellationToken::new(),
@@ -11561,9 +7132,10 @@ mod test {
                     let seen = seen_clone.clone();
                     Box::pin(async move {
                         if !allow_agreed_objects && !entry.is_dir() {
-                            return;
+                            return Ok(());
                         }
                         seen.lock().expect("seen mutex poisoned").push(entry.name);
+                        Ok(())
                     })
                 })),
                 ..Default::default()
@@ -11592,9 +7164,10 @@ mod test {
                     let seen = seen_clone.clone();
                     Box::pin(async move {
                         if !allow_agreed_objects && !entry.is_dir() {
-                            return;
+                            return Ok(());
                         }
                         seen.lock().expect("seen mutex poisoned").push(entry.name);
+                        Ok(())
                     })
                 })),
                 ..Default::default()
@@ -11630,17 +7203,17 @@ mod test {
                     let resolver = resolver.clone();
                     let fallback_old_entry = fallback_old_entry.clone();
                     Box::pin(async move {
-                        let entry = match resolve_agreed_listing_entry(entry, 5, resolver.clone(), true) {
+                        let entry = match resolve_agreed_listing_entry(entry, 5, &resolver, true) {
                             ListingEntryResolution::Resolved(entry) => entry,
-                            ListingEntryResolution::NeedsSupplement(entry, _) => {
+                            ListingEntryResolution::NeedsSupplement(entry) => {
                                 let mut candidates = vec![Some(entry); 5];
                                 candidates.extend(vec![Some(fallback_old_entry); 2]);
                                 let Some(entry) = resolve_listing_entries(MetaCacheEntries(candidates), resolver, true) else {
-                                    return;
+                                    return Ok(());
                                 };
                                 entry
                             }
-                            ListingEntryResolution::Rejected => return,
+                            ListingEntryResolution::Rejected => return Ok(()),
                         };
                         let info = entry.to_fileinfo("bucket").expect("resolved entry should decode");
                         seen.lock().expect("seen mutex poisoned").push((
@@ -11648,6 +7221,7 @@ mod test {
                             info.mod_time,
                             info.metadata.get("etag").cloned(),
                         ));
+                        Ok(())
                     })
                 })),
                 ..Default::default()
@@ -11684,12 +7258,31 @@ mod test {
                     let seen = seen_clone.clone();
                     let resolver = resolver.clone();
                     Box::pin(async move {
-                        let entry = match resolve_agreed_listing_entry(entry, 5, resolver, true) {
+                        let entry = match resolve_agreed_listing_entry(entry, 5, &resolver, true) {
                             ListingEntryResolution::Resolved(entry) => entry,
-                            ListingEntryResolution::NeedsSupplement(_, Some(entry)) => entry,
-                            ListingEntryResolution::NeedsSupplement(_, None) | ListingEntryResolution::Rejected => {
-                                return;
+                            ListingEntryResolution::NeedsSupplement(entry) => {
+                                let supplement = ListingSupplement::new(
+                                    ListingSupplementOptions {
+                                        bucket: "bucket".to_string(),
+                                        path: String::new(),
+                                        recursive: true,
+                                        incl_deleted: false,
+                                        skip_hidden_prefix_check: false,
+                                        filter_prefix: None,
+                                        forward_to: None,
+                                        per_disk_limit: 0,
+                                        skip_total_timeout: true,
+                                        walkdir_timeout: None,
+                                        walkdir_stall_timeout: None,
+                                    },
+                                    Arc::new(Vec::new()),
+                                    FallbackClaimTracker::default(),
+                                );
+                                super::resolve_agreed_listing_entry_with_supplement(entry, 5, resolver, supplement)
+                                    .await?
+                                    .expect("the previous committed version must resolve without extra disks")
                             }
+                            ListingEntryResolution::Rejected => return Ok(()),
                         };
                         let info = entry.to_fileinfo("bucket").expect("resolved entry should decode");
                         seen.lock().expect("seen mutex poisoned").push((
@@ -11697,6 +7290,7 @@ mod test {
                             info.mod_time,
                             info.metadata.get("etag").cloned(),
                         ));
+                        Ok(())
                     })
                 })),
                 ..Default::default()
@@ -11731,10 +7325,10 @@ mod test {
                     let resolver = resolver.clone();
                     let fallback_entry = fallback_entry.clone();
                     Box::pin(async move {
-                        let ListingEntryResolution::NeedsSupplement(entry, _) =
-                            resolve_agreed_listing_entry(entry, 5, resolver.clone(), true)
+                        let ListingEntryResolution::NeedsSupplement(entry) =
+                            resolve_agreed_listing_entry(entry, 5, &resolver, true)
                         else {
-                            return;
+                            return Ok(());
                         };
                         let mut candidates = vec![Some(entry); 5];
                         candidates.extend(vec![Some(fallback_entry); 2]);
@@ -11746,6 +7340,7 @@ mod test {
                             info.mod_time,
                             info.metadata.get("etag").cloned(),
                         ));
+                        Ok(())
                     })
                 })),
                 ..Default::default()
@@ -11771,7 +7366,7 @@ mod test {
                 disks: vec![None, None, None, None],
                 min_disks: raw_min_disks,
                 test_reader_behaviors: vec![TestReaderBehavior::Entries(vec![entry]); 4],
-                agreed: Some(Box::new(move |_| Box::pin(async {}))),
+                agreed: Some(Box::new(move |_| Box::pin(async { Ok(()) }))),
                 ..Default::default()
             },
         )
@@ -11878,111 +7473,6 @@ mod test {
         assert_eq!(parsed.cursor_source, Some(ListSourceMode::IndexKeyOnly));
         assert_eq!(parsed.cursor_generation.as_deref(), Some("generation-42"));
         assert!(!parsed.create);
-    }
-
-    #[test]
-    fn list_source_modes_expose_metadata_authority_boundaries() {
-        assert_eq!(ListSourceMode::Walker.metadata_authority(), ListMetadataAuthority::LiveXlMeta);
-        assert_eq!(
-            ListSourceMode::IndexKeyOnly.metadata_authority(),
-            ListMetadataAuthority::LiveVerifiedIndexCandidate
-        );
-        assert_eq!(
-            ListSourceMode::IndexVerifiedPage.metadata_authority(),
-            ListMetadataAuthority::LiveVerifiedIndexCandidate
-        );
-        assert_eq!(
-            ListSourceMode::IndexMetadataFast.metadata_authority(),
-            ListMetadataAuthority::IndexSnapshotEventuallyConsistent
-        );
-
-        assert!(ListSourceMode::IndexKeyOnly.requires_live_metadata_verification());
-        assert!(ListSourceMode::IndexVerifiedPage.requires_live_metadata_verification());
-        assert!(!ListSourceMode::IndexMetadataFast.requires_live_metadata_verification());
-        assert!(!ListSourceMode::IndexMetadataFast.can_satisfy_strong_listing());
-    }
-
-    #[test]
-    fn list_index_source_selection_falls_back_until_request_is_healthy_and_versioned() {
-        let healthy = TestIndexHealth { reason: None };
-        let unhealthy = TestIndexHealth {
-            reason: Some(ListIndexFallbackReason::Unhealthy),
-        };
-
-        assert_eq!(
-            select_list_index_source_mode(None, Some("generation-1"), &healthy),
-            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Disabled)
-        );
-        assert_eq!(
-            select_list_index_source_mode(Some(ListSourceMode::Walker), Some("generation-1"), &healthy),
-            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Disabled)
-        );
-        assert_eq!(
-            select_list_index_source_mode(Some(ListSourceMode::IndexKeyOnly), None, &healthy),
-            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::MissingGeneration)
-        );
-        assert_eq!(
-            select_list_index_source_mode(Some(ListSourceMode::IndexKeyOnly), Some(""), &healthy),
-            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::MissingGeneration)
-        );
-        assert_eq!(
-            select_list_index_source_mode(Some(ListSourceMode::IndexKeyOnly), Some("generation-1"), &unhealthy),
-            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Unhealthy)
-        );
-        assert_eq!(
-            select_list_index_source_mode(Some(ListSourceMode::IndexVerifiedPage), Some("generation-1"), &healthy),
-            ListIndexSourceDecision::UseIndex(ListSourceMode::IndexVerifiedPage)
-        );
-    }
-
-    #[test]
-    fn list_index_lifecycle_rebuild_requires_publish_before_health() {
-        let mut lifecycle = ListIndexLifecycle::disabled(10);
-
-        lifecycle.begin_rebuild("generation-1", 100);
-        lifecycle.checkpoint_rebuild(80);
-
-        let snapshot = lifecycle.health_snapshot();
-        assert_eq!(snapshot.state, ListIndexLifecycleState::Rebuilding);
-        assert_eq!(snapshot.active_generation, None);
-        assert_eq!(snapshot.staging_generation.as_deref(), Some("generation-1"));
-        assert_eq!(snapshot.checkpoint_high_water_mark, 80);
-        assert_eq!(snapshot.fallback_reason, Some(ListIndexFallbackReason::Rebuilding));
-
-        assert!(lifecycle.publish_rebuild());
-        let snapshot = lifecycle.health_snapshot();
-        assert_eq!(snapshot.state, ListIndexLifecycleState::Healthy);
-        assert_eq!(snapshot.active_generation.as_deref(), Some("generation-1"));
-        assert_eq!(snapshot.staging_generation, None);
-        assert_eq!(snapshot.fallback_reason, None);
-    }
-
-    #[test]
-    fn list_index_lifecycle_reports_lagging_and_fallback_reason() {
-        let mut lifecycle = ListIndexLifecycle::disabled(10);
-        lifecycle.begin_rebuild("generation-1", 100);
-        lifecycle.checkpoint_rebuild(100);
-        assert!(lifecycle.publish_rebuild());
-
-        lifecycle.observe_mutation_high_water_mark(115);
-        let snapshot = lifecycle.health_snapshot();
-
-        assert_eq!(snapshot.state, ListIndexLifecycleState::Lagging);
-        assert_eq!(snapshot.mutation_lag, 15);
-        assert_eq!(snapshot.fallback_reason, Some(ListIndexFallbackReason::Lagging));
-    }
-
-    #[test]
-    fn list_index_lifecycle_reports_degraded_as_fallback() {
-        let mut lifecycle = ListIndexLifecycle::disabled(10);
-        lifecycle.begin_rebuild("generation-1", 100);
-        lifecycle.checkpoint_rebuild(100);
-        assert!(lifecycle.publish_rebuild());
-
-        lifecycle.mark_degraded();
-        let degraded = lifecycle.health_snapshot();
-        assert_eq!(degraded.state, ListIndexLifecycleState::Degraded);
-        assert_eq!(degraded.fallback_reason, Some(ListIndexFallbackReason::Degraded));
     }
 
     #[test]
@@ -12105,8 +7595,8 @@ mod test {
     }
 
     #[test]
-    fn walk_result_from_set_errors_returns_non_eof_error() {
-        let err = walk_result_from_set_errors(&[Some(StorageError::Unexpected), Some(StorageError::FileAccessDenied)])
+    fn walk_result_from_set_errors_returns_real_error_after_missing_entries() {
+        let err = walk_result_from_set_errors(&[Some(StorageError::FileNotFound), Some(StorageError::FileAccessDenied)])
             .expect_err("walk should fail when any set reports a real listing error");
 
         assert_eq!(err, StorageError::FileAccessDenied);
@@ -12138,10 +7628,14 @@ mod test {
             .expect("missing objects under an existing listing path should not fail the walk");
     }
 
+    // `Unexpected` is a failure like any other; it no longer doubles as the
+    // "this set reached the end of its listing" sentinel.
     #[test]
-    fn walk_result_from_set_errors_ignores_only_unexpected_and_successes() {
-        walk_result_from_set_errors(&[None, Some(StorageError::Unexpected)])
-            .expect("successful sets and unexpected EOF-style markers should not fail the walk");
+    fn walk_result_from_set_errors_surfaces_unexpected_next_to_successes() {
+        let err = walk_result_from_set_errors(&[None, Some(StorageError::Unexpected)])
+            .expect_err("an unexpected set failure must fail the walk instead of posing as EOF");
+
+        assert_eq!(err, StorageError::Unexpected);
     }
 
     // Regression for #952 (ECA-11): when every set is unreachable the walk must
@@ -12588,9 +8082,9 @@ mod test {
         opts: ListPathOptions,
         recv: mpsc::Receiver<MetaCacheEntry>,
         producer: P,
-    ) -> rustfs_filemeta::MetaCacheEntriesSortedResult
+    ) -> Result<super::ListPage>
     where
-        P: std::future::Future<Output = Result<()>> + Send + 'static,
+        P: std::future::Future<Output = Result<ListPathRawOutcome>> + Send + 'static,
     {
         let context = super::ListPathLogContext::from_options(&opts);
         super::collect_list_path_results("test", &context, cancel, opts, recv, producer).await
@@ -12610,8 +8104,7 @@ mod test {
         .expect("producer panic must not strand the collector");
         assert!(
             result
-                .err
-                .expect("panic must be reported")
+                .expect_err("panic must be reported")
                 .to_string()
                 .contains("listing worker panicked")
         );
@@ -12645,13 +8138,14 @@ mod test {
                     Some(rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller::ListObjects)
                 );
                 drop(sender);
-                Ok(())
+                Ok(ListPathRawOutcome::default())
             })
             .await
         })
         .await;
 
-        assert!(result.err.is_some(), "the empty page channel remains an error");
+        let page = result.expect("an empty drained page is a successful page");
+        assert!(page.exhausted && page.entries.entries().is_empty());
         assert_eq!(rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(), None);
     }
 
@@ -12664,7 +8158,27 @@ mod test {
             Err(StorageError::FileCorrupt)
         })
         .await;
-        assert_eq!(result.err, Some(rustfs_filemeta::Error::FileCorrupt));
+        assert_eq!(
+            result.expect_err("producer failure must surface after the input closes"),
+            StorageError::FileCorrupt
+        );
+    }
+
+    /// `Unexpected` used to double as the EOF sentinel, so a producer failing
+    /// with it read as "listing complete". It must surface as the error it is.
+    #[tokio::test]
+    async fn list_path_workers_surface_unexpected_producer_failure_instead_of_empty_page() {
+        let (sender, recv) = mpsc::channel(1);
+        let result = collect_list_path_results(CancellationToken::new(), ListPathOptions::default(), recv, async move {
+            drop(sender);
+            tokio::task::yield_now().await;
+            Err(StorageError::Unexpected)
+        })
+        .await;
+        assert_eq!(
+            result.expect_err("an unexpected producer failure must not pose as a complete empty page"),
+            StorageError::Unexpected
+        );
     }
 
     #[tokio::test]
@@ -12682,14 +8196,18 @@ mod test {
                 for name in ["a", "b", "c"] {
                     sender.try_send(test_meta_entry(name)).expect("queue page");
                 }
-                Ok(())
+                Ok(ListPathRawOutcome::default())
             },
         )
         .await;
-        assert_eq!(result.err, Some(rustfs_filemeta::Error::Unexpected));
-        let entries = result.entries.expect("EOF retains entries");
+        let page = result.expect("a drained page is a successful page");
+        assert!(page.exhausted, "a closed input with no bounded producer is the end of the listing");
         assert_eq!(
-            entries.entries().iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+            page.entries
+                .entries()
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
             ["a", "b", "c"]
         );
     }
@@ -12712,14 +8230,15 @@ mod test {
                 async move {
                     let _drop_guard = producer_dropped.drop_guard();
                     sender.send(test_meta_entry("a")).await.expect("send page");
-                    std::future::pending::<Result<()>>().await
+                    std::future::pending::<Result<ListPathRawOutcome>>().await
                 },
             ),
         )
         .await
         .expect("page limit must not wait for a producer that ignores cancellation");
-        assert!(result.err.is_none());
-        assert_eq!(result.entries.expect("page").entries().len(), 1);
+        let page = result.expect("page");
+        assert!(!page.exhausted, "a page cut at its limit may have more");
+        assert_eq!(page.entries.entries().len(), 1);
         assert!(dropped.is_cancelled(), "producer must be dropped before the page is returned");
     }
 
@@ -12733,7 +8252,7 @@ mod test {
         let parent = tokio::spawn(collect_list_path_results(cancel.clone(), ListPathOptions::default(), recv, async move {
             let _drop_guard = producer_dropped.drop_guard();
             started_tx.send(()).expect("notify parent");
-            std::future::pending::<Result<()>>().await
+            std::future::pending::<Result<ListPathRawOutcome>>().await
         }));
         started_rx.await.expect("producer started");
         parent.abort();
@@ -12765,7 +8284,10 @@ mod test {
                 },
             )
             .await;
-            assert_eq!(result.err, Some(rustfs_filemeta::Error::FileCorrupt));
+            assert_eq!(
+                result.expect_err("a ready producer error must win over the page limit"),
+                StorageError::FileCorrupt
+            );
         }
     }
 

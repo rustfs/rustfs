@@ -283,6 +283,22 @@ impl ObjectLockConfigSnapshot {
         self.metadata_transaction_guard.clone()
     }
 
+    /// Returns the snapshot's validated bucket incarnation ID only while both the
+    /// lifecycle read fence and the metadata-transaction guard remain active and
+    /// unreleased for `(store_id, bucket)`.
+    pub(crate) fn validated_bucket_incarnation_for(
+        &self,
+        store_id: Uuid,
+        bucket: &str,
+        expected_incarnation_id: Option<Uuid>,
+    ) -> Option<Uuid> {
+        let guard = self.metadata_transaction_guard_for(store_id, bucket, expected_incarnation_id)?;
+        if guard.is_released() {
+            return None;
+        }
+        self.bucket_incarnation_id
+    }
+
     pub(crate) fn add_lock_fences(&self, opts: &mut ObjectOptions) {
         opts.bucket_lifecycle_lock_fence
             .get_or_insert_with(NamespaceLockFence::new)

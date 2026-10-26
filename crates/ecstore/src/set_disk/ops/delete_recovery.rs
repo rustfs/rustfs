@@ -113,6 +113,7 @@ pub(crate) struct DeleteRecoveryContext<'a> {
     pub repair_marker_source: bool,
     pub namespace_owner: Option<Arc<dyn Send + Sync>>,
     pub recovery_ticket: Option<crate::store::delete_recovery_runtime::DeleteRecoveryTicket>,
+    pub published_hint: Option<(Uuid, &'a [Result<DeleteRecoveryInspection>])>,
     pub can_commit: &'a (dyn Fn() -> bool + Sync),
 }
 
@@ -125,6 +126,7 @@ impl<'a> DeleteRecoveryContext<'a> {
             repair_marker_source: false,
             namespace_owner: None,
             recovery_ticket: None,
+            published_hint: None,
             can_commit,
         }
     }
@@ -421,7 +423,9 @@ impl SetDisks {
         let cleanup = loop {
             #[cfg(test)]
             test_hooks::record_cleanup_attempt(bucket, object);
-            match self.recover_delete_key(bucket, object, context.clone()).await {
+            let mut attempt_context = context.clone();
+            attempt_context.published_hint = (attempt == 1).then_some((transaction, published.as_slice()));
+            match self.recover_delete_key(bucket, object, attempt_context).await {
                 // A stale settlement fingerprint only means the snapshot raced
                 // another writer; each attempt re-inspects every participant.
                 Err(DiskError::OutdatedXLMeta) if attempt < PUBLISHED_CLEANUP_ATTEMPTS && can_commit() => attempt += 1,
@@ -551,6 +555,7 @@ impl SetDisks {
             explicit_delete,
             repair_marker_source,
             namespace_owner,
+            published_hint,
             can_commit,
             recovery_ticket: _,
         } = context;
@@ -589,7 +594,18 @@ impl SetDisks {
         let mut all_states = BTreeMap::new();
         for transaction in transactions {
             let mut complete = Vec::with_capacity(disks.len());
-            for state in inspect(&disks, bucket, object, transaction).await {
+            let inspections = if let Some((published_tx, published_states)) = published_hint
+                && !repair_marker_source
+                && !dry_run
+                && published_tx == transaction
+                && published_states.len() == disks.len()
+                && published_states.iter().all(Result::is_ok)
+            {
+                published_states.to_vec()
+            } else {
+                inspect(&disks, bucket, object, transaction).await
+            };
+            for state in inspections {
                 match state {
                     Ok(state) => {
                         if let Some(journal) = &state.journal {
@@ -832,6 +848,9 @@ impl SetDisks {
                     bucket,
                     copies,
                     |copy| {
+                        if receipt(copy.state) && copy.commit_data_safe {
+                            return None;
+                        }
                         Some(
                             if copy.state == DeleteRecoveryState::Absent
                                 || (certified_same_transaction
@@ -857,7 +876,10 @@ impl SetDisks {
                         &disks,
                         bucket,
                         copies,
-                        |_| Some(DeleteRecoveryAction::FinishCommit),
+                        |copy| {
+                            (copy.state != DeleteRecoveryState::CommitFinished || !copy.commit_data_safe)
+                                .then_some(DeleteRecoveryAction::FinishCommit)
+                        },
                         can_commit,
                         namespace_owner.as_ref(),
                         &mut summary.removed_versions,
@@ -922,13 +944,25 @@ impl SetDisks {
             // GC is a key-wide barrier: every predecessor must have settled
             // before the last surviving commit witness can disappear.
             let mut settled = Vec::with_capacity(all_states.len());
-            for transaction in all_states.keys() {
-                let fresh = inspect(&disks, bucket, object, *transaction).await;
-                if fresh.iter().any(|state| !matches!(state, Ok(state) if matches!(state.state, DeleteRecoveryState::Absent | DeleteRecoveryState::CommitFinished))) {
+            if all_states.len() == 1 {
+                let copies = all_states.into_values().next().ok_or(DiskError::FileCorrupt)?;
+                if copies
+                    .iter()
+                    .any(|state| !matches!(state.state, DeleteRecoveryState::Absent | DeleteRecoveryState::CommitFinished))
+                {
                     summary.pending += 1;
                     return Ok(summary);
                 }
-                settled.push(fresh.into_iter().collect::<Result<Vec<_>>>()?);
+                settled.push(copies);
+            } else {
+                for transaction in all_states.keys() {
+                    let fresh = inspect(&disks, bucket, object, *transaction).await;
+                    if fresh.iter().any(|state| !matches!(state, Ok(state) if matches!(state.state, DeleteRecoveryState::Absent | DeleteRecoveryState::CommitFinished))) {
+                        summary.pending += 1;
+                        return Ok(summary);
+                    }
+                    settled.push(fresh.into_iter().collect::<Result<Vec<_>>>()?);
+                }
             }
             for (index, mut copies) in settled.into_iter().enumerate() {
                 if index > 0 {
@@ -1784,6 +1818,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_recovery_set_replays_partial_gc_with_empty_transaction_directory() {
+        let bucket = "recover-empty-gc";
+        let (dirs, store, disks) = fixture(bucket).await;
+        put(&store, bucket, &[24; 4096], false).await;
+        let transaction = applied(&store, &disks, bucket, None, disks.len()).await;
+        for (index, disk) in disks.iter().enumerate() {
+            publish(disk, bucket, transaction).await;
+            let state = disk.inspect_delete_transaction(bucket, "object", transaction).await.unwrap();
+            let finished = disk
+                .settle_delete_transaction(bucket, "object", transaction, state.fingerprint, DeleteRecoveryAction::FinishCommit)
+                .await
+                .unwrap();
+            if index > 0 {
+                disk.settle_delete_transaction(
+                    bucket,
+                    "object",
+                    transaction,
+                    finished.fingerprint,
+                    DeleteRecoveryAction::FinalizeCommit,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        // A crash can persist proof removal before the final empty rmdir.
+        let empty = dirs[3].path().join(bucket).join("object").join(transaction.to_string());
+        tokio::fs::create_dir_all(&empty).await.unwrap();
+        for _ in 0..2 {
+            store
+                .recover_delete_transactions(bucket, &HealOpts::default())
+                .await
+                .expect("the remaining receipt must settle every participant without a fresh delete");
+            for disk in &disks {
+                assert!(discover(disk, bucket, Some("object")).await.unwrap().is_empty());
+                assert!(
+                    disk.inspect_delete_transaction(bucket, "object", transaction)
+                        .await
+                        .unwrap()
+                        .current_digest
+                        .is_none()
+                );
+            }
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("ordinary bucket removal must succeed after replay");
+    }
+
+    #[tokio::test]
     async fn delete_recovery_tracks_only_observed_removed_version() {
         let bucket = "recover-actual-removal";
         let (_dirs, store, disks) = fixture(bucket).await;
@@ -2557,100 +2641,328 @@ mod tests {
     #[tokio::test]
     async fn heal_mrf_inline_overwrite_does_not_strand_rollback_backup() {
         use crate::disk::STORAGE_FORMAT_FILE_BACKUP;
-        use crate::disk::local::inline_metadata_rollback_dir;
+        use crate::disk::local::{DurabilityMode, durability_mode, effective_durability, inline_metadata_rollback_dir};
+        use crate::layout::endpoint::Endpoint;
+        use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+        use crate::layout::format::FormatV3;
         use crate::object_api::ShardIntegrityWriteMode;
+        use crate::store::init_format::load_format_erasure;
         use rustfs_filemeta::FileMeta;
         use rustfs_heal_contracts::heal_channel::{HealScanMode, LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL};
 
-        for incoming_inline in [true, false] {
-            let bucket = if incoming_inline {
-                "heal-inline-rollback"
-            } else {
-                "heal-inline-to-external-rollback"
-            };
-            let (dirs, store, disks) = fixture(bucket).await;
-            let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity");
-            let synthetic = inline_metadata_rollback_dir(Uuid::nil(), &FileMeta::new());
-            let object = "object";
-            let child = format!("{object}/{synthetic}");
-            let child_body = b"child bytes must survive parent repair".to_vec();
-            let write_options = ObjectOptions {
-                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
-                write_completion: crate::object_api::WriteCompletion::TailDrained,
-                ..Default::default()
-            };
-            for (key, body) in [(child.as_str(), child_body.as_slice()), (object, b"inline-gen-1".as_slice())] {
-                store
-                    .put_object(bucket, key, &mut PutObjReader::from_vec(body.to_vec()), &write_options)
-                    .await
-                    .expect("seed initial inline objects");
-            }
-            let read_options = ReadOptions {
-                read_data: true,
-                ..Default::default()
-            };
-            let old_child = disks[3]
-                .read_version("", bucket, &child, "", &read_options)
-                .await
-                .expect("physical child before repair");
-            let set = &store.pools[0].disk_set[0];
-            set.disks.write().await[3] = None;
-            let payload = if incoming_inline {
-                b"inline-gen-2-updated".to_vec()
-            } else {
-                vec![0x53; 1024 * 1024]
-            };
-            store
-                .put_object(bucket, object, &mut PutObjReader::from_vec(payload.clone()), &write_options)
-                .await
-                .expect("degraded overwrite with a real stale target");
-            set.disks.write().await[3] = Some(disks[3].clone());
-            let donor = disks[0]
-                .read_version("", bucket, object, "", &read_options)
-                .await
-                .expect("current donor generation");
-            assert_eq!(donor.data.is_some(), incoming_inline, "fixture must use the intended commit branch");
-            let heal_opts = HealOpts {
-                scan_mode: HealScanMode::Normal,
-                ..Default::default()
-            };
-            let first = store
-                .heal_mrf_object_at_incarnation(bucket, object, "", incarnation, &heal_opts)
-                .await
-                .expect("first MRF repair");
-            assert!(first.error.is_none(), "first MRF repair: {:?}", first.error);
-            assert_eq!(first.item.drives_healed(), Some(1));
-            assert!(!first.item.repair_verified);
-            assert_eq!(first.item.detail, LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL);
-            let target = disks[3]
-                .read_version("", bucket, object, "", &read_options)
-                .await
-                .expect("repaired target generation");
-            assert_eq!(target.mod_time, donor.mod_time);
-            assert_eq!(target.data_dir, donor.data_dir);
-            assert_eq!(target.size, donor.size);
-            assert_eq!(target.version_id, donor.version_id);
-            let child_after = disks[3]
-                .read_version("", bucket, &child, "", &read_options)
-                .await
-                .expect("physical child survives parent cleanup");
-            assert_eq!(child_after.data, old_child.data);
-            assert!(child_after.data.is_some(), "child fixture must carry its physical inline bytes");
-            let child_dir = dirs[3].path().join(bucket).join(object).join(synthetic.to_string());
-            assert!(!child_dir.join(STORAGE_FORMAT_FILE_BACKUP).exists());
-            assert!(child_dir.join(STORAGE_FORMAT_FILE).exists());
-            let second = store
-                .heal_mrf_object_at_incarnation(bucket, object, "", incarnation, &heal_opts)
-                .await
-                .expect("follow-up MRF check must not return SlowDown");
-            assert!(second.error.is_none(), "second MRF check: {:?}", second.error);
-            assert_eq!(second.item.drives_healed(), Some(0));
-            assert_eq!(second.item.detail, LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL);
+        const CHILD_MANIFEST: &str = "RUSTFS_HEAL_MRF_RESTART_MANIFEST";
+        const CHILD_PHASE: &str = "RUSTFS_HEAL_MRF_RESTART_PHASE";
+        const TEST_NAME: &str =
+            "set_disk::ops::delete_recovery::tests::heal_mrf_inline_overwrite_does_not_strand_rollback_backup";
 
-            // EC2+2: force the repaired shard to participate in the exact read quorum.
+        fn object_tree(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+            let mut tree = BTreeMap::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(directory) = pending.pop() {
+                for entry in std::fs::read_dir(directory).expect("read object tree") {
+                    let path = entry.expect("object tree entry").path();
+                    let relative = path
+                        .strip_prefix(root)
+                        .expect("object tree stays below its root")
+                        .to_path_buf();
+                    if path.is_dir() {
+                        tree.insert(relative, None);
+                        pending.push(path);
+                    } else {
+                        tree.insert(relative, Some(std::fs::read(path).expect("read original object bytes")));
+                    }
+                }
+            }
+            tree
+        }
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct RestartDisk {
+            root: std::path::PathBuf,
+            slot: [i32; 3],
+            disk_id: Uuid,
+            format: FormatV3,
+            transaction: Uuid,
+            evidence: DeleteRecoveryInspection,
+            tree: BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
+        }
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct RestartFixture {
+            writer_pid: u32,
+            receipt_nonce: Uuid,
+            incoming_inline: bool,
+            legacy: bool,
+            set_count: usize,
+            drives_per_set: usize,
+            cmd_line: String,
+            platform: String,
+            bucket: String,
+            object: String,
+            incarnation: Uuid,
+            reads: Vec<(String, Option<String>, Vec<u8>)>,
+            disks: Vec<RestartDisk>,
+        }
+
+        fn read_restart_fixture(path: &std::path::Path) -> RestartFixture {
+            rmp_serde::from_slice(&std::fs::read(path).expect("read persisted MRF fixture"))
+                .expect("decode persisted MRF fixture")
+        }
+
+        fn assert_owned_disk_root(owned_root: &std::path::Path, disk_root: &std::path::Path) {
+            let owned_root = owned_root.canonicalize().expect("supervisor root must exist");
+            let disk_root = disk_root.canonicalize().expect("original disk directory must exist");
+            assert_ne!(disk_root, owned_root, "each disk must have its own directory");
+            assert!(
+                disk_root.starts_with(&owned_root),
+                "restart disk must remain below the supervisor-owned root"
+            );
+        }
+
+        async fn run_restart_process(phase: &str, owned_root: &std::path::Path, manifest_path: &std::path::Path) -> u32 {
+            let child_phase = phase.to_string();
+            let owned_root = owned_root.to_path_buf();
+            let manifest_path = manifest_path.to_path_buf();
+            let (child_pid, output, timed_out) = tokio::task::spawn_blocking(move || {
+                let mut child = std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                    .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+                    .env(CHILD_PHASE, child_phase)
+                    .env(CHILD_MANIFEST, manifest_path)
+                    .env("TMPDIR", &owned_root)
+                    .env("TMP", &owned_root)
+                    .env("TEMP", &owned_root)
+                    .env("RUSTFS_DURABILITY_MODE", "strict")
+                    .env("RUSTFS_NEW_BUCKET_DURABILITY_MODE", "strict")
+                    .env("RUSTFS_EXPERIMENTAL_DST_DIR_FSYNC_GROUP_COMMIT_ENABLE", "false")
+                    .env("RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_ENABLE", "false")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("start independent MRF restart process");
+                let child_pid = child.id();
+                let mut stdout = child.stdout.take().expect("captured child stdout");
+                let stdout = std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(&mut stdout, &mut bytes).expect("drain child stdout");
+                    bytes
+                });
+                let mut stderr = child.stderr.take().expect("captured child stderr");
+                let stderr = std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(&mut stderr, &mut bytes).expect("drain child stderr");
+                    bytes
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                let (status, timed_out) = loop {
+                    if let Some(status) = child.try_wait().expect("observe restart process") {
+                        break (status, false);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        break (child.wait().expect("reap timed-out restart process"), true);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                };
+                (
+                    child_pid,
+                    std::process::Output {
+                        status,
+                        stdout: stdout.join().expect("child stdout reader"),
+                        stderr: stderr.join().expect("child stderr reader"),
+                    },
+                    timed_out,
+                )
+            })
+            .await
+            .expect("restart process supervisor");
+            println!("MRF {phase} child {child_pid}:\n{}", String::from_utf8_lossy(&output.stdout));
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+            assert!(!timed_out, "MRF {phase} process exceeded its 60-second deadline");
+            assert!(output.status.success(), "MRF {phase} process failed: {}", output.status);
+            assert_ne!(child_pid, std::process::id(), "fixture must execute in a separate process");
+            child_pid
+        }
+
+        let Some(phase) = std::env::var_os(CHILD_PHASE) else {
+            for (phase, incoming_inline) in [("writer-inline", true), ("writer-external", false)] {
+                let restart_dir = tempfile::tempdir().expect("supervisor-owned restart directory");
+                let owned_root = restart_dir.path().to_path_buf();
+                let manifest_path = owned_root.join("fixture.msgpack");
+                assert!(!manifest_path.exists(), "each writer must produce a fresh manifest");
+                let writer_pid = run_restart_process(phase, &owned_root, &manifest_path).await;
+                let persisted = read_restart_fixture(&manifest_path);
+                assert_eq!(persisted.writer_pid, writer_pid, "the manifest must come from the exited writer");
+                assert_eq!(persisted.incoming_inline, incoming_inline, "each destination branch must run");
+                for disk in &persisted.disks {
+                    assert_owned_disk_root(&owned_root, &disk.root);
+                }
+                println!("MRF {phase} writer {writer_pid} exited successfully before verifier start");
+                let verifier_pid = run_restart_process("verify", &owned_root, &manifest_path).await;
+                assert_ne!(verifier_pid, writer_pid, "the verifier must not be the exited writer");
+                assert_eq!(
+                    std::fs::read_to_string(manifest_path.with_extension("verified"))
+                        .expect("verifier must finish the selected test and write its unique receipt"),
+                    format!("{}:{writer_pid}:{verifier_pid}", persisted.receipt_nonce)
+                );
+                for disk in &persisted.disks {
+                    assert_eq!(
+                        object_tree(&disk.root.join(&persisted.bucket).join(&persisted.object)),
+                        disk.tree,
+                        "writer exit and verifier exit must leave every original object file and directory unchanged"
+                    );
+                }
+                println!(
+                    "MRF_RESTART_RECEIPT {}",
+                    serde_json::json!({
+                        "case": phase,
+                        "writer_pid": writer_pid,
+                        "writer_exit": "success",
+                        "writer_exit_before_verifier_start": true,
+                        "verifier_pid": verifier_pid,
+                        "verifier_exit": "success",
+                        "nonce": persisted.receipt_nonce,
+                    })
+                );
+            }
+            return;
+        };
+        let phase = phase.to_str().expect("restart phase must be UTF-8");
+        let manifest_path =
+            std::path::PathBuf::from(std::env::var_os(CHILD_MANIFEST).expect("restart child requires its supervisor manifest"));
+        let owned_root = manifest_path
+            .parent()
+            .expect("manifest must have a supervisor-owned parent")
+            .to_path_buf();
+        assert!(owned_root.is_dir(), "supervisor root must exist");
+
+        if phase == "verify" {
+            let persisted = read_restart_fixture(&manifest_path);
+            for disk in &persisted.disks {
+                assert_owned_disk_root(&owned_root, &disk.root);
+            }
+            assert_ne!(persisted.writer_pid, std::process::id(), "reopen must use a fresh process");
+            assert_eq!(durability_mode(), DurabilityMode::Strict, "restarted process must actually use strict");
+            let endpoints = EndpointServerPools(vec![PoolEndpoints {
+                legacy: persisted.legacy,
+                set_count: persisted.set_count,
+                drives_per_set: persisted.drives_per_set,
+                endpoints: Endpoints::from(
+                    persisted
+                        .disks
+                        .iter()
+                        .map(|disk| {
+                            let mut endpoint = Endpoint::try_from(disk.root.to_str().expect("original UTF-8 disk path"))
+                                .expect("original local endpoint");
+                            endpoint.set_pool_index(usize::try_from(disk.slot[0]).expect("original pool index"));
+                            endpoint.set_set_index(usize::try_from(disk.slot[1]).expect("original set index"));
+                            endpoint.set_disk_index(usize::try_from(disk.slot[2]).expect("original disk index"));
+                            endpoint
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                cmd_line: persisted.cmd_line.clone(),
+                platform: persisted.platform.clone(),
+            }]);
+            let context = Arc::new(crate::runtime::instance::InstanceContext::new());
+            crate::store::init_local_disks_with_instance_ctx(&context, endpoints.clone())
+                .await
+                .expect("reopen persisted disks with original pool, set and disk indices");
+            let reopened = ECStore::new_with_instance_ctx(
+                "127.0.0.1:0".parse().expect("test address"),
+                endpoints.clone(),
+                tokio_util::sync::CancellationToken::new(),
+                context,
+            )
+            .await
+            .expect("reopen persisted store in a fresh process");
+            reopened
+                .background_cancel_token()
+                .expect("reopened background token")
+                .cancel();
+            tokio::task::yield_now().await;
+            init_bucket_metadata_sys(reopened.clone(), Vec::new()).await;
+            let bucket = persisted.bucket.as_str();
+            let object = persisted.object.as_str();
+            assert_eq!(
+                reopened
+                    .bucket_incarnation_id_from_disk(bucket)
+                    .await
+                    .expect("reopened bucket identity"),
+                persisted.incarnation
+            );
+            assert_eq!(durability_mode(), DurabilityMode::Strict, "reopened process must remain strict");
+            assert_eq!(effective_durability(bucket), DurabilityMode::Strict, "reopened bucket must remain strict");
+            let set = &reopened.pools[0].disk_set[0];
+            let disks: Vec<_> = set
+                .disk_inventory()
+                .await
+                .into_iter()
+                .map(|disk| disk.expect("reopened disk"))
+                .collect();
+            assert_eq!(disks.len(), persisted.disks.len());
+            for (index, (disk, expected)) in disks.iter().zip(&persisted.disks).enumerate() {
+                assert_eq!(disk.get_disk_id().await.expect("reopened disk identity"), Some(expected.disk_id));
+                assert_eq!(disk.endpoint(), endpoints.0[0].endpoints.as_ref()[index]);
+                assert_eq!(
+                    load_format_erasure(disk, false)
+                        .await
+                        .expect("reopened persisted disk format"),
+                    expected.format,
+                    "restart must retain the original deployment and set membership"
+                );
+                let evidence = disk
+                    .inspect_delete_transaction(bucket, object, expected.transaction)
+                    .await
+                    .expect("query retained C-class backup by its exact UUID");
+                assert_eq!(evidence, expected.evidence, "startup must preserve the original C fingerprint");
+                assert_eq!(
+                    evidence.state,
+                    DeleteRecoveryState::Absent,
+                    "live backup must not become a delete blocker"
+                );
+                assert!(
+                    evidence.journal.is_none() && evidence.backup_digest.is_some(),
+                    "no historical commit authority"
+                );
+                assert!(!evidence.explicit_delete_safe, "historical versions cannot grant fresh legacy discard");
+                assert_eq!(
+                    object_tree(&expected.root.join(bucket).join(object)),
+                    expected.tree,
+                    "startup and inspection preserve the entire original object tree"
+                );
+            }
+            let healthy = reopened
+                .heal_mrf_object_at_incarnation(
+                    bucket,
+                    object,
+                    "",
+                    persisted.incarnation,
+                    &HealOpts {
+                        scan_mode: HealScanMode::Normal,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("restarted MRF check must not create another backup");
+            assert!(healthy.error.is_none(), "restarted MRF check: {:?}", healthy.error);
+            assert_eq!(healthy.item.drives_healed(), Some(0));
+            for (disk, expected) in disks.iter().zip(&persisted.disks) {
+                assert_eq!(
+                    disk.inspect_delete_transaction(bucket, object, expected.transaction)
+                        .await
+                        .expect("C evidence after restarted MRF"),
+                    expected.evidence,
+                    "follow-up MRF must preserve the exact C fingerprint"
+                );
+                assert_eq!(
+                    object_tree(&expected.root.join(bucket).join(object)),
+                    expected.tree,
+                    "follow-up MRF must not create or remove any backup"
+                );
+            }
             let inventory = set.disks.read().await.clone();
             *set.disks.write().await = vec![None, None, Some(disks[2].clone()), Some(disks[3].clone())];
-            for (key, expected) in [(object, payload), (child.as_str(), child_body)] {
+            for (key, version_id, expected) in &persisted.reads {
                 let mut reader = set
                     .get_object_reader(
                         bucket,
@@ -2658,19 +2970,289 @@ mod tests {
                         None,
                         Default::default(),
                         &ObjectOptions {
+                            version_id: version_id.clone(),
                             no_lock: true,
                             suppress_read_repair: true,
                             ..Default::default()
                         },
                     )
                     .await
-                    .expect("exact-quorum GET using repaired target");
-                let mut body = Vec::new();
-                reader.read_to_end(&mut body).await.expect("read complete parent/child body");
-                assert_eq!(body, expected, "exact-quorum body for {key}");
+                    .expect("restarted exact-quorum GET using the repaired disk");
+                let mut actual = Vec::new();
+                reader.read_to_end(&mut actual).await.expect("read complete persisted object");
+                assert_eq!(&actual, expected, "restarted content for {key}");
             }
             *set.disks.write().await = inventory;
+            std::fs::write(
+                manifest_path.with_extension("verified"),
+                format!("{}:{}:{}", persisted.receipt_nonce, persisted.writer_pid, std::process::id()),
+            )
+            .expect("write child completion receipt after every assertion");
+            return;
         }
+
+        let incoming_inline = match phase {
+            "writer-inline" => true,
+            "writer-external" => false,
+            _ => panic!("unexpected MRF restart phase: {phase}"),
+        };
+        assert_eq!(durability_mode(), DurabilityMode::Strict, "writer process must actually use strict");
+        let bucket = if incoming_inline {
+            "heal-inline-rollback"
+        } else {
+            "heal-inline-to-external-rollback"
+        };
+        let (dirs, store, disks) = temp_env::async_with_vars(
+            [
+                ("RUSTFS_DURABILITY_MODE", Some("strict")),
+                ("RUSTFS_NEW_BUCKET_DURABILITY_MODE", Some("strict")),
+            ],
+            fixture(bucket),
+        )
+        .await;
+        assert_eq!(durability_mode(), DurabilityMode::Strict, "process durability must be strict");
+        assert_eq!(effective_durability(bucket), DurabilityMode::Strict, "bucket durability must be strict");
+        let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity");
+        let synthetic = inline_metadata_rollback_dir(Uuid::nil(), &FileMeta::new());
+        let object = "object";
+        let child = format!("{object}/{synthetic}");
+        let child_body = b"child bytes must survive parent repair".to_vec();
+        let write_options = ObjectOptions {
+            shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        let historical_body = vec![0x41; 1024 * 1024];
+        let historical_version = store
+            .put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(historical_body.clone()),
+                &ObjectOptions {
+                    versioned: true,
+                    ..write_options.clone()
+                },
+            )
+            .await
+            .expect("seed old external version")
+            .version_id
+            .expect("historical version has a UUID");
+        for (key, body) in [(child.as_str(), child_body.as_slice()), (object, b"inline-gen-1".as_slice())] {
+            store
+                .put_object(bucket, key, &mut PutObjReader::from_vec(body.to_vec()), &write_options)
+                .await
+                .expect("seed initial inline objects");
+        }
+        let mut historical_backups = Vec::new();
+        for (index, disk) in disks.iter().enumerate() {
+            let historical = disk
+                .read_version("", bucket, object, &historical_version.to_string(), &ReadOptions::default())
+                .await
+                .expect("read historical external version");
+            assert!(!historical.inline_data(), "historical version must use real data shards");
+            let data_dir = historical.data_dir.expect("historical data directory");
+            let mut backup = FileMeta::new();
+            backup.add_version(historical).expect("retain historical version evidence");
+            let bytes = backup.marshal_msg().expect("encode historical backup");
+            let backup_path = dirs[index]
+                .path()
+                .join(bucket)
+                .join(object)
+                .join(data_dir.to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP);
+            tokio::fs::write(&backup_path, &bytes)
+                .await
+                .expect("seed unreceipted historical backup");
+            historical_backups.push((data_dir, bytes));
+        }
+        let read_options = ReadOptions {
+            read_data: true,
+            ..Default::default()
+        };
+        let old_child = disks[3]
+            .read_version("", bucket, &child, "", &read_options)
+            .await
+            .expect("physical child before repair");
+        let set = &store.pools[0].disk_set[0];
+        set.disks.write().await[3] = None;
+        let payload = if incoming_inline {
+            b"inline-gen-2-updated".to_vec()
+        } else {
+            vec![0x53; 1024 * 1024]
+        };
+        store
+            .put_object(bucket, object, &mut PutObjReader::from_vec(payload.clone()), &write_options)
+            .await
+            .expect("degraded overwrite with a real stale target");
+        set.disks.write().await[3] = Some(disks[3].clone());
+        let donor = disks[0]
+            .read_version("", bucket, object, "", &read_options)
+            .await
+            .expect("current donor generation");
+        assert_eq!(donor.data.is_some(), incoming_inline, "fixture must use the intended commit branch");
+        let heal_opts = HealOpts {
+            scan_mode: HealScanMode::Normal,
+            ..Default::default()
+        };
+        let first = store
+            .heal_mrf_object_at_incarnation(bucket, object, "", incarnation, &heal_opts)
+            .await
+            .expect("first MRF repair");
+        assert!(first.error.is_none(), "first MRF repair: {:?}", first.error);
+        assert_eq!(first.item.drives_healed(), Some(1));
+        assert!(!first.item.repair_verified);
+        assert_eq!(first.item.detail, LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL);
+        let target = disks[3]
+            .read_version("", bucket, object, "", &read_options)
+            .await
+            .expect("repaired target generation");
+        assert_eq!(target.mod_time, donor.mod_time);
+        assert_eq!(target.data_dir, donor.data_dir);
+        assert_eq!(target.size, donor.size);
+        assert_eq!(target.version_id, donor.version_id);
+        let child_after = disks[3]
+            .read_version("", bucket, &child, "", &read_options)
+            .await
+            .expect("physical child survives parent cleanup");
+        assert_eq!(child_after.data, old_child.data);
+        assert!(child_after.data.is_some(), "child fixture must carry its physical inline bytes");
+        let child_dir = dirs[3].path().join(bucket).join(object).join(synthetic.to_string());
+        assert!(!child_dir.join(STORAGE_FORMAT_FILE_BACKUP).exists());
+        assert!(child_dir.join(STORAGE_FORMAT_FILE).exists());
+        let second = store
+            .heal_mrf_object_at_incarnation(bucket, object, "", incarnation, &heal_opts)
+            .await
+            .expect("follow-up MRF check must not return SlowDown");
+        assert!(second.error.is_none(), "second MRF check: {:?}", second.error);
+        assert_eq!(second.item.drives_healed(), Some(0));
+        assert_eq!(second.item.detail, LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL);
+
+        // EC2+2: force the repaired shard to participate in the exact read quorum.
+        let inventory = set.disks.read().await.clone();
+        *set.disks.write().await = vec![None, None, Some(disks[2].clone()), Some(disks[3].clone())];
+        for (key, expected) in [(object, payload.clone()), (child.as_str(), child_body.clone())] {
+            let mut reader = set
+                .get_object_reader(
+                    bucket,
+                    key,
+                    None,
+                    Default::default(),
+                    &ObjectOptions {
+                        no_lock: true,
+                        suppress_read_repair: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("exact-quorum GET using repaired target");
+            let mut body = Vec::new();
+            reader.read_to_end(&mut body).await.expect("read complete parent/child body");
+            assert_eq!(body, expected, "exact-quorum body for {key}");
+        }
+        *set.disks.write().await = inventory;
+
+        set.disks.write().await[3] = None;
+        let final_payload = if incoming_inline {
+            b"inline-gen-3-updated-again".to_vec()
+        } else {
+            vec![0x54; 1024 * 1024]
+        };
+        store
+            .put_object(bucket, object, &mut PutObjReader::from_vec(final_payload.clone()), &write_options)
+            .await
+            .expect("second degraded overwrite");
+        set.disks.write().await[3] = Some(disks[3].clone());
+        let second_repair = store
+            .heal_mrf_object_at_incarnation(bucket, object, "", incarnation, &heal_opts)
+            .await
+            .expect("second actual MRF repair");
+        assert!(second_repair.error.is_none(), "second repair: {:?}", second_repair.error);
+        assert_eq!(second_repair.item.drives_healed(), Some(1));
+
+        assert_eq!(store.pools.len(), 1, "restart fixture retains its original single pool");
+        let endpoints = EndpointServerPools(store.pools.iter().map(|pool| pool.endpoints.clone()).collect());
+        let disk_ids = join_all(disks.iter().map(|disk| disk.get_disk_id()))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .expect("original disk identities");
+        let formats = join_all(disks.iter().map(|disk| load_format_erasure(disk, false)))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .expect("original persisted disk formats");
+        let mut restart_disks = Vec::with_capacity(disks.len());
+        for (index, (disk, format)) in disks.iter().zip(&formats).enumerate() {
+            let endpoint = disk.endpoint();
+            let disk_id = disk_ids[index].expect("formatted disk has a UUID");
+            assert_eq!(endpoint, endpoints.0[0].endpoints.as_ref()[index]);
+            assert!(endpoint.is_local, "restart must reopen the original local disk");
+            assert_eq!(std::path::Path::new(&endpoint.get_file_path()), dirs[index].path());
+            assert_eq!(format.id, store.pools[0].format.id);
+            assert_eq!(format.erasure.sets, store.pools[0].format.erasure.sets);
+            assert_eq!(format.erasure.this, disk_id);
+            let set_index = usize::try_from(endpoint.set_idx).expect("original endpoint set index");
+            let disk_index = usize::try_from(endpoint.disk_idx).expect("original endpoint disk index");
+            assert_eq!(format.erasure.sets[set_index][disk_index], disk_id);
+            let (transaction, backup) = &historical_backups[index];
+            let tree = object_tree(&dirs[index].path().join(bucket).join(object));
+            assert_eq!(
+                tree.get(&std::path::PathBuf::from(format!("{transaction}/{STORAGE_FORMAT_FILE_BACKUP}")))
+                    .and_then(Option::as_ref),
+                Some(backup),
+                "both repairs must retain the original historical backup"
+            );
+            let evidence = disk
+                .inspect_delete_transaction(bucket, object, *transaction)
+                .await
+                .expect("capture exact pre-restart C evidence");
+            assert_eq!(evidence.state, DeleteRecoveryState::Absent);
+            assert!(evidence.journal.is_none() && evidence.backup_digest.is_some());
+            assert!(!evidence.explicit_delete_safe);
+            assert_eq!(object_tree(&dirs[index].path().join(bucket).join(object)), tree);
+            restart_disks.push(RestartDisk {
+                root: dirs[index].path().to_path_buf(),
+                slot: [endpoint.pool_idx, endpoint.set_idx, endpoint.disk_idx],
+                disk_id,
+                format: format.clone(),
+                transaction: *transaction,
+                evidence,
+                tree,
+            });
+        }
+        let pool = &endpoints.0[0];
+        let receipt_nonce = Uuid::new_v4();
+        let persisted = RestartFixture {
+            writer_pid: std::process::id(),
+            receipt_nonce,
+            incoming_inline,
+            legacy: pool.legacy,
+            set_count: pool.set_count,
+            drives_per_set: pool.drives_per_set,
+            cmd_line: pool.cmd_line.clone(),
+            platform: pool.platform.clone(),
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            incarnation,
+            reads: vec![
+                (object.to_string(), None, final_payload),
+                (child, None, child_body),
+                (object.to_string(), Some(historical_version.to_string()), historical_body),
+            ],
+            disks: restart_disks,
+        };
+        for dir in dirs {
+            assert_owned_disk_root(&owned_root, dir.path());
+            let retained = dir.keep();
+            assert_owned_disk_root(&owned_root, &retained);
+        }
+        drop(disks);
+        drop(store);
+        std::fs::write(
+            &manifest_path,
+            rmp_serde::to_vec_named(&persisted).expect("encode exact original restart state"),
+        )
+        .expect("publish writer manifest after every repair assertion");
     }
 
     #[tokio::test]

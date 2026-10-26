@@ -48,10 +48,12 @@ fn runtime() -> MrfRuntime {
         config,
         checkpoint_owner: Uuid::new_v4(),
         next_checkpoint_sequence: 1,
+        lifecycle_format_version: MRF_LIFECYCLE_FORMAT_VERSION,
         new_since_flush: 0,
         dirty: false,
         journal_on_disk: false,
         retain_replay_journal: false,
+        replay_readable: true,
         durable_replay_anchors: Vec::new(),
         replay_cleanup: None,
         runtime_checkpoint: None,
@@ -425,7 +427,8 @@ fn empty_events_real_consumer_stop_retains_unresolved_journal() {
             let listing = tokio::time::timeout(Duration::from_secs(10), listed)
                 .await
                 .expect("consumer startup finishes")
-                .expect("listing receipt");
+                .expect("listing receipt")
+                .expect("readable lifecycle snapshot");
             assert!(
                 listing
                     .responsibilities

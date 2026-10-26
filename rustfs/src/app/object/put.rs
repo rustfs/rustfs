@@ -18,7 +18,7 @@ use super::*;
 
 use crate::app::trailer_adapter::trailer_source;
 use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, parse_presigned_put_max_content_length};
-use crate::error::{ClientBodyReadTimeout, UploadLimitExceeded, normalize_put_read_quorum_error};
+use crate::error::{ClientBodyReadTimeout, UploadLimitExceeded, normalize_read_quorum_error};
 static PUT_FAILURE_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(5_000);
 
 #[cfg(test)]
@@ -1118,7 +1118,7 @@ impl PutObjectCompletion {
 /// Record the failed completion and hand the error back to the caller.
 fn fail_put_object(completion: PutObjectCompletion, err: S3Error) -> S3Error {
     let err = if matches!(&completion, PutObjectCompletion::S3(_)) {
-        normalize_put_read_quorum_error(err)
+        normalize_read_quorum_error(err)
     } else {
         err
     };
@@ -1211,7 +1211,7 @@ impl DefaultObjectUsecase {
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         self.execute_put_object_boxed(_fs, req)
             .await
-            .map_err(normalize_put_read_quorum_error)
+            .map_err(normalize_read_quorum_error)
     }
 
     fn execute_put_object_boxed<'a>(

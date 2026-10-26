@@ -8,6 +8,10 @@ collection:
 
 ## Operations
 
+- [Retained MRF responsibilities](operations/mrf-responsibilities.md) — unknown bucket identities, bounded probes, and unreadable checkpoint recovery.
+
+- [Internode HTTP streaming transport](operations/internode-http-transport.md) — protocol selection, pooled connection isolation, and distributed read validation.
+
 - [Persisted config compatibility](operations/persisted-config-compatibility.md) — ignored MinIO settings, bounded diagnostics, alias retention, and safe resets.
 
 - [Table maintenance periodic queueing](operations/s3-tables-maintenance-scheduler.md) — opt-in scheduling, limits, worker handoff, and recovery.

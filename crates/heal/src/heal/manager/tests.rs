@@ -27,6 +27,7 @@ use std::sync::Mutex as StdMutex;
 use tempfile::TempDir;
 
 pub(super) mod admin_overlap;
+mod admission_timing;
 mod root_recovery;
 use uuid::Uuid;
 mod auto_scan;
@@ -4388,7 +4389,7 @@ async fn admission_snapshot_tracks_start_duplicate_force_start_and_displacement(
     assert_eq!(admission.force_start, 1);
     assert!(
         admission.max_lock_phase_micros > 0,
-        "snapshot should expose a measurable queue/admission lock phase for p95-style external aggregation"
+        "snapshot should expose a measurable maximum queue/admission lock phase"
     );
 }
 
@@ -6307,4 +6308,111 @@ fn admin_bucket_discovery_retries_keep_the_existing_budget() {
         retry_request_for_result(&task, &error).is_none(),
         "persistent incompleteness must terminate"
     );
+}
+
+async fn check_node_admission_task_retry(source: HealRequestSource) {
+    use crate::heal::outcome::HealFailureClass;
+    use crate::heal::storage::ECStoreHealStorage;
+    use rustfs_concurrency::adaptive::{FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure};
+    use rustfs_heal_contracts::heal_channel::HealScanMode;
+    use std::num::NonZeroU16;
+
+    let root = TempDir::new().expect("isolated real storage");
+    let env = rustfs_test_utils::TestECStoreEnv::builder()
+        .base_dir(root.path())
+        .build()
+        .await;
+    env.make_bucket("admission-retry", false).await;
+    env.put_object_bytes("admission-retry", "existing", b"repair me".to_vec())
+        .await;
+    let gate = NodeAdmission::new(NonZeroU16::new(1).expect("one node unit"));
+    let storage: Arc<dyn HealStorageAPI> =
+        Arc::new(ECStoreHealStorage::new(env.ecstore.clone()).with_admission(Some(gate.clone())));
+    let mut request = HealRequest::object("admission-retry".to_string(), "existing".to_string(), None);
+    request.source = source;
+    request.options.scan_mode = HealScanMode::Deep;
+    let task = HealTask::from_request(request, storage.clone());
+    let result = task.execute().await;
+    let error = result
+        .as_ref()
+        .expect_err("closed node admission must defer an existing object");
+    assert!(
+        matches!(error, Error::TransientSkip { .. }),
+        "typed resource deferral must survive HealTask: {error:?}"
+    );
+    assert!(error.is_recoverable_heal());
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.objects.len(), 1);
+    assert_eq!(
+        outcome.objects[0].disposition,
+        HealObjectDisposition::Failed(HealFailureClass::Recoverable)
+    );
+    assert_eq!(gate.completed(), Some(0));
+    let (retry, delay, _) = retry_request_for_result_with_budget(&task, &result)
+        .await
+        .expect("scheduler must retain retry responsibility");
+    assert_eq!(retry.id, task.id);
+    assert_eq!(retry.source, source);
+    assert_eq!(retry.priority, task.priority);
+    assert_eq!(retry.retry_attempts, 1);
+    assert!(delay > Duration::ZERO);
+    gate.update(
+        &mut FeedbackController::new(),
+        Some(FeedbackObservation {
+            generation: 1,
+            max_concurrency: 1,
+            pressure: ResourcePressure::Unknown,
+            completed_units: None,
+        }),
+    );
+    let retried = HealTask::from_request(retry, storage);
+    retried
+        .execute()
+        .await
+        .expect("restored node capacity lets the same real repair finish");
+    assert_eq!(gate.completed(), Some(1));
+    assert_eq!(gate.snapshot().active, 0);
+    let outcome = retried.get_outcome().await;
+    assert_eq!(outcome.objects.len(), 1);
+    // The default fixture writes legacy metadata without an independent
+    // integrity identity. Admission recovery must not turn that into proof.
+    assert_eq!(outcome.objects[0].disposition, HealObjectDisposition::Unknown);
+    assert_eq!(
+        outcome.objects[0].detail.as_deref(),
+        Some(rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL)
+    );
+    assert_eq!(outcome.counters.failed, 0);
+    assert_eq!(outcome.counters.unknown, 1);
+}
+
+fn run_node_admission_task_retry(source: HealRequestSource) {
+    // Match the existing real-storage heal fixture's bounded stack budget.
+    const STACK_SIZE: usize = 8 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("node-admission-real-storage".to_owned())
+        .stack_size(STACK_SIZE)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(STACK_SIZE)
+                .enable_all()
+                .build()
+                .expect("node-admission storage runtime");
+            runtime.block_on(check_node_admission_task_retry(source));
+        })
+        .expect("node-admission test thread")
+        .join()
+        .expect("node-admission test must finish");
+}
+
+#[test]
+#[serial_test::serial]
+fn node_admission_scanner_task_stays_retryable_and_finishes_after_recovery() {
+    run_node_admission_task_retry(HealRequestSource::Scanner);
+}
+
+#[test]
+#[serial_test::serial]
+fn node_admission_read_repair_task_stays_retryable_and_finishes_after_recovery() {
+    run_node_admission_task_retry(HealRequestSource::ReadRepair);
 }

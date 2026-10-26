@@ -220,7 +220,7 @@ impl Index {
         b.extend_from_slice(S2_INDEX_HEADER);
 
         // Add total sizes
-        let mut tmp = [0u8; 8];
+        let mut tmp = [0u8; 10];
         let n = write_varint(&mut tmp, uncomp_total);
         b.extend_from_slice(&tmp[..n]);
         let n = write_varint(&mut tmp, comp_total);
@@ -472,31 +472,40 @@ impl Index {
     }
 }
 
-// Helper functions for varint encoding/decoding
-fn write_varint(buf: &mut [u8], mut v: i64) -> usize {
+// Helper functions for signed varint encoding/decoding (ZigZag + LEB128,
+// matching Go binary.PutVarint / binary.Varint used by the S2 index format).
+fn write_varint(buf: &mut [u8], v: i64) -> usize {
+    let mut uv = ((v as u64) << 1) ^ ((v >> 63) as u64);
     let mut n = 0;
-    while v >= 0x80 {
-        buf[n] = (v as u8) | 0x80;
-        v >>= 7;
+    while uv >= 0x80 {
+        buf[n] = (uv as u8) | 0x80;
+        uv >>= 7;
         n += 1;
     }
-    buf[n] = v as u8;
+    buf[n] = uv as u8;
     n + 1
 }
 
 fn read_varint(buf: &[u8]) -> io::Result<(i64, usize)> {
-    let mut result = 0i64;
-    let mut shift = 0;
+    let mut uv = 0u64;
+    let mut shift = 0u32;
     let mut n = 0;
 
     while n < buf.len() {
         let byte = buf[n];
         n += 1;
-        result |= ((byte & 0x7F) as i64) << shift;
+        if n == 10 && byte > 1 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "varint overflow"));
+        }
+        uv |= ((byte & 0x7F) as u64) << shift;
         if byte < 0x80 {
+            let result = ((uv >> 1) as i64) ^ (-((uv & 1) as i64));
             return Ok((result, n));
         }
         shift += 7;
+        if shift >= 64 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "varint overflow"));
+        }
     }
 
     Err(io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected EOF"))
@@ -714,6 +723,35 @@ mod tests {
         assert_eq!(decoded.total_uncompressed, source.total_uncompressed);
         assert_eq!(decoded.total_compressed, source.total_compressed);
         assert_eq!(decoded.info.len(), source.info.len());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_round_trip_with_negative_compressed_deltas_and_maximum_totals() -> io::Result<()> {
+        let mut source = Index::new();
+        source.est_block_uncomp = 1 << 20;
+        // Compressed blocks much smaller than est_block_uncomp / 2 (512 KiB)
+        // produce negative c_off residuals (-524,088 and -262,144).
+        source.add(0, 0)?;
+        source.add(200, 1 << 20)?;
+        source.add(300, 2 << 20)?;
+        source.add(450, (3 << 20) + 12345)?;
+        // ZigZag + LEB128 needs all 10 bytes for the largest valid signed value.
+        source.total_uncompressed = i64::MAX;
+        source.total_compressed = i64::MAX;
+
+        let encoded = source.clone().into_vec();
+        let mut decoded = Index::new();
+        let rest = decoded.load(encoded.as_ref())?;
+        assert!(rest.is_empty());
+        assert_eq!(decoded.total_uncompressed, source.total_uncompressed);
+        assert_eq!(decoded.total_compressed, source.total_compressed);
+        assert_eq!(decoded.info.len(), source.info.len());
+        for (actual, expected) in decoded.info.iter().zip(source.info.iter()) {
+            assert_eq!(actual.compressed_offset, expected.compressed_offset);
+            assert_eq!(actual.uncompressed_offset, expected.uncompressed_offset);
+        }
 
         Ok(())
     }

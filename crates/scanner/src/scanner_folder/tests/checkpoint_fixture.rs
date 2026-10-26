@@ -44,27 +44,37 @@ fn scan_options(scan_mode: HealScanMode) -> ScannerDiskScanOptions {
 /// Real cache persistence codec and CAS calls, backed by two bounded local files.
 #[derive(Debug)]
 struct FixtureStore {
-    root: tempfile::TempDir,
+    root: std::path::PathBuf,
+    _owned_root: Option<tempfile::TempDir>,
     reject_save: AtomicBool,
 }
 
 impl FixtureStore {
     fn new() -> Arc<Self> {
+        let root = tempfile::tempdir().expect("checkpoint fixture storage directory");
         Arc::new(Self {
-            root: tempfile::tempdir().expect("checkpoint fixture storage directory"),
+            root: root.path().to_path_buf(),
+            _owned_root: Some(root),
+            reject_save: AtomicBool::new(false),
+        })
+    }
+
+    fn reopen(root: std::path::PathBuf) -> Arc<Self> {
+        assert!(root.is_dir(), "reopen only an existing checkpoint fixture directory");
+        Arc::new(Self {
+            root,
+            _owned_root: None,
             reject_save: AtomicBool::new(false),
         })
     }
 
     fn path(&self, object: &str) -> std::path::PathBuf {
         assert!(object.ends_with(CACHE_NAME) || object.ends_with(&format!("{CACHE_NAME}.bkp")));
-        self.root
-            .path()
-            .join(if object.ends_with(".bkp") { "backup" } else { "main" })
+        self.root.join(if object.ends_with(".bkp") { "backup" } else { "main" })
     }
 
     async fn strict_load(&self) -> DataUsageCache {
-        let bytes = tokio::fs::read(self.root.path().join("main"))
+        let bytes = tokio::fs::read(self.root.join("main"))
             .await
             .expect("saved checkpoint fixture must exist");
         decode_fixture(&bytes).expect("saved checkpoint fixture must contain a valid bucket root")
@@ -900,14 +910,11 @@ async fn checkpoint_fixture_hot_bucket_certifies_after_mixed_end_and_leader_hand
 
 async fn hot_bucket_certifies_first_full_sweep_after_mixed_end(advance_epoch: bool) {
     let logs = CapturedLogs::default();
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_writer(logs.clone())
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    logs.capture(tracing::Level::DEBUG, run_hot_bucket_certification(advance_epoch, &logs))
+        .await;
+}
+
+async fn run_hot_bucket_certification(advance_epoch: bool, logs: &CapturedLogs) {
     let (scanner, root) = build_test_scanner().await;
     let _guard = TestGuard {
         temp_dir: Some(root.clone()),
@@ -1054,6 +1061,49 @@ async fn hot_bucket_certifies_first_full_sweep_after_mixed_end(advance_epoch: bo
     assert_eq!(fields["coverage_gap"], false);
     assert_eq!(fields["failed_objects"], 0);
     assert_eq!(fields["size_reconciliation_entries"], 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn checkpoint_admission_log_capture_survives_another_future_dispatcher() {
+    let logs = CapturedLogs::default();
+    let (mut cache, identity) = bound_checkpoint();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let captured = logs.capture(tracing::Level::DEBUG, async move {
+        entered_tx.send(()).expect("announce captured future");
+        ready_rx.await.expect("competing dispatcher is installed");
+        for cycle in 100..104 {
+            cache.prepare_bucket_checkpoint("bucket", cycle, 9, SOURCE, PLAN, identity);
+            assert_eq!(cache.info.next_cycle, cycle);
+        }
+        done_tx.send(()).expect("announce checkpoint completion");
+    });
+    let competing = async {
+        entered_rx.await.expect("captured future has yielded");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(std::io::sink)
+            .finish();
+        // An unrelated future keeps a quieter thread-local default while
+        // the captured future resumes on this same runtime thread.
+        let _guard = tracing::subscriber::set_default(subscriber);
+        ready_tx.send(()).expect("announce competing dispatcher");
+        done_rx.await.expect("checkpoint preparation has completed");
+    };
+    tokio::join!(captured, competing);
+
+    let events = logs
+        .contents()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("scanner JSON event"))
+        .filter(|event| event["fields"]["state"] == "bucket_checkpoint_prepared")
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 4, "all checkpoint admissions must use the captured dispatcher");
+    for (cycle, event) in (100..104).zip(events) {
+        assert_eq!(event["fields"]["cycle"], cycle);
+    }
 }
 
 async fn write_checkpoint_object(root: &std::path::Path, object: &str, versions: &[(Option<Uuid>, i64)]) {
@@ -1280,7 +1330,7 @@ where
         .load_with_revisions(store.clone(), CACHE_NAME)
         .await
         .expect("load final checkpoint");
-    let before = tokio::fs::read(store.root.path().join("main"))
+    let before = tokio::fs::read(store.root.join("main"))
         .await
         .expect("read durable checkpoint bytes");
     let epoch_error = loaded
@@ -1295,7 +1345,7 @@ where
         .await
         .expect_err("injected save failure must not report durable progress");
     assert_eq!(
-        tokio::fs::read(store.root.path().join("main"))
+        tokio::fs::read(store.root.join("main"))
             .await
             .expect("read unchanged checkpoint bytes"),
         before
@@ -1406,4 +1456,40 @@ where
         (cycle, epoch) = handoff(saved.info.next_cycle, saved.info.leader_epoch).await;
     }
     panic!("finite stable fixture must converge using the same four-object budget without an unbounded final sweep");
+}
+
+fn emit_first_registration_capture_event() {
+    tracing::debug!(
+        target: "rustfs::scanner::folder",
+        event = EVENT_SCANNER_FOLDER_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_FOLDER,
+        state = "first_registration_capture",
+        "Scanner test capture exercised first callsite registration"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn checkpoint_log_capture_survives_first_registration_on_unsubscribed_thread() {
+    let logs = CapturedLogs::default();
+    // Construct the capture before polling it: its subscriber must be live
+    // when the other thread first registers this otherwise unused callsite.
+    let captured = logs.capture(tracing::Level::DEBUG, async {
+        emit_first_registration_capture_event();
+    });
+    std::thread::spawn(emit_first_registration_capture_event)
+        .join()
+        .expect("unsubscribed first-registration thread");
+    captured.await;
+    let events = logs
+        .contents()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("scanner JSON event"))
+        .filter(|event| event["fields"]["state"] == "first_registration_capture")
+        .count();
+    assert_eq!(
+        events, 1,
+        "first registration without a subscriber must not disable the captured callsite"
+    );
 }
