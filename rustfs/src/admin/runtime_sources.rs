@@ -66,14 +66,6 @@ pub(crate) fn current_object_data_cache() -> Option<Arc<ObjectDataCacheAdapter>>
     current_object_data_cache_handle_for_context(context.as_deref())
 }
 
-/// Resolve the object store for an admin request through the server's context
-/// slot injected at router dispatch (backlog#1052 S2). Falls back to the
-/// ambient process context when no slot was injected (direct handler tests,
-/// paths outside the router) — the single-instance legacy default.
-pub(crate) fn object_store_from_req<B>(req: &s3s::S3Request<B>) -> Option<Arc<ECStore>> {
-    object_store_from_extensions(&req.extensions)
-}
-
 pub(crate) fn app_context_from_req<B>(req: &s3s::S3Request<B>) -> Option<Arc<AppContext>> {
     app_context_from_extensions(&req.extensions)
 }
@@ -85,8 +77,10 @@ pub(crate) fn app_context_from_envelope(envelope: &RequestEnvelope) -> Option<Ar
     }
 }
 
-/// Envelope form of [`object_store_from_req`]: the injected server slot wins,
-/// the ambient process store is the single-instance fallback.
+/// Resolve the object store for an admin request through the server's context
+/// slot injected at router dispatch (backlog#1052 S2). Falls back to the
+/// ambient process context when no slot was injected (direct handler tests,
+/// paths outside the router) — the single-instance legacy default.
 pub(crate) fn object_store_from_envelope(envelope: &RequestEnvelope) -> Option<Arc<ECStore>> {
     match envelope.server_context() {
         Some(slot) => slot.installed_object_store(),
@@ -104,15 +98,6 @@ pub(crate) fn app_context_from_extensions(extensions: &http::Extensions) -> Opti
     match extensions.get::<Arc<ServerContextSlot>>() {
         Some(slot) => slot.installed_app_context(),
         None => current_app_context(),
-    }
-}
-
-/// Field-borrow form of [`object_store_from_req`] for handlers that have
-/// already moved other request fields (body, credentials) out of the request.
-pub(crate) fn object_store_from_extensions(extensions: &http::Extensions) -> Option<Arc<ECStore>> {
-    match extensions.get::<Arc<ServerContextSlot>>() {
-        Some(slot) => slot.installed_object_store(),
-        None => current_object_store_handle(),
     }
 }
 
@@ -175,8 +160,7 @@ pub(crate) fn publish_storage_class_config(config: StorageClassConfig) {
 mod tests {
     use super::{
         AppContext, IamInterface, KmsInterface, ServerContextSlot, app_context_from_envelope, app_context_from_extensions,
-        app_context_from_req, current_app_context, object_store_from_envelope, object_store_from_extensions,
-        publish_test_app_context,
+        app_context_from_req, current_app_context, object_store_from_envelope, publish_test_app_context,
     };
     use crate::admin::router::{Operation, S3Router};
     use crate::app::RequestEnvelope;
@@ -256,7 +240,7 @@ mod tests {
         extensions.insert(slot);
 
         assert!(app_context_from_extensions(&extensions).is_none());
-        assert!(object_store_from_extensions(&extensions).is_none());
+        assert!(object_store_from_envelope(&envelope(extensions.clone())).is_none());
         assert!(app_context_from_req(&request(extensions)).is_none());
         assert!(Arc::ptr_eq(
             &current_app_context().expect("ambient context must remain available"),
@@ -287,7 +271,7 @@ mod tests {
 
         let resolved = app_context_from_extensions(&extensions).expect("legacy request must use ambient context");
         assert!(Arc::ptr_eq(&resolved, &ambient));
-        assert!(object_store_from_extensions(&extensions).is_some());
+        assert!(object_store_from_envelope(&envelope(extensions)).is_some());
     }
 
     #[tokio::test]

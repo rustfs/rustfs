@@ -2063,7 +2063,7 @@ mod tests {
     }
 
     /// Pins the gate wiring: each system handler authorizes through exactly one
-    /// `authorize_admin_request` call carrying the same action vector it used
+    /// `authorize_admin_envelope` call carrying the same action vector it used
     /// before the deduplication. The two gate-action helpers must be passed
     /// through by name so the vectors pinned by the tests above keep governing
     /// the live gate (rustfs/backlog#1829).

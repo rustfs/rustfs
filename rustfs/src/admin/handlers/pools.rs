@@ -1596,7 +1596,7 @@ mod pools_handler_tests {
     }
 
     /// Pins the gate wiring itself: every pool handler authorizes through
-    /// `authorize_admin_request` with the same action vector it used before the
+    /// `authorize_admin_envelope` with the same action vector it used before the
     /// deduplication, and the mutating handlers keep deriving their audit actor
     /// from the caller-supplied access key (rustfs/backlog#1829).
     #[test]

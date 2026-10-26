@@ -14,11 +14,10 @@
 
 use crate::admin::operation::AdminResponse;
 use crate::server::{MINIO_ADMIN_PREFIX, has_path_prefix};
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use rustfs_crypto::{decrypt_data, decrypt_stream_io, encrypt_stream_io};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Response};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -79,16 +78,6 @@ pub(crate) fn encode_compatible_admin_payload(path: &str, secret_key: &str, data
 /// the body. Serialization failure is reported as `InternalError`; the
 /// response structs the admin handlers pass here are plain owned data, so that
 /// arm is unreachable in practice.
-pub(crate) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let data = serde_json::to_vec(value)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    Ok(S3Response::with_headers((status, Body::from(data)), headers))
-}
-
-/// Owned-boundary form of [`json_response`]: the same single `Content-Type`
-/// header and the same serialized bytes, as an [`AdminResponse`].
 pub(crate) fn owned_json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<AdminResponse> {
     let data = serde_json::to_vec(value)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
@@ -127,7 +116,6 @@ pub(crate) fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
 mod tests {
     use super::*;
     use rustfs_crypto::encrypt_data;
-    use s3s::Body;
 
     #[test]
     fn has_space_be_detects_any_whitespace() {
@@ -177,28 +165,11 @@ mod tests {
         let payload = b"{\"ok\":true}".to_vec();
         let encrypted = encrypt_data(b"secret", &payload).expect("encrypt payload");
 
-        let decoded = read_compatible_admin_body(Body::from(encrypted), 1024, "/minio/admin/v3/list-users", "secret")
+        let decoded = read_compatible_admin_body(s3s::Body::from(encrypted), 1024, "/minio/admin/v3/list-users", "secret")
             .await
             .expect("decode payload");
 
         assert_eq!(decoded, payload);
-    }
-
-    #[tokio::test]
-    async fn owned_json_response_matches_the_legacy_shape() {
-        let value = serde_json::json!({"ok": true, "count": 3});
-        let mut legacy = json_response(StatusCode::CREATED, &value).expect("legacy serializes");
-        let (status, headers, mut body) = owned_json_response(StatusCode::CREATED, &value)
-            .expect("owned serializes")
-            .into_parts();
-
-        assert_eq!(status, legacy.output.0);
-        assert_eq!(headers, legacy.headers);
-        assert_eq!(headers.len(), 1);
-        assert_eq!(headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()), Some("application/json"));
-        let legacy_bytes = legacy.output.1.store_all_limited(1024).await.expect("legacy body reads");
-        let owned_bytes = body.store_all_limited(1024).await.expect("owned body reads");
-        assert_eq!(owned_bytes, legacy_bytes);
     }
 
     #[tokio::test]
@@ -220,7 +191,7 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("failed to read request body: length limit exceeded"));
 
-        let legacy_body = Body::http_body(http_body_util::Full::new(bytes::Bytes::from_static(b"nine bytes!")));
+        let legacy_body = s3s::Body::http_body(http_body_util::Full::new(bytes::Bytes::from_static(b"nine bytes!")));
         let legacy_err = read_compatible_admin_body(legacy_body, 8, "/rustfs/admin/v3/list-users", "secret")
             .await
             .expect_err("legacy streaming bodies retain the same limit error");
@@ -243,7 +214,7 @@ mod tests {
         assert_eq!(stream_err.message(), Some("failed to read request body: transport failed"));
     }
 
-    async fn body_bytes(mut body: Body) -> Vec<u8> {
+    async fn body_bytes(mut body: rustfs_s3_types::Body) -> Vec<u8> {
         body.store_all_limited(64 * 1024).await.expect("body should read").to_vec()
     }
 
@@ -251,35 +222,33 @@ mod tests {
     /// the requested status, `application/json`, and the serialized bytes
     /// verbatim — nothing else.
     #[tokio::test]
-    async fn json_response_carries_status_content_type_and_serialized_body() {
+    async fn owned_json_response_carries_status_content_type_and_serialized_body() {
         #[derive(Serialize)]
         struct Payload {
             success: bool,
             message: &'static str,
         }
 
-        let response = json_response(
+        let (status, headers, body) = owned_json_response(
             StatusCode::ACCEPTED,
             &Payload {
                 success: true,
                 message: "queued",
             },
         )
-        .expect("payload should serialize");
+        .expect("payload should serialize")
+        .into_parts();
 
-        assert_eq!(response.output.0, StatusCode::ACCEPTED);
-        assert_eq!(
-            response.headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()),
-            Some("application/json")
-        );
-        assert_eq!(response.headers.len(), 1);
-        assert_eq!(body_bytes(response.output.1).await, br#"{"success":true,"message":"queued"}"#.to_vec());
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()), Some("application/json"));
+        assert_eq!(headers.len(), 1);
+        assert_eq!(body_bytes(body).await, br#"{"success":true,"message":"queued"}"#.to_vec());
     }
 
     /// A serialization failure must surface as `InternalError` rather than a
     /// panic or a half-written body.
     #[test]
-    fn json_response_reports_serialization_failure_as_internal_error() {
+    fn owned_json_response_reports_serialization_failure_as_internal_error() {
         struct Unserializable;
 
         impl Serialize for Unserializable {
@@ -288,7 +257,7 @@ mod tests {
             }
         }
 
-        let err = json_response(StatusCode::OK, &Unserializable).expect_err("serialization must fail");
+        let err = owned_json_response(StatusCode::OK, &Unserializable).expect_err("serialization must fail");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
         assert!(err.message().unwrap_or_default().contains("failed to serialize response"));
     }
