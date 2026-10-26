@@ -29,7 +29,7 @@
     {
       "invariant": "list-uncommitted-version",
       "suite": "rustfs-filemeta",
-      "name": "metacache::tests::resolve_with_write_quorum_slack_keeps_partial_latest_hidden_during_merge"
+      "name": "metacache::tests::resolve_merge_keeps_the_newest_version_at_listing_quorum"
     },
     {
       "invariant": "minio-object-fixture",
