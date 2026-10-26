@@ -2786,7 +2786,9 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<PreparedGetObjectMetadata> {
-        let snapshot = self.get_object_fileinfo(bucket, object, opts, true, false).await?;
+        let snapshot = self
+            .get_object_fileinfo_for_object_read(bucket, object, opts, true, false)
+            .await?;
         let object_info = build_get_object_info(snapshot.fi(), bucket, object, opts.versioned || opts.version_suspended);
         Ok(PreparedGetObjectMetadata {
             snapshot,
