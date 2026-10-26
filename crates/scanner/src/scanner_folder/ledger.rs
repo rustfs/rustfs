@@ -58,7 +58,7 @@ impl FolderScanner {
             self.pending_heal_batch_dirty = true;
             return;
         }
-        self.update_cache.info.pending_heals = self.new_cache.info.pending_heals.clone();
+        self.update_cache.info.pending_heals = clone_cache_value(&self.new_cache.info.pending_heals);
         #[cfg(test)]
         {
             self.pending_heal_sync_count += 1;
@@ -246,7 +246,7 @@ impl FolderScanner {
             return Ok(());
         }
 
-        let bucket = scanner.new_cache.info.name.clone();
+        let bucket = clone_cache_value(&scanner.new_cache.info.name);
         // Legacy notices cannot bind a verified disposition to the current
         // incarnation, kind, set scope and responsibility generation.
         let repaired = rustfs_common::mrf_channel::take_mrf_repaired_events_for(&bucket);
@@ -295,9 +295,9 @@ impl FolderScanner {
             scanner
                 .send_required_scanner_heal_request(
                     pending.kind,
-                    pending.bucket.clone(),
-                    pending.object.clone(),
-                    pending.version_id.clone(),
+                    clone_cache_value(&pending.bucket),
+                    clone_cache_value(&pending.object),
+                    clone_cache_value(&pending.version_id),
                     request,
                 )
                 .await?;
@@ -371,7 +371,7 @@ pub(super) fn pending_scanner_heal_retry_candidates_at(
             .then_with(|| pending_scanner_heal_identity(a).cmp(&pending_scanner_heal_identity(b)))
     });
     entries.truncate(MAX_PENDING_SCANNER_HEAL_RETRIES_PER_BUCKET);
-    entries.into_iter().cloned().collect()
+    entries.into_iter().map(clone_cache_value).collect()
 }
 
 pub(super) fn build_pending_scanner_heal_request(entry: &PendingScannerHeal) -> Option<HealChannelRequest> {
@@ -383,15 +383,20 @@ pub(super) fn build_pending_scanner_heal_request(entry: &PendingScannerHeal) -> 
         HealChannelPriority::Low
     };
     match entry.kind {
-        PendingScannerHealKind::Bucket => Some(build_bucket_heal_request(entry.bucket.clone(), priority)),
+        PendingScannerHealKind::Bucket => Some(build_bucket_heal_request(clone_cache_value(&entry.bucket), priority)),
         PendingScannerHealKind::Object => entry.object.as_ref().map(|object| {
             if entry.version_id.is_none() {
-                build_non_destructive_object_heal_request(entry.bucket.clone(), object.clone(), entry.scan_mode, priority)
+                build_non_destructive_object_heal_request(
+                    clone_cache_value(&entry.bucket),
+                    clone_cache_value(object),
+                    entry.scan_mode,
+                    priority,
+                )
             } else {
                 build_object_heal_request(
-                    entry.bucket.clone(),
-                    object.clone(),
-                    entry.version_id.clone(),
+                    clone_cache_value(&entry.bucket),
+                    clone_cache_value(object),
+                    clone_cache_value(&entry.version_id),
                     entry.scan_mode,
                     priority,
                 )

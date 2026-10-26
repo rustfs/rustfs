@@ -11,8 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-/// scanner cache locks and the cache snapshot persist/publish path.
 use super::*;
+/// scanner cache locks and the cache snapshot persist/publish path.
+use crate::data_usage_define::clone_cache_value;
 use crate::{ScannerConfigObjectDelete, ScannerObjectIO};
 use rustfs_scanner_metrics::usage_candidate::{
     ScannerUsageCandidateKind as CandidateKind, ScannerUsageCandidateOutcome as CandidateOutcome,
@@ -823,7 +824,7 @@ pub(super) fn completed_usage_candidate(
                     scan_plan_digest: Some(result.info.scan_plan_digest.ok_or(CandidateOutcome::SetState)?.0),
                     complete: true,
                     tombstone: false,
-                    segment_invalidation_proof: result.info.segment_invalidation_proof.clone(),
+                    segment_invalidation_proof: clone_cache_value(&result.info.segment_invalidation_proof),
                 })
             })
             .collect::<std::result::Result<Vec<_>, CandidateOutcome>>()?;
@@ -1019,7 +1020,7 @@ pub(super) fn observational_data_usage_info(
                         selected.info.scan_plan_digest.map(|digest| digest.0),
                         selected.info.last_update,
                         true,
-                        selected.info.segment_invalidation_proof.clone(),
+                        clone_cache_value(&selected.info.segment_invalidation_proof),
                     )
                 } else {
                     (

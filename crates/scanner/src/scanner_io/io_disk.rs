@@ -11,9 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-/// ScannerIODisk implementation for Disk: get_size and the per-disk bucket scan.
 use super::*;
 use crate::UNKNOWN_TIER;
+/// ScannerIODisk implementation for Disk: get_size and the per-disk bucket scan.
+use crate::data_usage_define::clone_cache_value;
 
 ///
 /// Seed [`SizeSummary::tier_stats`] from the cached tier-name list.
@@ -166,7 +167,7 @@ impl ScannerIODisk for Disk {
         } = options;
         let done_drive = Metrics::time(Metric::ScanBucketDrive);
         let drive_start = std::time::Instant::now();
-        let bucket = cache.info.name.clone();
+        let bucket = clone_cache_value(&cache.info.name);
         let disk_path = self.path().to_string_lossy().to_string();
         let source = match scan_mode {
             HealScanMode::Deep => rustfs_scanner_metrics::metrics::ScannerWorkSource::Bitrot,

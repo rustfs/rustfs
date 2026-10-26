@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::data_usage_define::clone_cache_value;
 use std::collections::{HashMap, HashSet};
 use std::fs::FileType;
 use std::io::ErrorKind;
@@ -508,7 +509,7 @@ fn failed_scan_paths(cache: &DataUsageCache) -> Vec<String> {
         .cache
         .iter()
         .filter(|(_, entry)| entry.failed_objects > 0)
-        .map(|(path, _)| path.clone())
+        .map(|(path, _)| clone_cache_value(path))
         .collect::<Vec<_>>();
     paths.sort_unstable();
     paths
@@ -519,12 +520,12 @@ fn data_usage_entry_has_progress(entry: &DataUsageEntry) -> bool {
 }
 
 fn set_scan_checkpoint(cache: &mut DataUsageCache, reason: DataUsageScanCheckpointReason) {
-    let resume_after = cache.info.scan_resume_after.clone().or_else(|| {
+    let resume_after = clone_cache_value(&cache.info.scan_resume_after).or_else(|| {
         cache
             .info
             .scan_checkpoint
             .as_ref()
-            .map(|checkpoint| checkpoint.resume_after.clone())
+            .map(|checkpoint| clone_cache_value(&checkpoint.resume_after))
     });
 
     if let Some(resume_after) = resume_after {
@@ -853,8 +854,8 @@ impl RawEnumerationProgress {
             return None;
         }
         Some(DataUsageRawEnumerationCursor::new(
-            self.parent.clone(),
-            self.last_entry.clone(),
+            clone_cache_value(&self.parent),
+            clone_cache_value(&self.last_entry),
             self.entries_seen,
             self.digest.clone().finalize().into(),
         ))
@@ -928,7 +929,7 @@ fn prune_size_reconciliation(info: &mut DataUsageCacheInfo, now: u64) {
             .min_by(|(left_key, left), (right_key, right)| {
                 left.first_seen.cmp(&right.first_seen).then_with(|| left_key.cmp(right_key))
             })
-            .map(|(key, _)| key.clone());
+            .map(|(key, _)| clone_cache_value(key));
         let Some(oldest) = oldest else {
             break;
         };
@@ -1024,7 +1025,7 @@ impl FolderScanner {
             || folder.parent.is_some()
             || folder.name != self.old_cache.info.name
             || into.compacted
-            || !abandoned_children.contains(&child_hash.key())
+            || !abandoned_children.contains(&clone_cache_value(&child_hash.0))
         {
             return false;
         }
@@ -1140,7 +1141,7 @@ impl FolderScanner {
             return;
         }
 
-        let mut entries: Vec<(String, u64)> = failed.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let mut entries: Vec<(String, u64)> = failed.iter().map(|(k, v)| (clone_cache_value(k), *v)).collect();
         entries.sort_by(|(k1, ts1), (k2, ts2)| ts1.cmp(ts2).then_with(|| k1.cmp(k2)));
 
         let remove_count = failed.len().saturating_sub(max_entries);
@@ -1155,7 +1156,7 @@ impl FolderScanner {
     fn apply_size_reconciliation(&mut self, summary: &SizeSummary) {
         let now = Self::now_secs();
         self.pending_size_reconciliation_keys
-            .extend(summary.size_reconciliation.iter().map(|entry| entry.key.clone()));
+            .extend(summary.size_reconciliation.iter().map(|entry| clone_cache_value(&entry.key)));
         self.pending_size_reconciliation_scopes.extend(
             summary
                 .reconciliation_scopes
@@ -1167,10 +1168,10 @@ impl FolderScanner {
         for info in [&mut self.new_cache.info, &mut self.update_cache.info] {
             for incoming in &summary.size_reconciliation {
                 if let Some(existing) = info.size_reconciliation.get_mut(&incoming.key) {
-                    existing.reason = incoming.reason.clone();
+                    existing.reason = clone_cache_value(&incoming.reason);
                     existing.physical_size = incoming.physical_size;
-                    existing.generation = incoming.generation.clone();
-                    existing.version_id = incoming.version_id.clone();
+                    existing.generation = clone_cache_value(&incoming.generation);
+                    existing.version_id = clone_cache_value(&incoming.version_id);
                     existing.attempts = existing.attempts.saturating_add(1);
                     continue;
                 }
@@ -1179,10 +1180,10 @@ impl FolderScanner {
                     continue;
                 }
 
-                let mut entry = incoming.clone();
+                let mut entry = clone_cache_value(incoming);
                 entry.first_seen = now;
                 entry.attempts = 1;
-                info.size_reconciliation.insert(entry.key.clone(), entry);
+                info.size_reconciliation.insert(clone_cache_value(&entry.key), entry);
             }
         }
     }
@@ -1204,15 +1205,19 @@ impl FolderScanner {
     }
 
     fn record_scan_resume_hint(&mut self, folder: &str) {
-        self.new_cache.info.scan_resume_after = Some(folder.to_string());
-        self.update_cache.info.scan_resume_after = Some(folder.to_string());
-        let checkpoint = DataUsageScanCheckpoint::new(folder.to_string(), DataUsageScanCheckpointReason::Unknown);
+        self.record_scan_resume_hint_with(folder, str::to_owned);
+    }
+
+    fn record_scan_resume_hint_with(&mut self, folder: &str, copy: impl Fn(&str) -> String) {
+        self.new_cache.info.scan_resume_after = Some(copy(folder));
+        self.update_cache.info.scan_resume_after = Some(copy(folder));
+        let checkpoint = DataUsageScanCheckpoint::new(copy(folder), DataUsageScanCheckpointReason::Unknown);
         global_metrics().record_scanner_checkpoint_set(
             checkpoint.version,
             checkpoint.resume_after.clone(),
             checkpoint.reason.as_str(),
         );
-        self.new_cache.info.scan_checkpoint = Some(checkpoint.clone());
+        self.new_cache.info.scan_checkpoint = Some(clone_cache_value(&checkpoint));
         self.update_cache.info.scan_checkpoint = Some(checkpoint);
     }
 
@@ -1268,7 +1273,7 @@ impl FolderScanner {
             .as_deref()
             .is_some_and(|existing| matches!(folder_resume_match(folder, existing), Some(FolderResumeMatch::Descendant)));
         if !keep_existing {
-            self.record_scan_resume_hint(folder);
+            self.record_scan_resume_hint_with(folder, clone_cache_value::<str>);
         }
     }
 
@@ -1283,7 +1288,7 @@ impl FolderScanner {
         {
             self.raw_enumeration_progress.truncate(position + 1);
         } else {
-            let page_index = self.raw_enumeration_page_index_for_parent(parent).cloned();
+            let page_index = self.raw_enumeration_page_index_for_parent(parent).map(clone_cache_value);
             self.raw_enumeration_progress
                 .push(RawEnumerationProgress::new(parent, page_index));
         }
@@ -1439,11 +1444,11 @@ impl FolderScanner {
         }) {
             return None;
         }
-        let mut snapshot = self.new_cache.clone();
+        let mut snapshot = clone_cache_value(&self.new_cache);
         let mut parent = None;
         for ancestor in &self.checkpoint_ancestors[..self.checkpoint_depth] {
             snapshot.replace_hashed(&ancestor.hash, &parent, &ancestor.entry);
-            parent = Some(ancestor.hash.clone());
+            parent = Some(clone_cache_value(&ancestor.hash));
         }
         snapshot.replace_hashed(hash, &folder.parent, into);
         snapshot.checked_flatten_complete_scope(&snapshot.info.name)?;
@@ -1474,11 +1479,11 @@ impl FolderScanner {
             return;
         }
 
-        let Some(old_entry) = self.old_cache.cache.get(&parent_hash.key()) else {
+        let Some(old_entry) = self.old_cache.cache.get(&clone_cache_value(&parent_hash.0)) else {
             return;
         };
 
-        let old_children = old_entry.children.iter().cloned().collect::<Vec<_>>();
+        let old_children = old_entry.children.iter().map(clone_cache_value).collect::<Vec<_>>();
         for child in old_children {
             if entry.children.contains(&child) {
                 continue;
@@ -1487,9 +1492,9 @@ impl FolderScanner {
                 continue;
             }
 
-            let child_hash = DataUsageHash(child.clone());
+            let child_hash = DataUsageHash(clone_cache_value(&child));
             self.new_cache
-                .copy_with_children(&self.old_cache, &child_hash, &Some(parent_hash.clone()));
+                .copy_with_children(&self.old_cache, &child_hash, &Some(clone_cache_value(parent_hash)));
             entry.children.insert(child);
         }
     }
@@ -1511,9 +1516,9 @@ impl FolderScanner {
                 self.coverage_frontier = None;
                 self.coverage_gap = true;
             }
-            let mut child_entry = child_entry.clone();
+            let mut child_entry = clone_cache_value(child_entry);
             self.carry_forward_old_children(child_hash, &mut child_entry);
-            self.record_scan_resume_hint_if_not_ancestor(&child_hash.key());
+            self.record_scan_resume_hint_if_not_ancestor(&clone_cache_value(&child_hash.0));
             parent_entry.add_child(child_hash);
             self.new_cache.replace_hashed(child_hash, parent, &child_entry);
             self.update_cache.delete_recursive(child_hash);
@@ -2154,7 +2159,7 @@ impl FolderScanner {
                         continue;
                     }
 
-                    let exists = self.old_cache.cache.contains_key(&h.key());
+                    let exists = self.old_cache.cache.contains_key(&clone_cache_value(&h.0));
 
                     let this = CachedFolder {
                         name: entry_name.clone(),
@@ -2163,15 +2168,15 @@ impl FolderScanner {
                     };
 
                     if exists && self.should_reuse_clean_root_child(&folder, into, &this, &h, &abandoned_children) {
-                        abandoned_children.remove(&h.key());
+                        abandoned_children.remove(&clone_cache_value(&h.0));
                         self.reuse_clean_root_child(&this, &h, into);
                     } else if exists {
-                        abandoned_children.remove(&h.key());
+                        abandoned_children.remove(&clone_cache_value(&h.0));
                         existing_folders.push(this);
                         self.update_cache
-                            .copy_with_children(&self.old_cache, &h, &Some(this_hash.clone()));
+                            .copy_with_children(&self.old_cache, &h, &Some(clone_cache_value(&this_hash)));
                     } else {
-                        abandoned_children.remove(&h.key());
+                        abandoned_children.remove(&clone_cache_value(&h.0));
                         new_folders.push(this);
                     }
                     continue;
@@ -2506,11 +2511,11 @@ impl FolderScanner {
                         // Add new folders to the update tree so totals update for these.
                         if !into.compacted {
                             let mut found_any = false;
-                            let mut parent = this_hash.clone();
+                            let mut parent = clone_cache_value(&this_hash);
                             let update_cache_name_hash = hash_path(&self.update_cache.info.name);
 
                             while parent != update_cache_name_hash {
-                                let parent_key = parent.key();
+                                let parent_key = clone_cache_value(&parent.0);
                                 let e = self.update_cache.find(&parent_key);
                                 if e.is_none_or(|v| v.compacted) {
                                     found_any = true;
@@ -2525,8 +2530,11 @@ impl FolderScanner {
                             }
                             if !found_any {
                                 // Add non-compacted empty entry.
-                                self.update_cache
-                                    .replace_hashed(&h, &Some(this_hash.clone()), &DataUsageEntry::default());
+                                self.update_cache.replace_hashed(
+                                    &h,
+                                    &Some(clone_cache_value(&this_hash)),
+                                    &DataUsageEntry::default(),
+                                );
                             }
                         }
                     }
@@ -2600,13 +2608,13 @@ impl FolderScanner {
                 if outcome == FolderScanOutcome::Vanished {
                     self.new_cache.delete_recursive(&h);
                     self.update_cache.delete_recursive(&h);
-                    into.children.remove(&h.key());
+                    into.children.remove(&clone_cache_value(&h.0));
                     continue;
                 }
                 if outcome == FolderScanOutcome::ErasureData {
                     self.new_cache.delete_recursive(&h);
                     self.update_cache.delete_recursive(&h);
-                    into.children.remove(&h.key());
+                    into.children.remove(&clone_cache_value(&h.0));
                     // Earlier namespace siblings may have completed, but none
                     // can certify coverage of this unresolved parent object.
                     self.coverage_gap |= forward_sweep;
@@ -2636,11 +2644,14 @@ impl FolderScanner {
 
                 if queued_folder.source == FolderScanSource::New
                     && !into.compacted
-                    && self.update_cache.find(&this_hash.key()).is_some_and(|v| !v.compacted)
+                    && self
+                        .update_cache
+                        .find(&clone_cache_value(&this_hash.0))
+                        .is_some_and(|v| !v.compacted)
                 {
                     self.update_cache.delete_recursive(&h);
                     self.update_cache
-                        .copy_with_children(&self.new_cache, &h, &Some(this_hash.clone()));
+                        .copy_with_children(&self.new_cache, &h, &Some(clone_cache_value(&this_hash)));
                 }
             }
 
@@ -3068,7 +3079,7 @@ impl FolderScanner {
         if !into.compacted
             && self.old_cache.info.scan_progress.is_none()
             && self.new_cache.info.name != folder.name
-            && let Some(mut flat) = self.new_cache.size_recursive(&this_hash.key())
+            && let Some(mut flat) = self.new_cache.size_recursive(&clone_cache_value(&this_hash.0))
         {
             flat.compacted = true;
             let mut should_compact = false;
@@ -3105,9 +3116,9 @@ impl FolderScanner {
             done_compact();
         }
 
-        if self.update_cache.cache.contains_key(&this_hash.key()) && !was_compacted {
+        if self.update_cache.cache.contains_key(&clone_cache_value(&this_hash.0)) && !was_compacted {
             // Replace if existed before.
-            if let Some(flat) = self.new_cache.size_recursive(&this_hash.key()) {
+            if let Some(flat) = self.new_cache.size_recursive(&clone_cache_value(&this_hash.0)) {
                 self.update_cache.delete_recursive(&this_hash);
                 self.update_cache.replace_hashed(&this_hash, &folder.parent, &flat);
             }
@@ -3191,11 +3202,11 @@ pub(crate) async fn scan_data_folder_scoped(
     cache.fold_retired_tiers(&tier_registry.names);
     cache.info.tier_registry_generation = Some(tier_registry.generation);
 
-    let resume_frontier = cache.validated_scan_frontier().map(str::to_owned);
+    let resume_frontier = cache.validated_scan_frontier().map(clone_cache_value);
     if resume_frontier.is_some() {
         global_metrics().record_scanner_checkpoint_used();
     }
-    let bucket_name = cache.info.name.clone();
+    let bucket_name = clone_cache_value(&cache.info.name);
     let object_metadata_visits = metrics::counter!(
         "rustfs_scanner_object_metadata_visits_total",
         "bucket" => bucket_name.clone(),
@@ -3205,11 +3216,11 @@ pub(crate) async fn scan_data_folder_scoped(
     let resume_position_on_entry = cache.has_scan_position();
     let had_scan_checkpoint = cache.info.scan_checkpoint.is_some();
     let new_cache = DataUsageCache {
-        info: cache.info.clone(),
+        info: clone_cache_value(&cache.info),
         ..Default::default()
     };
     let update_cache = DataUsageCache {
-        info: cache.info.clone(),
+        info: clone_cache_value(&cache.info),
         ..Default::default()
     };
     let resume_failed_paths = if resume_frontier.is_some() {
@@ -3252,7 +3263,7 @@ pub(crate) async fn scan_data_folder_scoped(
         local_disk,
         tier_registry,
         pending_heals_changed: false,
-        coverage_frontier: resume_frontier.clone(),
+        coverage_frontier: clone_cache_value(&resume_frontier),
         resume_frontier,
         resume_failed_paths,
         coverage_gap: false,
@@ -3372,7 +3383,7 @@ pub(crate) async fn scan_data_folder_scoped(
                 if root_has_progress {
                     scanner.carry_forward_old_children(&root_hash, &mut root);
                 }
-                let coverage_frontier = scanner.coverage_frontier.clone();
+                let coverage_frontier = clone_cache_value(&scanner.coverage_frontier);
                 let new_cache = scanner.as_mut_new_cache();
                 if root_has_progress {
                     new_cache.replace_hashed(&root_hash, &None, &root);

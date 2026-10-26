@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::data_usage_define::clone_cache_value;
 use crate::data_usage_define::{DATA_USAGE_CACHE_KEY_FORMAT, DataUsageCacheRevisions};
 use crate::scanner_budget::ScannerCycleBudget;
 use crate::scanner_folder::{ScannerBucketPrefixScanScope, ScannerItem, scan_data_folder_scoped};
@@ -864,7 +865,7 @@ fn scanner_completed_set_segment_invalidation_proof(
     proof: &Option<crate::DataUsageSegmentInvalidationProof>,
     cold_zero_walk_reuse_candidate: bool,
 ) -> Option<crate::DataUsageSegmentInvalidationProof> {
-    proof.clone().map(|mut proof| {
+    clone_cache_value(proof).map(|mut proof| {
         proof.cold_zero_walk_oracle = cold_zero_walk_reuse_candidate;
         proof
     })
@@ -1377,7 +1378,7 @@ pub(crate) fn cache_root_entry_info(cache: &DataUsageCache) -> std::result::Resu
         .ok_or_else(|| ScannerError::Other(format!("scanner cache root is missing or corrupt: {}", cache.info.name)))?;
 
     Ok(DataUsageEntryInfo {
-        name: cache.info.name.clone(),
+        name: clone_cache_value(&cache.info.name),
         parent: DATA_USAGE_ROOT.to_string(),
         entry,
         bucket_incarnation: cache
@@ -1416,7 +1417,10 @@ fn apply_bucket_result_to_cache(
     }
     match result.bucket_incarnation {
         Some(incarnation) if !incarnation.is_nil() => {
-            cache.info.scan_bucket_incarnations.insert(result.name.clone(), incarnation);
+            cache
+                .info
+                .scan_bucket_incarnations
+                .insert(clone_cache_value(&result.name), incarnation);
         }
         _ => {
             cache.info.scan_bucket_incarnations.remove(&result.name);

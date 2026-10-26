@@ -1081,6 +1081,9 @@ pub async fn init_scanner_with_recovery(
     storeapi: Arc<ECStore>,
     enabled: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(feature = "hotpath-alloc")]
+    drop(hotpath::MeasurementGuardSync::new("cache_model.owned_copy", false, false));
+
     if enabled {
         if let Err(error) = run_scanner_usage_recovery_intents_for_startup(ctx.clone(), storeapi.clone()).await {
             warn!(
