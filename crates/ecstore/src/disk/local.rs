@@ -4136,6 +4136,8 @@ impl StdBackend {
             let _mount_lease = mount_lease;
             #[cfg(test)]
             run_owned_file_before_open(&path);
+            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+            os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::NativeReadOpen, &path);
             let mut file = std::fs::File::open(&path).map_err(to_file_error)?;
             let mut reclaim = None;
             if let Some((offset, length)) = range {
@@ -10787,6 +10789,8 @@ async fn read_file_all(path: impl AsRef<Path>, root: &os::PublicationRoot) -> Re
         let result = (|| {
             #[cfg(test)]
             run_owned_file_before_open(&path);
+            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+            os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::NativeReadOpen, &path);
             let mut file = root.open_readonly(&path)?;
             let metadata = file.metadata()?;
             if let Some(memory) = memory {

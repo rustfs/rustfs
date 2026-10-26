@@ -103,6 +103,13 @@ pub async fn open_file(path: impl AsRef<Path>, mode: FileMode) -> io::Result<Fil
         .create(mode & O_CREATE != 0)
         .append(mode & O_APPEND != 0)
         .truncate(mode & O_TRUNC != 0);
+        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+        if mode == O_RDONLY {
+            super::os::prepared_publication_test_hooks::run(
+                super::os::prepared_publication_test_hooks::Stage::NativeReadOpen,
+                &path,
+            );
+        }
         options.open(path).map(File::from_std)
     })
     .await

@@ -453,3 +453,150 @@ async fn scanner_tick_blocks_only_the_conflicting_generation_of_a_set() {
     assert!(blocks[0].reserves_targets, "an active intent still reserves its slot");
     assert!(blocks[0].blocked_since > 0);
 }
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn owned_auto_scan_waits_for_actual_native_intent_read() {
+    use rustfs_ecstore::api::disk::{LocalPublicationPause, LocalPublicationStage};
+
+    let fixture = ScannerFixture::new(false).await;
+    let path = format!(
+        "{}/ahm-replacement/{}_ahm_replacement_intent.json",
+        crate::heal::BUCKET_META_PREFIX,
+        fixture.task_id
+    );
+    let before = fixture
+        .storage
+        .survivor
+        .read_all(crate::heal::RUSTFS_META_BUCKET, &path)
+        .await
+        .expect("nonempty real replacement state");
+    assert!(!before.is_empty());
+    let mut pause = LocalPublicationPause::install(
+        fixture.storage.survivor.as_ref(),
+        crate::heal::RUSTFS_META_BUCKET,
+        &path,
+        LocalPublicationStage::NativeReadOpen,
+    )
+    .expect("native survivor read pause");
+    fixture
+        .manager
+        .start_auto_disk_scanner()
+        .await
+        .expect("actual slot-1 producer");
+    tokio::time::timeout(Duration::from_secs(5), pause.entered())
+        .await
+        .expect("scanner native read entry deadline")
+        .expect("real scanner read entered");
+    assert!(fixture.storage.inventory_calls.load(Ordering::SeqCst) >= 1);
+    let mut stop = Box::pin(fixture.manager.stop());
+    let first = tokio::time::timeout(Duration::from_millis(30), stop.as_mut()).await;
+    let held = first.is_err();
+    let unlocked = fixture.manager.admin_start_shutdown.try_lock().is_ok()
+        && fixture.manager.active_heals.try_lock().is_ok()
+        && fixture.manager.completed_heals.try_lock().is_ok();
+    drop(pause); // Release the native callback; its original syscall still runs.
+    let result = match first {
+        Ok(result) => Ok(result),
+        Err(_) => tokio::time::timeout(Duration::from_secs(5), stop).await,
+    };
+    assert!(held, "stop must own the scanner's in-flight tick branch");
+    assert!(unlocked, "join may not retain manager locks");
+    result.expect("released actual scanner joins").expect("scanner stop");
+    let registration = fixture.manager.workers.registration.lock().unwrap();
+    assert!(
+        registration.fixed[1]
+            .as_ref()
+            .expect("actual scanner receipt")
+            .peek()
+            .is_some()
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+#[serial_test::serial(replacement_auto_scan)]
+fn owned_resume_gc_cancels_async_loop_before_native_open_tail() {
+    use crate::heal::resume::ResumeState;
+    use rustfs_ecstore::api::disk::{LocalPublicationPause, LocalPublicationStage};
+
+    // This fixture owns its original executor, and drops it outside Tokio.
+    // Its receipt is local to this runtime, not the service's other native pools.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("owned GC fixture executor");
+    let (fixture, pause, file_path, original) = runtime.block_on(async {
+        let fixture = ScannerFixture::new(false).await;
+        let disk = crate::heal::local_disk_map_read()
+            .await
+            .get(&fixture.local_targets[0])
+            .and_then(Clone::clone)
+            .expect("actual registry disk");
+        let prefix = crate::heal::BUCKET_META_PREFIX;
+        match disk
+            .make_volume(&format!("{}/{prefix}", crate::heal::RUSTFS_META_BUCKET))
+            .await
+        {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(error) => panic!("resume volume: {error}"),
+        }
+        let id = Uuid::new_v4().to_string();
+        let state = ResumeState::new(id.clone(), SET.into(), "disk".into(), vec![]);
+        let original = serde_json::to_vec(&state).expect("real ordinary resume state");
+        assert!(!original.is_empty());
+        let path = format!("{prefix}/{id}_ahm_resume_state.json");
+        disk.write_all(crate::heal::RUSTFS_META_BUCKET, &path, original.clone().into())
+            .await
+            .expect("seed actual local GC namespace");
+        let file_path = std::path::Path::new(&fixture.local_targets[0])
+            .join(crate::heal::RUSTFS_META_BUCKET)
+            .join(&path);
+        let mut pause = LocalPublicationPause::install(
+            disk.as_ref(),
+            crate::heal::RUSTFS_META_BUCKET,
+            &path,
+            LocalPublicationStage::NativeReadOpen,
+        )
+        .expect("native ordinary-state open pause");
+        fixture.manager.start_resume_gc().await.expect("actual slot-2 producer");
+        tokio::time::timeout(Duration::from_secs(5), pause.entered())
+            .await
+            .expect("GC native open entry deadline")
+            .expect("real bounded read entered");
+        tokio::time::timeout(Duration::from_secs(5), fixture.manager.stop())
+            .await
+            .expect("read-only GC may cancel its async inspection")
+            .expect("async loop joined");
+        {
+            let registration = fixture.manager.workers.registration.lock().unwrap();
+            assert!(registration.fixed[2].as_ref().expect("actual GC receipt").peek().is_some());
+        }
+        (fixture, pause, file_path, original)
+    });
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let finisher = std::thread::spawn(move || {
+        drop(runtime); // Ordinary Drop must wait for its accepted native open.
+        finished_tx.send(()).expect("fixture finisher receiver");
+    });
+    let held_native = matches!(
+        finished_rx.recv_timeout(Duration::from_millis(30)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
+    drop(pause);
+    if held_native {
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("original executor drops after native release");
+    }
+    finisher.join().expect("ordinary executor Drop completed");
+    assert!(held_native, "async GC join must not masquerade as native-tail completion");
+    assert_eq!(
+        std::fs::read(file_path).expect("retained state"),
+        original,
+        "read-only cancellation preserves state"
+    );
+    drop(fixture);
+}

@@ -263,7 +263,7 @@ pub(crate) mod fsync_dir_recorder {
     }
 }
 
-/// Pause a real namespace mutation inside its physical executor.
+/// Pause a real native filesystem operation inside its physical executor.
 #[cfg(all(any(test, feature = "test-util"), not(windows)))]
 pub(crate) mod prepared_publication_test_hooks {
     use super::*;
@@ -273,6 +273,7 @@ pub(crate) mod prepared_publication_test_hooks {
         PreparedRename,
         Rename,
         Remove,
+        NativeReadOpen,
         #[cfg(test)]
         Rollback,
         #[cfg(test)]
@@ -365,6 +366,8 @@ pub enum LocalPublicationStage {
     PreparedRename,
     Rename,
     Remove,
+    /// Pause an accepted native read/open before its original syscall.
+    NativeReadOpen,
 }
 
 #[cfg(all(feature = "test-util", not(windows)))]
@@ -377,6 +380,7 @@ impl LocalPublicationPause {
             LocalPublicationStage::PreparedRename => prepared_publication_test_hooks::Stage::PreparedRename,
             LocalPublicationStage::Rename => prepared_publication_test_hooks::Stage::Rename,
             LocalPublicationStage::Remove => prepared_publication_test_hooks::Stage::Remove,
+            LocalPublicationStage::NativeReadOpen => prepared_publication_test_hooks::Stage::NativeReadOpen,
         };
         let (entered_tx, entered) = oneshot::channel();
         let (release, release_rx) = std::sync::mpsc::channel::<()>();
