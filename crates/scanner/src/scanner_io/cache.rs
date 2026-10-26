@@ -589,6 +589,11 @@ impl ScannerPublicationExpectation {
         Arc::ptr_eq(&self.candidate, &other.candidate) && self.candidate.1 == other.candidate.1
     }
 
+    #[cfg(feature = "e2e-test-hooks")]
+    pub(crate) fn e2e_digests(&self) -> (String, String) {
+        (crate::e2e_barrier::hex(&self.candidate.0), crate::e2e_barrier::hex(&self.candidate.1.0))
+    }
+
     #[cfg(test)]
     pub(crate) fn for_tests(candidate_digest: [u8; 32], coverage_digest: DataUsageScanPlanDigest) -> Self {
         Self {

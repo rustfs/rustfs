@@ -1330,6 +1330,7 @@ async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work()
                     requires_full_scan,
                     resolved_scope_observer: Some(observer),
                     post_walk_gate: None,
+                    peer_observations: None,
                     service_cohort: None,
                 },
             ),
@@ -1421,6 +1422,7 @@ async fn scoped_scan_same_cycle_maintenance_rewalks_after_root_delivery_failure(
                     requires_full_scan: false,
                     resolved_scope_observer: None,
                     post_walk_gate: None,
+                    peer_observations: None,
                     service_cohort: None,
                 },
             ),
@@ -1475,6 +1477,7 @@ async fn scoped_scan_same_cycle_maintenance_rewalks_after_root_delivery_failure(
                     requires_full_scan,
                     resolved_scope_observer: None,
                     post_walk_gate: None,
+                    peer_observations: None,
                     service_cohort: None,
                 },
             ),
@@ -2324,6 +2327,7 @@ async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers
             publication_epoch: Some(epoch),
             dirty_usage_buckets: Arc::new(HashMap::new()),
             bucket_failures: ScannerBucketFailureState::default(),
+            bucket_completions: None,
             pending_maintenance_work: Arc::new(AtomicBool::new(false)),
             cache_cycle_floor: Arc::new(AtomicU64::new(8)),
             cold_zero_walk_reuse_observed: Arc::new(AtomicBool::new(false)),
@@ -3241,6 +3245,7 @@ async fn distributed_scoped_scan_falls_back_when_remote_ack_exceeds_protocol_bat
         store.as_ref(),
         true,
         super::io_cycle::ScannerBucketScopeResolution {
+            remote_window: None,
             requested_scope: ScannerBucketScanScope::default(),
             baseline_proof: ScannerCacheBaselineProof {
                 authoritative_data: Some(&baseline),
@@ -3300,6 +3305,7 @@ async fn distributed_scoped_scan_falls_back_when_remote_scoped_ack_capability_is
             store.as_ref(),
             true,
             super::io_cycle::ScannerBucketScopeResolution {
+                remote_window: None,
                 requested_scope: ScannerBucketScanScope::default(),
                 baseline_proof: ScannerCacheBaselineProof {
                     authoritative_data: Some(&baseline),
@@ -4868,6 +4874,7 @@ async fn replication_maintenance_refreshes_compacted_stats_across_cycles_and_ret
                 service_cohort: None,
                 resolved_scope_observer: None,
                 post_walk_gate: None,
+                peer_observations: None,
             },
         )
         .await
@@ -4975,6 +4982,7 @@ async fn replication_maintenance_refreshes_compacted_stats_across_cycles_and_ret
                 service_cohort: None,
                 resolved_scope_observer: None,
                 post_walk_gate: None,
+                peer_observations: None,
             },
         )
         .await
@@ -5122,6 +5130,7 @@ async fn run_full_cycle(store: &Arc<ECStore>, cycle: u64) -> ScannerCycleStatus 
                 resolved_scope_observer: None,
                 service_cohort: None,
                 post_walk_gate: None,
+                peer_observations: None,
             },
         ),
     )

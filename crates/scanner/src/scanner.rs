@@ -2024,6 +2024,8 @@ where
             resolved_scope_observer: None,
             #[cfg(test)]
             post_walk_gate: None,
+            #[cfg(test)]
+            peer_observations: None,
         },
     )
     .await;
@@ -2164,6 +2166,9 @@ where
         scanner_post_lease_activity_defer_reason(
             result.activity_baseline(),
             probe_scanner_activity(storeapi.as_ref(), true).await,
+            result
+                .remote_dirty_usage_certification()
+                .zip(remote_publication_leases.as_ref().map(|(_, grants)| grants.as_slice())),
         )
     } else {
         None
@@ -2515,9 +2520,24 @@ where
     } else {
         "incomplete_coverage"
     };
+    #[cfg(feature = "e2e-test-hooks")]
+    let durable_observation = scan_cycle_result
+        .publication_expectation()
+        .as_ref()
+        .and_then(|expected| usage_publication_result.e2e_durable_observation(leader_epoch, cycle_info.current, expected));
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(observation) = &durable_observation {
+        let _ = crate::e2e_barrier::checkpoint("root_durable", observation.clone()).await;
+    }
     let pending_dirty_usage_buckets = scan_cycle_result.pending_dirty_usage_buckets();
     let (completion_outcome, scanner_pending_maintenance_work, remote_dirty_usage_acknowledgements) =
         finalize_scanner_cycle_result(scan_cycle_result, usage_publication_result);
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(mut observation) = durable_observation {
+        observation["acks"] = crate::e2e_barrier::acknowledgement_observations(&remote_dirty_usage_acknowledgements);
+        observation["pending_bucket_count"] = serde_json::json!(pending_dirty_usage_buckets);
+        let _ = crate::e2e_barrier::checkpoint("ack_send", observation).await;
+    }
     let remote_dirty_usage_pending = if remote_dirty_usage_acknowledgements.is_empty() {
         false
     } else if let Some(notification_system) = storeapi.scanner_notification_system() {
@@ -3949,18 +3969,26 @@ impl ScannerCyclePublicationPlan {
 /// Re-prove the guardrail after every peer granted a publication lease. The
 /// comparison uses the guardrail fields (`scanner_activity_guardrail_veto`),
 /// not the full digest: local generation movement in this window is the next
-/// cycle's work and its buckets stay in the dirty map. A peer whose dirty
-/// usage moved keeps deferring in this phase, as it does during the walk.
+/// cycle's work and its buckets stay in the dirty map. A sealed producer
+/// proof may cover peer dirty movement too, but must bind every lease owner
+/// and session without changing its candidate or acknowledged tuples.
 fn scanner_post_lease_activity_defer_reason(
     baseline: Option<&ScannerActivitySnapshot>,
     activity: Result<ScannerActivitySnapshot, String>,
+    certification: Option<(
+        &crate::scanner_io::ScannerRemoteDirtyUsageCertification,
+        &[crate::storage_api::EcstoreScannerPublicationLeaseGrant],
+    )>,
 ) -> Option<ScannerCycleDeferReason> {
     match activity {
         Ok(snapshot)
             if scanner_activity_allows_usage_publication(&snapshot)
                 && baseline.is_some_and(|baseline| {
                     scanner_activity_guardrail_veto(baseline, &snapshot).is_none()
-                        && scanner_peer_dirty_usage_moved(baseline, &snapshot).is_none()
+                        && certification.map_or_else(
+                            || scanner_peer_dirty_usage_moved(baseline, &snapshot).is_none(),
+                            |(proof, grants)| proof.matches_publication_leases(grants) && proof.matches_activity(&snapshot),
+                        )
                 }) =>
         {
             None
@@ -3970,6 +3998,13 @@ fn scanner_post_lease_activity_defer_reason(
                 Err(_) => "probe_failed",
                 Ok(snapshot) if !scanner_activity_allows_usage_publication(snapshot) => "publication_blocked",
                 Ok(_) if baseline.is_none() => "baseline_missing",
+                Ok(snapshot)
+                    if certification.is_some_and(|(proof, grants)| {
+                        !proof.matches_publication_leases(grants) || !proof.matches_activity(snapshot)
+                    }) =>
+                {
+                    "peer_certification"
+                }
                 Ok(snapshot) => baseline
                     .and_then(|baseline| {
                         scanner_activity_guardrail_veto(baseline, snapshot)
@@ -4133,6 +4168,7 @@ fn finalize_scanner_cycle_result(
                 .is_some_and(|proof| proof.verified_version_for(expected).is_some())
         });
     let pending_maintenance_work = scan_cycle_result.has_pending_maintenance_work()
+        || scan_cycle_result.has_remote_dirty_usage_pending()
         || (scan_cycle_result.has_dirty_usage_to_acknowledge() && !durable_complete_snapshot);
     let remote_dirty_usage_acknowledgements = if durable_complete_snapshot {
         match proof {

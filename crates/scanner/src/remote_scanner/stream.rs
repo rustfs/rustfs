@@ -792,6 +792,16 @@ async fn scan_and_persist_local_bucket(
     let set_disks = scanner_set_disk_inventory(set.as_ref()).await;
     let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel::<DataUsageCache>(1);
     let scan_ctx = ctx.child_token();
+    #[cfg(feature = "e2e-test-hooks")]
+    let _ = crate::e2e_barrier::checkpoint(
+        "bucket_walk",
+        serde_json::json!({
+            "epoch": leader_epoch, "cycle": next_cycle,
+            "pool": source.pool_index, "set": source.set_index,
+            "bucket": bucket, "drive": disk.path().display().to_string(),
+        }),
+    )
+    .await;
     let scan = ScannerIODisk::nsscanner_disk(
         disk.clone(),
         scan_ctx.clone(),

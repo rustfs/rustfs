@@ -58,6 +58,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub mod data_usage_define;
+#[cfg(feature = "e2e-test-hooks")]
+#[doc(hidden)]
+pub mod e2e_barrier;
 pub mod error;
 mod heal_completion;
 pub mod prefix_usage;

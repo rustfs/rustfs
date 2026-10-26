@@ -282,6 +282,7 @@ impl ScannerIOCache for SetDisks {
             publication_epoch,
             dirty_usage_buckets,
             bucket_failures,
+            bucket_completions,
             pending_maintenance_work,
             cache_cycle_floor,
             cold_zero_walk_reuse_observed,
@@ -1296,6 +1297,12 @@ impl ScannerIOCache for SetDisks {
                     let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel::<DataUsageCache>(1);
 
                     let scan_ctx = ctx_clone.child_token();
+                    #[cfg(feature = "e2e-test-hooks")]
+                    let _ = crate::e2e_barrier::checkpoint("bucket_walk", serde_json::json!({
+                        "epoch": leader_epoch, "cycle": want_cycle,
+                        "pool": source.pool_index, "set": source.set_index,
+                        "bucket": bucket.name, "drive": disk.path().display().to_string(),
+                    })).await;
                     let scan = disk.clone().nsscanner_disk(
                         scan_ctx.clone(),
                         budget_clone.clone(),
@@ -1705,6 +1712,22 @@ impl ScannerIOCache for SetDisks {
 
         if let Some(err) = first_join_err {
             return Err(err);
+        }
+
+        // Record only actual worker completions, before adding carried values.
+        // The root's cold entries cannot certify a newly observed peer tuple.
+        if let Some(completions) = bucket_completions {
+            let completed_incarnations = completed_buckets
+                .iter()
+                .filter_map(|bucket| {
+                    current_bucket_incarnations
+                        .as_ref()?
+                        .get(bucket)
+                        .filter(|incarnation| !incarnation.is_nil())
+                        .map(|incarnation| (bucket.clone(), *incarnation))
+                })
+                .collect();
+            completions.lock().await.insert(source, completed_incarnations);
         }
 
         let carried_buckets = carry_partial_bucket_values(

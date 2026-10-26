@@ -49,6 +49,7 @@ async fn complete_candidate(store: &Arc<ECStore>, cycle: u64) -> (crate::scanner
             service_cohort: None,
             resolved_scope_observer: None,
             post_walk_gate: None,
+            peer_observations: None,
         },
     )
     .await
@@ -285,6 +286,7 @@ async fn scoped_ack_publication_observed_candidate_reuse_requires_a_new_root_pro
             service_cohort: None,
             resolved_scope_observer: Some(observer),
             post_walk_gate: None,
+            peer_observations: None,
         },
     )
     .await
@@ -456,6 +458,7 @@ async fn scoped_ack_publication_rejects_builder_mutation_after_real_root_publish
         "remote_scoped_ack_target",
         "publication_epoch",
         "remote_lease_targets",
+        "remote_pending",
     ] {
         let (_directory, store) = candidate_store().await;
         let (scan, candidate) = complete_candidate(&store, PROOF_CYCLE).await;
@@ -502,6 +505,7 @@ async fn scoped_ack_publication_rejects_builder_mutation_after_real_root_publish
                 },
             }]),
             "publication_epoch" => scan.with_publication_epoch(Some(changed_epoch)),
+            "remote_pending" => scan.with_remote_dirty_usage_pending(true),
             "remote_lease_targets" => scan.with_remote_publication_lease_targets(vec![(
                 "proof-peer:9000".to_string(),
                 crate::scanner_activity_epoch().to_string(),
@@ -523,4 +527,143 @@ async fn scoped_ack_publication_rejects_builder_mutation_after_real_root_publish
         assert_eq!(read_root(&store).await, root_before, "{mutation}: the durable original root is retained");
     }
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+}
+
+#[test]
+#[serial]
+fn certified_empty_remote_ack_keeps_known_remote_work_pending() {
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    let scan = ScannerCycleResult::new(ScannerCycleStatus::Complete, None).with_remote_dirty_usage_pending(true);
+    let (outcome, pending, acknowledgements) = finalize_scanner_cycle_result(scan, DataUsagePersistOutcome::Current.into());
+    assert_eq!(outcome, ScannerCycleOutcome::Completed);
+    assert!(acknowledgements.is_empty());
+    assert!(pending, "an empty ACK cannot hide the remote buckets excluded from certification");
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+}
+
+#[test]
+fn sealed_peer_proof_binds_every_lease_and_keeps_all_post_lease_guardrails() {
+    use crate::storage_api::{
+        EcstoreScannerPeerDirtyUsageBucket, EcstoreScannerPeerDirtyUsageSnapshot, EcstoreScannerPublicationLease,
+        EcstoreScannerPublicationLeaseGrant,
+    };
+    let peer_rows = [("peer-a", 101_u128, 201_u128, true), ("peer-b", 102, 202, false)];
+    let mut before = BTreeMap::new();
+    let mut peers = Vec::new();
+    let mut grants = Vec::new();
+    for (host, owner, instance, pending) in peer_rows {
+        let owner_id = uuid::Uuid::from_u128(owner).simple().to_string();
+        let instance_id = uuid::Uuid::from_u128(instance).simple().to_string();
+        before.insert(host.to_string(), scanner_node_activity_for_tests(&instance_id, 10, 10, pending));
+        let buckets = if pending {
+            BTreeMap::from([(
+                "cold-bucket".to_string(),
+                EcstoreScannerPeerDirtyUsageBucket {
+                    bucket_incarnation: uuid::Uuid::from_u128(301),
+                    generation: 8,
+                },
+            )])
+        } else {
+            BTreeMap::new()
+        };
+        peers.push((
+            host.to_string(),
+            EcstoreScannerPeerDirtyUsageSnapshot {
+                owner_id: owner_id.clone(),
+                instance_id: instance_id.clone(),
+                generation: 10,
+                pending_bucket_count: buckets.len() as u64,
+                protocol_version: crate::SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION,
+                complete: true,
+                buckets,
+            },
+        ));
+        grants.push(EcstoreScannerPublicationLeaseGrant {
+            host: host.to_string(),
+            lease: EcstoreScannerPublicationLease {
+                token: uuid::Uuid::new_v4(),
+                movement_generation: 0,
+                observational_only: false,
+                owner_id,
+                session_id: instance_id,
+                expires_at: std::time::Instant::now() + Duration::from_secs(60),
+            },
+        });
+    }
+    let proof = crate::scanner_io::ScannerRemoteDirtyUsageCertification::for_tests(before.clone(), peers)
+        .expect("complete producer evidence");
+    let mut late_write = before.clone();
+    let writer = late_write.get_mut("peer-a").expect("writer");
+    writer.namespace_generation += 1;
+    writer.dirty_usage_generation += 1;
+    assert_eq!(
+        scanner_post_lease_activity_defer_reason(Some(&before), Ok(late_write.clone()), Some((&proof, &grants))),
+        None
+    );
+
+    for case in [
+        "missing",
+        "duplicate",
+        "owner",
+        "instance",
+        "movement",
+        "expired",
+        "observational",
+        "token",
+    ] {
+        let mut invalid = grants.clone();
+        match case {
+            "missing" => {
+                invalid.pop();
+            }
+            "duplicate" => invalid[1] = invalid[0].clone(),
+            "owner" => invalid[1].lease.owner_id = uuid::Uuid::from_u128(999).to_string(),
+            "instance" => invalid[1].lease.session_id = uuid::Uuid::from_u128(999).to_string(),
+            "movement" => invalid[1].lease.movement_generation += 1,
+            "expired" => invalid[1].lease.expires_at = std::time::Instant::now() - Duration::from_secs(1),
+            "observational" => invalid[1].lease.observational_only = true,
+            "token" => invalid[1].lease.token = uuid::Uuid::nil(),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            scanner_post_lease_activity_defer_reason(Some(&before), Ok(before.clone()), Some((&proof, &invalid))),
+            Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+            "{case}"
+        );
+    }
+    for field in [
+        "instance",
+        "protocol",
+        "topology",
+        "maintenance",
+        "data_movement",
+        "movement",
+        "blocked",
+        "missing_peer",
+        "overflow",
+        "rollback",
+    ] {
+        let mut changed = late_write.clone();
+        let peer = changed.get_mut("peer-a").expect("peer");
+        match field {
+            "instance" => peer.instance_id = uuid::Uuid::from_u128(999).to_string(),
+            "protocol" => peer.protocol_version += 1,
+            "topology" => peer.topology_digest[0] ^= 1,
+            "maintenance" => peer.maintenance_generation += 1,
+            "data_movement" => peer.data_movement_active = true,
+            "movement" => peer.movement_generation += 1,
+            "blocked" => peer.publication_blocked = true,
+            "missing_peer" => {
+                changed.remove("peer-b");
+            }
+            "overflow" => peer.dirty_usage_generation = u64::MAX,
+            "rollback" => peer.dirty_usage_generation = 9,
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            scanner_post_lease_activity_defer_reason(Some(&before), Ok(changed), Some((&proof, &grants))),
+            Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+            "{field}"
+        );
+    }
 }

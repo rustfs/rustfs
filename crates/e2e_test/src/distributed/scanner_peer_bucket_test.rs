@@ -1,0 +1,1784 @@
+// Copyright 2026 RustFS Team
+// SPDX-License-Identifier: Apache-2.0
+
+use super::harness::{TestResult, wait_until};
+use super::scanner_peer_bucket_fixture::{CYCLE_TIMEOUT, PeerBucketRun};
+use crate::common::init_logging;
+use crate::rpc_fault_proxy::ScopedAckFault;
+use rustfs_data_usage::DataUsageInfo;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
+
+fn identity(observation: &Value) -> TestResult<(u64, u64)> {
+    Ok((
+        observation["detail"]["epoch"]
+            .as_u64()
+            .ok_or("scanner observation omitted epoch")?,
+        observation["detail"]["cycle"]
+            .as_u64()
+            .ok_or("scanner observation omitted cycle")?,
+    ))
+}
+
+fn sequence(observation: &Value) -> TestResult<u64> {
+    observation["sequence"]
+        .as_u64()
+        .ok_or_else(|| "scanner observation omitted sequence".into())
+}
+
+fn names(value: &Value) -> TestResult<BTreeSet<String>> {
+    value
+        .as_array()
+        .ok_or_else(|| "scanner bucket observation is not an array".into())
+        .and_then(|items| {
+            items
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| "scanner bucket name is not a string".into())
+                })
+                .collect()
+        })
+}
+
+fn peer_for_address<'a>(observation: &'a Value, address: &str) -> TestResult<&'a Value> {
+    let peers = observation["detail"]["peers"]
+        .as_array()
+        .ok_or("scanner snapshot omitted actual peer maps")?;
+    let matching = peers
+        .iter()
+        .filter(|peer| {
+            peer["host"].as_str().is_some_and(|host| {
+                host.trim_start_matches("http://")
+                    .trim_start_matches("https://")
+                    .trim_end_matches('/')
+                    == address
+            })
+        })
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err(format!("actual snapshot must identify the remote ingress process once: {address}, {peers:?}").into());
+    }
+    Ok(matching[0])
+}
+
+fn tuples(entries: &Value) -> TestResult<BTreeMap<String, (String, u64)>> {
+    let mut result = BTreeMap::new();
+    for entry in entries.as_array().ok_or("scoped observation omitted entries")? {
+        let bucket = entry["bucket"].as_str().ok_or("scoped tuple omitted bucket")?;
+        let incarnation = entry["bucket_incarnation"]
+            .as_str()
+            .ok_or("scoped tuple omitted bucket incarnation")?;
+        if uuid::Uuid::parse_str(incarnation)?.is_nil() {
+            return Err("scoped tuple contains a nil incarnation".into());
+        }
+        let generation = entry["generation"]
+            .as_u64()
+            .filter(|value| *value > 0)
+            .ok_or("scoped tuple omitted generation")?;
+        if result
+            .insert(bucket.to_string(), (incarnation.to_string(), generation))
+            .is_some()
+        {
+            return Err("scoped observation contains duplicate buckets".into());
+        }
+    }
+    Ok(result)
+}
+
+fn assert_snapshot_window(observation: &Value, peer: &Value) -> TestResult {
+    let host = peer["host"].as_str().ok_or("snapshot peer omitted host")?;
+    let before = &observation["detail"]["activity_before"][host];
+    let after = &observation["detail"]["activity_after"][host];
+    let generation = peer["generation"].as_u64().ok_or("snapshot peer omitted generation")?;
+    let lower = before["dirty_usage_generation"]
+        .as_u64()
+        .ok_or("leading peer activity omitted generation")?;
+    let upper = after["dirty_usage_generation"]
+        .as_u64()
+        .ok_or("trailing peer activity omitted generation")?;
+    if peer["complete"].as_bool() != Some(true)
+        || peer["instance_id"] != before["instance_id"]
+        || peer["instance_id"] != after["instance_id"]
+        || lower >= generation
+        || generation > upper
+    {
+        return Err(
+            format!("real remote write did not advance a complete snapshot inside one process/activity window: {peer}").into(),
+        );
+    }
+    Ok(())
+}
+
+fn peer_identities(peers: &Value) -> TestResult<BTreeSet<(String, String, String)>> {
+    let mut identities = BTreeSet::new();
+    for peer in peers.as_array().ok_or("peer identities are not an array")? {
+        let host = peer["host"].as_str().ok_or("peer identity omitted host")?;
+        let owner = peer["owner_id"].as_str().ok_or("peer identity omitted owner")?;
+        let instance = peer["instance_id"].as_str().ok_or("peer identity omitted instance")?;
+        if uuid::Uuid::parse_str(owner)?.is_nil() || instance.is_empty() {
+            return Err("peer identity contains an empty owner or process instance".into());
+        }
+        if !identities.insert((host.to_string(), owner.to_string(), instance.to_string())) {
+            return Err("peer identities contain a duplicate".into());
+        }
+    }
+    if identities.len() != 3
+        || identities
+            .iter()
+            .map(|(_, _, instance)| instance)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != 3
+    {
+        return Err("the four-process fixture must observe exactly three distinct remote process instances".into());
+    }
+    Ok(identities)
+}
+
+fn assert_scope(candidate: &Value, expected: &BTreeSet<String>, incarnations: &BTreeMap<String, (String, u64)>) -> TestResult {
+    assert_completed_scope(candidate, expected, incarnations, false)
+}
+
+fn assert_completed_scope(
+    candidate: &Value,
+    expected: &BTreeSet<String>,
+    incarnations: &BTreeMap<String, (String, u64)>,
+    allow_full_scan: bool,
+) -> TestResult {
+    let detail = &candidate["detail"];
+    let selected = &detail["selected_scope"];
+    let expected_scope = (allow_full_scan && selected["kind"] == "all")
+        || (selected["kind"] == "buckets" && names(&selected["buckets"])? == *expected);
+    if detail["scan_mode"].as_str() != Some("normal")
+        || detail["status"].as_str() != Some("complete")
+        || !expected_scope
+        || names(&detail["scanned_buckets"])? != *expected
+    {
+        return Err(format!("cycle did not complete the exact Normal bucket scope: {detail}").into());
+    }
+    let coverage = detail["set_coverage"]
+        .as_array()
+        .ok_or("candidate omitted actual set completion evidence")?;
+    let mut sets = BTreeSet::new();
+    for set in coverage {
+        if set["pool"].as_u64() != Some(0) || names(&set["buckets"])? != *expected {
+            return Err(format!("set completed a different bucket scope: {set}").into());
+        }
+        for bucket in expected {
+            if set["bucket_incarnations"][bucket].as_str() != incarnations.get(bucket).map(|entry| entry.0.as_str()) {
+                return Err(format!("actual set completion did not bind the same bucket incarnation for {bucket}: {set}").into());
+            }
+        }
+        if !sets.insert(set["set"].as_u64().ok_or("set completion omitted set index")?) {
+            return Err("candidate repeated a set completion".into());
+        }
+    }
+    if sets != BTreeSet::from([0, 1, 2, 3]) {
+        return Err(format!("candidate lacks actual completion from all four sets: {sets:?}").into());
+    }
+    Ok(())
+}
+
+fn receiver_observation(run: &PeerBucketRun, stage: &str, pid: u32, expected_ack: &Value) -> TestResult<Option<Value>> {
+    receiver_observation_after(run, stage, pid, expected_ack, None)
+}
+
+fn receiver_observation_after(
+    run: &PeerBucketRun,
+    stage: &str,
+    pid: u32,
+    expected_ack: &Value,
+    after_sequence: Option<u64>,
+) -> TestResult<Option<Value>> {
+    select_receiver_observation(run.barrier.observations(false)?, stage, pid, expected_ack, after_sequence)
+}
+
+fn select_receiver_observation(
+    observations: Vec<Value>,
+    stage: &str,
+    pid: u32,
+    expected_ack: &Value,
+    after_sequence: Option<u64>,
+) -> TestResult<Option<Value>> {
+    let expected_entries = tuples(&expected_ack["entries"])?;
+    for observation in observations {
+        let detail = &observation["detail"];
+        if observation["stage"].as_str() == Some(stage)
+            && observation["pid"].as_u64() == Some(u64::from(pid))
+            && match after_sequence {
+                Some(previous) => sequence(&observation)? > previous,
+                None => true,
+            }
+            && detail["owner_id"] == expected_ack["owner_id"]
+            && detail["instance_id"] == expected_ack["instance_id"]
+            && tuples(&detail["entries"])? == expected_entries
+        {
+            return Ok(Some(observation));
+        }
+    }
+    Ok(None)
+}
+
+#[test]
+fn scanner_peer_bucket_receiver_observation_keeps_zero_and_excludes_prior_sequences() -> TestResult {
+    let ack = json!({
+        "owner_id": "00000000-0000-0000-0000-000000000001",
+        "instance_id": "a".repeat(32),
+        "entries": [{"bucket": "cold-a", "bucket_incarnation": "00000000-0000-0000-0000-000000000002", "generation": 7}],
+    });
+    let observation = |stage: &str, sequence: u64| {
+        json!({"stage": stage, "pid": 17, "sequence": sequence, "detail": {
+            "owner_id": ack["owner_id"], "instance_id": ack["instance_id"], "entries": ack["entries"],
+        }})
+    };
+    let before = observation("ack_before_apply", 0);
+    let after = observation("ack_after_apply", 1);
+    let later_before = observation("ack_before_apply", 2);
+    let later_after = observation("ack_after_apply", 3);
+    let observations = vec![before.clone(), after.clone(), later_before.clone(), later_after.clone()];
+    assert_eq!(
+        select_receiver_observation(observations.clone(), "ack_before_apply", 17, &ack, None)?,
+        Some(before),
+        "the first receiver event may have sequence zero"
+    );
+    assert_eq!(
+        select_receiver_observation(observations.clone(), "ack_after_apply", 17, &ack, None)?,
+        Some(after),
+        "the initial apply pair must retain its real 0/1 events"
+    );
+    assert_eq!(
+        select_receiver_observation(observations.clone(), "ack_before_apply", 17, &ack, Some(0))?,
+        Some(later_before),
+        "an actual sequence-zero cursor must exclude the earlier matching event"
+    );
+    assert_eq!(
+        select_receiver_observation(observations.clone(), "ack_after_apply", 17, &ack, Some(1))?,
+        Some(later_after),
+        "a later logical duplicate must not reuse the first apply observation"
+    );
+    assert_eq!(
+        select_receiver_observation(observations, "ack_after_apply", 17, &ack, Some(3))?,
+        None,
+        "an exclusive cursor must not select its own observation"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scanner_peer_bucket_hot_window_certifies_cold_and_scopes_next_normal_cycle() -> TestResult {
+    hot_window(None).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scanner_peer_bucket_alternating_producers_retry_cold_after_scoped_ack_request_loss() -> TestResult {
+    hot_window(Some(ScopedAckFault::RequestLoss)).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scanner_peer_bucket_alternating_producers_preserve_hot_after_scoped_ack_response_loss() -> TestResult {
+    hot_window(Some(ScopedAckFault::ResponseLoss)).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scanner_peer_bucket_logical_duplicate_scoped_acks_clear_cold_once() -> TestResult {
+    reordered_scoped_acks(false).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scanner_peer_bucket_reordered_scoped_ack_preserves_newest_cold_generation() -> TestResult {
+    reordered_scoped_acks(true).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scanner_peer_bucket_root_before_publish_sigkill_preserves_old_root_and_dirty_scope() -> TestResult {
+    crash_window("root_before_publish").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scanner_peer_bucket_root_durable_sigkill_preserves_committed_root_without_ack() -> TestResult {
+    crash_window("root_durable").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scanner_peer_bucket_ack_before_apply_sigkill_recovers_unapplied_scope() -> TestResult {
+    crash_window("ack_before_apply").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scanner_peer_bucket_ack_after_apply_sigkill_recovers_without_response() -> TestResult {
+    crash_window("ack_after_apply").await
+}
+
+fn assert_root_binding(candidate: &Value, root: &Value) -> TestResult {
+    for field in ["candidate_sha256", "coverage_sha256"] {
+        let digest = candidate["detail"][field].as_str().filter(|value| value.len() == 64);
+        if digest.is_none() || root["detail"][field].as_str() != digest {
+            return Err(format!("durable root did not bind the actual candidate {field}").into());
+        }
+    }
+    if root["detail"]["root_sha256"].as_str().is_none_or(|value| value.len() != 64)
+        || root["detail"]["root_version"].is_null()
+        || !matches!(root["detail"]["outcome"].as_str(), Some("saved" | "already_durable"))
+    {
+        return Err(format!("root omitted its verified durable publication receipt: {root}").into());
+    }
+    Ok(())
+}
+
+fn scoped_ack_for_peer<'a>(root: &Value, send: &'a Value, peer: &Value) -> TestResult<&'a Value> {
+    if sequence(root)? >= sequence(send)?
+        || identity(root)? != identity(send)?
+        || send["detail"]["candidate_sha256"] != root["detail"]["candidate_sha256"]
+        || send["detail"]["coverage_sha256"] != root["detail"]["coverage_sha256"]
+    {
+        return Err("scoped ACK did not follow the same candidate's verified durable root".into());
+    }
+    send["detail"]["acks"]
+        .as_array()
+        .ok_or("sender omitted actual acknowledgements")?
+        .iter()
+        .find(|ack| ack["kind"] == "scoped" && ack["owner_id"] == peer["owner_id"] && ack["instance_id"] == peer["instance_id"])
+        .ok_or_else(|| "sender omitted the actual producer's scoped ACK".into())
+}
+
+fn assert_retained_ack(receipt: &Value, ack: &Value, receiver: &str) -> TestResult {
+    if receipt["request"]["owner_id"] != ack["owner_id"]
+        || receipt["request"]["instance_id"] != ack["instance_id"]
+        || receipt["request"]["probe_only"] != false
+        || tuples(&receipt["request"]["entries"])? != tuples(&ack["entries"])?
+        || receipt["receiver"].as_str() != Some(receiver)
+        || receipt["forwarded"] != false
+        || receipt["completed"] != false
+        || receipt["outcome"] != "held"
+        || receipt["request_sha256"].as_str().is_none_or(|value| value.len() != 64)
+        || receipt["request_headers_sha256"]
+            .as_str()
+            .is_none_or(|value| value.len() != 64)
+        || (receipt["auth_nonce"].as_str().is_none_or(str::is_empty)
+            && receipt["replay_nonce"].as_str().is_none_or(str::is_empty))
+        || (receipt["signature_sha256"].as_str().is_none_or(|value| value.len() != 64)
+            && receipt["replay_signature_sha256"]
+                .as_str()
+                .is_none_or(|value| value.len() != 64))
+    {
+        return Err(format!("proxy did not retain the original signed production ACK unsent: {receipt}").into());
+    }
+    Ok(())
+}
+
+fn assert_forwarded_ack(receipt: &Value, ack: &Value, cleared: u64) -> TestResult {
+    if receipt["outcome"] != "forwarded"
+        || receipt["forwarded"] != true
+        || receipt["backend_complete"] != true
+        || receipt["response"]["status"] != 200
+        || receipt["response"]["grpc_status"] != "0"
+        || receipt["response"]["ack"]["owner_id"] != ack["owner_id"]
+        || receipt["response"]["ack"]["instance_id"] != ack["instance_id"]
+        || receipt["response"]["ack"]["supported"] != true
+        || receipt["response"]["ack"]["cleared"].as_u64() != Some(cleared)
+        || receipt["response"]["ack"]["response_proof_bytes"]
+            .as_u64()
+            .is_none_or(|count| count == 0)
+        || receipt["response"]["sha256"].as_str().is_none_or(|value| value.len() != 64)
+        || receipt["response"]["headers_sha256"]
+            .as_str()
+            .is_none_or(|value| value.len() != 64)
+    {
+        return Err(format!("retained ACK lacks an authenticated backend success clearing {cleared}: {receipt}").into());
+    }
+    Ok(())
+}
+
+fn dirty_generations(observation: &Value) -> TestResult<BTreeMap<String, u64>> {
+    let snapshot = &observation["detail"]["dirty_snapshot"];
+    let entries = snapshot["buckets"]
+        .as_array()
+        .ok_or("receiver omitted remaining dirty buckets")?;
+    if snapshot["complete"] != true || snapshot["pending_bucket_count"].as_u64() != Some(u64::try_from(entries.len())?) {
+        return Err(format!("receiver dirty snapshot is incomplete or inconsistent: {snapshot}").into());
+    }
+    let mut result = BTreeMap::new();
+    for entry in entries {
+        let bucket = entry["bucket"].as_str().ok_or("receiver dirty entry omitted bucket")?;
+        let generation = entry["generation"]
+            .as_u64()
+            .filter(|value| *value > 0)
+            .ok_or("receiver omitted dirty generation")?;
+        if result.insert(bucket.to_string(), generation).is_some() {
+            return Err("receiver repeated a dirty bucket".into());
+        }
+    }
+    Ok(result)
+}
+
+async fn applied_ack_after(
+    run: &PeerBucketRun,
+    pid: u32,
+    ack: &Value,
+    after_sequence: Option<u64>,
+) -> TestResult<(Value, Value)> {
+    wait_until(
+        CYCLE_TIMEOUT,
+        || async { Ok(receiver_observation_after(run, "ack_after_apply", pid, ack, after_sequence)?.is_some()) },
+        "actual retained scoped ACK compare-and-clear",
+    )
+    .await?;
+    let before = receiver_observation_after(run, "ack_before_apply", pid, ack, after_sequence)?
+        .ok_or("retained ACK omitted its receiver pre-apply observation")?;
+    let after = receiver_observation_after(run, "ack_after_apply", pid, ack, after_sequence)?
+        .ok_or("retained ACK omitted its receiver post-apply observation")?;
+    if sequence(&before)? >= sequence(&after)? {
+        return Err("retained ACK receiver observations are out of order".into());
+    }
+    Ok((before, after))
+}
+
+fn ack_deadline_log(path: &str, offset: u64) -> TestResult<Option<String>> {
+    use std::io::{BufRead, Seek};
+
+    let mut file = std::fs::File::open(path)?;
+    file.seek(std::io::SeekFrom::Start(offset))?;
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line?;
+        if line.contains("scoped dirty usage acknowledgement deadline elapsed")
+            && line.contains("remote_dirty_usage_acknowledgement_pending")
+        {
+            return Ok(Some(line));
+        }
+    }
+    Ok(None)
+}
+
+fn converged_shards(run: &PeerBucketRun) -> TestResult<Vec<Value>> {
+    let mut physical = Vec::new();
+    for object in &run.objects {
+        for (node_index, node) in run.dist.cluster.nodes.iter().enumerate() {
+            let mut complete = Vec::new();
+            for drive in &node.data_dirs {
+                let census = crate::chaos::census_object_version_on_disk(
+                    std::path::Path::new(drive),
+                    &object.bucket,
+                    &object.key,
+                    Some(&object.version_id),
+                )?;
+                if census.has_xl_meta {
+                    if !census.is_complete() || (census.data_blocks, census.parity_blocks) != (Some(2), Some(2)) {
+                        return Err(format!("converged version lost an acknowledged EC:2 shard on {drive}: {census:?}").into());
+                    }
+                    complete.push(json!({"drive": drive, "census": census}));
+                }
+            }
+            if complete.len() != 1 {
+                return Err(format!("converged version must retain one complete shard on node {node_index}: {object:?}").into());
+            }
+            physical.push(json!({"object": object, "node": node_index, "shards": complete}));
+        }
+    }
+    Ok(physical)
+}
+
+// The caller retains each real ACK only after this exact hot-window candidate
+// has completed every set and published its verified root.
+async fn queued_hot_cycle(run: &mut PeerBucketRun, leader: usize, producer: usize, start_gate: &Value) -> TestResult<Value> {
+    queued_hot_cycle_until(run, leader, producer, start_gate, "root_durable").await
+}
+
+async fn queued_hot_cycle_until(
+    run: &mut PeerBucketRun,
+    leader: usize,
+    producer: usize,
+    start_gate: &Value,
+    root_stage: &str,
+) -> TestResult<Value> {
+    let cycle = identity(start_gate)?;
+    let leader_pid = run.pid(leader)?;
+    let [cold_a, cold_b, hot] = run.buckets.clone();
+    let all = run.buckets.iter().cloned().collect::<BTreeSet<_>>();
+    let cold = BTreeSet::from([cold_a, cold_b]);
+    let address = run.peer_address(producer);
+    run.put(producer, &hot, &format!("queued-start-{}", cycle.1), 157).await?;
+    run.barrier.arm("before_post_walk_snapshot", leader_pid, Some(cycle))?;
+    run.barrier.release("before_start_snapshot", leader_pid)?;
+    let start = run
+        .barrier
+        .wait_stage("start_snapshot", leader_pid, Some(cycle), false)
+        .await?;
+    let start_peer = peer_for_address(&start, &address)?;
+    assert_snapshot_window(&start, start_peer)?;
+    let start_tuples = tuples(&start_peer["buckets"])?;
+    if start_tuples.keys().cloned().collect::<BTreeSet<_>>() != all {
+        return Err("held ACK did not leave all three producer buckets dirty for the next actual scan".into());
+    }
+    run.barrier
+        .wait_stage("before_post_walk_snapshot", leader_pid, Some(cycle), true)
+        .await?;
+    run.put(producer, &hot, &format!("queued-post-{}", cycle.1), 197).await?;
+    run.barrier.arm(root_stage, leader_pid, Some(cycle))?;
+    run.barrier.release("before_post_walk_snapshot", leader_pid)?;
+    let post = run
+        .barrier
+        .wait_stage("post_walk_snapshot", leader_pid, Some(cycle), false)
+        .await?;
+    let post_peer = peer_for_address(&post, &address)?;
+    assert_snapshot_window(&post, post_peer)?;
+    let post_tuples = tuples(&post_peer["buckets"])?;
+    let identities = peer_identities(&start["detail"]["peers"])?;
+    if peer_identities(&post["detail"]["peers"])? != identities
+        || cold.iter().any(|bucket| start_tuples.get(bucket) != post_tuples.get(bucket))
+        || post_tuples
+            .get(&hot)
+            .zip(start_tuples.get(&hot))
+            .is_none_or(|(after, before)| after.0 != before.0 || after.1 <= before.1)
+    {
+        return Err("queued ACK cycle did not preserve cold tuples while real hot writes advanced".into());
+    }
+    let candidate = run
+        .barrier
+        .wait_stage("cycle_candidate", leader_pid, Some(cycle), false)
+        .await?;
+    assert_scope(&candidate, &all, &start_tuples)?;
+    if candidate["detail"]["peer_certification"] != true
+        || peer_identities(&candidate["detail"]["certified_peers"])? != identities
+        || names(&candidate["detail"]["pending_buckets"])? != BTreeSet::from([hot])
+        || candidate["detail"]["converged"] != false
+    {
+        return Err(format!("queued ACK candidate did not certify only cold with hot pending: {candidate}").into());
+    }
+    let root = run.barrier.wait_stage(root_stage, leader_pid, Some(cycle), true).await?;
+    if root_stage == "root_durable" {
+        assert_root_binding(&candidate, &root)?;
+    } else if root_stage != "root_before_publish"
+        || root["detail"]["candidate_sha256"] != candidate["detail"]["candidate_sha256"]
+        || root["detail"]["coverage_sha256"] != candidate["detail"]["coverage_sha256"]
+    {
+        return Err("pre-publication barrier does not identify the sealed candidate".into());
+    }
+    Ok(json!({"start_gate": start_gate, "start": start, "post": post, "candidate": candidate, "root": root}))
+}
+
+fn complete_dirty_tuples(snapshot: &Value) -> TestResult<BTreeMap<String, (String, u64)>> {
+    let entries = tuples(&snapshot["buckets"])?;
+    if snapshot["complete"] != true
+        || snapshot["pending_bucket_count"].as_u64() != Some(u64::try_from(entries.len())?)
+        || snapshot["instance_id"].as_str().is_none_or(str::is_empty)
+        || snapshot["owner_id"].as_str().is_none_or(str::is_empty)
+    {
+        return Err(format!("crash window requires a complete authenticated dirty snapshot: {snapshot}").into());
+    }
+    Ok(entries)
+}
+
+fn assert_physical_root(root: &Value, physical: &Value) -> TestResult {
+    let usage: DataUsageInfo = serde_json::from_value(physical["usage"].clone())?;
+    if physical["root_version"] != root["detail"]["root_version"]
+        || physical["root_sha256"] != root["detail"]["root_sha256"]
+        || (usage.scanner_epoch.zip(usage.scanner_cycle)) != Some(identity(root)?)
+    {
+        return Err("physical authoritative root differs from the actual committed version, digest or cycle".into());
+    }
+    Ok(())
+}
+
+fn persisted_usage_fields(usage: &Value) -> TestResult<Value> {
+    let mut fields = usage.as_object().ok_or("usage comparison requires an object")?.clone();
+    // Admin fills these from live storage statistics; all other fields must
+    // still match the persisted scanner snapshot. Leave both raw receipts intact.
+    for field in ["total_capacity", "total_free_capacity", "total_used_capacity"] {
+        fields.remove(field);
+    }
+    Ok(Value::Object(fields))
+}
+
+fn assert_walked_buckets(run: &PeerBucketRun, cycle: (u64, u64), expected: &BTreeSet<String>) -> TestResult {
+    let actual = run
+        .barrier
+        .observations(false)?
+        .iter()
+        .filter(|event| event["stage"] == "bucket_walk" && identity(event).ok() == Some(cycle))
+        .map(|event| {
+            event["detail"]["bucket"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "crash recovery bucket walk omitted its bucket".into())
+        })
+        .collect::<TestResult<BTreeSet<_>>>()?;
+    if actual != *expected {
+        return Err(format!("crash recovery physically walked {actual:?}, expected {expected:?}").into());
+    }
+    Ok(())
+}
+
+async fn crash_window(stage: &str) -> TestResult {
+    init_logging();
+    let receiver_crash = matches!(stage, "ack_before_apply" | "ack_after_apply");
+    if !receiver_crash && !matches!(stage, "root_before_publish" | "root_durable") {
+        return Err("unknown scanner crash window".into());
+    }
+    let mut run = PeerBucketRun::start_for_crash(stage).await?;
+    let executable = run.executable_identity()?;
+    let scheduler_config = run.assert_default_cadence().await?;
+    let baseline = run.quiet_baseline().await?;
+    let leader = run.leader().await?;
+    let leader_pid = run.pid(leader)?;
+    let producer = (leader + 1) % 4;
+    let producer_pid = run.pid(producer)?;
+    let target = if receiver_crash { producer } else { leader };
+    let old_process = run.dirty_snapshot(target).await?;
+    let [cold_a, cold_b, hot] = run.buckets.clone();
+    let cold = BTreeSet::from([cold_a.clone(), cold_b.clone()]);
+    let all = run.buckets.iter().cloned().collect::<BTreeSet<_>>();
+    run.barrier.arm("before_start_snapshot", leader_pid, None)?;
+    run.barrier.start_session(&run.buckets)?;
+    run.put(leader, &hot, "wake-crash-window", 149).await?;
+    let start_gate = run
+        .barrier
+        .wait_stage("before_start_snapshot", leader_pid, None, true)
+        .await?;
+    let cycle = identity(&start_gate)?;
+    if baseline.scanner_epoch != Some(cycle.0) || baseline.scanner_cycle.is_none_or(|previous| previous >= cycle.1) {
+        return Err("crash window did not start under the observed baseline coordinator".into());
+    }
+    let old_root = run.authoritative_root()?;
+    if persisted_usage_fields(&old_root["usage"])? != persisted_usage_fields(&serde_json::to_value(&baseline)?)? {
+        return Err("physical pre-crash root does not match the authoritative baseline".into());
+    }
+    for bucket in &run.buckets.clone() {
+        run.put(producer, bucket, "crash-start-window", 137).await?;
+    }
+    let root_stage = if stage == "root_before_publish" {
+        stage
+    } else {
+        "root_durable"
+    };
+    let window = queued_hot_cycle_until(&mut run, leader, producer, &start_gate, root_stage).await?;
+    let candidate = &window["candidate"];
+    let root = &window["root"];
+    let start_peer = peer_for_address(&window["start"], &run.peer_address(producer))?;
+    let post_tuples = tuples(&peer_for_address(&window["post"], &run.peer_address(producer))?["buckets"])?;
+    let before_dirty = run.dirty_snapshot(producer).await?;
+    if complete_dirty_tuples(&before_dirty)? != post_tuples
+        || before_dirty["owner_id"] != start_peer["owner_id"]
+        || before_dirty["instance_id"] != start_peer["instance_id"]
+        || run.leader().await? != leader
+    {
+        return Err("actual producer state or coordinator changed before the crash window".into());
+    }
+    let planned_ack = candidate["detail"]["acks"]
+        .as_array()
+        .ok_or("candidate omitted ACK plan")?
+        .iter()
+        .find(|ack| {
+            ack["kind"] == "scoped"
+                && ack["owner_id"] == start_peer["owner_id"]
+                && ack["instance_id"] == start_peer["instance_id"]
+        })
+        .ok_or("candidate omitted the actual producer's scoped ACK")?
+        .clone();
+    let expected_cold = post_tuples
+        .iter()
+        .filter(|(bucket, _)| cold.contains(*bucket))
+        .map(|(bucket, tuple)| (bucket.clone(), tuple.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if tuples(&planned_ack["entries"])? != expected_cold || sequence(candidate)? >= sequence(root)? {
+        return Err("crash window did not seal the exact cold tuples before root publication".into());
+    }
+    let root_at_gate = run.authoritative_root()?;
+    if stage == "root_before_publish" {
+        if root_at_gate != old_root {
+            return Err("uncommitted candidate already replaced the authoritative root".into());
+        }
+    } else {
+        assert_physical_root(root, &root_at_gate)?;
+        let usage: DataUsageInfo = serde_json::from_value(root_at_gate["usage"].clone())?;
+        if usage.usage_snapshot_converged != Some(false)
+            || usage.usage_snapshot_pending_buckets != vec![hot.clone()]
+            || !run.usage_matches(&usage, &[&cold_a, &cold_b])
+        {
+            return Err("committed crash-window root lost cold usage or the hot pending obligation".into());
+        }
+    }
+    let before_shards = converged_shards(&run)?;
+    // Start before either queue retention or the production sender can begin;
+    // forwarding cannot reset the age of a previously held request.
+    let ack_started_at = std::time::Instant::now();
+    let queue = run.scoped_ack_queue(producer, start_peer, cold, 1)?;
+    let mut ack_send = Value::Null;
+    let mut retained = Value::Null;
+    let mut before_apply = Value::Null;
+    let mut after_apply = Value::Null;
+    let mut crash;
+    if receiver_crash {
+        run.barrier.arm_receiver(stage, producer_pid, start_peer)?;
+        run.barrier.release("root_durable", leader_pid)?;
+        ack_send = run.barrier.wait_stage("ack_send", leader_pid, Some(cycle), false).await?;
+        let ack = scoped_ack_for_peer(root, &ack_send, start_peer)?;
+        if tuples(&ack["entries"])? != expected_cold {
+            return Err("production sender changed the sealed cold ACK tuples".into());
+        }
+        queue.wait_for_packets(1).await?;
+        retained = queue.receipts().into_iter().next().ok_or("crash ACK packet disappeared")?;
+        assert_retained_ack(&retained, ack, &run.dist.cluster.nodes[producer].address)?;
+        if ack_started_at.elapsed() >= std::time::Duration::from_secs(5) {
+            return Err("receiver crash window expired while the original ACK was held".into());
+        }
+        let forwarded_at = std::time::Instant::now();
+        queue.settle(0, ScopedAckFault::Forward)?;
+        let receiver_gate = run.barrier.wait_stage(stage, producer_pid, None, true).await?;
+        if receiver_observation(&run, stage, producer_pid, ack)?.as_ref() != Some(&receiver_gate) {
+            return Err("armed receiver barrier does not identify the original signed ACK".into());
+        }
+        if ack_started_at.elapsed() >= std::time::Duration::from_secs(5) {
+            return Err("receiver crash window expired before SIGKILL".into());
+        }
+        // Kill while the unchanged five-second receiver operation is still
+        // paused. A timed-out hook is not the requested crash window.
+        crash = run.kill_at(producer, &receiver_gate)?;
+        let kill_elapsed = forwarded_at.elapsed();
+        let total_kill_elapsed = ack_started_at.elapsed();
+        if kill_elapsed >= std::time::Duration::from_secs(5) || total_kill_elapsed >= std::time::Duration::from_secs(5) {
+            return Err("receiver kill exceeded the real scoped ACK operation deadline".into());
+        }
+        crash["forward_to_sigkill_ms"] = json!(u64::try_from(kill_elapsed.as_millis())?);
+        crash["total_to_sigkill_ms"] = json!(u64::try_from(total_kill_elapsed.as_millis())?);
+        before_apply = receiver_observation(&run, "ack_before_apply", producer_pid, ack)?
+            .ok_or("crashed receiver omitted its pre-apply state")?;
+        let expected_before = post_tuples
+            .iter()
+            .map(|(bucket, (_, generation))| (bucket.clone(), *generation))
+            .collect::<BTreeMap<_, _>>();
+        if dirty_generations(&before_apply)? != expected_before {
+            return Err("receiver did not retain the exact original dirty map before apply".into());
+        }
+        let observed_after = receiver_observation(&run, "ack_after_apply", producer_pid, ack)?;
+        if stage == "ack_before_apply" {
+            if observed_after.is_some() {
+                return Err("ACK applied despite killing the receiver at its pre-apply barrier".into());
+            }
+        } else {
+            after_apply = observed_after.ok_or("receiver was killed without observed compare-and-remove")?;
+            if sequence(&before_apply)? >= sequence(&after_apply)?
+                || after_apply["detail"]["cleared"] != 2
+                || dirty_generations(&after_apply)? != BTreeMap::from([(hot.clone(), post_tuples[&hot].1)])
+            {
+                return Err("post-apply crash did not clear exactly cold while conserving the hot generation".into());
+            }
+        }
+    } else {
+        crash = run.kill_at(leader, root)?;
+        if run.barrier.observations(false)?.iter().any(|event| {
+            event["pid"].as_u64() == Some(u64::from(leader_pid))
+                && identity(event).ok() == Some(cycle)
+                && (event["stage"] == "ack_send" || (stage == "root_before_publish" && event["stage"] == "root_durable"))
+        }) || receiver_observation(&run, "ack_before_apply", producer_pid, &planned_ack)?.is_some()
+            || receiver_observation(&run, "ack_after_apply", producer_pid, &planned_ack)?.is_some()
+            || !queue.receipts().is_empty()
+        {
+            return Err("killed coordinator published or acknowledged past its held crash boundary".into());
+        }
+    }
+    // Read before any restart or recovery work. No root version is selected
+    // from disagreeing replicas, and an unexpected successor publication fails
+    // the controlled window instead of being mistaken for preservation.
+    let root_after_kill = run.authoritative_root()?;
+    if root_after_kill != root_at_gate {
+        return Err("authoritative root changed outside the controlled crash boundary".into());
+    }
+    let transport = if receiver_crash {
+        let receipt = queue.wait_for_completion(0).await?;
+        let total_transport_elapsed = ack_started_at.elapsed();
+        let transport_elapsed = receipt["completed_at_ms"]
+            .as_u64()
+            .zip(receipt["forwarded_at_ms"].as_u64())
+            .and_then(|(completed, forwarded)| completed.checked_sub(forwarded));
+        if receipt["completed"] != true
+            || receipt["forwarded"] != true
+            || receipt["backend_complete"] != false
+            || receipt["outcome"] != "transport_failed_or_expired"
+            || !receipt["response"].is_null()
+            || receipt["request_frame_hex"] != retained["request_frame_hex"]
+            || receipt["request_sha256"] != retained["request_sha256"]
+            || receipt["request_headers_sha256"] != retained["request_headers_sha256"]
+            || receipt["auth_nonce"] != retained["auth_nonce"]
+            || receipt["replay_nonce"] != retained["replay_nonce"]
+            || transport_elapsed.is_none_or(|millis| millis >= 5_000)
+            || total_transport_elapsed >= std::time::Duration::from_secs(5)
+        {
+            return Err("receiver crash did not lose the original signed ACK response in transport".into());
+        }
+        crash["total_to_transport_completion_ms"] = json!(u64::try_from(total_transport_elapsed.as_millis())?);
+        receipt
+    } else {
+        let after = run.dirty_snapshot(producer).await?;
+        if after != before_dirty {
+            return Err("coordinator crash changed the surviving producer's exact dirty responsibility".into());
+        }
+        after
+    };
+    drop(queue);
+    run.write_evidence(
+        "crash-boundary",
+        &json!({"stage": stage, "executable": executable, "scheduler_config": scheduler_config,
+        "baseline": baseline, "topology": run.topology, "old_process": old_process, "old_root": old_root,
+        "window": window, "before_dirty": before_dirty, "planned_ack": planned_ack, "ack_send": ack_send,
+        "retained_packet": retained, "before_apply": before_apply, "after_apply": after_apply, "transport": transport,
+        "root_at_gate": root_at_gate, "root_after_kill": root_after_kill, "crash": crash,
+        "objects": run.objects, "before_shards": before_shards}),
+    )?;
+    run.barrier.disarm()?;
+    let before_restart = run.barrier.observations(false)?;
+    let restarted = run.restart_after_crash(&crash, &old_process).await?;
+    run.write_evidence(
+        "restarted-process",
+        &json!({"crash": crash, "previous": old_process, "restarted": restarted,
+        "drives": run.drive_identity(target)?, "before_restart_observations": before_restart}),
+    )?;
+
+    // No S3 mutation is allowed between the crash and this convergence check.
+    // An empty volatile map in the new process cannot account for old versions.
+    let recovered = run.quiet_baseline().await?;
+    let recovery_cycle = recovered
+        .scanner_epoch
+        .zip(recovered.scanner_cycle)
+        .ok_or("recovery root omitted cycle")?;
+    if recovery_cycle == cycle || recovered == baseline {
+        return Err("restart did not produce a fresh authoritative recovery root".into());
+    }
+    let recovery_root = run.authoritative_root()?;
+    let observations = run.barrier.observations(false)?;
+    run.write_evidence(
+        "automatic-crash-recovery-observed",
+        &json!({"restarted": restarted, "usage": recovered, "root": recovery_root,
+            "objects": run.objects, "observations": observations}),
+    )?;
+    if persisted_usage_fields(&recovery_root["usage"])? != persisted_usage_fields(&serde_json::to_value(&recovered)?)? {
+        return Err("automatic recovery admin state differs from the physical authoritative root".into());
+    }
+    let recovery_durable = observations
+        .iter()
+        .find(|event| {
+            event["stage"] == "root_durable"
+                && identity(event).ok() == Some(recovery_cycle)
+                && event["detail"]["root_version"] == recovery_root["root_version"]
+                && event["detail"]["root_sha256"] == recovery_root["root_sha256"]
+        })
+        .ok_or("automatic recovery lacks an actual durable root receipt")?;
+    let recovery_candidate = observations
+        .iter()
+        .find(|event| {
+            event["stage"] == "cycle_candidate"
+                && event["pid"] == recovery_durable["pid"]
+                && identity(event).ok() == Some(recovery_cycle)
+        })
+        .ok_or("automatic recovery lacks actual per-set completion")?;
+    let recovery_sequence = sequence(recovery_candidate)?;
+    if before_restart.iter().any(|event| {
+        event["pid"] == recovery_candidate["pid"]
+            && event["sequence"]
+                .as_u64()
+                .is_some_and(|sequence| sequence >= recovery_sequence)
+    }) {
+        return Err("automatic recovery reused a candidate observed before the replacement process started".into());
+    }
+    assert_completed_scope(recovery_candidate, &all, &post_tuples, true)?;
+    assert_root_binding(recovery_candidate, recovery_durable)?;
+    assert_physical_root(recovery_durable, &recovery_root)?;
+    assert_walked_buckets(&run, recovery_cycle, &all)?;
+    if sequence(recovery_candidate)? >= sequence(recovery_durable)?
+        || recovery_candidate["detail"]["converged"] != true
+        || !names(&recovery_candidate["detail"]["pending_buckets"])?.is_empty()
+    {
+        return Err("automatic restart recovery did not conservatively complete all bucket obligations".into());
+    }
+    run.verify_objects().await?;
+    let recovered_shards = converged_shards(&run)?;
+    if recovered_shards != before_shards {
+        return Err("restart changed an acknowledged physical version shard".into());
+    }
+    run.write_evidence(
+        "automatic-crash-recovery",
+        &json!({"restarted": restarted, "usage": recovered,
+        "root": recovery_root, "candidate": recovery_candidate, "durable": recovery_durable,
+        "objects": run.objects, "physical": recovered_shards, "observations": observations}),
+    )?;
+
+    let new_leader = run.leader().await?;
+    // Recovery may elect another coordinator. Keep the ACK receiver remote,
+    // and bind the replacement through the role it actually holds now.
+    let fresh_receiver = if target == new_leader { (new_leader + 1) % 4 } else { target };
+    run.write_evidence(
+        "fresh-process-roles",
+        &json!({"leader_before_crash": leader, "leader_after_recovery": new_leader,
+            "coordinator_pid": run.pid(new_leader)?, "receiver": fresh_receiver,
+            "receiver_pid": run.pid(fresh_receiver)?, "replacement": target,
+            "replacement_pid": restarted["pid"],
+            "replacement_role": if target == new_leader { "coordinator" } else { "receiver" }}),
+    )?;
+    let fresh_ack = fresh_ack_after_restart(&mut run, new_leader, fresh_receiver, &post_tuples).await?;
+    if (fresh_receiver == target && fresh_ack["peer"]["instance_id"] != restarted["instance_id"])
+        || (new_leader == target && fresh_ack["coordinator_instance"] != restarted["instance_id"])
+    {
+        return Err("fresh scoped ACK did not bind the actual replacement process instance".into());
+    }
+    run.barrier.stop_session()?;
+    run.verify_objects().await?;
+    let physical = converged_shards(&run)?;
+    if run.executable_identity()? != executable {
+        return Err("crash recovery restarted a different executable".into());
+    }
+    run.write_evidence(
+        "crash-result",
+        &json!({"stage": stage, "crash": crash, "restarted": restarted,
+        "automatic_recovery_root": recovery_root, "fresh_ack": fresh_ack, "executable": executable,
+        "objects": run.objects, "physical": physical, "observations": run.barrier.observations(false)?}),
+    )?;
+    Ok(())
+}
+
+async fn fresh_ack_after_restart(
+    run: &mut PeerBucketRun,
+    leader: usize,
+    receiver: usize,
+    incarnations: &BTreeMap<String, (String, u64)>,
+) -> TestResult<Value> {
+    let leader_pid = run.pid(leader)?;
+    let receiver_pid = run.pid(receiver)?;
+    let hot = run.buckets[2].clone();
+    let expected = BTreeSet::from([hot.clone()]);
+    let previous = run.dirty_snapshot(receiver).await?;
+    if !complete_dirty_tuples(&previous)?.is_empty() {
+        return Err("automatic recovery left receiver dirty state before fresh-write proof".into());
+    }
+    let previous_sequence = run
+        .barrier
+        .observations(false)?
+        .iter()
+        .filter(|event| event["pid"].as_u64() == Some(u64::from(leader_pid)))
+        .map(sequence)
+        .collect::<TestResult<Vec<_>>>()?
+        .into_iter()
+        .max();
+    run.barrier.arm("before_start_snapshot", leader_pid, None)?;
+    run.put(leader, &hot, "wake-fresh-process-proof", 151).await?;
+    let gate = match previous_sequence {
+        Some(previous) => {
+            run.barrier
+                .wait_stage_after("before_start_snapshot", leader_pid, None, true, previous)
+                .await?
+        }
+        None => {
+            run.barrier
+                .wait_stage("before_start_snapshot", leader_pid, None, true)
+                .await?
+        }
+    };
+    let cycle = identity(&gate)?;
+    let write = run.put(receiver, &hot, "fresh-process-proof", 167).await?;
+    run.barrier.arm("root_durable", leader_pid, Some(cycle))?;
+    run.barrier.release("before_start_snapshot", leader_pid)?;
+    let start = run
+        .barrier
+        .wait_stage("start_snapshot", leader_pid, Some(cycle), false)
+        .await?;
+    let peer = peer_for_address(&start, &run.peer_address(receiver))?;
+    assert_snapshot_window(&start, peer)?;
+    let entries = complete_dirty_tuples(peer)?;
+    if peer["owner_id"] != previous["owner_id"]
+        || peer["instance_id"] != previous["instance_id"]
+        || entries.keys().cloned().collect::<BTreeSet<_>>() != expected
+        || entries[&hot].0 != incarnations[&hot].0
+    {
+        return Err("fresh write did not establish new evidence under the surviving bucket incarnation and process".into());
+    }
+    let candidate = run
+        .barrier
+        .wait_stage("cycle_candidate", leader_pid, Some(cycle), false)
+        .await?;
+    assert_scope(&candidate, &expected, &entries)?;
+    if candidate["detail"]["converged"] != true || !names(&candidate["detail"]["pending_buckets"])?.is_empty() {
+        return Err("fresh-process candidate did not converge its new write".into());
+    }
+    let root = run.barrier.wait_stage("root_durable", leader_pid, Some(cycle), true).await?;
+    assert_root_binding(&candidate, &root)?;
+    assert_walked_buckets(run, cycle, &expected)?;
+    let physical_root = run.authoritative_root()?;
+    assert_physical_root(&root, &physical_root)?;
+    let usage: DataUsageInfo = serde_json::from_value(physical_root["usage"].clone())?;
+    if !run.usage_matches(&usage, &run.buckets.iter().map(String::as_str).collect::<Vec<_>>()) {
+        return Err("fresh process publication lost an acknowledged object/version total".into());
+    }
+    let queue = run.scoped_ack_queue(receiver, peer, expected, 1)?;
+    run.barrier.disarm()?;
+    run.barrier.release("root_durable", leader_pid)?;
+    let send = run.barrier.wait_stage("ack_send", leader_pid, Some(cycle), false).await?;
+    let ack = scoped_ack_for_peer(&root, &send, peer)?;
+    if tuples(&ack["entries"])? != entries {
+        return Err("fresh process ACK did not carry its own newly certified dirty tuple".into());
+    }
+    queue.wait_for_packets(1).await?;
+    let retained = queue
+        .receipts()
+        .into_iter()
+        .next()
+        .ok_or("fresh process ACK packet disappeared")?;
+    assert_retained_ack(&retained, ack, &run.dist.cluster.nodes[receiver].address)?;
+    queue.settle(0, ScopedAckFault::Forward)?;
+    let receipt = queue.wait_for_completion(0).await?;
+    assert_forwarded_ack(&receipt, ack, 1)?;
+    let (before, after) = applied_ack_after(run, receiver_pid, ack, None).await?;
+    if dirty_generations(&before)? != BTreeMap::from([(hot, entries[&run.buckets[2]].1)])
+        || !dirty_generations(&after)?.is_empty()
+        || !complete_dirty_tuples(&run.dirty_snapshot(receiver).await?)?.is_empty()
+    {
+        return Err("fresh process clearing lacked the matching pre-apply tuple and actual successful removal".into());
+    }
+    Ok(json!({"write": write, "peer": peer, "start": start,
+        "coordinator_instance": start["detail"]["activity_before"]["<local>"]["instance_id"], "candidate": candidate, "root": root,
+        "physical_root": physical_root, "send": send, "retained": retained, "transport": receipt,
+        "before_apply": before, "after_apply": after}))
+}
+
+async fn reordered_scoped_acks(newer_generation: bool) -> TestResult {
+    init_logging();
+    let label = if newer_generation {
+        "ack-generation-reorder"
+    } else {
+        "ack-logical-duplicate"
+    };
+    let mut run = PeerBucketRun::start_with_ack_faults(label).await?;
+    let scheduler_config = run.assert_default_cadence().await?;
+    let baseline = run.quiet_baseline().await?;
+    let leader = run.leader().await?;
+    let leader_pid = run.pid(leader)?;
+    let producer = (leader + 1) % 4;
+    let producer_pid = run.pid(producer)?;
+    let address = run.peer_address(producer);
+    let [cold_a, cold_b, hot] = run.buckets.clone();
+    let cold = BTreeSet::from([cold_a.clone(), cold_b.clone()]);
+    let all = run.buckets.iter().cloned().collect::<BTreeSet<_>>();
+    let log_path = run.dist.cluster.node_capture_log_paths[leader]
+        .clone()
+        .ok_or("coordinator has no captured log")?;
+    run.write_evidence(
+        "baseline",
+        &json!({"topology": run.topology, "baseline": baseline,
+        "scheduler_config": scheduler_config, "objects": run.objects, "leader_node": leader, "producer_node": producer}),
+    )?;
+    run.barrier.arm("before_start_snapshot", leader_pid, None)?;
+    run.barrier.start_session(&run.buckets)?;
+    run.put(leader, &hot, "queued-wake-start", 149).await?;
+    let mut start_gate = run
+        .barrier
+        .wait_stage("before_start_snapshot", leader_pid, None, true)
+        .await?;
+    let first_cycle = identity(&start_gate)?;
+    if baseline.scanner_epoch != Some(first_cycle.0) || baseline.scanner_cycle.is_none_or(|cycle| cycle >= first_cycle.1) {
+        return Err("retained ACK window did not follow the quiet baseline under the same leader epoch".into());
+    }
+    for bucket in &all {
+        run.put(producer, bucket, "queued-initial-generation", 137).await?;
+    }
+    let mut writer = Some(run.start_hot_writer(producer, &hot)?);
+    let mut hot_stream = Vec::new();
+    let mut queue = None;
+    let mut cycles = Vec::new();
+    let mut deadline_log = None;
+    for index in 0..2 {
+        let cycle = identity(&start_gate)?;
+        if cycle.0 != first_cycle.0 || run.leader().await? != leader || (index == 1 && cycle.1 <= first_cycle.1) {
+            return Err("retained ACK cycles changed coordinator or epoch".into());
+        }
+        let mut observed = queued_hot_cycle(&mut run, leader, producer, &start_gate).await?;
+        let peer = peer_for_address(&observed["start"], &address)?.clone();
+        if index == 0 {
+            queue = Some(run.scoped_ack_queue(producer, &peer, cold.clone(), 2)?);
+        }
+        let hot_writer = writer.as_mut().ok_or("hot writer ended before the second candidate")?;
+        hot_writer.wait_for_completed(hot_writer.completed() + 1).await?;
+        if index == 1 {
+            hot_stream = writer.take().ok_or("hot writer already joined")?.finish().await?;
+            run.objects.extend(hot_stream.clone());
+        }
+        run.put(producer, &hot, &format!("queued-after-root-{}", cycle.1), 257)
+            .await?;
+        run.barrier.arm("before_start_snapshot", leader_pid, None)?;
+        run.put(leader, &hot, &format!("queued-wake-next-{}", cycle.1), 151).await?;
+        let log_offset = std::fs::metadata(&log_path)?.len();
+        run.barrier.release("root_durable", leader_pid)?;
+        let send = run.barrier.wait_stage("ack_send", leader_pid, Some(cycle), false).await?;
+        let ack = scoped_ack_for_peer(&observed["root"], &send, &peer)?.clone();
+        let entries = tuples(&ack["entries"])?;
+        let snapshot = tuples(&peer["buckets"])?;
+        if entries.keys().cloned().collect::<BTreeSet<_>>() != cold
+            || entries.iter().any(|(bucket, entry)| snapshot.get(bucket) != Some(entry))
+        {
+            return Err("retained production ACK did not bind exactly the certified cold tuples".into());
+        }
+        let ack_queue = queue.as_ref().ok_or("ACK queue was not armed")?;
+        ack_queue.wait_for_packets(index + 1).await?;
+        let captured = ack_queue.receipts()[index].clone();
+        assert_retained_ack(&captured, &ack, &run.dist.cluster.nodes[producer].address)?;
+        observed["send"] = send;
+        observed["ack"] = ack;
+        observed["captured"] = captured;
+        run.write_evidence(&format!("queued-cycle-{index}"), &observed)?;
+        cycles.push(observed);
+        if index == 0 {
+            // No proxy response or request loss is injected. Reaching the next
+            // cycle requires the genuine caller deadline to end this attempt.
+            start_gate = run
+                .barrier
+                .wait_stage_after("before_start_snapshot", leader_pid, None, true, sequence(&start_gate)?)
+                .await?;
+            wait_until(
+                CYCLE_TIMEOUT,
+                || async { Ok(ack_deadline_log(&log_path, log_offset)?.is_some()) },
+                "actual production ACK deadline",
+            )
+            .await?;
+            deadline_log = ack_deadline_log(&log_path, log_offset)?;
+            assert_retained_ack(&ack_queue.receipts()[0], &cycles[0]["ack"], &run.dist.cluster.nodes[producer].address)?;
+            if receiver_observation(&run, "ack_before_apply", producer_pid, &cycles[0]["ack"])?.is_some()
+                || receiver_observation(&run, "ack_after_apply", producer_pid, &cycles[0]["ack"])?.is_some()
+            {
+                return Err("held first ACK reached the receiver before its caller expired".into());
+            }
+            if newer_generation {
+                for bucket in &cold {
+                    run.put(producer, bucket, "queued-newer-generation", 211).await?;
+                }
+            }
+        }
+    }
+    let queue = queue.ok_or("two production ACKs were not retained")?;
+    let first_ack = &cycles[0]["ack"];
+    let second_ack = &cycles[1]["ack"];
+    let first_entries = tuples(&first_ack["entries"])?;
+    let second_entries = tuples(&second_ack["entries"])?;
+    if first_ack["owner_id"] != second_ack["owner_id"]
+        || first_ack["instance_id"] != second_ack["instance_id"]
+        || cold.iter().any(|bucket| {
+            let before = &first_entries[bucket];
+            let after = &second_entries[bucket];
+            before.0 != after.0
+                || if newer_generation {
+                    after.1 <= before.1
+                } else {
+                    after.1 != before.1
+                }
+        })
+    {
+        return Err("second real cycle did not produce the required same-owner cold generation relation".into());
+    }
+    let first_packet = &cycles[0]["captured"];
+    let second_packet = &cycles[1]["captured"];
+    for field in ["auth_nonce", "replay_nonce", "signature_sha256", "replay_signature_sha256"] {
+        if !first_packet[field].is_null() && (second_packet[field].is_null() || first_packet[field] == second_packet[field]) {
+            return Err(format!("separate production ACKs reused authentication field {field}").into());
+        }
+    }
+    if first_packet["request_sha256"] == second_packet["request_sha256"]
+        || first_packet["request_headers_sha256"] == second_packet["request_headers_sha256"]
+    {
+        return Err("logical ACK duplication reused a raw signed request instead of a fresh production request".into());
+    }
+    queue.settle(1, ScopedAckFault::Forward)?;
+    let second_receipt = queue.wait_for_completion(1).await?;
+    assert_forwarded_ack(&second_receipt, second_ack, 2)?;
+    let (second_before, second_after) = applied_ack_after(&run, producer_pid, second_ack, None).await?;
+    let after_second = dirty_generations(&second_after)?;
+    let second_post = tuples(&peer_for_address(&cycles[1]["post"], &address)?["buckets"])?;
+    if second_after["detail"]["cleared"] != 2
+        || after_second.keys().cloned().collect::<BTreeSet<_>>() != BTreeSet::from([hot.clone()])
+        || after_second
+            .get(&hot)
+            .is_none_or(|generation| *generation <= second_post[&hot].1)
+    {
+        return Err("newer delivery did not clear exactly cold while retaining the later hot generation".into());
+    }
+    let recovery_gate = run
+        .barrier
+        .wait_stage_after("before_start_snapshot", leader_pid, None, true, sequence(&start_gate)?)
+        .await?;
+    let recovery_cycle = identity(&recovery_gate)?;
+    if recovery_cycle.0 != first_cycle.0 || recovery_cycle.1 <= identity(&cycles[1]["root"])?.1 || run.leader().await? != leader {
+        return Err("recovery cycle changed coordinator, epoch, or order".into());
+    }
+    if newer_generation {
+        for bucket in &cold {
+            run.put(producer, bucket, "queued-newest-generation", 307).await?;
+        }
+    }
+    assert_retained_ack(&queue.receipts()[0], first_ack, &run.dist.cluster.nodes[producer].address)?;
+    queue.settle(0, ScopedAckFault::Forward)?;
+    let first_receipt = queue.wait_for_completion(0).await?;
+    assert_forwarded_ack(&first_receipt, first_ack, 0)?;
+    let (first_before, first_after) = applied_ack_after(&run, producer_pid, first_ack, Some(sequence(&second_after)?)).await?;
+    let remaining = dirty_generations(&first_after)?;
+    let recovery_scope = if newer_generation {
+        all.clone()
+    } else {
+        BTreeSet::from([hot.clone()])
+    };
+    if first_after["detail"]["cleared"] != 0
+        || first_before["detail"]["dirty_snapshot"] != first_after["detail"]["dirty_snapshot"]
+        || remaining.keys().cloned().collect::<BTreeSet<_>>() != recovery_scope
+        || remaining.get(&hot) != after_second.get(&hot)
+        || (newer_generation && cold.iter().any(|bucket| remaining[bucket] <= second_entries[bucket].1))
+        || first_receipt["forwarded_at_ms"]
+            .as_u64()
+            .zip(second_receipt["backend_completed_at_ms"].as_u64())
+            .is_none_or(|(first, second)| first < second)
+    {
+        return Err(format!("late old ACK changed responsibility or lost a newer generation: {first_after}").into());
+    }
+    run.barrier.arm("root_durable", leader_pid, Some(recovery_cycle))?;
+    run.barrier.release("before_start_snapshot", leader_pid)?;
+    let recovery_start = run
+        .barrier
+        .wait_stage("start_snapshot", leader_pid, Some(recovery_cycle), false)
+        .await?;
+    let recovery_peer = peer_for_address(&recovery_start, &address)?;
+    let recovery_entries = tuples(&recovery_peer["buckets"])?;
+    if recovery_entries
+        .iter()
+        .map(|(bucket, entry)| (bucket.clone(), entry.1))
+        .collect::<BTreeMap<_, _>>()
+        != remaining
+    {
+        return Err("next real snapshot did not retain the exact generations surviving the old ACK".into());
+    }
+    let recovery_candidate = run
+        .barrier
+        .wait_stage("cycle_candidate", leader_pid, Some(recovery_cycle), false)
+        .await?;
+    assert_scope(&recovery_candidate, &recovery_scope, &recovery_entries)?;
+    if !names(&recovery_candidate["detail"]["pending_buckets"])?.is_empty() || recovery_candidate["detail"]["converged"] != true {
+        return Err("healthy recovery failed to certify the remaining actual generations".into());
+    }
+    let recovery_root = run
+        .barrier
+        .wait_stage("root_durable", leader_pid, Some(recovery_cycle), true)
+        .await?;
+    assert_root_binding(&recovery_candidate, &recovery_root)?;
+    let queue_receipts = queue.receipts();
+    drop(queue);
+    run.barrier.disarm()?;
+    run.barrier.release("root_durable", leader_pid)?;
+    let recovery_send = run
+        .barrier
+        .wait_stage("ack_send", leader_pid, Some(recovery_cycle), false)
+        .await?;
+    let recovery_ack = scoped_ack_for_peer(&recovery_root, &recovery_send, recovery_peer)?;
+    if tuples(&recovery_ack["entries"])? != recovery_entries {
+        return Err("recovery ACK did not preserve the surviving next-snapshot tuples".into());
+    }
+    let (recovery_before, recovery_after) =
+        applied_ack_after(&run, producer_pid, recovery_ack, Some(sequence(&first_after)?)).await?;
+    if recovery_after["detail"]["cleared"].as_u64() != Some(u64::try_from(recovery_scope.len())?)
+        || !dirty_generations(&recovery_after)?.is_empty()
+    {
+        return Err("healthy production ACK did not clear precisely the final retained responsibility".into());
+    }
+    let recovered_usage = run.quiet_baseline().await?;
+    run.barrier.stop_session()?;
+    run.verify_objects().await?;
+    let physical_after_convergence = converged_shards(&run)?;
+    run.write_evidence(
+        label,
+        &json!({"topology": run.topology, "objects": run.objects, "baseline": baseline,
+        "scheduler_config": scheduler_config, "leader_node": leader, "leader_pid": leader_pid,
+        "producer_node": producer, "producer_pid": producer_pid, "newer_generation": newer_generation,
+        "hot_stream": hot_stream, "deadline_log": deadline_log, "cycles": cycles, "queue_receipts": queue_receipts,
+        "second_before": second_before, "second_after": second_after, "first_before": first_before, "first_after": first_after,
+        "recovery_scope": recovery_scope, "recovery_gate": recovery_gate, "recovery_start": recovery_start,
+        "recovery_candidate": recovery_candidate, "recovery_root": recovery_root, "recovery_send": recovery_send,
+        "recovery_before": recovery_before, "recovery_after": recovery_after, "recovered_usage": recovered_usage,
+        "physical_after_convergence": physical_after_convergence,
+        "observations": run.barrier.observations(false)?}),
+    )
+}
+
+async fn hot_window(fault: Option<ScopedAckFault>) -> TestResult {
+    init_logging();
+    let label = match fault {
+        None => "hot-window",
+        Some(ScopedAckFault::RequestLoss) => "ack-request-loss",
+        Some(ScopedAckFault::ResponseLoss) => "ack-response-loss",
+        Some(ScopedAckFault::Forward) => return Err("fault scenario needs actual request or response loss".into()),
+    };
+    let mut run = if fault.is_some() {
+        PeerBucketRun::start_with_ack_faults(label).await?
+    } else {
+        PeerBucketRun::start(label).await?
+    };
+    let scheduler_config = run.assert_default_cadence().await?;
+    let baseline = run.quiet_baseline().await?;
+    let leader = run.leader().await?;
+    let leader_pid = run.pid(leader)?;
+    let producer = (leader + 1) % 4;
+    let producers = if fault.is_some() {
+        vec![producer, (leader + 2) % 4]
+    } else {
+        vec![producer]
+    };
+    let producer_pid = run.pid(producer)?;
+    let producer_address = run.peer_address(producer);
+    let [cold_a, cold_b, hot] = run.buckets.clone();
+    let cold = BTreeSet::from([cold_a.clone(), cold_b.clone()]);
+    let all = run.buckets.iter().cloned().collect::<BTreeSet<_>>();
+    run.write_evidence(
+        "baseline",
+        &json!({"topology": run.topology, "baseline": baseline, "objects": run.objects, "scheduler_config": scheduler_config,
+            "leader_node": leader, "leader_pid": leader_pid, "producer_node": producer, "producer_pid": producer_pid}),
+    )?;
+
+    run.barrier.arm("before_start_snapshot", leader_pid, None)?;
+    run.barrier.start_session(&run.buckets)?;
+    // A quiet baseline has no pending wake. A local S3 mutation reaches the
+    // real DirtyUsage path; waiting for the timer would require a full scan.
+    let start_cycle_wake = run.put(leader, &hot, "wake-start-cycle", 149).await?;
+    run.write_evidence("start-cycle-wake", &json!({"leader_pid": leader_pid, "put": start_cycle_wake}))?;
+    let start_gate = run
+        .barrier
+        .wait_stage("before_start_snapshot", leader_pid, None, true)
+        .await?;
+    let cycle = identity(&start_gate)?;
+    if baseline.scanner_epoch != Some(cycle.0) || baseline.scanner_cycle.is_none_or(|value| value >= cycle.1) {
+        return Err("test window did not follow the quiet baseline under the observed leader epoch".into());
+    }
+    // These are actual mutations after leading activity and before the start
+    // map RPCs. All three buckets must appear on the remote ingress peer.
+    for node in &producers {
+        for bucket in [&cold_a, &cold_b, &hot] {
+            run.put(*node, bucket, "start-window", 137).await?;
+        }
+    }
+    run.barrier.arm("before_post_walk_snapshot", leader_pid, Some(cycle))?;
+    run.barrier.release("before_start_snapshot", leader_pid)?;
+    let start = run
+        .barrier
+        .wait_stage("start_snapshot", leader_pid, Some(cycle), false)
+        .await?;
+    let start_peer = peer_for_address(&start, &producer_address)?;
+    assert_snapshot_window(&start, start_peer)?;
+    let start_producers = producers
+        .iter()
+        .map(|node| peer_for_address(&start, &run.peer_address(*node)).cloned())
+        .collect::<TestResult<Vec<_>>>()?;
+    for peer in &start_producers {
+        assert_snapshot_window(&start, peer)?;
+    }
+    let start_identities = peer_identities(&start["detail"]["peers"])?;
+    for node in (0..4).filter(|node| *node != leader) {
+        peer_for_address(&start, &run.peer_address(node))?;
+    }
+    let start_tuples = tuples(&start_peer["buckets"])?;
+    if start_tuples.keys().cloned().collect::<BTreeSet<_>>() != all {
+        return Err(format!("remote producer did not own all three actual start tuples: {start_peer}").into());
+    }
+
+    run.barrier
+        .wait_stage("before_post_walk_snapshot", leader_pid, Some(cycle), true)
+        .await?;
+    let mut hot_in_post_snapshot_window = Vec::new();
+    for node in &producers {
+        hot_in_post_snapshot_window.push(run.put(*node, &hot, "post-walk-window", 193).await?);
+    }
+    let mut hot_writer = if producers.len() == 1 {
+        run.start_hot_writer(producer, &hot)?
+    } else {
+        run.start_alternating_hot_writer(&producers, &hot)?
+    };
+    hot_writer.wait_for_completed(producers.len()).await?;
+    run.barrier.arm("root_durable", leader_pid, Some(cycle))?;
+    run.barrier.release("before_post_walk_snapshot", leader_pid)?;
+    let post = run
+        .barrier
+        .wait_stage("post_walk_snapshot", leader_pid, Some(cycle), false)
+        .await?;
+    let post_peer = peer_for_address(&post, &producer_address)?;
+    assert_snapshot_window(&post, post_peer)?;
+    let post_tuples = tuples(&post_peer["buckets"])?;
+    if peer_identities(&post["detail"]["peers"])? != start_identities {
+        return Err("a remote peer identity changed inside the certification window".into());
+    }
+    for bucket in &cold {
+        if start_tuples.get(bucket) != post_tuples.get(bucket) {
+            return Err(format!("cold bucket {bucket} changed inside the certification window").into());
+        }
+    }
+    let hot_start = start_tuples.get(&hot).ok_or("hot bucket absent from actual start map")?;
+    let hot_post = post_tuples.get(&hot).ok_or("hot bucket absent from actual post-walk map")?;
+    if hot_start.0 != hot_post.0 || hot_post.1 <= hot_start.1 {
+        return Err("hot S3 operation did not advance the same-incarnation remote dirty tuple".into());
+    }
+    for (node, start_peer) in producers.iter().zip(&start_producers) {
+        let post_peer = peer_for_address(&post, &run.peer_address(*node))?;
+        assert_snapshot_window(&post, post_peer)?;
+        let previous = tuples(&start_peer["buckets"])?;
+        let current = tuples(&post_peer["buckets"])?;
+        if previous.keys().cloned().collect::<BTreeSet<_>>() != all
+            || cold.iter().any(|bucket| previous.get(bucket) != current.get(bucket))
+            || current
+                .get(&hot)
+                .zip(previous.get(&hot))
+                .is_none_or(|(after, before)| after.0 != before.0 || after.1 <= before.1)
+        {
+            return Err(format!("alternating producer {node} did not preserve cold and advance hot: {post_peer}").into());
+        }
+    }
+
+    let candidate = run
+        .barrier
+        .wait_stage("cycle_candidate", leader_pid, Some(cycle), false)
+        .await?;
+    assert_scope(&candidate, &all, &start_tuples)?;
+    if candidate["detail"]["peer_certification"].as_bool() != Some(true)
+        || peer_identities(&candidate["detail"]["certified_peers"])? != start_identities
+        || names(&candidate["detail"]["pending_buckets"])? != BTreeSet::from([hot.clone()])
+        || candidate["detail"]["converged"].as_bool() != Some(false)
+    {
+        return Err(format!("hot-window candidate is not complete with only hot pending: {candidate}").into());
+    }
+    let root = run.barrier.wait_stage("root_durable", leader_pid, Some(cycle), true).await?;
+    for field in ["candidate_sha256", "coverage_sha256"] {
+        let digest = candidate["detail"][field].as_str().filter(|value| value.len() == 64);
+        if digest.is_none() || root["detail"][field].as_str() != digest {
+            return Err(format!("durable root is not bound to the actual candidate {field}").into());
+        }
+    }
+    if root["detail"]["root_sha256"].as_str().is_none_or(|value| value.len() != 64)
+        || root["detail"]["root_version"].is_null()
+        || !matches!(root["detail"]["outcome"].as_str(), Some("saved" | "already_durable"))
+    {
+        return Err(format!("root observation lacks a verified durable publication receipt: {root}").into());
+    }
+    let completed_at_root = hot_writer.completed();
+    hot_writer.wait_for_completed(completed_at_root + producers.len()).await?;
+    let hot_stream = hot_writer.finish().await?;
+    run.objects.extend(hot_stream.clone());
+    // The sealed pending set is immutable. A later write must survive the
+    // actual receiver's generation check without resealing that candidate.
+    if hot_stream.iter().map(|receipt| receipt.ingress_node).collect::<BTreeSet<_>>() != producers.iter().copied().collect()
+        || hot_stream
+            .iter()
+            .enumerate()
+            .any(|(index, receipt)| receipt.ingress_node != producers[index % producers.len()])
+    {
+        return Err("acknowledged hot stream did not alternate the actual S3 ingress processes".into());
+    }
+    let mut hot_after_root = Vec::new();
+    for node in &producers {
+        hot_after_root.push(run.put(*node, &hot, "after-root-before-ack", 257).await?);
+    }
+    let ack_queue = if fault.is_some() {
+        Some(run.scoped_ack_queue(producer, start_peer, cold.clone(), 1)?)
+    } else {
+        None
+    };
+    run.barrier.arm("before_start_snapshot", leader_pid, None)?;
+    // Advance the coordinator's local generation after this cycle's start.
+    // The pending hot bucket then wakes the next scoped cycle immediately.
+    let next_cycle_wake = run.put(leader, &hot, "wake-next-cycle", 151).await?;
+    run.write_evidence("next-cycle-wake", &json!({"leader_pid": leader_pid, "put": next_cycle_wake}))?;
+    run.barrier.release("root_durable", leader_pid)?;
+    let ack_send = run.barrier.wait_stage("ack_send", leader_pid, Some(cycle), false).await?;
+    if sequence(&root)? >= sequence(&ack_send)?
+        || ack_send["detail"]["candidate_sha256"] != root["detail"]["candidate_sha256"]
+        || ack_send["detail"]["coverage_sha256"] != root["detail"]["coverage_sha256"]
+    {
+        return Err("scoped ACK was not ordered after the same candidate's verified root".into());
+    }
+    let expected_ack = ack_send["detail"]["acks"]
+        .as_array()
+        .ok_or("sender omitted actual acknowledgements")?
+        .iter()
+        .find(|ack| ack["owner_id"] == start_peer["owner_id"] && ack["instance_id"] == start_peer["instance_id"])
+        .ok_or("sender did not acknowledge the actual remote producer")?;
+    let expected_entries = tuples(&expected_ack["entries"])?;
+    if expected_ack["kind"].as_str() != Some("scoped")
+        || expected_entries.keys().cloned().collect::<BTreeSet<_>>() != cold
+        || expected_entries
+            .iter()
+            .any(|(bucket, entry)| start_tuples.get(bucket) != Some(entry))
+    {
+        return Err(format!("sender did not preserve the certified remote cold tuples: {expected_ack}").into());
+    }
+    let fault_receipt = if let (Some(queue), Some(fault)) = (&ack_queue, fault) {
+        queue.wait_for_packets(1).await?;
+        let captured = queue
+            .receipts()
+            .into_iter()
+            .next()
+            .ok_or("scoped ACK queue omitted its retained packet")?;
+        run.write_evidence("ack-fault-captured", &captured)?;
+        if captured["request"]["owner_id"] != expected_ack["owner_id"]
+            || captured["request"]["instance_id"] != expected_ack["instance_id"]
+            || tuples(&captured["request"]["entries"])? != expected_entries
+            || captured["receiver"].as_str() != Some(run.dist.cluster.nodes[producer].address.as_str())
+            || captured["forwarded"].as_bool() != Some(false)
+            || (captured["auth_nonce"].as_str().is_none_or(str::is_empty)
+                && captured["replay_nonce"].as_str().is_none_or(str::is_empty))
+            || (captured["signature_sha256"].as_str().is_none_or(|value| value.len() != 64)
+                && captured["replay_signature_sha256"]
+                    .as_str()
+                    .is_none_or(|value| value.len() != 64))
+        {
+            return Err(format!("proxy did not retain the original signed cold ACK before forwarding: {captured}").into());
+        }
+        queue.settle(0, fault)?;
+        let receipt = queue.wait_for_completion(0).await?;
+        run.write_evidence("ack-fault", &receipt)?;
+        match fault {
+            ScopedAckFault::RequestLoss
+                if receipt["outcome"] == "request_lost"
+                    && receipt["forwarded"] == false
+                    && receipt["backend_complete"] == false => {}
+            ScopedAckFault::ResponseLoss
+                if receipt["outcome"] == "response_lost"
+                    && receipt["forwarded"] == true
+                    && receipt["backend_complete"] == true
+                    && receipt["response"]["status"] == 200
+                    && receipt["response"]["grpc_status"] == "0"
+                    && receipt["response"]["ack"]["owner_id"] == expected_ack["owner_id"]
+                    && receipt["response"]["ack"]["instance_id"] == expected_ack["instance_id"]
+                    && receipt["response"]["ack"]["cleared"] == 2
+                    && receipt["response"]["ack"]["response_proof_bytes"]
+                        .as_u64()
+                        .is_some_and(|count| count > 0) => {}
+            _ => return Err(format!("scoped ACK fault lacks its actual transport/backend outcome: {receipt}").into()),
+        }
+        receipt
+    } else {
+        Value::Null
+    };
+    let find_receiver = |stage: &str| receiver_observation(&run, stage, producer_pid, expected_ack);
+    let (before_ack, after_ack) = if fault == Some(ScopedAckFault::RequestLoss) {
+        (Value::Null, Value::Null)
+    } else {
+        wait_until(
+            CYCLE_TIMEOUT,
+            || async { Ok(find_receiver("ack_after_apply")?.is_some()) },
+            "real remote scoped ACK apply",
+        )
+        .await?;
+        let before_ack = find_receiver("ack_before_apply")?.ok_or("receiver omitted pre-apply observation")?;
+        let after_ack = find_receiver("ack_after_apply")?.ok_or("receiver omitted post-apply observation")?;
+        let remaining = &after_ack["detail"]["dirty_snapshot"];
+        let remaining_buckets = remaining["buckets"]
+            .as_array()
+            .ok_or("receiver omitted actual remaining dirty map")?;
+        if sequence(&before_ack)? >= sequence(&after_ack)?
+            || after_ack["detail"]["cleared"].as_u64() != Some(2)
+            || remaining["complete"].as_bool() != Some(true)
+            || remaining["pending_bucket_count"].as_u64() != Some(1)
+            || remaining_buckets.len() != 1
+            || remaining_buckets[0]["bucket"].as_str() != Some(hot.as_str())
+            || remaining_buckets[0]["generation"]
+                .as_u64()
+                .is_none_or(|generation| generation <= hot_post.1)
+        {
+            return Err(
+                format!("receiver did not clear precisely cold while preserving the later hot generation: {after_ack}").into(),
+            );
+        }
+        (before_ack, after_ack)
+    };
+
+    let next_start_gate = run
+        .barrier
+        .wait_stage_after("before_start_snapshot", leader_pid, None, true, sequence(&start_gate)?)
+        .await?;
+    let next_cycle = identity(&next_start_gate)?;
+    if next_cycle.0 != cycle.0 || next_cycle.1 <= cycle.1 || run.leader().await? != leader {
+        return Err("next-cycle assertion lost the actual coordinator or epoch".into());
+    }
+    if fault == Some(ScopedAckFault::RequestLoss)
+        && (find_receiver("ack_before_apply")?.is_some() || find_receiver("ack_after_apply")?.is_some())
+    {
+        return Err("lost scoped ACK request reached the receiver before the next cycle".into());
+    }
+    let mut secondary_acks = Vec::new();
+    for (node, peer) in producers.iter().zip(&start_producers).skip(1) {
+        let ack = ack_send["detail"]["acks"]
+            .as_array()
+            .ok_or("sender omitted acknowledgements")?
+            .iter()
+            .find(|ack| ack["owner_id"] == peer["owner_id"] && ack["instance_id"] == peer["instance_id"])
+            .ok_or("second producer did not receive a scoped ACK")?;
+        let entries = tuples(&ack["entries"])?;
+        let original = tuples(&peer["buckets"])?;
+        if ack["kind"] != "scoped"
+            || entries.keys().cloned().collect::<BTreeSet<_>>() != cold
+            || entries.iter().any(|(bucket, tuple)| original.get(bucket) != Some(tuple))
+        {
+            return Err("second producer ACK does not bind its own original cold tuples".into());
+        }
+        let pid = run.pid(*node)?;
+        wait_until(
+            CYCLE_TIMEOUT,
+            || async { Ok(receiver_observation(&run, "ack_after_apply", pid, ack)?.is_some()) },
+            "second real producer scoped ACK",
+        )
+        .await?;
+        let applied = receiver_observation(&run, "ack_after_apply", pid, ack)?.ok_or("second producer omitted ACK apply")?;
+        let remaining = &applied["detail"]["dirty_snapshot"];
+        let buckets = remaining["buckets"]
+            .as_array()
+            .ok_or("second producer omitted remaining buckets")?;
+        let hot_generation = tuples(&peer_for_address(&post, &run.peer_address(*node))?["buckets"])?
+            .get(&hot)
+            .ok_or("second producer omitted post-walk hot generation")?
+            .1;
+        if applied["detail"]["cleared"] != 2
+            || remaining["complete"] != true
+            || remaining["pending_bucket_count"] != 1
+            || buckets.len() != 1
+            || buckets[0]["bucket"] != hot
+            || buckets[0]["generation"]
+                .as_u64()
+                .is_none_or(|generation| generation <= hot_generation)
+        {
+            return Err(format!("second producer did not clear cold and preserve its later hot tuple: {applied}").into());
+        }
+        secondary_acks.push(applied);
+    }
+    // Hold the next cycle before its start map so admin reads cannot race a
+    // newer publication. The candidate and root evidence above are separate.
+    wait_until(
+        CYCLE_TIMEOUT,
+        || async {
+            let usage: DataUsageInfo = serde_json::from_value(run.admin_json(leader, "/rustfs/admin/v3/datausageinfo").await?)?;
+            Ok(usage.scanner_epoch == Some(cycle.0) && usage.scanner_cycle == Some(cycle.1))
+        },
+        "admin read-back of the exact complete-pending root",
+    )
+    .await?;
+    let usage: DataUsageInfo = serde_json::from_value(run.admin_json(leader, "/rustfs/admin/v3/datausageinfo").await?)?;
+    if !usage.is_complete_bucket_usage_snapshot()
+        || usage.usage_snapshot_converged != Some(false)
+        || usage.usage_snapshot_observational
+        || usage.usage_snapshot_partial
+        || usage.usage_snapshot_bootstrap_pending
+        || usage.usage_snapshot_pending_buckets != vec![hot.clone()]
+        || usage.usage_snapshot_pending_bucket_count != 1
+        || !run.usage_matches(&usage, &[&cold_a, &cold_b])
+    {
+        return Err(format!("admin root did not retain exact cold usage and only-hot pending: {usage:?}").into());
+    }
+    run.barrier.arm("root_durable", leader_pid, Some(next_cycle))?;
+    run.barrier.release("before_start_snapshot", leader_pid)?;
+    let next_start = run
+        .barrier
+        .wait_stage("start_snapshot", leader_pid, Some(next_cycle), false)
+        .await?;
+    let next_scope = if fault == Some(ScopedAckFault::RequestLoss) {
+        all.clone()
+    } else {
+        BTreeSet::from([hot.clone()])
+    };
+    if fault.is_some() {
+        let actual = tuples(&peer_for_address(&next_start, &producer_address)?["buckets"])?;
+        if actual.keys().cloned().collect::<BTreeSet<_>>() != next_scope
+            || (fault == Some(ScopedAckFault::RequestLoss)
+                && cold.iter().any(|bucket| actual.get(bucket) != start_tuples.get(bucket)))
+        {
+            return Err(
+                format!("next actual peer map did not retain exactly the unapplied scoped responsibility: {actual:?}").into(),
+            );
+        }
+    }
+    let next_candidate = run
+        .barrier
+        .wait_stage("cycle_candidate", leader_pid, Some(next_cycle), false)
+        .await?;
+    assert_scope(&next_candidate, &next_scope, &start_tuples)?;
+    let next_root = run
+        .barrier
+        .wait_stage("root_durable", leader_pid, Some(next_cycle), true)
+        .await?;
+    let observations = run.barrier.observations(false)?;
+    let next_walks = observations
+        .iter()
+        .filter(|event| event["stage"].as_str() == Some("bucket_walk") && identity(event).ok() == Some(next_cycle))
+        .collect::<Vec<_>>();
+    let walked_buckets = next_walks
+        .iter()
+        .map(|event| {
+            event["detail"]["bucket"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "actual bucket walk omitted bucket".into())
+        })
+        .collect::<TestResult<BTreeSet<_>>>()?;
+    if walked_buckets != next_scope {
+        return Err(format!(
+            "next Normal cycle must physically walk exactly the retained bucket scope {next_scope:?}: {next_walks:?}"
+        )
+        .into());
+    }
+    run.barrier.disarm()?;
+    run.barrier.release("root_durable", leader_pid)?;
+    let mut recovered_ack = Value::Null;
+    let mut recovered_usage = Value::Null;
+    if fault.is_some() {
+        let next_send = run
+            .barrier
+            .wait_stage("ack_send", leader_pid, Some(next_cycle), false)
+            .await?;
+        if sequence(&next_root)? >= sequence(&next_send)?
+            || next_send["detail"]["candidate_sha256"] != next_root["detail"]["candidate_sha256"]
+            || next_send["detail"]["coverage_sha256"] != next_root["detail"]["coverage_sha256"]
+        {
+            return Err("recovery ACK did not follow the next verified durable root".into());
+        }
+        let retry = next_send["detail"]["acks"]
+            .as_array()
+            .ok_or("recovery cycle omitted ACKs")?
+            .iter()
+            .find(|ack| ack["owner_id"] == start_peer["owner_id"] && ack["instance_id"] == start_peer["instance_id"])
+            .ok_or("recovery cycle did not acknowledge the same producer process")?;
+        if retry["kind"] != "scoped"
+            || tuples(&retry["entries"])? != tuples(&peer_for_address(&next_start, &producer_address)?["buckets"])?
+        {
+            return Err("recovery ACK did not preserve the next actual producer snapshot tuples".into());
+        }
+        wait_until(
+            CYCLE_TIMEOUT,
+            || async { Ok(receiver_observation(&run, "ack_after_apply", producer_pid, retry)?.is_some()) },
+            "actual scoped ACK recovery after transport loss",
+        )
+        .await?;
+        recovered_ack =
+            receiver_observation(&run, "ack_after_apply", producer_pid, retry)?.ok_or("recovery receiver omitted apply")?;
+        let remaining = &recovered_ack["detail"]["dirty_snapshot"];
+        if recovered_ack["detail"]["cleared"].as_u64() != Some(u64::try_from(next_scope.len())?)
+            || remaining["complete"] != true
+            || remaining["pending_bucket_count"] != 0
+            || remaining["buckets"].as_array().is_none_or(|entries| !entries.is_empty())
+        {
+            return Err(format!("healthy recovery did not clear precisely the retained responsibility: {recovered_ack}").into());
+        }
+        recovered_usage = serde_json::to_value(run.quiet_baseline().await?)?;
+    }
+    run.barrier.stop_session()?;
+    run.verify_objects().await?;
+    run.write_evidence(
+        label,
+        &json!({"topology": run.topology, "objects": run.objects, "baseline": baseline, "scheduler_config": scheduler_config,
+            "leader_node": leader, "leader_pid": leader_pid, "producer_node": producer, "producer_pid": producer_pid,
+            "producers": producers, "start_producers": start_producers, "secondary_acks": secondary_acks,
+            "start_cycle_wake": start_cycle_wake, "next_cycle_wake": next_cycle_wake,
+            "hot_in_post_snapshot_window": hot_in_post_snapshot_window[0], "hot_after_root": hot_after_root[0],
+            "hot_in_post_snapshot_window_by_producer": hot_in_post_snapshot_window, "hot_after_root_by_producer": hot_after_root,
+            "hot_stream": hot_stream, "hot_stream_completed_at_root": completed_at_root,
+            "cycle": cycle, "next_cycle": next_cycle, "usage": usage,
+            "candidate": candidate, "root": root, "ack_send": ack_send, "ack_before_apply": before_ack,
+            "ack_after_apply": after_ack, "fault_receipt": fault_receipt, "next_scope": next_scope,
+            "next_start": next_start, "next_candidate": next_candidate, "next_root": next_root,
+            "recovered_ack": recovered_ack, "recovered_usage": recovered_usage, "observations": run.barrier.observations(false)?}),
+    )
+}
