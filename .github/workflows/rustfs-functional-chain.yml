@@ -312,10 +312,12 @@ jobs:
         if: ${{ !inputs.validation_tools_only && (startsWith(inputs.validation_case, 'ilm.') || startsWith(inputs.validation_case, 'pool.') || startsWith(inputs.validation_case, 'bucket-replication.') || startsWith(inputs.validation_case, 'site-replication.') || startsWith(inputs.validation_case, 'heal.')) }}
         run: |
           set -euo pipefail
-          python3 -m venv "${RUNNER_TEMP}/rustfs-validation-python"
-          "${RUNNER_TEMP}/rustfs-validation-python/bin/python" -m pip install \
+          validation_python="${RUNNER_TEMP}/rustfs-validation-python-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "${validation_python}"
+          python3 -m venv "${validation_python}"
+          "${validation_python}/bin/python" -m pip install \
             -r auto-testing/scripts/validation_ilm/requirements.txt
-          printf '%s\n' "${RUNNER_TEMP}/rustfs-validation-python/bin" >> "${GITHUB_PATH}"
+          printf '%s\n' "${validation_python}/bin" >> "${GITHUB_PATH}"
 
       - name: Validate Heal tool build identity
         if: ${{ !inputs.validation_tools_only && startsWith(inputs.validation_case, 'heal.') }}
