@@ -35,11 +35,14 @@ pub(crate) fn is_compat_admin_request(path: &str) -> bool {
 }
 
 pub(crate) async fn read_compatible_admin_body(
-    mut input: Body,
+    input: impl Into<rustfs_s3_types::Body>,
     max_len: usize,
     path: &str,
     secret_key: &str,
 ) -> S3Result<Vec<u8>> {
+    // Legacy handlers still hand over the s3s body; owned handlers pass the
+    // RustFS body. Both read through the owned type so one limit applies.
+    let mut input: rustfs_s3_types::Body = input.into();
     let body = input
         .store_all_limited(max_len)
         .await
@@ -165,6 +168,21 @@ mod tests {
             .expect("decode payload");
 
         assert_eq!(decoded, payload);
+    }
+
+    #[tokio::test]
+    async fn rejects_an_owned_body_past_the_limit() {
+        let err =
+            read_compatible_admin_body(rustfs_s3_types::Body::from("nine bytes!"), 8, "/rustfs/admin/v3/list-users", "secret")
+                .await
+                .expect_err("eleven bytes exceed an eight byte limit");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(
+            err.message()
+                .is_some_and(|message| message.contains("exceeds the 8 byte limit")),
+            "{err:?}"
+        );
     }
 
     async fn body_bytes(mut body: Body) -> Vec<u8> {

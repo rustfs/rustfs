@@ -3411,12 +3411,12 @@ impl Operation for AdminOperation {
     }
 }
 
-/// Converts the legacy router request and response at the edge while owned
-/// admin operations use only RustFS request and body types.
-pub(crate) struct LegacyAdminAdapter(pub(crate) &'static dyn OwnedOperation);
-
+/// Every owned admin operation also serves the legacy router. The request
+/// and response are converted at this edge, so handlers that implement the
+/// owned [`OwnedOperation`] trait register with `AdminOperation(&Handler {})`
+/// exactly like legacy ones and never see an s3s type.
 #[async_trait::async_trait]
-impl Operation for LegacyAdminAdapter {
+impl<T: OwnedOperation> Operation for T {
     async fn call(
         &self,
         req: S3Request<Body>,
@@ -3424,7 +3424,7 @@ impl Operation for LegacyAdminAdapter {
     ) -> rustfs_s3_types::S3Result<S3Response<(StatusCode, Body)>> {
         let envelope = crate::app::RequestEnvelope::from_s3s(&req);
         let request = AdminRequest::new(envelope, req.input.into());
-        let (status, headers, body) = self.0.call(request, params).await?.into_parts();
+        let (status, headers, body) = OwnedOperation::call(self, request, params).await?.into_parts();
         Ok(S3Response::with_headers((status, body.into()), headers))
     }
 }
@@ -3570,14 +3570,12 @@ mod tests {
     }
 
     static IDENTITY_OPERATION: IdentityOperation = IdentityOperation;
-    static IDENTITY_ADAPTER: LegacyAdminAdapter = LegacyAdminAdapter(&IDENTITY_OPERATION);
     static ECHO_OPERATION: EchoOperation = EchoOperation;
-    static ECHO_ADAPTER: LegacyAdminAdapter = LegacyAdminAdapter(&ECHO_OPERATION);
 
-    fn owned_router(path: &str, adapter: &'static LegacyAdminAdapter) -> S3Router<AdminOperation> {
+    fn owned_router(path: &str, operation: &'static dyn Operation) -> S3Router<AdminOperation> {
         let mut router = S3Router::new(false);
         router
-            .insert(Method::GET, path, AdminOperation(adapter))
+            .insert(Method::GET, path, AdminOperation(operation))
             .expect("owned test route should register");
         router
     }
@@ -3598,7 +3596,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_admin_adapter_rejects_missing_identity_and_preserves_supplied_identity() {
-        let router = owned_router("/__owned_admin/{kind}", &IDENTITY_ADAPTER);
+        let router = owned_router("/__owned_admin/{kind}", &IDENTITY_OPERATION);
 
         let error = router
             .call(router_request(Method::GET, "/__owned_admin/identity"))
@@ -3627,7 +3625,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_admin_adapter_preserves_status_repeated_headers_raw_body_and_size_hint() {
-        let router = owned_router("/__owned_admin/echo", &ECHO_ADAPTER);
+        let router = owned_router("/__owned_admin/echo", &ECHO_OPERATION);
         let raw = Bytes::from_static(&[0x00, 0x7f, 0x80, 0xff]);
         let mut request = router_request(Method::GET, "/__owned_admin/echo");
         request.input = Body::from(raw.clone());
@@ -3657,7 +3655,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_admin_adapter_preserves_body_errors() {
-        let router = owned_router("/__owned_admin/echo", &ECHO_ADAPTER);
+        let router = owned_router("/__owned_admin/echo", &ECHO_OPERATION);
         let stream = futures::stream::iter(vec![
             Ok::<Bytes, io::Error>(Bytes::from_static(b"before-error")),
             Err(io::Error::other("owned body sentinel")),

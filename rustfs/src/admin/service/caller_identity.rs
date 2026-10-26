@@ -25,9 +25,10 @@
 //! credentials but must *not* be allowed to rewrite the parent's secret. This
 //! module is the single place those distinctions are made.
 
-use crate::admin::auth::authenticate_request;
+use crate::admin::auth::{authenticate_envelope_credentials, authenticate_request};
 use crate::admin::runtime_sources::current_action_credentials;
 use crate::admin::storage_api::s3::{self, Body, S3ErrorCode, S3Request, S3Result};
+use crate::app::RequestEnvelope;
 use crate::auth::constant_time_eq;
 use rustfs_credentials::Credentials;
 use rustfs_iam::federation::OIDC_VIRTUAL_PARENT_CLAIM;
@@ -139,6 +140,23 @@ impl CallerIdentity {
         };
 
         let (credentials, is_owner) = authenticate_request(&req.headers, &req.uri, input_cred).await?;
+        Ok(Self::from_credentials(credentials, is_owner))
+    }
+
+    /// Envelope form of [`Self::resolve`] for handlers on the owned boundary.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
+        )
+    )]
+    pub(crate) async fn resolve_envelope(envelope: &RequestEnvelope) -> S3Result<Self> {
+        let Some(input_cred) = envelope.credentials() else {
+            return Err(s3::error(S3ErrorCode::InvalidRequest, "authentication required"));
+        };
+
+        let (credentials, is_owner) = authenticate_envelope_credentials(input_cred).await?;
         Ok(Self::from_credentials(credentials, is_owner))
     }
 
@@ -284,6 +302,31 @@ mod tests {
     use rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA;
     use serde_json::Value;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn resolve_envelope_rejects_a_missing_identity_like_resolve() {
+        let req = S3Request {
+            input: Body::empty(),
+            method: http::Method::GET,
+            uri: "/rustfs/admin/v3/accountinfo".parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let legacy = CallerIdentity::resolve(&req).await.expect_err("no credentials");
+        let owned = CallerIdentity::resolve_envelope(&RequestEnvelope::from_s3s(&req))
+            .await
+            .expect_err("no credentials");
+
+        assert_eq!(owned.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(owned.code(), legacy.code());
+        assert_eq!(owned.message(), Some("authentication required"));
+        assert_eq!(owned.message(), legacy.message());
+    }
 
     fn long_term(access_key: &str) -> Credentials {
         Credentials {

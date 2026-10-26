@@ -22,6 +22,7 @@ use crate::admin::{
     auth::{AdminResourceScope, validate_admin_action_with_bucket_object_for_iam},
     router::{AdminOperation, Operation, S3Router},
 };
+use crate::app::RequestEnvelope;
 use crate::auth::{check_key_valid_with_context, get_session_token};
 use crate::error::ApiError;
 use crate::server::{RemoteAddr, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
@@ -2463,6 +2464,89 @@ async fn table_bucket_enabled_from_extensions(extensions: &http::Extensions, buc
 
 async fn ensure_table_bucket_enabled_from_extensions(extensions: &http::Extensions, bucket: &str) -> S3Result<()> {
     if table_bucket_enabled_from_extensions(extensions, bucket).await? {
+        return Ok(());
+    }
+    Err(s3_error!(InvalidRequest, "bucket {bucket} is not table-enabled"))
+}
+
+// Envelope forms of the extension helpers above, for handlers on the owned
+// admin request boundary. They resolve the same slot-or-ambient context.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
+    )
+)]
+fn table_catalog_backend_from_envelope(
+    envelope: &RequestEnvelope,
+) -> S3Result<crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>> {
+    let context = runtime_sources::app_context_from_envelope(envelope)
+        .ok_or_else(|| table_catalog_internal_error("request application context is not initialized"))?;
+    Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
+        context.object_store(),
+        context.table_catalog_strong_runtime(),
+    ))
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
+    )
+)]
+fn table_catalog_store_from_envelope(
+    envelope: &RequestEnvelope,
+) -> S3Result<crate::table_catalog::EcStoreTableCatalogStore<ECStore>> {
+    table_catalog_store_from_backend(table_catalog_backend_from_envelope(envelope)?)
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
+    )
+)]
+fn table_catalog_object_store_from_envelope(envelope: &RequestEnvelope) -> S3Result<EcStoreObjectTableCatalogStore> {
+    match crate::table_catalog::TableCatalogBackingMode::from_env().map_err(catalog_store_error)? {
+        crate::table_catalog::TableCatalogBackingMode::ObjectBacked => Ok(crate::table_catalog::ObjectTableCatalogStore::new(
+            table_catalog_backend_from_envelope(envelope)?,
+        )),
+        crate::table_catalog::TableCatalogBackingMode::DurableStrong => Err(s3_error!(
+            InvalidRequest,
+            "operation is not supported with {} table catalog backing",
+            crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG
+        )),
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
+    )
+)]
+async fn table_bucket_enabled_from_envelope(envelope: &RequestEnvelope, bucket: &str) -> S3Result<bool> {
+    let store = runtime_sources::object_store_from_envelope(envelope)
+        .ok_or_else(|| table_catalog_internal_error("request object store is not initialized"))?;
+    store
+        .table_bucket_enabled(bucket)
+        .await
+        .map_err(|err| s3_error!(InvalidRequest, "failed to load table bucket metadata for {bucket}: {}", err))
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
+    )
+)]
+async fn ensure_table_bucket_enabled_from_envelope(envelope: &RequestEnvelope, bucket: &str) -> S3Result<()> {
+    if table_bucket_enabled_from_envelope(envelope, bucket).await? {
         return Ok(());
     }
     Err(s3_error!(InvalidRequest, "bucket {bucket} is not table-enabled"))

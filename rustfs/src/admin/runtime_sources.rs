@@ -85,6 +85,22 @@ pub(crate) fn app_context_from_envelope(envelope: &RequestEnvelope) -> Option<Ar
     }
 }
 
+/// Envelope form of [`object_store_from_req`]: the injected server slot wins,
+/// the ambient process store is the single-instance fallback.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
+    )
+)]
+pub(crate) fn object_store_from_envelope(envelope: &RequestEnvelope) -> Option<Arc<ECStore>> {
+    match envelope.server_context() {
+        Some(slot) => slot.installed_object_store(),
+        None => current_object_store_handle(),
+    }
+}
+
 /// Resolve an application context from request extensions.
 ///
 /// An injected slot identifies the server that owns the request. If that
@@ -166,7 +182,8 @@ pub(crate) fn publish_storage_class_config(config: StorageClassConfig) {
 mod tests {
     use super::{
         AppContext, IamInterface, KmsInterface, ServerContextSlot, app_context_from_envelope, app_context_from_extensions,
-        app_context_from_req, current_app_context, object_store_from_extensions, publish_test_app_context,
+        app_context_from_req, current_app_context, object_store_from_envelope, object_store_from_extensions,
+        publish_test_app_context,
     };
     use crate::admin::router::{Operation, S3Router};
     use crate::app::RequestEnvelope;
@@ -306,6 +323,33 @@ mod tests {
         let fallback = app_context_from_envelope(&envelope(http::Extensions::new()))
             .expect("an envelope with no server slot keeps the legacy ambient fallback");
         assert!(Arc::ptr_eq(&fallback, &ambient));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn envelope_object_store_lookup_preserves_slot_isolation_and_absent_slot_fallback() {
+        let ambient = ambient_context().await;
+
+        let mut empty_extensions = http::Extensions::new();
+        empty_extensions.insert(ServerContextSlot::new());
+        assert!(
+            object_store_from_envelope(&envelope(empty_extensions)).is_none(),
+            "an installed-but-empty slot must not fall back to the ambient store"
+        );
+
+        let installed = distinct_context(&ambient);
+        let installed_slot = ServerContextSlot::new();
+        assert!(installed_slot.install(installed.clone()));
+        let mut installed_extensions = http::Extensions::new();
+        installed_extensions.insert(installed_slot);
+        let resolved = object_store_from_envelope(&envelope(installed_extensions))
+            .expect("an installed slot must resolve its own object store");
+        assert!(Arc::ptr_eq(&resolved, &installed.object_store()));
+
+        assert!(
+            object_store_from_envelope(&envelope(http::Extensions::new())).is_some(),
+            "an envelope with no server slot keeps the legacy ambient fallback"
+        );
     }
 
     struct ContextDependentAdminRoute;

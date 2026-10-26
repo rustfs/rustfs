@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::RequestEnvelope;
+use crate::app::{RequestCredentials, RequestEnvelope};
 use crate::auth::get_condition_values;
 use crate::server::RemoteAddr;
 use http::HeaderMap;
@@ -269,6 +269,13 @@ pub async fn authenticate_request(
     authenticate_request_facts(&credentials.access_key, session_token).await
 }
 
+/// Authenticate the caller of an owned admin request from the facts its
+/// envelope carries: the presented access key and the session token the edge
+/// decoded.
+pub(crate) async fn authenticate_envelope_credentials(credentials: &RequestCredentials) -> S3Result<(Credentials, bool)> {
+    authenticate_request_facts(credentials.access_key(), credentials.session_token().unwrap_or_default()).await
+}
+
 async fn authenticate_request_facts(access_key: &str, session_token: &str) -> S3Result<(Credentials, bool)> {
     use crate::auth::check_key_valid;
 
@@ -322,8 +329,7 @@ pub async fn authorize_admin_envelope(req: &RequestEnvelope, actions: Vec<Action
         return Err(s3_error!(InvalidRequest, "get cred failed"));
     };
 
-    let (cred, owner) =
-        authenticate_request_facts(input_cred.access_key(), input_cred.session_token().unwrap_or_default()).await?;
+    let (cred, owner) = authenticate_envelope_credentials(input_cred).await?;
     validate_admin_request(req.headers(), &cred, owner, false, actions, req.remote_addr()).await?;
 
     Ok(cred)

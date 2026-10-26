@@ -16254,3 +16254,52 @@ async fn disable_table_bucket_preserves_objects_and_can_be_reenabled() {
             .table_bucket_enabled()
     );
 }
+
+#[tokio::test]
+async fn envelope_helpers_fail_closed_on_an_empty_server_slot_like_their_extension_twins() {
+    let mut extensions = http::Extensions::new();
+    extensions.insert(ServerContextSlot::new());
+    let request = crate::admin::operation::test_support::TestRequest::new(http::Method::GET, "/rustfs/admin/v3/tables")
+        .extensions(extensions.clone())
+        .build();
+    let envelope = request.envelope();
+
+    let backend = table_catalog_backend_from_envelope(envelope)
+        .map(|_| ())
+        .expect_err("empty slot has no context");
+    assert_eq!(
+        backend.message(),
+        table_catalog_backend_from_extensions(&extensions)
+            .map(|_| ())
+            .expect_err("extension twin fails the same way")
+            .message()
+    );
+    assert_eq!(backend.message(), Some("request application context is not initialized"));
+    assert_eq!(
+        table_catalog_store_from_envelope(envelope)
+            .map(|_| ())
+            .expect_err("store needs a context")
+            .message(),
+        backend.message()
+    );
+    assert!(table_catalog_object_store_from_envelope(envelope).is_err());
+
+    let enabled = table_bucket_enabled_from_envelope(envelope, "probe")
+        .await
+        .expect_err("empty slot has no store");
+    assert_eq!(enabled.message(), Some("request object store is not initialized"));
+    assert_eq!(
+        table_bucket_enabled_from_extensions(&extensions, "probe")
+            .await
+            .expect_err("extension twin fails the same way")
+            .message(),
+        enabled.message()
+    );
+    assert_eq!(
+        ensure_table_bucket_enabled_from_envelope(envelope, "probe")
+            .await
+            .expect_err("ensure fails closed too")
+            .message(),
+        enabled.message()
+    );
+}

@@ -36,6 +36,7 @@
 //! caller-supplied encryption context arrives already reduced by
 //! [`rustfs_kms::redact_encryption_context`].
 
+use crate::app::RequestEnvelope;
 use crate::server::RemoteAddr;
 use crate::storage::access::request_context_from_extensions;
 use crate::storage::helper::spawn_background_with_context;
@@ -196,6 +197,27 @@ impl KmsAdminAudit {
             &cred.parent_user,
             source_ip,
             Some(get_request_user_agent(headers)),
+            request_id,
+        )
+    }
+
+    /// Build the audit state from the owned request envelope.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
+        )
+    )]
+    pub(super) fn from_envelope(envelope: &RequestEnvelope, cred: &Credentials) -> Self {
+        let source_ip = envelope.remote_addr().map(|addr| addr.ip().to_string());
+        let request_id = envelope.request_context().map(|context| context.request_id.clone());
+
+        Self::new(
+            &cred.access_key,
+            &cred.parent_user,
+            source_ip,
+            Some(get_request_user_agent(envelope.headers())),
             request_id,
         )
     }
@@ -478,6 +500,42 @@ mod tests {
             Some("rustfs-admin/1".to_string()),
             Some("req-kms-1".to_string()),
         )
+    }
+
+    #[test]
+    fn from_envelope_reads_the_same_facts_as_from_request() {
+        let peer: std::net::SocketAddr = "10.1.2.3:4455".parse().expect("socket address");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::USER_AGENT, http::HeaderValue::from_static("rustfs-admin/1"));
+        let mut extensions = http::Extensions::new();
+        extensions.insert(Some(RemoteAddr(peer)));
+        extensions.insert(crate::storage::request_context::RequestContext::from_headers(&headers));
+        let cred = Credentials {
+            access_key: "AKIAOPERATOR".to_string(),
+            parent_user: "root-account".to_string(),
+            ..Default::default()
+        };
+
+        let from_request = KmsAdminAudit::from_request(&extensions, &headers, &cred);
+        let request = crate::admin::operation::test_support::TestRequest::new(http::Method::POST, "/rustfs/admin/v3/kms/key")
+            .headers(headers)
+            .extensions(extensions)
+            .build();
+        let from_envelope = KmsAdminAudit::from_envelope(request.envelope(), &cred);
+
+        // `operation_id` is minted per context, so compare every fact but it.
+        let (owned, legacy) = (from_envelope.context(), from_request.context());
+        assert_eq!(owned.principal, legacy.principal);
+        assert_eq!(owned.source_ip, legacy.source_ip);
+        assert_eq!(owned.user_agent, legacy.user_agent);
+        assert_eq!(owned.additional_context, legacy.additional_context);
+        assert_eq!(owned.source_ip.as_deref(), Some("10.1.2.3"));
+        assert_eq!(owned.user_agent.as_deref(), Some("rustfs-admin/1"));
+        assert_eq!(
+            owned.additional_context.get(CONTEXT_PARENT_USER).map(String::as_str),
+            Some("root-account")
+        );
+        assert!(owned.additional_context.contains_key(CONTEXT_REQUEST_ID));
     }
 
     fn tag<'a>(entry: &'a AuditEntry, name: &str) -> Option<&'a Value> {
