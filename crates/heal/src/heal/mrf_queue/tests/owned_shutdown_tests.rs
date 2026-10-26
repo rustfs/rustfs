@@ -216,6 +216,21 @@ async fn owned_mrf_full_admission_replies_full_without_false_ack() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn owned_mrf_real_consumer_joins_with_live_static_senders() {
+    const CHILD: &str = "RUSTFS_MRF_OWNED_CONSUMER_TEST_CHILD";
+    const TEST: &str = "heal::mrf_queue::tests::owned_shutdown_tests::owned_mrf_real_consumer_joins_with_live_static_senders";
+    if std::env::var_os(CHILD).is_none() {
+        // Process-global senders cannot be reinitialized by another unit test.
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .expect("isolated MRF consumer test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}{}", String::from_utf8_lossy(&output.stderr));
+        assert!(stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+        assert!(stdout.contains("MRF_OWNED_CONSUMER_CHILD_OK"));
+        return;
+    }
     let env = rustfs_test_utils::TestECStoreEnv::builder()
         .prefix("mrf_owned_loop")
         .build()
@@ -237,4 +252,5 @@ async fn owned_mrf_real_consumer_joins_with_live_static_senders() {
         .await
         .expect("explicit stop must terminate despite process-global sender lifetime")
         .expect("actual consumer joined");
+    println!("MRF_OWNED_CONSUMER_CHILD_OK");
 }
