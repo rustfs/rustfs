@@ -27,7 +27,8 @@ use hyper_util::{
 };
 use prost::Message as _;
 use rustfs_protos::proto_gen::node_service::{
-    DeleteRequest, ReadVersionRequest, RecoverMultipartSourceRequest, RenameDataResponse,
+    BatchGenerallyLockRequest, DeleteRequest, GenerallyLockRequest, ReadVersionRequest, RecoverMultipartSourceRequest,
+    RenameDataResponse,
 };
 use std::{
     collections::HashSet,
@@ -68,6 +69,9 @@ struct PauseState {
     blocked: AtomicUsize,
     forwarded: AtomicUsize,
     forwarded_routes: Mutex<HashSet<String>>,
+    record_lock_owners: bool,
+    lock_owner: Option<String>,
+    forwarded_lock_owners: Mutex<HashSet<String>>,
     reached: Notify,
     release: watch::Sender<Disposition>,
 }
@@ -92,6 +96,22 @@ impl RpcPause {
 
     pub(crate) fn forwarded_routes(&self) -> usize {
         self.state.forwarded_routes.lock().expect("RPC route observations").len()
+    }
+
+    pub(crate) fn forwarded_lock_owners(&self) -> usize {
+        self.state
+            .forwarded_lock_owners
+            .lock()
+            .expect("RPC lock owner observations")
+            .len()
+    }
+
+    pub(crate) fn has_forwarded_lock_owner(&self, owner: &str) -> bool {
+        self.state
+            .forwarded_lock_owners
+            .lock()
+            .expect("RPC lock owner observations")
+            .contains(owner)
     }
 
     pub(crate) fn responses(&self) -> usize {
@@ -160,9 +180,16 @@ impl Drop for RpcPause {
     }
 }
 
+#[derive(Default)]
+struct LockObservation<'a> {
+    record_owners: bool,
+    owner: Option<&'a str>,
+}
+
 pub(crate) struct RpcFaultProxy {
     address: SocketAddr,
     slot: PauseSlot,
+    lock_slot: PauseSlot,
     task: JoinHandle<()>,
     late_requests: LateRequests,
 }
@@ -173,6 +200,8 @@ impl RpcFaultProxy {
         let address = listener.local_addr()?;
         let slot: PauseSlot = Arc::new(Mutex::new(None));
         let active = slot.clone();
+        let lock_slot: PauseSlot = Arc::new(Mutex::new(None));
+        let active_lock = lock_slot.clone();
         let late_requests: LateRequests = Arc::new(Mutex::new(Some(Vec::new())));
         let late = late_requests.clone();
         let task = tokio::spawn(async move {
@@ -186,11 +215,20 @@ impl RpcFaultProxy {
                         let h1 = h1.clone();
                         let h2 = h2.clone();
                         let active = active.clone();
+                        let active_lock = active_lock.clone();
                         let late = late.clone();
                         connections.spawn(async move {
                             let service = service_fn(move |request: Request<Incoming>| {
                                 let client = if request.version() == http::Version::HTTP_2 { h2.clone() } else { h1.clone() };
-                                let pause = active.lock().expect("RPC pause slot").clone();
+                                let lock_method = request.uri().path().strip_prefix("/node_service.NodeService/")
+                                    .is_some_and(|method| matches!(method, "Lock" | "LockBatch"));
+                                let owner_pause = if lock_method {
+                                    let slot = active_lock.lock().expect("RPC owner lock slot");
+                                    slot.clone()
+                                } else {
+                                    None
+                                };
+                                let pause = owner_pause.or_else(|| active.lock().expect("RPC pause slot").clone());
                                 let retain = pause.as_ref().is_some_and(|pause| {
                                     pause.retain_after_disconnect
                                         && request.uri().path().strip_prefix("/node_service.NodeService/")
@@ -227,6 +265,7 @@ impl RpcFaultProxy {
         Ok(Self {
             address,
             slot,
+            lock_slot,
             task,
             late_requests,
         })
@@ -239,7 +278,37 @@ impl RpcFaultProxy {
     /// Pause at most limit requests to the named unary methods; other streams
     /// on the same HTTP/2 connection continue forwarding.
     pub(crate) fn pause(&self, methods: &[&'static str], limit: usize, scope: Option<&str>) -> io::Result<RpcPause> {
-        self.pause_with_lifetime(methods, limit, scope, false, None)
+        self.pause_with_lifetime(methods, limit, scope, false, LockObservation::default(), None)
+    }
+
+    /// Distinguish contenders by owner rather than counting lock retries.
+    pub(crate) fn pause_upload_locks(&self, scope: &str) -> io::Result<RpcPause> {
+        self.pause_with_lifetime(
+            &["Lock", "LockBatch"],
+            usize::MAX,
+            Some(scope),
+            false,
+            LockObservation {
+                record_owners: true,
+                owner: None,
+            },
+            None,
+        )
+    }
+
+    /// Hold one coordinator's locks while observing other scoped lock owners.
+    pub(crate) fn pause_upload_lock_owner(&self, scope: &str, owner: &str) -> io::Result<RpcPause> {
+        self.pause_with_lifetime(
+            &["Lock", "LockBatch"],
+            usize::MAX,
+            Some(scope),
+            false,
+            LockObservation {
+                record_owners: true,
+                owner: Some(owner),
+            },
+            None,
+        )
     }
 
     /// Retain bounded control packets until explicit delivery after caller retirement.
@@ -250,7 +319,7 @@ impl RpcFaultProxy {
                 "late RPC limit exceeds control-packet budget",
             ));
         }
-        self.pause_with_lifetime(methods, limit, Some(scope), true, None)
+        self.pause_with_lifetime(methods, limit, Some(scope), true, LockObservation::default(), None)
     }
 
     /// Observe exact native Inspect rejections without consuming mutation hits
@@ -265,7 +334,8 @@ impl RpcFaultProxy {
         if !methods.contains(&"RecoverMultipartSource") {
             methods.push("RecoverMultipartSource");
         }
-        let observer = self.pause_with_lifetime(&methods, usize::MAX, Some(mutation_scope), false, Some(path))?;
+        let observer =
+            self.pause_with_lifetime(&methods, usize::MAX, Some(mutation_scope), false, LockObservation::default(), Some(path))?;
         observer.release();
         Ok(observer)
     }
@@ -276,14 +346,39 @@ impl RpcFaultProxy {
         limit: usize,
         scope: Option<&str>,
         retain_after_disconnect: bool,
+        lock_observation: LockObservation<'_>,
         inspection_path: Option<&str>,
     ) -> io::Result<RpcPause> {
-        let mut slot = self.slot.lock().expect("RPC pause slot");
+        let LockObservation {
+            record_owners: record_lock_owners,
+            owner: lock_owner,
+        } = lock_observation;
+        // Always take the general slot before the owner slot. A typed lock
+        // gate may coexist with storage faults, never another lock rule.
+        let mut general_slot = self.slot.lock().expect("RPC pause slot");
+        let mut owner_slot = self.lock_slot.lock().expect("RPC owner lock slot");
+        if (lock_owner.is_some()
+            && general_slot
+                .as_ref()
+                .is_some_and(|pause| pause.methods.iter().any(|method| matches!(*method, "Lock" | "LockBatch"))))
+            || (lock_owner.is_none()
+                && owner_slot.is_some()
+                && methods.iter().any(|method| matches!(*method, "Lock" | "LockBatch")))
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "RPC lock gates must not overlap"));
+        }
+        let (slot, slot_arc) = if lock_owner.is_some() {
+            (&mut *owner_slot, self.lock_slot.clone())
+        } else {
+            (&mut *general_slot, self.slot.clone())
+        };
+
         if slot.is_some()
             || methods.is_empty()
             || limit == 0
             || scope.is_some_and(str::is_empty)
             || inspection_path.is_some_and(str::is_empty)
+            || lock_owner.is_some_and(str::is_empty)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -304,14 +399,14 @@ impl RpcFaultProxy {
             blocked: AtomicUsize::new(0),
             forwarded: AtomicUsize::new(0),
             forwarded_routes: Mutex::new(HashSet::new()),
+            record_lock_owners,
+            lock_owner: lock_owner.map(str::to_owned),
+            forwarded_lock_owners: Mutex::new(HashSet::new()),
             reached: Notify::new(),
             release,
         });
         *slot = Some(state.clone());
-        Ok(RpcPause {
-            state,
-            slot: self.slot.clone(),
-        })
+        Ok(RpcPause { state, slot: slot_arc })
     }
 }
 
@@ -379,6 +474,26 @@ fn source_inspection_route(body: &[u8], path: &[u8]) -> io::Result<Option<String
     Ok((!request.disk.is_empty()).then_some(request.disk))
 }
 
+fn scoped_lock_owners(method: &str, body: &[u8], scope: &[u8]) -> io::Result<Vec<String>> {
+    let payload = unary_payload(body)?;
+    let args = match method {
+        "Lock" => vec![GenerallyLockRequest::decode(payload).map_err(io::Error::other)?.args],
+        "LockBatch" => BatchGenerallyLockRequest::decode(payload).map_err(io::Error::other)?.args,
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "lock observer requires a lock method")),
+    };
+    args.into_iter()
+        .filter(|args| args.as_bytes().windows(scope.len()).any(|window| window == scope))
+        .map(|args| {
+            let request: serde_json::Value = serde_json::from_str(&args).map_err(io::Error::other)?;
+            request["owner"]
+                .as_str()
+                .filter(|owner| !owner.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "scoped lock needs an owner"))
+        })
+        .collect()
+}
+
 async fn forward_request(
     request: Request<Incoming>,
     client: ProxyClient,
@@ -393,6 +508,7 @@ async fn forward_request(
         let method = parts.uri.path().strip_prefix("/node_service.NodeService/");
         if let Some(method) = method.filter(|name| pause.methods.contains(name)) {
             let mut route = None;
+            let mut lock_owners = Vec::new();
             let matches = if let Some(scope) = pause.scope.as_deref() {
                 // Inspect bounded control routing while preserving the exact
                 // signed bytes and trailers forwarded to the backend.
@@ -405,7 +521,17 @@ async fn forward_request(
                 {
                     inspection = Some((pause.clone(), disk));
                 }
-                let matches = scope_matches(method, &bytes, scope)?;
+                let mut matches = scope_matches(method, &bytes, scope)?;
+                if matches && (pause.record_lock_owners || pause.lock_owner.is_some()) {
+                    lock_owners = scoped_lock_owners(method, &bytes, scope)?;
+                    if let Some(owner) = &pause.lock_owner {
+                        matches = lock_owners.iter().any(|candidate| candidate == owner);
+                        if !matches && pause.record_lock_owners {
+                            observed = Some((pause.clone(), None, std::mem::take(&mut lock_owners), false));
+                        }
+                    }
+                }
+
                 if matches && method == "ReadVersion" {
                     let disk = ReadVersionRequest::decode(unary_payload(&bytes)?)
                         .map_err(io::Error::other)?
@@ -441,6 +567,7 @@ async fn forward_request(
                 observed = Some((
                     pause,
                     route,
+                    lock_owners,
                     matches!(
                         method,
                         "RenameData" | "RenameMultipartData" | "RenameDataAtIncarnation" | "RenameDataWithQuotaFence"
@@ -477,13 +604,18 @@ async fn forward_request(
             .expect("inspection response routes")
             .insert(disk);
     }
-    if let Some((pause, route, rename)) = observed {
+    if let Some((pause, route, lock_owners, rename)) = observed {
         pause.responses.fetch_add(1, Ordering::SeqCst);
         if response.status().is_success() && response.headers().get("grpc-status").is_none_or(|status| status == "0") {
             pause.forwarded.fetch_add(1, Ordering::SeqCst);
             if let Some(route) = route {
                 pause.forwarded_routes.lock().expect("RPC route observations").insert(route);
             }
+            pause
+                .forwarded_lock_owners
+                .lock()
+                .expect("RPC lock owner observations")
+                .extend(lock_owners);
         }
         if pause.retain_after_disconnect {
             let (parts, body) = response.into_parts();
@@ -1123,6 +1255,145 @@ mod tests {
         })
         .await
         .expect("passive observer deadline");
+        assert_upload_lock_owner_observations().await;
+    }
+
+    async fn assert_upload_lock_owner_observations() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let backend = backend().await.expect("lock observation backend");
+            let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback"), backend.address)
+                .await
+                .expect("lock observation proxy");
+            let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(true).build_http();
+            let observer = proxy.pause_upload_locks("target-upload").expect("typed lock observer");
+            observer.release();
+            let args = |owner: &str, resource: &str| serde_json::json!({"owner": owner, "resource": resource}).to_string();
+            let lock_frame = |method: &str, requests: Vec<String>| {
+                let payload = if method == "Lock" {
+                    GenerallyLockRequest {
+                        args: requests[0].clone(),
+                    }
+                    .encode_to_vec()
+                } else {
+                    BatchGenerallyLockRequest { args: requests }.encode_to_vec()
+                };
+                let mut frame = vec![0];
+                frame.extend_from_slice(&u32::try_from(payload.len()).expect("small lock frame").to_be_bytes());
+                frame.extend_from_slice(&payload);
+                Bytes::from(frame)
+            };
+            for (method, requests, expected) in [
+                ("Lock", vec![args("a", "target-upload")], 1),
+                ("Lock", vec![args("a", "target-upload")], 1),
+                ("Lock", vec![args("b", "other-upload")], 1),
+                ("LockBatch", vec![args("a", "target-upload"), args("b", "target-upload")], 2),
+                ("LockBatch", vec![args("c", "other-upload"), args("b", "target-upload")], 2),
+                ("Lock", vec![args("c", "target-upload")], 3),
+            ] {
+                let frame = lock_frame(method, requests);
+                let body = call_body(&client, proxy.local_addr(), method, frame.clone())
+                    .await
+                    .expect("observed lock reaches backend")
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("observed lock response");
+                assert_eq!(body.trailers().expect("preserved lock trailers")["x-proof"], "unchanged-proof");
+                assert_eq!(body.to_bytes(), frame, "signed packet bytes must remain unchanged");
+                assert_eq!(
+                    observer.forwarded_lock_owners(),
+                    expected,
+                    "retries and other resources are not new contenders"
+                );
+            }
+            assert!(observer.has_forwarded_lock_owner("b"));
+            assert!(!observer.has_forwarded_lock_owner("unseen"));
+            drop(observer);
+
+            let storage = proxy
+                .pause(&["PreparePartTransaction"], usize::MAX, Some("target-upload"))
+                .expect("independent storage gate");
+            let owner = proxy
+                .pause_upload_lock_owner("target-upload", "held")
+                .expect("scoped owner gate");
+            assert!(proxy.pause_upload_lock_owner("target-upload", "another").is_err());
+            let held_frame = lock_frame("Lock", vec![args("held", "target-upload")]);
+            let address = proxy.local_addr();
+            let held_client = client.clone();
+            let packet = held_frame.clone();
+            let held = tokio::spawn(async move { call_body(&held_client, address, "Lock", packet).await });
+            owner.wait_for_hits(1).await.expect("selected coordinator reaches owner gate");
+            let part_client = client.clone();
+            let part = tokio::spawn(async move {
+                call_body(&part_client, address, "PreparePartTransaction", Bytes::from_static(b"target-upload-part")).await
+            });
+            storage.wait_for_hits(1).await.expect("part reaches its separate gate");
+            for (request_owner, resource) in [("allowed", "target-upload"), ("held", "other-upload")] {
+                let packet = lock_frame("LockBatch", vec![args(request_owner, resource)]);
+                let returned = call_body(&client, address, "LockBatch", packet.clone())
+                    .await
+                    .expect("other owner or upload must remain live")
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("bypass body");
+                assert_eq!(returned.to_bytes(), packet);
+            }
+            assert_eq!(owner.hits(), 1, "unrelated owners and uploads cannot count as the held contender");
+            assert!(owner.has_forwarded_lock_owner("allowed"));
+            assert!(!owner.has_forwarded_lock_owner("held"), "an unrelated upload is not forwarded admission");
+            storage.release();
+            assert_eq!(
+                part.await
+                    .expect("part task")
+                    .expect("released part")
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("part body")
+                    .to_bytes(),
+                Bytes::from_static(b"target-upload-part")
+            );
+            assert!(!held.is_finished(), "releasing part transactions must not release the losing lock owner");
+            owner.release();
+            let returned = held
+                .await
+                .expect("held owner task")
+                .expect("released owner")
+                .into_body()
+                .collect()
+                .await
+                .expect("held packet response");
+            assert_eq!(returned.trailers().expect("owner trailers")["x-proof"], "unchanged-proof");
+            assert_eq!(returned.to_bytes(), held_frame);
+            drop(storage);
+            assert!(
+                proxy.pause(&["Lock"], 1, Some("target-upload")).is_err(),
+                "lock rules cannot shadow one another"
+            );
+            drop(owner);
+            let general = proxy
+                .pause(&["LockBatch"], 1, Some("target-upload"))
+                .expect("general lock gate");
+            assert!(proxy.pause_upload_lock_owner("target-upload", "held").is_err());
+            drop(general);
+            assert!(proxy.pause_upload_lock_owner("target-upload", "").is_err());
+
+            let lost = proxy
+                .pause_upload_lock_owner("target-upload", "held")
+                .expect("discardable owner gate");
+            let lost_client = client.clone();
+            let packet = lock_frame("LockBatch", vec![args("held", "target-upload")]);
+            let before = backend.received.load(Ordering::SeqCst);
+            let lost_call = tokio::spawn(async move { call_body(&lost_client, address, "LockBatch", packet).await });
+            lost.wait_for_hits(1).await.expect("batched owner reaches loss gate");
+            lost.discard_pending();
+            drop(lost);
+            assert!(lost_call.await.expect("discarded owner task").is_err());
+            assert_eq!(backend.received.load(Ordering::SeqCst), before, "discard must not replay a lock grant");
+        })
+        .await
+        .expect("lock owner observation deadline");
     }
 
     #[tokio::test]
