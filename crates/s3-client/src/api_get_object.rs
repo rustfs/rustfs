@@ -137,7 +137,6 @@ mod bounded_response_tests {
         credentials::{Credentials, SignatureType, Static, Value},
         transition_api::{BucketLookupType, Options, TransitionClient, TransitionClientTimeouts, collect_response_body},
     };
-    use futures_util::FutureExt;
     use http_body_util::Full;
     use hyper::body::Bytes;
     use std::time::Duration;
@@ -283,23 +282,6 @@ mod bounded_response_tests {
                 .to_ascii_lowercase()
                 .contains("\r\nrange: bytes=0-6\r\n")
         );
-    }
-
-    #[tokio::test]
-    async fn overflowing_closed_range_is_rejected_before_network_io() {
-        let client = client_for_endpoint("127.0.0.1:0", TransitionClientTimeouts::default()).await;
-        let mut opts = GetObjectOptions::default();
-        opts.headers
-            .insert("range".to_string(), "bytes=0-18446744073709551615".to_string());
-
-        let err = client
-            .get_object_inner("bucket", "probe", &opts)
-            .now_or_never()
-            .expect("an overflowing closed range must be rejected on the first poll")
-            .expect_err("an overflowing closed range must be rejected locally");
-
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert_eq!(err.to_string(), "closed response range length overflows");
     }
 
     #[tokio::test]

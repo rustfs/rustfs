@@ -1717,6 +1717,37 @@ mod tests {
     use uuid::Uuid;
 
     #[tokio::test]
+    async fn overflowing_closed_range_is_rejected_before_network_io() {
+        let client = super::TransitionClient::new("127.0.0.1:0", super::Options::default(), "")
+            .await
+            .expect("fixture client should build");
+        // An offline dispatch fails before transport. Its distinct error makes
+        // validation order observable without accepting unrelated TCP traffic.
+        client
+            .health_status
+            .store(super::C_OFFLINE, std::sync::atomic::Ordering::SeqCst);
+        let mut opts = crate::api_get_options::GetObjectOptions::default();
+        opts.headers
+            .insert("range".to_string(), "bytes=0-18446744073709551615".to_string());
+
+        let err = client
+            .get_object_inner("bucket", "probe", &opts)
+            .await
+            .expect_err("overflow must be rejected before request dispatch");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "closed response range length overflows");
+
+        let mut valid = crate::api_get_options::GetObjectOptions::default();
+        valid.set_range(0, 6).expect("control range should be valid");
+        let dispatched = client
+            .get_object_inner("bucket", "probe", &valid)
+            .await
+            .expect_err("a valid range should reach the offline dispatch guard");
+        assert_eq!(dispatched.kind(), std::io::ErrorKind::Other);
+        assert!(dispatched.to_string().ends_with(" is offline."));
+    }
+
+    #[tokio::test]
     async fn response_body_limit_rejects_the_first_byte_past_the_boundary() {
         let exact = collect_response_body(
             Full::new(Bytes::from(vec![0_u8; MAX_S3_CLIENT_RESPONSE_SIZE])),
