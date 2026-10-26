@@ -369,6 +369,11 @@ pub(crate) mod scan {
         SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
         SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES,
     };
+    #[cfg(test)]
+    pub(crate) use super::{
+        EcstoreScannerPeerDirtyUsageBucket, EcstoreScannerPeerDirtyUsageSnapshot, EcstoreScannerPublicationLease,
+        EcstoreScannerPublicationLeaseGrant,
+    };
 }
 
 pub(crate) mod scanner_io {

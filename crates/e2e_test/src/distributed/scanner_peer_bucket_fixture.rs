@@ -21,13 +21,13 @@ use super::scanner_heal_topology_fixture::{assert_bucket_durability_strict, asse
 use crate::chaos::census_object_version_on_disk;
 use crate::common::admin_request;
 use crate::rpc_fault_proxy::{RpcFaultProxy, ScopedAckQueue, ScopedAckScope};
+use crate::storage_api::scanner_peer_bucket::{
+    BUCKET_META_PREFIX, PeerRestClient, RUSTFS_META_BUCKET, ReedSolomonEncoder, calc_shard_size,
+};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use http::Method;
 use rustfs_data_usage::DataUsageInfo;
-use rustfs_ecstore::api::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
-use rustfs_ecstore::api::erasure::{ReedSolomonEncoder, calc_shard_size};
-use rustfs_ecstore::api::rpc::PeerRestClient;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv6Addr, SocketAddr};
@@ -93,7 +93,7 @@ impl PeerBucketRun {
         if old_sha256 == new_sha256 {
             return Err("mixed-version fixture requires distinct old and new executables".into());
         }
-        self.quiet_baseline().await?;
+        let initial_baseline = self.quiet_baseline().await?;
         let leader = self.leader().await?;
         let retained = self.dirty_snapshot(leader).await?;
         let mut initial_processes = Vec::new();
@@ -119,10 +119,10 @@ impl PeerBucketRun {
             self.dist.cluster.stop_node_gracefully(node).await?;
             self.dist.cluster.start_node_from_binary(node, &old_binary).await?;
             let process = self.process_executable_identity(node, &old_binary, expected_old_sha256)?;
-            if self.leader().await? != leader
-                || u64::from(self.pid(leader)?) != retained["pid"].as_u64().ok_or("leader omitted PID")?
-            {
-                return Err("mixed-version replacement lost the retained new coordinator".into());
+            // A follower restart may invalidate the original fixed-quorum lease.
+            // Keep the N process identity here; requalify its role after the fleet is complete.
+            if self.process_executable_identity(leader, &new_binary, new_sha256)? != initial_processes[leader] {
+                return Err("mixed-version replacement changed the retained new process".into());
             }
             let current_leader = self.dirty_snapshot(leader).await?;
             if current_leader["owner_id"] != retained["owner_id"] || current_leader["instance_id"] != retained["instance_id"] {
@@ -163,12 +163,14 @@ impl PeerBucketRun {
             let replacement_peer = self.mixed_replacement_snapshot(node, &previous_peer, &process).await?;
             replacements.push(
                 json!({"node": node, "process": process, "previous_peer": previous_peer, "peer": replacement_peer,
-                "retained_leader": current_leader, "startup_log": {"path": log_path, "dev": log_before.dev(),
+                "retained_leader": current_leader, "retained_snapshot_scope": "process_identity_only", "startup_log": {"path": log_path, "dev": log_before.dev(),
                     "inode": log_before.ino(), "offset": log_offset, "prefix_bytes": startup.len(),
                     "prefix_sha256": sha256_hex(&startup), "prefix_limit": OBSERVATION_BYTES_LIMIT}}),
             );
         }
-        self.quiet_baseline().await?;
+        let requalification = self
+            .requalify_mixed_coordinator(leader, &initial_processes[leader], &retained, &initial_baseline)
+            .await?;
         let processes = self.mixed_process_identities(leader, &old_binary, expected_old_sha256)?;
         if processes[leader] != initial_processes[leader]
             || replacements.iter().any(|replacement| {
@@ -191,10 +193,157 @@ impl PeerBucketRun {
         let fleet = json!({"leader": leader, "leader_pid": self.pid(leader)?, "retained": retained,
             "old_sha256": expected_old_sha256, "new_executable": current, "old_binary": old_binary,
             "initial_processes": initial_processes, "processes": processes, "peers": peers,
-            "replacements": replacements, "drives_before": drives_before, "drives_after": drives_after});
+            "replacements": replacements, "requalification": requalification, "drives_before": drives_before, "drives_after": drives_after});
         self.assert_mixed_roles(&fleet).await?;
         self.write_evidence("mixed-version-fleet", &fleet)?;
         Ok(fleet)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]
+    async fn requalify_mixed_coordinator(
+        &self,
+        leader: usize,
+        expected_process: &Value,
+        retained: &Value,
+        initial_baseline: &DataUsageInfo,
+    ) -> TestResult<Value> {
+        use std::io::Write as _;
+
+        let started = tokio::time::Instant::now();
+        let deadline = started + CYCLE_TIMEOUT;
+        let initial_epoch = initial_baseline.scanner_epoch.ok_or("initial mixed baseline omitted epoch")?;
+        let initial_cycle = initial_baseline.scanner_cycle.ok_or("initial mixed baseline omitted cycle")?;
+        let path = self.artifacts.join("mixed-coordinator-requalification.jsonl");
+        let mut transcript = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        let (mut lines, mut bytes) = (0_usize, 0_usize);
+        let line_limit = OBSERVATION_LIMIT * 4;
+        let byte_limit = usize::try_from(OBSERVATION_BYTES_LIMIT)? * 32;
+        let mut record = |value: Value| -> TestResult {
+            let mut encoded = serde_json::to_vec(&value)?;
+            encoded.push(b'\n');
+            if lines >= line_limit || encoded.len() > byte_limit.saturating_sub(bytes) {
+                return Err("mixed coordinator requalification transcript exceeded its bounds".into());
+            }
+            transcript.write_all(&encoded)?;
+            lines += 1;
+            bytes += encoded.len();
+            Ok(())
+        };
+        record(json!({"event": "started", "leader": leader, "process": expected_process,
+            "retained": retained, "initial_baseline": initial_baseline,
+            "deadline_elapsed_ms": CYCLE_TIMEOUT.as_millis(), "line_limit": line_limit, "byte_limit": byte_limit}))?;
+        let mut attempts = 0_u64;
+        let mut post_fleet_floor = None;
+        let mut delay = Duration::from_millis(50);
+        let result: TestResult<Value> = loop {
+            attempts += 1;
+            let probe = tokio::time::timeout_at(deadline, async {
+                record(json!({"event": "attempt", "attempt": attempts, "elapsed_ms": started.elapsed().as_millis()}))?;
+                let pid = self.pid(leader)?;
+                if expected_process["pid"].as_u64() != Some(u64::from(pid))
+                    || expected_process["start_time_ticks"].as_u64() != Some(proc_start_time(pid)?)
+                    || std::fs::read_link(format!("/proc/{pid}/exe"))?
+                        != PathBuf::from(expected_process["path"].as_str().ok_or("retained process omitted path")?)
+                {
+                    return Err("mixed requalification replaced the retained N process".into());
+                }
+                let collecting_floor = post_fleet_floor.is_none();
+                let mut statuses = Vec::new();
+                let mut held = false;
+                let mut publication_available = false;
+                for node in 0..4 {
+                    let status = self.admin_json(node, "/rustfs/admin/v3/scanner/status").await?;
+                    record(json!({"event": "status", "attempt": attempts, "node": node,
+                        "elapsed_ms": started.elapsed().as_millis(), "status": status}))?;
+                    let active = status["metrics"]["leader_lock_held_by_this_process"]
+                        .as_bool()
+                        .ok_or("mixed scanner status omitted leader lock state")?;
+                    if active && node != leader {
+                        return Err(format!("mixed requalification observed another coordinator: node {node}").into());
+                    }
+                    if node == leader {
+                        let publication = &status["metrics"]["usage_publication"];
+                        match (publication.get("scanner_epoch"), publication.get("cycle")) {
+                            (Some(Value::Null), Some(Value::Null)) => {
+                                // Lock loss clears both optional fields until N starts a new attempt.
+                                record(json!({"event": "post_fleet_publication_unavailable", "attempt": attempts,
+                                    "node": node, "publication": publication}))?;
+                            }
+                            (Some(epoch), Some(cycle)) => {
+                                let observed = (
+                                    epoch.as_u64().ok_or("post-fleet N publication has an invalid epoch")?,
+                                    cycle.as_u64().ok_or("post-fleet N publication has an invalid cycle")?,
+                                );
+                                publication_available = true;
+                                if collecting_floor {
+                                    let floor = observed.max((initial_epoch, initial_cycle));
+                                    record(json!({"event": "post_fleet_floor", "attempt": attempts, "node": node,
+                                        "publication": publication, "scanner_epoch": floor.0, "scanner_cycle": floor.1}))?;
+                                    post_fleet_floor = Some(floor);
+                                }
+                            }
+                            _ => return Err("post-fleet N publication omitted epoch or cycle".into()),
+                        }
+                    }
+                    held |= active;
+                    statuses.push(status);
+                }
+                if collecting_floor || !held || !publication_available {
+                    return Ok(None);
+                }
+                let peer = self.dirty_snapshot(leader).await?;
+                record(json!({"event": "retained_peer", "attempt": attempts, "peer": peer}))?;
+                if peer["pid"] != expected_process["pid"]
+                    || peer["owner_id"] != retained["owner_id"]
+                    || peer["instance_id"] != retained["instance_id"]
+                {
+                    return Err("mixed requalification changed the retained authenticated N identity".into());
+                }
+                let usage: DataUsageInfo =
+                    serde_json::from_value(self.admin_json(leader, "/rustfs/admin/v3/datausageinfo").await?)?;
+                record(json!({"event": "baseline", "attempt": attempts, "baseline": usage}))?;
+                let publication = &statuses[leader]["metrics"]["usage_publication"];
+                let names = self.buckets.iter().map(String::as_str).collect::<Vec<_>>();
+                let floor = post_fleet_floor.ok_or("mixed requalification omitted its post-fleet publication floor")?;
+                let fresh = usage.scanner_epoch.zip(usage.scanner_cycle).is_some_and(|(epoch, cycle)| {
+                    (epoch, cycle) > floor
+                        && publication["scanner_epoch"].as_u64() == Some(epoch)
+                        && publication["cycle"].as_u64() == Some(cycle)
+                });
+                if !fresh
+                    || !usage.is_complete_bucket_usage_snapshot()
+                    || usage.usage_snapshot_converged != Some(true)
+                    || !usage.usage_snapshot_pending_buckets.is_empty()
+                    || !self.usage_matches(&usage, &names)
+                {
+                    return Ok(None);
+                }
+                Ok(Some(json!({"leader": leader, "leader_pid": pid, "peer": peer, "statuses": statuses,
+                    "scanner_epoch": usage.scanner_epoch, "scanner_cycle": usage.scanner_cycle,
+                    "post_fleet_floor": {"scanner_epoch": floor.0, "scanner_cycle": floor.1}, "baseline": usage})))
+            })
+            .await;
+            match probe {
+                Ok(Ok(Some(accepted))) if tokio::time::Instant::now() < deadline => break Ok(accepted),
+                Ok(Ok(None)) if tokio::time::Instant::now() < deadline => {}
+                Ok(Err(error)) => break Err(error),
+                _ => break Err("mixed coordinator requalification and fresh baseline exceeded the cycle timeout".into()),
+            }
+            tokio::time::sleep_until((tokio::time::Instant::now() + delay).min(deadline)).await;
+            delay = (delay * 2).min(Duration::from_secs(1));
+        };
+        // Persist even a timeout/partial probe; no response is omitted to fit the transcript.
+        let terminal = json!({"event": "finished", "attempts": attempts, "elapsed_ms": started.elapsed().as_millis(),
+            "deadline_elapsed_ms": CYCLE_TIMEOUT.as_millis(), "accepted": result.as_ref().ok(),
+            "error": result.as_ref().err().map(ToString::to_string)});
+        let terminal_record = record(terminal.clone());
+        let receipt = json!({"transcript": path, "lines": lines, "bytes": bytes,
+            "line_limit": line_limit, "byte_limit": byte_limit, "terminal": terminal});
+        self.write_evidence("mixed-coordinator-requalification", &receipt)?;
+        terminal_record?;
+        let mut accepted = result?;
+        accepted["receipt"] = receipt;
+        Ok(accepted)
     }
 
     #[cfg(all(target_os = "linux", feature = "scanner-peer-mixed-version"))]

@@ -543,7 +543,7 @@ fn certified_empty_remote_ack_keeps_known_remote_work_pending() {
 
 #[test]
 fn sealed_peer_proof_binds_every_lease_and_keeps_all_post_lease_guardrails() {
-    use crate::storage_api::{
+    use crate::storage_api::scan::{
         EcstoreScannerPeerDirtyUsageBucket, EcstoreScannerPeerDirtyUsageSnapshot, EcstoreScannerPublicationLease,
         EcstoreScannerPublicationLeaseGrant,
     };
