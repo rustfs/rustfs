@@ -2400,13 +2400,6 @@ impl FolderScanner {
                 }
             }
 
-            if !into.compacted {
-                for folder_item in &existing_folders {
-                    let h = hash_path(&folder_item.name);
-                    self.update_cache.copy_with_children(&self.old_cache, &h, &folder_item.parent);
-                }
-            }
-
             let is_scan_root = folder.name == self.old_cache.info.name;
             let scan_checkpoint = self.old_cache.info.scan_checkpoint.as_ref();
             let checkpoint_resume_after = scan_checkpoint.and_then(|checkpoint| {
@@ -2600,22 +2593,13 @@ impl FolderScanner {
                     self.send_update_for_entry(&this_hash, &folder.parent, into).await;
                     tokio::task::yield_now().await;
                 } else {
-                    tokio::task::yield_now().await;
                     into.add_child(&h);
                     self.record_completed_child(&folder_item.name);
+                    tokio::task::yield_now().await;
                     self.maybe_send_checkpoint(&folder, &this_hash, into);
                     self.update_cache.delete_recursive(&h);
                     self.update_cache.copy_with_children(&self.new_cache, &h, &folder_item.parent);
                     self.send_update().await;
-                }
-
-                if queued_folder.source == FolderScanSource::New
-                    && !into.compacted
-                    && self.update_cache.find(&this_hash.key()).is_some_and(|v| !v.compacted)
-                {
-                    self.update_cache.delete_recursive(&h);
-                    self.update_cache
-                        .copy_with_children(&self.new_cache, &h, &Some(this_hash.clone()));
                 }
             }
 
@@ -3028,12 +3012,14 @@ impl FolderScanner {
             self.new_cache.replace_hashed(&this_hash, &folder.parent, into);
         }
 
-        // Keep independently accounted children while the sweep cursor may
-        // reference them; the hard cardinality compaction below still applies.
+        // Completed healthy subtrees can keep aggregate usage. Coverage gaps
+        // and failed-object debt still need child entries for precise resume
+        // and to avoid rereading healthy siblings on a retry.
         if !into.compacted
-            && self.old_cache.info.scan_progress.is_none()
+            && (self.old_cache.info.scan_progress.is_none() || !self.coverage_gap)
             && self.new_cache.info.name != folder.name
             && let Some(mut flat) = self.new_cache.size_recursive(&this_hash.key())
+            && (self.old_cache.info.scan_progress.is_none() || flat.failed_objects == 0)
         {
             flat.compacted = true;
             let mut should_compact = false;
@@ -3054,6 +3040,16 @@ impl FolderScanner {
             }
 
             if should_compact {
+                // Heal revisits also reach this path without a parent advancing
+                // coverage. Keep the endpoint addressable when its completed
+                // subtree is replaced by an aggregate.
+                if self.coverage_frontier.as_deref().is_some_and(|frontier| {
+                    frontier
+                        .strip_prefix(&folder.name)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+                }) {
+                    self.record_completed_child(&folder.name);
+                }
                 self.new_cache.delete_recursive(&this_hash);
                 self.new_cache.replace_hashed(&this_hash, &folder.parent, &flat);
             }

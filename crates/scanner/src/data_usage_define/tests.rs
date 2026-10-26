@@ -2429,6 +2429,45 @@ fn test_data_usage_cache_recursive_helpers_tolerate_cycles() {
 }
 
 #[test]
+fn scanner_summary_releases_wide_child_sets() {
+    let root = hash_path("bucket");
+    let mut cache = DataUsageCache::default();
+    cache.replace_hashed(
+        &root,
+        &None,
+        &DataUsageEntry {
+            size: 17,
+            objects: 1,
+            versions: 2,
+            delete_markers: 1,
+            failed_objects: 1,
+            all_tier_stats: Some(AllTierStats::new()),
+            ..Default::default()
+        },
+    );
+    for index in 0..10_000 {
+        let child = hash_path(&format!("bucket/{index:05}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                size: 3,
+                objects: 1,
+                versions: 2,
+                ..Default::default()
+            },
+        );
+    }
+
+    let summary = cache.size_recursive("bucket").expect("wide bucket summary");
+    assert_eq!((summary.size, summary.objects, summary.versions), (30_017, 10_001, 20_002));
+    assert_eq!((summary.delete_markers, summary.failed_objects), (1, 1));
+    assert_eq!(summary.children.capacity(), 0, "summaries must not retain the wide namespace allocation");
+    assert!(summary.all_tier_stats.is_some(), "preserve the root's optional statistics representation");
+    assert_eq!(cache.find("bucket").expect("unchanged root").children.len(), 10_000);
+}
+
+#[test]
 fn test_data_usage_cache_flatten_does_not_count_root_twice_in_cycle() {
     let root_hash = hash_path("bucket");
     let child_hash = hash_path("bucket/a");
