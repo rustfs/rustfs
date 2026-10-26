@@ -12,28 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::authorize_admin_request;
+use crate::admin::auth::authorize_admin_envelope;
 use crate::admin::handlers::supervise_admin_mutation;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{
-    app_context_from_req, current_object_store_handle_for_context, current_scanner_metrics_report,
+    app_context_from_envelope, current_object_store_handle_for_context, current_scanner_metrics_report,
 };
 use crate::admin::storage_api::ScannerDataMovementPauseStatus;
 use crate::module_switches::{ENV_SCANNER_ENABLED, scanner_enabled_from_env};
 use crate::server::ADMIN_PREFIX;
 use chrono::Utc;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 #[cfg(test)]
 use rustfs_scanner_metrics::metrics::ScannerLifecycleTransitionSnapshot;
 use rustfs_scanner_metrics::metrics::{ScannerLifecycleExpirySnapshot, ScannerMaintenanceControlSnapshot, ScannerMetricsReport};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -291,31 +291,31 @@ pub fn register_scanner_route(r: &mut S3Router<AdminOperation>) -> std::io::Resu
 
 /// The pre-check keeps these endpoints' historical missing-credentials message;
 /// the shared gate reports "get cred failed".
-async fn validate_scanner_status_request(req: &S3Request<Body>) -> S3Result<Credentials> {
-    if req.credentials.is_none() {
+async fn validate_scanner_status_request(req: &AdminRequest) -> S3Result<Credentials> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "missing credentials"));
     }
 
-    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await
 }
 
-async fn validate_scanner_reset_request(req: &S3Request<Body>) -> S3Result<Credentials> {
-    if req.credentials.is_none() {
+async fn validate_scanner_reset_request(req: &AdminRequest) -> S3Result<Credentials> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "missing credentials"));
     }
-    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::ConfigUpdateAdminAction)]).await
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ConfigUpdateAdminAction)]).await
 }
 
-fn json_response(body: Vec<u8>) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn json_response(body: Vec<u8>) -> S3Result<AdminResponse> {
     json_response_with_status(StatusCode::OK, body)
 }
 
-fn json_response_with_status(status: StatusCode, body: Vec<u8>) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn json_response_with_status(status: StatusCode, body: Vec<u8>) -> S3Result<AdminResponse> {
     let mut headers = HeaderMap::new();
     let content_type = HeaderValue::from_str(JSON_CONTENT_TYPE)
         .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid content type: {err}")))?;
     headers.insert(CONTENT_TYPE, content_type);
-    Ok(S3Response::with_headers((status, Body::from(body)), headers))
+    Ok(AdminResponse::with_headers(status, Body::from(body), headers))
 }
 
 fn scanner_recovery_intent_error(err: rustfs_scanner::ScannerError) -> S3Error {
@@ -338,7 +338,7 @@ fn scanner_recovery_intent_record_response(
     status_code: StatusCode,
     status: &'static str,
     record: rustfs_scanner::ScannerRecoveryIntentRecord,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
+) -> S3Result<AdminResponse> {
     let response = ScannerRecoveryIntentResponse {
         status,
         action: record.action,
@@ -359,9 +359,7 @@ fn scanner_recovery_intent_record_response(
     json_response_with_status(status_code, body)
 }
 
-fn scanner_recovery_intent_accept_response(
-    result: rustfs_scanner::ScannerRecoveryIntentAcceptResult,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn scanner_recovery_intent_accept_response(result: rustfs_scanner::ScannerRecoveryIntentAcceptResult) -> S3Result<AdminResponse> {
     match result {
         rustfs_scanner::ScannerRecoveryIntentAcceptResult::Accepted { record } => {
             scanner_recovery_intent_record_response(StatusCode::ACCEPTED, "accepted", record)
@@ -399,14 +397,14 @@ pub struct ScannerStatusHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ScannerStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let _cred = validate_scanner_status_request(&req).await?;
         let enabled = scanner_enabled_from_env();
         let metrics = current_scanner_metrics_report().await;
         let runtime_config = rustfs_scanner::scanner_runtime_config_status();
         let cycle_schedule = rustfs_scanner::scanner_cycle_schedule_status();
-        let store =
-            app_context_from_req(&req).and_then(|context| current_object_store_handle_for_context(Some(context.as_ref())));
+        let store = app_context_from_envelope(req.envelope())
+            .and_then(|context| current_object_store_handle_for_context(Some(context.as_ref())));
         let (data_movement_pause, pause_backlog) = match store {
             Some(store) => (
                 store.scanner_data_movement_pause_status().await,
@@ -437,10 +435,10 @@ pub struct ScannerUsageStateRecoveryIntentStatusHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ScannerCycleStateResetHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let _cred = validate_scanner_reset_request(&req).await?;
         let body = req
-            .input
+            .take_body()
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|err| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid reset request body: {err}")))?;
@@ -449,7 +447,7 @@ impl Operation for ScannerCycleStateResetHandler {
         if reset.mode != "full-rescan" {
             return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "reset mode must be full-rescan"));
         }
-        let context = app_context_from_req(&req)
+        let context = app_context_from_envelope(req.envelope())
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "storage layer not initialized"))?;
         let store = current_object_store_handle_for_context(Some(context.as_ref()))
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "storage layer not initialized"))?;
@@ -466,10 +464,10 @@ impl Operation for ScannerCycleStateResetHandler {
 
 #[async_trait::async_trait]
 impl Operation for ScannerUsageStateResetHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let _cred = validate_scanner_reset_request(&req).await?;
         let body = req
-            .input
+            .take_body()
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|err| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid reset request body: {err}")))?;
@@ -478,7 +476,7 @@ impl Operation for ScannerUsageStateResetHandler {
         if reset.mode != "full-rebuild" {
             return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "reset mode must be full-rebuild"));
         }
-        let context = app_context_from_req(&req)
+        let context = app_context_from_envelope(req.envelope())
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "storage layer not initialized"))?;
         let store = current_object_store_handle_for_context(Some(context.as_ref()))
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "storage layer not initialized"))?;
@@ -529,10 +527,10 @@ impl Operation for ScannerUsageStateResetHandler {
 
 #[async_trait::async_trait]
 impl Operation for ScannerUsageStateRecoveryIntentStatusHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let _cred = validate_scanner_reset_request(&req).await?;
         let intent_id = params.get("intent_id").unwrap_or("");
-        let context = app_context_from_req(&req)
+        let context = app_context_from_envelope(req.envelope())
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "storage layer not initialized"))?;
         let store = current_object_store_handle_for_context(Some(context.as_ref()))
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "storage layer not initialized"))?;
@@ -550,14 +548,14 @@ impl Operation for ScannerUsageStateRecoveryIntentStatusHandler {
 
 #[async_trait::async_trait]
 impl Operation for IlmExpiryStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let _cred = validate_scanner_status_request(&req).await?;
         let enabled = scanner_enabled_from_env();
         let metrics = current_scanner_metrics_report().await;
         let runtime_config = rustfs_scanner::scanner_runtime_config_status();
         let cycle_schedule = rustfs_scanner::scanner_cycle_schedule_status();
-        let store =
-            app_context_from_req(&req).and_then(|context| current_object_store_handle_for_context(Some(context.as_ref())));
+        let store = app_context_from_envelope(req.envelope())
+            .and_then(|context| current_object_store_handle_for_context(Some(context.as_ref())));
         let (data_movement_pause, pause_backlog) = match store {
             Some(store) => (
                 store.scanner_data_movement_pause_status().await,
@@ -587,17 +585,11 @@ mod tests {
     /// message they have always returned (rustfs/backlog#1829).
     #[tokio::test]
     async fn scanner_status_gate_keeps_its_missing_credentials_message() {
-        let req = S3Request {
-            input: Body::from(String::new()),
-            method: Method::GET,
-            uri: http::Uri::from_static("/rustfs/admin/v3/scanner/status"),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let req = crate::admin::operation::test_support::TestRequest::new(Method::GET, "/rustfs/admin/v3/scanner/status")
+            .headers(HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::from(String::new()))
+            .build();
 
         let err = validate_scanner_status_request(&req)
             .await
@@ -608,17 +600,12 @@ mod tests {
 
     #[tokio::test]
     async fn scanner_reset_gate_rejects_missing_credentials() {
-        let req = S3Request {
-            input: Body::from(String::new()),
-            method: Method::POST,
-            uri: http::Uri::from_static("/rustfs/admin/v3/scanner/cycle-state/reset"),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let req =
+            crate::admin::operation::test_support::TestRequest::new(Method::POST, "/rustfs/admin/v3/scanner/cycle-state/reset")
+                .headers(HeaderMap::new())
+                .extensions(http::Extensions::new())
+                .body(Body::from(String::new()))
+                .build();
 
         let err = validate_scanner_reset_request(&req)
             .await
@@ -683,7 +670,7 @@ mod tests {
             scanner_recovery_intent_accept_response(rustfs_scanner::ScannerRecoveryIntentAcceptResult::Accepted { record })
                 .expect("accepted intent response");
 
-        assert_eq!(response.output.0, StatusCode::ACCEPTED);
+        assert_eq!(response.into_parts().0, StatusCode::ACCEPTED);
     }
 
     #[test]
@@ -752,7 +739,7 @@ mod tests {
         })
         .expect("conflict intent response");
 
-        assert_eq!(response.output.0, StatusCode::CONFLICT);
+        assert_eq!(response.into_parts().0, StatusCode::CONFLICT);
     }
 
     #[test]

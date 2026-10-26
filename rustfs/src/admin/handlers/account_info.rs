@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::authenticate_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{current_action_credentials, object_store_from_req};
+use crate::admin::auth::authenticate_envelope_credentials;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
+use crate::admin::runtime_sources::{current_action_credentials, object_store_from_envelope};
 use crate::admin::service::caller_identity::oidc_profile_fields;
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
@@ -22,7 +23,8 @@ use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOption
 use crate::admin::storage_api::data_usage::{apply_bucket_usage_memory_overlay, load_admin_data_usage_from_backend_cached};
 use crate::admin::storage_api::metadata_sys;
 use crate::auth::get_condition_values;
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -33,9 +35,7 @@ use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_policy::policy::{Args, action::Action, action::S3Action};
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -130,16 +130,16 @@ async fn bucket_quota_limit(bucket: &str) -> Option<u64> {
 
 #[async_trait::async_trait]
 impl Operation for AccountInfoHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(store) = object_store_from_req(&req) else {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (cred, owner) = authenticate_request(&req.headers, &req.uri, &input_cred).await?;
+        let (cred, owner) = authenticate_envelope_credentials(input_cred).await?;
 
         let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
@@ -149,8 +149,8 @@ impl Operation for AccountInfoHandler {
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
 
         let cred_clone = cred.clone();
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-        let conditions = get_condition_values(&req.headers, &cred_clone, None, None, remote_addr);
+        let remote_addr = req.remote_addr();
+        let conditions = get_condition_values(req.headers(), &cred_clone, None, None, remote_addr);
         let cred_clone = Arc::new(cred_clone);
         let conditions = Arc::new(conditions);
 
@@ -313,7 +313,7 @@ impl Operation for AccountInfoHandler {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 

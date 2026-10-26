@@ -97,18 +97,13 @@ pub(crate) fn owned_json_response<T: Serialize>(status: StatusCode, value: &T) -
     Ok(AdminResponse::with_headers(status, rustfs_s3_types::Body::from(data), headers))
 }
 
-/// Owned-boundary form of [`empty_response`].
-pub(crate) fn owned_empty_response(status: StatusCode) -> AdminResponse {
-    AdminResponse::new(status, rustfs_s3_types::Body::empty())
-}
-
 /// A bodiless admin response carrying only `status`.
 ///
 /// Used by the endpoints whose success answer is the status code itself
 /// (`204 No Content`, or a `200 OK` acknowledgement with nothing to report).
 /// No `Content-Type` is set, because there is no content to type.
-pub(crate) fn empty_response(status: StatusCode) -> S3Response<(StatusCode, Body)> {
-    S3Response::new((status, Body::empty()))
+pub(crate) fn owned_empty_response(status: StatusCode) -> AdminResponse {
+    AdminResponse::new(status, rustfs_s3_types::Body::empty())
 }
 
 /// Collect a request URI's query string into a parameter map.
@@ -208,11 +203,9 @@ mod tests {
 
     #[tokio::test]
     async fn owned_empty_response_carries_only_the_status() {
-        let legacy = empty_response(StatusCode::NO_CONTENT);
         let (status, headers, mut body) = owned_empty_response(StatusCode::NO_CONTENT).into_parts();
 
-        assert_eq!(status, legacy.output.0);
-        assert_eq!(headers, legacy.headers);
+        assert_eq!(status, StatusCode::NO_CONTENT);
         assert!(headers.is_empty());
         assert!(body.store_all_limited(16).await.expect("empty body reads").is_empty());
     }
@@ -303,12 +296,12 @@ mod tests {
     /// The bodiless answer must stay bodiless and must not claim a content
     /// type: callers use it for `204 No Content` and bare acknowledgements.
     #[tokio::test]
-    async fn empty_response_has_no_body_and_no_headers() {
-        for status in [StatusCode::OK, StatusCode::NO_CONTENT] {
-            let response = empty_response(status);
-            assert_eq!(response.output.0, status);
-            assert!(response.headers.is_empty());
-            assert!(body_bytes(response.output.1).await.is_empty());
+    async fn owned_empty_response_has_no_body_and_no_headers() {
+        for expected in [StatusCode::OK, StatusCode::NO_CONTENT] {
+            let (status, headers, mut body) = owned_empty_response(expected).into_parts();
+            assert_eq!(status, expected);
+            assert!(headers.is_empty());
+            assert!(body.store_all_limited(16).await.expect("empty body reads").is_empty());
         }
     }
 

@@ -51,7 +51,6 @@ pub use service_state::ShutdownSignal;
 pub use service_state::wait_for_shutdown;
 
 // Items only used within the library crate (admin handlers, server/http.rs, etc.).
-pub(crate) use crate::shared_types::NativeTlsTransport;
 pub use crate::shared_types::RemoteAddr;
 pub(crate) use event::{
     is_event_notifier_reconciled, mark_event_notifier_reconciled, mark_event_notifier_unreconciled,

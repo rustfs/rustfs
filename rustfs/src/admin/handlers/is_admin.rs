@@ -12,17 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::router::Operation;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::runtime_sources::current_action_credentials;
 use crate::auth::{check_key_valid, constant_time_eq, get_condition_values, get_session_token};
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
 use hyper::StatusCode;
 use matchit::Params;
 use rustfs_policy::policy::Args;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -37,15 +36,15 @@ pub struct IsAdminHandler {}
 
 #[async_trait::async_trait]
 impl Operation for IsAdminHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
         let (cred, _owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
 
-        let access_key_to_check = input_cred.access_key.clone();
+        let access_key_to_check = input_cred.access_key().to_string();
 
         // This endpoint reports a capability; it does not gate on one. The
         // `is_allowed` result below becomes the `is_admin` field of a 200
@@ -67,7 +66,7 @@ impl Operation for IsAdminHandler {
             let empty_claims = HashMap::new();
             let iam_store = crate::admin::runtime_sources::current_ready_iam_handle()
                 .map_err(|_| s3_error!(InternalError, "iam not init"))?;
-            let conditions = get_condition_values(&req.headers, &cred, None, None, None);
+            let conditions = get_condition_values(req.headers(), &cred, None, None, None);
             iam_store
                 .is_allowed(&Args {
                     account: &cred.access_key,
@@ -95,6 +94,6 @@ impl Operation for IsAdminHandler {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }

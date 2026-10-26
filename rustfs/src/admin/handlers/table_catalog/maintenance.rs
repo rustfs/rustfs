@@ -13,22 +13,23 @@
 // limitations under the License.
 
 use super::*;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use rustfs_s3_types::s3_error;
 
 pub struct RestTableMetadataMaintenanceHandler {}
 
 #[async_trait::async_trait]
 impl Operation for RestTableMetadataMaintenanceHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
-        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let request = read_json_body::<TableMetadataMaintenanceRequest>(req.input).await?;
-        let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
-        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
+        let request = read_json_body::<TableMetadataMaintenanceRequest>(req.take_body()).await?;
+        let metadata_backend = table_catalog_backend_from_envelope(req.envelope())?;
+        let store = table_catalog_store_from_envelope(req.envelope())?;
         let response =
             configured_table_metadata_maintenance_response(&store, &metadata_backend, &warehouse, &namespace, &table, request)
                 .await?;
@@ -77,14 +78,14 @@ pub struct GetTableMaintenanceConfigHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetTableMaintenanceConfigHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableLifecycleAction).await?;
-        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
+        let store = table_catalog_store_from_envelope(req.envelope())?;
         let response = store
             .get_table_maintenance_config(&warehouse, &namespace.public_name(), &table)
             .await
@@ -97,15 +98,15 @@ pub struct PutTableMaintenanceConfigHandler {}
 
 #[async_trait::async_trait]
 impl Operation for PutTableMaintenanceConfigHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableLifecycleAction).await?;
-        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let request = read_json_body::<crate::table_catalog::TableMaintenanceConfig>(req.input).await?;
-        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
+        let request = read_json_body::<crate::table_catalog::TableMaintenanceConfig>(req.take_body()).await?;
+        let store = table_catalog_store_from_envelope(req.envelope())?;
         let response = store
             .put_table_maintenance_config(&warehouse, &namespace.public_name(), &table, request)
             .await
@@ -118,15 +119,15 @@ pub struct GetTableMaintenanceJobHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetTableMaintenanceJobHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let job = job_id_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableLifecycleAction).await?;
-        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
+        let store = table_catalog_store_from_envelope(req.envelope())?;
         let Some(response) = store
             .get_table_metadata_maintenance_report(&warehouse, &namespace.public_name(), &table, &job)
             .await
@@ -142,14 +143,14 @@ pub struct GetTableMaintenanceSchedulerHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetTableMaintenanceSchedulerHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableLifecycleAction).await?;
-        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
+        let store = table_catalog_store_from_envelope(req.envelope())?;
         let response = store
             .get_table_maintenance_scheduler_report(&warehouse, &namespace.public_name(), &table)
             .await
@@ -162,15 +163,15 @@ pub struct RunTableMaintenanceWorkerHandler {}
 
 #[async_trait::async_trait]
 impl Operation for RunTableMaintenanceSchedulerHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
-        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let request = read_json_body_or_default::<TableMaintenanceSchedulerRunRequest>(req.input).await?;
-        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
+        let request = read_json_body_or_default::<TableMaintenanceSchedulerRunRequest>(req.take_body()).await?;
+        let store = table_catalog_store_from_envelope(req.envelope())?;
         let response = store
             .run_table_maintenance_scheduler_once(
                 &warehouse,
@@ -188,16 +189,16 @@ pub struct RunTableMaintenanceSchedulerHandler {}
 
 #[async_trait::async_trait]
 impl Operation for RunTableMaintenanceWorkerHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
-        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let request = read_json_body::<TableMaintenanceWorkerRunRequest>(req.input).await?;
+        ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
+        let request = read_json_body::<TableMaintenanceWorkerRunRequest>(req.take_body()).await?;
         let condition = request.condition()?;
-        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        let store = table_catalog_store_from_envelope(req.envelope())?;
         let response = match condition {
             Some(condition) => {
                 store
@@ -230,16 +231,16 @@ pub struct HeartbeatTableMaintenanceJobHandler {}
 
 #[async_trait::async_trait]
 impl Operation for HeartbeatTableMaintenanceJobHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let job = job_id_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
-        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let request = read_json_body::<TableMaintenanceHeartbeatRequest>(req.input).await?;
-        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
+        let request = read_json_body::<TableMaintenanceHeartbeatRequest>(req.take_body()).await?;
+        let store = table_catalog_store_from_envelope(req.envelope())?;
         let response = store
             .heartbeat_table_metadata_maintenance_job(
                 &warehouse,
@@ -259,16 +260,16 @@ pub struct TableMaintenanceQuarantineHandler {}
 
 #[async_trait::async_trait]
 impl Operation for TableMaintenanceQuarantineHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let job = job_id_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
-        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let request = read_json_body::<crate::table_catalog::TableMaintenanceQuarantineOperationRequest>(req.input).await?;
-        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
+        let request = read_json_body::<crate::table_catalog::TableMaintenanceQuarantineOperationRequest>(req.take_body()).await?;
+        let store = table_catalog_store_from_envelope(req.envelope())?;
         let response = store
             .apply_table_maintenance_quarantine_operation(&warehouse, &namespace.public_name(), &table, &job, request)
             .await

@@ -25,9 +25,9 @@
 //! credentials but must *not* be allowed to rewrite the parent's secret. This
 //! module is the single place those distinctions are made.
 
-use crate::admin::auth::{authenticate_envelope_credentials, authenticate_request};
+use crate::admin::auth::authenticate_envelope_credentials;
 use crate::admin::runtime_sources::current_action_credentials;
-use crate::admin::storage_api::s3::{self, Body, S3ErrorCode, S3Request, S3Result};
+use crate::admin::storage_api::s3::{self, S3ErrorCode, S3Result};
 use crate::app::RequestEnvelope;
 use crate::auth::constant_time_eq;
 use rustfs_credentials::Credentials;
@@ -134,16 +134,6 @@ impl CallerIdentity {
     /// Authentication only: callers that need an authorization decision must
     /// still gate on an admin action. Self-service endpoints deliberately do
     /// not, because every authenticated identity may inspect and manage itself.
-    pub(crate) async fn resolve(req: &S3Request<Body>) -> S3Result<Self> {
-        let Some(input_cred) = req.credentials.as_ref() else {
-            return Err(s3::error(S3ErrorCode::InvalidRequest, "authentication required"));
-        };
-
-        let (credentials, is_owner) = authenticate_request(&req.headers, &req.uri, input_cred).await?;
-        Ok(Self::from_credentials(credentials, is_owner))
-    }
-
-    /// Envelope form of [`Self::resolve`] for handlers on the owned boundary.
     pub(crate) async fn resolve_envelope(envelope: &RequestEnvelope) -> S3Result<Self> {
         let Some(input_cred) = envelope.credentials() else {
             return Err(s3::error(S3ErrorCode::InvalidRequest, "authentication required"));
@@ -297,28 +287,16 @@ mod tests {
     use std::collections::HashMap;
 
     #[tokio::test]
-    async fn resolve_envelope_rejects_a_missing_identity_like_resolve() {
-        let req = S3Request {
-            input: Body::empty(),
-            method: http::Method::GET,
-            uri: "/rustfs/admin/v3/accountinfo".parse().expect("uri"),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+    async fn resolve_envelope_rejects_a_missing_identity() {
+        let req =
+            crate::admin::operation::test_support::TestRequest::new(http::Method::GET, "/rustfs/admin/v3/accountinfo").build();
 
-        let legacy = CallerIdentity::resolve(&req).await.expect_err("no credentials");
-        let owned = CallerIdentity::resolve_envelope(&RequestEnvelope::from_s3s(&req))
+        let owned = CallerIdentity::resolve_envelope(req.envelope())
             .await
             .expect_err("no credentials");
 
         assert_eq!(owned.code(), &S3ErrorCode::InvalidRequest);
-        assert_eq!(owned.code(), legacy.code());
         assert_eq!(owned.message(), Some("authentication required"));
-        assert_eq!(owned.message(), legacy.message());
     }
 
     fn long_term(access_key: &str) -> Credentials {
