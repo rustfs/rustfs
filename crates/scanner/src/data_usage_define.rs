@@ -1486,27 +1486,20 @@ impl DataUsageCache {
     }
 
     pub fn delete_recursive(&mut self, hash: &DataUsageHash) {
-        let mut visited = HashSet::new();
-        self.delete_recursive_guard(hash, &mut visited, 0);
+        self.delete_recursive_guard(&hash.0, 0);
     }
 
-    fn delete_recursive_guard(&mut self, hash: &DataUsageHash, visited: &mut HashSet<String>, depth: usize) {
-        if !visited.insert(hash.key()) {
+    fn delete_recursive_guard(&mut self, path: &str, depth: usize) {
+        // Removal transfers child ownership and makes cyclic/shared references
+        // no-ops, without cloning paths or maintaining a second visited set.
+        let Some(children) = self.cache.remove(path).map(|entry| entry.children) else {
             return;
-        }
-
-        let mut need_remove = Vec::new();
-        if let Some(v) = self.cache.get(&hash.string()) {
-            for child in v.children.iter() {
-                need_remove.push(child.clone());
-            }
-        }
-        self.cache.remove(&hash.string());
+        };
         if depth >= MAX_DATA_USAGE_CACHE_DEPTH {
             return;
         }
-        for child in need_remove {
-            self.delete_recursive_guard(&DataUsageHash(child), visited, depth + 1);
+        for child in children {
+            self.delete_recursive_guard(&child, depth + 1);
         }
     }
 
@@ -1572,7 +1565,7 @@ impl DataUsageCache {
     }
 
     pub fn reduce_children_of(&mut self, path: &DataUsageHash, limit: usize, compact_self: bool) {
-        let Some(e) = self.cache.get(&path.key()).cloned() else {
+        let Some(e) = self.cache.get(&path.0) else {
             return;
         };
 
@@ -1624,12 +1617,13 @@ impl DataUsageCache {
     }
 
     pub fn total_children_rec(&self, path: &str) -> usize {
+        let root = hash_path(path);
         let mut visited = HashSet::new();
-        visited.insert(hash_path(path).key());
+        visited.insert(root.0.as_str());
         self.total_children_rec_guard(path, &mut visited, 0)
     }
 
-    fn total_children_rec_guard(&self, path: &str, visited: &mut HashSet<String>, depth: usize) -> usize {
+    fn total_children_rec_guard<'a>(&'a self, path: &str, visited: &mut HashSet<&'a str>, depth: usize) -> usize {
         let Some(root) = self.find(path) else {
             return 0;
         };
@@ -1639,7 +1633,7 @@ impl DataUsageCache {
 
         let mut n = 0;
         for ch in root.children.iter() {
-            if visited.insert(ch.clone()) {
+            if visited.insert(ch.as_str()) {
                 n += 1 + self.total_children_rec_guard(ch, visited, depth + 1);
             }
         }

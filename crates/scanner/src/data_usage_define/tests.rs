@@ -2429,6 +2429,25 @@ fn test_data_usage_cache_recursive_helpers_tolerate_cycles() {
 }
 
 #[test]
+fn delete_recursive_preserves_depth_boundary_and_unrelated_entries() {
+    let mut cache = DataUsageCache::default();
+    for depth in 0..=MAX_DATA_USAGE_CACHE_DEPTH + 1 {
+        let mut entry = DataUsageEntry::default();
+        if depth <= MAX_DATA_USAGE_CACHE_DEPTH {
+            entry.children.insert(format!("node-{}", depth + 1));
+        }
+        cache.cache.insert(format!("node-{depth}"), entry);
+    }
+    cache.cache.insert("unrelated".to_string(), DataUsageEntry::default());
+
+    cache.delete_recursive(&DataUsageHash("node-0".to_string()));
+
+    assert_eq!(cache.cache.len(), 2, "delete only reachable entries within the depth limit");
+    assert!(cache.cache.contains_key(&format!("node-{}", MAX_DATA_USAGE_CACHE_DEPTH + 1)));
+    assert!(cache.cache.contains_key("unrelated"));
+}
+
+#[test]
 fn scanner_summary_releases_wide_child_sets() {
     let root = hash_path("bucket");
     let mut cache = DataUsageCache::default();
@@ -2465,6 +2484,11 @@ fn scanner_summary_releases_wide_child_sets() {
     assert_eq!(summary.children.capacity(), 0, "summaries must not retain the wide namespace allocation");
     assert!(summary.all_tier_stats.is_some(), "preserve the root's optional statistics representation");
     assert_eq!(cache.find("bucket").expect("unchanged root").children.len(), 10_000);
+
+    cache.cache.insert("unrelated".to_string(), DataUsageEntry::default());
+    cache.delete_recursive(&root);
+    assert_eq!(cache.cache.len(), 1, "wide subtree deletion must consume every child exactly once");
+    assert!(cache.cache.contains_key("unrelated"));
 }
 
 #[test]

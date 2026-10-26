@@ -146,7 +146,6 @@ async fn assert_compaction_frontier(coverage_gap: bool) {
         .old_cache
         .prepare_bucket_checkpoint("bucket", 11, 7, SOURCE, PLAN, identity);
     scanner.new_cache.info = scanner.old_cache.info.clone();
-    scanner.update_cache.info = scanner.old_cache.info.clone();
     scanner.is_erasure_mode = true;
     scanner.skip_heal.store(true, Ordering::SeqCst);
     scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest);
