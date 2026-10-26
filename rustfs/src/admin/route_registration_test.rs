@@ -1631,8 +1631,9 @@ fn test_replication_diff_body_read_errors_are_not_ignored() {
         "replication diff must read the optional body through the compatible admin payload reader"
     );
 
-    let body_read_block =
-        extract_block_between_markers(handler_block, "let body = read_compatible_admin_body(", "if prefix.is_empty()");
+    // Anchor on the call itself: rustfmt may wrap the `let` binding onto two
+    // lines, which must not change what this contract checks.
+    let body_read_block = extract_block_between_markers(handler_block, "read_compatible_admin_body(", "if prefix.is_empty()");
     assert!(
         body_read_block.contains(".await?;"),
         "replication diff must fail closed when body read or MinIO-compatible decryption fails"
