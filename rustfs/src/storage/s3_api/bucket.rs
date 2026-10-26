@@ -396,7 +396,9 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
         .as_deref()
         .and_then(|token| decode_list_objects_v2_continuation_token(token).ok())
     {
-        return Some(encode_list_output_value(marker, v2.encoding_type.as_ref()));
+        // Only cache-shaped literal keys carry this server-generated escape.
+        let marker = marker.strip_suffix("[rustfs_cache:v2,return:]").unwrap_or(&marker);
+        return Some(encode_list_output_value(marker.to_owned(), v2.encoding_type.as_ref()));
     }
 
     let last_key = v2
@@ -579,6 +581,19 @@ mod tests {
 
         let output = build_list_objects_output(v2, None);
         assert_eq!(output.next_marker.as_deref(), Some(key));
+    }
+
+    #[test]
+    fn test_list_objects_next_marker_unwraps_only_the_literal_key_escape() {
+        let key = "key[rustfs_cache:v2,return:]";
+        let cursor = format!("{key}[rustfs_cache:v2,return:]");
+        let v2 = ListObjectsV2Output {
+            is_truncated: Some(true),
+            next_continuation_token: Some(encode_list_objects_v2_continuation_token(&cursor)),
+            ..Default::default()
+        };
+
+        assert_eq!(build_list_objects_output(v2, None).next_marker.as_deref(), Some(key));
     }
 
     #[test]
