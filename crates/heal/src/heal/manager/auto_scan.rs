@@ -235,8 +235,15 @@ impl HealManager {
                             if metadata_deferred_sets.contains(set_disk_id) {
                                 continue;
                             }
-                            match storage.replacement_intent_disks(set_disk_id).await {
+                            match storage.replacement_intent_disks(set_disk_id, Some(&cancel_token)).await {
                                 Ok(disks) => extend_replacement_recovery_disks(&mut recovery_disks, disks),
+                                Err(Error::TransientSkip { .. }) => {
+                                    if cancel_token.is_cancelled() {
+                                        return;
+                                    }
+                                    metadata_deferred_sets.insert(set_disk_id.clone());
+                                    deferred_recovery_sets.insert(set_disk_id.clone());
+                                }
                                 Err(error) => {
                                     conflicted_recovery_sets.insert(set_disk_id.clone());
                                     warn!(

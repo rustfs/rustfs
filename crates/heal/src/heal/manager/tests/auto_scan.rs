@@ -20,7 +20,7 @@ use crate::heal::storage_api::{
 };
 use std::{
     future::Future,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 const SET: &str = "pool_0_set_0";
@@ -32,13 +32,17 @@ struct ScannerStorage {
     sibling_survivors: Vec<DiskStore>,
     identity: ReplacementTargetIdentity,
     inventory_calls: AtomicUsize,
+    inventory_defers: AtomicBool,
 }
 
 #[async_trait::async_trait]
 impl HealStorageAPI for ScannerStorage {
-    async fn replacement_intent_disks(&self, set: &str) -> Result<Vec<DiskStore>> {
+    async fn replacement_intent_disks(&self, set: &str, _cancellation: Option<&CancellationToken>) -> Result<Vec<DiskStore>> {
         assert_eq!(set, SET, "discovery must use the target's erasure set");
         self.inventory_calls.fetch_add(1, Ordering::SeqCst);
+        if self.inventory_defers.load(Ordering::SeqCst) {
+            return Err(Error::transient_skip("test inventory admission deferred"));
+        }
         // This disk is deliberately outside the node's local registry. The
         // mock supplies the same inventory boundary as a remote survivor,
         // while real disk I/O exercises durable intent discovery and loading.
@@ -216,6 +220,7 @@ impl ScannerFixture {
             sibling_survivors: Vec::new(),
             identity,
             inventory_calls: AtomicUsize::new(0),
+            inventory_defers: AtomicBool::new(false),
         });
         let manager = HealManager::new_without_root_recovery_for_test(
             storage.clone(),
@@ -424,6 +429,7 @@ async fn scanner_tick_blocks_only_the_conflicting_generation_of_a_set() {
         sibling_survivors: vec![sibling_a, sibling_b],
         identity: fixture.storage.identity.clone(),
         inventory_calls: AtomicUsize::new(0),
+        inventory_defers: AtomicBool::new(false),
     });
     fixture.storage = storage.clone();
     fixture.manager = HealManager::new_without_root_recovery_for_test(
@@ -1115,4 +1121,413 @@ fn auto_format_admission_funded_probe_finishes_before_stop_and_releases_owners()
     assert_eq!(physical.snapshot().active, 0);
     assert_eq!(Arc::strong_count(&memory), memory_owners);
     drop(fixture);
+}
+
+#[cfg(not(windows))]
+async fn auto_inventory_local_disks(fixture: &ResumeAdmissionFixture) -> Vec<DiskStore> {
+    use crate::heal::storage_api::storage::{DiskSetSelector, StorageAdminApi};
+    let disks = StorageAdminApi::disk_set_inventory(fixture._store.ecstore.as_ref(), DiskSetSelector::new(0, 0))
+        .await
+        .expect("actual ECStore inventory snapshot");
+    let disks = disks
+        .into_iter()
+        .flatten()
+        .filter(|disk| disk.endpoint().is_local)
+        .collect::<Vec<_>>();
+    assert!(disks.len() >= 2, "native cancellation witness needs a following real local disk");
+    disks
+}
+
+#[cfg(not(windows))]
+async fn assert_auto_inventory_admission(mode: &str) {
+    use crate::heal::storage::ECStoreHealStorage;
+    use crate::heal::storage_api::{
+        EcstoreLocalPublicationPause as LocalPublicationPause, EcstoreLocalPublicationStage as LocalPublicationStage,
+    };
+    let node = (mode != "none").then(|| resume_node(!matches!(mode, "node-closed" | "startup-none")));
+    let physical = (!matches!(mode, "none" | "missing-plan")).then(|| {
+        rustfs_concurrency::adaptive::AdaptiveAdmission::new(std::num::NonZeroU16::MIN, u32::from(mode != "physical-closed"))
+    });
+    let (fixture, saved) = auto_format_fixture(node.clone(), physical.clone(), true).await;
+    let disks = auto_inventory_local_disks(&fixture).await;
+    if matches!(mode, "unformatted" | "corrupt-format") {
+        let format = crate::heal::storage_api::EcstoreDiskAPI::path(disks[0].as_ref())
+            .join(crate::heal::RUSTFS_META_BUCKET)
+            .join("format.json");
+        if mode == "unformatted" {
+            std::fs::remove_file(&format).expect("remove only the owned fixture format");
+        } else {
+            let replacement = format.with_extension("inventory-corrupt");
+            std::fs::write(&replacement, b"invalid format json").expect("corrupt owned fixture format");
+            std::fs::rename(replacement, format).expect("replace format inode to force actual decode");
+        }
+    }
+    if mode == "stale-plan" {
+        // Physical discovery has a three-second lease; the real wall clock must expire it.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        // Expire only physical discovery; node funding must remain independently fresh.
+        publish_resume_node(node.as_ref().expect("stale physical case has an attached node"), true);
+        assert_eq!(node.as_ref().expect("same attached node").snapshot().limit, 1);
+        assert!(disks[0].physical_admission().expect("local binding").plan().is_none());
+    }
+    let storage = Arc::new(ECStoreHealStorage::new(fixture._store.ecstore.clone()).with_admission(node.clone()));
+    match (node.as_ref(), storage.background_node_admission()) {
+        (Some(expected), Some(actual)) => assert!(Arc::ptr_eq(expected, &actual), "reuse the attached node controller"),
+        (None, None) => {}
+        _ => panic!("inventory storage changed admission capability"),
+    }
+    let mut pause = LocalPublicationPause::install(
+        disks[0].as_ref(),
+        crate::heal::RUSTFS_META_BUCKET,
+        "format.json",
+        LocalPublicationStage::NativeReadOpen,
+    )
+    .expect("actual first inventory format syscall pause");
+    let token = CancellationToken::new();
+    let startup = mode == "startup-none";
+    let probe = tokio::spawn(async move {
+        storage
+            .replacement_intent_disks(SET, if startup { None } else { Some(&token) })
+            .await
+    });
+    let entered = tokio::time::timeout(Duration::from_millis(400), pause.entered()).await;
+    let direct = matches!(mode, "none" | "startup-none" | "unformatted" | "corrupt-format");
+    let native_boundary = if direct {
+        entered.is_ok_and(|result| result.is_ok())
+    } else {
+        entered.is_err()
+    };
+    drop(pause);
+    let result = tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("inventory entry joins after releasing native work")
+        .expect("inventory task should not panic");
+    assert!(native_boundary, "inventory native boundary failed for {mode}");
+    if mode == "corrupt-format" {
+        assert!(
+            matches!(result, Err(Error::TaskExecutionFailed { .. })),
+            "backend corruption keeps its original error"
+        );
+    } else if direct {
+        let formatted = result.expect("inventory preserves the admitted backend result");
+        let contains_first = formatted
+            .iter()
+            .any(|disk| disk.endpoint().to_string() == disks[0].endpoint().to_string());
+        assert_eq!(
+            contains_first,
+            mode != "unformatted",
+            "preserve formatted/unformatted inventory filtering"
+        );
+        assert!(!formatted.is_empty(), "other formatted disks remain discoverable");
+    } else {
+        assert!(
+            matches!(result, Err(Error::TransientSkip { .. })),
+            "unavailable evidence must return typed deferral"
+        );
+    }
+    if let Some(node) = node {
+        assert_eq!(node.snapshot().active, 0);
+        assert_eq!(node.completed(), Some(0), "inventory diagnostics earn no repair credit");
+    }
+    if let Some(physical) = physical {
+        assert_eq!(physical.snapshot().active, 0);
+    }
+    let (path, original) = saved.expect("unread durable fixture");
+    let fixture_root = crate::heal::storage_api::EcstoreDiskAPI::path(fixture.disk.as_ref());
+    // Format validation can reject the storage API before opening this unchanged intent.
+    assert_eq!(
+        std::fs::read(fixture_root.join(crate::heal::RUSTFS_META_BUCKET).join(&path))
+            .expect("task-owned durable fixture remains")
+            .as_slice(),
+        original.as_slice()
+    );
+    let readable = fixture.disk.read_all(crate::heal::RUSTFS_META_BUCKET, &path).await;
+    if matches!(mode, "unformatted" | "corrupt-format")
+        && fixture_root == crate::heal::storage_api::EcstoreDiskAPI::path(disks[0].as_ref())
+    {
+        assert!(
+            matches!(
+                (mode, readable),
+                ("unformatted", Err(DiskError::UnformattedDisk)) | ("corrupt-format", Err(DiskError::CorruptedBackend))
+            ),
+            "the deliberately damaged fixture format must retain its exact backend error"
+        );
+    } else {
+        assert_eq!(readable.expect("healthy fixture remains API-readable").as_ref(), original.as_slice());
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn auto_inventory_admission_none_keeps_actual_format_probe() {
+    assert_auto_inventory_admission("none").await;
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn auto_inventory_admission_startup_none_keeps_original_probe() {
+    assert_auto_inventory_admission("startup-none").await;
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn auto_inventory_admission_closed_node_defers_before_native() {
+    assert_auto_inventory_admission("node-closed").await;
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn auto_inventory_admission_closed_physical_defers_before_native() {
+    assert_auto_inventory_admission("physical-closed").await;
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn auto_inventory_admission_missing_plan_defers_before_native() {
+    assert_auto_inventory_admission("missing-plan").await;
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn auto_inventory_admission_stale_plan_defers_before_native() {
+    assert_auto_inventory_admission("stale-plan").await;
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn auto_inventory_admission_funded_unformatted_keeps_backend_filter() {
+    assert_auto_inventory_admission("unformatted").await;
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn auto_inventory_admission_funded_corrupt_format_keeps_backend_error() {
+    assert_auto_inventory_admission("corrupt-format").await;
+}
+
+#[cfg(not(windows))]
+#[test]
+#[serial_test::serial(replacement_auto_scan)]
+fn auto_inventory_admission_cancel_yields_node_and_retains_only_started_native() {
+    const FLAG: &str = "RUSTFS_AUTO_INVENTORY_ADMISSION_CHILD";
+    const NAME: &str =
+        "heal::manager::tests::auto_scan::auto_inventory_admission_cancel_yields_node_and_retains_only_started_native";
+    if std::env::var(FLAG).ok().as_deref() != Some("1") {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+            .env(FLAG, "1")
+            .output()
+            .expect("fresh memory-policy test process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed; 0 ignored;"),
+            "child failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        println!("AUTO_INVENTORY_ADMISSION_CHILD_OK");
+        return;
+    }
+    use crate::heal::storage::ECStoreHealStorage;
+    use crate::heal::storage_api::{
+        EcstoreBackgroundMemoryBudget as BackgroundMemoryBudget, EcstoreLocalPublicationPause as LocalPublicationPause,
+        EcstoreLocalPublicationStage as LocalPublicationStage,
+    };
+    let memory = BackgroundMemoryBudget::new();
+    assert!(memory.install(), "fresh child owns installed policy");
+    let memory_owners = Arc::strong_count(&memory);
+    let node = resume_node(true);
+    let physical = rustfs_concurrency::adaptive::AdaptiveAdmission::new(std::num::NonZeroU16::MIN, 1);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("native test runtime");
+    let fixture = runtime.block_on(async {
+        let (fixture, saved) = auto_format_fixture(Some(node.clone()), Some(physical.clone()), true).await;
+        let disks = auto_inventory_local_disks(&fixture).await;
+        let storage = Arc::new(ECStoreHealStorage::new(fixture._store.ecstore.clone()).with_admission(Some(node.clone())));
+        let mut first_pause = LocalPublicationPause::install(
+            disks[0].as_ref(),
+            crate::heal::RUSTFS_META_BUCKET,
+            "format.json",
+            LocalPublicationStage::NativeReadOpen,
+        )
+        .expect("actual first native inventory probe");
+        let mut next_pause = LocalPublicationPause::install(
+            disks[1].as_ref(),
+            crate::heal::RUSTFS_META_BUCKET,
+            "format.json",
+            LocalPublicationStage::NativeReadOpen,
+        )
+        .expect("actual following native inventory probe");
+        let token = CancellationToken::new();
+        let probe_token = token.clone();
+        let mut probe = tokio::spawn(async move { storage.replacement_intent_disks(SET, Some(&probe_token)).await });
+        tokio::time::timeout(Duration::from_secs(5), first_pause.entered())
+            .await
+            .expect("actual native work must enter")
+            .expect("native entry witness");
+        let funded = (node.snapshot().active, physical.snapshot().active);
+        token.cancel();
+        let yielded = tokio::time::timeout(Duration::from_secs(2), async {
+            while node.snapshot().active != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let cancelled_ownership = (
+            node.snapshot().active,
+            physical.snapshot().active,
+            Arc::strong_count(&memory) > memory_owners,
+        );
+        let first = tokio::time::timeout(Duration::from_millis(30), &mut probe).await;
+        let held = first.is_err();
+        drop(first_pause);
+        let next_entered = tokio::time::timeout(Duration::from_millis(400), next_pause.entered())
+            .await
+            .is_ok();
+        drop(next_pause);
+        let result = match first {
+            Ok(joined) => joined,
+            Err(_) => tokio::time::timeout(Duration::from_secs(5), &mut probe)
+                .await
+                .expect("same inventory future joins after native release"),
+        }
+        .expect("inventory task must not panic");
+        assert_eq!(funded, (1, 1));
+        assert!(yielded, "cancellation returns node scheduling while native work stays held");
+        assert!(held, "the original inventory future must await its started native operation");
+        assert_eq!(
+            cancelled_ownership,
+            (0, 1, true),
+            "physical and memory capability remain with native work"
+        );
+        assert!(!next_entered, "cancellation must not start the following real disk probe");
+        assert!(
+            matches!(result, Err(Error::TransientSkip { .. })),
+            "cancelled inventory cannot become empty evidence"
+        );
+        assert_eq!(node.snapshot().active, 0);
+        assert_eq!(physical.snapshot().active, 0);
+        assert_eq!(node.completed(), Some(0));
+        let (path, original) = saved.expect("unread durable fixture");
+        assert_eq!(
+            fixture
+                .disk
+                .read_all(crate::heal::RUSTFS_META_BUCKET, &path)
+                .await
+                .expect("durable fixture remains")
+                .as_ref(),
+            original.as_slice()
+        );
+        fixture
+    });
+    drop(runtime);
+    assert_eq!(physical.snapshot().active, 0);
+    assert_eq!(Arc::strong_count(&memory), memory_owners, "native memory capability owners are released");
+    drop(fixture);
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial(replacement_auto_scan)]
+async fn auto_inventory_admission_deferral_skips_existing_local_recovery_snapshot() {
+    use crate::heal::storage_api::{
+        EcstoreLocalPublicationPause as LocalPublicationPause, EcstoreLocalPublicationStage as LocalPublicationStage,
+    };
+    let fixture = ScannerFixture::new(false).await;
+    let disk = crate::heal::local_disk_map_read()
+        .await
+        .values()
+        .flatten()
+        .next()
+        .cloned()
+        .expect("existing local recovery snapshot member");
+    let volume = format!("{}/{}/ahm-replacement", crate::heal::RUSTFS_META_BUCKET, crate::heal::BUCKET_META_PREFIX);
+    match disk.make_volume(&volume).await {
+        Ok(()) | Err(DiskError::VolumeExists) => {}
+        Err(error) => panic!("dedicated local intent fixture directory: {error}"),
+    }
+    let task = Uuid::new_v4().to_string();
+    let path = format!("{}/ahm-replacement/{task}_ahm_replacement_intent.json", crate::heal::BUCKET_META_PREFIX);
+    let original = b"unavailable inventory cannot classify an unread intent as corruption".to_vec();
+    disk.write_all(crate::heal::RUSTFS_META_BUCKET, &path, original.clone().into())
+        .await
+        .expect("seed unread local intent");
+    let survivor_path = format!(
+        "{}/ahm-replacement/{}_ahm_replacement_intent.json",
+        crate::heal::BUCKET_META_PREFIX,
+        fixture.task_id
+    );
+    let survivor_before = fixture
+        .storage
+        .survivor
+        .read_all(crate::heal::RUSTFS_META_BUCKET, &survivor_path)
+        .await
+        .expect("durable survivor intent");
+    fixture.storage.inventory_defers.store(true, Ordering::SeqCst);
+    let mut pause = LocalPublicationPause::install(
+        disk.as_ref(),
+        crate::heal::RUSTFS_META_BUCKET,
+        &path,
+        LocalPublicationStage::NativeReadOpen,
+    )
+    .expect("actual unread intent load pause");
+    fixture
+        .manager
+        .start_auto_disk_scanner()
+        .await
+        .expect("actual Auto slot1 starts");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture.storage.inventory_calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actual slot1 inventory boundary must be reached");
+    let entered = tokio::time::timeout(Duration::from_millis(400), pause.entered()).await;
+    let no_native_load = entered.is_err();
+    drop(pause);
+    tokio::time::timeout(Duration::from_secs(5), fixture.manager.stop())
+        .await
+        .expect("Auto slot1 joins after releasing any native read")
+        .expect("manager stop succeeds");
+    assert!(
+        no_native_load,
+        "the already-captured local recovery map must not bypass inventory deferral"
+    );
+    assert!(
+        fixture.manager.replacement_recovery_blocks().is_empty(),
+        "unread intent is not durable corruption"
+    );
+    assert_eq!(
+        fixture.manager.get_queue_length().await,
+        0,
+        "same-set evidence remains deferred for this tick"
+    );
+    assert_eq!(
+        disk.read_all(crate::heal::RUSTFS_META_BUCKET, &path)
+            .await
+            .expect("local intent remains")
+            .as_ref(),
+        original.as_slice()
+    );
+    assert_eq!(
+        fixture
+            .storage
+            .survivor
+            .read_all(crate::heal::RUSTFS_META_BUCKET, &survivor_path)
+            .await
+            .expect("survivor remains"),
+        survivor_before
+    );
 }

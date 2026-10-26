@@ -21,7 +21,7 @@ use rustfs_concurrency::adaptive::permit_set::NodeResourcePermit;
 use rustfs_heal_contracts::heal_channel::{DriveState, HealOpts, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, future::Future, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -728,7 +728,13 @@ pub trait HealStorageAPI: Send + Sync {
     /// Return every formatted disk that may durably host or expose a
     /// replacement intent. Implementations should order local disks first so
     /// discovery remains deterministic and preserves the local preference.
-    async fn replacement_intent_disks(&self, _set_disk_id: &str) -> Result<Vec<DiskStore>> {
+    /// A supplied token uses attached admission for known-local probes; None
+    /// keeps startup discovery on its original direct path.
+    async fn replacement_intent_disks(
+        &self,
+        _set_disk_id: &str,
+        _cancellation: Option<&CancellationToken>,
+    ) -> Result<Vec<DiskStore>> {
         Ok(Vec::new())
     }
 
@@ -772,6 +778,61 @@ pub trait HealStorageAPI: Send + Sync {
 
     async fn replacement_execution(&self, _targets: &[String]) -> Result<Arc<ReplacementExecution>> {
         Err(Error::other("replacement execution lease acquisition is unsupported"))
+    }
+}
+
+// One bounded local metadata operation owns only its selected disk. Permanent
+// tickers retain the controller capability, never a permit between operations.
+pub(super) async fn run_local_metadata<T>(
+    disk: &super::DiskStore,
+    admission: Option<&Arc<rustfs_concurrency::adaptive::NodeAdmission>>,
+    cancellation: &CancellationToken,
+    operation: impl Future<Output = T>,
+) -> Result<T> {
+    let Some(admission) = admission else {
+        return Ok(operation.await);
+    };
+    let plan = disk
+        .physical_admission()
+        .and_then(|binding| binding.plan())
+        .ok_or_else(|| Error::transient_skip("local metadata physical resource discovery unavailable"))?;
+    let permit = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(Error::transient_skip("local metadata admission cancelled")),
+        result = tokio::time::timeout(Duration::from_millis(250), plan.acquire(admission)) => {
+            result.ok().flatten()
+                .ok_or_else(|| Error::transient_skip("local metadata node or physical resource admission deferred"))?
+        }
+    };
+    if !plan.is_current() {
+        return Err(Error::transient_skip("local metadata physical resource discovery expired"));
+    }
+    use super::storage_api::owner::{
+        ecstore_with_background_disk_io, ecstore_with_background_resource_set, ecstore_with_rpc_background_request,
+    };
+    let mut operation = std::pin::pin!(ecstore_with_rpc_background_request(
+        false,
+        ecstore_with_background_disk_io(
+            cancellation.clone(),
+            ecstore_with_background_resource_set(permit.resources().clone(), operation),
+        ),
+    ));
+    let mut started = false;
+    let selected = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        result = std::future::poll_fn(|cx| {
+            started = true;
+            std::future::Future::poll(operation.as_mut(), cx)
+        }) => Some(result),
+    };
+    // Cancellation yields only the node unit; the same started operation owns
+    // its physical/native resources until it finishes. Never credit diagnostics.
+    drop(permit);
+    match selected {
+        Some(result) => Ok(result),
+        None if started => Ok(operation.await),
+        None => Err(Error::transient_skip("local metadata cancelled before first poll")),
     }
 }
 
@@ -2168,15 +2229,35 @@ impl HealStorageAPI for ECStoreHealStorage {
         })
     }
 
-    async fn replacement_intent_disks(&self, set_disk_id: &str) -> Result<Vec<DiskStore>> {
+    async fn replacement_intent_disks(
+        &self,
+        set_disk_id: &str,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<Vec<DiskStore>> {
         let disks = self.resume_disk_inventory(set_disk_id).await?;
         let mut formatted = Vec::with_capacity(disks.len());
+        let admitted_scan = self.admission.as_ref().zip(cancellation);
         for prefer_local in [true, false] {
             for disk in &disks {
                 if disk.endpoint().is_local != prefer_local {
                     continue;
                 }
-                match disk.get_disk_id().await {
+                if admitted_scan.is_some_and(|(_, cancellation)| cancellation.is_cancelled()) {
+                    return Err(Error::transient_skip("replacement inventory admission cancelled"));
+                }
+                let disk_id = if prefer_local && let Some((admission, cancellation)) = admitted_scan {
+                    let result = run_local_metadata(disk, Some(admission), cancellation, disk.get_disk_id()).await?;
+                    if cancellation.is_cancelled() {
+                        return Err(Error::transient_skip("replacement inventory admission cancelled"));
+                    }
+                    if matches!(&result, Err(DiskError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock) {
+                        return Err(Error::transient_skip("replacement inventory native resources unavailable"));
+                    }
+                    result
+                } else {
+                    disk.get_disk_id().await
+                };
+                match disk_id {
                     Ok(Some(id)) if !id.is_nil() => formatted.push(disk.clone()),
                     Ok(_) | Err(DiskError::UnformattedDisk) => {}
                     Err(error) => {
@@ -2892,6 +2973,167 @@ mod tests {
         assert!(matches!(error, crate::Error::ReplacementGenerationConflict { .. }));
         assert!(replacement_resume_conflict_for_other_tasks("task", &HashSet::new(), "pool_0_set_0").is_none());
     }
+    // Owner/resource composition only: this does not traverse an erasure page or namespace lock.
+    #[test]
+    fn replacement_outside_waiter_drop_keeps_cancelled_native_mutation_and_manager_drain_owned() {
+        const FLAG: &str = "RUSTFS_TEST_REPLACEMENT_OUTSIDE_WAITER_CHILD";
+        const NAME: &str =
+            "heal::storage::tests::replacement_outside_waiter_drop_keeps_cancelled_native_mutation_and_manager_drain_owned";
+        if std::env::var(FLAG).ok().as_deref() != Some("1") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+                .env(FLAG, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed; 0 failed; 0 ignored;"),
+                "child failed: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            println!("OUTSIDE_WAITER_COMPOSITION_CHILD_OK");
+            return;
+        }
+        use super::super::storage_api::owner::{PhysicalDiskBinding, ecstore_spawn_blocking_with_resource_ownership};
+        use crate::heal::storage_api::{
+            EcstoreBackgroundEncodeBuffer as BackgroundEncodeBuffer, EcstoreBackgroundMemoryBudget as BackgroundMemoryBudget,
+        };
+        use std::io::Write as _;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let env = rustfs_test_utils::TestECStoreEnv::builder()
+                .base_dir(root.path().join("store"))
+                .build()
+                .await;
+            let manager = Arc::new(crate::HealManager::new_without_root_recovery_for_test(
+                Arc::new(super::ECStoreHealStorage::new(env.ecstore.clone())),
+                None,
+            ));
+            let parent = manager.test_work_parent();
+            let execution = super::ReplacementExecution::for_test(Vec::new(), Vec::new());
+            let ownership = Arc::downgrade(&execution);
+            let node = admission(true);
+            let disk = rustfs_concurrency::adaptive::AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+            let binding = PhysicalDiskBinding::default();
+            binding.set_test_capacity(vec![disk.clone()]).unwrap();
+            let plan = binding.plan().unwrap().resource_plan();
+            let memory = BackgroundMemoryBudget::new();
+            memory.set_sampled_limit(128 * 1024, Duration::from_secs(60));
+            let mut encoded = BackgroundEncodeBuffer::new(memory.clone(), 64 * 1024);
+            encoded.write_all(b"same outside waiter mutation").unwrap();
+            let bytes = encoded.into_bytes();
+            let charged = memory.snapshot().used;
+            let path = root.path().join("mutated-object");
+            let native_path = path.clone();
+            let task_cancel = tokio_util::sync::CancellationToken::new();
+            let cancel = task_cancel.clone();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (continued_tx, continued_rx) = tokio::sync::oneshot::channel();
+            let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let worker_node = node.clone();
+            let waiter = tokio::spawn(async move {
+                execution
+                    .run_owned(&parent, async move {
+                        let result = super::run_background_object_inner(
+                            Some(&worker_node),
+                            || Ok(Some(plan)),
+                            &super::HealOpts::default(),
+                            Some(&cancel),
+                            |_: &bool| true,
+                            async {
+                                ecstore_spawn_blocking_with_resource_ownership(move || -> std::io::Result<()> {
+                                    let _ = entered_tx.send(());
+                                    let _ = release_rx.recv();
+                                    std::fs::write(native_path, &bytes)
+                                })
+                                .await
+                                .map_err(|error| super::Error::other(error.to_string()))??;
+                                let _ = continued_tx.send(());
+                                let _ = finish_rx.await;
+                                Ok(true)
+                            },
+                        )
+                        .await;
+                        let _ = result_tx.send(result.as_ref().is_ok_and(|ok| *ok));
+                        result
+                    })
+                    .await
+            });
+            let entered = tokio::time::timeout(Duration::from_secs(5), entered_rx)
+                .await
+                .is_ok_and(|result| result.is_ok());
+            let admitted = (node.snapshot().active, disk.snapshot().active);
+            waiter.abort();
+            let waiter_cancelled = waiter.await.is_err_and(|error| error.is_cancelled());
+            // Observer Drop alone is not logical cancellation of the accepted object.
+            task_cancel.cancel();
+            let yielded = tokio::time::timeout(Duration::from_secs(2), async {
+                while node.snapshot().active != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+            let retained = (disk.snapshot().active, memory.snapshot().used, ownership.upgrade().is_some());
+            let credit = (node.completed(), disk.completed());
+            let stopping = manager.clone();
+            let mut stop = tokio::spawn(async move { stopping.stop().await });
+            let stop_entered = tokio::time::timeout(Duration::from_secs(5), async {
+                while !manager.stop_handoff_completed() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+            let first_stop = tokio::time::timeout(Duration::from_millis(30), &mut stop).await;
+            let stop_pending_while_native_held = first_stop.is_err();
+
+            // Always release native work and its continuation before asserting or removing roots.
+            let _ = release_tx.send(());
+            let continued = tokio::time::timeout(Duration::from_secs(5), continued_rx)
+                .await
+                .is_ok_and(|result| result.is_ok());
+            let stop_pending_through_continuation = !stop.is_finished();
+            let _ = finish_tx.send(());
+            let mutation_completed = tokio::time::timeout(Duration::from_secs(5), result_rx)
+                .await
+                .is_ok_and(|result| result.is_ok_and(|completed| completed));
+            let drained = match first_stop {
+                Ok(result) => Ok(result),
+                Err(_) => tokio::time::timeout(Duration::from_secs(5), &mut stop).await,
+            };
+            if drained.is_err() {
+                stop.abort();
+                let _ = stop.await;
+            }
+            if !mutation_completed || drained.is_err() {
+                // Unknown native retirement must preserve its task-owned filesystem root.
+                let _ = root.keep();
+            }
+            assert!(entered && waiter_cancelled && yielded);
+            assert_eq!(admitted, (1, 1));
+            assert!(charged > 0);
+            assert_eq!(retained, (1, charged, true));
+            assert_eq!(credit, (Some(0), Some(0)));
+            assert!(stop_entered && stop_pending_while_native_held && continued && stop_pending_through_continuation);
+            assert!(mutation_completed, "the original owned operation must complete its actual continuation");
+            drained.unwrap().unwrap().unwrap();
+            assert!(ownership.upgrade().is_none());
+            assert_eq!(std::fs::read(path).unwrap(), b"same outside waiter mutation");
+            assert_eq!((node.snapshot().active, disk.snapshot().active, memory.snapshot().used), (0, 0, 0));
+            assert_eq!((node.completed(), disk.completed()), (Some(0), Some(0)));
+            manager.stop().await.unwrap();
+        });
+        drop(runtime);
+    }
+
     #[tokio::test]
     async fn logical_cancel_yields_node_without_dropping_native_buffer_or_result_continuation() {
         use super::super::storage_api::owner::{PhysicalDiskBinding, ecstore_spawn_blocking_with_resource_ownership};
