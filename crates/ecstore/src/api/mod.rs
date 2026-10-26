@@ -429,6 +429,7 @@ pub mod data_usage {
 pub mod disk {
     pub use crate::cluster::rpc::background_pipe::{BackgroundPipeReader, BackgroundPipeWriter, background_pipe};
     pub use crate::cluster::rpc::background_reader_stream::BackgroundReaderStream;
+    pub use crate::disk::background_memory::BackgroundEncodeBuffer;
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
     pub use crate::disk::local::{ReplacementExecutionLease, ScanGuard};
     #[cfg(all(feature = "test-util", not(windows)))]
@@ -585,6 +586,7 @@ pub mod rio {
 }
 
 pub mod rpc {
+    pub use crate::cluster::rpc::http_auth::with_rpc_background_request;
     pub use crate::cluster::rpc::{
         AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION,
         NetworkPeerProbeClient, NetworkPeerProbeError, NetworkPeerProbeMeasurement, NetworkPeerTarget, PEER_RESTDRY_RUN,

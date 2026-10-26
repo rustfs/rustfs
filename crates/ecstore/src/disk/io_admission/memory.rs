@@ -236,6 +236,10 @@ impl BackgroundBuffer {
         Reservation::wrap(bytes, reservation)
     }
 
+    pub(crate) fn memory_budget(&self) -> Option<Arc<BackgroundMemoryBudget>> {
+        self.budget.clone()
+    }
+
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.bytes
     }
@@ -245,9 +249,112 @@ impl BackgroundBuffer {
     }
 }
 
+/// Fallible, bounded serializer output using the admitted payload owner.
+pub struct BackgroundEncodeBuffer {
+    buffer: BackgroundBuffer,
+    filled: usize,
+    maximum: usize,
+}
+
+impl BackgroundEncodeBuffer {
+    pub fn new(memory: Arc<BackgroundMemoryBudget>, maximum: usize) -> Self {
+        Self {
+            buffer: BackgroundBuffer::new(Some(memory)),
+            filled: 0,
+            maximum,
+        }
+    }
+
+    pub fn into_bytes(mut self) -> Bytes {
+        self.buffer.take_bytes(self.filled)
+    }
+}
+
+impl io::Write for BackgroundEncodeBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let required = self.filled.checked_add(bytes.len()).ok_or(io::ErrorKind::OutOfMemory)?;
+        if required > self.maximum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "background encoded frame exceeds its size limit",
+            ));
+        }
+        if required > self.buffer.as_slice().len() {
+            let capacity = self
+                .buffer
+                .as_slice()
+                .len()
+                .saturating_mul(2)
+                .max(32)
+                .max(required)
+                .min(self.maximum);
+            self.buffer.grow(capacity, self.filled)?;
+        }
+        self.buffer.as_mut_slice()[self.filled..required].copy_from_slice(bytes);
+        self.filled = required;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoded_buffer_growth_retains_both_allocations_and_the_last_slice() {
+        use std::io::Write;
+
+        let owner = BackgroundMemoryBudget::new();
+        owner.set_sampled_limit(95, Duration::from_secs(30));
+        let mut buffer = BackgroundEncodeBuffer::new(owner.clone(), 64);
+        buffer.write_all(&[7; 32]).expect("initial allocation fits");
+        assert_eq!(owner.snapshot().used, 32);
+
+        let error = buffer.write_all(&[8]).expect_err("old 32 plus replacement 64 exceed 95");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(is_memory_pressure(&error));
+        assert_eq!(buffer.filled, 32);
+        assert_eq!(buffer.buffer.as_slice(), &[7; 32]);
+        assert_eq!(owner.snapshot().used, 32);
+
+        owner.set_sampled_limit(96, Duration::from_secs(30));
+        buffer.write_all(&[8]).expect("old 32 plus replacement 64 fit 96");
+        assert_eq!(owner.snapshot().used, 64);
+        let bytes = buffer.into_bytes();
+        assert_eq!(&bytes[..32], &[7; 32]);
+        assert_eq!(bytes[32], 8);
+        assert_eq!(bytes.len(), 33);
+        let slice = bytes.slice(32..);
+        drop(bytes);
+        assert_eq!(slice.as_ref(), &[8]);
+        assert_eq!(owner.snapshot().used, 64);
+        drop(slice);
+        assert_eq!(owner.snapshot().used, 0);
+    }
+
+    #[test]
+    fn encoded_buffer_checks_its_limit_before_reserving_storage() {
+        use std::io::Write;
+
+        let owner = BackgroundMemoryBudget::new();
+        for maximum in [0, 3] {
+            let mut buffer = BackgroundEncodeBuffer::new(owner.clone(), maximum);
+            buffer
+                .write_all(&[])
+                .expect("empty input needs no storage, including at limit zero");
+            let error = buffer
+                .write_all(&[7; 4])
+                .expect_err("oversized input must fail before memory admission");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(buffer.buffer.as_slice().is_empty());
+            assert!(buffer.into_bytes().is_empty());
+            assert_eq!(owner.snapshot().used, 0);
+        }
+    }
 
     #[test]
     fn returned_bytes_keep_the_allocation_charged_through_slices_and_shrink() {

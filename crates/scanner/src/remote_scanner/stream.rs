@@ -22,6 +22,7 @@ use crate::scanner_io::{
     persist_scanner_checkpoint, scanner_set_disk_inventory,
 };
 use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
+use crate::storage_api::{EcstoreBackgroundEncodeBuffer, EcstoreBackgroundMemoryBudget};
 use crate::{
     DATA_USAGE_CACHE_NAME, DataUsageCache, DataUsageCachePrepareOutcome, DataUsageCacheSource, DataUsageEntryInfo,
     DataUsageScanPlanDigest, Disk, ScannerError, StorageError, resolve_scanner_object_store_handle,
@@ -533,8 +534,21 @@ fn update_frame_mac(mac: &mut HmacSha256, request_id: Uuid, sequence: u64, paylo
 pub async fn serve_remote_scanner_request<W>(
     disk: Arc<Disk>,
     request: RemoteScannerRequest,
+    writer: W,
+    disconnect: CancellationToken,
+) -> Result<(), ScannerError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    serve_remote_scanner_request_with_memory(disk, request, writer, disconnect, None).await
+}
+
+pub async fn serve_remote_scanner_request_with_memory<W>(
+    disk: Arc<Disk>,
+    request: RemoteScannerRequest,
     mut writer: W,
     disconnect: CancellationToken,
+    memory: Option<Arc<EcstoreBackgroundMemoryBudget>>,
 ) -> Result<(), ScannerError>
 where
     W: AsyncWrite + Unpin + Send,
@@ -577,7 +591,7 @@ where
                     Ok(result) => result,
                     Err(err) => RemoteScannerFrameResult::Error(err.into_frame()),
                 };
-                write_frame_bounded(
+                write_frame_bounded_with_memory(
                     &mut writer,
                     &authenticator,
                     &mut sequence,
@@ -588,6 +602,7 @@ where
                     ),
                     &disconnect,
                     NS_SCANNER_WRITE_TIMEOUT,
+                    memory.as_ref(),
                 )
                 .await?;
                 shutdown_writer_bounded(&mut writer, &disconnect, NS_SCANNER_WRITE_TIMEOUT).await?;
@@ -605,7 +620,7 @@ where
             }
             _ = phase_changed.notified(), if !persistence_announced => {
                 persistence_announced = true;
-                if let Err(err) = write_frame_bounded(
+                if let Err(err) = write_frame_bounded_with_memory(
                     &mut writer,
                     &authenticator,
                     &mut sequence,
@@ -616,6 +631,7 @@ where
                     ),
                     &disconnect,
                     NS_SCANNER_WRITE_TIMEOUT,
+                    memory.as_ref(),
                 )
                 .await
                 {
@@ -630,7 +646,7 @@ where
                 }
             }
             _ = heartbeat.tick() => {
-                if let Err(err) = write_frame_bounded(
+                if let Err(err) = write_frame_bounded_with_memory(
                     &mut writer,
                     &authenticator,
                     &mut sequence,
@@ -641,6 +657,7 @@ where
                     ),
                     &disconnect,
                     NS_SCANNER_WRITE_TIMEOUT,
+                    memory.as_ref(),
                 )
                 .await
                 {
@@ -1493,6 +1510,7 @@ fn writer_timeout_error(operation: &str, timeout_duration: Duration) -> ScannerE
     ))
 }
 
+#[cfg(test)]
 async fn write_frame_bounded<W>(
     writer: &mut W,
     authenticator: &FrameAuthenticator,
@@ -1504,10 +1522,30 @@ async fn write_frame_bounded<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    write_frame_bounded_with_memory(writer, authenticator, sequence, frame, disconnect, timeout_duration, None).await
+}
+
+async fn write_frame_bounded_with_memory<W>(
+    writer: &mut W,
+    authenticator: &FrameAuthenticator,
+    sequence: &mut u64,
+    frame: &RemoteScannerFrame,
+    disconnect: &CancellationToken,
+    timeout_duration: Duration,
+    memory: Option<&Arc<EcstoreBackgroundMemoryBudget>>,
+) -> Result<(), ScannerError>
+where
+    W: AsyncWrite + Unpin,
+{
     tokio::select! {
         biased;
         _ = disconnect.cancelled() => Err(disconnected_writer_error()),
-        result = tokio::time::timeout(timeout_duration, write_frame(writer, authenticator, sequence, frame)) => {
+        result = tokio::time::timeout(timeout_duration, async {
+            match memory {
+                Some(memory) => write_background_frame(writer, authenticator, sequence, frame, memory).await,
+                None => write_frame(writer, authenticator, sequence, frame).await,
+            }
+        }) => {
             result.map_err(|_| writer_timeout_error("write", timeout_duration))?
         }
     }
@@ -1581,6 +1619,61 @@ where
 
     writer.write_all(&len.to_be_bytes()).await?;
     writer.write_all(&encoded).await?;
+    *sequence = sequence
+        .checked_add(1)
+        .ok_or_else(|| ScannerError::Other("remote namespace scanner frame sequence overflow".to_string()))?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct BorrowedRemoteScannerFrameEnvelope<'a> {
+    version: u16,
+    sequence: u64,
+    payload: &'a [u8],
+    mac: &'a [u8],
+}
+
+fn encode_background<T: Serialize>(value: &T, memory: &Arc<EcstoreBackgroundMemoryBudget>) -> Result<bytes::Bytes, ScannerError> {
+    let mut buffer = EcstoreBackgroundEncodeBuffer::new(memory.clone(), NS_SCANNER_MAX_FRAME_SIZE);
+    // Preserve the serializer's original I/O error and its memory-denial cause.
+    rmp_serde::encode::write_named(&mut buffer, value).map_err(|error| match error {
+        rmp_serde::encode::Error::InvalidValueWrite(error) => ScannerError::Io(error.into()),
+        error => ScannerError::Io(IoError::other(error)),
+    })?;
+    Ok(buffer.into_bytes())
+}
+
+async fn write_background_frame<W>(
+    writer: &mut W,
+    authenticator: &FrameAuthenticator,
+    sequence: &mut u64,
+    frame: &RemoteScannerFrame,
+    memory: &Arc<EcstoreBackgroundMemoryBudget>,
+) -> Result<(), ScannerError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let payload = encode_background(frame, memory)?;
+    let mut mac = HmacSha256::new_from_slice(authenticator.secret.as_bytes())
+        .map_err(|_| ScannerError::Other("invalid remote namespace scanner authentication key".to_string()))?;
+    update_frame_mac(&mut mac, authenticator.request_id, *sequence, &payload);
+    let signature = mac.finalize().into_bytes();
+    let envelope = BorrowedRemoteScannerFrameEnvelope {
+        version: NS_SCANNER_PROTOCOL_VERSION,
+        sequence: *sequence,
+        payload: &payload,
+        mac: &signature,
+    };
+    let encoded = encode_background(&envelope, memory)?;
+    if encoded.is_empty() {
+        return Err(ScannerError::Other("remote namespace scanner encoded frame is empty".to_string()));
+    }
+    let len = u32::try_from(encoded.len())
+        .map_err(|_| ScannerError::Other("remote namespace scanner frame is too large".to_string()))?;
+    writer.write_all(&len.to_be_bytes()).await?;
+    writer.write_all(&encoded).await?;
+    drop(encoded);
+    drop(payload);
     *sequence = sequence
         .checked_add(1)
         .ok_or_else(|| ScannerError::Other("remote namespace scanner frame sequence overflow".to_string()))?;

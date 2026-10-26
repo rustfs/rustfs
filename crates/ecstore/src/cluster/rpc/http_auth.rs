@@ -91,7 +91,9 @@ pub(crate) fn current_rpc_background_request() -> bool {
         .unwrap_or_else(|_| crate::disk::has_resource_io_scope())
 }
 
-pub(crate) async fn with_rpc_background_request<F: std::future::Future>(background: bool, operation: F) -> F::Output {
+/// Preserve the authenticated wire class while polling locally admitted work.
+/// This scope carries only the class, never node, disk, or memory ownership.
+pub async fn with_rpc_background_request<F: std::future::Future>(background: bool, operation: F) -> F::Output {
     RPC_BACKGROUND_REQUEST.scope(background, operation).await
 }
 

@@ -256,9 +256,10 @@ pub(crate) mod rpc_consumer {
         pub(crate) use super::super::Endpoint;
         #[cfg(test)]
         pub(crate) use super::super::ecstore_disk::DiskAPI;
-        pub(crate) use rustfs_ecstore::api::disk::{BackgroundPipeWriter, BackgroundReaderStream, background_pipe};
         #[cfg(test)]
-        pub(crate) use rustfs_ecstore::api::disk::{DiskOption, new_disk};
+        pub(crate) use rustfs_ecstore::api::disk::{BackgroundEncodeBuffer, DiskOption, new_disk};
+        pub(crate) use rustfs_ecstore::api::disk::{BackgroundPipeWriter, BackgroundReaderStream, background_pipe};
+        pub(crate) use rustfs_ecstore::api::rpc::with_rpc_background_request;
         pub(crate) const DEFAULT_READ_BUFFER_SIZE: usize = super::super::DEFAULT_READ_BUFFER_SIZE;
         #[cfg(test)]
         pub(crate) use super::super::storage_contracts::{

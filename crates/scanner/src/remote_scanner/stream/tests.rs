@@ -453,6 +453,102 @@ fn request_envelope_must_match_every_pre_body_replay_field() {
 }
 
 #[tokio::test]
+async fn background_frame_matches_foreground_wire_mac_and_sequence() {
+    let authenticator = FrameAuthenticator::for_test(Uuid::from_u128(7));
+    let frames = [
+        RemoteScannerFrame::progress(RemoteScannerProgress::default()),
+        RemoteScannerFrame::terminal(RemoteScannerProgress::default(), eof_test_terminal(0)),
+        RemoteScannerFrame::terminal(
+            RemoteScannerProgress::default(),
+            RemoteScannerFrameResult::Error(RemoteScannerErrorFrame {
+                scope: RemoteScannerErrorScope::Worker,
+                message: "目录/🙂/\0".to_string(),
+            }),
+        ),
+    ];
+
+    for frame in frames {
+        for initial_sequence in [0, 128] {
+            let owner = EcstoreBackgroundMemoryBudget::new();
+            owner.set_sampled_limit(64 * 1024, Duration::from_secs(30));
+            let (mut foreground, mut default, mut background) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut foreground_sequence, mut default_sequence, mut background_sequence) =
+                (initial_sequence, initial_sequence, initial_sequence);
+            write_frame(&mut foreground, &authenticator, &mut foreground_sequence, &frame)
+                .await
+                .expect("foreground frame should encode");
+            write_frame_bounded(
+                &mut default,
+                &authenticator,
+                &mut default_sequence,
+                &frame,
+                &CancellationToken::new(),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("default writer should use the foreground encoding");
+            write_background_frame(&mut background, &authenticator, &mut background_sequence, &frame, &owner)
+                .await
+                .expect("background frame should encode");
+            assert_eq!(foreground, default);
+            assert_eq!(foreground, background);
+            assert_eq!(foreground_sequence, initial_sequence + 1);
+            assert_eq!(default_sequence, foreground_sequence);
+            assert_eq!(background_sequence, foreground_sequence);
+            assert_eq!(owner.snapshot().used, 0);
+
+            let mut expected_sequence = initial_sequence;
+            let decoded = read_frame(&mut Cursor::new(background), &authenticator, &mut expected_sequence)
+                .await
+                .expect("the original decoder must verify the background MAC and sequence");
+            assert_eq!(expected_sequence, foreground_sequence);
+            assert_eq!(
+                rmp_serde::to_vec_named(&decoded).expect("decoded payload"),
+                rmp_serde::to_vec_named(&frame).expect("original payload")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn background_frame_payload_and_envelope_denial_preserve_io_cause_without_output() {
+    let authenticator = FrameAuthenticator::for_test(Uuid::from_u128(7));
+    let frame = RemoteScannerFrame::progress(RemoteScannerProgress::default());
+    let probe_owner = EcstoreBackgroundMemoryBudget::new();
+    probe_owner.set_sampled_limit(64 * 1024, Duration::from_secs(30));
+    let payload = encode_background(&frame, &probe_owner).expect("measure retained payload capacity");
+    let payload_capacity = probe_owner.snapshot().used;
+    assert!(payload_capacity > 0);
+    drop(payload);
+    assert_eq!(probe_owner.snapshot().used, 0);
+
+    for limit in [0, payload_capacity * 2] {
+        let owner = EcstoreBackgroundMemoryBudget::new();
+        owner.set_sampled_limit(limit, Duration::from_secs(30));
+        if limit != 0 {
+            let payload = encode_background(&frame, &owner).expect("this budget admits the entire inner encoding");
+            assert_eq!(owner.snapshot().used, payload_capacity);
+            drop(payload);
+            assert_eq!(owner.snapshot().used, 0);
+        }
+
+        let mut output = Vec::new();
+        let mut sequence = 17;
+        let error = write_background_frame(&mut output, &authenticator, &mut sequence, &frame, &owner)
+            .await
+            .expect_err("deny the payload at zero or the envelope after an admitted payload");
+        let ScannerError::Io(error) = error else {
+            panic!("serializer memory denial must remain an I/O error");
+        };
+        assert_eq!(error.kind(), ErrorKind::WouldBlock);
+        assert!(error.get_ref().is_some(), "the serializer must preserve the original memory-denial cause");
+        assert!(output.is_empty());
+        assert_eq!(sequence, 17);
+        assert_eq!(owner.snapshot().used, 0);
+    }
+}
+
+#[tokio::test]
 async fn bounded_frame_write_releases_a_stalled_response() {
     let request_id = Uuid::new_v4();
     let authenticator = FrameAuthenticator::for_test(request_id);

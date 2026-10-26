@@ -16,6 +16,20 @@ pub struct BackgroundPipeWriter {
     inner: PipeEnd,
 }
 
+impl BackgroundPipeWriter {
+    /// Capture only the payload owner, without retaining node or physical units.
+    pub fn memory_budget(&self) -> Option<Arc<crate::disk::BackgroundMemoryBudget>> {
+        match &self.inner {
+            PipeEnd::Foreground(_) => None,
+            PipeEnd::Background(state) => state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .buffer
+                .memory_budget(),
+        }
+    }
+}
+
 enum PipeEnd {
     Foreground(DuplexStream),
     Background(Arc<Mutex<PipeState>>),

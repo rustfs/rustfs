@@ -99,6 +99,9 @@ pub(crate) use rustfs_ecstore::api::disk::{
     NsScannerOpenRequest as EcstoreNsScannerOpenRequest, RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET,
     STORAGE_FORMAT_FILE as ECSTORE_STORAGE_FORMAT_FILE, ScanGuard as EcstoreScanGuard,
 };
+pub(crate) use rustfs_ecstore::api::disk::{
+    BackgroundEncodeBuffer as EcstoreBackgroundEncodeBuffer, BackgroundMemoryBudget as EcstoreBackgroundMemoryBudget,
+};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::disk::{
     DiskOption as EcstoreDiskOption, DiskStore as EcstoreDiskStore, new_disk as ecstore_new_disk,
