@@ -68,7 +68,7 @@ impl Operation for RestRenameTableHandler {
             )
             .await
             .map_err(catalog_store_error)?;
-        Ok(empty_response(StatusCode::NO_CONTENT))
+        Ok(owned_empty_response(StatusCode::NO_CONTENT))
     }
 }
 
@@ -193,7 +193,7 @@ impl Operation for RestTableExistsHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableAction).await?;
         ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
         let store = table_catalog_store_from_envelope(req.envelope())?;
-        Ok(empty_response(table_exists_status(&store, &warehouse, &namespace, &table).await?))
+        Ok(owned_empty_response(table_exists_status(&store, &warehouse, &namespace, &table).await?))
     }
 }
 
@@ -246,7 +246,7 @@ impl Operation for RestDropTableHandler {
         ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
         let store = table_catalog_store_from_envelope(req.envelope())?;
         drop_table_in_store(&store, &warehouse, &namespace, &table).await?;
-        Ok(empty_response(StatusCode::NO_CONTENT))
+        Ok(owned_empty_response(StatusCode::NO_CONTENT))
     }
 }
 

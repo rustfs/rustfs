@@ -103,13 +103,6 @@ pub(crate) fn admin_json_response<T: serde::Serialize>(
 
 /// Owned-boundary form of [`admin_json_response`]: the same compat-prefix
 /// encryption decision, `Content-Type`, and bytes, as an `AdminResponse`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-    )
-)]
 pub(crate) fn owned_admin_json_response<T: serde::Serialize>(
     path: &str,
     secret_key: &str,

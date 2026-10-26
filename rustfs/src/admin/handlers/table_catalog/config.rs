@@ -203,7 +203,7 @@ impl Operation for BackfillTableWarehouseIndexHandler {
             .map_err(catalog_store_error);
         record_table_catalog_admin_operation_result("warehouse-index-backfill", &warehouse, "", "", started, &result);
         result?;
-        Ok(empty_response(StatusCode::NO_CONTENT))
+        Ok(owned_empty_response(StatusCode::NO_CONTENT))
     }
 }
 

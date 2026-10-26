@@ -86,7 +86,7 @@ impl Operation for RestDropNamespaceHandler {
         ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
         let store = table_catalog_store_from_envelope(req.envelope())?;
         drop_namespace_in_store(&store, &warehouse, &namespace.public_name()).await?;
-        Ok(empty_response(StatusCode::NO_CONTENT))
+        Ok(owned_empty_response(StatusCode::NO_CONTENT))
     }
 }
 
@@ -126,6 +126,6 @@ impl Operation for RestNamespaceExistsHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableNamespaceAction).await?;
         ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
         let store = table_catalog_store_from_envelope(req.envelope())?;
-        Ok(empty_response(namespace_exists_status(&store, &warehouse, &namespace).await?))
+        Ok(owned_empty_response(namespace_exists_status(&store, &warehouse, &namespace).await?))
     }
 }

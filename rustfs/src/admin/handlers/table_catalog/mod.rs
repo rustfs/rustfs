@@ -18,6 +18,7 @@ use crate::admin::runtime_sources::default_admin_usecase;
 use crate::admin::storage_api::access::{ReqInfo, authorize_internal_object_request};
 use crate::admin::storage_api::bucket::metadata::table_catalog_path_hash;
 use crate::admin::storage_api::runtime::ECStore;
+use crate::admin::utils::owned_empty_response;
 use crate::admin::{
     auth::{AdminResourceScope, validate_admin_action_with_bucket_object_for_iam},
     router::{AdminOperation, S3Router},
@@ -1068,11 +1069,6 @@ fn build_sensitive_json_response<T: Serialize>(status: StatusCode, body: &T) -> 
     headers.insert(http::header::PRAGMA, HeaderValue::from_static("no-cache"));
     headers.insert(http::header::EXPIRES, HeaderValue::from_static("0"));
     Ok(AdminResponse::with_headers(status, body, headers))
-}
-
-/// A bodiless response carrying only `status`.
-fn empty_response(status: StatusCode) -> AdminResponse {
-    AdminResponse::new(status, Body::empty())
 }
 
 // The commit-path handlers (`TableCommitObjectBackend::for_request`) authorize

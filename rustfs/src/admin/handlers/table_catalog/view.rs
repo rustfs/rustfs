@@ -81,7 +81,7 @@ impl Operation for RestViewExistsHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableAction).await?;
         ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
         let store = table_catalog_store_from_envelope(req.envelope())?;
-        Ok(empty_response(view_exists_status(&store, &warehouse, &namespace, &view).await?))
+        Ok(owned_empty_response(view_exists_status(&store, &warehouse, &namespace, &view).await?))
     }
 }
 
@@ -122,6 +122,6 @@ impl Operation for RestDropViewHandler {
         ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
         let store = table_catalog_store_from_envelope(req.envelope())?;
         drop_view_in_store(&store, &warehouse, &namespace, &view).await?;
-        Ok(empty_response(StatusCode::NO_CONTENT))
+        Ok(owned_empty_response(StatusCode::NO_CONTENT))
     }
 }

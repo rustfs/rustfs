@@ -42,6 +42,7 @@
 use super::account_audit::{
     AccountAuditContext, AccountAuditFailure, AccountAuditOperation, AccountAuditRecord, MfaMethod, emit as emit_audit,
 };
+use super::owned_admin_json_response;
 use crate::admin::auth::validate_admin_request;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
@@ -638,19 +639,6 @@ fn empty_ok() -> AdminResponse {
     let mut header = hyper::HeaderMap::new();
     header.insert(http::header::CONTENT_LENGTH, "0".parse().expect("valid header value"));
     AdminResponse::with_headers(StatusCode::OK, Body::empty(), header)
-}
-
-/// Owned form of [`super::admin_json_response`], which still answers on the
-/// legacy response type: the same encoded payload and headers, converted here.
-fn owned_admin_json_response<T: serde::Serialize>(
-    path: &str,
-    secret_key: &str,
-    status: StatusCode,
-    payload: &T,
-) -> S3Result<AdminResponse> {
-    let response = super::admin_json_response(path, secret_key, status, payload)?;
-    let (status, body) = response.output;
-    Ok(AdminResponse::with_headers(status, body.into(), response.headers))
 }
 
 #[cfg(test)]

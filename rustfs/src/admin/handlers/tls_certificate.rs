@@ -136,8 +136,7 @@ mod tests {
             CertificateStateHandler
                 .call(request(Method::GET), Params::new())
                 .await
-                .err()
-                .expect("unauthenticated GET")
+                .expect_err("unauthenticated GET")
                 .code(),
             &S3ErrorCode::AccessDenied
         );
@@ -145,8 +144,7 @@ mod tests {
             PublishCertificateHandler
                 .call(request(Method::POST), Params::new())
                 .await
-                .err()
-                .expect("unauthenticated POST")
+                .expect_err("unauthenticated POST")
                 .code(),
             &S3ErrorCode::AccessDenied
         );

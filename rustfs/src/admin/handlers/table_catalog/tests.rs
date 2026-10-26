@@ -307,8 +307,7 @@ async fn table_catalog_authentication_and_credentials_use_the_request_context() 
     .build();
     let err = call_maintenance_worker_handler(request)
         .await
-        .err()
-        .expect("table read permission must not authorize a conditional maintenance worker");
+        .expect_err("table read permission must not authorize a conditional maintenance worker");
     assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
 }
 
@@ -560,8 +559,7 @@ async fn table_maintenance_worker_handler_enforces_conditions_after_authorizatio
             ] {
                 let error = call_maintenance_worker_handler(request(body))
                     .await
-                    .err()
-                    .expect("stale condition must not dispatch an unconditional worker");
+                    .expect_err("stale condition must not dispatch an unconditional worker");
                 assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
                 for id in [queued.job.job_id.as_str(), "latest", "current"] {
                     assert_eq!(
@@ -613,8 +611,7 @@ async fn table_maintenance_worker_handler_enforces_conditions_after_authorizatio
                 "worker-id":"worker-b", "expected-job-id":queued.job.job_id, "expected-attempt":0
             })))
             .await
-            .err()
-            .expect("another worker cannot replay an old condition");
+            .expect_err("another worker cannot replay an old condition");
             assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
             for id in [queued.job.job_id.as_str(), "latest", "current"] {
                 assert_eq!(
@@ -789,8 +786,7 @@ async fn strong_metadata_maintenance_handler_plans_without_changing_table_object
             ] {
                 let error = call_metadata_maintenance_handler(request(body))
                     .await
-                    .err()
-                    .expect("strong mutation must be rejected");
+                    .expect_err("strong mutation must be rejected");
                 assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
                 assert!(
                     error
@@ -810,23 +806,20 @@ async fn strong_metadata_maintenance_handler_plans_without_changing_table_object
             ] {
                 let error = call_metadata_maintenance_handler(request(body))
                     .await
-                    .err()
-                    .expect("malformed request must be rejected");
+                    .expect_err("malformed request must be rejected");
                 assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
                 assert_eq!(inventory(&backend).await, before, "{body}");
             }
             let anonymous = request_as(None, "{}");
             let error = call_metadata_maintenance_handler(anonymous)
                 .await
-                .err()
-                .expect("planning requires authentication");
+                .expect_err("planning requires authentication");
             assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
             assert!(error.message().unwrap_or_default().contains("authentication required"));
             let reader = request_as(Some((reader_access_key, reader_secret_key)), "not-json");
             let error = call_metadata_maintenance_handler(reader)
                 .await
-                .err()
-                .expect("read-only permission must not authorize planning");
+                .expect_err("read-only permission must not authorize planning");
             assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
             assert_eq!(inventory(&backend).await, before);
 
@@ -936,8 +929,7 @@ async fn strong_metadata_maintenance_handler_plans_without_changing_table_object
             let before = inventory(&backend).await;
             let error = call_metadata_maintenance_handler(request("{}"))
                 .await
-                .err()
-                .expect("planning must not replace a queued job");
+                .expect_err("planning must not replace a queued job");
             assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
             assert_eq!(inventory(&backend).await, before);
             assert_eq!(catalog.load_table("warehouse", "analytics", "events").await.unwrap(), Some(entry));
@@ -2154,8 +2146,7 @@ async fn table_maintenance_worker_handler_requires_authentication_for_both_reque
         .build();
         let err = call_maintenance_worker_handler(request)
             .await
-            .err()
-            .expect("worker requires authentication");
+            .expect_err("worker requires authentication");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert!(err.message().unwrap_or_default().contains("authentication required"));
     }
@@ -14510,8 +14501,7 @@ async fn namespace_property_handler_updates_object_backed_catalog_and_maps_error
             let missing = RestUpdateNamespacePropertiesHandler {}
                 .call(request("missing", serde_json::json!({"updates": {"owner": "platform"}})), params)
                 .await
-                .err()
-                .expect("missing namespace should fail");
+                .expect_err("missing namespace should fail");
             assert_eq!(missing.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_NO_SUCH_NAMESPACE.into()));
             assert_eq!(missing.status_code(), Some(StatusCode::NOT_FOUND));
 
@@ -14534,8 +14524,7 @@ async fn namespace_property_handler_updates_object_backed_catalog_and_maps_error
             let corrupt = RestUpdateNamespacePropertiesHandler {}
                 .call(request("corrupt", serde_json::json!({"updates": {"owner": "platform"}})), params)
                 .await
-                .err()
-                .expect("corrupt namespace should fail");
+                .expect_err("corrupt namespace should fail");
             assert_eq!(corrupt.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_BAD_REQUEST.into()));
             assert_eq!(corrupt.status_code(), Some(StatusCode::BAD_REQUEST));
         },

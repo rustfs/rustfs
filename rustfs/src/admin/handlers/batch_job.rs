@@ -38,7 +38,7 @@
 use crate::admin::auth::authorize_admin_envelope;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
-use crate::admin::utils::{extract_query_params, json_response, read_compatible_admin_body};
+use crate::admin::utils::{extract_query_params, owned_json_response, read_compatible_admin_body};
 use crate::server::ADMIN_PREFIX;
 use http::Uri;
 use hyper::{Method, StatusCode};
@@ -59,14 +59,6 @@ const KNOWN_JOB_TYPES: &[&str] = &["replicate", "keyrotate", "expire"];
 
 async fn validate_batch_job_admin_request(req: &AdminRequest, action: AdminAction) -> S3Result<Credentials> {
     authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await
-}
-
-/// Owned form of [`json_response`], which still answers on the legacy response
-/// type: the same serialized body and headers, converted here.
-fn owned_json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<AdminResponse> {
-    let response = json_response(status, value)?;
-    let (status, body) = response.output;
-    Ok(AdminResponse::with_headers(status, body.into(), response.headers))
 }
 
 /// Best-effort detection of the declared job type from a MinIO batch-job
