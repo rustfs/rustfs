@@ -15,6 +15,8 @@
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys;
 #[cfg(test)]
+pub(crate) const OBJECT_LOCK_TRACE_FILTER: &str = "info,rustfs_ecstore::object_lock_diag=trace";
+#[cfg(test)]
 pub(crate) use rustfs_ecstore::api::disk::{
     DiskOption, Endpoint, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, VolumeInfo, WalkDirOptions, new_disk,
 };
