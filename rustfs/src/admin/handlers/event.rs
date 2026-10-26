@@ -12,19 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::{
-    auth::authorize_admin_request,
+    auth::authorize_admin_envelope,
     handlers::notify_runtime_access::{get_notification_system, load_notification_config_snapshot},
     handlers::supervise_admin_mutation,
     handlers::target_descriptor::{
         AdminTargetSpec, EndpointKey, RuntimeHealthStatus, TargetEndpointSource, admin_target_spec_from_builtin,
-        build_enabled_target_kvs, build_json_response, collect_runtime_statuses, extract_supported_target_params,
+        build_enabled_target_kvs, collect_runtime_statuses, extract_supported_target_params,
         merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason,
     },
-    router::{AdminOperation, Operation, S3Router},
-    runtime_sources::object_store_from_extensions,
-    runtime_sources::{AppContext, app_context_from_req},
+    router::{AdminOperation, S3Router},
+    runtime_sources::object_store_from_envelope,
+    runtime_sources::{AppContext, app_context_from_envelope},
     service::config::{preflight_dynamic_config_reload_for_context, signal_dynamic_config_reload_checked_for_context},
     storage_api::contract::bucket::{BucketOperations, BucketOptions},
 };
@@ -40,9 +41,8 @@ use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::server_config::Config;
 use rustfs_config::{EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_targets::catalog::builtin::builtin_notify_target_admin_descriptors;
-use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -320,13 +320,24 @@ fn collect_target_subscriptions(
     Ok(subscriptions)
 }
 
+/// Owned-boundary form of `target_descriptor::build_json_response`, which
+/// still answers with the s3s response type.
+fn build_json_response(status: StatusCode, body: Body, request_id: Option<&http::HeaderValue>) -> AdminResponse {
+    let mut header = http::HeaderMap::new();
+    header.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
+    if let Some(v) = request_id {
+        header.insert("x-request-id", v.clone());
+    }
+    AdminResponse::with_headers(status, body, header)
+}
+
 #[async_trait::async_trait]
 impl Operation for ListTargetSubscriptions {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
-        let region = req.region.as_ref().map(ToString::to_string).unwrap_or_default();
+        let region = req.region().map(ToString::to_string).unwrap_or_default();
         let target_arn = subscription_target_arn(&params, &region)?;
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "object store is not initialized"));
         };
         let buckets = store
@@ -345,7 +356,7 @@ impl Operation for ListTargetSubscriptions {
         }
         let data = serde_json::to_vec(&subscriptions)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize subscriptions: {e}")))?;
-        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
+        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers().get("x-request-id")))
     }
 }
 
@@ -391,11 +402,11 @@ fn notification_target_specs() -> &'static [AdminTargetSpec] {
 
 /// The pre-check keeps these endpoints' historical missing-credentials message;
 /// the shared gate reports "get cred failed".
-async fn authorize_notification_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize_notification_admin_request(req: &AdminRequest, action: AdminAction) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "credentials not found"));
     }
-    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await?;
     Ok(())
 }
 
@@ -457,9 +468,9 @@ fn collect_online_target_arns(region: &str, target_statuses: Vec<(rustfs_targets
 pub struct NotificationTarget {}
 #[async_trait::async_trait]
 impl Operation for NotificationTarget {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (target_type, target_name) = extract_target_params(&params)?;
-        let context = app_context_from_req(&req);
+        let context = app_context_from_envelope(req.envelope());
 
         authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
         if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console").await {
@@ -472,7 +483,7 @@ impl Operation for NotificationTarget {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
-        let mut input = req.input;
+        let mut input = req.take_body();
         let body_bytes = input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await.map_err(|e| {
             log_notification_target_body_read_failed!(target_type, target_name, e);
             s3_error!(InvalidRequest, "failed to read request body")
@@ -516,14 +527,14 @@ impl Operation for NotificationTarget {
         })?;
         log_notification_target_config_updated!("set_target_config", target_type, target_name);
 
-        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
+        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers().get("x-request-id")))
     }
 }
 
 pub struct ListNotificationTargets {}
 #[async_trait::async_trait]
 impl Operation for ListNotificationTargets {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
         refresh_persisted_module_switches_from_store().await.map_err(|err| {
             warn!(
@@ -552,14 +563,14 @@ impl Operation for ListNotificationTargets {
             s3_error!(InternalError, "failed to serialize targets: {}", e)
         })?;
 
-        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
+        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers().get("x-request-id")))
     }
 }
 
 pub struct ListTargetsArns {}
 #[async_trait::async_trait]
 impl Operation for ListTargetsArns {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
         if let Some(reason) = notification_target_operation_block_reason(
             "querying notification target ARNs for bucket associations from the console",
@@ -571,7 +582,7 @@ impl Operation for ListTargetsArns {
         }
         let ns = get_notification_system().await?;
 
-        let region = req.region.clone().ok_or_else(|| {
+        let region = req.region().map(str::to_owned).ok_or_else(|| {
             warn!(
                 event = EVENT_ADMIN_REQUEST_REJECTED,
                 component = LOG_COMPONENT_ADMIN_API,
@@ -596,16 +607,16 @@ impl Operation for ListTargetsArns {
             s3_error!(InternalError, "failed to serialize targets: {}", e)
         })?;
 
-        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
+        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers().get("x-request-id")))
     }
 }
 
 pub struct RemoveNotificationTarget {}
 #[async_trait::async_trait]
 impl Operation for RemoveNotificationTarget {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (target_type, target_name) = extract_target_params(&params)?;
-        let context = app_context_from_req(&req);
+        let context = app_context_from_envelope(req.envelope());
 
         authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
         if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console").await {
@@ -638,7 +649,7 @@ impl Operation for RemoveNotificationTarget {
         })?;
         log_notification_target_config_updated!("remove_target_config", target_type, target_name);
 
-        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
+        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers().get("x-request-id")))
     }
 }
 
@@ -802,21 +813,19 @@ mod tests {
         for target_type in ["webhook", "notify_webhook", "unknown"] {
             let path = format!("/v3/target/{target_type}/primary/subscriptions");
             let params = router.at(&path).expect("subscription route should match").params;
-            let req = S3Request {
-                input: Body::empty(),
-                method: Method::GET,
-                uri: path.parse().expect("subscription path should parse"),
-                headers: http::HeaderMap::new(),
-                extensions: http::Extensions::new(),
-                credentials: None,
-                region: None,
-                service: None,
-                trailing_headers: None,
-            };
+            let req = crate::admin::operation::test_support::TestRequest::new(
+                Method::GET,
+                path.parse::<http::Uri>().expect("subscription path should parse"),
+            )
+            .headers(http::HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::empty())
+            .build();
             let err = ListTargetSubscriptions {}
                 .call(req, params)
                 .await
-                .expect_err("credentials must be required");
+                .err()
+                .expect("credentials must be required");
             assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
             assert_eq!(err.message(), Some("credentials not found"));
         }
@@ -1261,17 +1270,11 @@ mod tests {
     /// message they have always returned (rustfs/backlog#1829).
     #[tokio::test]
     async fn notification_target_gate_keeps_its_missing_credentials_message() {
-        let req = S3Request {
-            input: Body::from(String::new()),
-            method: Method::PUT,
-            uri: http::Uri::from_static("/rustfs/admin/v3/notification/target"),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let req = crate::admin::operation::test_support::TestRequest::new(Method::PUT, "/rustfs/admin/v3/notification/target")
+            .headers(http::HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::from(String::new()))
+            .build();
 
         let err = authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction)
             .await

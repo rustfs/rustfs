@@ -31,18 +31,17 @@
 use super::account_audit::{
     AccountAuditContext, AccountAuditFailure, AccountAuditOperation, AccountAuditRecord, emit as emit_audit,
 };
-use super::admin_json_response;
 use super::iam_error::iam_error_to_s3_error;
 use super::site_replication::site_replication_iam_change_hook;
 use super::supervise_admin_mutation;
 use crate::admin::auth::validate_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{current_action_credentials, current_ready_iam_handle, object_store_from_req};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
+use crate::admin::runtime_sources::{current_action_credentials, current_ready_iam_handle, object_store_from_envelope};
 use crate::admin::service::caller_identity::{CallerIdentity, oidc_profile_fields};
-use crate::admin::storage_api::s3::{self, Body, S3ErrorCode, S3Request, S3Response, S3Result};
+use crate::admin::storage_api::s3::{self, S3ErrorCode, S3Result};
 use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::constant_time_eq;
-use crate::server::RemoteAddr;
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
@@ -83,10 +82,26 @@ struct SelfAccountInfoResponse {
     email: Option<String>,
 }
 
+/// Owned-boundary form of `super::admin_json_response`, which still answers
+/// with the s3s response type.
+fn admin_json_response<T: serde::Serialize>(
+    path: &str,
+    secret_key: &str,
+    status: StatusCode,
+    payload: &T,
+) -> S3Result<AdminResponse> {
+    let body = serde_json::to_vec(payload).map_err(|e| s3::error(S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
+    let (body, content_type) = crate::admin::utils::encode_compatible_admin_payload(path, secret_key, body)?;
+
+    let mut header = http::HeaderMap::new();
+    header.insert(http::header::CONTENT_TYPE, content_type.parse().expect("valid header value"));
+    Ok(AdminResponse::with_headers(status, rustfs_s3_types::Body::from(body), header))
+}
+
 #[async_trait::async_trait]
 impl Operation for SelfAccountInfoHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let caller = CallerIdentity::resolve(&req).await?;
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
         let iam_store =
             current_ready_iam_handle().map_err(|_| s3::error(S3ErrorCode::InternalError, "iam is not initialized"))?;
 
@@ -110,7 +125,7 @@ impl Operation for SelfAccountInfoHandler {
 
         // Reported inline rather than behind a second round trip, so a client
         // can render the whole security surface from one response.
-        let mfa = match object_store_from_req(&req) {
+        let mfa = match object_store_from_envelope(req.envelope()) {
             Some(store) => {
                 let status = mfa_service::status(store, &caller.access_key, OffsetDateTime::now_utc())
                     .await
@@ -152,7 +167,7 @@ impl Operation for SelfAccountInfoHandler {
             email,
         };
 
-        admin_json_response(req.uri.path(), &caller.credentials.secret_key, StatusCode::OK, &info)
+        admin_json_response(req.uri().path(), &caller.credentials.secret_key, StatusCode::OK, &info)
     }
 }
 
@@ -161,9 +176,9 @@ pub struct ChangeOwnPasswordHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ChangeOwnPasswordHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let caller = CallerIdentity::resolve(&req).await?;
-        let audit = AccountAuditContext::from_request(&req);
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
+        let audit = AccountAuditContext::from_envelope(req.envelope());
 
         if let Err(err) = caller.ensure_credential_mutation_allowed() {
             emit_audit(
@@ -179,9 +194,10 @@ impl Operation for ChangeOwnPasswordHandler {
             return Err(err);
         }
 
-        let path = req.uri.path().to_string();
+        let path = req.uri().path().to_string();
         let body =
-            read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key).await?;
+            read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key)
+                .await?;
         let request: ChangePasswordRequest = serde_json::from_slice(&body)
             .map_err(|e| s3::error(S3ErrorCode::InvalidRequest, format!("invalid change-password request: {e}")))?;
 
@@ -338,8 +354,8 @@ struct SetUserSecretKeyQuery {
 
 #[async_trait::async_trait]
 impl Operation for SetUserSecretKeyHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let query: SetUserSecretKeyQuery = match req.uri.query() {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let query: SetUserSecretKeyQuery = match req.uri().query() {
             Some(query) => serde_urlencoded::from_str(query)
                 .map_err(|_| s3::error(S3ErrorCode::InvalidArgument, "failed to decode query"))?,
             None => SetUserSecretKeyQuery::default(),
@@ -349,8 +365,8 @@ impl Operation for SetUserSecretKeyHandler {
             return Err(s3::error(S3ErrorCode::InvalidArgument, "access key is empty"));
         }
 
-        let caller = CallerIdentity::resolve(&req).await?;
-        let audit = AccountAuditContext::from_request(&req);
+        let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
+        let audit = AccountAuditContext::from_envelope(req.envelope());
 
         // The root identity is provisioned from the environment; its secret is a
         // process-wide `OnceLock` that also derives the internode RPC secret, so
@@ -373,12 +389,12 @@ impl Operation for SetUserSecretKeyHandler {
         }
 
         validate_admin_request(
-            &req.headers,
+            req.headers(),
             &caller.credentials,
             caller.is_owner,
             false,
             vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            req.remote_addr(),
         )
         .await
         .inspect_err(|_| {
@@ -394,9 +410,10 @@ impl Operation for SetUserSecretKeyHandler {
             );
         })?;
 
-        let path = req.uri.path().to_string();
+        let path = req.uri().path().to_string();
         let body =
-            read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key).await?;
+            read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key)
+                .await?;
         let request: SetUserSecretKeyRequest = serde_json::from_slice(&body)
             .map_err(|e| s3::error(S3ErrorCode::InvalidRequest, format!("invalid set-user-secret-key request: {e}")))?;
 

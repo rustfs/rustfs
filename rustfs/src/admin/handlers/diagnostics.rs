@@ -23,28 +23,25 @@
 //! backing infrastructure (in-process log ring buffer, cross-node object
 //! speedtest harness).
 
-use crate::admin::auth::authorize_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::storage_api::access::spawn_traced;
-use crate::admin::utils::json_response;
 use crate::server::ADMIN_PREFIX;
 use crate::storage::storage_api::get_global_lock_clients;
 use bytes::Bytes;
-use futures::{Stream, StreamExt, future::join_all};
+use futures::future::join_all;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue, Uri, header::CONTENT_LENGTH};
+use http_body_util::BodyExt;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_lock::{LockLeaseInfo, LockMode, LockType, ObjectKey, get_global_lock_manager};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Error, S3Result, s3_error};
-use s3s::header::CONTENT_TYPE;
-use s3s::stream::{ByteStream, DynByteStream};
-use s3s::{Body, S3Request, S3Response, StdError};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, StdError, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -145,14 +142,24 @@ pub fn register_diagnostics_route(r: &mut S3Router<AdminOperation>) -> std::io::
 // Shared auth helper
 // ---------------------------------------------------------------------------
 
+/// Owned-boundary form of `crate::admin::utils::json_response`, which still
+/// answers with the s3s response type.
+fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<AdminResponse> {
+    let data = serde_json::to_vec(value)
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(AdminResponse::with_headers(status, Body::from(data), headers))
+}
+
 /// The pre-check keeps these endpoints' historical `AccessDenied` missing-credentials
 /// response; the shared gate reports `InvalidRequest` "get cred failed".
-async fn authorize(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize(req: &AdminRequest, action: AdminAction) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(AccessDenied, "Signature is required"));
     }
 
-    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await?;
     Ok(())
 }
 
@@ -414,9 +421,9 @@ pub struct TopLocksHandler {}
 
 #[async_trait::async_trait]
 impl Operation for TopLocksHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize(&req, AdminAction::TopLocksAdminAction).await?;
-        let limit = parse_top_locks_limit(&req.uri);
+        let limit = parse_top_locks_limit(req.uri());
         let response = collect_top_locks(limit).await;
         json_response(StatusCode::OK, &response)
     }
@@ -467,12 +474,12 @@ pub struct ForceUnlockHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ForceUnlockHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize(&req, AdminAction::ForceUnlockAdminAction).await?;
 
         // Resources may arrive as a JSON body or as repeated `resource` query params.
-        let mut resources: Vec<String> = query_values(&req.uri, "resource");
-        let body = read_body(req.input).await?;
+        let mut resources: Vec<String> = query_values(req.uri(), "resource");
+        let body = read_body(req.take_body()).await?;
         if !body.is_empty() {
             let parsed: ForceUnlockRequest = serde_json::from_slice(&body)
                 .map_err(|e| s3_error!(InvalidRequest, "invalid force-unlock request body: {}", e))?;
@@ -688,7 +695,7 @@ pub struct HealthInfoHandler {}
 
 #[async_trait::async_trait]
 impl Operation for HealthInfoHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize(&req, AdminAction::HealthInfoAdminAction).await?;
         let response = collect_health_info().await;
         json_response(StatusCode::OK, &response)
@@ -698,19 +705,6 @@ impl Operation for HealthInfoHandler {
 // ---------------------------------------------------------------------------
 // #607 GET /v3/log — MinIO-compatible streaming log endpoint
 // ---------------------------------------------------------------------------
-
-struct ByteChannelStream {
-    inner: ReceiverStream<Result<Bytes, StdError>>,
-}
-
-impl Stream for ByteChannelStream {
-    type Item = Result<Bytes, StdError>;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).inner.poll_next_unpin(cx)
-    }
-}
-
-impl ByteStream for ByteChannelStream {}
 
 /// A single console-log record, shaped after MinIO's `LogInfo`.
 #[derive(Debug, Clone, Serialize)]
@@ -728,7 +722,7 @@ pub struct ConsoleLogHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ConsoleLogHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize(&req, AdminAction::ConsoleLogAdminAction).await?;
 
         // RustFS routes logs to the tracing pipeline (stdout / OTLP sinks) and
@@ -773,12 +767,13 @@ impl Operation for ConsoleLogHandler {
             }
         });
 
-        let stream: DynByteStream = Box::pin(ByteChannelStream {
-            inner: ReceiverStream::new(rx),
-        });
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE_NDJSON));
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(stream)), headers))
+        Ok(AdminResponse::with_headers(
+            StatusCode::OK,
+            Body::from_stream(ReceiverStream::new(rx)),
+            headers,
+        ))
     }
 }
 
@@ -1016,12 +1011,12 @@ pub struct SpeedtestHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SpeedtestHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         // MinIO gates speedtest behind the health-info (OBD) admin action.
         authorize(&req, AdminAction::HealthInfoAdminAction).await?;
-        let kind = speedtest_kind_from_path(req.uri.path());
+        let kind = speedtest_kind_from_path(req.uri().path());
         // Drain any request body so the connection is not left half-read.
-        let _ = read_body(req.input).await?;
+        let _ = read_body(req.take_body()).await?;
 
         let response = match kind {
             SpeedtestKind::Drive => run_drive_speedtest().await?,
@@ -1102,8 +1097,11 @@ async fn drain_client_devnull(input: Body, max_bytes: u64, max_duration: Duratio
     tokio::time::timeout(max_duration, async move {
         let mut input = input;
         let mut total = 0u64;
-        while let Some(chunk) = input.next().await {
-            let chunk = chunk.map_err(|e| s3_error!(InvalidRequest, "failed to read devnull stream: {}", e))?;
+        while let Some(frame) = input.frame().await {
+            let frame = frame.map_err(|e| s3_error!(InvalidRequest, "failed to read devnull stream: {}", e))?;
+            let Ok(chunk) = frame.into_data() else {
+                continue;
+            };
             let chunk_len = u64::try_from(chunk.len())
                 .map_err(|_| s3_error!(InternalError, "devnull stream chunk length exceeds supported range"))?;
             total = total
@@ -1131,13 +1129,13 @@ async fn drain_client_devnull_with_production_limits(input: Body) -> S3Result<u6
 
 #[async_trait::async_trait]
 impl Operation for SpeedtestClientDevnullHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize(&req, AdminAction::HealthInfoAdminAction).await?;
-        validate_client_devnull_content_length(&req.headers)?;
+        validate_client_devnull_content_length(req.headers())?;
         let _permit = acquire_client_devnull_permit()?;
 
         let started = std::time::Instant::now();
-        let total = drain_client_devnull_with_production_limits(req.input).await?;
+        let total = drain_client_devnull_with_production_limits(req.take_body()).await?;
         let elapsed = started.elapsed();
 
         let response = SpeedtestResponse {
@@ -1161,12 +1159,12 @@ impl Operation for SpeedtestClientDevnullHandler {
 
 #[async_trait::async_trait]
 impl Operation for SpeedtestClientSourceHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize(&req, AdminAction::HealthInfoAdminAction).await?;
-        let bytes = client_source_bytes(&req.uri)?;
+        let bytes = client_source_bytes(req.uri())?;
         let _permit = acquire_client_devnull_permit()?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(vec![0_u8; bytes]))))
+        Ok(AdminResponse::new(StatusCode::OK, Body::from(vec![0_u8; bytes])))
     }
 }
 
@@ -1196,18 +1194,12 @@ mod tests {
     use http::{Extensions, Uri};
     use rustfs_s3_types::S3ErrorCode;
 
-    fn build_request(method: Method, uri: &'static str) -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method,
-            uri: Uri::from_static(uri),
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn build_request(method: Method, uri: &'static str) -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(method, Uri::from_static(uri))
+            .headers(HeaderMap::new())
+            .extensions(Extensions::new())
+            .body(Body::empty())
+            .build()
     }
 
     /// These endpoints authorize through the shared admin gate, which rejects a
@@ -1231,7 +1223,8 @@ mod tests {
         let err = TopLocksHandler {}
             .call(build_request(Method::GET, "/rustfs/admin/v3/top/locks"), Params::new())
             .await
-            .expect_err("must reject anonymous requests");
+            .err()
+            .expect("must reject anonymous requests");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 
@@ -1240,7 +1233,8 @@ mod tests {
         let err = ForceUnlockHandler {}
             .call(build_request(Method::POST, "/rustfs/admin/v3/force-unlock"), Params::new())
             .await
-            .expect_err("must reject anonymous requests");
+            .err()
+            .expect("must reject anonymous requests");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 
@@ -1249,7 +1243,8 @@ mod tests {
         let err = HealthInfoHandler {}
             .call(build_request(Method::GET, "/rustfs/admin/v3/healthinfo"), Params::new())
             .await
-            .expect_err("must reject anonymous requests");
+            .err()
+            .expect("must reject anonymous requests");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 
@@ -1258,7 +1253,8 @@ mod tests {
         let err = SpeedtestHandler {}
             .call(build_request(Method::POST, "/rustfs/admin/v3/speedtest/drive"), Params::new())
             .await
-            .expect_err("must reject anonymous requests");
+            .err()
+            .expect("must reject anonymous requests");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 
@@ -1274,10 +1270,7 @@ mod tests {
     #[tokio::test]
     async fn client_devnull_enforces_duration_limit() {
         let (tx, rx) = mpsc::channel::<Result<Bytes, StdError>>(1);
-        let stream: DynByteStream = Box::pin(ByteChannelStream {
-            inner: ReceiverStream::new(rx),
-        });
-        let body = Body::from(stream);
+        let body = Body::from_stream(ReceiverStream::new(rx));
 
         let err = drain_client_devnull(body, 4, Duration::ZERO)
             .await
@@ -1292,10 +1285,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn client_devnull_production_limits_enforce_advertised_timeout() {
         let (tx, rx) = mpsc::channel::<Result<Bytes, StdError>>(1);
-        let stream: DynByteStream = Box::pin(ByteChannelStream {
-            inner: ReceiverStream::new(rx),
-        });
-        let task = tokio::spawn(drain_client_devnull_with_production_limits(Body::from(stream)));
+        let task = tokio::spawn(drain_client_devnull_with_production_limits(Body::from_stream(ReceiverStream::new(rx))));
 
         tokio::task::yield_now().await;
         tokio::time::advance(CLIENT_DEVNULL_MAX_DURATION + Duration::from_millis(1)).await;
