@@ -159,8 +159,18 @@ pub fn lstat_std(path: impl AsRef<Path>) -> io::Result<Metadata> {
     std::fs::symlink_metadata(path)
 }
 
+pub fn create_dir_all_std(path: &Path) -> io::Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::create_dir_all(path),
+        Err(e) => Err(e),
+    }
+}
+
 pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
-    fs::create_dir_all(path.as_ref()).await
+    let path = path.as_ref().to_path_buf();
+    tokio::task::spawn_blocking(move || create_dir_all_std(&path)).await?
 }
 
 fn is_dir_error(e: &io::Error) -> bool {
@@ -210,6 +220,7 @@ pub fn remove_all_std(path: impl AsRef<Path>) -> io::Result<()> {
     }
 }
 
+#[cfg(test)]
 pub async fn mkdir(path: impl AsRef<Path>) -> io::Result<()> {
     fs::create_dir(path.as_ref()).await
 }
@@ -239,7 +250,7 @@ impl BucketExistenceCache {
         }
     }
 
-    fn check_exists(&self, path: &PathBuf) -> Option<bool> {
+    fn check_exists(&self, path: &Path) -> Option<bool> {
         let mut cache = self.cache.lock().ok()?;
         if let Some((timestamp, exists)) = cache.get(path) {
             if timestamp.elapsed() < self.ttl {
@@ -256,7 +267,7 @@ impl BucketExistenceCache {
         }
     }
 
-    fn invalidate(&self, path: &PathBuf) {
+    fn invalidate(&self, path: &Path) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.remove(path);
         }
@@ -268,15 +279,16 @@ static BUCKET_EXISTENCE_CACHE: std::sync::LazyLock<BucketExistenceCache> =
 
 /// Cached access check - reduces statx syscalls
 pub async fn cached_access(path: impl AsRef<Path>) -> io::Result<()> {
-    let path_buf = path.as_ref().to_path_buf();
+    let path = path.as_ref();
 
-    if let Some(exists) = BUCKET_EXISTENCE_CACHE.check_exists(&path_buf) {
+    if let Some(exists) = BUCKET_EXISTENCE_CACHE.check_exists(path) {
         if exists {
             return Ok(());
         }
         return Err(io::Error::new(io::ErrorKind::NotFound, "bucket not found (cached)"));
     }
 
+    let path_buf = path.to_path_buf();
     let result = fs::metadata(&path_buf).await;
 
     match &result {
@@ -292,7 +304,7 @@ pub async fn cached_access(path: impl AsRef<Path>) -> io::Result<()> {
 }
 
 pub fn invalidate_bucket_cache(path: impl AsRef<Path>) {
-    BUCKET_EXISTENCE_CACHE.invalidate(&path.as_ref().to_path_buf());
+    BUCKET_EXISTENCE_CACHE.invalidate(path.as_ref());
 }
 
 #[cfg(test)]
