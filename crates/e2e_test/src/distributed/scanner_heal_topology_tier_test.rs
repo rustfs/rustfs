@@ -21,6 +21,7 @@ use super::harness::{
     rebalance_status_json, sha256_hex, start_decommission, start_rebalance, unique_bucket, wait_for_decommission_complete,
     wait_for_rebalance_complete,
 };
+use super::publication_log::PublicationEvents;
 use super::scanner_heal_topology_fixture::{
     MOVEMENT_COMPLETE_TIMEOUT, MovementOperation, SEED_POOL, STAGE_AFTER_RESPONSIBILITY_PERSISTED, STAGE_BEFORE_SOURCE_CLEANUP,
     TopologyRun, assert_bucket_durability_strict, assert_process_durability_strict, require_test_hooks,
@@ -174,29 +175,6 @@ async fn transition_version(
     }
 }
 
-fn lock_events(run: &TopologyRun, bucket: &str) -> TestResult<Vec<Value>> {
-    let mut events = Vec::new();
-    for path in run.node_log_paths() {
-        let log = std::fs::read_to_string(path)?;
-        for line in log.lines() {
-            let Ok(row) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            let fields = row.get("fields").unwrap_or(&row);
-            if fields.get("event").and_then(Value::as_str) == Some("object_namespace_lock")
-                && fields.get("op").and_then(Value::as_str) == Some("data_movement_publication")
-                && fields.get("bucket").and_then(Value::as_str) == Some(bucket)
-                && fields.get("object").and_then(Value::as_str) == Some(KEY)
-            {
-                let mut event = fields.clone();
-                event["timestamp"] = row["timestamp"].clone();
-                events.push(event);
-            }
-        }
-    }
-    Ok(events)
-}
-
 fn event_time(event: &Value) -> TestResult<OffsetDateTime> {
     Ok(OffsetDateTime::parse(
         event["timestamp"].as_str().ok_or("lock event omitted its timestamp")?,
@@ -204,10 +182,10 @@ fn event_time(event: &Value) -> TestResult<OffsetDateTime> {
     )?)
 }
 
-async fn pending_publication(run: &TopologyRun, bucket: &str, started: OffsetDateTime) -> TestResult<Value> {
+async fn pending_publication(events: &mut PublicationEvents, started: OffsetDateTime) -> TestResult<Value> {
     loop {
-        let events = lock_events(run, bucket)?;
-        for event in &events {
+        let observed = events.poll()?;
+        for event in observed {
             if event_time(event)? < started {
                 continue;
             }
@@ -216,7 +194,7 @@ async fn pending_publication(run: &TopologyRun, bucket: &str, started: OffsetDat
                 "mover acquired its publication lock while remote DELETE was held"
             );
             if event["state"] == "acquiring"
-                && !events
+                && !observed
                     .iter()
                     .any(|later| later["lock_attempt_id"] == event["lock_attempt_id"] && later["state"] != "acquiring")
             {
@@ -228,14 +206,14 @@ async fn pending_publication(run: &TopologyRun, bucket: &str, started: OffsetDat
     }
 }
 
-async fn acquired_publication(run: &TopologyRun, bucket: &str, pending: &Value) -> TestResult<Value> {
+async fn acquired_publication(events: &mut PublicationEvents, pending: &Value) -> TestResult<Value> {
     loop {
-        for event in lock_events(run, bucket)? {
+        for event in events.poll()? {
             if event["lock_attempt_id"] != pending["lock_attempt_id"] {
                 continue;
             }
             match event["state"].as_str() {
-                Some("acquired") => return Ok(event),
+                Some("acquired") => return Ok(event.clone()),
                 Some("failed" | "cancelled") => return Err(format!("held publication attempt did not acquire: {event}").into()),
                 _ => {}
             }
@@ -403,6 +381,7 @@ async fn tier_delete_during_movement(decommission: bool) -> TestResult {
     // started a worker. Install a separate release nonce before holding DELETE.
     let cleanup_barrier = run.movement_barrier.next_phase();
     cleanup_barrier.arm_movement(operation, &bucket, KEY, STAGE_BEFORE_SOURCE_CLEANUP)?;
+    let mut publication_events = PublicationEvents::new(run.node_log_paths(), &bucket, KEY)?;
     let mut delete_gate = target.hold_delete_object(&remote_bucket, &old_remote.key);
     // The public DELETE persists a free owner and enqueues its remote cleanup.
     let client = run.dist.client(0)?;
@@ -470,11 +449,11 @@ async fn tier_delete_during_movement(decommission: bool) -> TestResult {
     })?;
     drop(decommission_start);
     let movement_acknowledged_at = OffsetDateTime::now_utc();
-    let pending = timeout_at(overlap_deadline, pending_publication(&run, &bucket, movement_started))
+    let pending = timeout_at(overlap_deadline, pending_publication(&mut publication_events, movement_started))
         .await
         .map_err(|error| format!(
             "G-TIER {operation} publication pending timed out within DELETE overlap: {error}; startup={startup}; lock_events={:?}; cleanup_barrier={:?}",
-            lock_events(&run, &bucket), cleanup_barrier.reached_observations()
+            publication_events.cached(), cleanup_barrier.reached_observations()
         ))?
         .map_err(|error| format!("G-TIER {operation} publication pending failed within DELETE overlap: {error}"))?;
     // Positive gate entry, exact physical ownership and the pending lock attempt
@@ -484,11 +463,11 @@ async fn tier_delete_during_movement(decommission: bool) -> TestResult {
     let released_at = OffsetDateTime::now_utc();
     let delete_overlap_elapsed_ms = overlap_started.elapsed().as_millis();
     drop(delete_gate);
-    let acquired = timeout(DELETE_OVERLAP_TIMEOUT, acquired_publication(&run, &bucket, &pending))
+    let acquired = timeout(DELETE_OVERLAP_TIMEOUT, acquired_publication(&mut publication_events, &pending))
         .await
         .map_err(|error| format!(
             "G-TIER {operation} publication acquired after DELETE release timed out: {error}; pending={pending}; lock_events={:?}; cleanup_barrier={:?}",
-            lock_events(&run, &bucket), cleanup_barrier.reached_observations()
+            publication_events.cached(), cleanup_barrier.reached_observations()
         ))?
         .map_err(|error| format!("G-TIER {operation} publication acquired after DELETE release failed: {error}"))?;
     assert!(event_time(&pending)? >= movement_started && event_time(&pending)? < released_at);
@@ -496,6 +475,7 @@ async fn tier_delete_during_movement(decommission: bool) -> TestResult {
         event_time(&acquired)? >= released_at,
         "the same publication attempt must acquire after DELETE is released"
     );
+    drop(publication_events);
     let reached = cleanup_barrier
         .wait_reached_during(
             &run.dist.cluster,

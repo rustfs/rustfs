@@ -4040,6 +4040,7 @@ dependencies = [
  "rustfs-utils",
  "rustls",
  "s3s",
+ "same-file",
  "serde",
  "serde_json",
  "serde_urlencoded",
