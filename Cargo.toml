@@ -66,6 +66,7 @@ members = [
     "crates/io-metrics", # I/O metrics collection for performance analysis
     "crates/io-core", # Buffered Bytes, mmap-then-copy, and aligned pread I/O helpers
     "crates/zip", # ZIP file handling and compression
+    "crates/zstd-compat", # Fixed codec for dependencies requiring zstd 0.13
 ]
 resolver = "3"
 
@@ -425,6 +426,7 @@ strip = "none"
 
 # Pin upstream fixes until compatible crates.io releases are available.
 [patch.crates-io]
+zstd = { path = "crates/zstd-compat" }
 # Preserve RustFS OIDC flows while migrating the old elliptic-curve dependency chain.
 # Upstream: openidconnect-rs#244 and oauth2-rs#352.
 openidconnect = { git = "https://github.com/ramosbugs/openidconnect-rs", rev = "2f77ee73bc4554e1cb6279adb386005429fb4e41" }
