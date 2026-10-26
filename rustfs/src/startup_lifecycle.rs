@@ -117,6 +117,36 @@ pub(crate) struct StartupRuntimeLifecycle {
     pub(crate) readiness: Arc<GlobalReadiness>,
 }
 
+#[derive(Debug)]
+struct StartupShutdownFailure {
+    capacity: Option<Error>,
+    observability: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl std::fmt::Display for StartupShutdownFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(capacity) = &self.capacity {
+            write!(f, "{capacity}")?;
+        }
+        if let Some(observability) = &self.observability {
+            if self.capacity.is_some() {
+                write!(f, "; ")?;
+            }
+            write!(f, "shutdown_global_guard: {observability}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for StartupShutdownFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.capacity {
+            Some(capacity) => Some(capacity),
+            None => self.observability.as_ref().map(|error| error.as_ref() as _),
+        }
+    }
+}
+
 pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifecycle) -> Result<()> {
     let StartupRuntimeLifecycle {
         server_address,
@@ -158,7 +188,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
     let scanner_cleanup = init_scanner_with_recovery(shutdown_token.clone(), store, enable_scanner).await;
 
     let shutdown_signal = wait_for_shutdown().await;
-    run_startup_shutdown_sequence(
+    let shutdown_report = run_startup_shutdown_sequence(
         &state_manager,
         shutdown_signal,
         s3_shutdown_tx,
@@ -202,6 +232,8 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         );
     }
 
+    let capacity_error = shutdown_report.finish().await.err();
+
     info!(
         target: "rustfs::main::run",
         event = EVENT_SERVER_SHUTDOWN_STATE,
@@ -211,9 +243,21 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         result = "stopped",
         "RustFS server stopped"
     );
-    startup_runtime_sources::shutdown_observability_guard()
-        .map_err(|err| Error::other(format!("shutdown_global_guard: {err}")))?;
-    Ok(())
+    let observability_error = startup_runtime_sources::shutdown_observability_guard()
+        .err()
+        .map(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>);
+    if capacity_error.is_none() && observability_error.is_none() {
+        Ok(())
+    } else {
+        let kind = capacity_error.as_ref().map_or(std::io::ErrorKind::Other, Error::kind);
+        Err(Error::new(
+            kind,
+            StartupShutdownFailure {
+                capacity: capacity_error,
+                observability: observability_error,
+            },
+        ))
+    }
 }
 
 async fn wait_for_scanner_cleanup(cleanup: tokio::task::JoinHandle<()>) -> bool {

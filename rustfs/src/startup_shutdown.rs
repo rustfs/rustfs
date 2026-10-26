@@ -240,6 +240,127 @@ where
     true
 }
 
+/// Own the same accepted capacity shutdown through the later lifecycle cleanup.
+pub(crate) struct CapacityShutdownReport {
+    configured: bool,
+    timed_out: bool,
+    result: Option<std::result::Result<(), tokio::task::JoinError>>,
+    pending: Option<std::pin::Pin<Box<dyn Future<Output = std::result::Result<(), tokio::task::JoinError>> + Send>>>,
+}
+
+#[derive(Debug)]
+struct CapacityShutdownFailure {
+    timed_out: bool,
+    joined: bool,
+    join_error: Option<tokio::task::JoinError>,
+}
+
+impl std::fmt::Display for CapacityShutdownFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match &self.join_error {
+            Some(error) => join_failure_reason(error),
+            None if self.joined => "owned tasks joined",
+            None => "actual join unconfirmed",
+        };
+        if self.timed_out {
+            write!(f, "capacity shutdown exceeded its original deadline: {reason}")
+        } else {
+            write!(f, "capacity shutdown failed: {reason}")
+        }
+    }
+}
+
+impl std::error::Error for CapacityShutdownFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.join_error.as_ref().map(|error| error as _)
+    }
+}
+
+impl CapacityShutdownReport {
+    async fn observe_deadline(&mut self) {
+        let Some(shutdown) = self.pending.as_mut() else {
+            return;
+        };
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            state = "stopping",
+            service = BACKGROUND_SERVICE_CAPACITY,
+            "Background service shutdown started"
+        );
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        let observed = tokio::time::timeout_at(deadline, shutdown.as_mut()).await;
+        // Ready wins inside Tokio Timeout, so a late observation must fail closed.
+        self.timed_out |= observed.is_err() || tokio::time::Instant::now() >= deadline;
+        match &observed {
+            Ok(Ok(())) if !self.timed_out => info!(
+                target: "rustfs::main::handle_shutdown",
+                event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                state = "stopped",
+                service = BACKGROUND_SERVICE_CAPACITY,
+                "Background service shutdown completed"
+            ),
+            Ok(Err(err)) if !self.timed_out => error!(
+                target: "rustfs::main::handle_shutdown",
+                event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                state = "stop_failed",
+                service = BACKGROUND_SERVICE_CAPACITY,
+                reason = join_failure_reason(err),
+                "Background service shutdown failed"
+            ),
+            _ => error!(
+                target: "rustfs::main::handle_shutdown",
+                event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                state = "stop_failed",
+                service = BACKGROUND_SERVICE_CAPACITY,
+                reason = "timeout",
+                timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
+                "Background service shutdown timed out"
+            ),
+        }
+        if let Ok(result) = observed {
+            self.result = Some(result);
+            self.pending = None;
+        }
+    }
+
+    fn allows_marker_clear(&self) -> bool {
+        !self.configured || (!self.timed_out && matches!(self.result, Some(Ok(()))))
+    }
+
+    pub(crate) async fn finish(mut self) -> std::io::Result<()> {
+        if let Some(pending) = self.pending.take() {
+            // Cleanup-only observation of the same future never resets its deadline.
+            self.result = Some(pending.await);
+        }
+        if !self.configured || (!self.timed_out && matches!(self.result, Some(Ok(())))) {
+            return Ok(());
+        }
+        let joined = self.result.is_some();
+        let join_error = self.result.and_then(std::result::Result::err);
+        Err(std::io::Error::new(
+            if self.timed_out {
+                std::io::ErrorKind::TimedOut
+            } else {
+                std::io::ErrorKind::Other
+            },
+            CapacityShutdownFailure {
+                timed_out: self.timed_out,
+                joined,
+                join_error,
+            },
+        ))
+    }
+}
+
 pub(crate) struct StartupBackgroundTasks {
     pub(crate) capacity: Option<CapacityBackgroundTasks>,
     pub(crate) table_maintenance: Option<crate::table_catalog::PeriodicMaintenanceRuntime>,
@@ -253,7 +374,7 @@ pub(crate) async fn run_startup_shutdown_sequence(
     optional_runtimes: OptionalRuntimeServices,
     background_tasks: StartupBackgroundTasks,
     ctx: CancellationToken,
-) {
+) -> CapacityShutdownReport {
     let StartupBackgroundTasks {
         capacity: capacity_tasks,
         table_maintenance,
@@ -283,49 +404,18 @@ pub(crate) async fn run_startup_shutdown_sequence(
         handle.signal();
     }
 
-    if let Some(capacity_tasks) = capacity_tasks {
-        info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            service = BACKGROUND_SERVICE_CAPACITY,
-            state = "stopping",
-            "Background service shutdown started"
-        );
-        match tokio::time::timeout(SHUTDOWN_TIMEOUT, capacity_tasks.shutdown()).await {
-            Ok(Ok(())) => info!(
-                target: "rustfs::main::handle_shutdown",
-                event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                service = BACKGROUND_SERVICE_CAPACITY,
-                state = "stopped",
-                "Background service shutdown completed"
-            ),
-            Ok(Err(err)) => error!(
-                target: "rustfs::main::handle_shutdown",
-                event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                service = BACKGROUND_SERVICE_CAPACITY,
-                state = "stop_failed",
-                reason = join_failure_reason(&err),
-                "Background service shutdown failed"
-            ),
-            Err(_) => error!(
-                target: "rustfs::main::handle_shutdown",
-                event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                service = BACKGROUND_SERVICE_CAPACITY,
-                state = "stop_failed",
-                reason = "timeout",
-                timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
-                "Background service shutdown timed out"
-            ),
-        }
+    let optional_runtime_shutdowns = prepare_optional_runtime_shutdowns(optional_runtimes);
+    for handle in &optional_runtime_shutdowns {
+        handle.signal();
     }
+
+    let mut capacity_report = CapacityShutdownReport {
+        configured: capacity_tasks.is_some(),
+        timed_out: false,
+        result: None,
+        pending: capacity_tasks.map(|tasks| Box::pin(tasks.shutdown()) as _),
+    };
+    capacity_report.observe_deadline().await;
 
     let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
     let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
@@ -396,8 +486,6 @@ pub(crate) async fn run_startup_shutdown_sequence(
         "Compression total persist started"
     );
     crate::storage_api::startup::shutdown::store_compression_total_in_backend().await;
-
-    let optional_runtime_shutdowns = prepare_optional_runtime_shutdowns(optional_runtimes);
 
     info!(
         target: "rustfs::main::handle_shutdown",
@@ -479,7 +567,7 @@ pub(crate) async fn run_startup_shutdown_sequence(
     // FTP, SFTP and WebDAV can start deletes too: wait for detached mutations
     // only after every front end has stopped.
     finish_detached_mutations_and_clear_unclean_shutdown_markers(
-        heal_handoff_complete && maintenance_drained,
+        heal_handoff_complete && maintenance_drained && capacity_report.allows_marker_clear(),
         DETACHED_MUTATION_SHUTDOWN_TIMEOUT,
         wait_for_detached_mutations,
         rustfs_heal::heal::clear_unclean_shutdown_markers(),
@@ -494,6 +582,7 @@ pub(crate) async fn run_startup_shutdown_sequence(
         state = "stopped",
         "RustFS server stopped"
     );
+    capacity_report
 }
 
 async fn run_embedded_runtime_cleanup(mut cleanup: EmbeddedRuntimeCleanup) {
@@ -672,6 +761,192 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::broadcast;
     use tokio_util::sync::CancellationToken;
+
+    #[tokio::test(start_paused = true)]
+    async fn capacity_report_late_ready_observation_keeps_deadline_failure_and_original_join() {
+        for panics in [false, true] {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _ = entered_tx.send(());
+                if release_rx.await.is_ok() {
+                    let _ = completed_tx.send(());
+                    assert!(!panics, "expected late capacity task failure");
+                }
+            });
+            let task_id = task.id();
+            let task_finished = task.abort_handle();
+            entered_rx.await.expect("the real task must start before observation");
+            let mut report = super::CapacityShutdownReport {
+                configured: true,
+                timed_out: false,
+                result: None,
+                pending: Some(Box::pin(task)),
+            };
+            let (first_pending, released, completed) = {
+                let mut observation = Box::pin(report.observe_deadline());
+                let first_pending = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(std::future::Future::poll(observation.as_mut(), cx).is_pending())
+                })
+                .await;
+                // Leave the actual observer unpolled until the original deadline
+                // has passed and the same real task has completely finished.
+                tokio::time::advance(super::SHUTDOWN_TIMEOUT + Duration::from_millis(1)).await;
+                let released = release_tx.send(()).is_ok();
+                let completed = completed_rx.await.is_ok();
+                while !task_finished.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+                if first_pending {
+                    observation.await;
+                }
+                (first_pending, released, completed)
+            };
+            let timed_out = report.timed_out;
+            let marker_allowed = report.allows_marker_clear();
+            let consumed = report.pending.is_none();
+            let joined = report.result.is_some();
+            let error = report.finish().await.expect_err("a late Ready observation must stay failed");
+            // Every assertion follows release, actual task exit and final observation.
+            assert!(first_pending && released && completed && consumed && joined);
+            assert!(timed_out && !marker_allowed);
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            if panics {
+                let failure = error.get_ref().expect("typed capacity failure");
+                let source = std::error::Error::source(failure).expect("late actual JoinError source");
+                let source = source
+                    .downcast_ref::<tokio::task::JoinError>()
+                    .expect("actual JoinError type");
+                assert!(source.is_panic());
+                assert_eq!(source.id(), task_id);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn capacity_report_ready_future_is_polled_once_and_cached_success_finishes() {
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_polls = polls.clone();
+        let report = super::CapacityShutdownReport {
+            configured: true,
+            timed_out: false,
+            result: None,
+            pending: Some(Box::pin(std::future::poll_fn(move |_| {
+                assert_eq!(observed_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst), 0);
+                std::task::Poll::Ready(Ok(()))
+            }))),
+        };
+        assert!(!report.allows_marker_clear(), "unobserved completion cannot clear markers");
+        report.finish().await.expect("the ready future should finish once");
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let completed = super::CapacityShutdownReport {
+            configured: true,
+            timed_out: false,
+            result: Some(Ok(())),
+            pending: None,
+        };
+        assert!(completed.allows_marker_clear());
+        completed
+            .finish()
+            .await
+            .expect("consumed timely completion needs no second poll");
+    }
+
+    #[tokio::test]
+    async fn capacity_report_configured_unknown_completion_fails_closed() {
+        let report = super::CapacityShutdownReport {
+            configured: true,
+            timed_out: false,
+            result: None,
+            pending: None,
+        };
+        assert!(!report.allows_marker_clear());
+        assert_eq!(
+            report.finish().await.expect_err("unknown completion must fail").kind(),
+            std::io::ErrorKind::Other
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_report_timeout_waits_for_held_future_and_stays_failed() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            started_tx.send(()).expect("the test should observe the task start");
+            release_rx.await.expect("the same held task must remain alive until release");
+            completed_tx.send(()).expect("the test should observe actual completion");
+        });
+        started_rx.await.expect("the real task should start");
+        let report = super::CapacityShutdownReport {
+            configured: true,
+            timed_out: true,
+            result: None,
+            pending: Some(Box::pin(task)),
+        };
+        assert!(!report.allows_marker_clear());
+        let mut finish = Box::pin(report.finish());
+        tokio::select! {
+            biased;
+            result = finish.as_mut() => panic!("finish returned before the held task was released: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        release_tx.send(()).expect("finish must not cancel the held task");
+        let error = finish
+            .await
+            .expect_err("late successful join must retain the timeout failure");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        completed_rx
+            .await
+            .expect("the same task must really complete before finish returns");
+
+        let completed_late = super::CapacityShutdownReport {
+            configured: true,
+            timed_out: true,
+            result: Some(Ok(())),
+            pending: None,
+        };
+        assert!(
+            !completed_late.allows_marker_clear(),
+            "late completion must not restore marker eligibility"
+        );
+        assert_eq!(
+            completed_late
+                .finish()
+                .await
+                .expect_err("cached late completion must remain failed")
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_report_preserves_actual_join_error_source() {
+        let task = tokio::spawn(async { panic!("expected capacity report task failure") });
+        let task_id = task.id();
+        let join_error = task.await.expect_err("the real task should panic");
+        let report = super::CapacityShutdownReport {
+            configured: true,
+            timed_out: false,
+            result: Some(Err(join_error)),
+            pending: None,
+        };
+        assert!(!report.allows_marker_clear());
+        let error = report
+            .finish()
+            .await
+            .expect_err("the observed task failure must remain a failure");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        let failure = error.get_ref().expect("the typed capacity failure must remain attached");
+        let source = std::error::Error::source(failure).expect("the real JoinError must remain the source");
+        let source = source
+            .downcast_ref::<tokio::task::JoinError>()
+            .expect("the source must retain its JoinError type");
+        assert!(source.is_panic());
+        assert_eq!(source.id(), task_id, "the original task identity must survive error propagation");
+    }
 
     #[test]
     fn background_shutdown_plan_keeps_scanner_before_ahm() {
