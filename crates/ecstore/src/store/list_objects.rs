@@ -93,7 +93,7 @@ type WalkOptions = StorageWalkOptions<fn(&rustfs_filemeta::FileInfo) -> bool>;
 /// Build the versioned listing options used by recursive object walks.
 ///
 /// `list_path_result` normally derives these scan bounds before dispatching to
-/// a disk. Versioned walks call `list_path` directly, so they must establish the
+/// a disk. Set walks call the version scan directly, so they must establish the
 /// same base directory and child-prefix filter at this boundary.
 fn recursive_walk_list_path_options(bucket: String, prefix: &str, opts: &WalkOptions) -> ListPathOptions {
     let mut list_options = ListPathOptions {
@@ -1393,6 +1393,16 @@ fn listing_quorum_from_ask_disks(ask_disks: i32) -> usize {
     positive_ask_disks(ask_disks)
         .map(|asked| asked.div_ceil(2))
         .unwrap_or_default()
+}
+
+/// Fewer online drives than a read quorum cannot prove a page complete.
+/// MinIO lists from whatever drives answer; RustFS fails the page instead.
+fn set_listing_read_floor(drive_count: usize, parity_count: usize) -> usize {
+    if parity_count == 0 {
+        drive_count
+    } else {
+        drive_count.div_ceil(2)
+    }
 }
 
 fn bounded_usize_to_i32(value: usize) -> i32 {
@@ -3183,7 +3193,7 @@ impl SetDisks {
         let forwarder = spawn_walk_entry_forwarder(rx.clone(), entry_rx, result, opts.clone(), bucket.to_owned());
 
         let list_options = recursive_walk_list_path_options(bucket.to_owned(), prefix, &opts);
-        let list_result = self.list_path(rx, list_options, entry_tx).await;
+        let list_result = self.list_versions_authoritatively(rx, list_options, entry_tx).await;
 
         let _ = forwarder.await;
 
@@ -3245,7 +3255,15 @@ impl SetDisks {
         let mut opts = o.clone();
         opts.stop_disk_at_limit = true;
         let producer_cancel = cancel.clone();
-        let producer = async move { set.list_path(producer_cancel, opts, sender).await };
+        // Set-scoped version pages back recursive prefix deletes, which must
+        // not skip a version that may still exist.
+        let producer = async move {
+            if opts.versioned {
+                set.list_versions_authoritatively(producer_cancel, opts, sender).await
+            } else {
+                set.list_path(producer_cancel, opts, sender).await
+            }
+        };
         let mut page = match collect_list_path_results("set_disks", &log_context, cancel, o.clone(), recv, producer).await {
             Ok(page) => page,
             Err(err) => {
@@ -3276,6 +3294,12 @@ impl SetDisks {
         Ok(page)
     }
 
+    /// Version scan for set-scoped callers that act on absence: set walks
+    /// (tier reference proofs, tier-delete journals, pool maintenance) and the
+    /// recursive prefix-delete scan. Every online drive is read and each
+    /// version is resolved at the read quorum of its own erasure layout; a
+    /// version that cannot be ruled out fails the scan instead of being
+    /// omitted. Merged `ListObjectVersions` pages go through `list_path`.
     async fn list_versions_authoritatively(
         &self,
         rx: CancellationToken,
@@ -3285,7 +3309,7 @@ impl SetDisks {
         let (disks, _, _) = self.get_online_disks_with_healing_and_info(true).await;
         let disk_count = self.set_drive_count;
         let parity = self.default_parity_count;
-        let read_quorum = if parity == 0 { disk_count } else { disk_count.div_ceil(2) };
+        let read_quorum = set_listing_read_floor(disk_count, parity);
         if disk_count == 0 || disks.len() < read_quorum {
             return Err(DiskError::ErasureReadQuorum.into());
         }
@@ -3348,15 +3372,18 @@ impl SetDisks {
         opts: ListPathOptions,
         sender: Sender<MetaCacheEntry>,
     ) -> Result<ListPathRawOutcome> {
-        if opts.versioned {
-            return self.list_versions_authoritatively(rx, opts, sender).await;
-        }
         let list_path_started = std::time::Instant::now();
 
         let (mut disks, infos, _) = self.get_online_disks_with_healing_and_info(true).await;
         // Captured before any quorum-based filtering: only genuinely
         // unreachable drives may relax the write-quorum requirement.
         let online_disks = disks.len();
+        // Version pages resolve every version at listing quorum and omit the
+        // rest, as MinIO's listPath does with requestedVersions = 0. Unlike
+        // MinIO they still require a read quorum of online drives.
+        if opts.versioned && online_disks < set_listing_read_floor(self.set_drive_count, self.default_parity_count) {
+            return Err(DiskError::ErasureReadQuorum.into());
+        }
 
         let mut ask_disks = get_list_quorum(&opts.ask_disks, self.set_drive_count as i32);
         if ask_disks == -1 {
@@ -6227,15 +6254,10 @@ mod test {
     }
 
     #[test]
-    fn version_listing_rejects_stale_markers_at_full_set_read_quorum() {
+    fn authoritative_version_scan_rejects_stale_markers_at_full_set_read_quorum() {
         let marker = test_delete_marker_meta_entry(
             "marker.bin",
             time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time"),
-        );
-        let sampled = MetaCacheEntries((0..8).map(|slot| (slot < 4).then(|| marker.clone())).collect());
-        assert!(
-            resolve_listing_entries(sampled, list_metadata_resolution_params("bucket".into(), 4, 12, true, 0), false).is_some(),
-            "the former sampled resolver accepts the four stale replicas"
         );
         for copies in [1, 4, 7, 8, 9, 16] {
             let entries = MetaCacheEntries((0..16).map(|slot| (slot < copies).then(|| marker.clone())).collect());
@@ -6246,7 +6268,7 @@ mod test {
     }
 
     #[test]
-    fn version_listing_checks_history_after_a_quorum_marker() {
+    fn authoritative_version_scan_checks_history_after_a_quorum_marker() {
         let time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time");
         let mut marker = test_delete_marker_meta_entry("history.bin", time + time::Duration::seconds(1));
         let history = test_object_meta_entry_with_erasure_versions("history.bin", &[(time, "old", 12, 4)]);
@@ -6274,7 +6296,7 @@ mod test {
     }
 
     #[test]
-    fn version_listing_preserves_metadata_uncertainty() {
+    fn authoritative_version_scan_preserves_metadata_uncertainty() {
         let marker = test_delete_marker_meta_entry(
             "marker.bin",
             time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time"),
@@ -6287,7 +6309,7 @@ mod test {
     }
 
     #[test]
-    fn version_listing_tolerates_corrupt_replicas_only_with_version_quorum() {
+    fn authoritative_version_scan_tolerates_corrupt_replicas_only_with_version_quorum() {
         let entry = test_object_meta_entry_with_erasure_versions(
             "readable.bin",
             &[(time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(), "current", 12, 4)],
@@ -6309,6 +6331,162 @@ mod test {
             } else {
                 assert!(resolved.is_err(), "corruption cannot establish the missing version's absence");
             }
+        }
+    }
+
+    /// Writes `metadata(slot)` as `name`'s xl.meta on every slot that has one.
+    async fn write_version_replicas(
+        dirs: &[tempfile::TempDir],
+        bucket: &str,
+        name: &str,
+        metadata: impl Fn(usize) -> Option<Vec<u8>>,
+    ) {
+        for (slot, dir) in dirs.iter().enumerate() {
+            let bucket_dir = dir.path().join(bucket);
+            tokio::fs::create_dir_all(&bucket_dir).await.expect("create bucket directory");
+            let Some(metadata) = metadata(slot) else {
+                continue;
+            };
+            let object_dir = bucket_dir.join(name);
+            tokio::fs::create_dir_all(&object_dir).await.expect("create object directory");
+            tokio::fs::write(object_dir.join(STORAGE_FORMAT_FILE), metadata)
+                .await
+                .expect("persist replica metadata");
+        }
+    }
+
+    /// Version ids per key from a strict-mode version walk of `set`.
+    async fn strict_version_listing(set: &SetDisks, bucket: &str) -> Vec<(String, Vec<Option<Uuid>>)> {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let walk = set.list_path(
+            CancellationToken::new(),
+            ListPathOptions {
+                bucket: bucket.to_owned(),
+                versioned: true,
+                incl_deleted: true,
+                recursive: true,
+                ask_disks: "strict".to_owned(),
+                limit: 100,
+                ..Default::default()
+            },
+            sender,
+        );
+        let drain = async {
+            let mut entries = Vec::new();
+            while let Some(entry) = receiver.recv().await {
+                if !entry.is_dir() {
+                    entries.push(entry);
+                }
+            }
+            entries
+        };
+        let (result, entries) = timeout(Duration::from_secs(10), async { tokio::join!(walk, drain) })
+            .await
+            .expect("version listing must terminate");
+        result.expect("sub-quorum replicas must not fail a version listing");
+        entries
+            .into_iter()
+            .map(|entry| {
+                let versions = entry.file_info_versions(bucket).expect("listed metadata decodes").versions;
+                (entry.name, versions.into_iter().map(|version| version.version_id).collect())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn version_listing_hides_stale_markers_below_strict_listing_quorum() {
+        let bucket = "version-list-strict-markers";
+        let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks(16, 4).await;
+        let marker = test_delete_marker_meta_entry(
+            "marker",
+            time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time"),
+        );
+        for copies in [1, 4, 7, 8, 9, 16] {
+            write_version_replicas(&dirs, bucket, &format!("marker-{copies:02}"), |slot| {
+                (slot < copies).then(|| marker.metadata.clone())
+            })
+            .await;
+        }
+        let marker_id = Some(Uuid::from_u128(0x44444444555566667777888888888888));
+        // Strict mode asks all sixteen drives, so a version needs eight copies.
+        assert_eq!(
+            strict_version_listing(&set, bucket).await,
+            ["marker-08", "marker-09", "marker-16"].map(|name| (name.to_owned(), vec![marker_id]))
+        );
+    }
+
+    #[tokio::test]
+    async fn version_listing_checks_history_per_version_at_listing_quorum() {
+        let bucket = "version-list-history";
+        let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks(16, 4).await;
+        let time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time");
+        let marker = test_delete_marker_meta_entry("history", time + time::Duration::seconds(1));
+        let mut with_history = marker.clone();
+        let history = test_object_meta_entry_with_erasure_versions("history", &[(time, "old", 12, 4)]);
+        with_history
+            .cached
+            .as_mut()
+            .expect("marker fixture")
+            .versions
+            .extend(history.cached.expect("history fixture").versions);
+        with_history.metadata = with_history
+            .cached
+            .as_ref()
+            .expect("combined fixture")
+            .marshal_msg()
+            .expect("encode history");
+        // (marker copies, history copies), in listing order: each version
+        // needs its own quorum.
+        let cases = [(7, 7), (8, 8), (12, 11), (16, 7), (16, 8), (16, 16)];
+        for (markers, histories) in cases {
+            write_version_replicas(&dirs, bucket, &format!("history-{markers:02}-{histories:02}"), |slot| {
+                if slot < histories {
+                    Some(with_history.metadata.clone())
+                } else {
+                    (slot < markers).then(|| marker.metadata.clone())
+                }
+            })
+            .await;
+        }
+        let marker_id = Some(Uuid::from_u128(0x44444444555566667777888888888888));
+        let expected = cases
+            .iter()
+            .filter_map(|&(markers, histories)| {
+                let versions = [(markers, marker_id), (histories, Some(Uuid::from_u128(1)))]
+                    .into_iter()
+                    .filter_map(|(copies, version)| (copies >= 8).then_some(version))
+                    .collect::<Vec<_>>();
+                (!versions.is_empty()).then(|| (format!("history-{markers:02}-{histories:02}"), versions))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(strict_version_listing(&set, bucket).await, expected);
+    }
+
+    #[test]
+    fn version_listing_tolerates_corrupt_replicas_at_listing_quorum() {
+        let entry = test_object_meta_entry_with_erasure_versions(
+            "readable.bin",
+            &[(time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(), "current", 12, 4)],
+        );
+        let corrupt = MetaCacheEntry {
+            name: entry.name.clone(),
+            metadata: vec![0xff],
+            ..Default::default()
+        };
+        // The resolver a strict version walk over sixteen drives uses.
+        let resolver = rustfs_filemeta::MetadataResolutionParams {
+            dir_quorum: 8,
+            obj_quorum: 8,
+            bucket: "bucket".to_owned(),
+            ..Default::default()
+        };
+        for copies in [7, 8, 11, 12, 15] {
+            let entries = MetaCacheEntries(
+                (0..16)
+                    .map(|slot| Some(if slot < copies { entry.clone() } else { corrupt.clone() }))
+                    .collect(),
+            );
+            assert_eq!(entries.resolve(resolver.clone()).is_some(), copies >= 8, "readable copies: {copies}");
         }
     }
 
@@ -6348,36 +6526,10 @@ mod test {
                     .expect("persist stale marker");
             }
         }
-        for quorum_mode in ["disk", "reduced", "optimal", "strict"] {
-            let (sender, mut receiver) = mpsc::channel(1);
-            let walk = set.list_path(
-                CancellationToken::new(),
-                ListPathOptions {
-                    bucket: bucket.to_string(),
-                    versioned: true,
-                    incl_deleted: true,
-                    recursive: true,
-                    ask_disks: quorum_mode.to_string(),
-                    limit: 100,
-                    ..Default::default()
-                },
-                sender,
-            );
-            let drain = async {
-                let mut names = Vec::new();
-                while let Some(entry) = receiver.recv().await {
-                    if !entry.is_dir() {
-                        names.push(entry.name);
-                    }
-                }
-                names
-            };
-            let (result, names) = timeout(Duration::from_secs(10), async { tokio::join!(walk, drain) })
-                .await
-                .expect("native listing must terminate");
-            result.expect("all drives are readable");
-            assert_eq!(names, ["new.bin"], "version authority cannot depend on {quorum_mode} sampling");
-        }
+        // Sampled modes ask fewer drives and, as in MinIO, may list stale
+        // replicas that happen to fill the sample.
+        let listed = strict_version_listing(&set, bucket).await;
+        assert_eq!(listed, [("new.bin".to_owned(), vec![Some(Uuid::from_u128(1))])]);
         for dir in dirs.iter().take(4) {
             assert_eq!(
                 tokio::fs::read(dir.path().join(bucket).join("marker.bin/xl.meta"))
@@ -6396,6 +6548,162 @@ mod test {
         assert_eq!(resolver.obj_quorum, 3);
         assert_eq!(resolver.bucket, "bucket");
         assert_eq!(resolver.requested_versions, 0);
+    }
+
+    async fn single_set_store(drive_count: usize) -> (Vec<tempfile::TempDir>, Arc<crate::store::ECStore>) {
+        let mut dirs = Vec::with_capacity(drive_count);
+        let mut endpoints = Vec::with_capacity(drive_count);
+        for disk_idx in 0..drive_count {
+            let dir = tempfile::tempdir().expect("disk directory");
+            let mut endpoint = Endpoint::try_from(dir.path().to_str().expect("disk path")).expect("disk endpoint");
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(disk_idx);
+            dirs.push(dir);
+            endpoints.push(endpoint);
+        }
+        let endpoints = crate::layout::endpoints::EndpointServerPools(vec![crate::layout::endpoints::PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: drive_count,
+            endpoints: crate::layout::endpoints::Endpoints::from(endpoints),
+            cmd_line: "version-listing-quorum".into(),
+            platform: "test".into(),
+        }]);
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        crate::store::init_local_disks_with_instance_ctx(&ctx, endpoints.clone())
+            .await
+            .expect("initialize disks");
+        let store = crate::store::ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().expect("test address"),
+            endpoints,
+            CancellationToken::new(),
+            ctx,
+        )
+        .await
+        .expect("initialize store");
+        (dirs, store)
+    }
+
+    fn versioned_object_metadata(bucket: &str, name: &str, versions: &[(u128, i64)], slot: usize) -> Bytes {
+        let mut meta = FileMeta::new();
+        for (id, modified) in versions {
+            let mut fi = FileInfo::new(name, 12, 4);
+            fi.volume = bucket.to_owned();
+            fi.name = name.to_owned();
+            fi.version_id = Some(Uuid::from_u128(*id));
+            fi.versioned = true;
+            fi.erasure.index = slot + 1;
+            fi.data_dir = Some(Uuid::from_u128(0x1000 + id));
+            fi.mod_time = Some(time::OffsetDateTime::from_unix_timestamp(*modified).expect("fixture time"));
+            fi.size = 1;
+            fi.parts = vec![ObjectPartInfo {
+                number: 1,
+                size: 1,
+                actual_size: 1,
+                ..Default::default()
+            }];
+            fi.metadata.insert("etag".to_owned(), format!("etag-{id}"));
+            fi.validate_for_metadata_read().expect("fixture version must be readable");
+            meta.add_version(fi).expect("encode fixture version");
+        }
+        Bytes::from(meta.marshal_msg().expect("encode fixture xl.meta"))
+    }
+
+    // A versioned DeleteObject(versionId) can reach write quorum while three
+    // drives are offline; they keep the deleted version after they return. A
+    // different drive going offline later must not turn that sub-quorum
+    // residue into a 503 for every ListObjectVersions page covering the key.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn version_listing_omits_sub_quorum_versions_while_a_drive_is_offline() {
+        temp_env::async_with_vars([(ENV_API_LIST_OBJECTS_QUORUM, Some("strict"))], async {
+            let bucket = "version-list-offline-stale";
+            let (_dirs, store) = single_set_store(16).await;
+            let set = store.pools[0].disk_set[0].clone();
+            assert_eq!((set.set_drive_count, set.default_parity_count), (16, 4));
+            let committed: &[(u128, i64)] = &[(3, 1_700_000_003), (1, 1_700_000_001)];
+            let stale: &[(u128, i64)] = &[(3, 1_700_000_003), (2, 1_700_000_002), (1, 1_700_000_001)];
+            for (slot, disk) in set.disks.read().await.iter().enumerate() {
+                let disk = disk.as_ref().expect("fixture drive is online");
+                disk.make_volume(bucket).await.expect("create bucket volume");
+                for (name, versions) in [
+                    ("doc", if slot < 3 { stale } else { committed }),
+                    ("other", &[(4, 1_700_000_004)][..]),
+                ] {
+                    disk.write_all(
+                        bucket,
+                        &format!("{name}/{STORAGE_FORMAT_FILE}"),
+                        versioned_object_metadata(bucket, name, versions, slot),
+                    )
+                    .await
+                    .expect("persist fixture metadata");
+                }
+            }
+            let expected = [
+                ("doc".to_owned(), Some(Uuid::from_u128(3))),
+                ("doc".to_owned(), Some(Uuid::from_u128(1))),
+                ("other".to_owned(), Some(Uuid::from_u128(4))),
+            ];
+            let list = || {
+                let store = store.clone();
+                async move {
+                    store
+                        .inner_list_object_versions(bucket, "", None, None, None, 1000)
+                        .await
+                        .map(|page| {
+                            assert!(!page.is_truncated);
+                            page.objects
+                                .into_iter()
+                                .map(|object| (object.name, object.version_id))
+                                .collect::<Vec<_>>()
+                        })
+                }
+            };
+
+            assert_eq!(list().await.expect("all drives online"), expected);
+            set.disks.write().await[15] = None;
+            assert_eq!(
+                list().await.expect("one offline drive must not fail the page"),
+                expected,
+                "the three stale copies are below listing quorum and must be omitted"
+            );
+
+            // Set-scoped scans back destructive decisions (tier reference
+            // proofs, raw prefix deletes) and keep failing closed instead.
+            let (sender, mut receiver) = mpsc::channel(16);
+            let walk = set
+                .clone()
+                .walk(CancellationToken::new(), bucket, "", sender, super::WalkOptions::default());
+            let drain = async { while receiver.recv().await.is_some() {} };
+            let (walk, ()) = timeout(Duration::from_secs(10), async { tokio::join!(walk, drain) })
+                .await
+                .expect("set walk must terminate");
+            assert!(matches!(walk, Err(StorageError::ErasureReadQuorum)), "{walk:?}");
+            let recursive_delete_scan = set
+                .clone()
+                .inner_list_object_versions_for_recursive_delete(bucket, "", None, None, 1000)
+                .await;
+            assert!(
+                matches!(recursive_delete_scan, Err(StorageError::InsufficientReadQuorum(..))),
+                "{:?}",
+                recursive_delete_scan.map(|page| page.objects.len())
+            );
+
+            {
+                let mut disks = set.disks.write().await;
+                for disk in disks.iter_mut().skip(8) {
+                    *disk = None;
+                }
+            }
+            assert_eq!(list().await.expect("half of the set still lists"), expected);
+            set.disks.write().await[7] = None;
+            assert!(
+                matches!(list().await, Err(StorageError::InsufficientReadQuorum(..))),
+                "fewer than half of the set's drives cannot serve a version page"
+            );
+        })
+        .await;
     }
 
     async fn collect_native_listing(set: &SetDisks, bucket: &str, mode: &str) -> (Result<ListPathRawOutcome>, Vec<String>) {
