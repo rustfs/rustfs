@@ -13,15 +13,16 @@
 // limitations under the License.
 
 use super::{cluster_snapshot, realtime};
-use crate::admin::auth::authorize_admin_request;
+use crate::admin::auth::authorize_admin_envelope;
 use crate::admin::handlers::account::{ACCOUNT_INFO_ROUTE, ACCOUNT_PASSWORD_ROUTE};
 use crate::admin::handlers::mfa::{ACCOUNT_MFA_ROUTE, MFA_CHALLENGE_ROUTE, USER_MFA_ROUTE};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::route_policy::{
     ADMIN_ROUTE_POLICY_SPECS, DEFERRED_ADMIN_ROUTE_POLICIES, DeferredAdminRoutePolicy, DeferredRoutePolicyReason,
 };
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{
-    DefaultAdminUsecase, QueryServerInfoRequest, current_endpoints_handle, default_admin_usecase, object_store_from_req,
+    DefaultAdminUsecase, QueryServerInfoRequest, current_endpoints_handle, default_admin_usecase, object_store_from_envelope,
 };
 use crate::admin::storage_api::bucket::replication::{
     REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS, REMOTE_TARGET_UNSUPPORTED_FIELDS,
@@ -36,16 +37,15 @@ use crate::admin::utils::is_compat_admin_request;
 use crate::runtime_capabilities::{EndpointTopologySnapshotProvider, RustFsObservabilitySnapshotProvider};
 use crate::server::ADMIN_PREFIX;
 use crate::workload_admission::workload_admission_registry_snapshot;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_concurrency::WorkloadAdmissionRegistrySnapshot;
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_security_governance::{AdminRouteSpec, HttpMethod};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{error, info, warn};
@@ -250,13 +250,13 @@ fn request_graceful_shutdown() {}
 
 #[async_trait::async_trait]
 impl Operation for ServiceHandle {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        if req.credentials.is_none() {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        if req.credentials().is_none() {
             log_system_request_rejected!("service_handle", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         }
 
-        let Some(action) = service_action_from_uri(&req.uri) else {
+        let Some(action) = service_action_from_uri(req.uri()) else {
             log_system_request_rejected!("service_handle", "invalid_action");
             return Err(s3_error!(InvalidRequest, "action must be one of: restart, stop, freeze, unfreeze"));
         };
@@ -268,7 +268,7 @@ impl Operation for ServiceHandle {
             ServiceAction::Freeze | ServiceAction::Unfreeze => AdminAction::ServiceFreezeAdminAction,
         };
 
-        authorize_admin_request(&req, vec![Action::AdminAction(admin_action)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(admin_action)]).await?;
 
         let response = match action {
             ServiceAction::Restart => {
@@ -344,7 +344,7 @@ impl Operation for ServiceHandle {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         log_system_response_emitted!("service_handle");
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
@@ -361,12 +361,12 @@ struct ServerUpdateStatus {
 
 #[async_trait::async_trait]
 impl Operation for UpdateHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        if req.credentials.is_none() {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        if req.credentials().is_none() {
             log_system_request_rejected!("server_update", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         }
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ServerUpdateAdminAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ServerUpdateAdminAction)]).await?;
 
         // MinIO's server-update downloads and swaps the binary in place. RustFS
         // intentionally does not implement in-process self-update: binaries are
@@ -394,7 +394,7 @@ impl Operation for UpdateHandler {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         log_system_response_emitted!("server_update");
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
@@ -468,13 +468,13 @@ fn bitrot_selftest_status_str() -> &'static str {
 
 #[async_trait::async_trait]
 impl Operation for ServerInfoHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        if req.credentials.is_none() {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        if req.credentials().is_none() {
             log_system_request_rejected!("query_server_info", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         }
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await?;
 
         let usecase = default_admin_usecase();
         let info = usecase
@@ -488,7 +488,7 @@ impl Operation for ServerInfoHandler {
             bitrot_selftest: bitrot_selftest_status_str(),
         };
 
-        let data = encode_server_info_response(req.uri.path(), &response).map_err(|e| {
+        let data = encode_server_info_response(req.uri().path(), &response).map_err(|e| {
             log_system_request_failed!("query_server_info", "serialize_server_info_failed", e);
             S3Error::with_message(S3ErrorCode::InternalError, "parse serverInfo failed")
         })?;
@@ -497,7 +497,7 @@ impl Operation for ServerInfoHandler {
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         log_system_response_emitted!("query_server_info");
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
@@ -529,16 +529,16 @@ fn inspect_data_target(uri: &http::Uri) -> Option<(String, String)> {
 
 #[async_trait::async_trait]
 impl Operation for InspectDataHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         use crate::admin::storage_api::contract::object::ObjectIO as _;
         use crate::admin::storage_api::object::StorageObjectOptions;
         use tokio::io::AsyncReadExt;
 
-        if req.credentials.is_none() {
+        if req.credentials().is_none() {
             log_system_request_rejected!("inspect_data", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         }
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::InspectDataAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::InspectDataAction)]).await?;
 
         // MinIO's inspect-data exports a signed archive of raw drive files for a
         // `volume`/`file` glob. RustFS erasure-codes and (optionally) encrypts
@@ -546,14 +546,14 @@ impl Operation for InspectDataHandler {
         // back; instead we return the reconstructed raw object bytes for the
         // requested `volume` (bucket) + `file` (object), which is the honest,
         // usable form of "inspect this object's data" against an EC store.
-        let Some((bucket, object)) = inspect_data_target(&req.uri) else {
+        let Some((bucket, object)) = inspect_data_target(req.uri()) else {
             return Err(s3_error!(
                 InvalidRequest,
                 "inspect-data requires `volume` (bucket) and `file` (object) query parameters"
             ));
         };
 
-        let Some(store) = object_store_from_req(&req) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             log_system_request_failed!("inspect_data", "object_store_unavailable", "not initialized");
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "object store is not initialized"));
         };
@@ -586,7 +586,7 @@ impl Operation for InspectDataHandler {
             header.insert(http::header::CONTENT_DISPOSITION, disposition);
         }
         log_system_response_emitted!("inspect_data");
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(buf)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(buf), header))
     }
 }
 
@@ -594,13 +594,13 @@ pub struct StorageInfoHandler {}
 
 #[async_trait::async_trait]
 impl Operation for StorageInfoHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        if req.credentials.is_none() {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        if req.credentials().is_none() {
             log_system_request_rejected!("query_storage_info", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         }
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::StorageInfoAdminAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::StorageInfoAdminAction)]).await?;
 
         let usecase = default_admin_usecase();
         let info = usecase.execute_query_storage_info().await.map_err(S3Error::from)?;
@@ -609,7 +609,7 @@ impl Operation for StorageInfoHandler {
             admin_discovery: system_admin_discovery(&usecase),
         };
 
-        let data = encode_storage_info_response(req.uri.path(), &response).map_err(|e| {
+        let data = encode_storage_info_response(req.uri().path(), &response).map_err(|e| {
             log_system_request_failed!("query_storage_info", "serialize_storage_info_failed", e);
             S3Error::with_message(S3ErrorCode::InternalError, "failed to serialize storage info")
         })?;
@@ -618,7 +618,7 @@ impl Operation for StorageInfoHandler {
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         log_system_response_emitted!("query_storage_info");
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
@@ -1179,13 +1179,13 @@ fn summarize_named_capability_statuses<const N: usize>(
 
 #[async_trait::async_trait]
 impl Operation for RuntimeCapabilitiesHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        if req.credentials.is_none() {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        if req.credentials().is_none() {
             log_system_request_rejected!("runtime_capabilities", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         }
 
-        authorize_admin_request(&req, runtime_capabilities_gate_actions()).await?;
+        authorize_admin_envelope(req.envelope(), runtime_capabilities_gate_actions()).await?;
 
         let response = build_runtime_capabilities_response().await.map_err(|err| {
             log_system_request_failed!("runtime_capabilities", "build_runtime_capabilities_failed", err);
@@ -1201,7 +1201,7 @@ impl Operation for RuntimeCapabilitiesHandler {
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         log_system_response_emitted!("runtime_capabilities");
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
@@ -1217,13 +1217,13 @@ pub(crate) fn data_usage_info_gate_actions() -> Vec<Action> {
 
 #[async_trait::async_trait]
 impl Operation for DataUsageInfoHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        if req.credentials.is_none() {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        if req.credentials().is_none() {
             log_system_request_rejected!("query_data_usage_info", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         }
 
-        authorize_admin_request(&req, data_usage_info_gate_actions()).await?;
+        authorize_admin_envelope(req.envelope(), data_usage_info_gate_actions()).await?;
 
         let usecase = default_admin_usecase();
         let info = usecase.execute_query_data_usage_info().await.map_err(S3Error::from)?;
@@ -1237,7 +1237,7 @@ impl Operation for DataUsageInfoHandler {
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         log_system_response_emitted!("query_data_usage_info");
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
@@ -1252,7 +1252,8 @@ mod tests {
         build_runtime_capabilities_summary, data_usage_info_gate_actions, runtime_capabilities_gate_actions,
         system_admin_discovery,
     };
-    use crate::admin::router::Operation;
+    use crate::admin::operation::AdminRequest;
+    use crate::admin::operation::Operation;
     use crate::admin::runtime_sources::DefaultAdminUsecase;
     use crate::admin::storage_api::cluster::{
         CapabilityState, CapabilityStatus, MemorySamplingState, ObservabilitySnapshot, PlatformSupport, TopologyCapabilities,
@@ -1264,9 +1265,9 @@ mod tests {
     use rustfs_concurrency::WorkloadClass;
     use rustfs_madmin::{InfoMessage, StorageInfo};
     use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
+    use rustfs_s3_types::Body;
     use rustfs_s3_types::S3ErrorCode;
     use rustfs_security_governance::HttpMethod;
-    use s3s::{Body, S3Request};
     use serde_json::json;
 
     /// Authz regression pin (rustfs/backlog#1306): datausageinfo stays an
@@ -1662,17 +1663,12 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_capabilities_authentication_failure_is_not_reported_as_unsupported() {
-        let request = S3Request {
-            input: Body::empty(),
-            method: Method::GET,
-            uri: Uri::from_static("/rustfs/admin/v4/runtime/capabilities"),
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let request =
+            crate::admin::operation::test_support::TestRequest::new(Method::GET, "/rustfs/admin/v4/runtime/capabilities")
+                .headers(HeaderMap::new())
+                .extensions(Extensions::new())
+                .body(Body::empty())
+                .build();
 
         let error = RuntimeCapabilitiesHandler {}
             .call(request, Params::new())
@@ -1726,26 +1722,18 @@ mod tests {
             Arc::new(rustfs_kms::KmsServiceManager::new()),
         )));
 
-        let request = S3Request {
-            input: Body::empty(),
-            method: Method::GET,
-            uri: Uri::from_static("/rustfs/admin/v3/info"),
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: Some(s3s::auth::Credentials {
-                access_key: ROOT_ACCESS_KEY.to_string(),
-                secret_key: s3s::auth::SecretKey::from(ROOT_SECRET_KEY.to_string()),
-            }),
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let request = crate::admin::operation::test_support::TestRequest::new(Method::GET, "/rustfs/admin/v3/info")
+            .headers(HeaderMap::new())
+            .extensions(Extensions::new())
+            .body(Body::empty())
+            .credentials(ROOT_ACCESS_KEY, ROOT_SECRET_KEY, None)
+            .build();
 
-        let (status, body) = super::ServerInfoHandler {}
+        let (status, _headers, body) = super::ServerInfoHandler {}
             .call(request, Params::new())
             .await
             .expect("root admin credentials must be served server info")
-            .output;
+            .into_parts();
         assert_eq!(status, hyper::StatusCode::OK);
 
         let bytes = body.collect().await.expect("server info body should read").to_bytes();
@@ -2018,18 +2006,12 @@ mod tests {
         );
     }
 
-    fn credential_less_request(method: Method, uri: &'static str) -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method,
-            uri: Uri::from_static(uri),
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn credential_less_request(method: Method, uri: &'static str) -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(method, Uri::from_static(uri))
+            .headers(HeaderMap::new())
+            .extensions(Extensions::new())
+            .body(Body::empty())
+            .build()
     }
 
     async fn assert_missing_credentials(operation: &dyn Operation, method: Method, uri: &'static str) {
@@ -2081,7 +2063,7 @@ mod tests {
     }
 
     /// Pins the gate wiring: each system handler authorizes through exactly one
-    /// `authorize_admin_request` call carrying the same action vector it used
+    /// `authorize_admin_envelope` call carrying the same action vector it used
     /// before the deduplication. The two gate-action helpers must be passed
     /// through by name so the vectors pinned by the tests above keep governing
     /// the live gate (rustfs/backlog#1829).
@@ -2115,7 +2097,7 @@ mod tests {
         ] {
             let block = source_block(production, &format!("impl Operation for {handler}"));
             assert_eq!(
-                block.matches("authorize_admin_request(").count(),
+                block.matches("authorize_admin_envelope(").count(),
                 1,
                 "{handler} must use exactly one shared gate"
             );
@@ -2128,7 +2110,7 @@ mod tests {
                 assert!(block.contains(token), "{handler} must authorize with {token}");
             }
             assert!(
-                !block.contains("let cred = authorize_admin_request("),
+                !block.contains("let cred = authorize_admin_envelope("),
                 "{handler} does not consume the authenticated credentials"
             );
         }

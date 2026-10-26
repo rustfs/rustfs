@@ -37,8 +37,6 @@
 //! [`rustfs_kms::redact_encryption_context`].
 
 use crate::app::RequestEnvelope;
-use crate::server::RemoteAddr;
-use crate::storage::access::request_context_from_extensions;
 use crate::storage::helper::spawn_background_with_context;
 use hashbrown::HashMap;
 use rustfs_audit::entity::{ApiDetailsBuilder, AuditEntry, AuditEntryBuilder};
@@ -180,28 +178,11 @@ pub(super) struct KmsAdminAudit {
 }
 
 impl KmsAdminAudit {
-    /// Build the audit state for an authenticated admin request.
+    /// Build the audit state for an authenticated admin request from the owned
+    /// request envelope.
     ///
-    /// Takes the request in pieces because every KMS handler moves
-    /// `credentials` out of it before reaching this point.
-    pub(super) fn from_request(extensions: &http::Extensions, headers: &http::HeaderMap, cred: &Credentials) -> Self {
-        // The peer address the authorization gate was given, so the audit trail
-        // and the policy decision agree on where the request came from.
-        let source_ip = extensions
-            .get::<Option<RemoteAddr>>()
-            .and_then(|opt| opt.map(|addr| addr.0.ip().to_string()));
-        let request_id = request_context_from_extensions(extensions).map(|context| context.request_id);
-
-        Self::new(
-            &cred.access_key,
-            &cred.parent_user,
-            source_ip,
-            Some(get_request_user_agent(headers)),
-            request_id,
-        )
-    }
-
-    /// Build the audit state from the owned request envelope.
+    /// The peer address is the one the authorization gate was given, so the
+    /// audit trail and the policy decision agree on where the request came from.
     pub(super) fn from_envelope(envelope: &RequestEnvelope, cred: &Credentials) -> Self {
         let source_ip = envelope.remote_addr().map(|addr| addr.ip().to_string());
         let request_id = envelope.request_context().map(|context| context.request_id.clone());
@@ -217,7 +198,7 @@ impl KmsAdminAudit {
 
     /// Assemble the operation context from already-extracted request values.
     ///
-    /// Separate from [`Self::from_request`] so the mapping onto an audit entry
+    /// Separate from [`Self::from_envelope`] so the mapping onto an audit entry
     /// is testable without an HTTP request.
     fn new(
         access_key: &str,
@@ -496,12 +477,12 @@ mod tests {
     }
 
     #[test]
-    fn from_envelope_reads_the_same_facts_as_from_request() {
+    fn from_envelope_reads_the_request_facts() {
         let peer: std::net::SocketAddr = "10.1.2.3:4455".parse().expect("socket address");
         let mut headers = http::HeaderMap::new();
         headers.insert(http::header::USER_AGENT, http::HeaderValue::from_static("rustfs-admin/1"));
         let mut extensions = http::Extensions::new();
-        extensions.insert(Some(RemoteAddr(peer)));
+        extensions.insert(Some(crate::server::RemoteAddr(peer)));
         extensions.insert(crate::storage::request_context::RequestContext::from_headers(&headers));
         let cred = Credentials {
             access_key: "AKIAOPERATOR".to_string(),
@@ -509,19 +490,14 @@ mod tests {
             ..Default::default()
         };
 
-        let from_request = KmsAdminAudit::from_request(&extensions, &headers, &cred);
         let request = crate::admin::operation::test_support::TestRequest::new(http::Method::POST, "/rustfs/admin/v3/kms/key")
             .headers(headers)
             .extensions(extensions)
             .build();
         let from_envelope = KmsAdminAudit::from_envelope(request.envelope(), &cred);
 
-        // `operation_id` is minted per context, so compare every fact but it.
-        let (owned, legacy) = (from_envelope.context(), from_request.context());
-        assert_eq!(owned.principal, legacy.principal);
-        assert_eq!(owned.source_ip, legacy.source_ip);
-        assert_eq!(owned.user_agent, legacy.user_agent);
-        assert_eq!(owned.additional_context, legacy.additional_context);
+        let owned = from_envelope.context();
+        assert_eq!(owned.principal, "AKIAOPERATOR");
         assert_eq!(owned.source_ip.as_deref(), Some("10.1.2.3"));
         assert_eq!(owned.user_agent.as_deref(), Some("rustfs-admin/1"));
         assert_eq!(

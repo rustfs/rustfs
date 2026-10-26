@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::storage_api::cluster::{CapabilityState, CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
 use crate::admin::{
-    auth::authorize_admin_request,
-    router::{AdminOperation, Operation, S3Router},
+    auth::authorize_admin_envelope,
+    router::{AdminOperation, S3Router},
     runtime_sources::default_admin_usecase,
     storage_api::cluster::{
         ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
@@ -29,15 +30,14 @@ use crate::cluster_snapshot::{
     cluster_has_actionable_pressure,
 };
 use crate::server::{ADMIN_PREFIX, ReadinessDegradedReason};
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_concurrency::AdmissionState as WorkloadAdmissionState;
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadClass};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Result, s3_error};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response};
+use rustfs_s3_types::{Body, S3Result, s3_error};
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -72,39 +72,35 @@ pub(crate) struct ClusterSnapshotDiscoveryResponse {
 
 /// The pre-check keeps this endpoint's historical missing-credentials message;
 /// the shared gate reports "get cred failed".
-async fn authorize_cluster_snapshot_request(req: &S3Request<Body>) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize_cluster_snapshot_request(req: &AdminRequest) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     }
 
-    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await?;
     Ok(())
 }
 
-fn build_json_response(
-    status: StatusCode,
-    body: &impl Serialize,
-    request_id: Option<&HeaderValue>,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn build_json_response(status: StatusCode, body: &impl Serialize, request_id: Option<&HeaderValue>) -> S3Result<AdminResponse> {
     let data = serde_json::to_vec(body).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
     let mut header = HeaderMap::new();
     header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     if let Some(value) = request_id {
         header.insert("x-request-id", value.clone());
     }
-    Ok(S3Response::with_headers((status, Body::from(data)), header))
+    Ok(AdminResponse::with_headers(status, Body::from(data), header))
 }
 
 pub struct GetClusterSnapshotHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetClusterSnapshotHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_cluster_snapshot_request(&req).await?;
         let snapshot = default_admin_usecase().execute_collect_cluster_read_only_snapshot().await;
         let server_info_endpoint = crate::runtime_sources::current_local_node_name().await;
         let snapshot = snapshot.map(|snapshot| ClusterSnapshotView::from_snapshot(snapshot, server_info_endpoint));
-        build_json_response(StatusCode::OK, &ClusterSnapshotResponse { snapshot }, req.headers.get("x-request-id"))
+        build_json_response(StatusCode::OK, &ClusterSnapshotResponse { snapshot }, req.headers().get("x-request-id"))
     }
 }
 
@@ -1035,6 +1031,7 @@ mod tests {
     };
     use crate::shared_types::{DependencyReadiness, ReadinessDegradedReason};
     use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadClass};
+    use rustfs_s3_types::Body;
 
     #[test]
     fn cluster_snapshot_handler_requires_server_info_admin_permission() {
@@ -1063,17 +1060,11 @@ mod tests {
     /// message it has always returned (rustfs/backlog#1829).
     #[tokio::test]
     async fn cluster_snapshot_gate_keeps_its_missing_credentials_message() {
-        let req = s3s::S3Request {
-            input: s3s::Body::from(String::new()),
-            method: http::Method::GET,
-            uri: http::Uri::from_static("/rustfs/admin/v4/cluster/snapshot"),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let req = crate::admin::operation::test_support::TestRequest::new(http::Method::GET, "/rustfs/admin/v4/cluster/snapshot")
+            .headers(http::HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::from(String::new()))
+            .build();
 
         let err = super::authorize_cluster_snapshot_request(&req)
             .await

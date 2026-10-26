@@ -1070,7 +1070,7 @@ pub(crate) mod s3 {
     pub(crate) use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
     #[allow(unused_imports)]
     pub(crate) use s3s::auth;
-    pub(crate) use s3s::{Body, S3Request, S3Response, header};
+    pub(crate) use s3s::header;
 
     /// Build an `S3Error` without reaching for the `s3s` error macro.
     ///

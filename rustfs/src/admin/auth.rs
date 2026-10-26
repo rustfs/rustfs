@@ -14,15 +14,12 @@
 
 use crate::app::{RequestCredentials, RequestEnvelope};
 use crate::auth::get_condition_values;
-use crate::server::RemoteAddr;
 use http::HeaderMap;
-use http::Uri;
 use rustfs_credentials::Credentials;
 use rustfs_iam::store::Store;
 use rustfs_iam::sys::IamSys;
 use rustfs_policy::policy::{Args, action::Action};
 use rustfs_s3_types::{S3Result, s3_error};
-use s3s::{Body, S3Request};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -238,37 +235,6 @@ pub async fn validate_admin_request_with_kms_key(
     .await
 }
 
-/// Unified authentication request handler for both UI and CLI
-///
-/// This function provides a single entry point for authentication,
-/// ensuring consistent behavior between UI and CLI authentication flows.
-///
-/// # Arguments
-/// * `headers` - HTTP request headers
-/// * `uri` - Request URI
-/// * `credentials` - User credentials from request (Credentials)
-///
-/// # Returns
-/// * `Ok((Credentials, bool))` - Authentication successful, returns user credentials and is_owner flag
-/// * `Err(S3Error)` - Authentication failed with error details
-///
-/// # Example
-/// ```ignore
-/// let (cred, is_owner) = authenticate_request(&req.headers, &req.uri, &input_cred).await?;
-/// ```
-pub async fn authenticate_request(
-    headers: &HeaderMap,
-    uri: &Uri,
-    credentials: &s3s::auth::Credentials,
-) -> S3Result<(Credentials, bool)> {
-    use crate::auth::get_session_token;
-
-    // Extract session token from request
-    let session_token = get_session_token(uri, headers).unwrap_or_default();
-
-    authenticate_request_facts(&credentials.access_key, session_token).await
-}
-
 /// Authenticate the caller of an owned admin request from the facts its
 /// envelope carries: the presented access key and the session token the edge
 /// decoded.
@@ -304,26 +270,12 @@ async fn authenticate_request_facts(access_key: &str, session_token: &str) -> S3
     result.map_err(Into::into)
 }
 
-/// Full admin gate over an `S3Request`: extract the request credentials,
-/// authenticate them ([`authenticate_request`]), then authorize the caller for
-/// `actions` ([`validate_admin_request`], allowing on the first permitted
-/// action). Returns the authenticated credentials for handlers that need the
-/// caller identity. `deny_only` stays `false`: every caller performs a full
-/// allow check.
-pub async fn authorize_admin_request(req: &S3Request<Body>, actions: Vec<Action>) -> S3Result<Credentials> {
-    let Some(input_cred) = req.credentials.as_ref() else {
-        return Err(s3_error!(InvalidRequest, "get cred failed"));
-    };
-
-    let (cred, owner) = authenticate_request(&req.headers, &req.uri, input_cred).await?;
-
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-    validate_admin_request(&req.headers, &cred, owner, false, actions, remote_addr).await?;
-
-    Ok(cred)
-}
-
-/// Full admin gate over RustFS-owned request facts.
+/// Full admin gate over RustFS-owned request facts: authenticate the
+/// presented credentials, then authorize the caller for `actions`
+/// ([`validate_admin_request`], allowing on the first permitted action).
+/// Returns the authenticated credentials for handlers that need the caller
+/// identity. `deny_only` stays `false`: every caller performs a full allow
+/// check.
 pub async fn authorize_admin_envelope(req: &RequestEnvelope, actions: Vec<Action>) -> S3Result<Credentials> {
     let Some(input_cred) = req.credentials() else {
         return Err(s3_error!(InvalidRequest, "get cred failed"));
@@ -348,6 +300,7 @@ mod tests {
     //! empty in-memory cache so `is_owner=true` returns allow (owner short-circuit)
     //! and every non-owner principal resolves to deny.
     use super::*;
+    use http::Uri;
     use rustfs_iam::cache::Cache;
     use rustfs_iam::manager::IamCache;
     use rustfs_iam::store::{GroupInfo, MappedPolicy, UserType};
@@ -616,27 +569,6 @@ mod tests {
     /// The shared admin gate rejects a request carrying no credentials before
     /// authentication or IAM is consulted, with the exact error the folded
     /// per-handler wrappers produced (rustfs/backlog#1829).
-    #[tokio::test]
-    async fn authorize_admin_request_without_credentials_is_rejected() {
-        let req = S3Request {
-            input: Body::from(String::new()),
-            method: http::Method::GET,
-            uri: Uri::from_static("/rustfs/admin/v3/list-jobs"),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
-
-        let err = authorize_admin_request(&req, vec![admin_action()])
-            .await
-            .expect_err("a request without credentials must be rejected");
-        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
-        assert_eq!(err.message(), Some("get cred failed"));
-    }
-
     #[tokio::test]
     async fn authorize_admin_envelope_without_credentials_is_rejected() {
         let envelope = crate::app::RequestEnvelope::from_parts(

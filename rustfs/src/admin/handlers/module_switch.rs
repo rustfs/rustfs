@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::runtime_sources::{AppContext, app_context_from_req, default_admin_usecase};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::runtime_sources::{AppContext, app_context_from_envelope, default_admin_usecase};
 use crate::admin::service::config::{
     preflight_dynamic_config_reload_for_context, signal_dynamic_config_reload_checked_for_context,
 };
 use crate::admin::{
-    auth::authorize_admin_request,
+    auth::authorize_admin_envelope,
     handlers::supervise_admin_mutation,
-    router::{AdminOperation, Operation, S3Router},
+    router::{AdminOperation, S3Router},
 };
 use crate::server::{
     ADMIN_PREFIX, MODULE_SWITCHES_SIGNAL_SUBSYSTEM, ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches,
@@ -28,13 +29,13 @@ use crate::server::{
     refresh_persisted_module_switches_from, refresh_persisted_module_switches_from_store, save_persisted_module_switches_to,
     validate_module_switch_update, with_notify_runtime_reconcile_lock,
 };
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Result, s3_error};
-use s3s::{Body, S3Request, S3Response, header::CONTENT_TYPE};
+use rustfs_s3_types::{Body, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -100,28 +101,24 @@ impl From<ModuleSwitchSnapshot> for ModuleSwitchesResponse {
     }
 }
 
-fn build_response<T: Serialize>(
-    status: StatusCode,
-    body: &T,
-    request_id: Option<&http::HeaderValue>,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn build_response<T: Serialize>(status: StatusCode, body: &T, request_id: Option<&http::HeaderValue>) -> S3Result<AdminResponse> {
     let data = serde_json::to_vec(body).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
     let mut header = HeaderMap::new();
     header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
     if let Some(v) = request_id {
         header.insert("x-request-id", v.clone());
     }
-    Ok(S3Response::with_headers((status, Body::from(data)), header))
+    Ok(AdminResponse::with_headers(status, Body::from(data), header))
 }
 
 /// The pre-check keeps these endpoints' historical missing-credentials message;
 /// the shared gate reports "get cred failed".
-async fn authorize_module_switch_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize_module_switch_request(req: &AdminRequest, action: AdminAction) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     }
 
-    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await?;
     Ok(())
 }
 
@@ -213,10 +210,10 @@ pub struct GetModuleSwitchesHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetModuleSwitchesHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_module_switch_request(&req, AdminAction::ServerInfoAdminAction).await?;
         let snapshot = refresh_module_switch_snapshot().await?;
-        build_response(StatusCode::OK, &ModuleSwitchesResponse::from(snapshot), req.headers.get("x-request-id"))
+        build_response(StatusCode::OK, &ModuleSwitchesResponse::from(snapshot), req.headers().get("x-request-id"))
     }
 }
 
@@ -224,16 +221,17 @@ pub struct UpdateModuleSwitchesHandler {}
 
 #[async_trait::async_trait]
 impl Operation for UpdateModuleSwitchesHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_module_switch_request(&req, AdminAction::ConfigUpdateAdminAction).await?;
-        let context = app_context_from_req(&req).ok_or_else(|| s3_error!(InternalError, "storage layer not initialized"))?;
+        let context =
+            app_context_from_envelope(req.envelope()).ok_or_else(|| s3_error!(InternalError, "storage layer not initialized"))?;
         let store = context.object_store();
         refresh_persisted_module_switches_from(store.clone())
             .await
             .map_err(|e| s3_error!(InternalError, "failed to reload persisted module switches: {}", e))?;
 
         let body = req
-            .input
+            .take_body()
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
@@ -258,30 +256,25 @@ impl Operation for UpdateModuleSwitchesHandler {
         supervise_admin_mutation("module switch update", apply_module_switch_update(context, switches)).await?;
 
         let snapshot = current_module_switch_snapshot();
-        build_response(StatusCode::OK, &ModuleSwitchesResponse::from(snapshot), req.headers.get("x-request-id"))
+        build_response(StatusCode::OK, &ModuleSwitchesResponse::from(snapshot), req.headers().get("x-request-id"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ModuleSwitchDiscovery, ModuleSwitchSource, ModuleSwitchesResponse};
+    use rustfs_s3_types::Body;
 
     /// These endpoints authorize through the shared admin gate, which reports
     /// "get cred failed" for a credential-less request. The pre-check keeps the
     /// message they have always returned (rustfs/backlog#1829).
     #[tokio::test]
     async fn module_switch_gate_keeps_its_missing_credentials_message() {
-        let req = s3s::S3Request {
-            input: s3s::Body::from(String::new()),
-            method: http::Method::GET,
-            uri: http::Uri::from_static("/rustfs/admin/v3/module-switches"),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let req = crate::admin::operation::test_support::TestRequest::new(http::Method::GET, "/rustfs/admin/v3/module-switches")
+            .headers(http::HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::from(String::new()))
+            .build();
 
         let err = super::authorize_module_switch_request(&req, rustfs_policy::policy::action::AdminAction::ServerInfoAdminAction)
             .await

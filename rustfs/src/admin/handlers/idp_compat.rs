@@ -45,7 +45,7 @@ use crate::admin::handlers::policies::{ListPolicyEntitiesBuiltin, handle_builtin
 use crate::admin::handlers::service_account::AddServiceAccount;
 use crate::admin::handlers::user::ImportIam;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
-use crate::admin::router::{AdminOperation, Operation as LegacyOperation, S3Router};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{current_app_context, current_ready_iam_handle, current_server_config_for_context};
 use crate::admin::utils::is_compat_admin_request;
 use crate::auth::{check_key_valid, get_session_token};
@@ -170,15 +170,9 @@ static LIST_ACCESS_KEYS_OPENID_BULK: ListAccessKeysProviderBulk = ListAccessKeys
 /// the same code path.
 pub struct ImportIamV2 {}
 
-// Stays on the legacy trait until `user::ImportIam`, which it delegates to,
-// serves the owned request.
 #[async_trait::async_trait]
-impl LegacyOperation for ImportIamV2 {
-    async fn call(
-        &self,
-        req: s3s::S3Request<s3s::Body>,
-        params: Params<'_, '_>,
-    ) -> S3Result<s3s::S3Response<(StatusCode, s3s::Body)>> {
+impl Operation for ImportIamV2 {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         // Identical semantics to v1 import-iam: same auth action, same body
         // format, same structured result. Delegate to the shared handler.
         ImportIam {}.call(req, params).await
@@ -687,15 +681,9 @@ fn current_active_server_config() -> Option<rustfs_config::server_config::Config
 /// provides, exactly as it is for other externally-provisioned identities.
 pub struct AddServiceAccountLdap {}
 
-// Stays on the legacy trait until `service_account::AddServiceAccount`, which
-// it delegates to, serves the owned request.
 #[async_trait::async_trait]
-impl LegacyOperation for AddServiceAccountLdap {
-    async fn call(
-        &self,
-        req: s3s::S3Request<s3s::Body>,
-        params: Params<'_, '_>,
-    ) -> S3Result<s3s::S3Response<(StatusCode, s3s::Body)>> {
+impl Operation for AddServiceAccountLdap {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         AddServiceAccount {}.call(req, params).await
     }
 }

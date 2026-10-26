@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::runtime_sources::object_store_from_extensions;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::runtime_sources::object_store_from_envelope;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::error::StorageError;
@@ -23,23 +24,20 @@ use crate::admin::storage_api::runtime::{ECStore, NotificationSys};
 use crate::{
     admin::runtime_sources::current_notification_system,
     admin::{
-        auth::authorize_admin_request,
-        router::{AdminOperation, Operation, S3Router},
+        auth::authorize_admin_envelope,
+        router::{AdminOperation, S3Router},
     },
-    server::{ADMIN_PREFIX, RemoteAddr},
+    server::ADMIN_PREFIX,
 };
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use hyper::Method;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::{
     MaskedAccessKey,
     http::{AMZ_REQUEST_ID, REQUEST_ID_HEADER},
-};
-use s3s::{
-    Body, S3Request, S3Response,
-    header::{CONTENT_LENGTH, CONTENT_TYPE},
 };
 use serde::{Deserialize, Serialize};
 use std::{future::Future, sync::Arc, time::Duration};
@@ -63,10 +61,8 @@ fn admin_request_id(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.to_str().ok())
 }
 
-fn admin_remote_addr(req: &S3Request<Body>) -> Option<String> {
-    req.extensions
-        .get::<Option<RemoteAddr>>()
-        .and_then(|opt| opt.map(|addr| addr.0.to_string()))
+fn admin_remote_addr(req: &AdminRequest) -> Option<String> {
+    req.remote_addr().map(|addr| addr.to_string())
 }
 
 fn log_rebalance_request_rejected(action: &str, reason: &str, request_id: &str, actor: &str, remote_addr: &str) {
@@ -564,8 +560,8 @@ pub struct RebalanceStart {}
 #[async_trait::async_trait]
 impl Operation for RebalanceStart {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let request_id = admin_request_id(req.headers()).unwrap_or_default().to_string();
         let remote_addr = admin_remote_addr(&req).unwrap_or_default();
         info!(
             event = EVENT_ADMIN_REBALANCE_STATE,
@@ -578,19 +574,19 @@ impl Operation for RebalanceStart {
             "admin rebalance state"
         );
 
-        let Some(input_cred) = req.credentials.as_ref() else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
-        let actor = MaskedAccessKey(&input_cred.access_key).to_string();
+        let actor = MaskedAccessKey(input_cred.access_key()).to_string();
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::RebalanceAdminAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::RebalanceAdminAction)]).await?;
 
-        if rebalance_query_present(&req.uri) {
+        if rebalance_query_present(req.uri()) {
             log_rebalance_request_rejected("start", "invalid_query_parameters", &request_id, &actor, &remote_addr);
             return Err(s3_error!(InvalidArgument, "rebalance start does not accept query parameters"));
         }
 
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
 
@@ -870,7 +866,7 @@ impl Operation for RebalanceStart {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
@@ -880,8 +876,8 @@ pub struct RebalanceStatus {}
 #[async_trait::async_trait]
 impl Operation for RebalanceStatus {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let request_id = admin_request_id(req.headers()).unwrap_or_default().to_string();
         let remote_addr = admin_remote_addr(&req).unwrap_or_default();
         info!(
             event = EVENT_ADMIN_REBALANCE_STATE,
@@ -894,14 +890,14 @@ impl Operation for RebalanceStatus {
             "admin rebalance state"
         );
 
-        let Some(input_cred) = req.credentials.as_ref() else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
-        let actor = MaskedAccessKey(&input_cred.access_key).to_string();
+        let actor = MaskedAccessKey(input_cred.access_key()).to_string();
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::RebalanceAdminAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::RebalanceAdminAction)]).await?;
 
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
 
@@ -933,9 +929,7 @@ impl Operation for RebalanceStatus {
                 let (parts, body) = s3s::S3Error::with_message(s3s::S3ErrorCode::NoSuchResource, REBALANCE_NOT_STARTED_MESSAGE)
                     .to_http_response()?
                     .into_parts();
-                let mut response = S3Response::with_headers((parts.status, body), parts.headers);
-                response.extensions = parts.extensions;
-                return Ok(response);
+                return Ok(AdminResponse::with_headers(parts.status, body.into(), parts.headers));
             }
 
             return Err(s3_error!(InternalError, "failed to load rebalance metadata from pool 0: {}", err));
@@ -975,7 +969,7 @@ impl Operation for RebalanceStatus {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
@@ -1029,8 +1023,8 @@ pub struct RebalanceStop {}
 #[async_trait::async_trait]
 impl Operation for RebalanceStop {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let request_id = admin_request_id(req.headers()).unwrap_or_default().to_string();
         let remote_addr = admin_remote_addr(&req).unwrap_or_default();
         info!(
             event = EVENT_ADMIN_REBALANCE_STATE,
@@ -1043,19 +1037,19 @@ impl Operation for RebalanceStop {
             "admin rebalance state"
         );
 
-        let Some(input_cred) = req.credentials.as_ref() else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
-        let actor = MaskedAccessKey(&input_cred.access_key).to_string();
+        let actor = MaskedAccessKey(input_cred.access_key()).to_string();
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::RebalanceAdminAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::RebalanceAdminAction)]).await?;
 
-        if rebalance_query_present(&req.uri) {
+        if rebalance_query_present(req.uri()) {
             log_rebalance_request_rejected("stop", "invalid_query_parameters", &request_id, &actor, &remote_addr);
             return Err(s3_error!(InvalidArgument, "rebalance stop does not accept query parameters"));
         }
 
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
 
@@ -1159,7 +1153,7 @@ impl Operation for RebalanceStop {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         header.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::empty(), header))
     }
 }
 
@@ -1201,13 +1195,14 @@ mod rebalance_handler_tests {
     use super::calculate_rebalance_progress;
     use super::{
         Body, HeaderMap, Method, Operation, Params, RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, RebalanceStart,
-        RebalanceStartStep, RebalanceStatus, RebalanceStop, RebalanceStopPropagationStatus, S3ErrorCode, S3Request, StatusCode,
-        Uri, build_rebalance_admin_status, build_rebalance_pool_statuses, build_rebalance_stop_propagation_status,
+        RebalanceStartStep, RebalanceStatus, RebalanceStop, RebalanceStopPropagationStatus, S3ErrorCode, StatusCode, Uri,
+        build_rebalance_admin_status, build_rebalance_pool_statuses, build_rebalance_stop_propagation_status,
         is_rebalance_start_fleet_proof_retryable, rebalance_init_failure_error, rebalance_pool_used, rebalance_query_present,
         rebalance_remaining_buckets, rebalance_rollback_failure_message, rebalance_rollback_stop_failure_message,
         rebalance_start_failure_error, rebalance_start_rollback_error, rebalance_start_steps, rebalance_stop_target_id,
         rebalance_used_pct, retry_rebalance_start_operation, rollback_result_label, stop_rebalance_admission_first,
     };
+    use crate::admin::operation::AdminRequest;
     use crate::admin::storage_api::error::StorageError;
     use crate::admin::storage_api::rebalance::{
         DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo,
@@ -1215,18 +1210,12 @@ mod rebalance_handler_tests {
     };
     use time::OffsetDateTime;
 
-    fn credential_less_request(method: Method, uri: &'static str) -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method,
-            uri: Uri::from_static(uri),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn credential_less_request(method: Method, uri: &'static str) -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(method, Uri::from_static(uri))
+            .headers(HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::empty())
+            .build()
     }
 
     async fn assert_missing_credentials(operation: &dyn Operation, method: Method, uri: &'static str) {
@@ -2309,7 +2298,7 @@ mod rebalance_handler_tests {
         for handler in ["RebalanceStart", "RebalanceStatus", "RebalanceStop"] {
             let block = source_block(production, &format!("impl Operation for {handler}"));
             assert_eq!(
-                block.matches("authorize_admin_request(").count(),
+                block.matches("authorize_admin_envelope(").count(),
                 1,
                 "{handler} must use exactly one shared gate"
             );
@@ -2323,11 +2312,11 @@ mod rebalance_handler_tests {
                 "{handler} must authorize with RebalanceAdminAction"
             );
             assert!(
-                !block.contains("let cred = authorize_admin_request("),
+                !block.contains("let cred = authorize_admin_envelope("),
                 "{handler} does not consume the authenticated credentials"
             );
             assert!(
-                block.contains("let actor = MaskedAccessKey(&input_cred.access_key).to_string();"),
+                block.contains("let actor = MaskedAccessKey(input_cred.access_key()).to_string();"),
                 "{handler} must keep masking the caller access key for its audit trail"
             );
         }
