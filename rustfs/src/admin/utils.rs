@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::operation::AdminResponse;
 use crate::server::{MINIO_ADMIN_PREFIX, has_path_prefix};
 use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use rustfs_crypto::{decrypt_data, decrypt_stream_io, encrypt_stream_io};
@@ -81,6 +82,35 @@ pub(crate) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Re
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     Ok(S3Response::with_headers((status, Body::from(data)), headers))
+}
+
+/// Owned-boundary form of [`json_response`]: the same single `Content-Type`
+/// header and the same serialized bytes, as an [`AdminResponse`].
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
+    )
+)]
+pub(crate) fn owned_json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<AdminResponse> {
+    let data = serde_json::to_vec(value)
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(AdminResponse::with_headers(status, rustfs_s3_types::Body::from(data), headers))
+}
+
+/// Owned-boundary form of [`empty_response`].
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
+    )
+)]
+pub(crate) fn owned_empty_response(status: StatusCode) -> AdminResponse {
+    AdminResponse::new(status, rustfs_s3_types::Body::empty())
 }
 
 /// A bodiless admin response carrying only `status`.
@@ -168,6 +198,34 @@ mod tests {
             .expect("decode payload");
 
         assert_eq!(decoded, payload);
+    }
+
+    #[tokio::test]
+    async fn owned_json_response_matches_the_legacy_shape() {
+        let value = serde_json::json!({"ok": true, "count": 3});
+        let mut legacy = json_response(StatusCode::CREATED, &value).expect("legacy serializes");
+        let (status, headers, mut body) = owned_json_response(StatusCode::CREATED, &value)
+            .expect("owned serializes")
+            .into_parts();
+
+        assert_eq!(status, legacy.output.0);
+        assert_eq!(headers, legacy.headers);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()), Some("application/json"));
+        let legacy_bytes = legacy.output.1.store_all_limited(1024).await.expect("legacy body reads");
+        let owned_bytes = body.store_all_limited(1024).await.expect("owned body reads");
+        assert_eq!(owned_bytes, legacy_bytes);
+    }
+
+    #[tokio::test]
+    async fn owned_empty_response_carries_only_the_status() {
+        let legacy = empty_response(StatusCode::NO_CONTENT);
+        let (status, headers, mut body) = owned_empty_response(StatusCode::NO_CONTENT).into_parts();
+
+        assert_eq!(status, legacy.output.0);
+        assert_eq!(headers, legacy.headers);
+        assert!(headers.is_empty());
+        assert!(body.store_all_limited(16).await.expect("empty body reads").is_empty());
     }
 
     #[tokio::test]

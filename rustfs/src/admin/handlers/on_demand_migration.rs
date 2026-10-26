@@ -29,12 +29,12 @@
 //! the `redacted()` config, probe failures name only the error class, and no
 //! log line carries the config.
 
-use crate::admin::auth::authorize_admin_request;
-use crate::admin::handlers::admin_json_response;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{
-    AppContext, app_context_from_req, current_deployment_id, current_endpoints_handle, current_notification_system_for_context,
-    object_store_from_req,
+    AppContext, app_context_from_envelope, current_deployment_id, current_endpoints_handle,
+    current_notification_system_for_context, object_store_from_envelope,
 };
 use crate::admin::storage_api::bucket::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG;
 use crate::admin::storage_api::bucket::metadata_sys;
@@ -43,7 +43,7 @@ use crate::admin::storage_api::bucket::remote_s3_client::{
 };
 use crate::admin::storage_api::contract::bucket::{BucketOperations as _, BucketOptions};
 use crate::admin::storage_api::error::StorageError;
-use crate::admin::storage_api::s3::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, error as admin_s3_error};
+use crate::admin::storage_api::s3::{S3Error, S3ErrorCode, S3Result, error as admin_s3_error};
 use crate::admin::utils::{extract_query_params, read_compatible_admin_body};
 use crate::error::ApiError;
 use crate::license::license_check;
@@ -64,6 +64,7 @@ use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::Body;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
@@ -389,10 +390,10 @@ fn bucket_from_params(params: &Params<'_, '_>) -> S3Result<String> {
 }
 
 /// Authorize with `action` and confirm the bucket exists (404 otherwise).
-async fn authorize_for_bucket(req: &S3Request<Body>, action: AdminAction, bucket: &str) -> S3Result<Credentials> {
-    let cred = authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+async fn authorize_for_bucket(req: &AdminRequest, action: AdminAction, bucket: &str) -> S3Result<Credentials> {
+    let cred = authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await?;
 
-    let Some(store) = object_store_from_req(req) else {
+    let Some(store) = object_store_from_envelope(req.envelope()) else {
         return Err(admin_s3_error(S3ErrorCode::InternalError, "object store is not initialized"));
     };
     store
@@ -437,8 +438,8 @@ fn parse_config(body: &[u8]) -> S3Result<OnDemandMigrationConfig> {
     })
 }
 
-fn is_dry_run(req: &S3Request<Body>) -> bool {
-    extract_query_params(&req.uri)
+fn is_dry_run(req: &AdminRequest) -> bool {
+    extract_query_params(req.uri())
         .get(DRY_RUN_QUERY)
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
@@ -450,8 +451,8 @@ enum BackfillOp {
     Cancel,
 }
 
-fn backfill_op(req: &S3Request<Body>) -> S3Result<BackfillOp> {
-    match extract_query_params(&req.uri).get(BACKFILL_OP_QUERY).map(String::as_str) {
+fn backfill_op(req: &AdminRequest) -> S3Result<BackfillOp> {
+    match extract_query_params(req.uri()).get(BACKFILL_OP_QUERY).map(String::as_str) {
         Some(BACKFILL_OP_START) => Ok(BackfillOp::Start),
         Some(BACKFILL_OP_CANCEL) => Ok(BackfillOp::Cancel),
         _ => Err(admin_s3_error(
@@ -714,10 +715,27 @@ fn notify_peers_reload(context: Option<Arc<AppContext>>, bucket: String, operati
     });
 }
 
+/// Owned-boundary form of `super::admin_json_response`, which still answers
+/// with the s3s response type.
+fn admin_json_response<T: serde::Serialize>(
+    path: &str,
+    secret_key: &str,
+    status: StatusCode,
+    payload: &T,
+) -> S3Result<AdminResponse> {
+    let body =
+        serde_json::to_vec(payload).map_err(|e| admin_s3_error(S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
+    let (body, content_type) = crate::admin::utils::encode_compatible_admin_payload(path, secret_key, body)?;
+
+    let mut header = http::HeaderMap::new();
+    header.insert(http::header::CONTENT_TYPE, content_type.parse().expect("valid header value"));
+    Ok(AdminResponse::with_headers(status, rustfs_s3_types::Body::from(body), header))
+}
+
 #[async_trait::async_trait]
 impl Operation for SetBucketOnDemandMigrationHandler {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let bucket = bucket_from_params(&params)?;
         let cred = authorize_for_bucket(&req, AdminAction::SetBucketOnDemandMigrationAction, &bucket).await?;
 
@@ -731,8 +749,8 @@ impl Operation for SetBucketOnDemandMigrationHandler {
         license_gate()?;
 
         let dry_run = is_dry_run(&req);
-        let path = req.uri.path().to_string();
-        let context = app_context_from_req(&req);
+        let path = req.uri().path().to_string();
+        let context = app_context_from_envelope(req.envelope());
 
         // Taken before the (possibly slow) probe: a bucket recreated meanwhile
         // must not receive this config.
@@ -740,7 +758,7 @@ impl Operation for SetBucketOnDemandMigrationHandler {
             .await
             .map_err(|err| admin_s3_error(S3ErrorCode::InternalError, format!("failed to capture bucket incarnation: {err}")))?;
 
-        let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &cred.secret_key).await?;
+        let body = read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, &path, &cred.secret_key).await?;
         let config = parse_config(&body)?;
         validate_config(&bucket, &config).await?;
         let probe = probe_source(&bucket, &config).await?;
@@ -783,7 +801,7 @@ impl Operation for SetBucketOnDemandMigrationHandler {
 #[async_trait::async_trait]
 impl Operation for GetBucketOnDemandMigrationHandler {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let bucket = bucket_from_params(&params)?;
         let cred = authorize_for_bucket(&req, AdminAction::GetBucketOnDemandMigrationAction, &bucket).await?;
 
@@ -803,14 +821,14 @@ impl Operation for GetBucketOnDemandMigrationHandler {
             config: config.redacted(),
             updated_at: format_updated_at(updated_at)?,
         };
-        admin_json_response(req.uri.path(), &cred.secret_key, StatusCode::OK, &response)
+        admin_json_response(req.uri().path(), &cred.secret_key, StatusCode::OK, &response)
     }
 }
 
 #[async_trait::async_trait]
 impl Operation for DeleteBucketOnDemandMigrationHandler {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let bucket = bucket_from_params(&params)?;
         authorize_for_bucket(&req, AdminAction::SetBucketOnDemandMigrationAction, &bucket).await?;
 
@@ -833,16 +851,16 @@ impl Operation for DeleteBucketOnDemandMigrationHandler {
             bucket = %bucket,
             "on-demand migration config cleared"
         );
-        notify_peers_reload(app_context_from_req(&req), bucket, "clear on-demand migration config");
+        notify_peers_reload(app_context_from_envelope(req.envelope()), bucket, "clear on-demand migration config");
 
-        Ok(S3Response::new((StatusCode::NO_CONTENT, Body::empty())))
+        Ok(AdminResponse::new(StatusCode::NO_CONTENT, Body::empty()))
     }
 }
 
 #[async_trait::async_trait]
 impl Operation for GetBucketOnDemandMigrationStatusHandler {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let bucket = bucket_from_params(&params)?;
         let cred = authorize_for_bucket(&req, AdminAction::GetBucketOnDemandMigrationAction, &bucket).await?;
 
@@ -867,18 +885,18 @@ impl Operation for GetBucketOnDemandMigrationStatusHandler {
             module_enabled(),
         )?;
         status.backfill = backfill;
-        admin_json_response(req.uri.path(), &cred.secret_key, StatusCode::OK, &status)
+        admin_json_response(req.uri().path(), &cred.secret_key, StatusCode::OK, &status)
     }
 }
 
 #[async_trait::async_trait]
 impl Operation for ControlBucketOnDemandMigrationBackfillHandler {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let bucket = bucket_from_params(&params)?;
         let cred = authorize_for_bucket(&req, AdminAction::SetBucketOnDemandMigrationAction, &bucket).await?;
         let op = backfill_op(&req)?;
-        let path = req.uri.path().to_string();
+        let path = req.uri().path().to_string();
         let runner = global_backfill_runner().ok_or_else(|| backfill_error(&bucket, BackfillError::RunnerNotInstalled))?;
 
         let job = match op {
@@ -891,7 +909,8 @@ impl Operation for ControlBucketOnDemandMigrationBackfillHandler {
                     ));
                 }
                 license_gate()?;
-                let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &cred.secret_key).await?;
+                let body =
+                    read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, &path, &cred.secret_key).await?;
                 let request = parse_backfill_request(&body)?;
                 let job = runner
                     .start(&bucket, request)
@@ -931,7 +950,7 @@ impl Operation for ControlBucketOnDemandMigrationBackfillHandler {
 #[async_trait::async_trait]
 impl Operation for GetBucketOnDemandMigrationBackfillHandler {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let bucket = bucket_from_params(&params)?;
         let cred = authorize_for_bucket(&req, AdminAction::GetBucketOnDemandMigrationAction, &bucket).await?;
         let runner = global_backfill_runner().ok_or_else(|| backfill_error(&bucket, BackfillError::RunnerNotInstalled))?;
@@ -941,7 +960,7 @@ impl Operation for GetBucketOnDemandMigrationBackfillHandler {
             .map_err(|err| backfill_error(&bucket, err))?
             .ok_or_else(|| backfill_error(&bucket, BackfillError::NotFound(bucket.clone())))?;
         let response = BackfillJobResponse { bucket, job };
-        admin_json_response(req.uri.path(), &cred.secret_key, StatusCode::OK, &response)
+        admin_json_response(req.uri().path(), &cred.secret_key, StatusCode::OK, &response)
     }
 }
 
@@ -1175,16 +1194,12 @@ mod tests {
 
     #[test]
     fn backfill_op_requires_start_or_cancel() {
-        let request = |uri: &'static str| S3Request {
-            input: Body::empty(),
-            method: Method::POST,
-            uri: Uri::from_static(uri),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
+        let request = |uri: &'static str| {
+            crate::admin::operation::test_support::TestRequest::new(Method::POST, Uri::from_static(uri))
+                .headers(http::HeaderMap::new())
+                .extensions(http::Extensions::new())
+                .body(Body::empty())
+                .build()
         };
         assert_eq!(
             backfill_op(&request("/rustfs/admin/v3/on-demand-migration/b/backfill?op=start")).expect("start"),
@@ -1312,16 +1327,12 @@ mod tests {
 
     #[test]
     fn dry_run_query_requires_a_literal_true() {
-        let request = |uri: &'static str| S3Request {
-            input: Body::empty(),
-            method: Method::PUT,
-            uri: Uri::from_static(uri),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
+        let request = |uri: &'static str| {
+            crate::admin::operation::test_support::TestRequest::new(Method::PUT, Uri::from_static(uri))
+                .headers(http::HeaderMap::new())
+                .extensions(http::Extensions::new())
+                .body(Body::empty())
+                .build()
         };
         assert!(is_dry_run(&request("/rustfs/admin/v3/on-demand-migration/b?dry-run=true")));
         assert!(is_dry_run(&request("/rustfs/admin/v3/on-demand-migration/b?dry-run=TRUE")));
@@ -1347,16 +1358,12 @@ mod tests {
 
     #[tokio::test]
     async fn handlers_reject_requests_without_credentials_before_touching_storage() {
-        let request = |method: Method, uri: &'static str| S3Request {
-            input: Body::empty(),
-            method,
-            uri: Uri::from_static(uri),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
+        let request = |method: Method, uri: &'static str| {
+            crate::admin::operation::test_support::TestRequest::new(method, Uri::from_static(uri))
+                .headers(http::HeaderMap::new())
+                .extensions(http::Extensions::new())
+                .body(Body::empty())
+                .build()
         };
         let router = bucket_router();
         let params = router.at("/photos").expect("route matches").params;
@@ -1386,7 +1393,8 @@ mod tests {
             let err = handler
                 .call(request(method, uri), params.clone())
                 .await
-                .expect_err("a request without credentials must be rejected");
+                .err()
+                .expect("a request without credentials must be rejected");
             assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
             assert_eq!(err.message(), Some("get cred failed"));
         }
@@ -1394,21 +1402,17 @@ mod tests {
 
     #[tokio::test]
     async fn handlers_reject_an_empty_bucket_path_param() {
-        let request = S3Request {
-            input: Body::empty(),
-            method: Method::GET,
-            uri: Uri::from_static("/rustfs/admin/v3/on-demand-migration/"),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let request =
+            crate::admin::operation::test_support::TestRequest::new(Method::GET, "/rustfs/admin/v3/on-demand-migration/")
+                .headers(http::HeaderMap::new())
+                .extensions(http::Extensions::new())
+                .body(Body::empty())
+                .build();
         let err = GetBucketOnDemandMigrationHandler {}
             .call(request, Params::new())
             .await
-            .expect_err("an empty bucket must be rejected");
+            .err()
+            .expect("an empty bucket must be rejected");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("bucket name is required"));
     }
@@ -1422,7 +1426,6 @@ mod store_tests {
     use crate::admin::runtime_sources::{NotificationSystemInterface, publish_test_app_context};
     use crate::admin::storage_api::NotificationSys;
     use crate::admin::storage_api::runtime_sources::ECStore;
-    use crate::admin::storage_api::s3::auth as s3_auth;
     use http::{Extensions, HeaderMap, Uri};
     use http_body_util::BodyExt as _;
     use rustfs_iam::store::{Store as _, UserType};
@@ -1440,24 +1443,16 @@ mod store_tests {
     const BUCKET: &str = "photos";
     const SOURCE_BUCKET: &str = "legacy-photos";
 
-    fn admin_request(method: Method, uri: String, body: Vec<u8>, access_key: &str, secret_key: &str) -> S3Request<Body> {
-        S3Request {
-            input: Body::from(body),
-            method,
-            uri: Uri::try_from(uri).expect("valid uri"),
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: Some(s3_auth::Credentials {
-                access_key: access_key.to_string(),
-                secret_key: s3_auth::SecretKey::from(secret_key.to_string()),
-            }),
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn admin_request(method: Method, uri: String, body: Vec<u8>, access_key: &str, secret_key: &str) -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(method, Uri::try_from(uri).expect("valid uri"))
+            .headers(HeaderMap::new())
+            .extensions(Extensions::new())
+            .body(Body::from(body))
+            .credentials(access_key, secret_key, None)
+            .build()
     }
 
-    fn root_request(method: Method, uri: String, body: Vec<u8>) -> S3Request<Body> {
+    fn root_request(method: Method, uri: String, body: Vec<u8>) -> AdminRequest {
         admin_request(method, uri, body, ROOT_ACCESS_KEY, ROOT_SECRET_KEY)
     }
 
@@ -1488,8 +1483,8 @@ mod store_tests {
         .into_bytes()
     }
 
-    async fn response_json(response: S3Response<(StatusCode, Body)>) -> (StatusCode, Value) {
-        let (status, body) = response.output;
+    async fn response_json(response: AdminResponse) -> (StatusCode, Value) {
+        let (status, _, body) = response.into_parts();
         let bytes = body.collect().await.expect("collect body").to_bytes();
         let value = serde_json::from_slice(&bytes).expect("json body");
         (status, value)
@@ -1656,7 +1651,8 @@ mod store_tests {
                     bucket_params(&router),
                 )
                 .await
-                .expect_err("PUT must be refused while the module is disabled");
+                .err()
+                .expect("PUT must be refused while the module is disabled");
             assert_eq!(err.code(), &S3ErrorCode::Custom(ERR_CODE_MODULE_DISABLED.into()));
             assert_eq!(err.status_code(), Some(StatusCode::BAD_REQUEST));
 
@@ -1689,7 +1685,8 @@ mod store_tests {
                         missing,
                     )
                     .await
-                    .expect_err("unknown bucket must be rejected");
+                    .err()
+                    .expect("unknown bucket must be rejected");
                 assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);
 
                 // Validation failure (empty region) does not persist anything.
@@ -1701,7 +1698,8 @@ mod store_tests {
                         bucket_params(&router),
                     )
                     .await
-                    .expect_err("invalid config must be rejected");
+                    .err()
+                    .expect("invalid config must be rejected");
                 assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
                 assert!(err.message().unwrap_or_default().contains("region"));
                 assert!(get_config().await.is_err(), "a rejected PUT must not persist");
@@ -1711,7 +1709,8 @@ mod store_tests {
                 let err = SetBucketOnDemandMigrationHandler {}
                     .call(root_request(Method::PUT, config_uri(""), config_json(&closed)), bucket_params(&router))
                     .await
-                    .expect_err("unreachable source must be rejected");
+                    .err()
+                    .expect("unreachable source must be rejected");
                 assert_eq!(err.code(), &S3ErrorCode::Custom(ERR_CODE_SOURCE_UNREACHABLE.into()));
                 assert_eq!(err.status_code(), Some(StatusCode::BAD_REQUEST));
                 let rendered = format!("{err:?}");
@@ -1769,7 +1768,8 @@ mod store_tests {
                     let err = SetBucketOnDemandMigrationHandler {}
                         .call(root_request(Method::PUT, config_uri(""), invalid), bucket_params(&router))
                         .await
-                        .expect_err("malformed replacement must be rejected");
+                        .err()
+                        .expect("malformed replacement must be rejected");
                     assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
                     let after = metadata_sys::get(BUCKET).await.expect("saved metadata remains readable");
                     assert_eq!(after.on_demand_migration_config_json, before.on_demand_migration_config_json);
@@ -1801,7 +1801,7 @@ mod store_tests {
                     )
                     .await
                     .expect("reader may GET");
-                assert_eq!(reader_get.output.0, StatusCode::OK);
+                assert_eq!(reader_get.into_parts().0, StatusCode::OK);
                 let reader_status = GetBucketOnDemandMigrationStatusHandler {}
                     .call(
                         admin_request(Method::GET, config_uri("/status"), Vec::new(), READER_ACCESS_KEY, READER_SECRET_KEY),
@@ -1809,14 +1809,15 @@ mod store_tests {
                     )
                     .await
                     .expect("reader may read status");
-                assert_eq!(reader_status.output.0, StatusCode::OK);
+                assert_eq!(reader_status.into_parts().0, StatusCode::OK);
                 let err = SetBucketOnDemandMigrationHandler {}
                     .call(
                         admin_request(Method::PUT, config_uri(""), config_json(&source), READER_ACCESS_KEY, READER_SECRET_KEY),
                         bucket_params(&router),
                     )
                     .await
-                    .expect_err("reader must not PUT");
+                    .err()
+                    .expect("reader must not PUT");
                 assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
                 let err = DeleteBucketOnDemandMigrationHandler {}
                     .call(
@@ -1824,7 +1825,8 @@ mod store_tests {
                         bucket_params(&router),
                     )
                     .await
-                    .expect_err("reader must not DELETE");
+                    .err()
+                    .expect("reader must not DELETE");
                 assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
                 assert!(get_config().await.is_ok(), "denied writes must not change the config");
 
@@ -1833,7 +1835,7 @@ mod store_tests {
                     .call(root_request(Method::DELETE, config_uri(""), Vec::new()), bucket_params(&router))
                     .await
                     .expect("DELETE succeeds");
-                assert_eq!(response.output.0, StatusCode::NO_CONTENT);
+                assert_eq!(response.into_parts().0, StatusCode::NO_CONTENT);
                 let err = get_config().await.expect_err("config is gone after DELETE");
                 assert_eq!(err.code(), &S3ErrorCode::Custom(ERR_CODE_NO_SUCH_CONFIGURATION.into()));
                 let metadata = metadata_sys::get(BUCKET).await.expect("bucket metadata");
@@ -1849,7 +1851,7 @@ mod store_tests {
                     .call(root_request(Method::DELETE, config_uri(""), Vec::new()), bucket_params(&router))
                     .await
                     .expect("a second DELETE is idempotent");
-                assert_eq!(response.output.0, StatusCode::NO_CONTENT);
+                assert_eq!(response.into_parts().0, StatusCode::NO_CONTENT);
             },
         )
         .await;

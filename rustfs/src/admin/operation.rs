@@ -63,13 +63,6 @@ impl AdminRequest {
         self.envelope.credentials()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-        )
-    )]
     pub(crate) fn region(&self) -> Option<&str> {
         self.envelope.region()
     }
@@ -165,6 +158,7 @@ impl AdminRequest {
 }
 
 /// The raw HTTP response produced by an owned admin operation.
+#[derive(Debug)]
 pub(crate) struct AdminResponse {
     status: StatusCode,
     headers: HeaderMap,

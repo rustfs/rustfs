@@ -12,18 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::profile::authorize_profile_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::current_outbound_tls_state;
 use crate::server::ADMIN_PREFIX;
 use http::StatusCode;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
 use hyper::Method;
 use matchit::Params;
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
+use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_tls_runtime::{OutboundOnlySnapshotArgs, TlsConsumerStatusItem, TlsDebugStatusResponse, TlsRuntimeStatusSnapshot};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response};
 
 pub fn register_tls_debug_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -40,9 +41,21 @@ const PROTOS_GRPC_CHANNEL_CONSUMER: &str = "protos_grpc_channel";
 const RIO_HTTP_READER_CONSUMER: &str = "rio_http_reader";
 const ECSTORE_TRANSITION_CLIENT_CONSUMER: &str = "ecstore_transition_client";
 
+/// Owned-boundary form of `super::profile::authorize_profile_request`. The
+/// pre-check keeps this endpoint's historical `AccessDenied` missing-credentials
+/// response; the shared gate reports `InvalidRequest` "get cred failed".
+async fn authorize_profile_request(req: &AdminRequest) -> S3Result<()> {
+    if req.credentials().is_none() {
+        return Err(s3_error!(AccessDenied, "Signature is required"));
+    }
+
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ProfilingAdminAction)]).await?;
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl Operation for TlsStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_profile_request(&req).await?;
 
         let tls_path = rustfs_utils::get_env_opt_str(rustfs_config::ENV_RUSTFS_TLS_PATH).unwrap_or_default();
@@ -91,39 +104,34 @@ impl Operation for TlsStatusHandler {
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), headers))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(body), headers))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::TlsStatusHandler;
-    use crate::admin::router::Operation;
-    use http::{Extensions, HeaderMap, Uri};
+    use crate::admin::operation::AdminRequest;
+    use crate::admin::operation::Operation;
+    use http::{Extensions, HeaderMap};
     use hyper::Method;
     use matchit::Params;
+    use rustfs_s3_types::Body;
     use rustfs_s3_types::S3ErrorCode;
     use rustfs_tls_runtime::{OutboundOnlySnapshotArgs, TlsConsumerStatusItem, TlsRuntimeStatusSnapshot};
-    use s3s::{Body, S3Request};
 
-    fn build_tls_status_request() -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method: Method::GET,
-            uri: Uri::from_static("/rustfs/admin/debug/tls/status"),
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn build_tls_status_request() -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(Method::GET, "/rustfs/admin/debug/tls/status")
+            .headers(HeaderMap::new())
+            .extensions(Extensions::new())
+            .body(Body::empty())
+            .build()
     }
 
     #[tokio::test]
     async fn tls_status_handler_rejects_missing_credentials() {
         let result = TlsStatusHandler {}.call(build_tls_status_request(), Params::new()).await;
-        let err = result.expect_err("tls status handler must reject unauthenticated requests");
+        let err = result.err().expect("tls status handler must reject unauthenticated requests");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 
