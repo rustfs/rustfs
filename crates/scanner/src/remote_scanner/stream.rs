@@ -21,8 +21,7 @@ use crate::scanner_io::{
     cache_root_entry_info, current_cache_root_or_prepare_with_generation, log_saved_partial_bucket_cache,
     persist_scanner_checkpoint, scanner_set_disk_inventory,
 };
-use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
-use crate::storage_api::{EcstoreBackgroundEncodeBuffer, EcstoreBackgroundMemoryBudget};
+use crate::storage_api::owner::{EcstoreBackgroundEncodeBuffer, EcstoreBackgroundMemoryBudget, NS_SCANNER_PROTOCOL_VERSION};
 use crate::{
     DATA_USAGE_CACHE_NAME, DataUsageCache, DataUsageCachePrepareOutcome, DataUsageCacheSource, DataUsageEntryInfo,
     DataUsageScanPlanDigest, Disk, ScannerError, StorageError, resolve_scanner_object_store_handle,
@@ -1225,7 +1224,7 @@ pub(crate) async fn checkpoint_fixture_partial_return(progress: (u64, u64), entr
     )
     .await
     .expect("checkpoint partial frame must encode");
-    let frame = read_frame(&mut std::io::Cursor::new(bytes.as_slice()), &reader_auth, &mut 0)
+    let frame = read_frame(&mut std::io::Cursor::new(bytes.as_slice()), &reader_auth, &mut 0, None)
         .await
         .expect("checkpoint progress frame must authenticate");
     assert_eq!(frame.progress.entries_visited, entries_visited);
@@ -1287,6 +1286,9 @@ async fn consume_remote_scanner_stream_until<R>(
 where
     R: AsyncRead + Unpin,
 {
+    // Namespace consumption is background work even in a plain spawned worker.
+    // Capture only its installed local memory policy, never scheduler receipts.
+    let memory = EcstoreBackgroundMemoryBudget::current();
     let mut expected_sequence = 0_u64;
     let mut last_progress = RemoteScannerProgress::default();
     let mut last_phase = RemoteScannerPhase::Scanning;
@@ -1312,7 +1314,7 @@ where
             }
             result = tokio::time::timeout_at(
                 read_deadline,
-                read_frame(&mut reader, &authenticator, &mut expected_sequence),
+                read_frame(&mut reader, &authenticator, &mut expected_sequence, memory.as_ref()),
             ) => match result {
                 Ok(Ok(frame)) => frame,
                 Ok(Err(err)) => {
@@ -1684,6 +1686,7 @@ async fn read_frame<R>(
     reader: &mut R,
     authenticator: &FrameAuthenticator,
     expected_sequence: &mut u64,
+    memory: Option<&Arc<EcstoreBackgroundMemoryBudget>>,
 ) -> std::io::Result<RemoteScannerFrame>
 where
     R: AsyncRead + Unpin,
@@ -1705,9 +1708,17 @@ where
         ));
     }
 
-    let mut encoded = vec![0_u8; len];
-    reader.read_exact(&mut encoded).await?;
-    let envelope: RemoteScannerFrameEnvelope = rmp_serde::from_slice(&encoded)
+    let mut background = memory.map(|memory| EcstoreBackgroundEncodeBuffer::new(memory.clone(), len));
+    let mut foreground;
+    let encoded = match background.as_mut() {
+        Some(buffer) => buffer.prepare_read(len)?,
+        None => {
+            foreground = vec![0_u8; len];
+            foreground.as_mut_slice()
+        }
+    };
+    reader.read_exact(encoded).await?;
+    let envelope: RemoteScannerFrameEnvelope = rmp_serde::from_slice(encoded)
         .map_err(|_| IoError::new(ErrorKind::InvalidData, "invalid remote namespace scanner frame envelope"))?;
     if envelope.version != NS_SCANNER_PROTOCOL_VERSION {
         return Err(IoError::new(

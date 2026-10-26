@@ -498,7 +498,7 @@ async fn background_frame_matches_foreground_wire_mac_and_sequence() {
             assert_eq!(owner.snapshot().used, 0);
 
             let mut expected_sequence = initial_sequence;
-            let decoded = read_frame(&mut Cursor::new(background), &authenticator, &mut expected_sequence)
+            let decoded = read_frame(&mut Cursor::new(background), &authenticator, &mut expected_sequence, None)
                 .await
                 .expect("the original decoder must verify the background MAC and sequence");
             assert_eq!(expected_sequence, foreground_sequence);
@@ -2052,7 +2052,7 @@ async fn wrong_frame_version_and_sequence_are_rejected() {
         input.set_position(0);
 
         let mut expected_sequence = 0;
-        let error = read_frame(&mut input, &auth, &mut expected_sequence)
+        let error = read_frame(&mut input, &auth, &mut expected_sequence, None)
             .await
             .expect_err("invalid frame must fail");
         assert!(error.to_string().contains(expected_error));
@@ -2144,7 +2144,175 @@ fn oversized_frame_is_rejected_before_allocation() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
     let mut sequence = 0;
     let error = runtime
-        .block_on(read_frame(&mut input, &auth, &mut sequence))
+        .block_on(read_frame(&mut input, &auth, &mut sequence, None))
         .expect_err("oversized frame must fail");
     assert_eq!(error.kind(), ErrorKind::InvalidData);
+}
+
+#[tokio::test]
+async fn raw_frame_staging_denial_consumes_only_the_length_prefix() {
+    let auth = FrameAuthenticator::for_test(Uuid::new_v4());
+    let frame = RemoteScannerFrame::progress(RemoteScannerProgress::default());
+    let mut wire = Vec::new();
+    write_frame(&mut wire, &auth, &mut 0, &frame).await.expect("wire fixture");
+    let owner = EcstoreBackgroundMemoryBudget::new();
+    let mut input = Cursor::new(wire.clone());
+    let mut sequence = 0;
+    let error = read_frame(&mut input, &auth, &mut sequence, Some(&owner))
+        .await
+        .expect_err("closed staging budget");
+    assert_eq!(error.kind(), ErrorKind::WouldBlock);
+    assert_eq!(input.position(), 4, "do not read a frame body after staging denial");
+    assert_eq!(sequence, 0);
+    assert_eq!(owner.snapshot().used, 0);
+
+    let length = wire.len() - 4;
+    owner.set_sampled_limit(u64::try_from(length).expect("frame length"), Duration::from_secs(30));
+    let decoded = read_frame(&mut input, &auth, &mut sequence, Some(&owner)).await;
+    assert!(decoded.is_err(), "denial is terminal; do not resume from the consumed prefix");
+    let mut input = Cursor::new(wire);
+    read_frame(&mut input, &auth, &mut sequence, Some(&owner))
+        .await
+        .expect("a fresh reader with an admitted frame decodes");
+    assert_eq!(sequence, 1);
+    assert_eq!(owner.snapshot().used, 0);
+}
+
+#[tokio::test]
+async fn raw_frame_staging_failure_keeps_existing_validation_errors() {
+    let auth = FrameAuthenticator::for_test(Uuid::new_v4());
+    let mut wire = Vec::new();
+    write_frame(&mut wire, &auth, &mut 0, &RemoteScannerFrame::progress(RemoteScannerProgress::default()))
+        .await
+        .expect("wire fixture");
+    let owner = EcstoreBackgroundMemoryBudget::new();
+    owner.set_sampled_limit(4 * 1024 * 1024, Duration::from_secs(30));
+    let mut truncated = wire.clone();
+    truncated.pop();
+    for bytes in [
+        vec![0, 0, 0],
+        vec![0, 0, 0, 0],
+        (2_097_153_u32).to_be_bytes().to_vec(),
+        truncated,
+    ] {
+        let original = read_frame(&mut Cursor::new(bytes.clone()), &auth, &mut 0, None)
+            .await
+            .expect_err("invalid original frame");
+        let mut sequence = 0;
+        let error = read_frame(&mut Cursor::new(bytes), &auth, &mut sequence, Some(&owner))
+            .await
+            .expect_err("invalid admitted frame");
+        assert_eq!(error.kind(), original.kind());
+        assert_eq!(error.to_string(), original.to_string());
+        assert_eq!(sequence, 0);
+        assert_eq!(owner.snapshot().used, 0);
+    }
+}
+
+struct ShrinkDecodeBudgetAfterFrame {
+    input: Cursor<Vec<u8>>,
+    first_frame_end: u64,
+    memory: Arc<EcstoreBackgroundMemoryBudget>,
+}
+
+impl AsyncRead for ShrinkDecodeBudgetAfterFrame {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.input.position() >= self.first_frame_end {
+            self.memory.set_sampled_limit(0, Duration::from_secs(30));
+        }
+        std::pin::Pin::new(&mut self.input).poll_read(cx, buf)
+    }
+}
+
+#[tokio::test]
+async fn namespace_decode_denial_keeps_previously_reported_progress() {
+    const CHILD: &str = "RUSTFS_NAMESPACE_DECODE_PROGRESS_CHILD";
+    const TEST: &str = "remote_scanner::stream::tests::namespace_decode_denial_keeps_previously_reported_progress";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .expect("isolated installed-policy consumer test");
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("NAMESPACE_DECODE_PROGRESS_OK"));
+        return;
+    }
+    let owner = EcstoreBackgroundMemoryBudget::new();
+    assert!(owner.install());
+    owner.set_sampled_limit(4 * 1024 * 1024, Duration::from_secs(30));
+    let auth = FrameAuthenticator::for_test(Uuid::new_v4());
+    let mut wire = Vec::new();
+    let mut sequence = 0;
+    write_frame(
+        &mut wire,
+        &auth,
+        &mut sequence,
+        &RemoteScannerFrame::progress(RemoteScannerProgress {
+            objects_scanned: 3,
+            directories_started: 1,
+            entries_visited: 3,
+        }),
+    )
+    .await
+    .expect("reported progress frame");
+    let first_frame_end = u64::try_from(wire.len()).expect("frame position");
+    write_frame(
+        &mut wire,
+        &auth,
+        &mut sequence,
+        &RemoteScannerFrame::terminal(
+            RemoteScannerProgress {
+                objects_scanned: 3,
+                directories_started: 1,
+                entries_visited: 3,
+            },
+            RemoteScannerFrameResult::NamespaceNotFound,
+        ),
+    )
+    .await
+    .expect("terminal frame that must not be accepted after denial");
+    let mut input = ShrinkDecodeBudgetAfterFrame {
+        input: Cursor::new(wire),
+        first_frame_end,
+        memory: owner.clone(),
+    };
+    let budget = ScannerCycleBudget::new_with_progress_tracking(
+        &CancellationToken::new(),
+        ScannerCycleBudgetConfig {
+            max_objects: Some(100),
+            ..ScannerCycleBudgetConfig::default()
+        },
+    );
+    let result = consume_remote_scanner_stream_until(
+        &mut input,
+        budget.token(),
+        budget.clone(),
+        RemoteScannerResponseExpectation {
+            bucket: "bucket",
+            source: TEST_SOURCE,
+            next_cycle: 7,
+            scan_plan_digest: TEST_PLAN_DIGEST,
+            tier_registry_generation: 0,
+        },
+        auth,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .await;
+    let failure = finish_remote_scanner_stream(result, &budget).expect_err("staging denial must not become completion");
+    assert!(failure.retire_worker());
+    assert_eq!(budget.progress(), (3, 1));
+    assert!(budget.token().is_cancelled());
+    assert_eq!(input.input.position(), first_frame_end + 4);
+    assert_eq!(owner.snapshot().used, 0);
+    println!("NAMESPACE_DECODE_PROGRESS_OK");
 }

@@ -52,7 +52,9 @@ impl BackgroundMemoryBudget {
         BACKGROUND_MEMORY.set(self.clone()).is_ok()
     }
 
-    pub(super) fn current() -> Option<Arc<Self>> {
+    /// Return only the installed process memory policy; no node or disk ownership.
+    /// No policy is installed in the default, non-adaptive startup path.
+    pub fn current() -> Option<Arc<Self>> {
         BACKGROUND_MEMORY.get().cloned()
     }
 
@@ -249,7 +251,8 @@ impl BackgroundBuffer {
     }
 }
 
-/// Fallible, bounded serializer output using the admitted payload owner.
+/// Bounded encoded-frame storage for serializer output and raw read staging.
+/// Both paths reserve the actual allocation before initializing its bytes.
 pub struct BackgroundEncodeBuffer {
     buffer: BackgroundBuffer,
     filled: usize,
@@ -263,6 +266,20 @@ impl BackgroundEncodeBuffer {
             filled: 0,
             maximum,
         }
+    }
+
+    /// Borrow initialized raw-frame staging; decode only after a successful read.
+    /// Staging is not encoded output: `into_bytes` remains empty for this path.
+    pub fn prepare_read(&mut self, length: usize) -> io::Result<&mut [u8]> {
+        if length > self.maximum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "background encoded frame exceeds its size limit",
+            ));
+        }
+        self.buffer.ensure_len(length)?;
+        self.filled = 0;
+        Ok(&mut self.buffer.as_mut_slice()[..length])
     }
 
     pub fn into_bytes(mut self) -> Bytes {
