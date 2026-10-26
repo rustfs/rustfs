@@ -288,6 +288,13 @@ pub(crate) fn target_module_disabled_reason(module_name: &str, env_key: &str, en
     })
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "kept for the legacy/owned equivalence test until the legacy admin response helpers retire in T1.12 (rustfs/backlog#2788)"
+    )
+)]
 pub(crate) fn build_json_response(
     status: StatusCode,
     body: Body,

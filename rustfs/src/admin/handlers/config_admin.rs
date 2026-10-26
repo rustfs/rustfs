@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::authorize_admin_request;
+use crate::admin::auth::authorize_admin_envelope;
 use crate::admin::handlers::supervise_admin_mutation;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{
     current_action_credentials, current_app_context, current_object_store_handle_for_context, current_server_config_for_context,
 };
@@ -35,6 +36,7 @@ use crate::admin::utils::{
 };
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -82,9 +84,7 @@ use rustfs_config::{
 };
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::env;
@@ -693,13 +693,13 @@ pub fn register_config_route(r: &mut S3Router<AdminOperation>) -> std::io::Resul
     Ok(())
 }
 
-async fn validate_config_admin_request(req: &S3Request<Body>) -> S3Result<Credentials> {
+async fn validate_config_admin_request(req: &AdminRequest) -> S3Result<Credentials> {
     // Pre-check keeps this endpoint's historical missing-credentials message;
     // the shared gate reports "get cred failed".
-    if req.credentials.is_none() {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "missing credentials"));
     }
-    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::ConfigUpdateAdminAction)]).await
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ConfigUpdateAdminAction)]).await
 }
 
 fn header_value(content_type: &str) -> S3Result<HeaderValue> {
@@ -707,10 +707,10 @@ fn header_value(content_type: &str) -> S3Result<HeaderValue> {
         .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid content type: {err}")))
 }
 
-fn response_with_content_type(status: StatusCode, body: Vec<u8>, content_type: &str) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn response_with_content_type(status: StatusCode, body: Vec<u8>, content_type: &str) -> S3Result<AdminResponse> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, header_value(content_type)?);
-    Ok(S3Response::with_headers((status, Body::from(body)), headers))
+    Ok(AdminResponse::with_headers(status, Body::from(body), headers))
 }
 
 fn encode_config_payload(path: &str, secret_key: &str, data: Vec<u8>, plain_content_type: &str) -> S3Result<(Vec<u8>, String)> {
@@ -722,15 +722,15 @@ fn encode_config_payload(path: &str, secret_key: &str, data: Vec<u8>, plain_cont
     }
 }
 
-fn success_response(config_applied: bool) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn success_response(config_applied: bool) -> S3Result<AdminResponse> {
     if !config_applied {
-        return Ok(S3Response::new((StatusCode::OK, Body::default())));
+        return Ok(AdminResponse::new(StatusCode::OK, Body::default()));
     }
 
     let mut headers = HeaderMap::new();
     headers.insert(CONFIG_APPLIED_HEADER, header_value(CONFIG_APPLIED_TRUE)?);
     headers.insert(CONFIG_APPLIED_COMPAT_HEADER, header_value(CONFIG_APPLIED_TRUE)?);
-    Ok(S3Response::with_headers((StatusCode::OK, Body::default()), headers))
+    Ok(AdminResponse::with_headers(StatusCode::OK, Body::default(), headers))
 }
 
 fn object_store() -> S3Result<std::sync::Arc<crate::admin::storage_api::runtime::ECStore>> {
@@ -2019,9 +2019,9 @@ pub struct GetConfigKVHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetConfigKVHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_config_admin_request(&req).await?;
-        let queries = extract_query_params(&req.uri);
+        let queries = extract_query_params(req.uri());
         let selector = parse_config_selector(
             queries
                 .get("key")
@@ -2029,7 +2029,7 @@ impl Operation for GetConfigKVHandler {
         )?;
         let config = load_active_server_config().await?;
         let payload = render_selected_config(&config, &selector, true)?;
-        let (body, content_type) = encode_config_payload(req.uri.path(), &cred.secret_key, payload, TEXT_CONTENT_TYPE)?;
+        let (body, content_type) = encode_config_payload(req.uri().path(), &cred.secret_key, payload, TEXT_CONTENT_TYPE)?;
         response_with_content_type(StatusCode::OK, body, &content_type)
     }
 }
@@ -2038,9 +2038,10 @@ pub struct SetConfigKVHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SetConfigKVHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_config_admin_request(&req).await?;
-        let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key).await?;
+        let body =
+            read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, req.uri().path(), &cred.secret_key).await?;
         let directives = parse_config_directives(std::str::from_utf8(&body).map_err(ApiError::other)?, false)?;
         if directives.is_empty() {
             return Err(s3_error!(InvalidRequest, "config update body is empty"));
@@ -2066,9 +2067,10 @@ pub struct DelConfigKVHandler {}
 
 #[async_trait::async_trait]
 impl Operation for DelConfigKVHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_config_admin_request(&req).await?;
-        let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key).await?;
+        let body =
+            read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, req.uri().path(), &cred.secret_key).await?;
         let directives = parse_config_directives(std::str::from_utf8(&body).map_err(ApiError::other)?, true)?;
         if directives.is_empty() {
             return Err(s3_error!(InvalidRequest, "config delete body is empty"));
@@ -2094,9 +2096,9 @@ pub struct HelpConfigKVHandler {}
 
 #[async_trait::async_trait]
 impl Operation for HelpConfigKVHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_config_admin_request(&req).await?;
-        let queries = extract_query_params(&req.uri);
+        let queries = extract_query_params(req.uri());
         let response = build_help_response(
             queries.get("subSys").map(String::as_str),
             queries.get("key").map(String::as_str),
@@ -2111,9 +2113,9 @@ pub struct ListConfigHistoryKVHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ListConfigHistoryKVHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_config_admin_request(&req).await?;
-        let queries = extract_query_params(&req.uri);
+        let queries = extract_query_params(req.uri());
         let count = queries
             .get("count")
             .ok_or_else(|| s3_error!(InvalidRequest, "missing count query parameter"))?
@@ -2122,7 +2124,7 @@ impl Operation for ListConfigHistoryKVHandler {
             .map_err(S3Error::from)?;
         let entries = list_server_config_history(true, Some(count)).await?;
         let payload = serde_json::to_vec(&entries).map_err(ApiError::other).map_err(S3Error::from)?;
-        let (body, content_type) = encode_config_payload(req.uri.path(), &cred.secret_key, payload, JSON_CONTENT_TYPE)?;
+        let (body, content_type) = encode_config_payload(req.uri().path(), &cred.secret_key, payload, JSON_CONTENT_TYPE)?;
         response_with_content_type(StatusCode::OK, body, &content_type)
     }
 }
@@ -2131,9 +2133,9 @@ pub struct ClearConfigHistoryKVHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ClearConfigHistoryKVHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_config_admin_request(&req).await?;
-        let queries = extract_query_params(&req.uri);
+        let queries = extract_query_params(req.uri());
         let restore_id = queries
             .get("restoreId")
             .ok_or_else(|| s3_error!(InvalidRequest, "missing restoreId query parameter"))?;
@@ -2154,9 +2156,9 @@ pub struct RestoreConfigHistoryKVHandler {}
 
 #[async_trait::async_trait]
 impl Operation for RestoreConfigHistoryKVHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_config_admin_request(&req).await?;
-        let queries = extract_query_params(&req.uri);
+        let queries = extract_query_params(req.uri());
         let restore_id = queries
             .get("restoreId")
             .ok_or_else(|| s3_error!(InvalidRequest, "missing restoreId query parameter"))?;
@@ -2263,11 +2265,11 @@ pub struct GetConfigHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetConfigHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_config_admin_request(&req).await?;
         let config = load_active_server_config().await?;
         let payload = render_full_config(&config, false);
-        let (body, content_type) = encode_config_payload(req.uri.path(), &cred.secret_key, payload, TEXT_CONTENT_TYPE)?;
+        let (body, content_type) = encode_config_payload(req.uri().path(), &cred.secret_key, payload, TEXT_CONTENT_TYPE)?;
         response_with_content_type(StatusCode::OK, body, &content_type)
     }
 }
@@ -2276,9 +2278,10 @@ pub struct SetConfigHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SetConfigHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_config_admin_request(&req).await?;
-        let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key).await?;
+        let body =
+            read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, req.uri().path(), &cred.secret_key).await?;
         let directives = parse_config_directives(std::str::from_utf8(&body).map_err(ApiError::other)?, false)?;
         if directives.is_empty() {
             return Err(s3_error!(InvalidRequest, "full config body is empty"));
@@ -2303,7 +2306,6 @@ impl Operation for SetConfigHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::Uri;
     use serial_test::serial;
     use temp_env::with_vars;
 
@@ -2312,17 +2314,11 @@ mod tests {
     /// `validate_config_admin_request` must keep that message byte-identical.
     #[tokio::test]
     async fn config_admin_request_without_credentials_keeps_historical_message() {
-        let req = S3Request {
-            input: Body::from(String::new()),
-            method: Method::GET,
-            uri: Uri::from_static("/rustfs/admin/v3/config"),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let req = crate::admin::operation::test_support::TestRequest::new(Method::GET, "/rustfs/admin/v3/config")
+            .headers(HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::from(String::new()))
+            .build();
 
         let err = validate_config_admin_request(&req)
             .await

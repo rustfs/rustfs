@@ -248,7 +248,7 @@ impl crate::admin::router::Operation for ListExtensionInstancesHandler {
         _params: Params<'_, '_>,
     ) -> S3Result<s3s::S3Response<(StatusCode, s3s::Body)>> {
         authorize_extension_instance_request(&req).await?;
-        let filters = plugins_instances::extract_plugin_instance_filters(&req)?;
+        let filters = plugins_instances::extract_plugin_instance_filters(&req.uri)?;
         let instances = plugins_instances::filter_plugin_instances(plugins_instances::collect_all_instances().await?, &filters);
         let diagnostic_counts = plugins_instances::collect_diagnostic_counts(&instances);
         let (instances, truncated, next_marker) = plugins_instances::paginate_plugin_instances(instances, &filters)?;

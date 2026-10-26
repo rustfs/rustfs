@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::profile::{authorize_profile_request, profile_not_implemented_response};
-use crate::admin::auth::authorize_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use super::profile::authorize_profile_envelope;
+use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::storage_api::access::spawn_traced;
 use crate::server::ADMIN_PREFIX;
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -27,14 +28,9 @@ use rustfs_common::trace_bus::{TraceEvent, TraceKind, TraceVal, subscribe_trace_
 use rustfs_madmin::service_commands::ServiceTraceOpts;
 use rustfs_madmin::trace::TraceType;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Result, s3_error};
-use s3s::header::CONTENT_TYPE;
-use s3s::stream::{ByteStream, DynByteStream};
-use s3s::{Body, S3Request, S3Response, StdError};
+use rustfs_s3_types::{Body, S3Result, StdError, s3_error};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::mpsc;
@@ -91,11 +87,11 @@ pub fn register_profiling_route(r: &mut S3Router<AdminOperation>) -> std::io::Re
 /// Authorize a request against a single admin action (profiling or trace).
 /// The pre-check keeps these endpoints' historical `AccessDenied` missing-credentials
 /// response; the shared gate reports `InvalidRequest` "get cred failed".
-async fn authorize_action(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize_action(req: &AdminRequest, action: AdminAction) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(AccessDenied, "Signature is required"));
     }
-    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await?;
     Ok(())
 }
 
@@ -103,15 +99,18 @@ pub struct ProfileHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ProfileHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_profile_request(&req).await?;
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        authorize_profile_envelope(req.envelope()).await?;
 
-        let requested_url = req.uri.to_string();
+        let requested_url = req.uri().to_string();
         crate::profiling::log_cpu_pprof_dump_skipped();
-        Ok(profile_not_implemented_response(format!(
-            "{}; requested_url={requested_url}",
-            crate::profiling::local_cpu_pprof_unsupported_message()
-        )))
+        Ok(AdminResponse::new(
+            StatusCode::NOT_IMPLEMENTED,
+            Body::from(format!(
+                "{}; requested_url={requested_url}",
+                crate::profiling::local_cpu_pprof_unsupported_message()
+            )),
+        ))
     }
 }
 
@@ -119,8 +118,8 @@ pub struct ProfileStatusHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ProfileStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_profile_request(&req).await?;
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        authorize_profile_envelope(req.envelope()).await?;
 
         let status = ProfileStatus {
             enabled: "false",
@@ -133,14 +132,14 @@ impl Operation for ProfileStatusHandler {
             Ok(json) => {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                Ok(S3Response::with_headers((StatusCode::OK, Body::from(json)), headers))
+                Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(json), headers))
             }
             Err(e) => {
                 error!("Failed to serialize status: {}", e);
-                Ok(S3Response::new((
+                Ok(AdminResponse::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Body::from("Failed to serialize status".to_string()),
-                )))
+                ))
             }
         }
     }
@@ -157,13 +156,16 @@ pub struct ProfilingStartHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ProfilingStartHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_action(&req, AdminAction::ProfilingAdminAction).await?;
         crate::profiling::log_cpu_pprof_dump_skipped();
-        Ok(profile_not_implemented_response(format!(
-            "profiling start is not supported: {}",
-            crate::profiling::local_cpu_pprof_unsupported_message()
-        )))
+        Ok(AdminResponse::new(
+            StatusCode::NOT_IMPLEMENTED,
+            Body::from(format!(
+                "profiling start is not supported: {}",
+                crate::profiling::local_cpu_pprof_unsupported_message()
+            )),
+        ))
     }
 }
 
@@ -175,12 +177,15 @@ pub struct ProfilingDownloadHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ProfilingDownloadHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_action(&req, AdminAction::ProfilingAdminAction).await?;
-        Ok(profile_not_implemented_response(format!(
-            "profiling download is not supported: {}",
-            crate::profiling::local_cpu_pprof_unsupported_message()
-        )))
+        Ok(AdminResponse::new(
+            StatusCode::NOT_IMPLEMENTED,
+            Body::from(format!(
+                "profiling download is not supported: {}",
+                crate::profiling::local_cpu_pprof_unsupported_message()
+            )),
+        ))
     }
 }
 
@@ -189,28 +194,18 @@ pub struct ProfileControlHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ProfileControlHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_action(&req, AdminAction::ProfilingAdminAction).await?;
         crate::profiling::log_cpu_pprof_dump_skipped();
-        Ok(profile_not_implemented_response(format!(
-            "in-process profiling is not supported: {}",
-            crate::profiling::local_cpu_pprof_unsupported_message()
-        )))
+        Ok(AdminResponse::new(
+            StatusCode::NOT_IMPLEMENTED,
+            Body::from(format!(
+                "in-process profiling is not supported: {}",
+                crate::profiling::local_cpu_pprof_unsupported_message()
+            )),
+        ))
     }
 }
-
-struct TraceStream {
-    inner: ReceiverStream<Result<Bytes, StdError>>,
-}
-
-impl Stream for TraceStream {
-    type Item = Result<Bytes, StdError>;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).inner.poll_next_unpin(cx)
-    }
-}
-
-impl ByteStream for TraceStream {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TraceKindFilter {
@@ -374,15 +369,15 @@ pub struct TraceHandler {}
 
 #[async_trait::async_trait]
 impl Operation for TraceHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_action(&req, AdminAction::TraceAdminAction).await?;
 
         // Validate the trace options so malformed filters are rejected up front,
         // matching MinIO's behavior.
         let mut opts = ServiceTraceOpts::default();
-        opts.parse_params(&req.uri)
+        opts.parse_params(req.uri())
             .map_err(|_| s3_error!(InvalidRequest, "invalid trace parameters"))?;
-        let filter = TraceStreamFilter::from_request(&req.uri, &opts)?;
+        let filter = TraceStreamFilter::from_request(req.uri(), &opts)?;
 
         let node_name = sysinfo::System::host_name().unwrap_or_else(|| "rustfs".to_string());
         let mut subscription = subscribe_trace_events();
@@ -423,12 +418,13 @@ impl Operation for TraceHandler {
             }
         });
 
-        let stream: DynByteStream = Box::pin(TraceStream {
-            inner: ReceiverStream::new(rx),
-        });
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/x-ndjson"));
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(stream)), headers))
+        Ok(AdminResponse::with_headers(
+            StatusCode::OK,
+            Body::from_stream(ReceiverStream::new(rx)),
+            headers,
+        ))
     }
 }
 
@@ -532,7 +528,8 @@ mod tests {
         ProfileControlHandler, ProfileHandler, ProfileStatusHandler, ProfilingDownloadHandler, ProfilingStartHandler,
         TraceHandler, TraceKindFilter, TraceStreamFilter, TraceWireRecord, authorize_action,
     };
-    use crate::admin::router::Operation;
+    use crate::admin::operation::AdminRequest;
+    use crate::admin::operation::Operation;
     use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
     use matchit::Params;
@@ -540,22 +537,16 @@ mod tests {
     use rustfs_madmin::service_commands::ServiceTraceOpts;
     use rustfs_madmin::trace::TraceType;
     use rustfs_policy::policy::action::AdminAction;
+    use rustfs_s3_types::Body;
     use rustfs_s3_types::{S3ErrorCode, S3Result};
-    use s3s::{Body, S3Request};
     use std::time::{Duration, UNIX_EPOCH};
 
-    fn build_profile_request(uri: &'static str) -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method: Method::GET,
-            uri: Uri::from_static(uri),
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn build_profile_request(uri: &'static str) -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(Method::GET, Uri::from_static(uri))
+            .headers(HeaderMap::new())
+            .extensions(Extensions::new())
+            .body(Body::empty())
+            .build()
     }
 
     fn build_trace_stream_filter(uri: &'static str) -> S3Result<TraceStreamFilter> {
