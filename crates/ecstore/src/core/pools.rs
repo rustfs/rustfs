@@ -66,7 +66,7 @@ use crate::storage_api_contracts::{
     admin::StorageAdminApi,
     bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
     heal::HealOperations as _,
-    list::ListOperations as _,
+    list::StorageWalkOptions,
     namespace::NamespaceLocking as _,
     object::{EcstoreObjectIO, HTTPPreconditions, ObjectIO as _, ObjectOperations as _},
 };
@@ -20027,29 +20027,49 @@ impl ECStore {
             .pools
             .get(pool_idx)
             .ok_or_else(|| invalid_decommission_pool_index_error(self.pools.len(), pool_idx))?;
-        let mut receipts = Vec::new();
-        let mut continuation = None;
-        loop {
-            let page = pool
-                .clone()
-                .list_objects_v2(RUSTFS_META_BUCKET, prefix, continuation, None, 1000, false, None, false)
-                .await
-                .map_err(|err| {
-                    Error::other(format!(
-                        "failed to list durable ILM decommission receipts under `{prefix}` in pool {pool_idx}: {err}"
-                    ))
-                })?;
-            receipts.extend(page.objects.into_iter().map(|object| object.name));
-            if !page.is_truncated {
-                break;
-            }
-            continuation = Some(page.next_continuation_token.ok_or_else(|| {
+        // Receipts live in one pool, so walk that pool's sets directly; the
+        // merged `ListObjectsV2` cannot be scoped to a pool.
+        let mut receipts = std::collections::BTreeSet::new();
+        for set in pool.disk_set.iter() {
+            let (tx, mut rx) = mpsc::channel(256);
+            let cancel = CancellationToken::new();
+            let walk = set.clone().walk(
+                cancel.clone(),
+                RUSTFS_META_BUCKET,
+                prefix,
+                tx,
+                StorageWalkOptions::<fn(&FileInfo) -> bool> {
+                    latest_only: true,
+                    filter: Some(|info| !info.deleted && info.version_purge_status().is_empty()),
+                    ..Default::default()
+                },
+            );
+            let collect = async {
+                let mut names = Vec::new();
+                let mut first_error = None;
+                while let Some(item) = rx.recv().await {
+                    if let Some(err) = item.err {
+                        first_error.get_or_insert(err);
+                        cancel.cancel();
+                        continue;
+                    }
+                    if let Some(object) = item.item
+                        && object.name.starts_with(prefix)
+                    {
+                        names.push(object.name);
+                    }
+                }
+                (names, first_error)
+            };
+            let (walk_result, (names, item_error)) = tokio::join!(walk, collect);
+            walk_result.and(item_error.map_or(Ok(()), Err)).map_err(|err| {
                 Error::other(format!(
-                    "durable ILM decommission receipt listing under `{prefix}` in pool {pool_idx} was truncated without a continuation token"
+                    "failed to list durable ILM decommission receipts under `{prefix}` in pool {pool_idx}: {err}"
                 ))
-            })?);
+            })?;
+            receipts.extend(names);
         }
-        Ok(receipts)
+        Ok(receipts.into_iter().collect())
     }
 
     async fn list_decommission_durable_ilm_receipts(&self, source_pool_idx: usize) -> Result<Vec<(usize, String)>> {

@@ -236,50 +236,27 @@ impl Fixture {
         .expect("corpus xl.meta should reach the real local disk");
     }
 
-    async fn page(
-        &self,
-        layer: usize,
-        prefix: &str,
-        marker: Option<String>,
-        delimiter: Option<&str>,
-        max: i32,
-    ) -> ListObjectsInfo {
-        let request = format!("corpus layer={layer}, prefix={prefix}, marker={marker:?}, delimiter={delimiter:?}, max={max}");
+    async fn page(&self, prefix: &str, marker: Option<String>, delimiter: Option<&str>, max: i32) -> ListObjectsInfo {
+        let request = format!("corpus prefix={prefix}, marker={marker:?}, delimiter={delimiter:?}, max={max}");
         let delimiter = delimiter.map(str::to_owned);
         timeout(Duration::from_secs(10), async {
-            match layer {
-                0 => {
-                    self.store
-                        .clone()
-                        .list_objects_generic(&self.bucket, prefix, marker, delimiter, max, false)
-                        .await
-                }
-                1 => {
-                    self.store.pools[0]
-                        .clone()
-                        .list_objects_generic(&self.bucket, prefix, marker, delimiter, max, false)
-                        .await
-                }
-                _ => {
-                    self.store.pools[0].disk_set[0]
-                        .clone()
-                        .list_objects_generic(&self.bucket, prefix, marker, delimiter, max, false)
-                        .await
-                }
-            }
+            self.store
+                .clone()
+                .list_objects_generic(&self.bucket, prefix, marker, delimiter, max, false)
+                .await
         })
         .await
         .unwrap_or_else(|error| panic!("{request}: page must finish: {error}"))
-        .unwrap_or_else(|error| panic!("corpus layer={layer}, prefix={prefix}, max={max}: {error:?}"))
+        .unwrap_or_else(|error| panic!("corpus prefix={prefix}, max={max}: {error:?}"))
     }
 
-    async fn assert_walk(&self, layer: usize, prefix: &str, delimiter: Option<&str>, start: Option<&str>, max: usize) {
+    async fn assert_walk(&self, prefix: &str, delimiter: Option<&str>, start: Option<&str>, max: usize) {
         let mut marker = start.map(str::to_owned);
         let mut seen = Vec::new();
         for page_number in 0..=self.objects.len() {
             let expected = reference_page(&self.objects, prefix, delimiter, marker.as_deref().map(marker_key), max);
             let actual = self
-                .page(layer, prefix, marker.clone(), delimiter, i32::try_from(max).expect("small corpus limit"))
+                .page(prefix, marker.clone(), delimiter, i32::try_from(max).expect("small corpus limit"))
                 .await;
             let observed = Page {
                 objects: actual.objects.into_iter().map(|object| object.name).collect(),
@@ -290,7 +267,7 @@ impl Fixture {
             assert_eq!(
                 observed,
                 expected,
-                "layer={layer}, prefix={prefix}, delimiter={delimiter:?}, max={max}, page={page_number}, marker={marker:?}, mode={:?}, provider={:?}",
+                "prefix={prefix}, delimiter={delimiter:?}, max={max}, page={page_number}, marker={marker:?}, mode={:?}, provider={:?}",
                 std::env::var(ENV_API_LIST_OBJECTS_INDEX_MODE).ok(),
                 std::env::var(ENV_API_LIST_OBJECTS_INDEX_PROVIDER).ok(),
             );
@@ -348,12 +325,10 @@ async fn list_objects_shared_corpus_static_namespace() {
             .map(|entry| entry.name)
             .collect();
         assert_eq!(names, keys[..count], "raw walker should preserve byte order and __XLDIR__ decoding");
-        for layer in 0..3 {
-            for prefix in ["", "a", "a/", "中/", "missing/"] {
-                for delimiter in [None, Some("/")] {
-                    for max in [0, 1, 3, 4] {
-                        fixture.assert_walk(layer, prefix, delimiter, None, max).await;
-                    }
+        for prefix in ["", "a", "a/", "中/", "missing/"] {
+            for delimiter in [None, Some("/")] {
+                for max in [0, 1, 3, 4] {
+                    fixture.assert_walk(prefix, delimiter, None, max).await;
                 }
             }
         }
@@ -383,10 +358,8 @@ async fn list_objects_shared_corpus_cross_subdirectory_limit() {
             "#7049: a recursive child that reaches the limit must stop its parent"
         );
     }
-    for layer in 0..3 {
-        for max in [1, 2, 3, 4] {
-            fixture.assert_walk(layer, "", None, None, max).await;
-        }
+    for max in [1, 2, 3, 4] {
+        fixture.assert_walk("", None, None, max).await;
     }
 }
 
@@ -396,9 +369,7 @@ async fn list_objects_shared_corpus_max_and_max_plus_one() {
     for count in [max, max + 1] {
         let keys: Vec<_> = (0..count).map(|index| format!("bulk/key-{index:04}")).collect();
         let fixture = Fixture::new(&format!("list-corpus-max-{count}"), namespace(&keys), true).await;
-        for layer in 0..3 {
-            fixture.assert_walk(layer, "bulk/", None, None, max).await;
-        }
+        fixture.assert_walk("bulk/", None, None, max).await;
         let index_dir = tempfile::tempdir().expect("maximum-boundary index fixture");
         let index_path = index_dir.path().join("maximum.idx");
         for mode in [ListSourceMode::IndexKeyOnly, ListSourceMode::IndexVerifiedPage] {
@@ -409,7 +380,7 @@ async fn list_objects_shared_corpus_max_and_max_plus_one() {
                     (ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, index_path.to_str()),
                     (ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION, Some("maximum-corpus")),
                 ],
-                async { fixture.assert_walk(0, "bulk/", None, None, max).await },
+                async { fixture.assert_walk("bulk/", None, None, max).await },
             )
             .await;
         }
@@ -446,19 +417,15 @@ async fn list_objects_shared_corpus_fixed_seed_marker_and_prefix() {
         let marker = marker.filter(|marker| marker.starts_with(prefix));
         let delimiter = (seed & 1 == 0).then_some("/");
         let max = usize::try_from((seed >> 16) % 4 + 1).expect("small page size");
-        for layer in 0..3 {
-            fixture.assert_walk(layer, prefix, delimiter, marker, max).await;
-        }
+        fixture.assert_walk(prefix, delimiter, marker, max).await;
     }
     // A folded prefix can consume more raw candidates than the producer's
     // ordinary page budget before the next visible identity appears.
     let mut keys: Vec<_> = (0..12).map(|index| format!("data-{index:02}")).collect();
     keys.push("other-key".to_owned());
     let folded = Fixture::new("list-corpus-long-fold", namespace(&keys), true).await;
-    for layer in 0..3 {
-        for max in [1, 2] {
-            folded.assert_walk(layer, "", Some("-"), None, max).await;
-        }
+    for max in [1, 2] {
+        folded.assert_walk("", Some("-"), None, max).await;
     }
 }
 
@@ -480,7 +447,7 @@ async fn list_objects_shared_corpus_offline_corrupt_and_minority_stale() {
         .await
         .expect("fixture should retain exactly a write quorum of metadata copies");
     }
-    fixture.assert_walk(0, "", None, None, 3).await;
+    fixture.assert_walk("", None, None, 3).await;
     let offline_disk = set.disks.write().await[0]
         .take()
         .expect("a disk with a committed copy should exist before the offline fault");
@@ -489,10 +456,8 @@ async fn list_objects_shared_corpus_offline_corrupt_and_minority_stale() {
         3,
         "offline fault must reach the real set"
     );
-    for layer in 0..3 {
-        fixture.assert_walk(layer, "", None, None, 3).await;
-        fixture.assert_walk(layer, "", Some("/"), None, 3).await;
-    }
+    fixture.assert_walk("", None, None, 3).await;
+    fixture.assert_walk("", Some("/"), None, 3).await;
     set.disks.write().await[0] = Some(offline_disk);
     for object in &fixture.objects {
         fixture.write_metadata(3, object).await;
@@ -508,9 +473,7 @@ async fn list_objects_shared_corpus_offline_corrupt_and_minority_stale() {
         .await
         .expect("corrupt fault should reach disk bytes");
     assert!(FileMeta::load(&tokio::fs::read(&metadata_path).await.expect("fault bytes should be readable")).is_err());
-    for layer in 0..3 {
-        fixture.assert_walk(layer, "a", None, None, 1).await;
-    }
+    fixture.assert_walk("a", None, None, 1).await;
     fixture.write_metadata(3, object).await;
 
     let mut stale = object.clone();
@@ -521,9 +484,7 @@ async fn list_objects_shared_corpus_offline_corrupt_and_minority_stale() {
         versions: stale.versions.clone(),
     };
     fixture.write_metadata(3, &phantom).await;
-    for layer in 0..3 {
-        fixture.assert_walk(layer, "", None, None, 3).await;
-    }
+    fixture.assert_walk("", None, None, 3).await;
 }
 
 #[tokio::test]
@@ -698,91 +659,59 @@ async fn list_objects_shared_corpus_versions_delete_markers_and_free_versions() 
                 .map(|version| (object.key.clone(), version.id, version.kind == VersionKind::Delete))
         })
         .collect();
-    for layer in 0..3 {
-        fixture.assert_walk(layer, "", None, None, 1).await;
-        fixture.assert_walk(layer, "", Some("/"), None, 1).await;
-        for max in [0, 1, expected.len() - 1, expected.len(), expected.len() + 1] {
-            let mut marker = None;
-            let mut version_marker = None;
-            let mut offset = 0;
-            loop {
-                let result = timeout(Duration::from_secs(10), async {
-                    match layer {
-                    0 => {
-                        fixture
-                            .store
-                            .clone()
-                            .inner_list_object_versions(
-                                &fixture.bucket,
-                                "",
-                                marker.clone(),
-                                version_marker.clone(),
-                                None,
-                                i32::try_from(max).expect("small limit"),
-                            )
-                            .await
-                    }
-                    1 => {
-                        fixture.store.pools[0]
-                            .clone()
-                            .inner_list_object_versions(
-                                &fixture.bucket,
-                                "",
-                                marker.clone(),
-                                version_marker.clone(),
-                                None,
-                                i32::try_from(max).expect("small limit"),
-                            )
-                            .await
-                    }
-                    _ => {
-                        fixture.store.pools[0].disk_set[0]
-                            .clone()
-                            .inner_list_object_versions(
-                                &fixture.bucket,
-                                "",
-                                marker.clone(),
-                                version_marker.clone(),
-                                None,
-                                i32::try_from(max).expect("small limit"),
-                            )
-                            .await
-                    }
-                    }
-                })
-                .await
-                .unwrap_or_else(|error| {
-                    panic!("version layer={layer}, max={max}, offset={offset}, marker={marker:?}, version_marker={version_marker:?}: page must finish: {error}")
-                })
-                .expect("real version page should list");
-                let end = (offset + max).min(expected.len());
-                let actual: Vec<_> = result
-                    .objects
-                    .into_iter()
-                    .map(|object| (object.name, object.version_id.filter(|id| !id.is_nil()), object.delete_marker))
-                    .collect();
-                assert_eq!(actual, expected[offset..end], "version layer={layer}, max={max}, offset={offset}");
-                assert!(result.prefixes.is_empty());
-                let more = max > 0 && end < expected.len();
-                assert_eq!(
-                    result.is_truncated, more,
-                    "version layer={layer}, max={max}, offset={offset}, marker={marker:?}, version_marker={version_marker:?}, returned={actual:?}, next_key={:?}, next_version={:?}: page needs exactly one lookahead",
-                    result.next_marker, result.next_version_idmarker,
-                );
-                if !more {
-                    assert!(result.next_marker.is_none() && result.next_version_idmarker.is_none());
-                    break;
-                }
-                let last = &expected[end - 1];
-                assert_eq!(result.next_marker.as_deref().map(marker_key), Some(last.0.as_str()));
-                assert_eq!(
-                    result.next_version_idmarker,
-                    Some(last.1.map_or_else(|| "null".to_owned(), |id| id.to_string()))
-                );
-                marker = result.next_marker;
-                version_marker = result.next_version_idmarker;
-                offset = end;
+    fixture.assert_walk("", None, None, 1).await;
+    fixture.assert_walk("", Some("/"), None, 1).await;
+    for max in [0, 1, expected.len() - 1, expected.len(), expected.len() + 1] {
+        let mut marker = None;
+        let mut version_marker = None;
+        let mut offset = 0;
+        loop {
+            let result = timeout(Duration::from_secs(10), async {
+                fixture
+                    .store
+                    .clone()
+                    .inner_list_object_versions(
+                        &fixture.bucket,
+                        "",
+                        marker.clone(),
+                        version_marker.clone(),
+                        None,
+                        i32::try_from(max).expect("small limit"),
+                    )
+                    .await
+            })
+            .await
+            .unwrap_or_else(|error| {
+                panic!("version max={max}, offset={offset}, marker={marker:?}, version_marker={version_marker:?}: page must finish: {error}")
+            })
+            .expect("real version page should list");
+            let end = (offset + max).min(expected.len());
+            let actual: Vec<_> = result
+                .objects
+                .into_iter()
+                .map(|object| (object.name, object.version_id.filter(|id| !id.is_nil()), object.delete_marker))
+                .collect();
+            assert_eq!(actual, expected[offset..end], "version max={max}, offset={offset}");
+            assert!(result.prefixes.is_empty());
+            let more = max > 0 && end < expected.len();
+            assert_eq!(
+                result.is_truncated, more,
+                "version max={max}, offset={offset}, marker={marker:?}, version_marker={version_marker:?}, returned={actual:?}, next_key={:?}, next_version={:?}: page needs exactly one lookahead",
+                result.next_marker, result.next_version_idmarker,
+            );
+            if !more {
+                assert!(result.next_marker.is_none() && result.next_version_idmarker.is_none());
+                break;
             }
+            let last = &expected[end - 1];
+            assert_eq!(result.next_marker.as_deref().map(marker_key), Some(last.0.as_str()));
+            assert_eq!(
+                result.next_version_idmarker,
+                Some(last.1.map_or_else(|| "null".to_owned(), |id| id.to_string()))
+            );
+            marker = result.next_marker;
+            version_marker = result.next_version_idmarker;
+            offset = end;
         }
     }
     // A deleted directory-marker key cannot hide a different live child.
@@ -796,10 +725,8 @@ async fn list_objects_shared_corpus_versions_delete_markers_and_free_versions() 
     )
     .await
     .expect("delete-marker fixture should retain three committed copies");
-    for layer in 0..3 {
-        fixture.assert_walk(layer, "folder/", None, None, 1).await;
-        fixture.assert_walk(layer, "", Some("/"), None, 1).await;
-    }
+    fixture.assert_walk("folder/", None, None, 1).await;
+    fixture.assert_walk("", Some("/"), None, 1).await;
 }
 
 #[tokio::test]
@@ -819,7 +746,7 @@ async fn list_objects_shared_corpus_orphan_cleanup_requires_authoritative_eviden
                 .await
                 .expect("orphan input must share an ancestor with a legal child");
         }
-        let result = fixture.page(0, "ghost/", None, None, 1).await;
+        let result = fixture.page("ghost/", None, None, 1).await;
         assert!(result.objects.is_empty() && result.prefixes.is_empty() && !result.is_truncated);
         for dir in &fixture.dirs {
             assert_eq!(
@@ -836,7 +763,7 @@ async fn list_objects_shared_corpus_orphan_cleanup_requires_authoritative_eviden
                 "purge must preserve legal siblings"
             );
         }
-        fixture.assert_walk(0, "legal/", None, None, 1).await;
+        fixture.assert_walk("legal/", None, None, 1).await;
         for dir in &fixture.dirs {
             assert!(
                 dir.path()
@@ -860,7 +787,7 @@ async fn list_objects_shared_corpus_orphan_cleanup_requires_authoritative_eviden
                 .expect("authoritative fixture has a metadata system");
             let guard = metadata_sys.write().await;
             assert!(
-                timeout(Duration::from_millis(100), fixture.page(0, "timed-out/", None, None, 1))
+                timeout(Duration::from_millis(100), fixture.page("timed-out/", None, None, 1))
                     .await
                     .is_err(),
                 "blocked authoritative evidence must time out before cleanup can classify the prefix as empty"
@@ -993,7 +920,7 @@ async fn list_objects_shared_corpus_cancelled_quorum_walk_releases_senders_and_d
         "all production callback/producer sender clones must be released"
     );
     assert!(set.disks.try_write().is_ok(), "listing cancellation must not retain the set's disk lock");
-    fixture.assert_walk(0, "", None, None, 3).await;
+    fixture.assert_walk("", None, None, 3).await;
 }
 
 #[tokio::test]
@@ -1018,11 +945,11 @@ async fn list_objects_shared_corpus_enabled_index_contracts() {
                     for prefix in ["", "a", "a/", "missing/"] {
                         for delimiter in [None, Some("/")] {
                             for max in [0, 1, 3, 4] {
-                                fixture.assert_walk(0, prefix, delimiter, None, max).await;
+                                fixture.assert_walk(prefix, delimiter, None, max).await;
                             }
                         }
                     }
-                    let result = fixture.page(0, "", None, None, 1).await;
+                    let result = fixture.page("", None, None, 1).await;
                     let mut parsed = ListPathOptions {
                         marker: result.next_marker,
                         ..Default::default()
@@ -1052,8 +979,8 @@ async fn list_objects_shared_corpus_enabled_index_contracts() {
             (ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, Some("5000")),
         ],
         async {
-            fixture.assert_walk(0, "", None, None, 3).await;
-            let first = fixture.page(0, "", None, None, 1).await;
+            fixture.assert_walk("", None, None, 3).await;
+            let first = fixture.page("", None, None, 1).await;
             let mut cursor = ListPathOptions {
                 marker: first.next_marker.clone(),
                 ..Default::default()
@@ -1111,8 +1038,8 @@ async fn list_objects_shared_corpus_enabled_index_contracts() {
                     .is_none(),
                 "an index path that is a directory must fail the enabled provider"
             );
-            fixture.assert_walk(0, "", None, None, 3).await;
-            let result = fixture.page(0, "", None, None, 1).await;
+            fixture.assert_walk("", None, None, 3).await;
+            let result = fixture.page("", None, None, 1).await;
             let mut cursor = ListPathOptions {
                 marker: result.next_marker,
                 ..Default::default()

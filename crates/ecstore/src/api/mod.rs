@@ -429,12 +429,16 @@ pub mod data_usage {
 pub mod disk {
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
     pub use crate::disk::local::{ReplacementExecutionLease, ScanGuard};
+    #[cfg(feature = "test-util")]
+    pub use crate::disk::local::{local_durability_modes, set_local_rename_data_fail_after_metadata_commit};
     pub use crate::disk::multipart_source::{
         MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartAbortCertificate, MultipartAbortProof, MultipartAbortProofKind,
         MultipartAbortRound, MultipartSourceOperation, MultipartSourcePhase, MultipartSourceRequest, MultipartSourceResponse,
         MultipartSourceSnapshot, PublicationIdentity, SourceGeneration, SourceGeometry, SourceLineage, capture_source_condition,
         require_source_condition, strip_native_controls,
     };
+    #[cfg(all(feature = "test-util", unix))]
+    pub use crate::disk::os::set_local_dir_fsync_failure;
     #[cfg(all(feature = "test-util", not(windows)))]
     pub use crate::disk::os::{LocalPublicationPause, LocalPublicationStage};
     pub use crate::disk::{

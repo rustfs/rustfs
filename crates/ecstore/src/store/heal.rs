@@ -1809,6 +1809,165 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn historical_heal_backup_survives_stale_incarnation_and_movement() {
+        use crate::disk::local::{DurabilityMode, durability_mode, durability_mode_override, effective_durability};
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_DURABILITY_MODE", Some("strict")),
+                ("RUSTFS_NEW_BUCKET_DURABILITY_MODE", Some("strict")),
+            ],
+            async {
+                let (_root, store, shutdown) = heal_store_with_pool_count(1).await;
+                assert_eq!(durability_mode(), DurabilityMode::Strict, "process durability must be strict");
+                let bucket = "heal-retained-backup";
+                let object = "object";
+                store
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("original bucket");
+                assert_eq!(effective_durability(bucket), DurabilityMode::Strict, "original bucket must be strict");
+                let old = store
+                    .bucket_incarnation_id_from_disk(bucket)
+                    .await
+                    .expect("original identity");
+                store
+                    .delete_bucket(bucket, &DeleteBucketOptions::default())
+                    .await
+                    .expect("delete original empty bucket");
+                store
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("same-name successor");
+                assert_eq!(effective_durability(bucket), DurabilityMode::Strict, "successor bucket must be strict");
+                let current = store
+                    .bucket_incarnation_id_from_disk(bucket)
+                    .await
+                    .expect("successor identity");
+                assert_ne!(old, current);
+                let set = &store.pools[0].disk_set[0];
+                set.put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(vec![73; 512 * 1024]),
+                    &ObjectOptions {
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write successor object");
+                let disks: Vec<_> = set.disks.read().await.iter().flatten().cloned().collect();
+                assert_eq!(disks.len(), 4);
+                let mut evidence = Vec::new();
+                for disk in &disks {
+                    let metadata = disk.read_all(bucket, "object/xl.meta").await.expect("current metadata");
+                    let info = disk
+                        .read_version("", bucket, object, "", &Default::default())
+                        .await
+                        .expect("current generation");
+                    let transaction = info.data_dir.expect("external shard directory");
+                    let backup = format!("{object}/{transaction}/xl.meta.bkp");
+                    disk.write_all(bucket, &backup, metadata.clone())
+                        .await
+                        .expect("retain unreceipted historical backup");
+                    let inspection = disk
+                        .inspect_delete_transaction(bucket, object, transaction)
+                        .await
+                        .expect("read-only historical inspection");
+                    assert_eq!(inspection.state, crate::disk::DeleteRecoveryState::Absent);
+                    assert!(inspection.journal.is_none());
+                    assert!(inspection.backup_digest.is_some(), "delete absence must not hide the retained backup");
+                    evidence.push((transaction, backup, metadata, inspection.fingerprint));
+                }
+                let opts = HealOpts {
+                    pool: Some(0),
+                    set: Some(0),
+                    ..Default::default()
+                };
+                assert!(
+                    store
+                        .recover_delete_transactions_at_incarnation(bucket, Some(object), Some(old), &opts)
+                        .await
+                        .is_err(),
+                    "an old bucket admission cannot inspect or settle its successor"
+                );
+
+                for rebalance in [false, true] {
+                    let movement_gate = store.ctx.data_movement_operation_gate();
+                    let held = movement_gate.write().await;
+                    let mut recovery = tokio::spawn({
+                        let store = store.clone();
+                        async move {
+                            store
+                                .recover_delete_transactions_at_incarnation(bucket, Some(object), Some(current), &opts)
+                                .await
+                        }
+                    });
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_millis(100), &mut recovery)
+                            .await
+                            .is_err(),
+                        "recovery must wait for the movement owner before inspecting backups"
+                    );
+                    if rebalance {
+                        *store.rebalance_meta.write().await = Some(RebalanceMeta {
+                            id: Uuid::new_v4().to_string(),
+                            pool_stats: vec![RebalanceStats {
+                                participating: true,
+                                info: RebalanceInfo {
+                                    status: RebalStatus::Started,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        });
+                    } else {
+                        store.pool_meta.write().await.pools[0].decommission = Some(PoolDecommissionInfo {
+                            start_time: Some(OffsetDateTime::now_utc()),
+                            ..Default::default()
+                        });
+                    }
+                    drop(held);
+                    let error = tokio::time::timeout(std::time::Duration::from_secs(10), recovery)
+                        .await
+                        .expect("released recovery must finish")
+                        .expect("recovery task")
+                        .expect_err("active movement must defer historical recovery");
+                    assert_eq!(error, StorageError::SlowDown);
+                    *store.rebalance_meta.write().await = None;
+                    store.pool_meta.write().await.pools[0].decommission = None;
+                }
+                store
+                    .recover_delete_transactions_at_incarnation(bucket, Some(object), Some(current), &opts)
+                    .await
+                    .expect("fresh recovery can proceed after movement stops");
+                for (disk, (transaction, backup, metadata, fingerprint)) in disks.iter().zip(evidence) {
+                    assert_eq!(
+                        disk.read_all(bucket, "object/xl.meta")
+                            .await
+                            .expect("preserved current metadata"),
+                        metadata
+                    );
+                    assert_eq!(disk.read_all(bucket, &backup).await.expect("preserved historical backup"), metadata);
+                    let inspection = disk
+                        .inspect_delete_transaction(bucket, object, transaction)
+                        .await
+                        .expect("retained backup remains queryable");
+                    assert_eq!(inspection.fingerprint, fingerprint);
+                    assert!(inspection.backup_digest.is_some());
+                    assert!(inspection.journal.is_none());
+                }
+                shutdown.cancel();
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn bucket_incarnation_heal_preserves_successor_shards_and_allows_fresh_repair() {
         let (_root, store, shutdown) = multi_pool_heal_store().await;
         let bucket = format!("heal-incarnation-{}", Uuid::new_v4().simple());
