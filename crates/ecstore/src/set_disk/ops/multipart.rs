@@ -5617,7 +5617,10 @@ mod tests {
                 .await
                 .expect("abort task should join after completion releases")
                 .expect_err("the committed upload should no longer exist");
-            assert!(matches!(abort_err, StorageError::InvalidUploadID(..)));
+            assert!(
+                matches!(abort_err, StorageError::InvalidUploadID(..)),
+                "the completed upload must be absent after the tail drains, got: {abort_err:?}"
+            );
 
             for (disk_index, disk) in disk_stores.iter().enumerate() {
                 let fi = disk
@@ -9553,10 +9556,12 @@ mod tests {
                                 ).expect("actual completion identity"));
                             }
                         }
-                        if published == 3 && tasks.running() == 1 { break; }
+                        // The fourth native syscall is held by release_rx even if
+                        // its deadline has already retired the async wrapper.
+                        if published == 3 { break; }
                         tokio::task::yield_now().await;
                     }
-                }).await.expect("three real native publication legs must return before the fourth deadline");
+                }).await.expect("three real native publication legs must succeed while the fourth syscall remains paused");
                 after_publication.as_ref().expect("publication barrier").wait_until_paused().await;
                 // Quorum has been validated and the parent released its object
                 // guard. The successful physical tail cannot retain a clone.
