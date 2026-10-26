@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncReadExt;
 
 const MAX_CACHE_BYTES: u64 = 1024 * 1024;
-const REQUEST_ENV: &str = "RUSTFS_ENUMERATION_REQUEST";
+pub(super) const REQUEST_ENV: &str = "RUSTFS_ENUMERATION_REQUEST";
 
 struct Observation {
     root: PathBuf,
@@ -72,7 +72,7 @@ struct Request {
     round: u32,
 }
 
-async fn read_bounded(path: &Path) -> Vec<u8> {
+pub(super) async fn read_bounded(path: &Path) -> Vec<u8> {
     let file = tokio::fs::File::open(path).await.expect("open fixture artifact");
     let mut bytes = Vec::new();
     file.take(MAX_CACHE_BYTES + 1)

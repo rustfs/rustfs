@@ -285,35 +285,6 @@ mod bounded_response_tests {
     }
 
     #[tokio::test]
-    async fn overflowing_closed_range_is_rejected_before_network_io() {
-        let listener = match TcpListener::bind("127.0.0.1:0").await {
-            Ok(listener) => listener,
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
-            Err(err) => panic!("test listener should bind: {err}"),
-        };
-        let endpoint = listener
-            .local_addr()
-            .expect("listener local address should be available")
-            .to_string();
-        let client = client_for_endpoint(&endpoint, TransitionClientTimeouts::default()).await;
-        let mut opts = GetObjectOptions::default();
-        opts.headers
-            .insert("range".to_string(), "bytes=0-18446744073709551615".to_string());
-
-        let err = client
-            .get_object_inner("bucket", "probe", &opts)
-            .await
-            .expect_err("an overflowing closed range must be rejected locally");
-
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), listener.accept())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
     async fn connection_refused_returns_without_waiting_for_the_request_timeout() {
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,

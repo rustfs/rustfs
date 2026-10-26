@@ -15,7 +15,9 @@
 //! CopyObject path.
 
 use super::*;
+use futures::FutureExt;
 use rustfs_utils::path::fold_object_name_path_separators;
+use tracing::Instrument;
 
 use crate::auth::{VerifiedPresignedRequest, reject_presigned_put_max_content_length_for_other_operation};
 use crate::error::ServerSideSourceReadError;
@@ -168,12 +170,21 @@ impl DefaultObjectUsecase {
     pub fn execute_copy_object(
         &self,
         req: S3Request<CopyObjectInput>,
-    ) -> impl std::future::Future<Output = S3Result<S3Response<CopyObjectOutput>>> + Send + '_ {
-        Box::pin(self.execute_copy_object_inner(req))
+    ) -> impl std::future::Future<Output = S3Result<S3Response<CopyObjectOutput>>> + Send + Unpin + '_ {
+        let body = self.execute_copy_object_body_boxed(req);
+        futures::future::lazy(move |_| body.instrument(tracing::debug_span!("execute_copy_object"))).flatten()
     }
 
-    #[instrument(name = "execute_copy_object", level = "debug", skip(self, req))]
-    async fn execute_copy_object_inner(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+    // Construct the large business future outside its caller's polling frame.
+    #[inline(never)]
+    fn execute_copy_object_body_boxed(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> impl std::future::Future<Output = S3Result<S3Response<CopyObjectOutput>>> + Send + Unpin + '_ {
+        Box::pin(self.execute_copy_object_body(req))
+    }
+
+    async fn execute_copy_object_body(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         reject_presigned_put_max_content_length_for_other_operation(
             &req.headers,
             req.uri.query(),
@@ -326,9 +337,13 @@ impl DefaultObjectUsecase {
 
         // warn!("copy_object {}/{}, to {}/{}", &src_bucket, &src_key, &bucket, &key);
 
+        let src_versioned_enabled = BucketVersioningSys::prefix_enabled(&src_bucket, &src_key).await;
+        let src_version_suspended = BucketVersioningSys::prefix_suspended(&src_bucket, &src_key).await;
         let mut src_opts = copy_src_opts(&src_bucket, &src_key, &req.headers).map_err(ApiError::from)?;
 
         src_opts.version_id = version_id.clone();
+        src_opts.versioned = src_versioned_enabled;
+        src_opts.version_suspended = src_version_suspended;
 
         let mut src_get_opts = ObjectOptions {
             version_id: src_opts.version_id.clone(),
@@ -864,15 +879,11 @@ impl DefaultObjectUsecase {
         // AWS/MinIO return this whenever the source bucket carries versioning (enabled or
         // suspended); render the null version as "null" like GET/HEAD do. This is the exact source
         // version, kept distinct from the destination version_id above.
-        let src_versioned = BucketVersioningSys::prefix_enabled(&src_bucket, &src_key).await
-            || BucketVersioningSys::prefix_suspended(&src_bucket, &src_key).await;
+        let src_versioned = src_versioned_enabled || src_version_suspended;
         let copy_source_version_id = if src_versioned {
-            src_resolved_version_id.map(|vid| {
-                if vid == Uuid::nil() {
-                    "null".to_string()
-                } else {
-                    vid.to_string()
-                }
+            Some(match src_resolved_version_id {
+                Some(vid) if vid != Uuid::nil() => vid.to_string(),
+                _ => "null".to_string(),
             })
         } else {
             None

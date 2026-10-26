@@ -197,6 +197,10 @@ pub const ENV_HEAL_MRF_REPLAY_BATCH: &str = "RUSTFS_HEAL_MRF_REPLAY_BATCH";
 /// Default behavior keeps the MRF intent pipeline enabled.
 pub const DEFAULT_HEAL_MRF_ENABLE: bool = true;
 
+/// Opt in to lifecycle V2 transitions after qualifying every reader and the rollback binary.
+pub const ENV_MRF_LIFECYCLE_V2_ENABLE: &str = "RUSTFS_MRF_LIFECYCLE_V2_ENABLE";
+pub const DEFAULT_MRF_LIFECYCLE_V2_ENABLE: bool = false;
+
 /// Default MRF queue capacity (matches MinIO's 100k MRF list ceiling).
 pub const DEFAULT_HEAL_MRF_QUEUE_SIZE: usize = 100_000;
 

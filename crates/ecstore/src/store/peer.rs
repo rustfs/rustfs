@@ -266,6 +266,25 @@ impl ECStore {
         .await
     }
 
+    /// Recovery stays bound to this admitted instance even after RPC cancellation.
+    pub async fn recover_local_multipart_source(
+        &self,
+        disk_ref: &str,
+        request: crate::disk::multipart_source::MultipartSourceRequest,
+    ) -> DiskResult<crate::disk::multipart_source::MultipartSourceResponse> {
+        request.validate()?;
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let owner = admit_local_disk(&self.ctx, &disk, id, request.operation.is_mutation()).await?;
+        let Disk::Local(wrapper) = disk.as_ref() else {
+            return Err(DiskError::DiskNotFound);
+        };
+        wrapper
+            .get_disk()
+            .bind_multipart_proof_authority(&self.ctx.multipart_proof_verification_context())?;
+        let owner = owner.map(|owner| owner as Arc<dyn Send + Sync>);
+        wrapper.recover_multipart_source_with_namespace_owner(request, owner).await
+    }
+
     pub async fn undo_local_write(
         &self,
         disk_ref: &str,
@@ -353,6 +372,14 @@ async fn rename_local_data_with_ctx(
     let mutates_namespace = !is_meta_bucketname(source.0) || !is_meta_bucketname(destination.0);
     let admit_started = rustfs_io_metrics::put_stage_timer();
     let owner = admit_local_disk(ctx, &disk, disk_id, mutates_namespace).await?;
+    if source.0 == crate::disk::RUSTFS_META_MULTIPART_BUCKET {
+        let Disk::Local(wrapper) = disk.as_ref() else {
+            return Err(DiskError::DiskNotFound);
+        };
+        wrapper
+            .get_disk()
+            .bind_multipart_proof_authority(&ctx.multipart_proof_verification_context())?;
+    }
     let admit_ms = admit_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
     if let Some(duration_ms) = admit_ms {
         rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_ADMIT, duration_ms);
@@ -917,12 +944,110 @@ mod tests {
             let ctx = Arc::new(InstanceContext::new());
             let root = tempfile::tempdir().expect("root");
             let disk = target_disk(&ctx, root.path(), Uuid::new_v4()).await;
-            let fi = target_file_info("destination", Uuid::new_v4(), b"internal-CAS-body");
-            seed_target(&disk, volume, "staged", fi.clone()).await;
-            BootstrapLocalTarget::new(ctx.clone())
-                .rename_local_data(&disk.endpoint().to_string(), (volume, "staged"), &fi, (volume, "destination"), None)
+            let body = b"internal-CAS-body";
+            let mut fi = target_file_info("destination", Uuid::new_v4(), body);
+            let source = if volume == crate::disk::RUSTFS_META_MULTIPART_BUCKET {
+                // MPI remains a valid internal bootstrap volume, but its source
+                // must obey the real initial-head and part-generation protocol.
+                let authority = ctx
+                    .bind_multipart_proof_topology(&single_local_disk_pools(root.path()))
+                    .expect("complete actual local bootstrap topology");
+                crate::disk::multipart_source::bind_multipart_proof_snapshot(&[Some(disk.clone())], &authority)
+                    .expect("bootstrap MPI handle belongs to this instance");
+                tokio::fs::create_dir_all(root.path().join(volume))
+                    .await
+                    .expect("MPI fixture volume");
+                let hash = rustfs_utils::crypto::hex_sha256(format!("{volume}/destination").as_bytes(), str::to_owned);
+                let path = format!("{hash}/{}x{}", Uuid::new_v4(), fi.mod_time.unwrap().unix_timestamp_nanos());
+                let original_dir = Uuid::new_v4();
+                let mut initial = FileInfo::new("destination", 1, 0);
+                initial.erasure.index = 1;
+                initial.version_id = fi.version_id;
+                initial.mod_time = fi.mod_time;
+                initial.data_dir = Some(original_dir);
+                initial.fresh = true;
+                crate::disk::multipart_source::mark_native_source(&mut initial);
+                rustfs_utils::http::insert_str(&mut initial.metadata, "multipart-bucket", volume.to_string());
+                rustfs_utils::http::insert_str(&mut initial.metadata, "multipart-object", "destination".to_string());
+                disk.write_metadata(volume, volume, &path, initial)
+                    .await
+                    .expect("publish the unique real MPI initial head");
+                let mut completed = disk
+                    .read_version(
+                        volume,
+                        volume,
+                        &path,
+                        &fi.version_id.unwrap().to_string(),
+                        &crate::disk::ReadOptions::default(),
+                    )
+                    .await
+                    .expect("capture the persisted initial source");
+                let condition = crate::disk::multipart_source::capture_source_condition(
+                    volume,
+                    "destination",
+                    &path,
+                    &completed,
+                    Uuid::new_v4(),
+                )
+                .expect("capture the actual native source condition");
+                completed.size = body.len() as i64;
+                completed.add_object_part(
+                    1,
+                    "bootstrap-part".to_string(),
+                    body.len(),
+                    completed.mod_time,
+                    body.len() as i64,
+                    None,
+                    None,
+                );
+                let data_path = format!("{path}/{original_dir}/part.1");
+                disk.write_all(volume, &data_path, bytes::Bytes::from_static(body))
+                    .await
+                    .expect("stage the actual MPI part");
+                disk.write_all(
+                    volume,
+                    &format!("{data_path}.meta"),
+                    completed.parts[0]
+                        .marshal_msg()
+                        .expect("encode native selected part generation")
+                        .into(),
+                )
+                .await
+                .expect("stage the actual native part metadata");
+                completed.data_dir = Some(Uuid::new_v4());
+                rustfs_utils::http::remove_str(&mut completed.metadata, "multipart-bucket");
+                rustfs_utils::http::remove_str(&mut completed.metadata, "multipart-object");
+                crate::disk::multipart_source::strip_native_controls(&mut completed.metadata);
+                condition
+                    .attach(&mut completed)
+                    .expect("attach native publication precondition");
+                fi = completed;
+                path
+            } else {
+                seed_target(&disk, volume, "staged", fi.clone()).await;
+                "staged".to_string()
+            };
+            let response = BootstrapLocalTarget::new(ctx.clone())
+                .rename_local_data(&disk.endpoint().to_string(), (volume, &source), &fi, (volume, "destination"), None)
                 .await
                 .expect("legitimate bootstrap metadata write");
+            if volume == crate::disk::RUSTFS_META_MULTIPART_BUCKET {
+                response
+                    .multipart_source
+                    .as_ref()
+                    .expect("real native MPI publication proof")
+                    .verify_with_authority(&ctx.multipart_proof_verification_context())
+                    .expect("native bootstrap proof must verify");
+                assert!(
+                    !root
+                        .path()
+                        .join(volume)
+                        .join(&source)
+                        .join(crate::disk::STORAGE_FORMAT_FILE)
+                        .exists(),
+                    "native MPI publication must consume the canonical source head"
+                );
+            }
             let read = disk
                 .read_version(
                     volume,
@@ -936,7 +1061,62 @@ mod tests {
                 )
                 .await
                 .expect("read bootstrap result");
-            assert_eq!(read.data, fi.data);
+            if volume == crate::disk::RUSTFS_META_MULTIPART_BUCKET {
+                assert!(!read.inline_data(), "native MPI metadata must not carry an inline marker");
+                // read_data may prefetch a small legacy-shaped part. Inspect
+                // the raw persisted map rather than mistaking that cache for inline storage.
+                let raw = disk
+                    .read_all(volume, "destination/xl.meta")
+                    .await
+                    .expect("read actual committed xl.meta");
+                let metadata = rustfs_filemeta::FileMeta::load(&raw).expect("decode actual committed metadata");
+                assert_eq!(metadata.versions.len(), 1, "bootstrap MPI must publish exactly one version");
+                assert_eq!(metadata.data.entries().expect("validate the actual inline map"), 0);
+                assert!(
+                    metadata
+                        .data
+                        .find(&fi.version_id.expect("version").to_string())
+                        .expect("inspect this version's inline key")
+                        .is_none(),
+                    "the committed version must have no inline payload"
+                );
+                let persisted = rustfs_filemeta::get_file_info(
+                    &raw,
+                    volume,
+                    "destination",
+                    &fi.version_id.expect("version").to_string(),
+                    rustfs_filemeta::FileInfoOpts {
+                        data: true,
+                        include_free_versions: false,
+                        include_part_checksums: true,
+                    },
+                )
+                .expect("decode FI directly without legacy part read-ahead");
+                assert!(
+                    !persisted.inline_data() && persisted.data.is_none(),
+                    "raw metadata must remain parts-backed"
+                );
+                assert_eq!(persisted.data_dir, fi.data_dir);
+                if let Some(prefetched) = &read.data {
+                    assert_eq!(
+                        prefetched.as_ref(),
+                        body,
+                        "compatibility read-ahead must contain the complete physical part bytes"
+                    );
+                }
+                assert_eq!(read.size, body.len() as i64);
+                assert_eq!(read.data_dir, fi.data_dir);
+                let committed_part = format!("destination/{}/part.1", fi.data_dir.unwrap());
+                assert_eq!(
+                    disk.read_all(volume, &committed_part)
+                        .await
+                        .expect("read committed native part bytes")
+                        .as_ref(),
+                    body
+                );
+            } else {
+                assert_eq!(read.data, fi.data);
+            }
             assert_eq!(ctx.namespace_commit_generation(), 0);
             assert!(!ctx.namespace_commits_pending());
         }

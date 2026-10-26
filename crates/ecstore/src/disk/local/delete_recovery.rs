@@ -32,6 +32,7 @@ impl DiscoverySession {
             }
         }
         let mut transactions = BTreeSet::new();
+        let mut seen_candidates = HashSet::new();
         let mut visited = 0usize;
         while !self.frames.is_empty()
             && transactions.len() < usize::try_from(limit).map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?
@@ -91,6 +92,9 @@ impl DiscoverySession {
                             .find_map(|prefix| delete_transaction_marker_id(&name, prefix))
                         };
                     if let Some(transaction) = transaction {
+                        if !seen_candidates.insert((object.to_owned(), transaction)) {
+                            continue;
+                        }
                         let physical = match self.object.as_ref() {
                             Some(_) => self.root.clone(),
                             None => self.root.join(object),
@@ -101,15 +105,20 @@ impl DiscoverySession {
                             continue;
                         }
                         let proof_root = physical.join(transaction.to_string());
+                        if self.object.is_some() {
+                            regular_file_exists(&proof_root.join(PREPARED)).map_err(std::io::Error::from)?;
+                            regular_file_exists(&proof_root.join(DELETE_QUORUM_COMMITTED_FILE)).map_err(std::io::Error::from)?;
+                            transactions.insert((object.to_owned(), transaction));
+                            continue;
+                        }
                         let prepared = regular_bytes(&proof_root.join(PREPARED)).map_err(std::io::Error::from)?;
-                        let receipt =
-                            regular_bytes(&proof_root.join(DELETE_QUORUM_COMMITTED_FILE)).map_err(std::io::Error::from)?;
                         // Only a fully bound journal can name a logical
                         // key. Other records remain discoverable by their
                         // physical key for canonical inspection to reject.
                         let record = match prepared {
                             Some(bytes) => serde_json::from_slice::<DeleteRecoveryJournal>(&bytes).ok(),
-                            None => receipt
+                            None => regular_bytes(&proof_root.join(DELETE_QUORUM_COMMITTED_FILE))
+                                .map_err(std::io::Error::from)?
                                 .filter(|bytes| !bytes.is_empty())
                                 .and_then(|bytes| serde_json::from_slice::<CommitReceipt>(&bytes).ok())
                                 .map(|receipt| receipt.journal),
@@ -280,11 +289,19 @@ fn regular_metadata_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
-fn regular_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
-    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.len() > MAX_METADATA) {
-        return Err(DiskError::FileCorrupt);
+fn regular_file_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() && meta.len() <= MAX_METADATA => Ok(true),
+        Ok(_) => Err(DiskError::FileCorrupt),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(to_file_error(err).into()),
     }
-    regular_metadata_bytes(path)
+}
+
+fn regular_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    regular_file_exists(path)?
+        .then(|| std::fs::read(path).map_err(|err| DiskError::from(to_file_error(err))))
+        .transpose()
 }
 
 /// A write/heal backup is not a delete transaction when the live metadata
@@ -299,7 +316,7 @@ fn live_write_backup(root: &Path, transaction: Uuid) -> Result<bool> {
         DELETE_MARKER_ROLLBACK_FILE,
         DELETE_QUORUM_COMMITTED_FILE,
     ] {
-        if regular_bytes(&rollback.join(name))?.is_some() {
+        if regular_file_exists(&rollback.join(name))? {
             return Ok(false);
         }
     }
@@ -309,7 +326,7 @@ fn live_write_backup(root: &Path, transaction: Uuid) -> Result<bool> {
         RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX,
     ] {
         let name = format!("{prefix}{transaction}");
-        if regular_bytes(&root.join(&name))?.is_some() || regular_bytes(&rollback.join(name))?.is_some() {
+        if regular_file_exists(&root.join(&name))? || regular_file_exists(&rollback.join(name))? {
             return Ok(false);
         }
     }
@@ -530,13 +547,11 @@ struct ExplicitDeletePlan {
     proof_files: Vec<PathBuf>,
 }
 
-fn explicit_delete_plan(
-    root: &Path,
-    transaction: Uuid,
+fn explicit_delete_referenced_data_dirs(
     original: Option<&FileMeta>,
     journal: Option<&DeleteRecoveryJournal>,
     current_missing: bool,
-) -> Result<Option<ExplicitDeletePlan>> {
+) -> Result<Option<HashSet<Uuid>>> {
     if !current_missing
         || journal
             .is_some_and(|journal| journal.target_digest.is_some() || (journal.original_digest.is_some() && original.is_none()))
@@ -562,6 +577,19 @@ fn explicit_delete_plan(
         }
         referenced.extend(metadata.get_data_dirs()?.into_iter().flatten().filter(|id| !id.is_nil()));
     }
+    Ok(Some(referenced))
+}
+
+fn explicit_delete_plan(
+    root: &Path,
+    transaction: Uuid,
+    original: Option<&FileMeta>,
+    journal: Option<&DeleteRecoveryJournal>,
+    current_missing: bool,
+) -> Result<Option<ExplicitDeletePlan>> {
+    let Some(referenced) = explicit_delete_referenced_data_dirs(original, journal, current_missing)? else {
+        return Ok(None);
+    };
     let rollback = root.join(transaction.to_string());
     let marker_names = [
         DELETE_DATA_DIR_MARKER_PREFIX,
@@ -669,7 +697,12 @@ fn canonical_uuid(name: &str) -> Option<Uuid> {
     Uuid::parse_str(name).ok().filter(|id| name == id.hyphenated().to_string())
 }
 
-fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Result<DeleteRecoveryInspection> {
+pub(super) fn inspection_with_markers(
+    root: &Path,
+    volume: &str,
+    object: &str,
+    transaction: Uuid,
+) -> Result<(DeleteRecoveryInspection, bool)> {
     let rollback = root.join(transaction.to_string());
     let before = regular_metadata_bytes(&rollback.join(STORAGE_FORMAT_FILE_BACKUP))?;
     let current = regular_metadata_bytes(&root.join(STORAGE_FORMAT_FILE))?;
@@ -739,6 +772,8 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
     }
     fingerprint.update([u8::from(committed), u8::from(finished)]);
     let mut any_marker = false;
+    let mut has_other_uuid_dir = false;
+    let mut has_staged_dir = false;
     let mut descriptions = Vec::new();
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => Some(entries),
@@ -762,6 +797,7 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
             }
             descriptions.push((name.clone(), kind.is_dir(), entry.metadata().map_err(to_file_error)?.len()));
             if kind.is_dir() && id.is_some_and(|id| !id.is_nil()) {
+                has_other_uuid_dir |= id != Some(transaction);
                 for child in std::fs::read_dir(entry.path()).map_err(to_file_error)? {
                     let child = child.map_err(to_file_error)?;
                     let kind = child.file_type().map_err(to_file_error)?;
@@ -807,6 +843,7 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
                         return Err(DiskError::FileCorrupt);
                     }
                     if name == transaction.to_string() && kind.is_dir() {
+                        has_staged_dir = true;
                         for file in std::fs::read_dir(child.path()).map_err(to_file_error)? {
                             let file = file.map_err(to_file_error)?;
                             let kind = file.file_type().map_err(to_file_error)?;
@@ -924,9 +961,18 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
     } else {
         DeleteRecoveryState::Absent
     };
-    let explicit_delete_safe =
-        explicit_delete_plan(root, transaction, before_meta.as_ref(), journal.as_ref(), current.is_none())?.is_some();
-    Ok(DeleteRecoveryInspection {
+    let has_physical_data_dirs_or_markers = any_marker || has_other_uuid_dir || has_staged_dir;
+    let explicit_delete_safe = match state {
+        DeleteRecoveryState::NewPrepared if !has_physical_data_dirs_or_markers => {
+            explicit_delete_referenced_data_dirs(before_meta.as_ref(), journal.as_ref(), current.is_none())?
+                .is_some_and(|referenced| !referenced.contains(&transaction))
+        }
+        DeleteRecoveryState::LegacyAmbiguous | DeleteRecoveryState::NewPrepared => {
+            explicit_delete_plan(root, transaction, before_meta.as_ref(), journal.as_ref(), current.is_none())?.is_some()
+        }
+        _ => false,
+    };
+    let inspection = DeleteRecoveryInspection {
         protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
         id: DeleteTransactionId {
             object: object.to_owned(),
@@ -950,10 +996,22 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
             .transpose()?
             .unwrap_or_default(),
         fingerprint: fingerprint.finalize().into(),
-    })
+    };
+    Ok((inspection, has_physical_data_dirs_or_markers))
 }
 
 impl LocalDisk {
+    // Native MPU source closure has its own conditional protocol. Generic
+    // object recovery must never restore its head or acquire SourceRW under
+    // an already-owned object metadata lease.
+    fn reject_multipart_delete_recovery_mutation(&self, volume: &str, object: &str) -> Result<()> {
+        multipart_staging::reject_noncanonical_scope(&self.root, self.io_root(), volume, object)?;
+        if volume == RUSTFS_META_MULTIPART_BUCKET {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
+        Ok(())
+    }
+
     async fn delete_recovery_predecessors(
         &self,
         volume: &str,
@@ -1196,12 +1254,25 @@ impl LocalDisk {
         transaction: Uuid,
         owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<DeleteRecoveryInspection> {
+        Ok(self
+            .delete_recovery_inspect_owned_with_markers(volume, object, transaction, owner)
+            .await?
+            .0)
+    }
+
+    async fn delete_recovery_inspect_owned_with_markers(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<(DeleteRecoveryInspection, bool)> {
         let root = self.io_get_object_path(volume, object)?;
         self.io_get_object_path(volume, &format!("{object}/{transaction}"))?;
         let volume = volume.to_owned();
         let object = object.to_owned();
         let lease = os::acquire_namespace_mutation_lease_with_owner(&root, owner).await;
-        os::run_blocking_namespace_operation(lease, move || Ok(inspection(&root, &volume, &object, transaction)))
+        os::run_blocking_namespace_operation(lease, move || Ok(inspection_with_markers(&root, &volume, &object, transaction)))
             .await
             .map_err(to_file_error)?
     }
@@ -1221,11 +1292,12 @@ impl LocalDisk {
         let temporary = self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?;
         let (bucket, root) = self.io_get_bucket_and_object_path(volume, object)?;
         let destination = root.join(transaction.to_string());
+        let destination_was_absent = original.is_none();
         let original = original.map(<[u8]>::to_vec);
         let sync = effective_durability(volume).syncs_commit_metadata();
         #[cfg(test)]
         let record_destination = destination.clone();
-        let staging_root = temporary.clone();
+        let staging_root = temporary;
         let lease = os::acquire_namespace_mutation_lease_with_owner(&destination, owner.clone()).await;
         let (staged, target) = os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
             std::fs::create_dir_all(&staging_root)?;
@@ -1248,8 +1320,8 @@ impl LocalDisk {
                 run_owned_file_write_before_open(&record_destination.join(name));
                 let mut file = std::fs::File::create(staged.path().join(name))?;
                 std::io::Write::write_all(&mut file, bytes)?;
-                if sync {
-                    file.sync_all()?;
+                if sync && !bytes.is_empty() {
+                    file.sync_data()?;
                 }
             }
             if sync {
@@ -1286,12 +1358,11 @@ impl LocalDisk {
             let mut path = root.as_path();
             loop {
                 dirs_to_sync.push(path.to_path_buf());
-                if path == bucket {
+                if !destination_was_absent || path == bucket {
                     break;
                 }
                 path = path.parent().ok_or(DiskError::InvalidPath)?;
             }
-            dirs_to_sync.push(temporary);
             let sync_owner = owner.clone();
             self.blocking_queue
                 .run_fsync_cancellable(move |_| {
@@ -1317,6 +1388,8 @@ impl LocalDisk {
         authority: Option<&DeleteRecoveryJournal>,
         context: DeletePreparationContext,
     ) -> Result<Option<Vec<u8>>> {
+        self.reject_multipart_delete_recovery_mutation(volume, object)?;
+
         let DeletePreparationContext {
             transaction,
             bucket_incarnation: incarnation,
@@ -1408,6 +1481,8 @@ impl LocalDisk {
         action: DeleteRecoveryAction,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<DeleteRecoveryInspection> {
+        self.reject_multipart_delete_recovery_mutation(volume, object)?;
+
         if !safe_path(object, false) || transaction.is_nil() {
             return Err(DiskError::InvalidPath);
         }
@@ -1447,8 +1522,10 @@ impl LocalDisk {
         action: DeleteRecoveryAction,
         owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<DeleteRecoveryInspection> {
-        let mut observed = self
-            .delete_recovery_inspect_owned(volume, object, transaction, owner.clone())
+        self.reject_multipart_delete_recovery_mutation(volume, object)?;
+
+        let (mut observed, mut has_data_dir_work) = self
+            .delete_recovery_inspect_owned_with_markers(volume, object, transaction, owner.clone())
             .await?;
         if observed.fingerprint != expected_fingerprint {
             return Err(DiskError::OutdatedXLMeta);
@@ -1574,8 +1651,8 @@ impl LocalDisk {
                     },
                 )
                 .await?;
-                observed = self
-                    .delete_recovery_inspect_owned(volume, object, transaction, owner.clone())
+                (observed, has_data_dir_work) = self
+                    .delete_recovery_inspect_owned_with_markers(volume, object, transaction, owner.clone())
                     .await?;
             } else {
                 return Ok(observed);
@@ -1682,17 +1759,22 @@ impl LocalDisk {
                     journal: journal.clone(),
                     finished: false,
                 };
-                write_delete_rollback_file(
+                let inspect_after = (!cfg!(feature = "e2e-test-hooks")).then_some(object);
+                let inspected = write_delete_rollback_files(
                     self.io_root(),
                     volume,
                     &root,
                     transaction,
-                    DELETE_QUORUM_COMMITTED_FILE,
-                    &serde_json::to_vec(&receipt)?,
+                    &[],
+                    &[(DELETE_QUORUM_COMMITTED_FILE, &serde_json::to_vec(&receipt)?)],
+                    inspect_after,
                     owner.clone(),
                 )
                 .await?;
                 self.delete_recovery_barrier(volume, object, transaction, "DECISION").await?;
+                if let Some(inspected) = inspected {
+                    return Ok(inspected);
+                }
             }
             DeleteRecoveryAction::FinishCommit => {
                 if !matches!(observed.state, DeleteRecoveryState::QuorumCommitted | DeleteRecoveryState::CommitFinished)
@@ -1703,7 +1785,7 @@ impl LocalDisk {
                 if observed.state == DeleteRecoveryState::CommitFinished {
                     return Ok(observed);
                 }
-                for dir in &journal.data_dirs {
+                for dir in journal.data_dirs.iter().filter(|_| has_data_dir_work) {
                     self.reserve_version_delete_with_namespace_owner(volume, object, *dir, transaction, owner.clone())
                         .await?;
                 }
@@ -1733,24 +1815,26 @@ impl LocalDisk {
                         }
                     }
                 }
-                self.commit_reserved_version_delete_with_namespace_owner(volume, object, transaction, owner.clone())
-                    .await?;
-                os::remove_files_and_fsync_with_owner(
-                    &rollback,
-                    &[STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE],
-                    effective_durability(volume).syncs_commit_metadata(),
-                    None,
-                    owner.clone(),
-                )
-                .await
-                .map_err(to_file_error)?;
-                let (_, complete) = self
-                    .finish_version_delete(volume, object, transaction, true, owner.clone())
-                    .await?;
-                if !complete {
-                    return Err(DiskError::DiskOngoingReq);
+                if has_data_dir_work {
+                    self.commit_reserved_version_delete_with_namespace_owner(volume, object, transaction, owner.clone())
+                        .await?;
+                    os::remove_files_and_fsync_with_owner(
+                        &rollback,
+                        &[STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE],
+                        effective_durability(volume).syncs_commit_metadata(),
+                        None,
+                        owner.clone(),
+                    )
+                    .await
+                    .map_err(to_file_error)?;
+                    let (_, complete) = self
+                        .finish_version_delete(volume, object, transaction, true, owner.clone(), None)
+                        .await?;
+                    if !complete {
+                        return Err(DiskError::DiskOngoingReq);
+                    }
                 }
-                for dir in &journal.data_dirs {
+                for dir in journal.data_dirs.iter().filter(|_| has_data_dir_work) {
                     let staged = rollback.join(dir.to_string());
                     match fs::symlink_metadata(&staged).await {
                         Ok(metadata) if metadata.is_dir() => {
@@ -1802,40 +1886,92 @@ impl LocalDisk {
                     finished: true,
                 };
                 let receipt_bytes = serde_json::to_vec(&receipt)?;
-                write_delete_rollback_files(
+                let remove_before_publish: &[&'static str] = if has_data_dir_work {
+                    &[]
+                } else {
+                    &[STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE]
+                };
+                if let Some(inspected) = write_delete_rollback_files(
                     self.io_root(),
                     volume,
                     &root,
                     transaction,
+                    remove_before_publish,
                     &[(FINISHED, &[]), (DELETE_QUORUM_COMMITTED_FILE, &receipt_bytes)],
+                    Some(object),
                     owner.clone(),
                 )
-                .await?;
+                .await?
+                {
+                    return Ok(inspected);
+                }
             }
             DeleteRecoveryAction::FinalizeCommit => {
                 if observed.state != DeleteRecoveryState::CommitFinished {
                     return Err(DiskError::DiskOngoingReq);
                 }
-                os::remove_files_and_fsync_with_owner(
-                    &rollback,
-                    &[TARGET, PREPARED, FINISHED],
-                    effective_durability(volume).syncs_commit_metadata(),
-                    Some(DELETE_QUORUM_COMMITTED_FILE),
-                    owner.clone(),
-                )
+                let bucket_path = self.io_get_bucket_path(volume)?;
+                let mut file_leases = Vec::with_capacity(3);
+                for name in [TARGET, PREPARED, FINISHED] {
+                    let path = rollback.join(name);
+                    let lease = os::acquire_namespace_mutation_lease_with_owner(&path, owner.clone()).await;
+                    file_leases.push((path, lease));
+                }
+                let receipt_path = rollback.join(DELETE_QUORUM_COMMITTED_FILE);
+                let receipt_lease = os::acquire_namespace_mutation_lease_with_owner(&receipt_path, owner.clone()).await;
+                let prune_paths: Vec<_> = rollback
+                    .ancestors()
+                    .take_while(|dir| *dir != bucket_path.as_path() && dir.starts_with(&bucket_path))
+                    .map(Path::to_path_buf)
+                    .collect();
+                let mut prune_dirs = Vec::with_capacity(prune_paths.len());
+                for dir in prune_paths {
+                    let lease = os::acquire_namespace_mutation_lease_with_owner(&dir, owner.clone()).await;
+                    prune_dirs.push((dir, lease));
+                }
+                let sync = effective_durability(volume).syncs_commit_metadata();
+                let (rollback_buf, root_buf, volume_str, object_str) =
+                    (rollback.clone(), root.clone(), volume.to_owned(), object.to_owned());
+                let publication_root = self.publication_root.clone();
+                return os::run_blocking_namespace_operation_with_sync(receipt_lease, sync, move || {
+                    let _publication_root = publication_root;
+                    for (path, _) in &file_leases {
+                        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                        os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, path);
+                        match std::fs::remove_file(path) {
+                            Ok(()) => {}
+                            Err(err) if err.kind() == ErrorKind::NotFound => {}
+                            Err(err) => return Err(err),
+                        }
+                    }
+                    if sync {
+                        os::fsync_dir_std(&rollback_buf)?;
+                    }
+                    #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                    os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &receipt_path);
+                    std::fs::remove_file(&receipt_path)?;
+                    for (dir_path, _) in &prune_dirs {
+                        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                        os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, dir_path);
+                        if let Err(err) = std::fs::remove_dir(dir_path) {
+                            if is_dir_not_empty_error(&err) {
+                                break;
+                            }
+                            if !is_benign_object_rmdir_error(&err) {
+                                return Err(std::io::Error::other(FileAccessDeniedWithContext {
+                                    path: dir_path.clone(),
+                                    source: err,
+                                }));
+                            }
+                        }
+                    }
+                    let inspected =
+                        inspection_with_markers(&root_buf, &volume_str, &object_str, transaction).map(|(state, _)| state);
+                    drop((file_leases, prune_dirs));
+                    Ok(inspected)
+                })
                 .await
                 .map_err(to_file_error)?;
-                self.delete_unleased_with_namespace_owner(
-                    volume,
-                    &format!("{object}/{transaction}"),
-                    &DeleteOptions {
-                        immediate: true,
-                        ..Default::default()
-                    },
-                    owner.clone(),
-                    None,
-                )
-                .await?;
             }
             DeleteRecoveryAction::Rollback => {
                 if observed.state != DeleteRecoveryState::NewPrepared || !observed.rollback_data_complete {
@@ -2598,6 +2734,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_recovery_known_heal_backup_inspection_preserves_unproven_owners_after_reopen() {
+        for change in [
+            "unchanged",
+            "generation",
+            "tier-object",
+            "tier-version",
+            "missing-free-owner",
+            "replaced-backup",
+        ] {
+            let (_temp, disk, mut info, _) = fixture().await;
+            info.metadata.insert("etag".to_owned(), "same-visible-etag".to_owned());
+            info.set_object_transaction_epoch(Uuid::new_v4());
+            let free_id = Uuid::new_v4();
+            info.set_tier_free_version_id(&free_id.to_string());
+            let mut remote = test_file_info("object", Uuid::nil(), Some(Uuid::new_v4()), None);
+            remote.mod_time = info.mod_time;
+            remote.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_owned();
+            remote.transition_tier = "WARM".to_owned();
+            remote.transitioned_objname = "remote/original".to_owned();
+            remote.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
+            remote.transition_version = Some("original-provider-version".to_owned());
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut remote.metadata,
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                "ab".repeat(32),
+            );
+            let metadata = |remote: FileInfo, current: FileInfo| {
+                let mut meta = FileMeta::new();
+                meta.add_version(remote).expect("seed transitioned predecessor");
+                meta.add_version(current)
+                    .expect("commit local replacement and its free-version owner");
+                meta
+            };
+            let original = metadata(remote.clone(), info.clone());
+            let (_, free) = original.find_version(Some(free_id)).expect("original free-version owner");
+            assert!(free.free_version(), "fixture must retain a separate remote cleanup owner");
+            let backup_bytes = original.marshal_msg().expect("encode historical backup");
+            let transaction = inline_metadata_rollback_dir(Uuid::nil(), &original);
+            let root = disk.io_get_object_path("recovery", "object").expect("object path");
+            let backup_path = root.join(transaction.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+            fs::create_dir_all(backup_path.parent().expect("backup parent"))
+                .await
+                .expect("create backup directory");
+            fs::write(&backup_path, &backup_bytes)
+                .await
+                .expect("retain historical backup");
+
+            let mut current = info.clone();
+            match change {
+                "generation" => current.set_object_transaction_epoch(Uuid::new_v4()),
+                "tier-object" => remote.transitioned_objname = "remote/successor".to_owned(),
+                "tier-version" => remote.transition_version = Some("successor-provider-version".to_owned()),
+                _ => {}
+            }
+            let mut current_meta = metadata(remote, current);
+            if change == "missing-free-owner" {
+                current_meta
+                    .versions
+                    .retain(|version| version.header.version_id != Some(free_id));
+            } else if change == "replaced-backup" {
+                let replacement = root.join("replacement-backup");
+                fs::write(&replacement, &backup_bytes).await.expect("write replacement inode");
+                fs::rename(replacement, &backup_path)
+                    .await
+                    .expect("replace backup without changing its bytes");
+            }
+            let current_bytes = current_meta.marshal_msg().expect("encode current metadata");
+            fs::write(root.join(STORAGE_FORMAT_FILE), &current_bytes)
+                .await
+                .expect("publish readable current object");
+            let visible = disk
+                .read_version(
+                    "",
+                    "recovery",
+                    "object",
+                    "",
+                    &ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("current object remains physically readable");
+            assert_eq!(visible.data, info.data, "{change}: current payload");
+            assert_eq!(visible.mod_time, info.mod_time, "{change}: unchanged modification time");
+            assert_eq!(visible.metadata.get("etag"), info.metadata.get("etag"), "{change}: unchanged ETag");
+
+            let before = disk
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .expect("query known backup without inferring commit authority");
+            let endpoint = disk.endpoint();
+            drop(disk);
+            let reopened = LocalDisk::new(&endpoint, false).await.expect("reopen original disk endpoint");
+            // Linux I/O paths belong to the open disk's mount descriptor.
+            let root = reopened
+                .io_get_object_path("recovery", "object")
+                .expect("reopened object path");
+            let backup_path = root.join(transaction.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+            let after = reopened
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .expect("known historical backup remains queryable after reopen");
+            assert_eq!(after, before, "{change}: inspection must preserve the complete evidence snapshot");
+            assert!(after.journal.is_none(), "{change}: no historical success or delete authority exists");
+            assert_eq!(after.backup_digest, Some(digest(&backup_bytes)), "{change}: retained C-class evidence");
+            assert!(!after.explicit_delete_safe, "{change}: current data forbids legacy discard");
+            let expected_state = if matches!(change, "unchanged" | "replaced-backup") {
+                DeleteRecoveryState::Absent
+            } else {
+                DeleteRecoveryState::LegacyAmbiguous
+            };
+            assert_eq!(
+                after.state, expected_state,
+                "{change}: delete-owner semantics remain separate from C classification"
+            );
+            let page = reopened
+                .discover_delete_transactions("recovery", Some("object"), None, 128)
+                .await
+                .expect("discover only delete-recovery work");
+            assert_eq!(
+                page.transactions.iter().any(|id| id.transaction == transaction),
+                expected_state == DeleteRecoveryState::LegacyAmbiguous,
+                "{change}: a live backup must not become a delete blocker"
+            );
+            assert_eq!(fs::read(&backup_path).await.expect("retained backup bytes"), backup_bytes, "{change}");
+            assert_eq!(
+                fs::read(root.join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("retained current bytes"),
+                current_bytes,
+                "{change}"
+            );
+            let backup = FileMeta::load(&backup_bytes).expect("decode retained owner evidence");
+            assert_eq!(
+                backup.find_version(Some(free_id)).expect("retained free-version owner").1,
+                free,
+                "{change}: ordinary-object readability cannot release remote ownership"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn delete_recovery_live_external_backup_rejects_partial_version_delete() {
         let (_temp, disk, mut info, _) = fixture().await;
         let root = disk.io_get_object_path("recovery", "object").unwrap();
@@ -2734,6 +3013,152 @@ mod tests {
         assert!(!disk.io_root().join(RUSTFS_META_TMP_OLD_BUCKET).exists());
         assert!(temporary.join(".trash").is_dir(), "startup recreates the active trash directory");
         assert_eq!(disk.read_all("recovery", "object/xl.meta").await.unwrap().as_ref(), original);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn delete_recovery_cancelled_finalize_pins_root_after_last_disk_owner_drops() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        use futures::FutureExt;
+
+        struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(release) = self.0.take() {
+                    let _ = release.send(());
+                }
+            }
+        }
+
+        let (temp, native, _info, _original) = fixture().await;
+        let root_file = Arc::downgrade(native.publication_root.directory());
+        assert!(Arc::ptr_eq(native.publication_root.directory(), &native.mount_lease));
+        // The constructor's idle GC task also owns this FD. Drain that existing
+        // task so it cannot mask a missing pin in the Finalize callback.
+        let exit = native.exit_signal.as_ref().expect("fixture cleanup lifecycle");
+        exit.send(()).expect("stop the existing idle cleanup task");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while exit.receiver_count() != 0 || root_file.strong_count() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("only LocalDisk's publication and mount fields may retain the initial root FD");
+        let transaction = Uuid::new_v4();
+        let applied = apply(&native, transaction).await;
+        let committed = native
+            .settle_delete_transaction(
+                "recovery",
+                "object",
+                transaction,
+                applied.fingerprint,
+                DeleteRecoveryAction::PublishCommit,
+            )
+            .await
+            .expect("publish actual delete decision");
+        let finished = native
+            .settle_delete_transaction(
+                "recovery",
+                "object",
+                transaction,
+                committed.fingerprint,
+                DeleteRecoveryAction::FinishCommit,
+            )
+            .await
+            .expect("finish actual committed deletion");
+        assert_eq!(finished.state, DeleteRecoveryState::CommitFinished);
+        let physical_object = temp.path().join("recovery/object");
+        let physical_rollback = physical_object.join(transaction.to_string());
+        assert!(physical_rollback.join(PREPARED).is_file());
+        assert!(physical_rollback.join(DELETE_QUORUM_COMMITTED_FILE).is_file());
+        let io_root = native.io_root().to_path_buf();
+        assert!(io_root.starts_with("/proc/self/fd"), "exercise the real borrowed Linux FD path");
+        let canonical_root = std::fs::canonicalize(temp.path()).expect("actual root identity");
+        let fd_alias = io_root.components().collect::<PathBuf>();
+        let io_rollback = native
+            .io_get_object_path("recovery", &format!("object/{transaction}"))
+            .expect("actual IO rollback path");
+        let receipt_path = io_rollback.join(DELETE_QUORUM_COMMITTED_FILE);
+        let (entered, reached) = tokio::sync::oneshot::channel();
+        let (release, resumed) = std::sync::mpsc::channel::<()>();
+        let release = ReleaseOnDrop(Some(release));
+        let hook = hooks::install_at(hooks::Stage::Remove, &io_rollback.join(PREPARED), move || {
+            let _ = entered.send(());
+            let _ = resumed.recv();
+        });
+        let mut native = Some(Arc::new(native));
+        let weak = Arc::downgrade(native.as_ref().expect("fixture disk owner"));
+        let finalizing = native.as_ref().expect("fixture disk owner").clone();
+        let mut task = Some(tokio::spawn(async move {
+            finalizing
+                .settle_delete_transaction(
+                    "recovery",
+                    "object",
+                    transaction,
+                    finished.fingerprint,
+                    DeleteRecoveryAction::FinalizeCommit,
+                )
+                .await
+        }));
+        let observations = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(Duration::from_secs(10), reached)
+                .await
+                .expect("actual Finalize remove callback must pause")
+                .expect("actual physical Remove hook");
+            let cancelling = task.take().expect("live finalize waiter");
+            cancelling.abort();
+            assert!(cancelling.await.expect_err("cancel the real waiter").is_cancelled());
+            drop(native.take());
+            assert!(weak.upgrade().is_none(), "no test or cancelled future may retain a LocalDisk");
+            assert_eq!(
+                root_file.strong_count(),
+                1,
+                "only the actual callback may retain the root FD after disk retirement"
+            );
+            assert_eq!(
+                std::fs::read_link(&fd_alias).expect("the physical callback must still own its root FD"),
+                canonical_root,
+                "the borrowed FD alias must keep the same actual disk identity"
+            );
+            assert!(
+                physical_rollback.join(PREPARED).is_file(),
+                "paused callback has not removed the actual prepared record"
+            );
+            assert!(
+                physical_rollback.join(DELETE_QUORUM_COMMITTED_FILE).is_file(),
+                "the actual final witness still exists before resume"
+            );
+        })
+        .catch_unwind()
+        .await;
+        if let Some(task) = task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        drop(native.take());
+        drop(release);
+        drop(hook);
+        // This path-only lease does not hold a root handle. Acquiring it proves
+        // the actual callback, including its inline inspection, has returned.
+        let drained = tokio::time::timeout(
+            Duration::from_secs(5),
+            os::acquire_namespace_mutation_lease_with_owner(&receipt_path, None),
+        )
+        .await
+        .map(drop);
+        if let Err(panic) = observations {
+            std::panic::resume_unwind(panic);
+        }
+        drained.expect("cancelled physical Finalize callback must finish");
+        for name in [TARGET, PREPARED, FINISHED, DELETE_QUORUM_COMMITTED_FILE] {
+            assert!(
+                !physical_rollback.join(name).exists(),
+                "actual original-volume proof must be reclaimed: {name}"
+            );
+        }
+        assert!(!physical_rollback.exists(), "the real rollback directory is pruned after proof removal");
+        assert!(!physical_object.exists(), "completed deletion leaves no original-volume object residue");
+        assert!(temp.path().join("recovery").is_dir(), "finalization must preserve its original volume");
     }
 
     #[cfg(unix)]
@@ -5224,4 +5649,9 @@ mod tests {
             b"outside bytes"
         );
     }
+}
+
+#[cfg(test)]
+mod multipart_scope_tests {
+    include!("multipart_delete_recovery_scope_tests.rs");
 }

@@ -31,6 +31,18 @@ pub(crate) use rustfs_ecstore::api::error::{Error as EcstoreErrorType, StorageEr
 pub(crate) use rustfs_ecstore::api::layout::{
     EndpointServerPools as EcstoreEndpointServerPools, Endpoints as EcstoreEndpoints, PoolEndpoints as EcstorePoolEndpoints,
 };
+pub(crate) use rustfs_ecstore::api::notification::{
+    MrfLifecycleWriterFleetProofToken as EcstoreMrfLifecycleWriterFleetProofToken,
+    acquire_mrf_lifecycle_writer_fleet_proof as ecstore_acquire_mrf_lifecycle_writer_fleet_proof,
+    mrf_lifecycle_writer_fleet_proof_current as ecstore_mrf_lifecycle_writer_fleet_proof_current,
+    mrf_lifecycle_writer_fleet_proof_matches as ecstore_mrf_lifecycle_writer_fleet_proof_matches,
+    with_mrf_lifecycle_writer_fleet_proof as ecstore_with_mrf_lifecycle_writer_fleet_proof,
+};
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::notification::{
+    new_global_notification_sys as ecstore_new_global_notification_sys,
+    start_remote_version_state_fleet_probe as ecstore_start_remote_version_state_fleet_probe,
+};
 pub(crate) use rustfs_ecstore::api::runtime::local_disk_map_read as ecstore_local_disk_map_read;
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::storage::init_local_disks as ecstore_init_local_disks;

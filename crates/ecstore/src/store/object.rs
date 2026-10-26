@@ -55,7 +55,6 @@ use crate::set_disk::{
     is_lock_optimization_enabled, is_object_lock_diag_enabled,
 };
 use crate::storage_api_contracts::{
-    list::ListOperations as _,
     namespace::NamespaceLocking as _,
     object::{DeleteAccounting, ObjectIO as _, ObjectOperations as _},
 };
@@ -781,7 +780,7 @@ async fn replay_authorized_tier_delete_sources(
         }
     }
     if deleted > 0 {
-        super::list_objects::observe_list_objects_mutation(store, bucket).await;
+        super::list_objects::observe_scanner_namespace_mutations(bucket, 1);
     }
     if let Some(err) = first_error {
         if publication_scope.is_some_and(|scope| !scope.can_commit())
@@ -3146,13 +3145,13 @@ impl ECStore {
     }
 
     pub(crate) fn is_equivalent_decommission_capacity_target(source: &ObjectInfo, target: &ObjectInfo) -> bool {
-        source.bucket == target.bucket
-            && source.name == decode_dir_object(&target.name)
-            && if source.delete_marker {
-                is_equivalent_data_movement_delete_marker(source, target)
-            } else {
-                crate::data_movement::is_equivalent_data_movement_object_identity(source, target, true, false)
-            }
+        if source.delete_marker {
+            source.bucket == target.bucket
+                && source.name == decode_dir_object(&target.name)
+                && is_equivalent_data_movement_delete_marker(source, target)
+        } else {
+            crate::data_movement::is_equivalent_data_movement_capacity_target(source, target)
+        }
     }
 
     /// Captures Object Lock state once for a batch of PUTs to the same bucket.
@@ -4743,7 +4742,7 @@ impl ECStore {
             .await;
         let result = enqueue_transition_after_write(self, result, LcEventSrc::S3PutObject, request_opts).await;
         if result.is_ok() {
-            list_objects::observe_list_objects_mutation(self, bucket).await;
+            list_objects::observe_scanner_namespace_mutations(bucket, 1);
         }
         Ok((idx, result))
     }
@@ -5203,7 +5202,7 @@ impl ECStore {
                     .handle_delete_object_with_journal(&bucket, &object, opts, Some(Arc::clone(&store)))
                     .await;
                 if result.is_ok() {
-                    list_objects::observe_list_objects_mutation(&store, &bucket).await;
+                    list_objects::observe_scanner_namespace_mutations(&bucket, 1);
                 }
                 // Transient options also retain these guards through late disk I/O.
                 drop(guards);
@@ -5243,7 +5242,7 @@ impl ECStore {
                     .await;
                 let success_count = result.1.iter().filter(|err| err.is_none()).count();
                 if success_count > 0 {
-                    list_objects::observe_list_objects_mutations(&store, &bucket, success_count).await;
+                    list_objects::observe_scanner_namespace_mutations(&bucket, u64::try_from(success_count).unwrap_or(u64::MAX));
                 }
                 result
             })
@@ -6773,12 +6772,50 @@ mod tests {
     use crate::set_disk::{SetDisks, disk_call_counters};
     use crate::storage_api_contracts::bucket::MakeBucketOptions;
     use crate::storage_api_contracts::lifecycle::TransitionedObject;
+    use crate::storage_api_contracts::list::ListOperations as _;
     use bytes::Bytes;
     use std::future::Future as _;
     use std::io::Cursor;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::AsyncReadExt;
+
+    /// Versions of `object` as one pool stores them, newest first: the per-pool
+    /// view that the merged `ListObjectVersions` cannot give.
+    async fn pool_object_versions(pool: &Arc<Sets>, bucket: &str, object: &str) -> Vec<ObjectInfo> {
+        let mut versions = Vec::new();
+        for set in &pool.disk_set {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let walk = set.clone().walk(
+                tokio_util::sync::CancellationToken::new(),
+                bucket,
+                object,
+                tx,
+                WalkOptions {
+                    versions_sort: crate::storage_api_contracts::list::WalkVersionsSortOrder::Descending,
+                    ..Default::default()
+                },
+            );
+            let collect = async {
+                let mut found = Vec::new();
+                while let Some(item) = rx.recv().await {
+                    if let Some(err) = item.err {
+                        panic!("pool walk of {bucket}/{object} failed: {err:?}");
+                    }
+                    if let Some(info) = item.item
+                        && info.name == object
+                    {
+                        found.push(info);
+                    }
+                }
+                found
+            };
+            let (walk_result, found) = tokio::join!(walk, collect);
+            walk_result.expect("pool walk should succeed");
+            versions.extend(found);
+        }
+        versions
+    }
 
     #[test]
     fn predecessor_replay_scope_distinguishes_exact_object_from_recursive_prefix() {
@@ -7435,9 +7472,30 @@ mod tests {
 
         let wrong_bucket = ObjectInfo {
             bucket: "other-bucket".to_string(),
-            ..target
+            ..target.clone()
         };
         assert!(!ECStore::is_equivalent_decommission_capacity_target(&source, &wrong_bucket));
+        for changed in ["name", "version", "mtime", "metadata"] {
+            let mut invalid = target.clone();
+            match changed {
+                "name" => invalid.name = rustfs_utils::path::encode_dir_object("other-directory/"),
+                "version" => invalid.version_id = Some(Uuid::from_u128(2)),
+                "mtime" => invalid.mod_time = Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+                "metadata" => {
+                    Arc::make_mut(&mut invalid.user_defined).insert("x-amz-meta-different".to_owned(), "value".to_owned());
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !ECStore::is_equivalent_decommission_capacity_target(&source, &invalid),
+                "changed {changed}"
+            );
+        }
+        let ordinary_file = ObjectInfo {
+            name: "directory".to_owned(),
+            ..source
+        };
+        assert!(!ECStore::is_equivalent_decommission_capacity_target(&ordinary_file, &target));
     }
 
     fn publication_part(number: usize) -> ObjectPartInfo {
@@ -10591,14 +10649,9 @@ mod tests {
             if versioned {
                 let marker = deleted[0].delete_marker_version_id.expect("conditional marker result");
                 for pool in &store.pools {
-                    let versions = pool
-                        .clone()
-                        .inner_list_object_versions(bucket, object, None, None, None, 10)
-                        .await
-                        .expect("list the frozen marker destination");
+                    let versions = pool_object_versions(pool, bucket, object).await;
                     assert_eq!(
                         versions
-                            .objects
                             .iter()
                             .any(|entry| entry.delete_marker && entry.version_id == Some(marker)),
                         pool.pool_idx == 1,
@@ -11311,14 +11364,10 @@ mod tests {
         let marker_id = marker.version_id.expect("DELETE must acknowledge a marker UUID");
         assert!(!expected_versions.contains(&marker_id));
 
-        let local = store.pools[1]
-            .clone()
-            .inner_list_object_versions(bucket, object, None, None, None, 10)
-            .await
-            .expect("list the object-owning pool");
-        assert_eq!(local.objects.len(), 4, "the marker must be committed beside the three existing versions");
-        assert_eq!(local.objects[0].version_id, Some(marker_id));
-        assert!(local.objects[0].delete_marker && local.objects[0].is_latest);
+        let local = pool_object_versions(&store.pools[1], bucket, object).await;
+        assert_eq!(local.len(), 4, "the marker must be committed beside the three existing versions");
+        assert_eq!(local[0].version_id, Some(marker_id));
+        assert!(local[0].delete_marker && local[0].is_latest);
         let versions = store
             .clone()
             .inner_list_object_versions(bucket, object, None, None, None, 10)
@@ -11686,26 +11735,14 @@ mod tests {
             split_error.expect_err("a readable older pool does not prove the global current version"),
             StorageError::ErasureWriteQuorum
         );
-        let split = store.pools[0]
-            .clone()
-            .inner_list_object_versions(quorum_bucket, "split.bin", None, None, None, 10)
-            .await
-            .expect("inspect the readable older pool");
-        assert_eq!(split.objects.len(), 1);
-        assert!(!split.objects[0].delete_marker);
-        let other = store.pools[0]
-            .clone()
-            .inner_list_object_versions(quorum_bucket, object, None, None, None, 10)
-            .await
-            .expect("inspect the other pool");
-        assert!(other.objects.is_empty());
-        let history = store.pools[1]
-            .clone()
-            .inner_list_object_versions(quorum_bucket, object, None, None, None, 10)
-            .await
-            .expect("inspect the restored owner");
-        assert_eq!(history.objects.len(), 1);
-        assert!(!history.objects[0].delete_marker);
+        let split = pool_object_versions(&store.pools[0], quorum_bucket, "split.bin").await;
+        assert_eq!(split.len(), 1);
+        assert!(!split[0].delete_marker);
+        let other = pool_object_versions(&store.pools[0], quorum_bucket, object).await;
+        assert!(other.is_empty());
+        let history = pool_object_versions(&store.pools[1], quorum_bucket, object).await;
+        assert_eq!(history.len(), 1);
+        assert!(!history[0].delete_marker);
     }
 
     #[tokio::test]
@@ -11774,20 +11811,12 @@ mod tests {
         assert!(errors.iter().all(Option::is_none), "batch DELETE should succeed: {errors:?}");
         assert_eq!(deleted.len(), 1);
         assert!(deleted[0].delete_marker);
-        let versions = store.pools[1]
-            .clone()
-            .inner_list_object_versions(bucket, object, None, None, None, 10)
-            .await
-            .expect("inspect the owner after batch DELETE");
-        assert_eq!(versions.objects.len(), 2, "only one null marker and the UUID history remain");
-        assert!(versions.objects[0].delete_marker && versions.objects[0].is_latest);
-        assert_eq!(versions.objects[1].version_id, original.version_id);
-        let other = store.pools[0]
-            .clone()
-            .inner_list_object_versions(bucket, object, None, None, None, 10)
-            .await
-            .expect("inspect the unused pool");
-        assert!(other.objects.is_empty());
+        let versions = pool_object_versions(&store.pools[1], bucket, object).await;
+        assert_eq!(versions.len(), 2, "only one null marker and the UUID history remain");
+        assert!(versions[0].delete_marker && versions[0].is_latest);
+        assert_eq!(versions[1].version_id, original.version_id);
+        let other = pool_object_versions(&store.pools[0], bucket, object).await;
+        assert!(other.is_empty());
     }
 
     async fn assert_prepared_reader_blocks_writer(store: &ECStore, bucket: &str, object: &str) {

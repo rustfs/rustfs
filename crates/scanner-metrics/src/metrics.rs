@@ -998,6 +998,7 @@ impl ScannerUsagePublicationObservation {
 }
 
 pub struct Metrics {
+    startup: crate::startup::ScannerStartupObservation,
     operations: Vec<AtomicU64>,
     latency: Vec<LockedLastMinuteLatency>,
     actions: Vec<AtomicU64>,
@@ -1715,6 +1716,8 @@ pub struct ScannerMetricsReport {
     pub last_cycle_replication_repair: Vec<ScannerReplicationRepairSnapshot>,
     #[serde(default)]
     pub partial_cycles: u64,
+    #[serde(default)]
+    pub startup: crate::startup::ScannerStartupStatus,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1770,7 +1773,7 @@ fn scanner_ratio(numerator: f64, denominator: f64) -> f64 {
     }
 }
 
-fn unix_now_secs() -> u64 {
+pub(crate) fn unix_now_secs() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -2140,8 +2143,13 @@ pub fn emit_scan_bucket_drive_partial(_source: ScannerWorkSource, bucket: &str, 
 }
 
 impl Metrics {
+    pub fn startup(&self) -> &crate::startup::ScannerStartupObservation {
+        &self.startup
+    }
+
     pub fn new() -> Self {
         Self {
+            startup: crate::startup::ScannerStartupObservation::default(),
             operations: (0..Metric::Last as usize).map(|_| AtomicU64::new(0)).collect(),
             // Each slot gets its own fresh LockedLastMinuteLatency so that
             // different metrics never accidentally share state.
@@ -3721,7 +3729,10 @@ impl Metrics {
     }
 
     pub async fn report_with_runtime_details(&self) -> (ScannerMetricsReport, ScannerRuntimeDetailsReport) {
-        let mut m = ScannerMetricsReport::default();
+        let mut m = ScannerMetricsReport {
+            startup: self.startup.snapshot(),
+            ..Default::default()
+        };
         let runtime_details;
 
         let has_cycle = {

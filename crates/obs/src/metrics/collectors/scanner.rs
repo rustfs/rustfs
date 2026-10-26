@@ -23,6 +23,7 @@ use crate::metrics::schema::scanner::*;
 /// Scanner statistics.
 #[derive(Debug, Clone, Default)]
 pub struct ScannerStats {
+    pub startup: rustfs_scanner_metrics::startup::ScannerStartupStatus,
     /// Number of bucket-drive scans finished
     pub bucket_scans_finished: u64,
     /// Number of bucket-drive scans started
@@ -316,6 +317,23 @@ fn collect_scanner_metrics_with_runtime(stats: &ScannerStats, runtime: Option<&S
     }
 
     let mut metrics = vec![
+        PrometheusMetric::from_descriptor(&SCANNER_RUNTIME_ACTIVE_MD, if stats.startup.runtime_active { 1.0 } else { 0.0 }),
+        PrometheusMetric::from_descriptor(&SCANNER_STARTUP_PHASE_MD, stats.startup.phase.code() as f64),
+        PrometheusMetric::from_descriptor(&SCANNER_STARTUP_STARTED_UNIX_SECONDS_MD, stats.startup.started_at_unix_secs as f64),
+        PrometheusMetric::from_descriptor(&SCANNER_STARTUP_PHASE_AGE_SECONDS_MD, stats.startup.phase_age_seconds as f64),
+        PrometheusMetric::from_descriptor(
+            &SCANNER_STARTUP_PLANNED_ATTEMPT_UNIX_SECONDS_MD,
+            stats.startup.planned_attempt_at_unix_secs.unwrap_or_default() as f64,
+        ),
+        PrometheusMetric::from_descriptor(
+            &SCANNER_STARTUP_WAIT_REMAINING_SECONDS_MD,
+            stats.startup.wait_remaining_seconds as f64,
+        ),
+        PrometheusMetric::from_descriptor(&SCANNER_STARTUP_WAIT_OVERDUE_SECONDS_MD, stats.startup.wait_overdue_seconds as f64),
+        PrometheusMetric::from_descriptor(
+            &SCANNER_STARTUP_FIRST_ATTEMPT_UNIX_SECONDS_MD,
+            stats.startup.first_attempt_at_unix_secs.unwrap_or_default() as f64,
+        ),
         PrometheusMetric::from_descriptor(&SCANNER_BUCKET_SCANS_FINISHED_MD, stats.bucket_scans_finished as f64),
         PrometheusMetric::from_descriptor(&SCANNER_BUCKET_SCANS_STARTED_MD, stats.bucket_scans_started as f64),
         PrometheusMetric::from_descriptor(&SCANNER_BUCKET_SCANS_FAILED_MD, stats.bucket_scans_failed as f64),
@@ -661,6 +679,7 @@ mod tests {
                 age_seconds: 7,
             }],
             stats: ScannerStats {
+                startup: Default::default(),
                 bucket_scans_finished: 100,
                 bucket_scans_started: 100,
                 bucket_scans_failed: 2,
@@ -749,7 +768,7 @@ mod tests {
         let metrics = collect_scanner_runtime_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 105);
+        assert_eq!(metrics.len(), 113);
 
         let objects = metrics.iter().find(|m| m.value == 1000000.0);
         assert!(objects.is_some());
@@ -1164,11 +1183,47 @@ mod tests {
     }
 
     #[test]
+    fn startup_metrics_use_one_bounded_snapshot() {
+        use rustfs_scanner_metrics::startup::{ScannerStartupPhase, ScannerStartupStatus};
+        let stats = ScannerStats {
+            startup: ScannerStartupStatus {
+                runtime_active: true,
+                phase: ScannerStartupPhase::Waiting,
+                started_at_unix_secs: 1_700_000_000,
+                phase_age_seconds: 12,
+                planned_attempt_at_unix_secs: Some(1_700_000_120),
+                wait_remaining_seconds: 108,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let metrics = collect_scanner_metrics(&stats);
+        for (descriptor, expected) in [
+            (&*SCANNER_RUNTIME_ACTIVE_MD, 1.0),
+            (&*SCANNER_STARTUP_PHASE_MD, 3.0),
+            (&*SCANNER_STARTUP_STARTED_UNIX_SECONDS_MD, 1_700_000_000.0),
+            (&*SCANNER_STARTUP_PHASE_AGE_SECONDS_MD, 12.0),
+            (&*SCANNER_STARTUP_PLANNED_ATTEMPT_UNIX_SECONDS_MD, 1_700_000_120.0),
+            (&*SCANNER_STARTUP_WAIT_REMAINING_SECONDS_MD, 108.0),
+            (&*SCANNER_STARTUP_WAIT_OVERDUE_SECONDS_MD, 0.0),
+            (&*SCANNER_STARTUP_FIRST_ATTEMPT_UNIX_SECONDS_MD, 0.0),
+        ] {
+            let selected: Vec<_> = metrics
+                .iter()
+                .filter(|metric| metric.name == descriptor.get_full_metric_name())
+                .collect();
+            assert_eq!(selected.len(), 1, "one producer per startup gauge");
+            assert_eq!(selected[0].value, expected);
+            assert!(selected[0].labels.is_empty(), "startup gauges must not add per-object labels");
+        }
+    }
+
+    #[test]
     fn test_collect_scanner_metrics_default() {
         let stats = ScannerStats::default();
         let metrics = collect_scanner_metrics(&stats);
 
-        assert_eq!(metrics.len(), 82);
+        assert_eq!(metrics.len(), 90);
         for metric in &metrics {
             assert_eq!(metric.value, 0.0);
             if metric.name == SCANNER_PARTIAL_CYCLES_BY_REASON_MD.get_full_metric_name() {
