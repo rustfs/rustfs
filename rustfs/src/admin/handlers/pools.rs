@@ -12,16 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::runtime_sources::object_store_from_extensions;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::runtime_sources::object_store_from_envelope;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::{
     MaskedAccessKey,
     http::{AMZ_REQUEST_ID, REQUEST_ID_HEADER},
 };
-use s3s::{Body, S3Request, S3Response, header::CONTENT_TYPE};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -31,12 +32,12 @@ use crate::{
         AdminPoolStatus, QueryPoolStatusRequest, current_endpoints_handle, current_notification_system, default_admin_usecase,
     },
     admin::{
-        auth::authorize_admin_request,
-        router::{AdminOperation, Operation, S3Router},
+        auth::authorize_admin_envelope,
+        router::{AdminOperation, S3Router},
         storage_api::runtime::{EndpointServerPools, PeerRestClient},
     },
     error::ApiError,
-    server::{ADMIN_PREFIX, RemoteAddr},
+    server::ADMIN_PREFIX,
 };
 use hyper::Method;
 
@@ -73,10 +74,8 @@ fn admin_request_id(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.to_str().ok())
 }
 
-fn admin_remote_addr(req: &S3Request<Body>) -> Option<String> {
-    req.extensions
-        .get::<Option<RemoteAddr>>()
-        .and_then(|opt| opt.map(|addr| addr.0.to_string()))
+fn admin_remote_addr(req: &AdminRequest) -> Option<String> {
+    req.remote_addr().map(|addr| addr.to_string())
 }
 
 fn log_pool_request_rejected_with_context(operation: &str, reason: &str, request_id: &str, actor: &str, remote_addr: &str) {
@@ -532,13 +531,13 @@ pub struct ListPools {}
 impl Operation for ListPools {
     // GET <endpoint>/<admin-API>/pools/list
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        if req.credentials.is_none() {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        if req.credentials().is_none() {
             return Err(pool_admin_missing_credentials_error("list pools"));
         }
 
-        authorize_admin_request(
-            &req,
+        authorize_admin_envelope(
+            req.envelope(),
             vec![
                 Action::AdminAction(AdminAction::ServerInfoAdminAction),
                 Action::AdminAction(AdminAction::DecommissionAdminAction),
@@ -558,7 +557,7 @@ impl Operation for ListPools {
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         log_pool_response_emitted!("list_pools");
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
@@ -622,13 +621,13 @@ pub struct StatusPool {}
 impl Operation for StatusPool {
     // GET <endpoint>/<admin-API>/pools/status?pool=http://server{1...4}/disk{1...4}
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        if req.credentials.is_none() {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        if req.credentials().is_none() {
             return Err(pool_admin_missing_credentials_error("load pool status"));
         }
 
-        authorize_admin_request(
-            &req,
+        authorize_admin_envelope(
+            req.envelope(),
             vec![
                 Action::AdminAction(AdminAction::ServerInfoAdminAction),
                 Action::AdminAction(AdminAction::DecommissionAdminAction),
@@ -636,7 +635,7 @@ impl Operation for StatusPool {
         )
         .await?;
 
-        let query = parse_status_pool_query(&req.uri).map_err(|_| pool_admin_query_parse_error("load pool status"))?;
+        let query = parse_status_pool_query(req.uri()).map_err(|_| pool_admin_query_parse_error("load pool status"))?;
 
         let usecase = default_admin_usecase();
         let pools_status = usecase
@@ -660,7 +659,7 @@ impl Operation for StatusPool {
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         log_pool_response_emitted!("query_pool_status");
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
@@ -670,13 +669,13 @@ pub struct StatusDecommission {}
 impl Operation for StatusDecommission {
     // GET <endpoint>/<admin-API>/decommission/status[?pool=http://server{1...4}/disk{1...4}]
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        if req.credentials.is_none() {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        if req.credentials().is_none() {
             return Err(pool_admin_missing_credentials_error("load decommission status"));
         }
 
-        authorize_admin_request(
-            &req,
+        authorize_admin_envelope(
+            req.envelope(),
             vec![
                 Action::AdminAction(AdminAction::ServerInfoAdminAction),
                 Action::AdminAction(AdminAction::DecommissionAdminAction),
@@ -684,7 +683,7 @@ impl Operation for StatusDecommission {
         )
         .await?;
 
-        let query = parse_status_pool_query(&req.uri).map_err(|_| pool_admin_query_parse_error("load decommission status"))?;
+        let query = parse_status_pool_query(req.uri()).map_err(|_| pool_admin_query_parse_error("load decommission status"))?;
 
         let usecase = default_admin_usecase();
         let data = if query.pool.is_empty() {
@@ -709,7 +708,7 @@ impl Operation for StatusDecommission {
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         log_pool_response_emitted!("query_decommission_status");
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
@@ -719,8 +718,8 @@ pub struct StartDecommission {}
 impl Operation for StartDecommission {
     // POST <endpoint>/<admin-API>/pools/decommission?pool=http://server{1...4}/disk{1...4}
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let request_id = admin_request_id(req.headers()).unwrap_or_default().to_string();
         let remote_addr = admin_remote_addr(&req).unwrap_or_default();
         info!(
             event = EVENT_ADMIN_REQUEST_STATE,
@@ -734,16 +733,16 @@ impl Operation for StartDecommission {
             "admin pool request state"
         );
 
-        let Some(input_cred) = req.credentials.as_ref() else {
+        let Some(input_cred) = req.credentials() else {
             return Err(pool_admin_missing_credentials_error_with_request(
                 "start decommission",
                 &request_id,
                 &remote_addr,
             ));
         };
-        let actor = MaskedAccessKey(&input_cred.access_key).to_string();
+        let actor = MaskedAccessKey(input_cred.access_key()).to_string();
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::DecommissionAdminAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::DecommissionAdminAction)]).await?;
         let audit = PoolAuditContext::new(&request_id, &actor, &remote_addr);
 
         let Some(endpoints) = endpoints_from_context() else {
@@ -762,11 +761,11 @@ impl Operation for StartDecommission {
             return Err(s3_error!(NotImplemented));
         }
 
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(decommission_admin_not_initialized_error_with_audit("start decommission", audit));
         };
 
-        let query = parse_mutation_pool_query(&req.uri)
+        let query = parse_mutation_pool_query(req.uri())
             .map_err(|_| pool_admin_query_parse_error_with_audit("start decommission", audit))?;
         let is_byid = query.by_id.as_str() == "true";
 
@@ -879,7 +878,7 @@ impl Operation for StartDecommission {
             pool_indices = ?pools_indices,
             "admin response emitted"
         );
-        Ok(S3Response::new((StatusCode::OK, Body::default())))
+        Ok(AdminResponse::new(StatusCode::OK, Body::default()))
     }
 }
 
@@ -889,8 +888,8 @@ pub struct CancelDecommission {}
 impl Operation for CancelDecommission {
     // POST <endpoint>/<admin-API>/pools/cancel?pool=http://server{1...4}/disk{1...4}
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let request_id = admin_request_id(req.headers()).unwrap_or_default().to_string();
         let remote_addr = admin_remote_addr(&req).unwrap_or_default();
         info!(
             event = EVENT_ADMIN_REQUEST_STATE,
@@ -904,16 +903,16 @@ impl Operation for CancelDecommission {
             "admin pool request state"
         );
 
-        let Some(input_cred) = req.credentials.as_ref() else {
+        let Some(input_cred) = req.credentials() else {
             return Err(pool_admin_missing_credentials_error_with_request(
                 "cancel decommission",
                 &request_id,
                 &remote_addr,
             ));
         };
-        let actor = MaskedAccessKey(&input_cred.access_key).to_string();
+        let actor = MaskedAccessKey(input_cred.access_key()).to_string();
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::DecommissionAdminAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::DecommissionAdminAction)]).await?;
         let audit = PoolAuditContext::new(&request_id, &actor, &remote_addr);
 
         let Some(endpoints) = endpoints_from_context() else {
@@ -932,7 +931,7 @@ impl Operation for CancelDecommission {
             return Err(s3_error!(NotImplemented));
         }
 
-        let query = parse_mutation_pool_query(&req.uri)
+        let query = parse_mutation_pool_query(req.uri())
             .map_err(|_| pool_admin_query_parse_error_with_audit("cancel decommission", audit))?;
 
         let is_byid = query.by_id.as_str() == "true";
@@ -956,7 +955,7 @@ impl Operation for CancelDecommission {
                 .map_err(ApiError::from)
                 .map_err(|err| contextualize_admin_pool_api_error(err, "cancel decommission", format!("pool {idx}")))?;
         } else {
-            let Some(store) = object_store_from_extensions(&req.extensions) else {
+            let Some(store) = object_store_from_envelope(req.envelope()) else {
                 return Err(decommission_admin_not_initialized_error_with_audit("cancel decommission", audit));
             };
 
@@ -980,7 +979,7 @@ impl Operation for CancelDecommission {
             pool_index = idx,
             "admin response emitted"
         );
-        Ok(S3Response::new((StatusCode::OK, Body::default())))
+        Ok(AdminResponse::new(StatusCode::OK, Body::default()))
     }
 }
 
@@ -991,8 +990,8 @@ impl Operation for ClearDecommission {
     // POST <endpoint>/<admin-API>/pools/clear?pool=http://server{1...4}/disk{1...4}
     // Clears failed/canceled decommission metadata only; already moved data is not rolled back.
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let request_id = admin_request_id(req.headers()).unwrap_or_default().to_string();
         let remote_addr = admin_remote_addr(&req).unwrap_or_default();
         info!(
             event = EVENT_ADMIN_REQUEST_STATE,
@@ -1006,16 +1005,16 @@ impl Operation for ClearDecommission {
             "admin pool request state"
         );
 
-        let Some(input_cred) = req.credentials.as_ref() else {
+        let Some(input_cred) = req.credentials() else {
             return Err(pool_admin_missing_credentials_error_with_request(
                 "clear decommission",
                 &request_id,
                 &remote_addr,
             ));
         };
-        let actor = MaskedAccessKey(&input_cred.access_key).to_string();
+        let actor = MaskedAccessKey(input_cred.access_key()).to_string();
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::DecommissionAdminAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::DecommissionAdminAction)]).await?;
         let audit = PoolAuditContext::new(&request_id, &actor, &remote_addr);
 
         let Some(endpoints) = endpoints_from_context() else {
@@ -1034,7 +1033,7 @@ impl Operation for ClearDecommission {
             return Err(s3_error!(NotImplemented));
         }
 
-        let query = parse_mutation_pool_query(&req.uri)
+        let query = parse_mutation_pool_query(req.uri())
             .map_err(|_| pool_admin_query_parse_error_with_audit("clear decommission", audit))?;
 
         let is_byid = query.by_id.as_str() == "true";
@@ -1058,7 +1057,7 @@ impl Operation for ClearDecommission {
                 .map_err(ApiError::from)
                 .map_err(|err| contextualize_admin_pool_api_error(err, "clear decommission", format!("pool {idx}")))?;
         } else {
-            let Some(store) = object_store_from_extensions(&req.extensions) else {
+            let Some(store) = object_store_from_envelope(req.envelope()) else {
                 return Err(decommission_admin_not_initialized_error_with_audit("clear decommission", audit));
             };
 
@@ -1082,7 +1081,7 @@ impl Operation for ClearDecommission {
             pool_index = idx,
             "admin response emitted"
         );
-        Ok(S3Response::new((StatusCode::OK, Body::default())))
+        Ok(AdminResponse::new(StatusCode::OK, Body::default()))
     }
 }
 
@@ -1090,29 +1089,24 @@ impl Operation for ClearDecommission {
 mod pools_handler_tests {
     use super::{
         AdminPoolStatus, Body, CancelDecommission, ClearDecommission, HeaderMap, ListPools, Method, Operation,
-        POOL_ACTIVATION_FLEET_PROOF_REQUIRED, Params, PoolAuditContext, S3ErrorCode, S3Request, StartDecommission,
-        StatusDecommission, StatusPool, Uri, contextualize_admin_pool_api_error,
-        decommission_admin_not_initialized_error_with_audit, decommission_peer_target, decommission_start_api_error,
-        decommission_start_rebalance_refresh_error, has_duplicate_indices, parse_mutation_pool_query, parse_pool_idx_by_id,
-        parse_status_pool_query, pool_admin_missing_credentials_error, pool_admin_missing_credentials_error_with_request,
+        POOL_ACTIVATION_FLEET_PROOF_REQUIRED, Params, PoolAuditContext, S3ErrorCode, StartDecommission, StatusDecommission,
+        StatusPool, Uri, contextualize_admin_pool_api_error, decommission_admin_not_initialized_error_with_audit,
+        decommission_peer_target, decommission_start_api_error, decommission_start_rebalance_refresh_error,
+        has_duplicate_indices, parse_mutation_pool_query, parse_pool_idx_by_id, parse_status_pool_query,
+        pool_admin_missing_credentials_error, pool_admin_missing_credentials_error_with_request,
         pool_admin_pool_index_error_with_audit, pool_admin_pool_not_found_error_with_audit,
         pool_admin_pool_parse_error_with_audit, pool_admin_query_parse_error, pool_admin_query_parse_error_with_audit,
         validate_pool_mutation_leader, validate_start_decommission_guards,
     };
+    use crate::admin::operation::AdminRequest;
     use crate::admin::storage_api::runtime::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 
-    fn credential_less_request(method: Method, uri: &'static str) -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method,
-            uri: Uri::from_static(uri),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn credential_less_request(method: Method, uri: &'static str) -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(method, Uri::from_static(uri))
+            .headers(HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::empty())
+            .build()
     }
 
     async fn assert_missing_credentials(operation: &dyn Operation, method: Method, uri: &'static str, message: &str) {
@@ -1582,7 +1576,7 @@ mod pools_handler_tests {
 
     fn assert_shared_gate_wiring(block: &str, item: &str, actions: &[&str], binds_credentials: bool) {
         assert_eq!(
-            block.matches("authorize_admin_request(").count(),
+            block.matches("authorize_admin_envelope(").count(),
             1,
             "{item} must use exactly one shared gate"
         );
@@ -1595,7 +1589,7 @@ mod pools_handler_tests {
             assert!(block.contains(&format!("AdminAction::{action}")), "{item} must authorize with {action}");
         }
         assert_eq!(
-            block.contains("let cred = authorize_admin_request("),
+            block.contains("let cred = authorize_admin_envelope("),
             binds_credentials,
             "{item} credential binding must match its payload-processing contract"
         );
@@ -1629,7 +1623,7 @@ mod pools_handler_tests {
         for handler in ["StartDecommission", "CancelDecommission", "ClearDecommission"] {
             let block = source_block(production, &format!("impl Operation for {handler}"));
             assert!(
-                block.contains("let actor = MaskedAccessKey(&input_cred.access_key).to_string();"),
+                block.contains("let actor = MaskedAccessKey(input_cred.access_key()).to_string();"),
                 "{handler} must keep masking the caller access key for its audit trail"
             );
         }

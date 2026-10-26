@@ -13,7 +13,8 @@
 // limitations under the License.
 #![allow(unused_variables, unused_mut, unused_must_use)]
 
-use crate::admin::runtime_sources::object_store_from_extensions;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::runtime_sources::object_store_from_envelope;
 use crate::admin::storage_api::runtime_sources::TierConfigMgr;
 use crate::admin::storage_api::tier::{
     AdminError, ClusterTierDailyStats, DailyAllTierStats, ECStore, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE,
@@ -24,11 +25,12 @@ use crate::admin::storage_api::tier::{
 use crate::{
     admin::runtime_sources::{current_daily_tier_stats, current_notification_system, current_tier_config_handle},
     admin::{
-        auth::authorize_admin_request,
-        router::{AdminOperation, Operation, S3Router},
+        auth::authorize_admin_envelope,
+        router::{AdminOperation, S3Router},
     },
     server::ADMIN_PREFIX,
 };
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderMap, StatusCode, Uri};
 use hyper::Method;
 use matchit::Params;
@@ -36,11 +38,7 @@ use percent_encoding::percent_decode_str;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_data_usage::TierStats;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
-use s3s::{
-    Body, S3Request, S3Response,
-    header::{CONTENT_LENGTH, CONTENT_TYPE},
-};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use serde_urlencoded::from_bytes;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -308,9 +306,9 @@ pub fn register_tier_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
 
 #[async_trait::async_trait]
 impl Operation for AddTier {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AddTierQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
@@ -319,13 +317,13 @@ impl Operation for AddTier {
             }
         };
 
-        if req.credentials.is_none() {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         }
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
 
-        let mut input = req.input;
+        let mut input = req.take_body();
         let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
@@ -374,7 +372,7 @@ impl Operation for AddTier {
                 s3_error!(InvalidRequest, "invalid force flag")
             })?;
         }
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
@@ -435,16 +433,16 @@ impl Operation for AddTier {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
         header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::empty(), header))
     }
 }
 
 pub struct EditTier {}
 #[async_trait::async_trait]
 impl Operation for EditTier {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AddTierQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
@@ -453,13 +451,13 @@ impl Operation for EditTier {
             }
         };
 
-        if req.credentials.is_none() {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         }
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
 
-        let mut input = req.input;
+        let mut input = req.take_body();
         let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
@@ -491,7 +489,7 @@ impl Operation for EditTier {
             "admin tier state"
         );
 
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
@@ -527,7 +525,7 @@ impl Operation for EditTier {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
         header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::empty(), header))
     }
 }
 
@@ -539,9 +537,9 @@ pub struct BucketQuery {
 pub struct ListTiers {}
 #[async_trait::async_trait]
 impl Operation for ListTiers {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: BucketQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get query failed"))?;
                 input
@@ -550,11 +548,11 @@ impl Operation for ListTiers {
             }
         };
 
-        if req.credentials.is_none() {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         }
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
 
         let tier_config_mgr_handle = current_tier_config_handle();
         let tier_config_mgr = tier_config_mgr_handle.read().await;
@@ -566,16 +564,16 @@ impl Operation for ListTiers {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
 pub struct RemoveTier {}
 #[async_trait::async_trait]
 impl Operation for RemoveTier {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AddTierQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
@@ -584,11 +582,11 @@ impl Operation for RemoveTier {
             }
         };
 
-        if req.credentials.is_none() {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         }
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
 
         let mut force: bool = false;
         let force_str = query.force.clone().unwrap_or_default();
@@ -609,7 +607,7 @@ impl Operation for RemoveTier {
 
         let tier_name = params.get("tiername").map(|s| s.to_string()).unwrap_or_default();
 
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
@@ -652,21 +650,21 @@ impl Operation for RemoveTier {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
         header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::empty(), header))
     }
 }
 
 pub struct VerifyTier {}
 #[async_trait::async_trait]
 impl Operation for VerifyTier {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        if req.credentials.is_none() {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         }
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
 
-        let tier = resolve_tier_name(&req.uri, &params)?;
+        let tier = resolve_tier_name(req.uri(), &params)?;
         let tier_config_mgr_handle = current_tier_config_handle();
         TierConfigMgr::verify_without_manager_lock(&tier_config_mgr_handle, &tier)
             .await
@@ -675,7 +673,7 @@ impl Operation for VerifyTier {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
         header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::empty(), header))
     }
 }
 
@@ -783,15 +781,15 @@ struct TierStatsBodyV2 {
 pub struct GetTierInfo {}
 #[async_trait::async_trait]
 impl Operation for GetTierInfo {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        if req.credentials.is_none() {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         }
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
 
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: TierStatsQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
@@ -809,7 +807,7 @@ impl Operation for GetTierInfo {
         let data = if tier_stats_wants_legacy_format(&query)? {
             serde_json::to_vec(&filter_tier_stats(current_daily_tier_stats(), tier_name))
         } else {
-            let store = object_store_from_extensions(&req.extensions);
+            let store = object_store_from_envelope(req.envelope());
             serde_json::to_vec(&tier_stats_body(store, tier_name).await)
         }
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal tier err {e}")))?;
@@ -817,7 +815,7 @@ impl Operation for GetTierInfo {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
@@ -1064,14 +1062,14 @@ fn parse_clear_tier_query(uri: &Uri) -> S3Result<ClearTierQuery> {
 pub struct ClearTier {}
 #[async_trait::async_trait]
 impl Operation for ClearTier {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let query = parse_clear_tier_query(&req.uri)?;
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let query = parse_clear_tier_query(req.uri())?;
 
-        if req.credentials.is_none() {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         }
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
 
         let mut force: bool = false;
         let force_str = query.force;
@@ -1098,7 +1096,7 @@ impl Operation for ClearTier {
             return Err(s3_error!(InvalidRequest, "invalid clear-tier confirmation token"));
         };
 
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
@@ -1149,7 +1147,7 @@ impl Operation for ClearTier {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
         header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::empty(), header))
     }
 }
 
@@ -1736,18 +1734,12 @@ mod tests {
         stats
     }
 
-    fn credential_less_request(method: Method, uri: &'static str) -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method,
-            uri: Uri::from_static(uri),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn credential_less_request(method: Method, uri: &'static str) -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(method, Uri::from_static(uri))
+            .headers(HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::empty())
+            .build()
     }
 
     async fn assert_missing_credentials(operation: &dyn Operation, method: Method, uri: &'static str, message: &str) {
@@ -1787,7 +1779,7 @@ mod tests {
 
     fn assert_shared_gate_wiring(block: &str, item: &str, actions: &[&str], binds_credentials: bool) {
         assert_eq!(
-            block.matches("authorize_admin_request(").count(),
+            block.matches("authorize_admin_envelope(").count(),
             1,
             "{item} must use exactly one shared gate"
         );
@@ -1800,7 +1792,7 @@ mod tests {
             assert!(block.contains(&format!("AdminAction::{action}")), "{item} must authorize with {action}");
         }
         assert_eq!(
-            block.contains("let cred = authorize_admin_request("),
+            block.contains("let cred = authorize_admin_envelope("),
             binds_credentials,
             "{item} credential binding must match its payload-processing contract"
         );

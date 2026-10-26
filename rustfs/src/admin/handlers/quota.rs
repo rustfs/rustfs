@@ -16,9 +16,10 @@
 
 use crate::admin::auth::{validate_admin_request, validate_admin_request_with_bucket};
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{
-    AppContext, app_context_from_req, current_bucket_metadata_handle, current_notification_system_for_context,
+    AppContext, app_context_from_envelope, current_bucket_metadata_handle, current_notification_system_for_context,
     current_object_store_handle,
 };
 use crate::admin::storage_api::bucket::metadata_sys::{self, BucketMetadataSys};
@@ -30,13 +31,11 @@ use crate::admin::storage_api::contract::bucket::{BucketOperations as _, BucketO
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
-use crate::server::RemoteAddr;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
-use rustfs_s3_types::{S3Error, S3Result, s3_error};
-use s3s::{Body, S3Request, S3Response};
+use rustfs_s3_types::{Body, S3Error, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::sync::Arc;
@@ -382,7 +381,7 @@ pub fn register_quota_route(r: &mut S3Router<AdminOperation>) -> std::io::Result
 #[async_trait::async_trait]
 impl Operation for SetBucketQuotaHandler {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         warn!(
             event = EVENT_ADMIN_QUOTA_STATE,
             component = LOG_COMPONENT_ADMIN,
@@ -392,16 +391,16 @@ impl Operation for SetBucketQuotaHandler {
             "admin quota state"
         );
 
-        let Some(ref cred) = req.credentials else {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        let remote_addr = req.remote_addr();
         validate_admin_request(
-            &req.headers,
+            req.headers(),
             &cred,
             owner,
             false,
@@ -410,7 +409,7 @@ impl Operation for SetBucketQuotaHandler {
         )
         .await?;
 
-        let bucket = bucket_from_params_or_query(&params, &req.uri);
+        let bucket = bucket_from_params_or_query(&params, req.uri());
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
@@ -419,7 +418,7 @@ impl Operation for SetBucketQuotaHandler {
             .map_err(|e| s3_error!(InternalError, "failed to capture bucket incarnation: {}", e))?;
 
         let body = req
-            .input
+            .take_body()
             .store_all_limited(rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
@@ -472,7 +471,7 @@ impl Operation for SetBucketQuotaHandler {
         }
         .map_err(ApiError::from)?;
 
-        notify_quota_metadata_reload(app_context_from_req(&req), bucket.clone(), "set_bucket_quota").await;
+        notify_quota_metadata_reload(app_context_from_envelope(req.envelope()), bucket.clone(), "set_bucket_quota").await;
 
         if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
             bucket: bucket.clone(),
@@ -501,7 +500,7 @@ impl Operation for SetBucketQuotaHandler {
         // Get real-time usage from data usage system
         let current_usage = current_usage_from_context(&bucket).await;
 
-        let json = if is_compat_set_bucket_quota_path(req.uri.path()) {
+        let json = if is_compat_set_bucket_quota_path(req.uri().path()) {
             String::new()
         } else {
             let response = BucketQuotaResponse {
@@ -514,14 +513,14 @@ impl Operation for SetBucketQuotaHandler {
             serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?
         };
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(json))))
+        Ok(AdminResponse::new(StatusCode::OK, Body::from(json)))
     }
 }
 
 #[async_trait::async_trait]
 impl Operation for GetBucketQuotaHandler {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         warn!(
             event = EVENT_ADMIN_QUOTA_STATE,
             component = LOG_COMPONENT_ADMIN,
@@ -531,20 +530,20 @@ impl Operation for GetBucketQuotaHandler {
             "admin quota state"
         );
 
-        let Some(ref cred) = req.credentials else {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let bucket = bucket_from_params_or_query(&params, &req.uri);
+        let bucket = bucket_from_params_or_query(&params, req.uri());
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        let remote_addr = req.remote_addr();
         validate_admin_request_with_bucket(
-            &req.headers,
+            req.headers(),
             &cred,
             owner,
             false,
@@ -559,7 +558,7 @@ impl Operation for GetBucketQuotaHandler {
 
         let quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 
-        if is_compat_get_bucket_quota_path(req.uri.path()) {
+        if is_compat_get_bucket_quota_path(req.uri().path()) {
             if !quota_checker.bucket_exists(&bucket).await {
                 return Err(s3_error!(NoSuchBucket, "bucket not found: {}", bucket));
             }
@@ -569,7 +568,7 @@ impl Operation for GetBucketQuotaHandler {
                 .map_err(|e| s3_error!(InternalError, "failed to get quota: {}", e))?;
             let json = serde_json::to_string(&compat_bucket_quota_response(&quota))
                 .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
-            return Ok(S3Response::new((StatusCode::OK, Body::from(json))));
+            return Ok(AdminResponse::new(StatusCode::OK, Body::from(json)));
         }
 
         let (quota, current_usage) = quota_checker
@@ -587,14 +586,14 @@ impl Operation for GetBucketQuotaHandler {
         let json =
             serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(json))))
+        Ok(AdminResponse::new(StatusCode::OK, Body::from(json)))
     }
 }
 
 #[async_trait::async_trait]
 impl Operation for ClearBucketQuotaHandler {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         warn!(
             event = EVENT_ADMIN_QUOTA_STATE,
             component = LOG_COMPONENT_ADMIN,
@@ -604,16 +603,16 @@ impl Operation for ClearBucketQuotaHandler {
             "admin quota state"
         );
 
-        let Some(ref cred) = req.credentials else {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        let remote_addr = req.remote_addr();
         validate_admin_request(
-            &req.headers,
+            req.headers(),
             &cred,
             owner,
             false,
@@ -652,7 +651,7 @@ impl Operation for ClearBucketQuotaHandler {
             .await
             .map_err(|e| s3_error!(InternalError, "failed to clear quota: {}", e))?;
 
-        notify_quota_metadata_reload(app_context_from_req(&req), bucket.clone(), "clear_bucket_quota").await;
+        notify_quota_metadata_reload(app_context_from_envelope(req.envelope()), bucket.clone(), "clear_bucket_quota").await;
 
         if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
             bucket: bucket.clone(),
@@ -701,14 +700,14 @@ impl Operation for ClearBucketQuotaHandler {
         let json =
             serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(json))))
+        Ok(AdminResponse::new(StatusCode::OK, Body::from(json)))
     }
 }
 
 #[async_trait::async_trait]
 impl Operation for GetBucketQuotaStatsHandler {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         warn!(
             event = EVENT_ADMIN_QUOTA_STATE,
             component = LOG_COMPONENT_ADMIN,
@@ -718,21 +717,21 @@ impl Operation for GetBucketQuotaStatsHandler {
             "admin quota state"
         );
 
-        let Some(ref cred) = req.credentials else {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
         let bucket = params.get("bucket").unwrap_or("").to_string();
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
 
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        let remote_addr = req.remote_addr();
         validate_admin_request_with_bucket(
-            &req.headers,
+            req.headers(),
             &cred,
             owner,
             false,
@@ -770,14 +769,14 @@ impl Operation for GetBucketQuotaStatsHandler {
         let json =
             serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(json))))
+        Ok(AdminResponse::new(StatusCode::OK, Body::from(json)))
     }
 }
 
 #[async_trait::async_trait]
 impl Operation for CheckBucketQuotaHandler {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         warn!(
             event = EVENT_ADMIN_QUOTA_STATE,
             component = LOG_COMPONENT_ADMIN,
@@ -787,21 +786,21 @@ impl Operation for CheckBucketQuotaHandler {
             "admin quota state"
         );
 
-        let Some(ref cred) = req.credentials else {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
         let bucket = params.get("bucket").unwrap_or("").to_string();
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
 
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        let remote_addr = req.remote_addr();
         validate_admin_request_with_bucket(
-            &req.headers,
+            req.headers(),
             &cred,
             owner,
             false,
@@ -812,7 +811,7 @@ impl Operation for CheckBucketQuotaHandler {
         .await?;
 
         let body = req
-            .input
+            .take_body()
             .store_all_limited(rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
@@ -866,7 +865,7 @@ impl Operation for CheckBucketQuotaHandler {
         let json =
             serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(json))))
+        Ok(AdminResponse::new(StatusCode::OK, Body::from(json)))
     }
 }
 
@@ -877,7 +876,7 @@ impl Operation for CheckBucketQuotaHandler {
 #[async_trait::async_trait]
 impl Operation for MigrateBucketQuotaProtocolHandler {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         warn!(
             event = EVENT_ADMIN_QUOTA_STATE,
             component = LOG_COMPONENT_ADMIN,
@@ -887,16 +886,16 @@ impl Operation for MigrateBucketQuotaProtocolHandler {
             "admin quota state"
         );
 
-        let Some(ref cred) = req.credentials else {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        let remote_addr = req.remote_addr();
         validate_admin_request(
-            &req.headers,
+            req.headers(),
             &cred,
             owner,
             false,
@@ -937,7 +936,7 @@ impl Operation for MigrateBucketQuotaProtocolHandler {
 
         let json = serde_json::to_string(&report).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(json))))
+        Ok(AdminResponse::new(StatusCode::OK, Body::from(json)))
     }
 }
 

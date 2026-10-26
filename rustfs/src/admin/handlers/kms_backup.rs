@@ -42,11 +42,12 @@
 
 use super::kms_audit::{KmsAdminAudit, KmsAdminOperation};
 use crate::admin::auth::validate_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{current_deployment_id, current_kms_runtime_service_manager};
-use crate::admin::utils::json_response;
+use crate::admin::utils::owned_json_response;
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use base64_simd::STANDARD as BASE64;
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -60,7 +61,6 @@ use rustfs_kms::config::{BackendConfig, KmsConfig, LocalConfig, VaultAuthMethod}
 use rustfs_kms::{KmsBackend, KmsManager, KmsServiceManager, KmsServiceStatus};
 use rustfs_policy::policy::action::{Action, KmsAction};
 use rustfs_s3_types::{S3Result, s3_error};
-use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -897,9 +897,9 @@ struct ErrorResponse {
     message: String,
 }
 
-fn failure_response(failure: Failure) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn failure_response(failure: Failure) -> S3Result<AdminResponse> {
     let (status, message) = failure;
-    json_response(status, &ErrorResponse { success: false, message })
+    owned_json_response(status, &ErrorResponse { success: false, message })
 }
 
 /// Authenticate, audit-gate on the dedicated action, and read the body.
@@ -907,32 +907,25 @@ fn failure_response(failure: Failure) -> S3Result<S3Response<(StatusCode, Body)>
 /// Returns the audit state and the raw body. The gate runs before the body is
 /// parsed so an unauthorized caller learns nothing about the request contract.
 async fn authorize(
-    mut req: S3Request<Body>,
+    mut req: AdminRequest,
     actions: Vec<Action>,
     operation: KmsAdminOperation,
 ) -> S3Result<(KmsAdminAudit, Vec<u8>)> {
-    let Some(cred) = req.credentials else {
+    let Some(cred) = req.credentials() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
-    let (cred, owner) = check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
-    let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+    let (cred, owner) =
+        check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
+    let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
     audit.gate_admin(
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            actions,
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await,
+        validate_admin_request(req.headers(), &cred, owner, false, actions, req.remote_addr()).await,
         operation,
         None,
     )?;
 
     let body = req
-        .input
+        .take_body()
         .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
         .await
         .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?
@@ -1012,7 +1005,7 @@ pub struct KmsBackupHandler {}
 
 #[async_trait::async_trait]
 impl Operation for KmsBackupHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (audit, body) = authorize(req, kms_backup_actions(), KmsAdminOperation::Backup).await?;
         let request: KmsBackupRequest = parse_optional_body(&body)?;
 
@@ -1036,7 +1029,7 @@ impl Operation for KmsBackupHandler {
         match execute_backup(&manager, &context, &request).await {
             Ok(response) => {
                 finish(&audit, KmsAdminOperation::Backup, "backup", Some(&response.backup_id), None);
-                json_response(StatusCode::OK, &response)
+                owned_json_response(StatusCode::OK, &response)
             }
             Err(failure) => {
                 finish(
@@ -1057,7 +1050,7 @@ pub struct KmsRestoreDryRunHandler {}
 
 #[async_trait::async_trait]
 impl Operation for KmsRestoreDryRunHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (audit, body) = authorize(req, kms_restore_actions(), KmsAdminOperation::RestoreDryRun).await?;
         let request: KmsRestoreDryRunRequest = parse_body(&body)?;
 
@@ -1078,7 +1071,7 @@ impl Operation for KmsRestoreDryRunHandler {
         match execute_restore_dry_run(&context, &request).await {
             Ok(response) => {
                 finish(&audit, KmsAdminOperation::RestoreDryRun, "restore_dry_run", Some(&request.bundle), None);
-                json_response(StatusCode::OK, &response)
+                owned_json_response(StatusCode::OK, &response)
             }
             Err(failure) => {
                 finish(
@@ -1099,7 +1092,7 @@ pub struct KmsRestoreHandler {}
 
 #[async_trait::async_trait]
 impl Operation for KmsRestoreHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (audit, body) = authorize(req, kms_restore_actions(), KmsAdminOperation::Restore).await?;
         let request: KmsRestoreRequest = parse_body(&body)?;
 
@@ -1114,7 +1107,7 @@ impl Operation for KmsRestoreHandler {
         match execute_restore(&context, &request).await {
             Ok(report) => {
                 finish(&audit, KmsAdminOperation::Restore, "restore", Some(&report.backup_id), None);
-                json_response(StatusCode::OK, &report)
+                owned_json_response(StatusCode::OK, &report)
             }
             Err(failure) => {
                 finish(&audit, KmsAdminOperation::Restore, "restore", Some(&request.bundle), Some(&failure.1));
@@ -1129,7 +1122,7 @@ pub struct KmsRestoreAbortHandler {}
 
 #[async_trait::async_trait]
 impl Operation for KmsRestoreAbortHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (audit, body) = authorize(req, kms_restore_actions(), KmsAdminOperation::RestoreAbort).await?;
         let request: KmsRestoreAbortRequest = parse_body(&body)?;
 
@@ -1144,7 +1137,7 @@ impl Operation for KmsRestoreAbortHandler {
         match execute_restore_abort(&context, &request).await {
             Ok(response) => {
                 finish(&audit, KmsAdminOperation::RestoreAbort, "restore_abort", None, None);
-                json_response(StatusCode::OK, &response)
+                owned_json_response(StatusCode::OK, &response)
             }
             Err(failure) => {
                 finish(&audit, KmsAdminOperation::RestoreAbort, "restore_abort", None, Some(&failure.1));
@@ -1159,11 +1152,11 @@ pub struct KmsBackupStatusHandler {}
 
 #[async_trait::async_trait]
 impl Operation for KmsBackupStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (audit, _body) = authorize(req, kms_backup_actions(), KmsAdminOperation::BackupStatus).await?;
         let response = backup_status().await;
         finish(&audit, KmsAdminOperation::BackupStatus, "backup_status", None, None);
-        json_response(StatusCode::OK, &response)
+        owned_json_response(StatusCode::OK, &response)
     }
 }
 

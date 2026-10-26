@@ -18,26 +18,21 @@
 //! keeping the response format explicitly NDJSON. It is not a Prometheus text
 //! exposition endpoint.
 
-use crate::admin::auth::authorize_admin_request;
-use crate::admin::router::Operation;
+use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::storage_api::access::spawn_traced;
 use crate::admin::storage_api::metrics::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::StatusCode;
 use matchit::Params;
 use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::utils::parse_duration;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Result, s3_error};
-use s3s::header::CONTENT_TYPE;
-use s3s::stream::{ByteStream, DynByteStream};
-use s3s::{Body, S3Request, S3Response, StdError};
+use rustfs_s3_types::{Body, S3Result, StdError, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Duration as StdDuration;
 use tokio::select;
 use tokio::sync::mpsc;
@@ -164,42 +159,27 @@ fn resolve_sample_count(mp: &MetricsParams) -> u64 {
     requested
 }
 
-struct MetricsStream {
-    inner: ReceiverStream<Result<Bytes, StdError>>,
-}
-
-impl Stream for MetricsStream {
-    type Item = Result<Bytes, StdError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = Pin::into_inner(self);
-        this.inner.poll_next_unpin(cx)
-    }
-}
-
-impl ByteStream for MetricsStream {}
-
 pub struct MetricsHandler {}
 
 /// The pre-check keeps this endpoint's historical `AccessDenied` missing-credentials
 /// response; the shared gate reports `InvalidRequest` "get cred failed".
-async fn authorize_metrics_request(req: &S3Request<Body>) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize_metrics_request(req: &AdminRequest) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(AccessDenied, "Signature is required"));
     }
 
-    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::GetMetricsAction)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::GetMetricsAction)]).await?;
     Ok(())
 }
 
 #[async_trait::async_trait]
 impl Operation for MetricsHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        debug!("handle MetricsHandler, uri: {:?}, params: {:?}", req.uri, params);
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        debug!("handle MetricsHandler, uri: {:?}, params: {:?}", req.uri(), params);
         authorize_metrics_request(&req).await?;
         debug!("validated console metrics admin authorization");
 
-        let mp = extract_metrics_init_params(&req.uri);
+        let mp = extract_metrics_init_params(req.uri());
         debug!("mp: {:?}", mp);
 
         let tick = parse_duration(&mp.tick).unwrap_or_else(|_| StdDuration::from_secs(3));
@@ -224,11 +204,8 @@ impl Operation for MetricsHandler {
             job_id: mp.by_job_id,
             dep_id: mp.by_dep_id,
         };
-        let (tx, rx) = mpsc::channel(10);
-        let in_stream: DynByteStream = Box::pin(MetricsStream {
-            inner: ReceiverStream::new(rx),
-        });
-        let body = Body::from(in_stream);
+        let (tx, rx) = mpsc::channel::<Result<Bytes, StdError>>(10);
+        let body = Body::from_stream(ReceiverStream::new(rx));
 
         spawn_traced(async move {
             while n > 0 {
@@ -271,7 +248,7 @@ impl Operation for MetricsHandler {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static(CONSOLE_METRICS_CONTENT_TYPE));
 
-        Ok(S3Response::with_headers((StatusCode::OK, body), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, body, header))
     }
 }
 
@@ -281,25 +258,20 @@ mod tests {
         CONSOLE_METRICS_CONTENT_TYPE, DEFAULT_METRICS_SAMPLES, MAX_METRICS_SAMPLES, MetricsHandler, extract_metrics_init_params,
         resolve_sample_count,
     };
-    use crate::admin::router::Operation;
+    use crate::admin::operation::AdminRequest;
+    use crate::admin::operation::Operation;
     use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
     use matchit::Params;
+    use rustfs_s3_types::Body;
     use rustfs_s3_types::S3ErrorCode;
-    use s3s::{Body, S3Request};
 
-    fn build_metrics_request(uri: &'static str) -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method: Method::GET,
-            uri: Uri::from_static(uri),
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn build_metrics_request(uri: &'static str) -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(Method::GET, Uri::from_static(uri))
+            .headers(HeaderMap::new())
+            .extensions(Extensions::new())
+            .body(Body::empty())
+            .build()
     }
 
     #[test]

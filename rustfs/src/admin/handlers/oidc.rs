@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::authorize_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::current_federated_identity_service;
 use crate::admin::service::federated_identity::DefaultFederatedSessionBinding;
 use crate::admin::service::oidc_config;
-use crate::admin::utils::json_response;
+use crate::admin::utils::owned_json_response;
 use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, console_prefix};
 use http::StatusCode;
 use hyper::Method;
@@ -26,8 +27,7 @@ use rustfs_config::{ENV_RUSTFS_BROWSER_REDIRECT_URL, MAX_ADMIN_REQUEST_BODY_SIZE
 use rustfs_iam::federation::{FederatedSessionBindingError, FederationError};
 use rustfs_iam::oidc::{OidcProviderConfigInput, OidcProviderValidationInput, console_session_duration_secs};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
-use s3s::{Body, S3Request, S3Response};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use time::OffsetDateTime;
@@ -204,17 +204,16 @@ pub struct ListOidcProvidersHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ListOidcProvidersHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, _req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let federation = current_federated_identity_service().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
         let providers = federation.list_visible_providers();
         let json_body = serde_json::to_vec(&providers)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
 
-        let mut resp = S3Response::new((StatusCode::OK, Body::from(json_body)));
-        resp.headers
-            .insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
-        Ok(resp)
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(json_body), headers))
     }
 }
 
@@ -222,7 +221,7 @@ pub struct GetOidcConfigHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetOidcConfigHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_oidc_config_request(&req, AdminAction::ServerInfoAdminAction).await?;
 
         let config = oidc_config::list_config().await.map_err(config_service_error)?;
@@ -255,7 +254,7 @@ impl Operation for GetOidcConfigHandler {
             })
             .collect();
 
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &OidcConfigListResponse {
                 providers,
@@ -269,7 +268,7 @@ pub struct PutOidcConfigHandler {}
 
 #[async_trait::async_trait]
 impl Operation for PutOidcConfigHandler {
-    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_oidc_config_request(&req, AdminAction::ConfigUpdateAdminAction).await?;
 
         let provider_id = params
@@ -283,7 +282,7 @@ impl Operation for PutOidcConfigHandler {
             .await
             .map_err(config_service_error)?;
 
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &OidcMutationResponse {
                 success: true,
@@ -298,7 +297,7 @@ pub struct DeleteOidcConfigHandler {}
 
 #[async_trait::async_trait]
 impl Operation for DeleteOidcConfigHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_oidc_config_request(&req, AdminAction::ConfigUpdateAdminAction).await?;
 
         let provider_id = params
@@ -308,7 +307,7 @@ impl Operation for DeleteOidcConfigHandler {
         let provider_id = provider_id.to_owned();
         oidc_config::delete_config(provider_id).await.map_err(config_service_error)?;
 
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &OidcMutationResponse {
                 success: true,
@@ -323,13 +322,13 @@ pub struct ValidateOidcConfigHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ValidateOidcConfigHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_oidc_config_request(&req, AdminAction::ServerInfoAdminAction).await?;
 
         let request: OidcProviderValidationInput = parse_json_body(&mut req).await?;
         let validation = oidc_config::validate_config(request).await.map_err(config_service_error)?;
 
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &OidcValidationResponse {
                 valid: true,
@@ -348,7 +347,7 @@ pub struct OidcAuthorizeHandler {}
 
 #[async_trait::async_trait]
 impl Operation for OidcAuthorizeHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let provider_id = params
             .get("provider_id")
             .ok_or_else(|| s3_error!(InvalidRequest, "missing provider_id"))?;
@@ -363,7 +362,7 @@ impl Operation for OidcAuthorizeHandler {
         let redirect_uri = derive_callback_uri(&req, provider_id)?;
 
         // Optional: redirect_after query parameter (must be a safe relative path)
-        let redirect_after = extract_safe_redirect_after(&req.uri)?;
+        let redirect_after = extract_safe_redirect_after(req.uri())?;
         let redirect_after_log = redirect_after.clone();
 
         let auth_url = federation
@@ -397,14 +396,14 @@ impl Operation for OidcAuthorizeHandler {
         );
 
         // Return 302 redirect
-        let mut resp = S3Response::new((StatusCode::FOUND, Body::empty()));
-        resp.headers.insert(
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
             http::header::LOCATION,
             auth_url
                 .parse()
                 .map_err(|_| s3_error!(InternalError, "failed to construct authorization URL"))?,
         );
-        Ok(resp)
+        Ok(AdminResponse::with_headers(StatusCode::FOUND, Body::empty(), headers))
     }
 }
 
@@ -414,7 +413,7 @@ pub struct OidcCallbackHandler {}
 
 #[async_trait::async_trait]
 impl Operation for OidcCallbackHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let provider_id = params
             .get("provider_id")
             .ok_or_else(|| s3_error!(InvalidRequest, "missing provider_id"))?;
@@ -424,7 +423,7 @@ impl Operation for OidcCallbackHandler {
         }
 
         // Check for error response from IdP
-        if let Some((error, desc)) = extract_idp_callback_error(&req.uri) {
+        if let Some((error, desc)) = extract_idp_callback_error(req.uri()) {
             warn!(
                 event = EVENT_ADMIN_OIDC_STATE,
                 component = LOG_COMPONENT_ADMIN,
@@ -443,9 +442,9 @@ impl Operation for OidcCallbackHandler {
 
         // Extract code and state from query parameters
         let code =
-            extract_query_param(&req.uri, "code").ok_or_else(|| s3_error!(InvalidRequest, "missing 'code' query parameter"))?;
-        let state =
-            extract_query_param(&req.uri, "state").ok_or_else(|| s3_error!(InvalidRequest, "missing 'state' query parameter"))?;
+            extract_query_param(req.uri(), "code").ok_or_else(|| s3_error!(InvalidRequest, "missing 'code' query parameter"))?;
+        let state = extract_query_param(req.uri(), "state")
+            .ok_or_else(|| s3_error!(InvalidRequest, "missing 'state' query parameter"))?;
 
         let federation = current_federated_identity_service().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
@@ -516,14 +515,14 @@ impl Operation for OidcCallbackHandler {
             Some(login.logout_token.as_str()),
         )?;
 
-        let mut resp = S3Response::new((StatusCode::FOUND, Body::empty()));
-        resp.headers.insert(
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
             http::header::LOCATION,
             console_redirect
                 .parse()
                 .map_err(|_| s3_error!(InternalError, "failed to construct console redirect URL"))?,
         );
-        Ok(resp)
+        Ok(AdminResponse::with_headers(StatusCode::FOUND, Body::empty(), headers))
     }
 }
 
@@ -534,9 +533,9 @@ pub struct OidcLogoutHandler {}
 
 #[async_trait::async_trait]
 impl Operation for OidcLogoutHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let fallback_location = build_console_login_redirect(&req)?;
-        let Some(logout_token) = extract_query_param(&req.uri, "logout_token") else {
+        let Some(logout_token) = extract_query_param(req.uri(), "logout_token") else {
             return redirect_response(&fallback_location);
         };
 
@@ -567,14 +566,14 @@ impl Operation for OidcLogoutHandler {
 /// Uses the provider's configured redirect_uri if set, otherwise derives dynamically
 /// from request headers. For production deployments behind a reverse proxy, configuring
 /// an explicit redirect_uri is recommended to prevent header manipulation.
-fn derive_callback_uri(req: &S3Request<Body>, provider_id: &str) -> S3Result<String> {
+fn derive_callback_uri(req: &AdminRequest, provider_id: &str) -> S3Result<String> {
     let policy = current_federated_identity_service().and_then(|federation| federation.redirect_policy(provider_id));
 
     derive_callback_uri_with_redirect_policy(req, provider_id, policy.as_ref())
 }
 
 fn derive_callback_uri_with_redirect_policy(
-    req: &S3Request<Body>,
+    req: &AdminRequest,
     provider_id: &str,
     policy: Option<&rustfs_iam::federation::FederatedRedirectPolicy>,
 ) -> S3Result<String> {
@@ -676,7 +675,7 @@ fn build_console_callback_fragment(
 
 /// Build the console redirect URL with STS credentials in the hash fragment.
 fn build_console_redirect(
-    req: &S3Request<Body>,
+    req: &AdminRequest,
     access_key: &str,
     secret_key: &str,
     session_token: &str,
@@ -699,7 +698,7 @@ fn build_console_redirect(
     Ok(format!("{scheme}://{host}{callback_path}#{fragment}"))
 }
 
-fn build_console_login_redirect(req: &S3Request<Body>) -> S3Result<String> {
+fn build_console_login_redirect(req: &AdminRequest) -> S3Result<String> {
     let console_prefix = console_prefix();
     let login_path = format!("{console_prefix}{CONSOLE_LOGIN_SUFFIX}");
     if let Some(url) = browser_redirect_url(&login_path)? {
@@ -711,31 +710,31 @@ fn build_console_login_redirect(req: &S3Request<Body>) -> S3Result<String> {
     Ok(format!("{scheme}://{host}{login_path}"))
 }
 
-fn redirect_response(location: &str) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let mut resp = S3Response::new((StatusCode::FOUND, Body::empty()));
-    resp.headers.insert(
+fn redirect_response(location: &str) -> S3Result<AdminResponse> {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
         http::header::LOCATION,
         location
             .parse()
             .map_err(|_| s3_error!(InternalError, "failed to construct redirect URL"))?,
     );
-    Ok(resp)
+    Ok(AdminResponse::with_headers(StatusCode::FOUND, Body::empty(), headers))
 }
 
 /// The pre-check keeps this endpoint family's historical missing-credentials
 /// message; the shared gate reports "get cred failed".
-async fn authorize_oidc_config_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize_oidc_config_request(req: &AdminRequest, action: AdminAction) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     }
 
-    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await?;
     Ok(())
 }
 
-async fn parse_json_body<T: DeserializeOwned>(req: &mut S3Request<Body>) -> S3Result<T> {
+async fn parse_json_body<T: DeserializeOwned>(req: &mut AdminRequest) -> S3Result<T> {
     let body = req
-        .input
+        .take_body()
         .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
         .await
         .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
@@ -747,15 +746,15 @@ async fn parse_json_body<T: DeserializeOwned>(req: &mut S3Request<Body>) -> S3Re
     serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))
 }
 
-fn extract_request_scheme(req: &S3Request<Body>) -> S3Result<String> {
+fn extract_request_scheme(req: &AdminRequest) -> S3Result<String> {
     let raw_scheme = req
-        .headers
+        .headers()
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         .map(|v| v.split(',').next().map(str::trim).unwrap_or(""))
         .filter(|v| !v.is_empty())
         .map(ToOwned::to_owned)
-        .or_else(|| req.uri.scheme_str().map(str::to_owned))
+        .or_else(|| req.uri().scheme_str().map(str::to_owned))
         .unwrap_or_else(|| "http".to_owned())
         .to_ascii_lowercase();
 
@@ -766,16 +765,16 @@ fn extract_request_scheme(req: &S3Request<Body>) -> S3Result<String> {
     Ok(raw_scheme)
 }
 
-fn extract_request_host(req: &S3Request<Body>) -> S3Result<String> {
+fn extract_request_host(req: &AdminRequest) -> S3Result<String> {
     let host = req
-        .headers
+        .headers()
         .get(http::header::HOST)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| {
             let v = v.trim();
             if v.is_empty() { None } else { Some(v.to_owned()) }
         })
-        .or_else(|| req.uri.authority().map(|a| a.as_str().to_owned()))
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_owned()))
         .ok_or_else(|| s3_error!(InvalidRequest, "cannot determine host for redirect URI"))?;
 
     parse_host_authority(&host)
@@ -908,17 +907,19 @@ mod tests {
                 for (hidden, complete) in [(true, false), (false, false), (false, true)] {
                     let document = serde_json::json!({"provider_id": "workload", "client_id": "rustfs-test", "issuer": base,
                         "config_url": format!("{base}{}/.well-known/openid-configuration", if complete { "/complete" } else { "" }), "hide_from_ui": hidden});
-                    let request = || {
-                        let mut req = build_oidc_request("/rustfs/admin/v3/oidc/validate", None, None);
-                        req.method = Method::POST;
-                        req.input = Body::from(document.to_string());
-                        req
+                    let request = |credentials: Option<(&str, &str)>| {
+                        let request = crate::admin::operation::test_support::TestRequest::new(Method::POST, "/rustfs/admin/v3/oidc/validate")
+                            .body(Body::from(document.to_string()));
+                        match credentials {
+                            Some((access_key, secret_key)) => request.credentials(access_key, secret_key, None),
+                            None => request,
+                        }
+                        .build()
                     };
-                    let denied = ValidateOidcConfigHandler {}.call(request(), Params::new()).await.unwrap_err();
+                    let denied = ValidateOidcConfigHandler {}.call(request(None), Params::new()).await.unwrap_err();
                     assert_eq!(denied.code(), &S3ErrorCode::InvalidRequest);
                     assert_eq!(denied.message(), Some("authentication required"));
-                    let mut req = request();
-                    req.credentials = Some(s3s::auth::Credentials { access_key: "OIDCVALIDATEROOT".into(), secret_key: "oidcValidateRootSecret123".into() });
+                    let req = request(Some(("OIDCVALIDATEROOT", "oidcValidateRootSecret123")));
                     let result = ValidateOidcConfigHandler {}.call(req, Params::new()).await;
                     if !hidden && !complete {
                         let err = result.unwrap_err();
@@ -926,7 +927,7 @@ mod tests {
                         assert!(err.message().unwrap().contains("authorization_endpoint"));
                         continue;
                     }
-                    let (status, body) = result.unwrap().output;
+                    let (status, _headers, body) = result.unwrap().into_parts();
                     assert_eq!(status, StatusCode::OK);
                     let body = body.collect().await.unwrap().to_bytes();
                     let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -945,11 +946,7 @@ mod tests {
         ).await;
     }
 
-    fn build_oidc_request(
-        uri: &'static str,
-        host: Option<&'static str>,
-        forwarded_proto: Option<&'static str>,
-    ) -> S3Request<Body> {
+    fn build_oidc_request(uri: &'static str, host: Option<&'static str>, forwarded_proto: Option<&'static str>) -> AdminRequest {
         let mut headers = HeaderMap::new();
         if let Some(host) = host {
             headers.insert(http::header::HOST, HeaderValue::from_static(host));
@@ -958,17 +955,11 @@ mod tests {
             headers.insert("x-forwarded-proto", HeaderValue::from_static(proto));
         }
 
-        S3Request {
-            input: Body::empty(),
-            method: Method::GET,
-            uri: Uri::from_static(uri),
-            headers,
-            extensions: Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+        crate::admin::operation::test_support::TestRequest::new(Method::GET, Uri::from_static(uri))
+            .headers(headers)
+            .extensions(Extensions::new())
+            .body(Body::empty())
+            .build()
     }
 
     fn test_redirect_policy(
@@ -1360,16 +1351,16 @@ mod tests {
             .0;
 
         assert_eq!(
-            wrapper.matches("authorize_admin_request(").count(),
+            wrapper.matches("authorize_admin_envelope(").count(),
             1,
             "the OIDC config gate must use exactly one shared gate"
         );
         assert!(
-            wrapper.contains("authorize_admin_request(req, vec![Action::AdminAction(action)])"),
+            wrapper.contains("authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)])"),
             "the OIDC config gate must forward its parameterized action unchanged"
         );
         assert!(
-            !wrapper.contains("let cred = authorize_admin_request("),
+            !wrapper.contains("let cred = authorize_admin_envelope("),
             "the OIDC config gate does not need the authenticated credentials"
         );
 
