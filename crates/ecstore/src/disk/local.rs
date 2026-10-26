@@ -115,7 +115,7 @@ use time::OffsetDateTime;
 use tokio::fs::{self, File};
 #[cfg(not(unix))]
 use tokio::io::AsyncReadExt;
-use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind, ReadBuf};
+use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, ErrorKind, ReadBuf};
 use tokio::sync::{Notify, RwLock, Semaphore};
 use tokio::time::{Instant, Sleep, interval_at, timeout};
 use tracing::{debug, error, info, warn};
@@ -9460,99 +9460,62 @@ impl LocalDisk {
             skip_parent
         };
 
-        match data {
-            InternalBuf::Ref(buf) => {
-                let mut f = self.open_file(file_path, O_CREATE | O_WRONLY | O_TRUNC, skip_parent).await?;
-                f.write_all(buf).await.map_err(to_file_error)?;
-                if sync != SyncMode::None {
-                    f.sync_data().await.map_err(to_file_error)?;
-                    // Persist the directory entry too, so a freshly created file
-                    // survives power loss along with its contents. Skipped for
-                    // FileOnly: the caller renames the file away immediately.
-                    if sync == SyncMode::FileAndDir
-                        && let Some(parent) = file_path.parent()
-                    {
-                        os::fsync_dir(parent).await.map_err(to_file_error)?;
-                    }
-                }
-            }
-            InternalBuf::Owned(buf) => {
-                let path = file_path.to_path_buf();
-                if let Some(parent) = path.parent()
-                    && parent != skip_parent
-                {
-                    os::make_dir_all(parent, skip_parent).await?;
-                }
-
-                let root = self.publication_root.clone();
-                let operation = move |is_cancelled: &dyn Fn() -> bool| {
-                    if is_cancelled() {
-                        return Err(std::io::Error::other("blocking namespace operation cancelled"));
-                    }
-                    #[cfg(test)]
-                    run_owned_file_write_before_open(&path);
-
-                    let (mut file, parent_handle) = if sync == SyncMode::FileAndDir {
-                        root.create_truncate_with_parent(&path)?
-                    } else {
-                        (root.create_truncate(&path)?, None)
-                    };
-                    std::io::Write::write_all(&mut file, buf.as_ref())?;
-                    if sync != SyncMode::None {
-                        file.sync_data()?;
-                        // FileOnly callers rename the file away, so the tmp
-                        // directory entry never needs to become durable.
-                        if sync == SyncMode::FileAndDir
-                            && let Some(parent) = path.parent()
-                        {
-                            os::fsync_directory_handle_std(parent, parent_handle.as_ref())?;
-                        }
-                    }
-                    Ok(())
-                };
-                let result = if sync == SyncMode::None {
-                    self.blocking_queue.run_cancellable(operation).await
-                } else {
-                    self.blocking_queue.run_fsync_cancellable(operation).await
-                };
-                result.map_err(to_file_error)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn open_file(&self, path: impl AsRef<Path>, mode: usize, skip_parent: impl AsRef<Path>) -> Result<File> {
-        let mut skip_parent = skip_parent.as_ref();
-        if skip_parent.as_os_str().is_empty() {
-            skip_parent = self.io_root();
-        }
-
-        if let Some(parent) = path.as_ref().parent()
-            && parent != skip_parent
-        {
-            os::make_dir_all(parent, skip_parent).await?;
-        }
-
-        let f = if mode == O_CREATE | O_WRONLY | O_TRUNC {
-            let path = path.as_ref().to_path_buf();
-            let root = self.publication_root.clone();
-            File::from_std(
-                self.blocking_queue
-                    .run_cancellable(move |is_cancelled| {
-                        if is_cancelled() {
-                            return Err(std::io::Error::other("blocking namespace operation cancelled"));
-                        }
-                        root.create_truncate(&path)
-                    })
-                    .await
-                    .map_err(to_file_error)?,
-            )
-        } else {
-            super::fs::open_file(path.as_ref(), mode).await.map_err(to_file_error)?
+        #[cfg(test)]
+        let is_owned = matches!(data, InternalBuf::Owned(_));
+        let buf = match data {
+            InternalBuf::Ref(slice) => Bytes::copy_from_slice(slice),
+            InternalBuf::Owned(bytes) => bytes,
         };
 
-        Ok(f)
+        let path = file_path.to_path_buf();
+        let create_parent = if let Some(parent) = path.parent()
+            && parent != skip_parent
+        {
+            os::check_path_length(parent.to_string_lossy().as_ref())?;
+            !(!skip_parent.as_os_str().is_empty() && skip_parent.starts_with(parent))
+        } else {
+            false
+        };
+
+        let root = self.publication_root.clone();
+        let operation = move |is_cancelled: &dyn Fn() -> bool| {
+            if is_cancelled() {
+                return Err(std::io::Error::other("blocking namespace operation cancelled"));
+            }
+            if create_parent && let Some(parent) = path.parent() {
+                super::fs::create_dir_all_std(parent)?;
+            }
+            #[cfg(test)]
+            if is_owned {
+                run_owned_file_write_before_open(&path);
+            }
+
+            let (mut file, parent_handle) = if sync == SyncMode::FileAndDir {
+                root.create_truncate_with_parent(&path)?
+            } else {
+                (root.create_truncate(&path)?, None)
+            };
+            std::io::Write::write_all(&mut file, buf.as_ref())?;
+            if sync != SyncMode::None {
+                file.sync_data()?;
+                // FileOnly callers rename the file away, so the tmp
+                // directory entry never needs to become durable.
+                if sync == SyncMode::FileAndDir
+                    && let Some(parent) = path.parent()
+                {
+                    os::fsync_directory_handle_std(parent, parent_handle.as_ref())?;
+                }
+            }
+            Ok(())
+        };
+        let result = if sync == SyncMode::None {
+            self.blocking_queue.run_cancellable(operation).await
+        } else {
+            self.blocking_queue.run_fsync_cancellable(operation).await
+        };
+        result.map_err(to_file_error)?;
+
+        Ok(())
     }
 
     #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
@@ -10514,10 +10477,11 @@ async fn read_file_all(path: impl AsRef<Path>, root: &os::PublicationRoot) -> Re
     let root = root.clone();
     tokio::task::spawn_blocking(move || {
         let result = (|| {
-            let mut file = root.open_readonly(&path)?;
+            let file = root.open_readonly(&path)?;
             let metadata = file.metadata()?;
-            let mut data = Vec::new();
-            std::io::Read::read_to_end(&mut file, &mut data)?;
+            let size = usize::try_from(metadata.len()).map_err(std::io::Error::other)?;
+            let mut data = Vec::with_capacity(size.saturating_add(1));
+            std::io::Read::read_to_end(&mut std::io::Read::take(file, metadata.len()), &mut data)?;
             Ok::<_, std::io::Error>((Bytes::from(data), metadata))
         })();
         result
@@ -12475,12 +12439,12 @@ impl DiskAPI for LocalDisk {
         let src_volume_dir = self.io_get_bucket_path(src_volume)?;
         let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
         if !skip_access_checks(src_volume) {
-            access(&src_volume_dir)
+            cached_access(&src_volume_dir)
                 .await
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
         if !skip_access_checks(dst_volume) {
-            access(&dst_volume_dir)
+            cached_access(&dst_volume_dir)
                 .await
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
@@ -12559,7 +12523,7 @@ impl DiskAPI for LocalDisk {
         if !origvolume.is_empty() {
             let origvolume_dir = self.io_get_bucket_path(origvolume)?;
             if !skip_access_checks(origvolume) {
-                access(origvolume_dir)
+                cached_access(origvolume_dir)
                     .await
                     .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
             }
@@ -13189,7 +13153,7 @@ impl DiskAPI for LocalDisk {
         if !org_volume.is_empty() {
             let org_volume_path = self.io_get_bucket_path(org_volume)?;
             if !skip_access_checks(org_volume) {
-                access(&org_volume_path)
+                cached_access(&org_volume_path)
                     .await
                     .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
             }
