@@ -1004,14 +1004,14 @@ async fn phase_quorum_matrix(
                 } else {
                     None
                 };
-                let mut abort_records = Vec::new();
+                let mut abort_roots = Vec::new();
                 if committed.is_some() {
                     for directory in cluster.nodes.iter().flat_map(|node| &node.data_dirs) {
-                        let root = std::path::Path::new(directory).join(".rustfs.sys/multipart").join(&scope);
-                        let metadata = tokio::fs::read(root.join("xl.meta")).await?;
-                        abort_records.push((root, metadata));
+                        let root = Path::new(directory).join(RUSTFS_META_MULTIPART_BUCKET).join(&scope);
+                        assert!(root.join("xl.meta").try_exists()?, "each native participant must have its original head");
+                        abort_roots.push(root);
                     }
-                    assert_eq!(abort_records.len(), 4 * drives_per_node);
+                    assert_eq!(abort_roots.len(), 4 * drives_per_node);
                 }
                 match phase {
                     "part" => {
@@ -1088,53 +1088,31 @@ async fn phase_quorum_matrix(
                 // A rejected Complete must retain authority for ordinary
                 // Abort. NoSuchUpload must not hide partial staging loss.
                 let allow_missing = phase != "complete" || unavailable == unavailable_at_quorum;
-                if !abort_records.is_empty() {
-                    let retained = abort_records.iter().map(|(root, _)| root.exists()).collect::<Vec<_>>();
-                    let survivors = retained.iter().filter(|present| **present).count();
-                    assert_eq!(survivors, abort_records.len() - available_votes, "the scoped Delete fault must be real");
-                    for (root, metadata) in &abort_records {
-                        if root.exists() {
-                            assert_eq!(tokio::fs::read(root.join("xl.meta")).await?, *metadata);
-                        }
+                if !abort_roots.is_empty() {
+                    let survivors = abort_roots.iter().filter(|root| root.exists()).count();
+                    assert_eq!(
+                        survivors,
+                        abort_roots.len() - available_votes,
+                        "the scoped DeleteAborted fault must be real"
+                    );
+                    // Every native participant closed and persisted the full-N
+                    // certificate before this exact DeleteAborted fault. The
+                    // surviving roots have retired their ACTIVE heads; their
+                    // certificate authorizes retry below metadata read quorum.
+                    // Uncertified legacy authority has a separate regression.
+                    for root in abort_roots.iter().filter(|root| root.exists()) {
+                        assert!(!root.join("xl.meta").try_exists()?, "certified Abort must retire each surviving head");
                     }
-                    let identity_quorum = abort_records.len() / 2;
-                    if survivors < identity_quorum {
-                        // Even a successful quorum Abort can leave a minority
-                        // on an unavailable peer. Without identity quorum, a
-                        // later coordinator must refuse rather than infer GC.
-                        let observers = proxies
-                            .iter()
-                            .map(|proxy| proxy.pause(&["Delete"], usize::MAX, Some(&scope)))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        let refused = clients[2]
-                            .abort_multipart_upload()
-                            .bucket(bucket)
-                            .key(&key)
-                            .upload_id(upload_id)
-                            .send()
-                            .await
-                            .expect_err("minority authority must not become cleanup success or NoSuchUpload");
-                        assert_unavailable(&refused, "storage_write_quorum", None);
-                        let delete_calls = observers.iter().map(RpcPause::hits).sum::<usize>();
-                        assert_eq!(delete_calls, 0, "uncertain authority cannot authorize further root deletion");
-                        drop(observers);
-                        for ((root, metadata), present) in abort_records.iter().zip(&retained) {
-                            assert_eq!(root.exists(), *present, "retry must preserve each surviving authority location");
-                            if *present {
-                                assert_eq!(tokio::fs::read(root.join("xl.meta")).await?, *metadata);
-                            }
-                        }
-                        eprintln!(
-                            "MPU Abort boundary: deleted={available_votes}, survivors={survivors}, identity_quorum={identity_quorum}, retry_delete_calls={delete_calls}"
-                        );
-                    } else {
-                        abort_after_fault(&clients[0], bucket, &key, upload_id, allow_missing).await?;
-                        assert!(abort_records.iter().all(|(root, _)| !root.exists()));
-                    }
+                    abort_after_fault(&clients[0], bucket, &key, upload_id, false).await?;
+                    assert!(abort_roots.iter().all(|root| !root.exists()));
                     for reader in clients {
                         assert_object_bytes(reader, bucket, &key, committed.as_ref().expect("Abort fixture has an old object"))
                             .await?;
                     }
+                    eprintln!(
+                        "MPU native Abort boundary: closure_members={}, deleted={available_votes}, survivors={survivors}, retry_cleanup=true",
+                        abort_roots.len()
+                    );
                 } else {
                     abort_after_fault(&clients[0], bucket, &key, upload_id, allow_missing).await?;
                 }
