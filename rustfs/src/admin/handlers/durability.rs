@@ -21,19 +21,18 @@
 //! can never carry an override. See docs/operations/durability-modes.md.
 
 use crate::admin::auth::validate_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::current_notification_system;
 use crate::admin::storage_api::bucket::durability::BucketDurabilityConfig;
 use crate::admin::storage_api::bucket::metadata::BUCKET_DURABILITY_CONFIG;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::ADMIN_PREFIX;
-use crate::server::RemoteAddr;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Result, s3_error};
-use s3s::{Body, S3Request, S3Response};
+use rustfs_s3_types::{Body, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -121,16 +120,17 @@ fn notify_peers_reload(bucket: String, operation: &'static str) {
     });
 }
 
-async fn authenticate_admin(req: &S3Request<Body>) -> S3Result<()> {
-    let Some(ref cred) = req.credentials else {
+async fn authenticate_admin(req: &AdminRequest) -> S3Result<()> {
+    let Some(cred) = req.credentials() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
 
-    let (cred, owner) = check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+    let (cred, owner) =
+        check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+    let remote_addr = req.remote_addr();
     validate_admin_request(
-        &req.headers,
+        req.headers(),
         &cred,
         owner,
         false,
@@ -150,16 +150,16 @@ fn bucket_from_params(params: &Params<'_, '_>) -> S3Result<String> {
     Ok(bucket)
 }
 
-fn durability_response(bucket: String, mode: Option<String>) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn durability_response(bucket: String, mode: Option<String>) -> S3Result<AdminResponse> {
     let response = BucketDurabilityResponse { bucket, mode };
     let json = serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
-    Ok(S3Response::new((StatusCode::OK, Body::from(json))))
+    Ok(AdminResponse::new(StatusCode::OK, Body::from(json)))
 }
 
 #[async_trait::async_trait]
 impl Operation for SetBucketDurabilityHandler {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authenticate_admin(&req).await?;
 
         let bucket = bucket_from_params(&params)?;
@@ -168,7 +168,7 @@ impl Operation for SetBucketDurabilityHandler {
             .map_err(|e| s3_error!(InternalError, "failed to capture bucket incarnation: {}", e))?;
 
         let body = req
-            .input
+            .take_body()
             .store_all_limited(rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
@@ -203,7 +203,7 @@ impl Operation for SetBucketDurabilityHandler {
 #[async_trait::async_trait]
 impl Operation for GetBucketDurabilityHandler {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authenticate_admin(&req).await?;
 
         let bucket = bucket_from_params(&params)?;
@@ -220,7 +220,7 @@ impl Operation for GetBucketDurabilityHandler {
 #[async_trait::async_trait]
 impl Operation for DeleteBucketDurabilityHandler {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authenticate_admin(&req).await?;
 
         let bucket = bucket_from_params(&params)?;

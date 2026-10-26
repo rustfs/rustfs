@@ -12,28 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::{
-    auth::authorize_admin_request,
+    auth::authorize_admin_envelope,
     handlers::audit_runtime_config::{load_server_config_from_store, remove_audit_target_config, set_audit_target_config},
     handlers::notify_runtime_access::{
         load_notification_config_snapshot, remove_notification_target_config, set_notification_target_config,
     },
     handlers::target_descriptor::{
         AdminTargetSpec, RuntimeHealthStatus, TargetEndpointSource, TargetInstanceReadModel, admin_target_spec_from_builtin,
-        build_enabled_target_kvs, build_json_response, collect_runtime_statuses, collect_target_instances, find_target_instance,
-        target_module_disabled_reason, target_mutation_block_reason as shared_target_mutation_block_reason,
+        build_enabled_target_kvs, collect_runtime_statuses, collect_target_instances, find_target_instance,
+        owned_build_json_response, target_module_disabled_reason,
+        target_mutation_block_reason as shared_target_mutation_block_reason,
     },
     plugin_contract::{
         PluginContractDomain, PluginInstanceDetail, PluginInstanceDiagnostic, PluginInstanceDiagnosticCode,
         PluginInstanceDiagnosticCount, PluginInstanceEntry, PluginInstanceSource, PluginInstancesResponse,
     },
-    router::{AdminOperation, Operation, S3Router},
+    router::{AdminOperation, S3Router},
 };
 use crate::server::{
     ADMIN_PREFIX, is_audit_module_enabled, is_notify_module_enabled, refresh_audit_module_enabled, refresh_notify_module_enabled,
     refresh_persisted_module_switches_from_store,
 };
-use hyper::{Method, StatusCode};
+use hyper::{Method, StatusCode, Uri};
 use matchit::Params;
 use rustfs_audit::audit_system;
 use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
@@ -41,10 +43,9 @@ use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{AUDIT_DEFAULT_DIR, EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Result, s3_error};
 use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, builtin_notify_target_admin_descriptors};
 use rustfs_targets::{builtin_target_plugin_operational_state, runtime_state_from_status_label};
-use s3s::{Body, S3Request, S3Response};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 use tracing::warn;
@@ -332,10 +333,10 @@ pub(super) struct PluginInstanceFilters {
     marker: Option<String>,
 }
 
-pub(super) fn extract_plugin_instance_filters(req: &S3Request<Body>) -> S3Result<PluginInstanceFilters> {
+pub(super) fn extract_plugin_instance_filters(uri: &Uri) -> S3Result<PluginInstanceFilters> {
     let mut filters = PluginInstanceFilters::default();
 
-    if let Some(query) = req.uri.query() {
+    if let Some(query) = uri.query() {
         for (key, value) in form_urlencoded::parse(query.as_bytes()) {
             let value = value.trim();
             if value.is_empty() {
@@ -565,23 +566,23 @@ fn plugin_instance_matches_query(instance: &PluginInstanceEntry, query: &str) ->
 
 /// The pre-check keeps this endpoint's historical missing-credentials message;
 /// the shared gate reports "get cred failed".
-async fn authorize_plugin_instance_request(req: &S3Request<Body>) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize_plugin_instance_request(req: &AdminRequest) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     }
 
-    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::GetBucketTargetAction)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::GetBucketTargetAction)]).await?;
     Ok(())
 }
 
 /// The pre-check keeps this endpoint's historical missing-credentials message;
 /// the shared gate reports "get cred failed".
-async fn authorize_plugin_instance_write_request(req: &S3Request<Body>) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize_plugin_instance_write_request(req: &AdminRequest) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     }
 
-    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::SetBucketTargetAction)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::SetBucketTargetAction)]).await?;
     Ok(())
 }
 
@@ -712,9 +713,9 @@ pub struct ListPluginInstancesHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ListPluginInstancesHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_plugin_instance_request(&req).await?;
-        let filters = extract_plugin_instance_filters(&req)?;
+        let filters = extract_plugin_instance_filters(req.uri())?;
         let instances = filter_plugin_instances(collect_all_instances().await?, &filters);
         let diagnostic_counts = collect_diagnostic_counts(&instances);
         let (instances, truncated, next_marker) = paginate_plugin_instances(instances, &filters)?;
@@ -725,7 +726,11 @@ impl Operation for ListPluginInstancesHandler {
             next_marker,
         })
         .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
-        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::from(data),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
@@ -733,7 +738,7 @@ pub struct GetPluginInstanceHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetPluginInstanceHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_plugin_instance_request(&req).await?;
         let instance_id = params
             .get("id")
@@ -746,7 +751,11 @@ impl Operation for GetPluginInstanceHandler {
 
         let data = serde_json::to_vec(&plugin_instance_detail(instance))
             .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
-        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::from(data),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
@@ -754,7 +763,7 @@ pub struct PutPluginInstanceHandler {}
 
 #[async_trait::async_trait]
 impl Operation for PutPluginInstanceHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_plugin_instance_write_request(&req).await?;
         let instance_id = params
             .get("id")
@@ -767,7 +776,7 @@ impl Operation for PutPluginInstanceHandler {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
-        let mut input = req.input;
+        let mut input = req.take_body();
         let body_bytes = input
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
@@ -806,7 +815,11 @@ impl Operation for PutPluginInstanceHandler {
 
         set_plugin_instance_config(context, &resolved, kvs).await?;
 
-        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::empty(),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
@@ -814,7 +827,7 @@ pub struct DeletePluginInstanceHandler {}
 
 #[async_trait::async_trait]
 impl Operation for DeletePluginInstanceHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_plugin_instance_write_request(&req).await?;
         let instance_id = params
             .get("id")
@@ -840,7 +853,11 @@ impl Operation for DeletePluginInstanceHandler {
 
         remove_plugin_instance_config(context, &resolved).await?;
 
-        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::empty(),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
@@ -856,6 +873,7 @@ mod tests {
         RuntimeHealthStatus, TargetEndpointSource, TargetInstanceReadModel, canonical_target_instance_id,
         collect_target_instances,
     };
+    use crate::admin::operation::AdminRequest;
     use crate::admin::plugin_contract::{
         PluginInstanceDiagnosticCode, PluginInstanceDiagnosticCount, PluginInstanceEntry, PluginInstanceSource,
     };
@@ -866,8 +884,8 @@ mod tests {
     use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
     use rustfs_config::server_config::{Config, KV, KVS};
     use rustfs_config::{ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT};
+    use rustfs_s3_types::Body;
     use rustfs_targets::TargetDomain;
-    use s3s::{Body, S3Request};
     use std::collections::HashMap;
 
     fn enabled_kvs(value: &str) -> KVS {
@@ -931,16 +949,12 @@ mod tests {
     /// message these endpoints have always returned (rustfs/backlog#1829).
     #[tokio::test]
     async fn plugin_instance_gates_keep_their_missing_credentials_message() {
-        let credential_less_request = || S3Request {
-            input: Body::from(String::new()),
-            method: Method::GET,
-            uri: Uri::from_static("/rustfs/admin/v4/plugins/instances"),
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
+        let credential_less_request = || {
+            crate::admin::operation::test_support::TestRequest::new(Method::GET, "/rustfs/admin/v4/plugins/instances")
+                .headers(HeaderMap::new())
+                .extensions(Extensions::new())
+                .body(Body::from(String::new()))
+                .build()
         };
 
         for err in [
@@ -1266,7 +1280,7 @@ mod tests {
             "/rustfs/admin/v4/plugins/instances?domain=notify&service=webhook&status=offline&source=env&diagnostic_code=not_loaded_in_runtime&enabled=true&q=Primary&limit=25&marker=builtin:webhook:notify:seed",
         );
 
-        let filters = extract_plugin_instance_filters(&req).expect("query should parse");
+        let filters = extract_plugin_instance_filters(req.uri()).expect("query should parse");
         assert_eq!(
             filters,
             PluginInstanceFilters {
@@ -1775,18 +1789,12 @@ mod tests {
         }
     }
 
-    fn build_plugin_instances_request(uri: &'static str) -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method: Method::GET,
-            uri: Uri::from_static(uri),
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn build_plugin_instances_request(uri: &'static str) -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(Method::GET, Uri::from_static(uri))
+            .headers(HeaderMap::new())
+            .extensions(Extensions::new())
+            .body(Body::empty())
+            .build()
     }
 
     fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {

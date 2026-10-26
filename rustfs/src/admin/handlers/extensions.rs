@@ -238,7 +238,7 @@ pub struct ListExtensionInstancesHandler {}
 impl Operation for ListExtensionInstancesHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_extension_instance_request(&req).await?;
-        let filters = plugins_instances::extract_plugin_instance_filters(&req)?;
+        let filters = plugins_instances::extract_plugin_instance_filters(&req.uri)?;
         let instances = plugins_instances::filter_plugin_instances(plugins_instances::collect_all_instances().await?, &filters);
         let diagnostic_counts = plugins_instances::collect_diagnostic_counts(&instances);
         let (instances, truncated, next_marker) = plugins_instances::paginate_plugin_instances(instances, &filters)?;

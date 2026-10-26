@@ -188,13 +188,6 @@ impl RequestEnvelope {
         &self.uri
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "URI-mutating admin handlers move to the envelope in later T1.12 slices"
-        )
-    )]
     pub(crate) fn uri_mut(&mut self) -> &mut Uri {
         &mut self.uri
     }

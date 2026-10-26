@@ -36,13 +36,6 @@ impl AdminRequest {
         &self.envelope
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-        )
-    )]
     pub(crate) fn envelope_mut(&mut self) -> &mut RequestEnvelope {
         &mut self.envelope
     }
@@ -83,58 +76,23 @@ impl AdminRequest {
         self.envelope.remote_addr()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-        )
-    )]
     pub(crate) fn client_info(&self) -> Option<&ClientInfo> {
         self.envelope.client_info()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-        )
-    )]
     pub(crate) fn request_context(&self) -> Option<&RequestContext> {
         self.envelope.request_context()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-        )
-    )]
     pub(crate) fn req_info(&self) -> Option<&ReqInfo> {
         self.envelope.req_info()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-        )
-    )]
     pub(crate) fn req_info_mut(&mut self) -> Option<&mut ReqInfo> {
         self.envelope.req_info_mut()
     }
 
     /// Attaches the authorization-phase request info, returning any it replaces.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-        )
-    )]
     pub(crate) fn install_req_info(&mut self, req_info: ReqInfo) -> Option<ReqInfo> {
         self.envelope.install_req_info(req_info)
     }
