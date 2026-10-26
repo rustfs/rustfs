@@ -5629,8 +5629,9 @@ mod test {
     #[test]
     #[serial_test::serial]
     fn list_objects_quorum_from_env_honors_supported_value() {
-        temp_env::with_var(ENV_API_LIST_OBJECTS_QUORUM, Some("strict"), || {
-            assert_eq!(list_objects_quorum_from_env(), "strict");
+        // Use a non-default value so the assertion proves the variable is read.
+        temp_env::with_var(ENV_API_LIST_OBJECTS_QUORUM, Some("optimal"), || {
+            assert_eq!(list_objects_quorum_from_env(), "optimal");
         });
     }
 
