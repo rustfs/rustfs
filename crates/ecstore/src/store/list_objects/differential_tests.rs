@@ -14,14 +14,14 @@
 
 use super::*;
 use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
-use crate::disk::STORAGE_FORMAT_FILE;
+use crate::disk::{DiskAPI, STORAGE_FORMAT_FILE, WalkDirOptions};
 use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
 use bytes::Bytes;
-use rustfs_filemeta::{FileInfo, ObjectPartInfo};
+use rustfs_filemeta::{FileInfo, MetacacheReader, ObjectPartInfo};
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncWrite, DuplexStream};
+use tokio::io::{AsyncWrite, DuplexStream, duplex};
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
@@ -466,6 +466,50 @@ async fn list_objects_shared_corpus_offline_corrupt_and_minority_stale() {
     };
     fixture.write_metadata(3, &phantom).await;
     fixture.assert_walk("", None, None, 3).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn list_objects_shared_corpus_quorum_delete_leaves_no_resurrectable_stale_copy() {
+    let mut fixture = Fixture::new("list-corpus-stale-copies", namespace(&shared_keys()), true).await;
+    // A delete that reached write quorum (three of four drives) leaves one
+    // stale copy, the most any quorum delete can leave on this set.
+    let deleted = ["a0", "z"];
+    for key in deleted {
+        let physical_key = rustfs_utils::path::encode_dir_object(key);
+        for dir in fixture.dirs.iter().take(3) {
+            tokio::fs::remove_dir_all(dir.path().join(&fixture.bucket).join(&physical_key))
+                .await
+                .expect("quorum delete fixture should remove the object directory");
+        }
+    }
+    fixture.objects.retain(|object| !deleted.contains(&object.key.as_str()));
+
+    temp_env::async_with_vars([(ENV_API_LIST_OBJECTS_QUORUM, Some("strict"))], async {
+        for max in [1, 3, 1000] {
+            fixture.assert_walk("", None, None, max).await;
+            fixture.assert_walk("", Some("/"), None, max).await;
+        }
+    })
+    .await;
+
+    // A sampling mode promises only that no committed key goes missing.
+    temp_env::async_with_vars([(ENV_API_LIST_OBJECTS_QUORUM, Some("optimal"))], async {
+        let mut listed = Vec::new();
+        let mut marker = None;
+        for _ in 0..=fixture.objects.len() + deleted.len() {
+            let page = fixture.page("", marker.clone(), None, 3).await;
+            listed.extend(page.objects.into_iter().map(|object| object.name));
+            if !page.is_truncated {
+                break;
+            }
+            marker = page.next_marker;
+        }
+        for object in &fixture.objects {
+            assert!(listed.contains(&object.key), "optimal LIST lost committed key {}", object.key);
+        }
+    })
+    .await;
 }
 
 #[tokio::test]

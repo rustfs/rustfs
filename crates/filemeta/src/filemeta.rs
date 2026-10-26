@@ -155,7 +155,6 @@ pub fn is_skip_meta_key(key: &str) -> bool {
 }
 
 mod codec;
-pub(crate) use codec::{BorrowedFileMeta, reconcile_headers};
 mod inline_data;
 pub(crate) mod msgp_decode;
 mod validation;
