@@ -14,7 +14,7 @@
 
 use futures::future::BoxFuture;
 use hashbrown::HashSet as HbHashSet;
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE};
 use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{
     AMQP_QUEUE_DIR, ENABLE_KEY, EnableState, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_TOPIC, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS,
@@ -36,7 +36,6 @@ use rustfs_targets::{
     target::{TargetType, mqtt::MQTTTlsConfig},
 };
 use rustfs_utils::egress::OutboundPolicy;
-use s3s::{Body, S3Response, header::CONTENT_TYPE};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
@@ -288,27 +287,9 @@ pub(crate) fn target_module_disabled_reason(module_name: &str, env_key: &str, en
     })
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "kept for the legacy/owned equivalence test until the legacy admin response helpers retire in T1.12 (rustfs/backlog#2788)"
-    )
-)]
-pub(crate) fn build_json_response(
-    status: StatusCode,
-    body: Body,
-    request_id: Option<&HeaderValue>,
-) -> S3Response<(StatusCode, Body)> {
-    let mut header = HeaderMap::new();
-    header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    if let Some(v) = request_id {
-        header.insert("x-request-id", v.clone());
-    }
-    S3Response::with_headers((status, body), header)
-}
-
-/// Owned-boundary form of [`build_json_response`].
+/// Wrap an already-serialized JSON `body` as an admin response: `Content-Type:
+/// application/json`, plus the caller's `x-request-id` echoed back when the
+/// request carried one.
 pub(crate) fn owned_build_json_response(
     status: StatusCode,
     body: rustfs_s3_types::Body,
@@ -1007,23 +988,23 @@ mod webhook_request_tests {
 
 #[cfg(test)]
 mod owned_response_tests {
-    use super::{build_json_response, owned_build_json_response};
+    use super::owned_build_json_response;
 
     #[tokio::test]
-    async fn owned_build_json_response_matches_the_legacy_shape() {
+    async fn owned_build_json_response_sets_json_content_type_and_echoes_the_request_id() {
         let request_id = http::HeaderValue::from_static("req-42");
         for id in [None, Some(&request_id)] {
-            let mut legacy = build_json_response(http::StatusCode::ACCEPTED, s3s::Body::from(b"{\"ok\":true}".to_vec()), id);
             let (status, headers, mut body) =
                 owned_build_json_response(http::StatusCode::ACCEPTED, rustfs_s3_types::Body::from("{\"ok\":true}"), id)
                     .into_parts();
-            assert_eq!(status, legacy.output.0);
-            assert_eq!(headers, legacy.headers);
-            assert_eq!(headers.get("x-request-id"), id);
+            assert_eq!(status, http::StatusCode::ACCEPTED);
             assert_eq!(
-                body.store_all_limited(64).await.expect("owned body reads"),
-                legacy.output.1.store_all_limited(64).await.expect("legacy body reads")
+                headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                Some("application/json")
             );
+            assert_eq!(headers.get("x-request-id"), id);
+            assert_eq!(headers.len(), 1 + usize::from(id.is_some()));
+            assert_eq!(body.store_all_limited(64).await.expect("body reads").as_ref(), b"{\"ok\":true}");
         }
     }
 }
