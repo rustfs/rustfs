@@ -352,6 +352,19 @@ mod tests {
         pollster::block_on(resource.is_match(object, &HashMap::new()))
     }
 
+    #[test_case("arn:aws:s3:::mybucket/${jwt:preferred_username}/*", "mybucket/alice/photo.jpg" => true; "jwt variable")]
+    #[test_case("arn:aws:s3:::mybucket/${jwt:preferred_username}/*", "mybucket/bob/photo.jpg" => false; "jwt variable other user")]
+    #[test_case("arn:aws:s3:::mybucket/${ldap:username}/*", "mybucket/alice-ldap/photo.jpg" => true; "ldap variable")]
+    fn test_resource_is_match_substitutes_condition_variables(resource: &str, object: &str) -> bool {
+        let resource: Resource = resource.try_into().unwrap();
+        let conditions = HashMap::from([
+            ("preferred_username".to_string(), vec!["alice".to_string()]),
+            ("username".to_string(), vec!["alice-ldap".to_string()]),
+        ]);
+
+        pollster::block_on(resource.is_match(object, &conditions))
+    }
+
     #[test]
     fn test_wildcard_resource_serialization_round_trip() {
         use crate::policy::resource::ResourceSet;

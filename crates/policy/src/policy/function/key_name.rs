@@ -139,15 +139,9 @@ impl KeyName {
         Self::COMMON_KEYS.iter().filter(|k| k.is_server_derived()).map(|k| k.name())
     }
 
+    /// Returns the policy variable form of the key, e.g. `${jwt:sub}`.
     pub fn var_name(&self) -> String {
-        match self {
-            KeyName::Aws(s) => format!("${{aws:{}}}", Into::<&str>::into(s)),
-            KeyName::Jwt(s) => format!("${{jwt:{}}}", Into::<&str>::into(s)),
-            KeyName::Ldap(s) => format!("${{ldap:{}}}", Into::<&str>::into(s)),
-            KeyName::Sts(s) => format!("${{sts:{}}}", Into::<&str>::into(s)),
-            KeyName::Svc(s) => format!("${{svc:{}}}", Into::<&str>::into(s)),
-            KeyName::S3(s) => format!("${{s3:{}}}", Into::<&str>::into(s)),
-        }
+        format!("${{{}}}", Into::<&str>::into(self))
     }
 }
 
@@ -412,6 +406,14 @@ mod tests {
             serde_json::to_string(&key).expect("condition key should serialize"),
             "\"s3:ObjectCreationOperation\""
         );
+    }
+
+    #[test_case(KeyName::Aws(AwsKeyName::AWSSourceIP), "${aws:SourceIp}")]
+    #[test_case(KeyName::Jwt(JwtKeyName::JWTPrefUsername), "${jwt:preferred_username}")]
+    #[test_case(KeyName::Ldap(LdapKeyName::Username), "${ldap:username}")]
+    #[test_case(KeyName::S3(S3KeyName::S3LocationConstraint), "${s3:LocationConstraint}")]
+    fn var_name_matches_policy_variable_syntax(key: KeyName, expected: &str) {
+        assert_eq!(key.var_name(), expected);
     }
 
     #[test_case("s3:x-amz-copy-source", KeyName::S3(S3KeyName::S3XAmzCopySource))]
