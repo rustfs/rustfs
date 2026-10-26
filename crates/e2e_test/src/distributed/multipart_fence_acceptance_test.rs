@@ -35,6 +35,7 @@ const DEADLINE: Duration = Duration::from_secs(45);
 async fn fixture(
     drives_per_node: usize,
     storage_class: &str,
+    lock_diagnostics: bool,
 ) -> TestResult<(RustFSTestClusterEnvironment, Vec<RpcFaultProxy>, Vec<Client>, String)> {
     let mut cluster =
         RustFSTestClusterEnvironment::with_topology(ClusterTopology::single_pool_multidrive(4, drives_per_node)).await?;
@@ -53,6 +54,13 @@ async fn fixture(
         ("RUST_LOG", "warn"),
     ] {
         cluster.set_env(name, value);
+    }
+    if lock_diagnostics {
+        cluster.set_env(
+            "RUST_LOG",
+            "warn,rustfs_lock::distributed_lock=debug,rustfs_ecstore::object_lock_diag=trace,rustfs_ecstore::cluster::rpc::remote_locker=info",
+        );
+        cluster.set_env("RUSTFS_OBJECT_LOCK_DIAG_ENABLE", "true");
     }
     let mut proxies = Vec::new();
     for node in 0..4 {
@@ -316,26 +324,120 @@ fn upload_path_scope(bucket: &str, key: &str, upload_id: &str) -> TestResult<Str
     ))
 }
 
-async fn with_paused_peers<T: Send + 'static>(
+async fn with_paused_peers<T, E>(
     proxies: &[RpcFaultProxy],
     methods: &[&'static str],
     limits: &[usize],
     scope: &str,
-    request: impl std::future::Future<Output = T> + Send + 'static,
-) -> TestResult<T> {
+    request: impl std::future::Future<Output = Result<T, SdkError<E>>> + Send + 'static,
+) -> TestResult<Result<T, SdkError<E>>>
+where
+    T: Send + 'static,
+    E: std::error::Error + ProvideErrorMetadata + Send + Sync + 'static,
+{
+    let deadline = tokio::time::Instant::now() + DEADLINE;
     let pauses: Vec<_> = proxies[1..=limits.len()]
         .iter()
         .zip(limits)
         .map(|(proxy, limit)| proxy.pause(methods, *limit, Some(scope)))
         .collect::<Result<_, _>>()?;
-    let task = tokio::spawn(request);
-    wait_for_faults(&pauses, methods).await?;
-    let result = tokio::time::timeout(DEADLINE, task).await??;
+    let mut task = tokio::spawn(request);
+    let mut joined = None;
+    let mut deadline_expired = false;
+    let mut barrier_result = {
+        let faults = wait_for_faults(&pauses, methods);
+        tokio::pin!(faults);
+        match tokio::time::timeout_at(deadline, async {
+            tokio::select! {
+                result = &mut faults => result,
+                result = &mut task => {
+                    joined = Some(result);
+                    // A ready request is not evidence that every selected fault
+                    // was reached. Poll the original barrier once for that proof.
+                    match futures::poll!(faults.as_mut()) {
+                        std::task::Poll::Ready(result) => result,
+                        std::task::Poll::Pending => Err("SDK request completed before the selected RPC fault barrier".into()),
+                    }
+                }
+            }
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                deadline_expired = true;
+                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, error).into())
+            }
+        }
+    };
+    // Tokio's timeout polls an already-ready inner future before its timer.
+    // A late observation cannot certify the original absolute deadline.
+    deadline_expired |= tokio::time::Instant::now() >= deadline;
+    if deadline_expired {
+        barrier_result = Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "selected RPC fault proof observed after the absolute MPU deadline",
+        )
+        .into());
+    }
+    if barrier_result.is_err() {
+        for pause in &pauses {
+            pause.discard_pending();
+        }
+    }
+    let mut client_task_aborted = false;
+    let request_result = match joined {
+        Some(result) => result,
+        None => match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(result) => result,
+            Err(error) => {
+                deadline_expired = true;
+                for pause in &pauses {
+                    pause.discard_pending();
+                }
+                barrier_result = Err(std::io::Error::new(std::io::ErrorKind::TimedOut, error).into());
+                // This owns only the test's SDK request, not server/native work.
+                // Retire the client task without granting another operation budget.
+                client_task_aborted = true;
+                task.abort();
+                task.await
+            }
+        },
+    };
+    deadline_expired |= tokio::time::Instant::now() >= deadline;
+    if deadline_expired {
+        barrier_result = Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "SDK request result observed after the absolute MPU deadline",
+        )
+        .into());
+    }
+    let hits: Vec<_> = pauses.iter().map(RpcPause::hits).collect();
     for pause in &pauses {
         pause.discard_pending();
     }
     drop(pauses);
-    Ok(result)
+    if barrier_result.is_err() {
+        let sdk_error = request_result.as_ref().ok().and_then(|result| result.as_ref().err());
+        let response = sdk_error.and_then(SdkError::raw_response);
+        eprintln!(
+            "MPU fault barrier failed: methods={methods:?}, hits={hits:?}, client_task_aborted={client_task_aborted}, deadline_expired={deadline_expired}, sdk_code={:?}, cause={:?}, request_id={:?}",
+            sdk_error
+                .and_then(|error| error.as_service_error())
+                .and_then(|error| error.meta().code()),
+            response.and_then(|response| response.headers().get("x-rustfs-error-cause")),
+            response.and_then(|response| response.headers().get("x-amz-request-id")),
+        );
+    }
+    match (barrier_result, request_result) {
+        // Preserve the actual SDK source instead of replacing an early service
+        // failure with an unrelated fault-wait timeout. The outer Err stays red.
+        (Err(_), Ok(Err(error))) => Err(Box::new(error)),
+        (Err(_), Err(error)) if !client_task_aborted => Err(Box::new(error)),
+        (Err(error), _) => Err(error),
+        (Ok(()), Ok(result)) => Ok(result),
+        (Ok(()), Err(error)) => Err(Box::new(error)),
+    }
 }
 
 fn quorum_outcome<T: std::fmt::Debug, E: std::fmt::Debug + ProvideErrorMetadata>(
@@ -583,19 +685,19 @@ async fn phase_quorum_matrix(
 
 #[tokio::test]
 async fn metadata_delay_preserves_write_quorum_and_rejects_quorum_minus_one() -> TestResult {
-    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2", true).await?;
     phase_quorum_matrix(&proxies, &clients, &bucket, false, 1).await
 }
 
 #[tokio::test]
 async fn lock_delay_preserves_admission_quorum_and_reports_timeout() -> TestResult {
-    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2", false).await?;
     phase_quorum_matrix(&proxies, &clients, &bucket, true, 1).await
 }
 
 #[tokio::test]
 async fn sixteen_shard_multipart_metadata_requires_twelve_votes() -> TestResult {
-    let (cluster, proxies, clients, bucket) = fixture(4, "EC:4").await?;
+    let (cluster, proxies, clients, bucket) = fixture(4, "EC:4", false).await?;
     let storage = cluster_admin_ok(&cluster, http::Method::GET, "/rustfs/admin/v3/storageinfo", None).await?;
     let storage: serde_json::Value = serde_json::from_str(&storage)?;
     let storage: rustfs_madmin::StorageInfo = serde_json::from_value(storage["info"].clone())?;
@@ -608,7 +710,7 @@ async fn sixteen_shard_multipart_metadata_requires_twelve_votes() -> TestResult 
 
 #[tokio::test]
 async fn cancelled_metadata_wait_releases_fence_for_bucket_recreation() -> TestResult {
-    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2", false).await?;
     let pauses: Vec<_> = proxies[1..]
         .iter()
         .map(|proxy| proxy.pause(&["WriteMetadata"], usize::MAX, Some(&bucket)))
@@ -734,7 +836,7 @@ async fn resume_at_rpc<T: Send + 'static>(
 
 #[tokio::test]
 async fn each_multipart_phase_resumes_after_metadata_and_lock_delays() -> TestResult {
-    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2", false).await?;
     for locks in [false, true] {
         let key = format!("phase-{locks}");
         let client = clients[0].clone();
