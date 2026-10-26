@@ -11314,13 +11314,7 @@ mod tests {
         let marker = marker
             .as_deref()
             .expect("production checkpoint should persist an object marker");
-        let marker_suffix = marker
-            .strip_prefix(&expected_marker)
-            .expect("production checkpoint should stop at the first page boundary");
-        assert!(
-            marker_suffix.is_empty() || marker_suffix.starts_with("[rustfs_cache:v2,"),
-            "unexpected production checkpoint marker suffix: {marker_suffix}"
-        );
+        assert_eq!(marker, expected_marker, "production checkpoint should stop at the first page boundary");
         assert_eq!(version_marker.as_deref(), Some("null"));
     }
 
