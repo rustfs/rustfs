@@ -1087,9 +1087,8 @@ trace_hot_spans=(
   "crates/ecstore/src/store/mod.rs:list_objects_v2"
   # The ECStore handle_list_objects_v2 forwarder was folded into the trait impl
   # above, so store/mod.rs now carries this hot path's TRACE requirement
-  # directly (backlog#1821).
-  "crates/ecstore/src/core/sets.rs:list_objects_v2"
-  "crates/ecstore/src/set_disk/ops/list.rs:list_objects_v2"
+  # directly (backlog#1821). Sets and SetDisks no longer paginate; ECStore is
+  # the only listing entry point.
   "rustfs/src/app/bucket_usecase.rs:execute_list_objects_v2"
   "rustfs/src/app/object:execute_get_object"
 )
