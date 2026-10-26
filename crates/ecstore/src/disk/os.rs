@@ -92,9 +92,6 @@ pub(crate) mod fsync_dir_recorder {
     static LIMITED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static GROUPED: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
     #[cfg(unix)]
-    static FAILURES: std::sync::LazyLock<Mutex<HashMap<PathBuf, io::ErrorKind>>> =
-        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-    #[cfg(unix)]
     static BEFORE_LIMITED: std::sync::LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
         std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
     static BEFORE_GROUP_BATCH: std::sync::LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
@@ -156,15 +153,12 @@ pub(crate) mod fsync_dir_recorder {
 
     #[cfg(unix)]
     pub(crate) fn set_failure(dir: &Path, kind: io::ErrorKind) {
-        FAILURES
-            .lock()
-            .expect("fsync dir failure hook poisoned")
-            .insert(dir.to_path_buf(), kind);
+        super::dir_fsync_failures::set(dir, kind);
     }
 
     #[cfg(unix)]
     pub(crate) fn take_failure(dir: &Path) -> Option<io::ErrorKind> {
-        remove_path_keyed(&FAILURES, dir, "fsync dir failure hook poisoned")
+        super::dir_fsync_failures::take(dir)
     }
 
     #[cfg(unix)]
@@ -261,6 +255,49 @@ pub(crate) mod fsync_dir_recorder {
     pub(crate) fn take_grouped_failure(dir: &Path) -> Option<io::ErrorKind> {
         remove_path_keyed(&GROUPED_FAILURES, dir, "grouped fsync failure hook poisoned")
     }
+}
+
+#[cfg(all(any(test, feature = "test-util"), unix))]
+mod dir_fsync_failures {
+    use super::*;
+
+    static FAILURES: LazyLock<Mutex<HashMap<PathBuf, io::ErrorKind>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) fn set(dir: &Path, kind: io::ErrorKind) {
+        FAILURES.lock().insert(dir.to_path_buf(), kind);
+    }
+
+    pub(super) fn take(dir: &Path) -> Option<io::ErrorKind> {
+        let mut failures = FAILURES.lock();
+        if failures.is_empty() {
+            return None;
+        }
+        if let Some(kind) = failures.remove(dir) {
+            return Some(kind);
+        }
+        let canonical = dir.canonicalize().ok();
+        let matching_key = failures
+            .keys()
+            .find(|registered| {
+                registered.as_path() == dir
+                    || canonical.as_ref().is_some_and(|canonical| *registered == canonical)
+                    || registered.canonicalize().ok().is_some_and(|registered_canonical| {
+                        registered_canonical == dir || canonical.as_ref() == Some(&registered_canonical)
+                    })
+            })
+            .cloned();
+        matching_key.and_then(|key| failures.remove(&key))
+    }
+}
+
+/// Inject one error at the real directory-fsync boundary for a local path.
+#[cfg(all(feature = "test-util", unix))]
+pub fn set_local_dir_fsync_failure(disk: &crate::disk::Disk, volume: &str, path: &str, kind: io::ErrorKind) -> Result<()> {
+    let path = disk
+        .get_object_path_for_io_if_local(volume, path)
+        .ok_or(DiskError::DiskNotFound)??;
+    dir_fsync_failures::set(&path, kind);
+    Ok(())
 }
 
 /// Pause a real namespace mutation inside its physical executor.
@@ -500,8 +537,8 @@ pub(crate) fn fsync_directory_handle_std(dir: &Path, opened: Option<&std::fs::Fi
     fsync_dir_recorder::record(dir);
     #[cfg(unix)]
     {
-        #[cfg(test)]
-        if let Some(kind) = fsync_dir_recorder::take_failure(dir) {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(kind) = dir_fsync_failures::take(dir) {
             return Err(io::Error::from(kind));
         }
         match opened {

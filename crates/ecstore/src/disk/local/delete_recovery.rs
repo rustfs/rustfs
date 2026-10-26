@@ -2715,6 +2715,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_recovery_known_heal_backup_inspection_preserves_unproven_owners_after_reopen() {
+        for change in [
+            "unchanged",
+            "generation",
+            "tier-object",
+            "tier-version",
+            "missing-free-owner",
+            "replaced-backup",
+        ] {
+            let (_temp, disk, mut info, _) = fixture().await;
+            info.metadata.insert("etag".to_owned(), "same-visible-etag".to_owned());
+            info.set_object_transaction_epoch(Uuid::new_v4());
+            let free_id = Uuid::new_v4();
+            info.set_tier_free_version_id(&free_id.to_string());
+            let mut remote = test_file_info("object", Uuid::nil(), Some(Uuid::new_v4()), None);
+            remote.mod_time = info.mod_time;
+            remote.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_owned();
+            remote.transition_tier = "WARM".to_owned();
+            remote.transitioned_objname = "remote/original".to_owned();
+            remote.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
+            remote.transition_version = Some("original-provider-version".to_owned());
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut remote.metadata,
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                "ab".repeat(32),
+            );
+            let metadata = |remote: FileInfo, current: FileInfo| {
+                let mut meta = FileMeta::new();
+                meta.add_version(remote).expect("seed transitioned predecessor");
+                meta.add_version(current)
+                    .expect("commit local replacement and its free-version owner");
+                meta
+            };
+            let original = metadata(remote.clone(), info.clone());
+            let (_, free) = original.find_version(Some(free_id)).expect("original free-version owner");
+            assert!(free.free_version(), "fixture must retain a separate remote cleanup owner");
+            let backup_bytes = original.marshal_msg().expect("encode historical backup");
+            let transaction = inline_metadata_rollback_dir(Uuid::nil(), &original);
+            let root = disk.io_get_object_path("recovery", "object").expect("object path");
+            let backup_path = root.join(transaction.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+            fs::create_dir_all(backup_path.parent().expect("backup parent"))
+                .await
+                .expect("create backup directory");
+            fs::write(&backup_path, &backup_bytes)
+                .await
+                .expect("retain historical backup");
+
+            let mut current = info.clone();
+            match change {
+                "generation" => current.set_object_transaction_epoch(Uuid::new_v4()),
+                "tier-object" => remote.transitioned_objname = "remote/successor".to_owned(),
+                "tier-version" => remote.transition_version = Some("successor-provider-version".to_owned()),
+                _ => {}
+            }
+            let mut current_meta = metadata(remote, current);
+            if change == "missing-free-owner" {
+                current_meta
+                    .versions
+                    .retain(|version| version.header.version_id != Some(free_id));
+            } else if change == "replaced-backup" {
+                let replacement = root.join("replacement-backup");
+                fs::write(&replacement, &backup_bytes).await.expect("write replacement inode");
+                fs::rename(replacement, &backup_path)
+                    .await
+                    .expect("replace backup without changing its bytes");
+            }
+            let current_bytes = current_meta.marshal_msg().expect("encode current metadata");
+            fs::write(root.join(STORAGE_FORMAT_FILE), &current_bytes)
+                .await
+                .expect("publish readable current object");
+            let visible = disk
+                .read_version(
+                    "",
+                    "recovery",
+                    "object",
+                    "",
+                    &ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("current object remains physically readable");
+            assert_eq!(visible.data, info.data, "{change}: current payload");
+            assert_eq!(visible.mod_time, info.mod_time, "{change}: unchanged modification time");
+            assert_eq!(visible.metadata.get("etag"), info.metadata.get("etag"), "{change}: unchanged ETag");
+
+            let before = disk
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .expect("query known backup without inferring commit authority");
+            let endpoint = disk.endpoint();
+            drop(disk);
+            let reopened = LocalDisk::new(&endpoint, false).await.expect("reopen original disk endpoint");
+            // Linux I/O paths belong to the open disk's mount descriptor.
+            let root = reopened
+                .io_get_object_path("recovery", "object")
+                .expect("reopened object path");
+            let backup_path = root.join(transaction.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+            let after = reopened
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .expect("known historical backup remains queryable after reopen");
+            assert_eq!(after, before, "{change}: inspection must preserve the complete evidence snapshot");
+            assert!(after.journal.is_none(), "{change}: no historical success or delete authority exists");
+            assert_eq!(after.backup_digest, Some(digest(&backup_bytes)), "{change}: retained C-class evidence");
+            assert!(!after.explicit_delete_safe, "{change}: current data forbids legacy discard");
+            let expected_state = if matches!(change, "unchanged" | "replaced-backup") {
+                DeleteRecoveryState::Absent
+            } else {
+                DeleteRecoveryState::LegacyAmbiguous
+            };
+            assert_eq!(
+                after.state, expected_state,
+                "{change}: delete-owner semantics remain separate from C classification"
+            );
+            let page = reopened
+                .discover_delete_transactions("recovery", Some("object"), None, 128)
+                .await
+                .expect("discover only delete-recovery work");
+            assert_eq!(
+                page.transactions.iter().any(|id| id.transaction == transaction),
+                expected_state == DeleteRecoveryState::LegacyAmbiguous,
+                "{change}: a live backup must not become a delete blocker"
+            );
+            assert_eq!(fs::read(&backup_path).await.expect("retained backup bytes"), backup_bytes, "{change}");
+            assert_eq!(
+                fs::read(root.join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("retained current bytes"),
+                current_bytes,
+                "{change}"
+            );
+            let backup = FileMeta::load(&backup_bytes).expect("decode retained owner evidence");
+            assert_eq!(
+                backup.find_version(Some(free_id)).expect("retained free-version owner").1,
+                free,
+                "{change}: ordinary-object readability cannot release remote ownership"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn delete_recovery_live_external_backup_rejects_partial_version_delete() {
         let (_temp, disk, mut info, _) = fixture().await;
         let root = disk.io_get_object_path("recovery", "object").unwrap();
