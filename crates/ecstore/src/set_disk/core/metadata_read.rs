@@ -36,13 +36,12 @@ use crate::disk::{
     self, BATCH_READ_VERSION_MAX_ITEMS, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp, Disk, DiskAPI,
 };
 use crate::set_disk::{
-    DiskError, DiskStore, FileInfo, HashAlgorithm, ReadOptions, SetDisks, build_inline_bitrot_readers_from_refs,
-    can_try_inline_data_shards_direct, codec_streaming_rollout_applies, coding,
-    collect_inline_data_shard_fileinfos_from_observations, file_info_is_valid_for_metadata, get_metadata_slowtail_fault_request,
-    inline_erasure_shard_file_offset, inline_erasure_shard_size, is_get_metadata_data_read_early_stop_enabled,
-    is_get_metadata_early_stop_bounded_fanout_enabled, is_get_metadata_early_stop_enabled,
-    is_get_metadata_non_inline_data_read_early_stop_enabled, is_version_early_stop_enabled, object_fits_single_block,
-    try_read_inline_data_shards_direct,
+    DiskError, DiskStore, FileInfo, HashAlgorithm, ReadOptions, SetDisks, can_try_inline_data_shards_direct,
+    codec_streaming_rollout_applies, collect_inline_data_shard_fileinfos_from_observations, file_info_is_valid_for_metadata,
+    get_metadata_slowtail_fault_request, inline_erasure_shard_file_offset, inline_erasure_shard_size,
+    is_get_metadata_data_read_early_stop_enabled, is_get_metadata_early_stop_bounded_fanout_enabled,
+    is_get_metadata_early_stop_enabled, is_get_metadata_non_inline_data_read_early_stop_enabled, is_version_early_stop_enabled,
+    object_fits_single_block,
 };
 use futures::future::join_all;
 use metrics::counter;
@@ -125,6 +124,7 @@ fn metadata_metrics_path(bucket: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub(super) fn metadata_distribution_key(bucket: &str, object: &str) -> String {
     [bucket, object].join("/")
 }
@@ -449,36 +449,16 @@ pub(in crate::set_disk) fn bounded_metadata_fanout_order(
     total_disks: usize,
     default_parity_count: usize,
 ) -> Vec<usize> {
-    let fallback_order = || (0..total_disks).collect::<Vec<_>>();
     if default_parity_count == 0 || default_parity_count >= total_disks {
-        return fallback_order();
+        return (0..total_disks).collect();
     }
 
     let data_blocks = total_disks - default_parity_count;
-    let distribution_key = metadata_distribution_key(bucket, object);
-    let distribution = FileInfo::new(&distribution_key, data_blocks, default_parity_count)
-        .erasure
-        .distribution;
-    if distribution.len() != total_disks {
-        return fallback_order();
-    }
-
+    let start = FileInfo::distribution_start(bucket, object, total_disks);
+    let offset = (start + 1) % total_disks;
     let mut order = Vec::with_capacity(total_disks);
-    for block_index in 1..=data_blocks {
-        let Some(disk_index) = distribution
-            .iter()
-            .position(|distributed_block| *distributed_block == block_index)
-        else {
-            return fallback_order();
-        };
-        order.push(disk_index);
-    }
-    order.extend(
-        distribution
-            .iter()
-            .enumerate()
-            .filter_map(|(disk_index, block_index)| (*block_index > data_blocks).then_some(disk_index)),
-    );
+    order.extend((0..data_blocks).map(|i| (total_disks + i - offset) % total_disks));
+    order.extend((0..total_disks).filter(|&disk_index| (start + disk_index + 1) % total_disks >= data_blocks));
     order
 }
 
@@ -597,6 +577,9 @@ impl MetadataFanoutDiagnostics {
     }
 
     pub(in crate::set_disk) fn record(&self, path: &'static str) {
+        if !rustfs_io_metrics::get_stage_metrics_enabled() {
+            return;
+        }
         rustfs_io_metrics::record_get_object_metadata_fanout_duration(path, self.fanout_duration.as_secs_f64());
         if let Some(latency) = self.first_response_latency() {
             rustfs_io_metrics::record_get_object_first_metadata_response_latency(path, latency.as_secs_f64());
@@ -620,6 +603,9 @@ impl MetadataFanoutDiagnostics {
     }
 
     pub(in crate::set_disk) fn record_quorum_candidate_latency(&self, path: &'static str, read_quorum: usize) {
+        if !rustfs_io_metrics::get_stage_metrics_enabled() {
+            return;
+        }
         if let Some(latency) = self.quorum_candidate_latency(read_quorum) {
             rustfs_io_metrics::record_get_object_metadata_quorum_result(path, "reached");
             rustfs_io_metrics::record_get_object_quorum_reached_latency(path, latency.as_secs_f64());
@@ -629,15 +615,14 @@ impl MetadataFanoutDiagnostics {
 
 #[cfg(test)]
 pub(in crate::set_disk) async fn data_read_early_stop_inline_body_miss_reason(
-    bucket: &str,
-    object: &str,
+    _bucket: &str,
+    _object: &str,
     candidate: &FileInfo,
     parts_metadata: &[FileInfo],
     disks: &[Option<DiskStore>],
 ) -> Option<&'static str> {
     verify_inline_body_from_observations(
-        bucket,
-        object,
+        _object,
         candidate,
         parts_metadata
             .iter()
@@ -645,13 +630,11 @@ pub(in crate::set_disk) async fn data_read_early_stop_inline_body_miss_reason(
             .map(|(index, metadata)| (index, Some(metadata))),
         disks,
     )
-    .await
     .err()
 }
 
-async fn verify_inline_body_from_observations<'a>(
-    bucket: &str,
-    object: &str,
+fn verify_inline_body_from_observations<'a>(
+    _object: &str,
     candidate: &FileInfo,
     observations: impl IntoIterator<Item = (usize, Option<&'a FileInfo>)>,
     disks: &[Option<DiskStore>],
@@ -660,21 +643,18 @@ async fn verify_inline_body_from_observations<'a>(
         return Err(reason);
     }
 
-    let Ok(erasure) = coding::Erasure::try_new_with_options(
-        candidate.erasure.data_blocks,
-        candidate.erasure.parity_blocks,
-        candidate.erasure.block_size,
-        candidate.uses_legacy_checksum,
-    ) else {
+    let data_shards = candidate.erasure.data_blocks;
+    if data_shards == 0
+        || candidate.erasure.block_size == 0
+        || (candidate.erasure.parity_blocks > 0
+            && candidate.uses_legacy_checksum
+            && !reed_solomon_simd::ReedSolomonEncoder::supports(data_shards, candidate.erasure.parity_blocks))
+    {
         return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY);
-    };
-    let data_files =
-        match collect_inline_data_shard_fileinfos_from_observations(observations, candidate, erasure.data_shards, |index| {
-            disks.get(index).is_some_and(Option::is_some)
-        }) {
-            Ok(data_files) => data_files,
-            Err(reason) => return Err(reason),
-        };
+    }
+    let data_files = collect_inline_data_shard_fileinfos_from_observations(observations, candidate, data_shards, |index| {
+        disks.get(index).is_some_and(Option::is_some)
+    })?;
 
     let Some(part) = candidate.parts.first() else {
         return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE);
@@ -693,22 +673,51 @@ async fn verify_inline_body_from_observations<'a>(
         object_size,
         object_size,
         candidate.erasure.block_size,
-        erasure.data_shards,
+        data_shards,
         candidate.uses_legacy_checksum,
     );
-    let shard_size = inline_erasure_shard_size(candidate.erasure.block_size, erasure.data_shards, candidate.uses_legacy_checksum);
-    let Ok(mut readers) =
-        build_inline_bitrot_readers_from_refs(&data_files, bucket, object, read_length, shard_size, &checksum_algo, false).await
-    else {
+    let shard_size = inline_erasure_shard_size(candidate.erasure.block_size, data_shards, candidate.uses_legacy_checksum);
+    if object_size == 0 || read_length == 0 || read_length > shard_size || data_files.len() < data_shards {
+        return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
+    }
+    let shards_needed = object_size.div_ceil(read_length);
+    if shards_needed > data_shards {
+        return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
+    }
+    let Some(encoded_capacity) = read_length.checked_mul(shards_needed) else {
         return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
     };
-
     #[cfg(test)]
-    crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
-    match try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size).await {
-        Some(body) if body.len() == object_size => Ok(body),
-        _ => Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY),
+    {
+        for file in &data_files {
+            if file.data.is_some() {
+                crate::set_disk::disk_call_counters::record_shard_open(_object, true);
+            }
+        }
+        crate::set_disk::disk_call_counters::record(_object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
     }
+
+    let hash_size = checksum_algo.size();
+    let need = hash_size + read_length;
+    let mut body = Vec::with_capacity(encoded_capacity);
+    for file in data_files.iter().take(shards_needed) {
+        let Some(raw) = file.data.as_deref() else {
+            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
+        };
+        let Some(block) = raw.get(..need) else {
+            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
+        };
+        let (hash, data) = block.split_at(hash_size);
+        if hash_size > 0 && checksum_algo.hash_encode(data).as_ref() != hash {
+            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
+        }
+        body.extend_from_slice(data);
+        if body.len() >= object_size {
+            body.truncate(object_size);
+            return Ok(bytes::Bytes::from(body));
+        }
+    }
+    Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY)
 }
 
 fn data_read_early_stop_inline_candidate_miss_reason(candidate: &FileInfo) -> Option<&'static str> {
@@ -786,16 +795,18 @@ fn data_read_inline_missing_shards_are_pending(
     fanout_order: &[usize],
     scheduled_fanout_len: usize,
 ) -> bool {
-    let Ok(erasure) = coding::Erasure::try_new_with_options(
-        candidate.erasure.data_blocks,
-        candidate.erasure.parity_blocks,
-        candidate.erasure.block_size,
-        candidate.uses_legacy_checksum,
-    ) else {
+    let data_shards = candidate.erasure.data_blocks;
+    if data_shards == 0
+        || candidate.erasure.block_size == 0
+        || !candidate.has_valid_erasure_geometry()
+        || (candidate.erasure.parity_blocks > 0
+            && candidate.uses_legacy_checksum
+            && !reed_solomon_simd::ReedSolomonEncoder::supports(data_shards, candidate.erasure.parity_blocks))
+    {
         return false;
-    };
+    }
     let distribution = &candidate.erasure.distribution;
-    let mut data_shards_seen_or_pending = vec![false; erasure.data_shards];
+    let mut data_shards_seen_or_pending = vec![false; data_shards];
     let mut missing_pending_data_shards = 0usize;
 
     for slot in slots {
@@ -803,7 +814,7 @@ fn data_read_inline_missing_shards_are_pending(
         let Some(&block_index) = distribution.get(disk_index) else {
             return false;
         };
-        if block_index == 0 || block_index > erasure.data_shards {
+        if block_index == 0 || block_index > data_shards {
             continue;
         }
         if !disks.get(disk_index).is_some_and(Option::is_some) {
@@ -1170,7 +1181,8 @@ impl SetDisks {
         default_parity_count: usize,
         allow_coalescing: bool,
     ) -> disk::error::Result<MetadataReadResult> {
-        let fanout_start = Instant::now();
+        let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+        let fanout_start = stage_metrics_enabled.then(Instant::now);
         let mut slots = MetadataReadResult::pending(disks.len());
         let mut task_ids = vec![None; disks.len()];
         let mut observations = Vec::with_capacity(disks.len());
@@ -1220,7 +1232,7 @@ impl SetDisks {
             let diagnostic_context = diagnostic_context;
             let task = join_set.spawn(async move {
                 let read = async move {
-                    let response_start = Instant::now();
+                    let response_start = stage_metrics_enabled.then(Instant::now);
                     let result = if let Some(disk) = disk {
                         #[cfg(test)]
                         let _fanout_task_guard = rename_fanout_barrier::task_guard(&object);
@@ -1243,7 +1255,7 @@ impl SetDisks {
                     } else {
                         Err(DiskError::DiskNotFound)
                     };
-                    (index, result, response_start.elapsed())
+                    (index, result, response_start.map_or(Duration::ZERO, |s| s.elapsed()))
                 };
                 #[cfg(feature = "diagnostic-read-version-caller")]
                 return crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
@@ -1348,7 +1360,10 @@ impl SetDisks {
                 },
                 Err(join_error) => {
                     let err = DiskError::Unexpected;
-                    observations.push(MetadataFanoutObservation::from_error(&err, fanout_start.elapsed()));
+                    observations.push(MetadataFanoutObservation::from_error(
+                        &err,
+                        fanout_start.map_or(Duration::ZERO, |s| s.elapsed()),
+                    ));
                     if let Some(index) = task_ids.iter().position(|id| *id == Some(join_error.id())) {
                         slots[index].result = Some(Err(err));
                         accumulator.observe(&slots[index]);
@@ -1384,14 +1399,11 @@ impl SetDisks {
                             accumulator.candidate_has_read_reserve()
                         }
                         Some(candidate) => match verify_inline_body_from_observations(
-                            bucket.as_ref(),
                             object.as_ref(),
                             candidate,
                             slots.iter().map(|slot| (slot.disk_index, slot.file_info())),
                             disks,
-                        )
-                        .await
-                        {
+                        ) {
                             Ok(body) => {
                                 verified_inline_body = Some(body);
                                 true
@@ -1449,7 +1461,8 @@ impl SetDisks {
                         scheduled_count.saturating_sub(cancelled_count),
                         cancelled_count,
                     );
-                    let diagnostics = MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations);
+                    let diagnostics =
+                        MetadataFanoutDiagnostics::new(fanout_start.map_or(Duration::ZERO, |s| s.elapsed()), observations);
                     return Ok(MetadataReadResult {
                         slots,
                         diagnostics,
@@ -1532,7 +1545,7 @@ impl SetDisks {
         rustfs_io_metrics::record_get_object_metadata_early_stop_miss(metrics_path, final_miss_reason);
         rustfs_io_metrics::record_get_object_metadata_early_stop_saved_responses(metrics_path, 0);
         rustfs_io_metrics::record_get_object_metadata_fanout_lifecycle(metrics_path, scheduled_count, scheduled_count, 0);
-        let diagnostics = MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations);
+        let diagnostics = MetadataFanoutDiagnostics::new(fanout_start.map_or(Duration::ZERO, |s| s.elapsed()), observations);
         Ok(MetadataReadResult {
             slots,
             diagnostics,
