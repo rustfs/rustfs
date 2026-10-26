@@ -52,6 +52,10 @@ pub fn check_path_length(path_name: &str) -> Result<()> {
         return Err(DiskError::FileAccessDenied);
     }
 
+    if path_name.len() <= 255 {
+        return Ok(());
+    }
+
     // Check each path segment length is > 255 on all Unix
     // platforms, look for this value as NAME_MAX in
     // /usr/include/linux/limits.h

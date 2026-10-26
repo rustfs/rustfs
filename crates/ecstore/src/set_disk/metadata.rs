@@ -275,6 +275,22 @@ impl SetDisks {
 
     pub(super) fn common_parity(parities: &[i32], default_parity_count: i32) -> i32 {
         let n = parities.len() as i32;
+        let mut valid_parities = parities.iter().copied().filter(|&p| p != -1);
+        let Some(first_parity) = valid_parities.next() else {
+            return -1;
+        };
+        let mut same_count = 1i32;
+        if valid_parities.all(|p| {
+            same_count += 1;
+            p == first_parity
+        }) {
+            let read_quorum = if default_parity_count > 0 && first_parity == 0 {
+                n / 2 + 1
+            } else {
+                n - first_parity
+            };
+            return if same_count >= read_quorum { first_parity } else { -1 };
+        }
 
         let mut occ_map: HashMap<i32, i32> = HashMap::new();
         for &p in parities {
@@ -333,6 +349,19 @@ impl SetDisks {
     }
 
     pub(super) fn common_time_and_occurrence(times: &[Option<OffsetDateTime>]) -> (Option<OffsetDateTime>, usize) {
+        let mut valid_times = times.iter().flatten().copied();
+        let Some(first_time) = valid_times.next() else {
+            return (None, 0);
+        };
+        let mut count = 1usize;
+        if valid_times.all(|t| {
+            count += 1;
+            t == first_time
+        }) && first_time.unix_timestamp_nanos() != 0
+        {
+            return (Some(first_time), count);
+        }
+
         let mut time_occurrence_map = HashMap::new();
 
         // Ignore the uuid sentinel and count the rest.
@@ -597,6 +626,25 @@ impl SetDisks {
 
         if !has_read_error {
             return write_quorum;
+        }
+
+        if let Some((first, _)) = parts_metadata
+            .iter()
+            .zip(errs.iter())
+            .find(|(meta, err)| err.is_none() && file_info_is_valid_for_metadata(meta))
+        {
+            let same_count = parts_metadata
+                .iter()
+                .zip(errs.iter())
+                .filter(|(meta, err)| {
+                    err.is_none()
+                        && file_info_is_valid_for_metadata(meta)
+                        && super::core::metadata_quorum::metadata_early_stop_candidate_matches(first, meta)
+                })
+                .count();
+            if same_count >= write_quorum {
+                return write_quorum;
+            }
         }
 
         let mut identity_counts = HashMap::with_capacity(usable_metadata);
@@ -980,6 +1028,33 @@ impl SetDisks {
         if quorum < 1 {
             warn!("find_file_info_in_quorum: quorum < 1");
             return Err(DiskError::ErasureReadQuorum);
+        }
+
+        let matches_time_or_etag = |meta: &FileInfo| {
+            mod_time == &meta.mod_time
+                || (mod_time.is_none() && etag.as_deref().is_some_and(|e| meta.get_etag().as_deref() == Some(e)))
+        };
+
+        if let Some(first) = metas
+            .iter()
+            .find(|meta| file_info_is_valid_for_metadata(meta) && matches_time_or_etag(meta))
+        {
+            let mut total_valid = 0usize;
+            let mut same_count = 0usize;
+            for meta in metas {
+                if !file_info_is_valid_for_metadata(meta) || !matches_time_or_etag(meta) {
+                    continue;
+                }
+                total_valid += 1;
+                if super::core::metadata_quorum::metadata_early_stop_candidate_matches(first, meta) {
+                    same_count += 1;
+                }
+            }
+            if same_count >= quorum && same_count > total_valid - same_count {
+                let mut fi = first.clone();
+                fi.is_latest = fi.successor_mod_time.is_none();
+                return Ok(fi);
+            }
         }
 
         let mut meta_hashes = vec![None; metas.len()];

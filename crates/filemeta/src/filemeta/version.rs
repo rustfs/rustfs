@@ -4374,6 +4374,29 @@ pub struct FileInfoOpts {
 pub fn get_file_info(buf: &[u8], volume: &str, path: &str, version_id: &str, opts: FileInfoOpts) -> Result<FileInfo> {
     FileMeta::decode_fileinfo_from_buf(
         buf,
+        None,
+        volume,
+        path,
+        version_id,
+        FileInfoDecodeOptions {
+            read_data: opts.data,
+            include_free_versions: opts.include_free_versions,
+            all_parts: true,
+            include_part_checksums: opts.include_part_checksums,
+        },
+    )
+}
+
+pub fn get_file_info_from_bytes(
+    buf: &bytes::Bytes,
+    volume: &str,
+    path: &str,
+    version_id: &str,
+    opts: FileInfoOpts,
+) -> Result<FileInfo> {
+    FileMeta::decode_fileinfo_from_buf(
+        buf.as_ref(),
+        Some(buf),
         volume,
         path,
         version_id,
@@ -4505,14 +4528,14 @@ fn read_more_sync<R: std::io::Read>(
     }
 
     let extra = read_size - has;
-    if buf.capacity() >= read_size {
-        // Extend the buffer if we have enough space.
-        buf.resize(read_size, 0);
-    } else {
-        buf.extend(vec![0u8; extra]);
+    buf.try_reserve(extra.saturating_add(1)).map_err(Error::other)?;
+    std::io::Read::read_to_end(&mut std::io::Read::take(reader, extra as u64), buf)?;
+    if buf.len() < read_size {
+        return Err(Error::from(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        )));
     }
-
-    reader.read_exact(&mut buf[has..])?;
     Ok(())
 }
 
@@ -4534,8 +4557,8 @@ pub fn read_xl_meta_no_data_sync<R: std::io::Read>(reader: &mut R, size: usize) 
         has_full = false;
     }
 
-    let mut buf = vec![0u8; initial];
-    reader.read_exact(&mut buf)?;
+    let mut buf = Vec::new();
+    read_more_sync(reader, &mut buf, size, initial, false)?;
 
     let (tmp_buf, major, minor) = FileMeta::check_xl2_v1(&buf)?;
 

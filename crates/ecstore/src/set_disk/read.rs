@@ -427,6 +427,7 @@ impl SetDisks {
         }
     }
 
+    #[cfg(test)]
     async fn cache_get_object_fileinfo(
         &self,
         identity: (&str, &str),
@@ -437,8 +438,30 @@ impl SetDisks {
         read_quorum: usize,
     ) {
         let (fi, capability) = selected;
+        let _ = self
+            .cache_get_object_fileinfo_owned(
+                identity,
+                generation,
+                (fi.clone(), capability),
+                parts_metadata.to_vec(),
+                online_disks.to_vec(),
+                read_quorum,
+            )
+            .await;
+    }
+
+    async fn cache_get_object_fileinfo_owned(
+        &self,
+        identity: (&str, &str),
+        generation: Option<GetObjectMetadataCacheGeneration>,
+        selected: (FileInfo, GetObjectMetadataCacheCapability),
+        parts_metadata: Vec<FileInfo>,
+        online_disks: Vec<Option<DiskStore>>,
+        read_quorum: usize,
+    ) -> GetObjectFileInfo {
+        let (fi, capability) = selected;
         if fi.deleted || !fi.has_valid_erasure_geometry() {
-            return;
+            return GetObjectFileInfo::owned(fi, parts_metadata, online_disks);
         }
         let (bucket, object) = identity;
 
@@ -449,20 +472,21 @@ impl SetDisks {
                 GET_METADATA_CACHE_DECISION_REJECT,
                 GET_METADATA_CACHE_REASON_STALE_PUBLICATION,
             );
-            return;
+            return GetObjectFileInfo::owned(fi, parts_metadata, online_disks);
         };
 
         let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
         let entry = Arc::new(GetObjectMetadataCacheEntry {
             created_at: Instant::now(),
-            fi: fi.clone(),
-            parts_metadata: parts_metadata.to_vec(),
-            online_disks: online_disks.to_vec(),
+            fi,
+            parts_metadata,
+            online_disks,
             read_quorum,
             capability,
         });
-        self.insert_get_object_metadata_cache_entry_after_insert(key, generation, entry, || {})
+        self.insert_get_object_metadata_cache_entry_after_insert(key, generation, Arc::clone(&entry), || {})
             .await;
+        GetObjectFileInfo::owned_published(entry)
     }
 
     async fn insert_get_object_metadata_cache_entry_after_insert(
@@ -845,7 +869,11 @@ impl SetDisks {
             }
         }
         metadata_fanout_diagnostics.record_quorum_candidate_latency(metadata_metrics_path, fileinfo_selection_quorum);
-        if !opts.suppress_read_repair && errs.iter().any(|err| err.is_some()) {
+        let needs_late_metadata_fanout = !metadata_fanout_complete
+            && allow_early_stop
+            && non_inline_data_read_early_stop_allowed(read_data, bucket, object)
+            && late_materialization_candidate_is_safe(&fi);
+        let mut snapshot = if !opts.suppress_read_repair && errs.iter().any(|err| err.is_some()) {
             let version_id = resolved_read_repair_version_id(&fi, opts.version_id.as_deref());
             submit_read_repair_heal(
                 &fi.volume,
@@ -857,6 +885,7 @@ impl SetDisks {
                 "metadata_read_error",
             )
             .await;
+            GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks)
         } else if use_metadata_cache
             && (metadata_fanout_complete
                 || condition_stopped
@@ -869,11 +898,11 @@ impl SetDisks {
         {
             #[cfg(test)]
             metadata_cache_tests::wait_before_metadata_cache_publish(bucket, object).await;
-            self.cache_get_object_fileinfo(
+            self.cache_get_object_fileinfo_owned(
                 (bucket, object),
                 metadata_cache_generation,
                 (
-                    &fi,
+                    fi,
                     if metadata_fanout_complete {
                         GetObjectMetadataCacheCapability::Full
                     } else if condition_stopped {
@@ -882,26 +911,18 @@ impl SetDisks {
                         GetObjectMetadataCacheCapability::QuorumSelected
                     },
                 ),
-                &parts_metadata,
-                &op_online_disks,
+                parts_metadata,
+                op_online_disks,
                 read_quorum,
             )
-            .await;
-        }
-        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_METADATA_RESOLVE, metadata_resolve_stage_start);
-        // debug!("get_object_fileinfo pick fi {:?}", &fi);
-
-        // let online_disks: Vec<Option<DiskStore>> = op_online_disks.iter().filter(|v| v.is_some()).cloned().collect();
-
-        let mut snapshot = if !metadata_fanout_complete
-            && allow_early_stop
-            && non_inline_data_read_early_stop_allowed(read_data, bucket, object)
-            && late_materialization_candidate_is_safe(&fi)
-        {
-            GetObjectFileInfo::owned_with_late_metadata_fanout(fi, parts_metadata, op_online_disks, disks)
+            .await
         } else {
             GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks)
         };
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_METADATA_RESOLVE, metadata_resolve_stage_start);
+        if needs_late_metadata_fanout {
+            snapshot.set_late_metadata_fanout_disks(disks);
+        }
         snapshot.condition_stopped = condition_stopped;
         snapshot.set_verified_inline_body(verified_inline_body);
         Ok(snapshot)

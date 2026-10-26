@@ -115,6 +115,7 @@ pub(crate) fn data_key_for_version(version_id: Option<Uuid>) -> String {
     }
 }
 
+#[cfg(test)]
 fn legacy_data_key_for_version(version_id: Option<Uuid>) -> Option<String> {
     if version_id.is_none() || version_id == Some(Uuid::nil()) {
         Some(Uuid::nil().to_string())
@@ -348,19 +349,21 @@ impl FileMeta {
         self.versions.sort_by(cmp_shallow_versions_for_order);
     }
 
+    fn find_inline_data_slice(inline_data: &[u8], version_id: Option<Uuid>) -> Result<Option<&[u8]>> {
+        if let Some(vid) = version_id.filter(|v| !v.is_nil()) {
+            let mut buf = Uuid::encode_buffer();
+            let key = vid.hyphenated().encode_lower(&mut buf);
+            InlineData::find_slice_in_raw(inline_data, key)
+        } else {
+            if let Some(data) = InlineData::find_slice_in_raw(inline_data, NULL_VERSION_ID)? {
+                return Ok(Some(data));
+            }
+            InlineData::find_slice_in_raw(inline_data, "00000000-0000-0000-0000-000000000000")
+        }
+    }
+
     fn find_inline_data_in_slice(inline_data: &[u8], version_id: Option<Uuid>) -> Result<Option<Vec<u8>>> {
-        let key = data_key_for_version(version_id);
-        if let Some(data) = InlineData::find_in_slice(inline_data, key.as_str())? {
-            return Ok(Some(data));
-        }
-
-        if let Some(legacy_key) = legacy_data_key_for_version(version_id)
-            && legacy_key != key
-        {
-            return InlineData::find_in_slice(inline_data, legacy_key.as_str());
-        }
-
-        Ok(None)
+        Ok(Self::find_inline_data_slice(inline_data, version_id)?.map(<[u8]>::to_vec))
     }
 
     fn find_inline_data_for_version(&self, version_id: Option<Uuid>) -> Result<Option<Vec<u8>>> {
@@ -1100,6 +1103,7 @@ impl FileMeta {
             self.versions.len(),
             self.versions.iter().map(|ver| Ok((ver.header.clone(), ver.meta.as_slice()))),
             self.data.as_slice(),
+            None,
             volume,
             path,
             version_id,
@@ -1109,6 +1113,7 @@ impl FileMeta {
 
     fn decode_fileinfo_from_buf(
         buf: &[u8],
+        inline_owner: Option<&bytes::Bytes>,
         volume: &str,
         path: &str,
         version_id: &str,
@@ -1145,6 +1150,7 @@ impl FileMeta {
             versions_len,
             (0..versions_len).map(|_| Self::read_next_shallow_slice(meta, &mut cur, header_ver)),
             inline_buf,
+            inline_owner,
             volume,
             path,
             version_id,
@@ -1152,10 +1158,12 @@ impl FileMeta {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn select_and_decode_fileinfo<'a, I>(
         versions_len: usize,
         versions: I,
         inline_data: &[u8],
+        inline_owner: Option<&bytes::Bytes>,
         volume: &str,
         path: &str,
         version_id: &str,
@@ -1248,7 +1256,9 @@ impl FileMeta {
                         }
 
                         if opts.read_data && fi.inline_data() {
-                            fi.data = Self::find_inline_data_in_slice(inline_data, fi.version_id)?.map(bytes::Bytes::from);
+                            fi.data = Self::find_inline_data_slice(inline_data, fi.version_id)?.map(|slice| {
+                                inline_owner.map_or_else(|| bytes::Bytes::copy_from_slice(slice), |owner| owner.slice_ref(slice))
+                            });
                         }
 
                         Ok(fi)

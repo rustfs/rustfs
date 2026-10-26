@@ -125,6 +125,7 @@ fn metadata_metrics_path(bucket: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub(super) fn metadata_distribution_key(bucket: &str, object: &str) -> String {
     [bucket, object].join("/")
 }
@@ -449,36 +450,16 @@ pub(in crate::set_disk) fn bounded_metadata_fanout_order(
     total_disks: usize,
     default_parity_count: usize,
 ) -> Vec<usize> {
-    let fallback_order = || (0..total_disks).collect::<Vec<_>>();
     if default_parity_count == 0 || default_parity_count >= total_disks {
-        return fallback_order();
+        return (0..total_disks).collect();
     }
 
     let data_blocks = total_disks - default_parity_count;
-    let distribution_key = metadata_distribution_key(bucket, object);
-    let distribution = FileInfo::new(&distribution_key, data_blocks, default_parity_count)
-        .erasure
-        .distribution;
-    if distribution.len() != total_disks {
-        return fallback_order();
-    }
-
+    let start = FileInfo::distribution_start(bucket, object, total_disks);
+    let offset = (start + 1) % total_disks;
     let mut order = Vec::with_capacity(total_disks);
-    for block_index in 1..=data_blocks {
-        let Some(disk_index) = distribution
-            .iter()
-            .position(|distributed_block| *distributed_block == block_index)
-        else {
-            return fallback_order();
-        };
-        order.push(disk_index);
-    }
-    order.extend(
-        distribution
-            .iter()
-            .enumerate()
-            .filter_map(|(disk_index, block_index)| (*block_index > data_blocks).then_some(disk_index)),
-    );
+    order.extend((0..data_blocks).map(|i| (total_disks + i - offset) % total_disks));
+    order.extend((0..total_disks).filter(|&disk_index| (start + disk_index + 1) % total_disks >= data_blocks));
     order
 }
 

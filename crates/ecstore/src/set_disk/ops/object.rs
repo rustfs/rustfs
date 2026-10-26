@@ -3008,46 +3008,48 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 };
 
             if can_try_inline_data_shards_direct(object_size, fi.erasure.block_size)
+                && let Some(body) = verified_inline_body.filter(|body| body.len() == object_size)
+            {
+                if let Some(inline_prepare_stage_start) = inline_prepare_stage_start.take() {
+                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                        GET_OBJECT_PATH_INLINE_DIRECT,
+                        GET_STAGE_INLINE_PREPARE,
+                        object_class.as_str(),
+                        size_bucket,
+                        inline_prepare_stage_start.elapsed().as_secs_f64(),
+                    );
+                }
+                if rustfs_io_metrics::get_stage_metrics_enabled() {
+                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                        GET_OBJECT_PATH_INLINE_DIRECT,
+                        GET_STAGE_READER_SETUP,
+                        object_class.as_str(),
+                        size_bucket,
+                        0.0,
+                    );
+                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                        GET_OBJECT_PATH_INLINE_DIRECT,
+                        GET_STAGE_DECODE,
+                        object_class.as_str(),
+                        size_bucket,
+                        0.0,
+                    );
+                }
+                record_get_object_reader_path_observation(GET_OBJECT_PATH_INLINE_DIRECT, object_class, size_bucket);
+                let reader = GetObjectReader {
+                    stream: Box::new(Cursor::new(body.clone())),
+                    object_info,
+                    buffered_body: Some(body),
+                    body_source: GetObjectBodySource::Unprobed,
+                };
+                return Ok(reader);
+            }
+
+            if can_try_inline_data_shards_direct(object_size, fi.erasure.block_size)
                 && let Some(data_files) = collect_inline_data_shard_fileinfos_by_index(files, fi, data_shards, |index| {
                     disks.get(index).is_some_and(Option::is_some)
                 })
             {
-                if let Some(body) = verified_inline_body.filter(|body| body.len() == object_size) {
-                    if let Some(inline_prepare_stage_start) = inline_prepare_stage_start.take() {
-                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                            GET_OBJECT_PATH_INLINE_DIRECT,
-                            GET_STAGE_INLINE_PREPARE,
-                            object_class.as_str(),
-                            size_bucket,
-                            inline_prepare_stage_start.elapsed().as_secs_f64(),
-                        );
-                    }
-                    if rustfs_io_metrics::get_stage_metrics_enabled() {
-                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                            GET_OBJECT_PATH_INLINE_DIRECT,
-                            GET_STAGE_READER_SETUP,
-                            object_class.as_str(),
-                            size_bucket,
-                            0.0,
-                        );
-                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                            GET_OBJECT_PATH_INLINE_DIRECT,
-                            GET_STAGE_DECODE,
-                            object_class.as_str(),
-                            size_bucket,
-                            0.0,
-                        );
-                    }
-                    record_get_object_reader_path_observation(GET_OBJECT_PATH_INLINE_DIRECT, object_class, size_bucket);
-                    let reader = GetObjectReader {
-                        stream: Box::new(Cursor::new(body.clone())),
-                        object_info,
-                        buffered_body: Some(body),
-                        body_source: GetObjectBodySource::Unprobed,
-                    };
-                    return Ok(reader);
-                }
-
                 let read_length = inline_erasure_shard_file_offset(
                     0,
                     object_size,
