@@ -3145,13 +3145,13 @@ impl ECStore {
     }
 
     pub(crate) fn is_equivalent_decommission_capacity_target(source: &ObjectInfo, target: &ObjectInfo) -> bool {
-        source.bucket == target.bucket
-            && source.name == decode_dir_object(&target.name)
-            && if source.delete_marker {
-                is_equivalent_data_movement_delete_marker(source, target)
-            } else {
-                crate::data_movement::is_equivalent_data_movement_object_identity(source, target, true, false)
-            }
+        if source.delete_marker {
+            source.bucket == target.bucket
+                && source.name == decode_dir_object(&target.name)
+                && is_equivalent_data_movement_delete_marker(source, target)
+        } else {
+            crate::data_movement::is_equivalent_data_movement_capacity_target(source, target)
+        }
     }
 
     /// Captures Object Lock state once for a batch of PUTs to the same bucket.
@@ -7472,9 +7472,30 @@ mod tests {
 
         let wrong_bucket = ObjectInfo {
             bucket: "other-bucket".to_string(),
-            ..target
+            ..target.clone()
         };
         assert!(!ECStore::is_equivalent_decommission_capacity_target(&source, &wrong_bucket));
+        for changed in ["name", "version", "mtime", "metadata"] {
+            let mut invalid = target.clone();
+            match changed {
+                "name" => invalid.name = rustfs_utils::path::encode_dir_object("other-directory/"),
+                "version" => invalid.version_id = Some(Uuid::from_u128(2)),
+                "mtime" => invalid.mod_time = Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+                "metadata" => {
+                    Arc::make_mut(&mut invalid.user_defined).insert("x-amz-meta-different".to_owned(), "value".to_owned());
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !ECStore::is_equivalent_decommission_capacity_target(&source, &invalid),
+                "changed {changed}"
+            );
+        }
+        let ordinary_file = ObjectInfo {
+            name: "directory".to_owned(),
+            ..source
+        };
+        assert!(!ECStore::is_equivalent_decommission_capacity_target(&ordinary_file, &target));
     }
 
     fn publication_part(number: usize) -> ObjectPartInfo {

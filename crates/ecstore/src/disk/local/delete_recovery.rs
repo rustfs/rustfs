@@ -1001,6 +1001,17 @@ pub(super) fn inspection_with_markers(
 }
 
 impl LocalDisk {
+    // Native MPU source closure has its own conditional protocol. Generic
+    // object recovery must never restore its head or acquire SourceRW under
+    // an already-owned object metadata lease.
+    fn reject_multipart_delete_recovery_mutation(&self, volume: &str, object: &str) -> Result<()> {
+        multipart_staging::reject_noncanonical_scope(&self.root, self.io_root(), volume, object)?;
+        if volume == RUSTFS_META_MULTIPART_BUCKET {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
+        Ok(())
+    }
+
     async fn delete_recovery_predecessors(
         &self,
         volume: &str,
@@ -1377,6 +1388,8 @@ impl LocalDisk {
         authority: Option<&DeleteRecoveryJournal>,
         context: DeletePreparationContext,
     ) -> Result<Option<Vec<u8>>> {
+        self.reject_multipart_delete_recovery_mutation(volume, object)?;
+
         let DeletePreparationContext {
             transaction,
             bucket_incarnation: incarnation,
@@ -1468,6 +1481,8 @@ impl LocalDisk {
         action: DeleteRecoveryAction,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<DeleteRecoveryInspection> {
+        self.reject_multipart_delete_recovery_mutation(volume, object)?;
+
         if !safe_path(object, false) || transaction.is_nil() {
             return Err(DiskError::InvalidPath);
         }
@@ -1507,6 +1522,8 @@ impl LocalDisk {
         action: DeleteRecoveryAction,
         owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<DeleteRecoveryInspection> {
+        self.reject_multipart_delete_recovery_mutation(volume, object)?;
+
         let (mut observed, mut has_data_dir_work) = self
             .delete_recovery_inspect_owned_with_markers(volume, object, transaction, owner.clone())
             .await?;
@@ -1811,7 +1828,7 @@ impl LocalDisk {
                     .await
                     .map_err(to_file_error)?;
                     let (_, complete) = self
-                        .finish_version_delete(volume, object, transaction, true, owner.clone())
+                        .finish_version_delete(volume, object, transaction, true, owner.clone(), None)
                         .await?;
                     if !complete {
                         return Err(DiskError::DiskOngoingReq);
@@ -1915,7 +1932,9 @@ impl LocalDisk {
                 let sync = effective_durability(volume).syncs_commit_metadata();
                 let (rollback_buf, root_buf, volume_str, object_str) =
                     (rollback.clone(), root.clone(), volume.to_owned(), object.to_owned());
+                let publication_root = self.publication_root.clone();
                 return os::run_blocking_namespace_operation_with_sync(receipt_lease, sync, move || {
+                    let _publication_root = publication_root;
                     for (path, _) in &file_leases {
                         #[cfg(all(any(test, feature = "test-util"), not(windows)))]
                         os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, path);
@@ -2994,6 +3013,152 @@ mod tests {
         assert!(!disk.io_root().join(RUSTFS_META_TMP_OLD_BUCKET).exists());
         assert!(temporary.join(".trash").is_dir(), "startup recreates the active trash directory");
         assert_eq!(disk.read_all("recovery", "object/xl.meta").await.unwrap().as_ref(), original);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn delete_recovery_cancelled_finalize_pins_root_after_last_disk_owner_drops() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        use futures::FutureExt;
+
+        struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(release) = self.0.take() {
+                    let _ = release.send(());
+                }
+            }
+        }
+
+        let (temp, native, _info, _original) = fixture().await;
+        let root_file = Arc::downgrade(native.publication_root.directory());
+        assert!(Arc::ptr_eq(native.publication_root.directory(), &native.mount_lease));
+        // The constructor's idle GC task also owns this FD. Drain that existing
+        // task so it cannot mask a missing pin in the Finalize callback.
+        let exit = native.exit_signal.as_ref().expect("fixture cleanup lifecycle");
+        exit.send(()).expect("stop the existing idle cleanup task");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while exit.receiver_count() != 0 || root_file.strong_count() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("only LocalDisk's publication and mount fields may retain the initial root FD");
+        let transaction = Uuid::new_v4();
+        let applied = apply(&native, transaction).await;
+        let committed = native
+            .settle_delete_transaction(
+                "recovery",
+                "object",
+                transaction,
+                applied.fingerprint,
+                DeleteRecoveryAction::PublishCommit,
+            )
+            .await
+            .expect("publish actual delete decision");
+        let finished = native
+            .settle_delete_transaction(
+                "recovery",
+                "object",
+                transaction,
+                committed.fingerprint,
+                DeleteRecoveryAction::FinishCommit,
+            )
+            .await
+            .expect("finish actual committed deletion");
+        assert_eq!(finished.state, DeleteRecoveryState::CommitFinished);
+        let physical_object = temp.path().join("recovery/object");
+        let physical_rollback = physical_object.join(transaction.to_string());
+        assert!(physical_rollback.join(PREPARED).is_file());
+        assert!(physical_rollback.join(DELETE_QUORUM_COMMITTED_FILE).is_file());
+        let io_root = native.io_root().to_path_buf();
+        assert!(io_root.starts_with("/proc/self/fd"), "exercise the real borrowed Linux FD path");
+        let canonical_root = std::fs::canonicalize(temp.path()).expect("actual root identity");
+        let fd_alias = io_root.components().collect::<PathBuf>();
+        let io_rollback = native
+            .io_get_object_path("recovery", &format!("object/{transaction}"))
+            .expect("actual IO rollback path");
+        let receipt_path = io_rollback.join(DELETE_QUORUM_COMMITTED_FILE);
+        let (entered, reached) = tokio::sync::oneshot::channel();
+        let (release, resumed) = std::sync::mpsc::channel::<()>();
+        let release = ReleaseOnDrop(Some(release));
+        let hook = hooks::install_at(hooks::Stage::Remove, &io_rollback.join(PREPARED), move || {
+            let _ = entered.send(());
+            let _ = resumed.recv();
+        });
+        let mut native = Some(Arc::new(native));
+        let weak = Arc::downgrade(native.as_ref().expect("fixture disk owner"));
+        let finalizing = native.as_ref().expect("fixture disk owner").clone();
+        let mut task = Some(tokio::spawn(async move {
+            finalizing
+                .settle_delete_transaction(
+                    "recovery",
+                    "object",
+                    transaction,
+                    finished.fingerprint,
+                    DeleteRecoveryAction::FinalizeCommit,
+                )
+                .await
+        }));
+        let observations = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(Duration::from_secs(10), reached)
+                .await
+                .expect("actual Finalize remove callback must pause")
+                .expect("actual physical Remove hook");
+            let cancelling = task.take().expect("live finalize waiter");
+            cancelling.abort();
+            assert!(cancelling.await.expect_err("cancel the real waiter").is_cancelled());
+            drop(native.take());
+            assert!(weak.upgrade().is_none(), "no test or cancelled future may retain a LocalDisk");
+            assert_eq!(
+                root_file.strong_count(),
+                1,
+                "only the actual callback may retain the root FD after disk retirement"
+            );
+            assert_eq!(
+                std::fs::read_link(&fd_alias).expect("the physical callback must still own its root FD"),
+                canonical_root,
+                "the borrowed FD alias must keep the same actual disk identity"
+            );
+            assert!(
+                physical_rollback.join(PREPARED).is_file(),
+                "paused callback has not removed the actual prepared record"
+            );
+            assert!(
+                physical_rollback.join(DELETE_QUORUM_COMMITTED_FILE).is_file(),
+                "the actual final witness still exists before resume"
+            );
+        })
+        .catch_unwind()
+        .await;
+        if let Some(task) = task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        drop(native.take());
+        drop(release);
+        drop(hook);
+        // This path-only lease does not hold a root handle. Acquiring it proves
+        // the actual callback, including its inline inspection, has returned.
+        let drained = tokio::time::timeout(
+            Duration::from_secs(5),
+            os::acquire_namespace_mutation_lease_with_owner(&receipt_path, None),
+        )
+        .await
+        .map(drop);
+        if let Err(panic) = observations {
+            std::panic::resume_unwind(panic);
+        }
+        drained.expect("cancelled physical Finalize callback must finish");
+        for name in [TARGET, PREPARED, FINISHED, DELETE_QUORUM_COMMITTED_FILE] {
+            assert!(
+                !physical_rollback.join(name).exists(),
+                "actual original-volume proof must be reclaimed: {name}"
+            );
+        }
+        assert!(!physical_rollback.exists(), "the real rollback directory is pruned after proof removal");
+        assert!(!physical_object.exists(), "completed deletion leaves no original-volume object residue");
+        assert!(temp.path().join("recovery").is_dir(), "finalization must preserve its original volume");
     }
 
     #[cfg(unix)]
@@ -5484,4 +5649,9 @@ mod tests {
             b"outside bytes"
         );
     }
+}
+
+#[cfg(test)]
+mod multipart_scope_tests {
+    include!("multipart_delete_recovery_scope_tests.rs");
 }

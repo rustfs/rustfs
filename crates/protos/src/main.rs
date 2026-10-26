@@ -65,6 +65,13 @@ fn main() -> Result<(), AnyError> {
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_well_known_types(true)
         .bytes(".")
+        // These payloads can contain linear multipart undo capabilities.
+        // Their hand-written Debug implementations redact the complete payload.
+        .skip_debug([
+            ".node_service.RenameDataResponse",
+            ".node_service.RecoverMultipartSourceRequest",
+            ".node_service.RecoverMultipartSourceResponse",
+        ])
         .emit_rerun_if_changed(false)
         .compile_protos(proto_files, &[proto_dir.to_string_lossy().as_ref()])
         .map_err(|e| format!("Failed to generate protobuf file: {e}."))?;

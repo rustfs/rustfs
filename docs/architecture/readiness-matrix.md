@@ -20,7 +20,7 @@ The outer gate uses the same HTTP/2 and `application/grpc` predicate as the hybr
 
 | Dependency | Ready signal | Blocks `FullReady` | Notes |
 |---|---|---|---|
-| StorageReady | Storage/global config readiness publication plus runtime storage checks. | Yes. | Startup can mark the stage before later runtime readiness rechecks storage. |
+| StorageReady | Storage/global config readiness publication plus runtime storage checks. | Yes. | Startup can mark the stage before later runtime readiness rechecks storage. Initial pool metadata reads must complete before object-store publication; see [pool metadata recovery](../operations/pool-metadata-recovery.md). |
 | IamReady | Inline IAM bootstrap or deferred IAM recovery publication. | Yes. | Deferred recovery can publish IAM readiness after HTTP has already started. |
 | Lock quorum | Per-set write quorum readiness. | Yes. | Do not replace the distributed lock quorum check with node count or endpoint count. |
 | Peer health | `peer_health_ready` runtime status. | Only when `RUSTFS_HEALTH_PEER_READY_CHECK_ENABLE` is enabled. | The gate is disabled by default; unknown peer health degrades readiness only when enabled. |
@@ -75,6 +75,8 @@ The existing `details.storage.ready` boolean and `connected` / `disconnected` st
 Node readiness additionally reports `details.storage.readQuorum`, `details.storage.writeQuorum`, and `details.poolMetadata.ready`. `details.storage.ready` follows read quorum. `details.lock.ready` on this probe follows shared-lock quorum; on `/minio/health/cluster` it follows exclusive-lock quorum. The metadata component's status is `writable` or `unavailable`. A blocked metadata writer is visible there and on the cluster-write probe; it does not by itself make `/health/ready` return 503.
 
 `details.storage.unavailableDrives` lists inventoried handles excluded from the node's quorum snapshot. Each entry has zero-based `poolIndex`, `setIndex`, and `diskIndex`, its `runtimeState`, and `hostOnline` from the lock reachability observation (always true for local drives). A `suspect` drive with `hostOnline: true` is reachable but not counted; an `online` drive with `hostOnline: false` is excluded because its host did not answer. Internal addresses and filesystem paths are omitted. This list does not enumerate missing inventory slots, and an empty list does not override a failed inventory or quorum check. It is omitted with the other details in minimal responses; HEAD responses have no body. Admin storage info still reports each owner's disk view, which can differ from these node-local handle states.
+
+`details.storage.missingDrives` separately lists configured slots with no handle, including a short inventory, using only zero-based `poolIndex`, `setIndex`, and `diskIndex`. It carries no host-health claim. Both lists must be empty to establish a complete node-local drive inventory; quorum readiness can still be true with a missing slot when enough other drives are online. The extra diagnostics do not change probe status, quorum, or minimal/HEAD response semantics.
 
 Node storage quorum uses configured drives per set, all configured pools/sets, and their Standard storage-class data/parity layout. Missing, duplicate, unreachable, or unhealthy disk observations cannot supply extra quorum votes. The read quorum is the data-drive count; the write quorum is that count plus one when data and parity counts are equal. These are observations of available storage slots, not guarantees that a particular object's metadata, shards, or required locks are available.
 

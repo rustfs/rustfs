@@ -17,7 +17,9 @@ pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys;
 #[cfg(test)]
 pub(crate) const OBJECT_LOCK_TRACE_FILTER: &str = "info,rustfs_ecstore::object_lock_diag=trace";
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::api::disk::{DiskOption, Endpoint, RUSTFS_META_BUCKET, VolumeInfo, WalkDirOptions, new_disk};
+pub(crate) use rustfs_ecstore::api::disk::{
+    DiskOption, Endpoint, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, VolumeInfo, WalkDirOptions, new_disk,
+};
 pub(crate) use rustfs_ecstore::api::rpc::{AuthenticatedChannel, TonicInterceptor, node_service_time_out_client_no_auth};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::rpc::{
@@ -57,5 +59,24 @@ pub(crate) mod replication_extension {
 
 #[cfg(test)]
 pub(crate) mod upgrade_compatibility {
-    pub(crate) use super::{DiskOption, Endpoint, new_disk};
+    pub(crate) use super::{DiskOption, Endpoint, RUSTFS_META_MULTIPART_BUCKET, new_disk};
+}
+
+#[cfg(test)]
+pub(crate) mod multipart_rpc_delay {
+    pub(crate) use super::RUSTFS_META_MULTIPART_BUCKET;
+}
+
+#[cfg(test)]
+pub(crate) mod multipart_fence_acceptance {
+    pub(crate) use super::RUSTFS_META_MULTIPART_BUCKET;
+}
+
+#[cfg(test)]
+pub(crate) mod multipart_source_rpc {
+    pub(crate) use rustfs_ecstore::api::disk::{
+        MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartAbortCertificate, MultipartAbortProof, MultipartAbortProofKind,
+        MultipartAbortRound, MultipartSourceOperation, MultipartSourcePhase, MultipartSourceRequest, MultipartSourceSnapshot,
+        PublicationIdentity, SourceGeneration, SourceGeometry, SourceLineage,
+    };
 }

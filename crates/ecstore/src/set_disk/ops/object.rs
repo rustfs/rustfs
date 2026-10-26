@@ -4822,6 +4822,63 @@ impl SetDisks {
                 return Err(err);
             }
 
+            if bucket == RUSTFS_META_BUCKET
+                && object == "pool.bin"
+                && rustfs_utils::http::metadata_compat::contains_key_str(
+                    &opts.user_defined,
+                    crate::disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+                )
+            {
+                // The logical If-Match above remains authoritative. Bind each
+                // disk mutation to its actual physical predecessor as well, so
+                // a lagging replica can converge without admitting late tails.
+                let condition = rustfs_utils::http::metadata_compat::get_consistent_str(
+                    &opts.user_defined,
+                    crate::disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+                )
+                .ok_or(DiskError::FileCorrupt)?;
+                let condition: crate::disk::PoolMetaNativeCasCondition =
+                    serde_json::from_str(condition).map_err(|_| DiskError::FileCorrupt)?;
+                let (parents, errors) =
+                    Self::read_all_fileinfo(&shuffle_disks, bucket, bucket, object, "", false, false, false).await?;
+                for (index, ((metadata, parent), error)) in parts_metadatas.iter_mut().zip(&parents).zip(&errors).enumerate() {
+                    let mut parent_raw_sha256 = None;
+                    let parent = match error {
+                        None => Some(crate::disk::PoolMetaNativeFileIdentity::from_file_info(parent)?),
+                        Some(DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound) => None,
+                        // An unavailable disk keeps the exact logical parent;
+                        // reconnecting cannot turn an unknown head into absence.
+                        Some(
+                            DiskError::DiskNotFound | DiskError::FaultyDisk | DiskError::DiskAccessDenied | DiskError::Timeout,
+                        ) => condition.parent.clone(),
+                        Some(DiskError::FileCorrupt) => {
+                            use sha2::Digest as _;
+                            let disk = shuffle_disks[index].as_ref().ok_or(DiskError::DiskNotFound)?;
+                            match disk
+                                .pool_meta_native_recovery(crate::disk::PoolMetaNativeRecoveryRequest::Inspect {
+                                    object: crate::disk::PoolMetaNativeObject::PoolBin,
+                                })
+                                .await?
+                            {
+                                crate::disk::PoolMetaNativeRecoveryResponse::Inspected(snapshot) => {
+                                    let raw = snapshot.current.ok_or(DiskError::ConditionalDeleteConflict)?;
+                                    parent_raw_sha256 = Some(sha2::Sha256::digest(&raw).into());
+                                    None
+                                }
+                                _ => return Err(DiskError::FileCorrupt.into()),
+                            }
+                        }
+                        Some(err) => return Err(err.clone().into()),
+                    };
+                    crate::disk::PoolMetaNativeCasCondition {
+                        attempt_id: condition.attempt_id,
+                        parent,
+                        parent_raw_sha256,
+                    }
+                    .insert_into(&mut metadata.metadata)?;
+                }
+            }
+
             // Generate ordinary PUT timestamps under the commit lock so version
             // ordering follows durable commit ordering when writers queued on
             // the same object. Internal callers with an explicit timestamp keep
@@ -12791,6 +12848,21 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
             disks.push(Some(disk));
         }
 
+        // This fixture owns a complete physical topology even when it shares
+        // the bootstrap service context with other independent hermetic sets.
+        let topology = crate::layout::endpoints::EndpointServerPools(vec![crate::layout::endpoints::PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: disk_count,
+            endpoints: endpoints.clone().into(),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]);
+        let (_, multipart_authority) = crate::disk::multipart_source::ProofVerificationContext::for_topology(&topology)
+            .expect("hermetic fixture should have a complete local topology");
+        crate::disk::multipart_source::bind_multipart_proof_snapshot(&disks, &multipart_authority)
+            .expect("hermetic local disks should bind to their fixture authority");
+
         let set_disks = SetDisks::new_with_instance_ctx(
             "hermetic-ops-test-owner".to_string(),
             Arc::new(RwLock::new(disks)),
@@ -12805,6 +12877,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         )
         .await;
 
+        set_disks.set_multipart_proof_authority_for_test(multipart_authority);
         (temp_dirs, disk_stores, set_disks)
     }
 }
