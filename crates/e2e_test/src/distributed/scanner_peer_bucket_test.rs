@@ -1998,9 +1998,7 @@ async fn hot_window_with_old_followers(
     } else {
         Value::Null
     };
-    run.write_evidence(
-        label,
-        &json!({"topology": run.topology, "objects": run.objects, "baseline": baseline, "scheduler_config": scheduler_config,
+    let mut evidence = json!({"topology": run.topology, "objects": run.objects, "baseline": baseline, "scheduler_config": scheduler_config,
             "leader_node": leader, "leader_pid": leader_pid, "producer_node": producer, "producer_pid": producer_pid,
             "producers": producers, "start_producers": start_producers, "secondary_acks": secondary_acks,
             "start_cycle_wake": start_cycle_wake, "next_cycle_wake": next_cycle_wake,
@@ -2012,11 +2010,16 @@ async fn hot_window_with_old_followers(
             "ack_after_apply": after_ack, "fault_receipt": fault_receipt, "next_scope": next_scope,
             "next_start": next_start, "next_candidate": next_candidate, "next_root": next_root,
             "recovered_ack": recovered_ack, "recovered_usage": recovered_usage,
-            "mixed_fleet": mixed_fleet, "mixed_initial_physical": mixed_initial_physical,
-            "mixed_physical_root": mixed_physical_root, "mixed_before_ack": mixed_before_ack,
-            "mixed_retained_ack": mixed_retained_ack, "mixed_after_ack": mixed_after_ack,
-            "mixed_next_root": mixed_next_root, "mixed_final_processes": mixed_final_processes,
-            "mixed_final_physical": mixed_final_physical, "mixed_final_drives": mixed_final_drives,
-            "observations": run.barrier.observations(false)?}),
-    )
+            "observations": run.barrier.observations(false)?});
+    evidence["mixed_fleet"] = mixed_fleet;
+    evidence["mixed_initial_physical"] = mixed_initial_physical;
+    evidence["mixed_physical_root"] = mixed_physical_root;
+    evidence["mixed_before_ack"] = mixed_before_ack;
+    evidence["mixed_retained_ack"] = mixed_retained_ack;
+    evidence["mixed_after_ack"] = mixed_after_ack;
+    evidence["mixed_next_root"] = mixed_next_root;
+    evidence["mixed_final_processes"] = mixed_final_processes;
+    evidence["mixed_final_physical"] = mixed_final_physical;
+    evidence["mixed_final_drives"] = mixed_final_drives;
+    run.write_evidence(label, &evidence)
 }
