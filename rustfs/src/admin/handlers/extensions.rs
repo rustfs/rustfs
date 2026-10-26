@@ -15,7 +15,7 @@
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::storage_api::cluster::CapabilityStatus;
 use crate::admin::{
-    auth::{authorize_admin_envelope, authorize_admin_request},
+    auth::authorize_admin_envelope,
     handlers::{cluster_snapshot, plugins_instances, system},
     plugin_contract::{
         PluginContractDomain, PluginInstanceDiagnosticCode, PluginInstanceDiagnosticCount, PluginInstanceEntry,
@@ -196,21 +196,13 @@ async fn authorize_extension_catalog_request(req: &AdminRequest) -> S3Result<()>
 
 /// The pre-check keeps this endpoint's historical missing-credentials message;
 /// the shared gate reports "get cred failed".
-// TODO(T1.12-codemod): stays on the s3s request with ListExtensionInstancesHandler, whose
-// query filters come from plugins_instances::extract_plugin_instance_filters(&S3Request<Body>).
-async fn authorize_extension_instance_request(req: &s3s::S3Request<s3s::Body>) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize_extension_instance_request(req: &AdminRequest) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     }
 
-    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::GetBucketTargetAction)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::GetBucketTargetAction)]).await?;
     Ok(())
-}
-
-// TODO(T1.12-codemod): remove with the legacy ListExtensionInstancesHandler impl.
-fn legacy_response(response: AdminResponse) -> s3s::S3Response<(StatusCode, s3s::Body)> {
-    let (status, headers, body) = response.into_parts();
-    s3s::S3Response::with_headers((status, body.into()), headers)
 }
 
 fn build_json_response(status: StatusCode, body: &impl Serialize, request_id: Option<&HeaderValue>) -> S3Result<AdminResponse> {
@@ -239,16 +231,10 @@ impl Operation for GetExtensionCatalogHandler {
 pub struct ListExtensionInstancesHandler {}
 
 #[async_trait::async_trait]
-impl crate::admin::router::Operation for ListExtensionInstancesHandler {
-    // TODO(T1.12-codemod): plugins_instances::extract_plugin_instance_filters still takes the
-    // s3s request; this handler moves to AdminRequest once that helper does.
-    async fn call(
-        &self,
-        req: s3s::S3Request<s3s::Body>,
-        _params: Params<'_, '_>,
-    ) -> S3Result<s3s::S3Response<(StatusCode, s3s::Body)>> {
+impl Operation for ListExtensionInstancesHandler {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_extension_instance_request(&req).await?;
-        let filters = plugins_instances::extract_plugin_instance_filters(&req.uri)?;
+        let filters = plugins_instances::extract_plugin_instance_filters(req.uri())?;
         let instances = plugins_instances::filter_plugin_instances(plugins_instances::collect_all_instances().await?, &filters);
         let diagnostic_counts = plugins_instances::collect_diagnostic_counts(&instances);
         let (instances, truncated, next_marker) = plugins_instances::paginate_plugin_instances(instances, &filters)?;
@@ -258,11 +244,7 @@ impl crate::admin::router::Operation for ListExtensionInstancesHandler {
             truncated,
             next_marker,
         };
-        Ok(legacy_response(build_json_response(
-            StatusCode::OK,
-            &response,
-            req.headers.get("x-request-id"),
-        )?))
+        build_json_response(StatusCode::OK, &response, req.headers().get("x-request-id"))
     }
 }
 
@@ -290,11 +272,8 @@ mod tests {
             "impl Operation for GetExtensionCatalogHandler",
             "pub struct ListExtensionInstancesHandler",
         );
-        let instances_block = extract_block_between_markers(
-            src,
-            "impl crate::admin::router::Operation for ListExtensionInstancesHandler",
-            "#[cfg(test)]",
-        );
+        let instances_block =
+            extract_block_between_markers(src, "impl Operation for ListExtensionInstancesHandler", "#[cfg(test)]");
 
         assert!(
             catalog_block.contains("authorize_extension_catalog_request(&req).await?;"),
@@ -327,29 +306,17 @@ mod tests {
     /// message these endpoints have always returned (rustfs/backlog#1829).
     #[tokio::test]
     async fn extension_gates_keep_their_missing_credentials_message() {
-        let credential_less_request =
+        let credential_less_request = || {
             crate::admin::operation::test_support::TestRequest::new(http::Method::GET, "/rustfs/admin/v4/extensions/catalog")
                 .body(Body::from(String::new()))
-                .build();
-        // TODO(T1.12-codemod): the instance gate still takes the s3s request; see
-        // authorize_extension_instance_request.
-        let credential_less_legacy_request = s3s::S3Request {
-            input: s3s::Body::from(String::new()),
-            method: http::Method::GET,
-            uri: http::Uri::from_static("/rustfs/admin/v4/extensions/catalog"),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
+                .build()
         };
 
         for err in [
-            super::authorize_extension_catalog_request(&credential_less_request)
+            super::authorize_extension_catalog_request(&credential_less_request())
                 .await
                 .expect_err("a request without credentials must be rejected"),
-            super::authorize_extension_instance_request(&credential_less_legacy_request)
+            super::authorize_extension_instance_request(&credential_less_request())
                 .await
                 .expect_err("a request without credentials must be rejected"),
         ] {
