@@ -465,6 +465,7 @@ async fn wait_for_storage_peer_recovery(
 }
 
 async fn phase_quorum_matrix(
+    cluster: &RustFSTestClusterEnvironment,
     proxies: &[RpcFaultProxy],
     clients: &[Client],
     bucket: &str,
@@ -509,6 +510,19 @@ async fn phase_quorum_matrix(
                     abort_after_fault(&clients[0], bucket, &key, upload_id, false).await?;
                 }
             } else {
+                let committed = if !locks && phase == "abort" {
+                    let previous = payload_for(&format!("{key}-committed"), 4096);
+                    clients[0]
+                        .put_object()
+                        .bucket(bucket)
+                        .key(&key)
+                        .body(ByteStream::from(previous.clone()))
+                        .send()
+                        .await?;
+                    Some(previous)
+                } else {
+                    None
+                };
                 let upload = clients[0]
                     .create_multipart_upload()
                     .bucket(bucket)
@@ -538,6 +552,15 @@ async fn phase_quorum_matrix(
                 } else {
                     None
                 };
+                let mut abort_records = Vec::new();
+                if committed.is_some() {
+                    for directory in cluster.nodes.iter().flat_map(|node| &node.data_dirs) {
+                        let root = std::path::Path::new(directory).join(".rustfs.sys/multipart").join(&scope);
+                        let metadata = tokio::fs::read(root.join("xl.meta")).await?;
+                        abort_records.push((root, metadata));
+                    }
+                    assert_eq!(abort_records.len(), 4 * drives_per_node);
+                }
                 match phase {
                     "part" => {
                         let request = clients[0]
@@ -613,7 +636,56 @@ async fn phase_quorum_matrix(
                 // A rejected Complete must retain authority for ordinary
                 // Abort. NoSuchUpload must not hide partial staging loss.
                 let allow_missing = phase != "complete" || unavailable == unavailable_at_quorum;
-                abort_after_fault(&clients[0], bucket, &key, upload_id, allow_missing).await?;
+                if !abort_records.is_empty() {
+                    let retained = abort_records.iter().map(|(root, _)| root.exists()).collect::<Vec<_>>();
+                    let survivors = retained.iter().filter(|present| **present).count();
+                    assert_eq!(survivors, abort_records.len() - available_votes, "the scoped Delete fault must be real");
+                    for (root, metadata) in &abort_records {
+                        if root.exists() {
+                            assert_eq!(tokio::fs::read(root.join("xl.meta")).await?, *metadata);
+                        }
+                    }
+                    let identity_quorum = abort_records.len() / 2;
+                    if survivors < identity_quorum {
+                        // Even a successful quorum Abort can leave a minority
+                        // on an unavailable peer. Without identity quorum, a
+                        // later coordinator must refuse rather than infer GC.
+                        let observers = proxies
+                            .iter()
+                            .map(|proxy| proxy.pause(&["Delete"], usize::MAX, Some(&scope)))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let refused = clients[2]
+                            .abort_multipart_upload()
+                            .bucket(bucket)
+                            .key(&key)
+                            .upload_id(upload_id)
+                            .send()
+                            .await
+                            .expect_err("minority authority must not become cleanup success or NoSuchUpload");
+                        assert_unavailable(&refused, "storage_write_quorum", None);
+                        let delete_calls = observers.iter().map(RpcPause::hits).sum::<usize>();
+                        assert_eq!(delete_calls, 0, "uncertain authority cannot authorize further root deletion");
+                        drop(observers);
+                        for ((root, metadata), present) in abort_records.iter().zip(&retained) {
+                            assert_eq!(root.exists(), *present, "retry must preserve each surviving authority location");
+                            if *present {
+                                assert_eq!(tokio::fs::read(root.join("xl.meta")).await?, *metadata);
+                            }
+                        }
+                        eprintln!(
+                            "MPU Abort boundary: deleted={available_votes}, survivors={survivors}, identity_quorum={identity_quorum}, retry_delete_calls={delete_calls}"
+                        );
+                    } else {
+                        abort_after_fault(&clients[0], bucket, &key, upload_id, allow_missing).await?;
+                        assert!(abort_records.iter().all(|(root, _)| !root.exists()));
+                    }
+                    for reader in clients {
+                        assert_object_bytes(reader, bucket, &key, committed.as_ref().expect("Abort fixture has an old object"))
+                            .await?;
+                    }
+                } else {
+                    abort_after_fault(&clients[0], bucket, &key, upload_id, allow_missing).await?;
+                }
                 recover_after_fault(&format!("DeleteObject {key} after {phase}"), || {
                     clients[0].delete_object().bucket(bucket).key(&key).send()
                 })
@@ -629,14 +701,14 @@ async fn phase_quorum_matrix(
 
 #[tokio::test]
 async fn metadata_delay_preserves_write_quorum_and_rejects_quorum_minus_one() -> TestResult {
-    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
-    phase_quorum_matrix(&proxies, &clients, &bucket, false, 1).await
+    let (cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+    phase_quorum_matrix(&cluster, &proxies, &clients, &bucket, false, 1).await
 }
 
 #[tokio::test]
 async fn lock_delay_preserves_admission_quorum_and_reports_timeout() -> TestResult {
-    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
-    phase_quorum_matrix(&proxies, &clients, &bucket, true, 1).await
+    let (cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+    phase_quorum_matrix(&cluster, &proxies, &clients, &bucket, true, 1).await
 }
 
 #[tokio::test]
@@ -649,7 +721,7 @@ async fn sixteen_shard_multipart_metadata_requires_twelve_votes() -> TestResult 
     assert_eq!(storage.backend.total_sets, vec![1]);
     assert_eq!(storage.backend.drives_per_set, vec![16]);
     assert_eq!(storage.backend.standard_sc_parity, Some(4));
-    phase_quorum_matrix(&proxies, &clients, &bucket, false, 4).await
+    phase_quorum_matrix(&cluster, &proxies, &clients, &bucket, false, 4).await
 }
 
 #[tokio::test]
@@ -1196,6 +1268,243 @@ async fn part_resend_owner_serializes_complete_and_abort_after_client_cancellati
                 "MPU resend owner: cancel_waiter={cancel_waiter}, complete={complete}, prepared_peers=3, retired_roots=4, verified_readers=4"
             );
         }
+    }
+    simultaneous_resend_complete_and_abort(&cluster, &proxies, &clients, &bucket).await
+}
+
+async fn simultaneous_resend_complete_and_abort(
+    cluster: &RustFSTestClusterEnvironment,
+    proxies: &[RpcFaultProxy],
+    clients: &[Client],
+    bucket: &str,
+) -> TestResult {
+    use md5::{Digest as _, Md5};
+
+    for (cancel_waiter, preferred_complete) in [
+        (false, None),
+        (true, None),
+        (false, Some(false)),
+        (true, Some(false)),
+        (false, Some(true)),
+        (true, Some(true)),
+    ] {
+        let schedule = match preferred_complete {
+            None => "race",
+            Some(false) => "abort",
+            Some(true) => "complete",
+        };
+        let key = format!("three-way-resend-{cancel_waiter}-{schedule}");
+        let previous = payload_for(&key, 4096);
+        clients[0]
+            .put_object()
+            .bucket(bucket)
+            .key(&key)
+            .body(ByteStream::from(previous.clone()))
+            .send()
+            .await?;
+        let upload = clients[0].create_multipart_upload().bucket(bucket).key(&key).send().await?;
+        let upload_id = upload.upload_id().ok_or("missing three-way upload ID")?;
+        let original = clients[0]
+            .upload_part()
+            .bucket(bucket)
+            .key(&key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(vec![0x41; 9 * 1024 * 1024]))
+            .send()
+            .await?;
+        let replacement = vec![0x63; 9 * 1024 * 1024];
+        let replacement_etag = format!(
+            "\"{}\"",
+            hex_simd::encode_to_string(Md5::digest(&replacement), hex_simd::AsciiCase::Lower)
+        );
+        assert_ne!(original.e_tag(), Some(replacement_etag.as_str()));
+        let scope = upload_scope(upload_id)?;
+        let path = upload_path_scope(bucket, &key, upload_id)?;
+        let roots = cluster
+            .nodes
+            .iter()
+            .flat_map(|node| &node.data_dirs)
+            .map(|root| std::path::Path::new(root).join(".rustfs.sys/multipart").join(&path))
+            .collect::<Vec<_>>();
+        let pauses = proxies[1..]
+            .iter()
+            .map(|proxy| proxy.pause(&["PreparePartTransaction"], usize::MAX, Some(&scope)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let resend = clients[0]
+            .upload_part()
+            .bucket(bucket)
+            .key(&key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(replacement.clone()));
+        let caller = tokio::spawn(async move { resend.send().await });
+        wait_for_faults(&pauses, &["PreparePartTransaction"]).await?;
+        let caller = if cancel_waiter {
+            caller.abort();
+            assert!(
+                caller
+                    .await
+                    .expect_err("cancelled three-way part response waiter")
+                    .is_cancelled()
+            );
+            None
+        } else {
+            Some(caller)
+        };
+
+        // The part owns the upload lock before either terminal call starts.
+        // Ordered rows hold the loser's remote votes so partial lock grants
+        // cannot prevent the winner from reaching its quorum.
+        let held_locks = if let Some(complete_wins) = preferred_complete {
+            let loser = if complete_wins { 2 } else { 1 };
+            let owner = proxies[loser].local_addr().to_string();
+            (0..4)
+                .filter(|node| *node != loser)
+                .map(|node| proxies[node].pause_upload_lock_owner(&scope, &owner))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        let admission = if preferred_complete.is_none() {
+            let admission = proxies[0].pause_upload_locks(&scope)?;
+            admission.release();
+            Some(admission)
+        } else {
+            None
+        };
+        let observer = admission
+            .as_ref()
+            .or_else(|| held_locks.first())
+            .expect("peer-zero lock observer");
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let complete_request = clients[1]
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(&key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(CompletedPart::builder().part_number(1).e_tag(&replacement_etag).build())
+                    .build(),
+            );
+        let complete_start = start.clone();
+        let mut complete = tokio::spawn(async move {
+            complete_start.wait().await;
+            complete_request.send().await
+        });
+        let abort_request = clients[2]
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(&key)
+            .upload_id(upload_id);
+        let abort_start = start.clone();
+        let mut abort = tokio::spawn(async move {
+            abort_start.wait().await;
+            abort_request.send().await
+        });
+        start.wait().await;
+        if let Some(complete_wins) = preferred_complete {
+            let winner = if complete_wins { 1 } else { 2 };
+            let owner = proxies[winner].local_addr().to_string();
+            wait_for_faults(&held_locks, &["Lock", "LockBatch"]).await?;
+            wait_until(
+                DEADLINE,
+                || async { Ok(observer.has_forwarded_lock_owner(&owner)) },
+                "preferred terminal coordinator reaches the peer while its competitor is held",
+            )
+            .await?;
+        } else {
+            wait_until(
+                DEADLINE,
+                || async { Ok(observer.forwarded_lock_owners() == 2) },
+                "Complete and Abort from distinct upload-lock owners reach the peer",
+            )
+            .await?;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut complete).await.is_err(),
+            "Complete must wait while the resent part is prepared: cancel_waiter={cancel_waiter}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut abort).await.is_err(),
+            "Abort must wait while the resent part is prepared: cancel_waiter={cancel_waiter}"
+        );
+        let terminal_owners = observer.forwarded_lock_owners();
+        if preferred_complete.is_none() {
+            assert_eq!(terminal_owners, 2, "both ungated terminal coordinators reach the peer");
+        } else {
+            assert_eq!(terminal_owners, 1, "only the preferred coordinator may pass the owner gate");
+        }
+        let held_lock_calls = held_locks.iter().map(RpcPause::hits).sum::<usize>();
+        assert_eq!(held_lock_calls > 0, preferred_complete.is_some());
+        drop(admission);
+        for pause in &pauses {
+            pause.release();
+        }
+        if let Some(caller) = caller {
+            let part = tokio::time::timeout(DEADLINE, caller).await???;
+            assert_eq!(part.e_tag(), Some(replacement_etag.as_str()));
+        }
+        // Keep remote peers unavailable only to the losing coordinator until
+        // the winner finishes. The part owner and winner remain unaffected.
+        let (completion, abortion) = if preferred_complete == Some(false) {
+            let abortion = tokio::time::timeout(DEADLINE, &mut abort).await??;
+            assert!(abortion.is_ok(), "preferred Abort must succeed: {abortion:?}");
+            for gate in &held_locks {
+                gate.release();
+            }
+            (tokio::time::timeout(DEADLINE, &mut complete).await??, abortion)
+        } else {
+            let completion = tokio::time::timeout(DEADLINE, &mut complete).await??;
+            if preferred_complete == Some(true) {
+                assert!(completion.is_ok(), "preferred Complete must succeed: {completion:?}");
+            }
+            for gate in &held_locks {
+                gate.release();
+            }
+            (completion, tokio::time::timeout(DEADLINE, &mut abort).await??)
+        };
+        let completed = match completion {
+            Ok(_) => true,
+            Err(error) => {
+                assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(404), "{error:?}");
+                assert_eq!(error.as_service_error().and_then(|error| error.meta().code()), Some("NoSuchUpload"));
+                false
+            }
+        };
+        if let Some(expected) = preferred_complete {
+            assert_eq!(completed, expected, "the scoped lock gate must establish the requested terminal order");
+        }
+        if !completed {
+            abortion?;
+        } else if let Err(error) = abortion {
+            assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(404), "{error:?}");
+            assert_eq!(error.as_service_error().and_then(|error| error.meta().code()), Some("NoSuchUpload"));
+        }
+        wait_until(
+            DEADLINE,
+            || async { Ok(roots.iter().all(|root| !root.exists())) },
+            "three-way terminal operation retires every staging root",
+        )
+        .await?;
+        let expected = if completed { &replacement } else { &previous };
+        for client in clients {
+            assert_object_bytes(client, bucket, &key, expected).await?;
+            let missing = client
+                .list_parts()
+                .bucket(bucket)
+                .key(&key)
+                .upload_id(upload_id)
+                .send()
+                .await
+                .expect_err("three-way terminal upload must reject ListParts");
+            assert_eq!(missing.as_service_error().and_then(|error| error.meta().code()), Some("NoSuchUpload"));
+        }
+        assert_no_uploads(clients, bucket).await?;
+        eprintln!(
+            "MPU three-way owner: cancel_waiter={cancel_waiter}, complete_won={completed}, forwarded_terminal_owners={terminal_owners}, prepared_peers=3, retired_roots=4, verified_readers=4, schedule={schedule}, held_lock_calls={held_lock_calls}"
+        );
     }
     Ok(())
 }
