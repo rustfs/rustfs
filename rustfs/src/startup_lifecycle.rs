@@ -120,7 +120,34 @@ pub(crate) struct StartupRuntimeLifecycle {
 #[derive(Debug)]
 struct StartupShutdownFailure {
     capacity: Option<Error>,
+    maintenance: Option<Error>,
+    fronts: Option<crate::startup_shutdown::FrontShutdownFailure>,
     observability: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl StartupShutdownFailure {
+    fn into_result(self) -> Result<()> {
+        if self.capacity.is_none() && self.maintenance.is_none() && self.fronts.is_none() && self.observability.is_none() {
+            return Ok(());
+        }
+        let kind = if self
+            .capacity
+            .as_ref()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+            || self
+                .maintenance
+                .as_ref()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+        {
+            std::io::ErrorKind::TimedOut
+        } else {
+            self.capacity
+                .as_ref()
+                .or(self.maintenance.as_ref())
+                .map_or(std::io::ErrorKind::Other, Error::kind)
+        };
+        Err(Error::new(kind, self))
+    }
 }
 
 impl std::fmt::Display for StartupShutdownFailure {
@@ -128,8 +155,20 @@ impl std::fmt::Display for StartupShutdownFailure {
         if let Some(capacity) = &self.capacity {
             write!(f, "{capacity}")?;
         }
-        if let Some(observability) = &self.observability {
+        if let Some(maintenance) = &self.maintenance {
             if self.capacity.is_some() {
+                write!(f, "; ")?;
+            }
+            write!(f, "{maintenance}")?;
+        }
+        if let Some(fronts) = &self.fronts {
+            if self.capacity.is_some() || self.maintenance.is_some() {
+                write!(f, "; ")?;
+            }
+            write!(f, "{fronts}")?;
+        }
+        if let Some(observability) = &self.observability {
+            if self.capacity.is_some() || self.maintenance.is_some() || self.fronts.is_some() {
                 write!(f, "; ")?;
             }
             write!(f, "shutdown_global_guard: {observability}")?;
@@ -140,9 +179,13 @@ impl std::fmt::Display for StartupShutdownFailure {
 
 impl std::error::Error for StartupShutdownFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match &self.capacity {
-            Some(capacity) => Some(capacity),
-            None => self.observability.as_ref().map(|error| error.as_ref() as _),
+        match self.capacity.as_ref().or(self.maintenance.as_ref()) {
+            Some(error) => Some(error),
+            None => self
+                .fronts
+                .as_ref()
+                .map(|error| error as &(dyn std::error::Error + 'static))
+                .or_else(|| self.observability.as_ref().map(|error| error.as_ref() as _)),
         }
     }
 }
@@ -188,7 +231,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
     let scanner_cleanup = init_scanner_with_recovery(shutdown_token.clone(), store, enable_scanner).await;
 
     let shutdown_signal = wait_for_shutdown().await;
-    let shutdown_report = run_startup_shutdown_sequence(
+    let (capacity_report, maintenance_result, front_result) = run_startup_shutdown_sequence(
         &state_manager,
         shutdown_signal,
         s3_shutdown_tx,
@@ -232,7 +275,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         );
     }
 
-    let capacity_error = shutdown_report.finish().await.err();
+    let capacity_error = capacity_report.finish().await.err();
 
     info!(
         target: "rustfs::main::run",
@@ -246,18 +289,13 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
     let observability_error = startup_runtime_sources::shutdown_observability_guard()
         .err()
         .map(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>);
-    if capacity_error.is_none() && observability_error.is_none() {
-        Ok(())
-    } else {
-        let kind = capacity_error.as_ref().map_or(std::io::ErrorKind::Other, Error::kind);
-        Err(Error::new(
-            kind,
-            StartupShutdownFailure {
-                capacity: capacity_error,
-                observability: observability_error,
-            },
-        ))
+    StartupShutdownFailure {
+        capacity: capacity_error,
+        maintenance: maintenance_result.err(),
+        fronts: front_result.err(),
+        observability: observability_error,
     }
+    .into_result()
 }
 
 async fn wait_for_scanner_cleanup(cleanup: tokio::task::JoinHandle<()>) -> bool {
@@ -328,11 +366,95 @@ pub(crate) fn log_embedded_server_ready(endpoint_address: SocketAddr) {
 
 #[cfg(test)]
 mod tests {
-    use super::{embedded_endpoint_address, mark_embedded_global_init_started, wait_for_scanner_cleanup};
+    use super::{StartupShutdownFailure, embedded_endpoint_address, mark_embedded_global_init_started, wait_for_scanner_cleanup};
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         sync::atomic::{AtomicBool, Ordering},
     };
+
+    #[test]
+    fn startup_shutdown_result_accepts_no_failures() {
+        StartupShutdownFailure {
+            capacity: None,
+            maintenance: None,
+            fronts: None,
+            observability: None,
+        }
+        .into_result()
+        .expect("all observed stages succeeded");
+    }
+
+    #[tokio::test]
+    async fn startup_shutdown_result_preserves_maintenance_only_join_error() {
+        let task = tokio::spawn(async { panic!("expected maintenance shutdown aggregation failure") });
+        let task_id = task.id();
+        let join_error = task.await.expect_err("actual maintenance task must fail");
+        let error = StartupShutdownFailure {
+            capacity: None,
+            maintenance: Some(std::io::Error::other(join_error)),
+            fronts: None,
+            observability: None,
+        }
+        .into_result()
+        .expect_err("maintenance failure must reach the lifecycle result");
+        let failure = error
+            .get_ref()
+            .expect("typed startup failure")
+            .downcast_ref::<StartupShutdownFailure>()
+            .expect("startup failure type retained");
+        let source = std::error::Error::source(failure).expect("maintenance source must survive without a capacity failure");
+        let source = source.downcast_ref::<std::io::Error>().expect("original maintenance error");
+        let join_error = source
+            .get_ref()
+            .expect("actual JoinError attached")
+            .downcast_ref::<tokio::task::JoinError>()
+            .expect("actual JoinError type");
+        assert!(join_error.is_panic());
+        assert_eq!(join_error.id(), task_id);
+    }
+
+    #[tokio::test]
+    async fn startup_shutdown_result_retains_capacity_maintenance_and_observability_failures() {
+        let capacity = tokio::spawn(async { panic!("expected capacity shutdown aggregation failure") });
+        let capacity_id = capacity.id();
+        let capacity_error = capacity.await.expect_err("actual capacity failure");
+        let maintenance = tokio::spawn(async { panic!("expected maintenance shutdown aggregation failure") });
+        let maintenance_id = maintenance.id();
+        let maintenance_error = maintenance.await.expect_err("actual maintenance failure");
+        let error = StartupShutdownFailure {
+            capacity: Some(std::io::Error::other(capacity_error)),
+            maintenance: Some(std::io::Error::new(std::io::ErrorKind::TimedOut, maintenance_error)),
+            fronts: None,
+            observability: Some(Box::new(std::io::Error::other("observability fixture failure"))),
+        }
+        .into_result()
+        .expect_err("no observed failure may be overwritten by another stage");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "maintenance's original deadline stays failed");
+        let failure = error
+            .get_ref()
+            .expect("typed startup failure")
+            .downcast_ref::<StartupShutdownFailure>()
+            .expect("startup failure type retained");
+        let capacity_error = failure.capacity.as_ref().expect("capacity failure retained");
+        let capacity_join = capacity_error
+            .get_ref()
+            .expect("capacity JoinError attached")
+            .downcast_ref::<tokio::task::JoinError>()
+            .expect("capacity JoinError type retained");
+        assert_eq!(capacity_join.id(), capacity_id);
+        let maintenance_error = failure.maintenance.as_ref().expect("maintenance failure retained");
+        let maintenance_join = maintenance_error
+            .get_ref()
+            .expect("maintenance JoinError attached")
+            .downcast_ref::<tokio::task::JoinError>()
+            .expect("maintenance JoinError type retained");
+        assert_eq!(maintenance_join.id(), maintenance_id);
+        assert!(failure.observability.is_some(), "observability cleanup failure must also survive");
+        let display = error.to_string();
+        assert!(display.contains("expected capacity shutdown aggregation failure"));
+        assert!(display.contains("expected maintenance shutdown aggregation failure"));
+        assert!(display.contains("observability fixture failure"));
+    }
 
     #[tokio::test]
     async fn disabled_cleanup_shutdown_joins_a_finished_task() {
@@ -419,5 +541,101 @@ mod tests {
             embedded_endpoint_address(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9001)),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9001)
         );
+    }
+    #[tokio::test]
+    async fn startup_shutdown_front_only_retains_actual_join_error_source() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+        let task = tokio::spawn(async { panic!("expected lifecycle front failure") });
+        let task_id = task.id();
+        let mut s3 = Some(crate::server::ShutdownHandle::new(tx, task));
+        let mut console = None;
+        let mut optional = Vec::new();
+        let mut fronts = crate::startup_shutdown::FrontShutdownFailure::default();
+        crate::startup_shutdown::join_startup_fronts(&mut s3, &mut console, &mut optional, &mut fronts).await;
+        let error = StartupShutdownFailure {
+            capacity: None,
+            maintenance: None,
+            fronts: fronts.into_result().err(),
+            observability: None,
+        }
+        .into_result()
+        .expect_err("front failure must reach lifecycle result");
+        assert!(error.to_string().contains("join_panicked"));
+        assert!(
+            !error.to_string().contains("expected lifecycle front failure"),
+            "front Display keeps panic payload out"
+        );
+        let failure = error
+            .get_ref()
+            .expect("typed lifecycle failure")
+            .downcast_ref::<StartupShutdownFailure>()
+            .expect("lifecycle failure type");
+        let source = std::error::Error::source(failure).expect("front failure source");
+        let source = std::error::Error::source(source).expect("checked receipt source");
+        let source = std::error::Error::source(source).expect("actual task source");
+        let join = source
+            .downcast_ref::<tokio::task::JoinError>()
+            .expect("original JoinError type");
+        assert!(join.is_panic());
+        assert_eq!(join.id(), task_id);
+        assert!(s3.is_none() && console.is_none() && optional.is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_shutdown_result_retains_front_capacity_maintenance_and_observability() {
+        let capacity = tokio::spawn(async { panic!("expected capacity combination failure") });
+        let capacity_id = capacity.id();
+        let capacity = capacity.await.expect_err("actual capacity task panic");
+        let maintenance = tokio::spawn(async { panic!("expected maintenance combination failure") });
+        let maintenance_id = maintenance.id();
+        let maintenance = maintenance.await.expect_err("actual maintenance task panic");
+        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+        let front = tokio::spawn(async { panic!("expected front combination failure") });
+        let front_id = front.id();
+        let mut s3 = Some(crate::server::ShutdownHandle::new(tx, front));
+        let mut console = None;
+        let mut optional = Vec::new();
+        let mut fronts = crate::startup_shutdown::FrontShutdownFailure::default();
+        crate::startup_shutdown::join_startup_fronts(&mut s3, &mut console, &mut optional, &mut fronts).await;
+        let error = StartupShutdownFailure {
+            capacity: Some(std::io::Error::new(std::io::ErrorKind::TimedOut, capacity)),
+            maintenance: Some(std::io::Error::other(maintenance)),
+            fronts: fronts.into_result().err(),
+            observability: Some(Box::new(std::io::Error::other("observability combination failure"))),
+        }
+        .into_result()
+        .expect_err("every failure remains represented");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let failure = error
+            .get_ref()
+            .expect("typed lifecycle failure")
+            .downcast_ref::<StartupShutdownFailure>()
+            .expect("lifecycle failure type");
+        let capacity = failure
+            .capacity
+            .as_ref()
+            .expect("capacity retained")
+            .get_ref()
+            .expect("capacity source")
+            .downcast_ref::<tokio::task::JoinError>()
+            .expect("actual capacity JoinError");
+        assert_eq!(capacity.id(), capacity_id);
+        let maintenance = failure
+            .maintenance
+            .as_ref()
+            .expect("maintenance retained")
+            .get_ref()
+            .expect("maintenance source")
+            .downcast_ref::<tokio::task::JoinError>()
+            .expect("actual maintenance JoinError");
+        assert_eq!(maintenance.id(), maintenance_id);
+        let source = std::error::Error::source(failure.fronts.as_ref().expect("front retained")).expect("checked receipt");
+        let join = std::error::Error::source(source)
+            .expect("actual front source")
+            .downcast_ref::<tokio::task::JoinError>()
+            .expect("actual front JoinError");
+        assert_eq!(join.id(), front_id);
+        assert!(failure.observability.is_some());
+        assert!(s3.is_none() && console.is_none() && optional.is_empty());
     }
 }

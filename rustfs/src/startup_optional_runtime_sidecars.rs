@@ -13,11 +13,10 @@
 // limitations under the License.
 
 use crate::{
-    server::ShutdownHandle,
+    server::{ShutdownHandle, ShutdownWaitError},
     startup_protocols::{ProtocolShutdownSenders, init_protocol_shutdown_senders},
     storage_api::startup::services::ServerContextSlot,
 };
-use futures_util::future::join_all;
 use std::{io::Result, sync::Arc};
 use tracing::info;
 
@@ -101,8 +100,21 @@ pub(crate) fn prepare_optional_runtime_shutdowns(optional_runtimes: OptionalRunt
     protocol_shutdowns
 }
 
-pub(crate) async fn shutdown_optional_runtime_services(protocol_shutdowns: Vec<ShutdownHandle>) {
-    join_all(protocol_shutdowns.into_iter().map(ShutdownHandle::shutdown)).await;
+pub(crate) async fn shutdown_optional_runtime_services(
+    protocol_shutdowns: &mut Vec<ShutdownHandle>,
+    failures: &mut Vec<ShutdownWaitError>,
+) {
+    for handle in protocol_shutdowns.iter() {
+        handle.signal();
+    }
+    // At most four configured fronts; keep each actual owner until its join is observed.
+    while let Some(handle) = protocol_shutdowns.first_mut() {
+        let result = handle.wait_checked().await;
+        protocol_shutdowns.remove(0);
+        if let Err(error) = result {
+            failures.push(error);
+        }
+    }
 }
 
 fn log_protocol_stopping(step: OptionalRuntimeShutdownStep) {
@@ -171,14 +183,97 @@ mod tests {
             sftp: None,
         };
 
-        let protocol_shutdowns = prepare_optional_runtime_shutdowns(OptionalRuntimeServices::new(protocols));
+        let mut protocol_shutdowns = prepare_optional_runtime_shutdowns(OptionalRuntimeServices::new(protocols));
         tokio::task::yield_now().await;
         assert!(events.lock().unwrap_or_else(|err| err.into_inner()).is_empty());
 
-        shutdown_optional_runtime_services(protocol_shutdowns).await;
+        let mut failures = Vec::new();
+        shutdown_optional_runtime_services(&mut protocol_shutdowns, &mut failures).await;
+        assert!(failures.is_empty(), "all configured front task joins succeeded");
+        assert!(protocol_shutdowns.is_empty(), "all actual owners were joined");
 
         let mut events = events.lock().unwrap_or_else(|err| err.into_inner()).clone();
         events.sort_unstable();
         assert_eq!(events, ["ftp", "webdav"]);
+    }
+    #[tokio::test]
+    async fn optional_front_join_observer_retains_errors_and_all_remaining_owners() {
+        use crate::server::ShutdownWaitError;
+        use std::{future::Future, task::Poll, time::Duration};
+        let (tx, _rx) = broadcast::channel(1);
+        let panic = tokio::spawn(async { panic!("expected optional front panic") });
+        let panic_id = panic.id();
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            while !panic.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let panic = ShutdownHandle::new(tx, panic);
+        let (tx, mut rx) = broadcast::channel(1);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let held = ShutdownHandle::new(
+            tx,
+            tokio::spawn(async move {
+                let _ = rx.recv().await;
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+                let _ = done_tx.send(());
+            }),
+        );
+        let (tx, _rx) = broadcast::channel(1);
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        let cancel_id = cancelled.id();
+        cancelled.abort();
+        let cancelled = ShutdownHandle::new(tx, cancelled);
+        let mut handles = vec![panic, held, cancelled];
+        let mut failures = Vec::new();
+        let mut observer = Box::pin(shutdown_optional_runtime_services(&mut handles, &mut failures));
+        let pending = std::future::poll_fn(|cx| Poll::Ready(observer.as_mut().poll(cx).is_pending())).await;
+        drop(observer);
+        let retained = handles.len() == 2 && failures.len() == 1;
+        let entered = tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .is_ok_and(|r| r.is_ok());
+        for handle in &handles {
+            handle.signal();
+        }
+        let _ = release_tx.send(());
+        let completed = tokio::time::timeout(Duration::from_secs(5), done_rx)
+            .await
+            .is_ok_and(|r| r.is_ok());
+        shutdown_optional_runtime_services(&mut handles, &mut failures).await;
+        assert!(ready && pending && retained && entered && completed);
+        assert!(handles.is_empty());
+        assert_eq!(failures.len(), 2);
+        match &failures[0] {
+            ShutdownWaitError::Join(error) => {
+                assert!(error.is_panic());
+                assert_eq!(error.id(), panic_id);
+            }
+            error => panic!("lost real panic: {error}"),
+        }
+        match &failures[1] {
+            ShutdownWaitError::Join(error) => {
+                assert!(error.is_cancelled());
+                assert_eq!(error.id(), cancel_id);
+            }
+            error => panic!("lost real cancellation: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_front_consumed_handle_is_not_reported_as_success() {
+        let (tx, _rx) = broadcast::channel(1);
+        let mut handle = ShutdownHandle::new(tx, tokio::spawn(async {}));
+        handle.wait_checked().await.expect("actual initial join");
+        let mut handles = vec![handle];
+        let mut failures = Vec::new();
+        shutdown_optional_runtime_services(&mut handles, &mut failures).await;
+        assert!(handles.is_empty());
+        assert!(matches!(failures.as_slice(), [crate::server::ShutdownWaitError::MissingTask]));
     }
 }

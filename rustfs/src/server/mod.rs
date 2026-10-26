@@ -36,6 +36,10 @@ mod http3;
 
 use tracing::warn;
 
+const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
+const LOG_COMPONENT_SERVER: &str = "server";
+const LOG_SUBSYSTEM_TRANSPORT: &str = "transport";
+
 // Items used by main.rs (binary crate) and/or embedded.rs — must be fully pub.
 pub(crate) use audit::apply_audit_module_switch_for_context;
 pub use audit::{is_audit_module_enabled, refresh_audit_module_enabled, start_audit_system, stop_audit_system};
@@ -102,6 +106,38 @@ pub(crate) fn strip_valid_port_suffix(host: &str) -> &str {
     }
 }
 
+/// Failure to observe the one task owned by a shutdown handle.
+#[derive(Debug)]
+pub(crate) enum ShutdownWaitError {
+    Join(tokio::task::JoinError),
+    MissingTask,
+}
+
+impl ShutdownWaitError {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Join(error) if error.is_cancelled() => "join_cancelled",
+            Self::Join(_) => "join_panicked",
+            Self::MissingTask => "join_unconfirmed",
+        }
+    }
+}
+
+impl std::fmt::Display for ShutdownWaitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server task shutdown {}", self.reason())
+    }
+}
+
+impl std::error::Error for ShutdownWaitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Join(error) => Some(error),
+            Self::MissingTask => None,
+        }
+    }
+}
+
 pub struct ShutdownHandle {
     shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
@@ -126,11 +162,27 @@ impl ShutdownHandle {
         self.wait().await;
     }
 
+    /// Observe only this outer task, not every connection or request it spawned.
+    /// Dropping a pending observer leaves the original task in this handle.
+    pub(crate) async fn wait_checked(&mut self) -> Result<(), ShutdownWaitError> {
+        let Some(task_handle) = self.task_handle.as_mut() else {
+            return Err(ShutdownWaitError::MissingTask);
+        };
+        let result = task_handle.await;
+        let _ = self.task_handle.take();
+        result.map_err(ShutdownWaitError::Join)
+    }
+
     pub async fn wait(mut self) {
-        if let Some(task_handle) = self.task_handle.take()
-            && let Err(err) = task_handle.await
-        {
-            warn!(?err, "Server task join failed during shutdown");
+        if let Err(err) = self.wait_checked().await {
+            warn!(
+                event = EVENT_SERVER_SHUTDOWN_STATE,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                state = "join_failed",
+                reason = err.reason(),
+                "Server task join failed during shutdown"
+            );
         }
     }
 }
@@ -140,5 +192,119 @@ impl Drop for ShutdownHandle {
         if let Some(tx) = &self.shutdown_tx {
             let _ = tx.send(());
         }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_handle_tests {
+    use super::{ShutdownHandle, ShutdownWaitError};
+    use std::{future::Future, task::Poll, time::Duration};
+    use tokio::sync::{broadcast, oneshot};
+
+    #[tokio::test]
+    async fn checked_wait_cancelled_observer_keeps_original_held_task() {
+        let (tx, mut rx) = broadcast::channel(1);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = rx.recv().await;
+            let _ = entered_tx.send(());
+            let _ = release_rx.await;
+            let _ = done_tx.send(());
+        });
+        let id = task.id();
+        let mut handle = ShutdownHandle::new(tx, task);
+        handle.signal();
+        let entered = tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .is_ok_and(|r| r.is_ok());
+        let mut observer = Box::pin(handle.wait_checked());
+        let pending = std::future::poll_fn(|cx| Poll::Ready(observer.as_mut().poll(cx).is_pending())).await;
+        drop(observer);
+        let retained = handle.task_handle.as_ref().is_some_and(|task| task.id() == id);
+        let _ = release_tx.send(());
+        let completed = tokio::time::timeout(Duration::from_secs(5), done_rx)
+            .await
+            .is_ok_and(|r| r.is_ok());
+        let joined = handle.wait_checked().await;
+        assert!(entered && pending && retained && completed);
+        joined.expect("same original task joined after observer cancellation");
+        assert!(handle.task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn checked_wait_preserves_actual_panic_and_cancel_sources() {
+        let (tx, _rx) = broadcast::channel(1);
+        let task = tokio::spawn(async { panic!("expected checked server task panic") });
+        let panic_id = task.id();
+        let mut handle = ShutdownHandle::new(tx, task);
+        let panic = handle.wait_checked().await.expect_err("actual panic must survive");
+        assert!(panic.to_string().contains("join_panicked"));
+        assert!(
+            !panic.to_string().contains("expected checked server task panic"),
+            "Display must not emit the panic payload"
+        );
+        let source = std::error::Error::source(&panic).expect("actual JoinError source");
+        let source = source.downcast_ref::<tokio::task::JoinError>().expect("typed JoinError");
+        assert!(source.is_panic());
+        assert_eq!(source.id(), panic_id);
+
+        let (tx, _rx) = broadcast::channel(1);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = entered_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let cancel_id = task.id();
+        let abort = task.abort_handle();
+        let mut handle = ShutdownHandle::new(tx, task);
+        let entered = tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .is_ok_and(|r| r.is_ok());
+        abort.abort();
+        let cancelled = handle.wait_checked().await.expect_err("actual cancellation must survive");
+        let source = std::error::Error::source(&cancelled).expect("actual JoinError source");
+        let source = source.downcast_ref::<tokio::task::JoinError>().expect("typed JoinError");
+        assert!(entered && source.is_cancelled());
+        assert_eq!(source.id(), cancel_id);
+    }
+
+    #[tokio::test]
+    async fn checked_wait_missing_or_consumed_receipt_stays_unknown() {
+        let mut missing = ShutdownHandle {
+            shutdown_tx: None,
+            task_handle: None,
+        };
+        assert!(matches!(missing.wait_checked().await, Err(ShutdownWaitError::MissingTask)));
+        let (tx, _rx) = broadcast::channel(1);
+        let mut completed = ShutdownHandle::new(tx, tokio::spawn(async {}));
+        completed.wait_checked().await.expect("actual task joined once");
+        assert!(matches!(completed.wait_checked().await, Err(ShutdownWaitError::MissingTask)));
+    }
+
+    #[tokio::test]
+    async fn checked_outer_join_does_not_certify_accepted_child_retirement() {
+        let (tx, _rx) = broadcast::channel(1);
+        let (child_tx, child_rx) = oneshot::channel();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let outer = tokio::spawn(async move {
+            let child = tokio::spawn(async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            });
+            let _ = child_tx.send(child);
+        });
+        let mut handle = ShutdownHandle::new(tx, outer);
+        let child = child_rx.await.expect("actual accepted child owner");
+        let entered = tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .is_ok_and(|r| r.is_ok());
+        let outer_joined = handle.wait_checked().await.is_ok();
+        let child_still_held = !child.is_finished();
+        let _ = release_tx.send(());
+        child.await.expect("accepted child joined only after its own release");
+        assert!(entered && outer_joined && child_still_held);
     }
 }
