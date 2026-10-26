@@ -44,10 +44,13 @@ pub(crate) async fn read_compatible_admin_body(
     // Legacy handlers still hand over the s3s body; owned handlers pass the
     // RustFS body. Both read through the owned type so one limit applies.
     let mut input: rustfs_s3_types::Body = input.into();
-    let body = input
-        .store_all_limited(max_len)
-        .await
-        .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
+    let body = input.store_all_limited(max_len).await.map_err(|e| {
+        if e.is::<rustfs_s3_types::BodyTooLarge>() {
+            s3_error!(InvalidRequest, "failed to read request body: length limit exceeded")
+        } else {
+            s3_error!(InvalidRequest, "failed to read request body: {}", e)
+        }
+    })?;
 
     if is_compat_admin_request(path) {
         decrypt_stream_io(secret_key.as_bytes(), body.as_ref())
@@ -222,11 +225,29 @@ mod tests {
                 .expect_err("eleven bytes exceed an eight byte limit");
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
-        assert!(
-            err.message()
-                .is_some_and(|message| message.contains("exceeds the 8 byte limit")),
-            "{err:?}"
-        );
+        assert_eq!(err.message(), Some("failed to read request body: length limit exceeded"));
+
+        let legacy_body = Body::http_body(http_body_util::Full::new(bytes::Bytes::from_static(b"nine bytes!")));
+        let legacy_err = read_compatible_admin_body(legacy_body, 8, "/rustfs/admin/v3/list-users", "secret")
+            .await
+            .expect_err("legacy streaming bodies retain the same limit error");
+        assert_eq!(legacy_err.code(), err.code());
+        assert_eq!(legacy_err.message(), err.message());
+
+        let exact =
+            read_compatible_admin_body(rustfs_s3_types::Body::from("12345678"), 8, "/rustfs/admin/v3/list-users", "secret")
+                .await
+                .expect("the exact byte limit is allowed");
+        assert_eq!(exact, b"12345678");
+
+        let failed_body = rustfs_s3_types::Body::from_stream(futures_util::stream::iter([Err::<bytes::Bytes, _>(
+            std::io::Error::other("transport failed"),
+        )]));
+        let stream_err = read_compatible_admin_body(failed_body, 8, "/rustfs/admin/v3/list-users", "secret")
+            .await
+            .expect_err("transport errors remain distinct from the byte limit");
+        assert_eq!(stream_err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(stream_err.message(), Some("failed to read request body: transport failed"));
     }
 
     async fn body_bytes(mut body: Body) -> Vec<u8> {
