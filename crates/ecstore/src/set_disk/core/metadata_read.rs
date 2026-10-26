@@ -622,6 +622,7 @@ pub(in crate::set_disk) async fn data_read_early_stop_inline_body_miss_reason(
     disks: &[Option<DiskStore>],
 ) -> Option<&'static str> {
     verify_inline_body_from_observations(
+        _object,
         candidate,
         parts_metadata
             .iter()
@@ -633,6 +634,7 @@ pub(in crate::set_disk) async fn data_read_early_stop_inline_body_miss_reason(
 }
 
 fn verify_inline_body_from_observations<'a>(
+    _object: &str,
     candidate: &FileInfo,
     observations: impl IntoIterator<Item = (usize, Option<&'a FileInfo>)>,
     disks: &[Option<DiskStore>],
@@ -689,10 +691,10 @@ fn verify_inline_body_from_observations<'a>(
     {
         for file in &data_files {
             if file.data.is_some() {
-                crate::set_disk::disk_call_counters::record_shard_open(object, true);
+                crate::set_disk::disk_call_counters::record_shard_open(_object, true);
             }
         }
-        crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
+        crate::set_disk::disk_call_counters::record(_object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
     }
 
     let hash_size = checksum_algo.size();
@@ -1397,6 +1399,7 @@ impl SetDisks {
                             accumulator.candidate_has_read_reserve()
                         }
                         Some(candidate) => match verify_inline_body_from_observations(
+                            object.as_ref(),
                             candidate,
                             slots.iter().map(|slot| (slot.disk_index, slot.file_info())),
                             disks,
