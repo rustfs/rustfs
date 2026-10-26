@@ -33,6 +33,9 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
+    # Ordered drain patch fixed while hotpath-rs/hotpath#759 is reviewed.
+    # owner: overtrue  review: 2026-10
+    "https://github.com/rustfs/hotpath.git",
     # Official s3s repository pinned for Iceberg SigV4 path encoding support.
     # owner: GatewayJ  review: 2026-10
     "https://github.com/s3s-project/s3s",
@@ -43,9 +46,9 @@ allow-git = [
     # owner: rustfs-maintainers  review: 2026-10
     "https://github.com/ramosbugs/openidconnect-rs",
     "https://github.com/ramosbugs/oauth2-rs",
-    # RustFS io_uring backend is now consumed from crates.io at 0.3.0.
-    # owner: rustfs-maintainers  review: 2026-10
-    # "https://github.com/rustfs/uring",
+    # Completion ownership patch fixed to rustfs/uring#20.
+    # owner: overtrue  review: 2026-10
+    "https://github.com/rustfs/uring.git",
 ]
 
 [bans]

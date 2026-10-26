@@ -384,7 +384,7 @@ dav-server = "0.11.0"
 # Performance Analysis and Memory Profiling
 rustfs-mimalloc = { version = "0.7.2" }
 # Preserve Unicode focus filters until rustfs/backlog#2302 is resolved.
-hotpath = { version = "0.29.1", default-features = false }
+hotpath = { version = "=0.29.1", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.49" }
 
@@ -424,6 +424,9 @@ strip = "none"
 
 # Pin upstream fixes until compatible crates.io releases are available.
 [patch.crates-io]
+# Keep the ordered drain API fixed while its upstream patch is reviewed.
+hotpath = { git = "https://github.com/rustfs/hotpath.git", rev = "4d7a2f15758e65579c7c80f3c14b8c90b7760d3b" }
+hotpath-drain = { git = "https://github.com/rustfs/hotpath.git", rev = "4d7a2f15758e65579c7c80f3c14b8c90b7760d3b" }
 # Preserve RustFS OIDC flows while migrating the old elliptic-curve dependency chain.
 # Upstream: openidconnect-rs#244 and oauth2-rs#352.
 openidconnect = { git = "https://github.com/ramosbugs/openidconnect-rs", rev = "2f77ee73bc4554e1cb6279adb386005429fb4e41" }

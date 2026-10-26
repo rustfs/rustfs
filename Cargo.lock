@@ -5236,8 +5236,7 @@ dependencies = [
 [[package]]
 name = "hotpath"
 version = "0.29.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62f2351902fa259b758c7303505273393f6b08172ab5bdd5739a2d2bc6d554e8"
+source = "git+https://github.com/rustfs/hotpath.git?rev=4d7a2f15758e65579c7c80f3c14b8c90b7760d3b#4d7a2f15758e65579c7c80f3c14b8c90b7760d3b"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -5271,14 +5270,12 @@ dependencies = [
 [[package]]
 name = "hotpath-drain"
 version = "0.29.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83dab2340134d9976d62f9f5172f9c6584c7f521b092f258e0e58e412e160b53"
+source = "git+https://github.com/rustfs/hotpath.git?rev=4d7a2f15758e65579c7c80f3c14b8c90b7760d3b#4d7a2f15758e65579c7c80f3c14b8c90b7760d3b"
 
 [[package]]
 name = "hotpath-macros"
 version = "0.29.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a04bbe5701b097f224a08187a78b75bb9d9b4bbaff6a279c2a50ba73edbb7aac"
+source = "git+https://github.com/rustfs/hotpath.git?rev=4d7a2f15758e65579c7c80f3c14b8c90b7760d3b#4d7a2f15758e65579c7c80f3c14b8c90b7760d3b"
 dependencies = [
  "proc-macro2",
  "quote",
