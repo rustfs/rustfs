@@ -23,9 +23,13 @@ def stable(info):
             info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def inventory(root):
+def inventory(root, *, copy_to=None):
     files, total, entries = [], 0, 0
     device = root.lstat().st_dev
+    if copy_to is not None:
+        require(copy_to.is_absolute() and copy_to.parent.resolve(strict=True) == copy_to.parent,
+                "evidence copy parent is not canonical")
+        copy_to.mkdir(mode=0o700, exist_ok=False)
 
     def visit(fd, prefix):
         nonlocal total, entries
@@ -41,6 +45,8 @@ def inventory(root):
             path = prefix + name
             require(info.st_uid == os.getuid() and info.st_dev == device, "evidence entry has a different owner or device")
             if stat.S_ISDIR(info.st_mode):
+                if copy_to is not None:
+                    (copy_to / path).mkdir(mode=0o700, exist_ok=False)
                 child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                 try:
                     require(stable(os.fstat(child)) == stable(info), "evidence directory changed before inspection")
@@ -52,17 +58,28 @@ def inventory(root):
                         and len(files) < MAX_FILES and total + info.st_size <= MAX_BYTES,
                         "evidence contains links, special files or exceeds its byte/file budget")
                 child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                target = None
                 try:
                     require(stable(os.fstat(child)) == stable(info), "evidence file changed before inspection")
+                    if copy_to is not None:
+                        target = os.open(copy_to / path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                     digest, size = hashlib.sha256(), 0
                     while chunk := os.read(child, 1024**2):
                         size += len(chunk)
                         require(size <= info.st_size, "evidence file grew during inspection")
                         digest.update(chunk)
+                        if target is not None:
+                            remaining = memoryview(chunk)
+                            while remaining:
+                                written = os.write(target, remaining)
+                                require(written > 0, "evidence copy made no progress")
+                                remaining = remaining[written:]
                     require(size == info.st_size and stable(os.fstat(child)) == stable(info),
                             "evidence file changed during inspection")
                 finally:
                     os.close(child)
+                    if target is not None:
+                        os.close(target)
                 total += size
                 files.append({"path": path, "size": size, "sha256": digest.hexdigest()})
             require(stable(os.stat(name, dir_fd=fd, follow_symlinks=False)) == stable(info),

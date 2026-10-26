@@ -90,6 +90,11 @@ on:
         type: string
         required: false
         default: ''
+      validation_cleanup_retained_evidence:
+        description: Recover from verified persistent runner-local evidence when the failed run uploaded no artifact
+        type: boolean
+        required: false
+        default: false
       validation_tools_run_id:
         description: Successful tool build run; required by Heal physical metadata checks
         type: string
@@ -187,7 +192,7 @@ jobs:
               raise ValueError("package build requires an exact source SHA")
           exclusive = ("validation_retain_evidence_run_id", "validation_runner_inspect_only", "build_run_id", "build_run_attempt", "validation_case", "auto_testing_sha",
                        "validation_tools_only", "validation_native_tools", "validation_shared_tools",
-                       "validation_manager_tools", "validation_cleanup_run_id", "validation_tools_run_id")
+                       "validation_manager_tools", "validation_cleanup_run_id", "validation_cleanup_retained_evidence", "validation_tools_run_id")
           if any(value.get(name) for name in exclusive):
               raise ValueError("package-only build cannot select existing candidate, tools, fleet or recovery execution")
           PY
@@ -205,7 +210,7 @@ jobs:
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
 
   prepare:
-    if: ${{ (github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id == '' && inputs.validation_package_sha == '' && inputs.validation_case == '' && !inputs.validation_tools_only && !inputs.validation_native_tools && !inputs.validation_shared_tools && !inputs.validation_manager_tools && inputs.validation_cleanup_run_id == '') || github.event.workflow_run.event == 'schedule' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id == '' && inputs.validation_package_sha == '' && inputs.validation_case == '' && !inputs.validation_tools_only && !inputs.validation_native_tools && !inputs.validation_shared_tools && !inputs.validation_manager_tools && !inputs.validation_cleanup_retained_evidence && inputs.validation_cleanup_run_id == '') || github.event.workflow_run.event == 'schedule' }}
     runs-on: smoke-testing
     timeout-minutes: 10
     outputs:
@@ -254,7 +259,7 @@ jobs:
           fi
 
   validation:
-    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id == '' && inputs.validation_package_sha == '' && (inputs.validation_case != '' || inputs.validation_tools_only || inputs.validation_native_tools || inputs.validation_shared_tools || inputs.validation_manager_tools || inputs.validation_cleanup_run_id != '') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id == '' && inputs.validation_package_sha == '' && (inputs.validation_case != '' || inputs.validation_tools_only || inputs.validation_native_tools || inputs.validation_shared_tools || inputs.validation_manager_tools || inputs.validation_cleanup_run_id != '' || inputs.validation_cleanup_retained_evidence) }}
     runs-on: ${{ inputs.validation_tools_only && 'ubuntu-latest' || 'smoke-testing' }}
     timeout-minutes: 90
     outputs:
@@ -290,6 +295,7 @@ jobs:
           BUILD_RUN_ATTEMPT: ${{ inputs.build_run_attempt }}
           AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
           CLEANUP_RUN_ID: ${{ inputs.validation_cleanup_run_id }}
+          CLEANUP_RETAINED_EVIDENCE: ${{ inputs.validation_cleanup_retained_evidence }}
           SELECTED_CASE: ${{ inputs.validation_case }}
           TOOLS_ONLY: ${{ inputs.validation_tools_only }}
           NATIVE_TOOLS: ${{ inputs.validation_native_tools }}
@@ -307,6 +313,8 @@ jobs:
 
           revision = os.environ["AUTO_TESTING_SHA"]
           cleanup = os.environ["CLEANUP_RUN_ID"]
+          if os.environ["CLEANUP_RETAINED_EVIDENCE"] == "true" and not cleanup:
+              raise ValueError("persistent recovery input requires one exact cleanup run")
           if os.environ["TOOLS_ONLY"] == "true" and (cleanup or os.environ["SELECTED_CASE"]):
               raise ValueError("tools-only execution cannot select a fleet case or cleanup")
           if os.environ["NATIVE_TOOLS"] == "true" and (os.environ["TOOLS_ONLY"] != "true" or cleanup or os.environ["SELECTED_CASE"]):
@@ -586,6 +594,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           FAILED_RUN_ID: ${{ inputs.validation_cleanup_run_id }}
           AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+          CLEANUP_RETAINED_EVIDENCE: ${{ inputs.validation_cleanup_retained_evidence }}
         run: |
           set -euo pipefail
           test "$(git -C auto-testing rev-parse HEAD)" = "${AUTO_TESTING_SHA}"
@@ -600,8 +609,13 @@ jobs:
               or run["workflowName"] != "RustFS Functional Chain" or run["headBranch"] != os.environ["GITHUB_REF_NAME"]):
               raise ValueError("cleanup source must be a completed failed or cancelled Functional Chain run")
           PY
-          gh run download "${FAILED_RUN_ID}" --repo "${GITHUB_REPOSITORY}" \
-            --pattern "rustfs-validation-${FAILED_RUN_ID}-*" --dir "${VALIDATION_ROOT}/failed-artifact"
+          if [ "${CLEANUP_RETAINED_EVIDENCE}" = true ]; then
+            python3 -B scripts/prepare_retained_validation_recovery.py \
+              --report "${VALIDATION_ROOT}/retained-recovery-input.json"
+          else
+            gh run download "${FAILED_RUN_ID}" --repo "${GITHUB_REPOSITORY}" \
+              --pattern "rustfs-validation-${FAILED_RUN_ID}-*" --dir "${VALIDATION_ROOT}/failed-artifact"
+          fi
           python3 -B auto-testing/scripts/validation_heal/recover_environment.py \
             --failed-run-id "${FAILED_RUN_ID}" --artifact "${VALIDATION_ROOT}/failed-artifact" \
             --candidate "${VALIDATION_ROOT}/candidate.json" --evidence "${VALIDATION_ROOT}/recovery"

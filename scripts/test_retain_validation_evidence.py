@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 import retain_validation_evidence as retain
+import prepare_retained_validation_recovery as recovery_input
 
 
 class RetainEvidenceTests(unittest.TestCase):
@@ -130,6 +131,58 @@ class RetainEvidenceTests(unittest.TestCase):
             self.assertFalse(value["complete"])
             self.assertEqual(value["errorType"], "FileNotFoundError")
             self.assertFalse(Path(env["GITHUB_ENV"]).exists())
+
+    def test_recovery_copy_keeps_original_bytes_and_separate_collection_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env, root, run, jobs = self.fixture(directory)
+            destination = Path(directory).resolve() / 'new-recovery'; destination.mkdir(mode=0o700)
+            env.update(FAILED_RUN_ID='77', GITHUB_REF_NAME='topic', VALIDATION_ROOT=str(destination))
+            run['head_branch'] = 'topic'
+            nested = root / 'nested'; nested.mkdir(); (nested / 'receipt').write_bytes(b'ACK')
+            before = retain.inventory(root)
+            report = {'collectionRunId': '88', 'sourceArtifactClaimed': False}
+            with patch.object(recovery_input, 'api', return_value=run), patch.object(retain, 'api', side_effect=[run, jobs]):
+                recovery_input.stage(env, report)
+            self.assertTrue(report['complete'])
+            self.assertEqual(report['collectionRunId'], '88')
+            self.assertEqual(report['sourceRun']['id'], 77)
+            self.assertIs(report['sourceArtifactClaimed'], False)
+            copied = Path(report['recoveryInput'])
+            self.assertEqual(retain.inventory(copied), before)
+            self.assertEqual(retain.inventory(root), before)
+            self.assertNotEqual((copied / 'original.json').stat().st_ino, (root / 'original.json').stat().st_ino)
+
+    def test_recovery_copy_refuses_changed_source_and_foreign_branch(self):
+        for mutation in ('drift', 'branch'):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                env, root, run, jobs = self.fixture(directory)
+                destination = Path(directory).resolve() / 'recovery'; destination.mkdir(mode=0o700)
+                env.update(FAILED_RUN_ID='77', GITHUB_REF_NAME='topic', VALIDATION_ROOT=str(destination))
+                run['head_branch'] = 'foreign' if mutation == 'branch' else 'topic'
+                original = retain.prepare
+                def changed(environment, report):
+                    source = original(environment, report)
+                    (source / 'original.json').write_bytes(b'new bytes after admission')
+                    return source
+                with patch.object(recovery_input, 'api', return_value=run), \
+                     patch.object(retain, 'api', side_effect=[run, jobs]), \
+                     patch.object(recovery_input, 'prepare', side_effect=changed), self.assertRaises(ValueError):
+                    recovery_input.stage(env, {})
+
+    def test_copy_does_not_follow_a_symlink_swapped_after_directory_listing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env, root, run, jobs = self.fixture(directory)
+            secret = Path(directory) / 'private'; secret.write_bytes(b'outside-root-secret')
+            destination = Path(directory).resolve() / 'copy'
+            original_stat = os.stat
+            def swapped(path, *args, **kwargs):
+                info = original_stat(path, *args, **kwargs)
+                if path == 'original.json' and kwargs.get('follow_symlinks') is False:
+                    (root / path).unlink(); (root / path).symlink_to(secret)
+                return info
+            with patch.object(retain.os, 'stat', side_effect=swapped), self.assertRaises(OSError):
+                retain.inventory(root, copy_to=destination)
+            self.assertFalse((destination / 'original.json').exists())
 
 
 if __name__ == "__main__":
