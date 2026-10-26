@@ -239,6 +239,45 @@ async fn issue_8297_supervisor_recovers_paused_follower_without_restart() {
     crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }
 
+#[tokio::test]
+#[serial]
+async fn enabled_scanner_startup_returns_owned_supervisor_handle() {
+    temp_env::async_with_vars([(ENV_SCANNER_CYCLE, Some("1")), (ENV_SCANNER_START_DELAY_SECS, Some("0"))], async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+        global_metrics().set_cycle(None).await;
+        let (_dir, store) = setup_scanner_cycle_store().await;
+        assert!(!crate::scanner_runtime_initialized(), "test must own the scanner runtime");
+        let ctx = CancellationToken::new();
+        let _cancel_on_drop = ctx.clone().drop_guard();
+        let startup_probe = ScannerStartupObservedProbe::install();
+        let mut supervisor = init_scanner_with_recovery(ctx.clone(), store, true)
+            .await
+            .expect("enabled startup must return its actual supervisor handle");
+
+        startup_probe.wait().await;
+        assert!(crate::scanner_runtime_initialized(), "the observed supervisor owns its runtime guard");
+        assert!(!supervisor.is_finished(), "the observed supervisor remains in flight");
+        ctx.cancel();
+        assert!(
+            futures::poll!(&mut supervisor).is_pending(),
+            "cancellation cannot join the supervisor before its observed work is released"
+        );
+        startup_probe.resume();
+        drop(startup_probe);
+        tokio::time::timeout(Duration::from_secs(15), supervisor)
+            .await
+            .expect("cancelled supervisor must join within the existing test bound")
+            .expect("the exact enabled supervisor must exit successfully");
+        assert!(
+            !crate::scanner_runtime_initialized(),
+            "joining releases the actual supervisor runtime guard"
+        );
+    })
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
 async fn run_disabled_startup(ctx: CancellationToken, store: Arc<ECStore>) {
     let initialized_before = crate::scanner_runtime_initialized();
     let cleanup = init_scanner_with_recovery(ctx, store, false).await;

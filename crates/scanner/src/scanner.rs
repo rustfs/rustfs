@@ -1072,10 +1072,9 @@ async fn run_scanner_usage_recovery_intents_for_startup(
     Ok(attempted)
 }
 
-/// Start normal scanning when enabled, or one bounded recovery attempt.
-/// The disabled branch returns a finite task for the startup owner to join;
-/// it never enables ordinary namespace scanning while it replays durable reset
-/// intents and cleanup markers.
+/// Return the normal scanner supervisor or one finite disabled recovery task.
+/// The disabled branch never enables ordinary namespace scanning while it
+/// replays durable reset intents and cleanup markers.
 pub async fn init_scanner_with_recovery(
     ctx: CancellationToken,
     storeapi: Arc<ECStore>,
@@ -1096,8 +1095,7 @@ pub async fn init_scanner_with_recovery(
                 "Scanner recovery intent startup discovery failed"
             );
         }
-        init_data_scanner(ctx, storeapi).await;
-        return None;
+        return Some(init_data_scanner_task_with_storage(ctx, storeapi).await);
     }
     Some(tokio::spawn(async move {
         if let Err(error) = run_scanner_usage_recovery_intents_for_startup(ctx.clone(), storeapi.clone()).await {
@@ -1126,6 +1124,14 @@ pub async fn init_scanner_with_recovery(
 }
 
 async fn init_data_scanner_with_storage<S>(ctx: CancellationToken, storeapi: Arc<S>)
+where
+    S: ScannerStorage,
+{
+    // Preserve the existing detached-start contract for legacy callers.
+    drop(init_data_scanner_task_with_storage(ctx, storeapi).await);
+}
+
+async fn init_data_scanner_task_with_storage<S>(ctx: CancellationToken, storeapi: Arc<S>) -> tokio::task::JoinHandle<()>
 where
     S: ScannerStorage,
 {
@@ -1233,7 +1239,7 @@ where
                 break;
             }
         }
-    });
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
