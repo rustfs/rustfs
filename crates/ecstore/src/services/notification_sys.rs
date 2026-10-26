@@ -308,6 +308,7 @@ struct FleetCapabilityProofState {
     proof: Option<FleetCapabilityProof>,
     draining_generation: Option<Arc<FleetCapabilityProofGeneration>>,
     topology_conflict: bool,
+    published: Arc<Notify>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -455,6 +456,7 @@ fn publish_fleet_capability_probe_result(
                 .filter(|proof| proof.topology_fingerprint == topology_fingerprint && proof.peer_epochs.as_ref() == &peer_epochs)
             {
                 current.expires_at = observed_at + REMOTE_VERSION_STATE_PROOF_TTL;
+                state.published.notify_waiters();
                 return None;
             }
 
@@ -481,6 +483,7 @@ fn publish_fleet_capability_probe_result(
                 Arc::new(peer_epochs),
                 observed_at + REMOTE_VERSION_STATE_PROOF_TTL,
             ));
+            state.published.notify_waiters();
             None
         }
         Err(err) => {
@@ -560,6 +563,43 @@ pub fn acquire_cross_pool_fence_fleet_proof() -> Option<CrossPoolFenceFleetProof
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     acquire_fleet_capability_proof_from(&state, expected_topology, Instant::now()).map(CrossPoolFenceFleetProofToken)
+}
+
+async fn wait_for_fleet_capability_proof(
+    rx: &CancellationToken,
+    published: &Notify,
+    mut available: impl FnMut() -> bool,
+) -> bool {
+    loop {
+        let publication = published.notified();
+        tokio::pin!(publication);
+        // Register before checking authority: a publication between the check
+        // and the await must wake us even when no further probe is needed.
+        publication.as_mut().enable();
+        if rx.is_cancelled() {
+            return false;
+        }
+        if available() {
+            return true;
+        }
+        tokio::select! {
+            biased;
+            _ = rx.cancelled() => return false,
+            _ = publication => {}
+        }
+    }
+}
+
+/// Wait only for readiness; callers must reacquire and validate authority at
+/// their operation boundary because a published proof may already be revoked.
+pub(crate) async fn wait_for_cross_pool_fence_fleet_proof(rx: CancellationToken) -> bool {
+    let published = Arc::clone(
+        &cross_pool_fence_fleet_proof_slot()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .published,
+    );
+    wait_for_fleet_capability_proof(&rx, &published, || acquire_cross_pool_fence_fleet_proof().is_some()).await
 }
 
 /// Startup layout identity remains available when peers or the live fleet proof are unavailable.
@@ -4525,6 +4565,134 @@ mod tests {
         assert!(!fleet_capability_proof_valid_at(None, "topology-a", now));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn fleet_proof_wait_observes_publication_before_waiting() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(BTreeMap::new()), Instant::now()).is_none());
+        let published = Arc::clone(&slot.read().expect("proof state should be readable").published);
+        let started_at = tokio::time::Instant::now();
+        assert!(
+            wait_for_fleet_capability_proof(&CancellationToken::new(), &published, || {
+                acquire_fleet_capability_proof_from(
+                    &slot.read().expect("proof state should be readable"),
+                    "topology-a",
+                    Instant::now(),
+                )
+                .is_some()
+            })
+            .await
+        );
+        assert_eq!(tokio::time::Instant::now(), started_at);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fleet_proof_wait_cannot_lose_publication_between_registration_and_check() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let published = Arc::clone(&slot.read().expect("proof state should be readable").published);
+        let mut checks = 0;
+        let ready = timeout(
+            Duration::from_secs(1),
+            wait_for_fleet_capability_proof(&CancellationToken::new(), &published, || {
+                checks += 1;
+                if checks == 1 {
+                    // The authority check saw no proof immediately before the
+                    // publisher ran. There will be no second publication.
+                    assert!(
+                        publish_fleet_capability_probe_result(&slot, "topology-a", Ok(BTreeMap::new()), Instant::now()).is_none()
+                    );
+                    return false;
+                }
+                acquire_fleet_capability_proof_from(
+                    &slot.read().expect("proof state should be readable"),
+                    "topology-a",
+                    Instant::now(),
+                )
+                .is_some()
+            }),
+        )
+        .await
+        .expect("the single publication must wake the registered waiter");
+        assert!(ready);
+        assert_eq!(checks, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fleet_proof_wait_revalidates_authority_without_polling() {
+        let slot = Arc::new(std::sync::RwLock::new(FleetCapabilityProofState::default()));
+        let published = Arc::clone(&slot.read().expect("proof state should be readable").published);
+        let checks = Arc::new(AtomicUsize::new(0));
+        let rx = CancellationToken::new();
+        let task = tokio::spawn({
+            let slot = slot.clone();
+            let published = published.clone();
+            let checks = checks.clone();
+            async move {
+                wait_for_fleet_capability_proof(&rx, &published, || {
+                    checks.fetch_add(1, Ordering::SeqCst);
+                    acquire_fleet_capability_proof_from(
+                        &slot.read().expect("proof state should be readable"),
+                        "topology-a",
+                        Instant::now(),
+                    )
+                    .is_some()
+                })
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(300)).await;
+        assert_eq!(checks.load(Ordering::SeqCst), 1, "missing proof must sleep until publication");
+
+        assert!(
+            publish_fleet_capability_probe_result(
+                &slot,
+                "topology-a",
+                Ok(BTreeMap::new()),
+                Instant::now() - REMOTE_VERSION_STATE_PROOF_TTL,
+            )
+            .is_none()
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert!(!task.is_finished(), "a published but expired proof must not authorize recovery");
+
+        slot.write().expect("proof state should be writable").topology_conflict = true;
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(BTreeMap::new()), Instant::now()).is_none());
+        tokio::task::yield_now().await;
+        assert_eq!(checks.load(Ordering::SeqCst), 3);
+        assert!(!task.is_finished(), "a publication must not bypass conflicting topology");
+
+        slot.write().expect("proof state should be writable").topology_conflict = false;
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(BTreeMap::new()), Instant::now()).is_none());
+        assert!(task.await.expect("a renewed valid proof should release the waiter"));
+        assert_eq!(checks.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fleet_proof_wait_cancels_without_publication() {
+        let rx = CancellationToken::new();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let rx = rx.clone();
+            let checks = checks.clone();
+            async move {
+                wait_for_fleet_capability_proof(&rx, &Notify::new(), || {
+                    checks.fetch_add(1, Ordering::SeqCst);
+                    false
+                })
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        let cancelled_at = tokio::time::Instant::now();
+        rx.cancel();
+        assert!(!task.await.expect("proof wait must observe cancellation"));
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        assert_eq!(tokio::time::Instant::now(), cancelled_at);
+    }
+
     #[test]
     fn remote_version_state_fleet_proof_rejects_nil_process_epoch() {
         let mut peer_epochs = BTreeMap::new();
@@ -5078,6 +5246,7 @@ mod tests {
             )),
             draining_generation: None,
             topology_conflict: false,
+            ..Default::default()
         };
         assert!(acquire_fleet_capability_proof_from(&state, "topology-a", now).is_some());
 

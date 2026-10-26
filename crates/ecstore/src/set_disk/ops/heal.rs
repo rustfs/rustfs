@@ -41,6 +41,14 @@ struct ExplicitVersionHeal<'a> {
     retirement: Option<&'a MarkerRetirementContext<'a>>,
 }
 
+// Keep the large heal state machine and its construction temporary out of
+// each dispatch caller's poll frame. Ordinary object writes do not use this
+// heal-only allocation boundary.
+#[inline(never)]
+fn pin_object_heal_future<F: std::future::Future>(build: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    Box::pin(build())
+}
+
 use crate::disk::DataDirDeleteStatus;
 use crate::disk::DiskAPI;
 use crate::disk::local::{DELETE_DATA_DIR_MARKER_PREFIX, metadata_less_part_file};
@@ -3761,8 +3769,8 @@ impl SetDisks {
         inner_opts.no_lock = true;
         let commit_fence = || !_write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost());
         let namespace_owner = _write_lock_guard.as_ref().map(|guard| guard.clone() as Arc<dyn Send + Sync>);
-        let (result, err) = self
-            .heal_object_with_explicit_version_regen(
+        let (result, err) = pin_object_heal_future(|| {
+            self.heal_object_with_explicit_version_regen(
                 bucket,
                 object,
                 version_id,
@@ -3776,16 +3784,17 @@ impl SetDisks {
                 },
                 absence,
             )
-            .await
-            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+        })
+        .await
+        .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
         if let Some(err) = err.as_ref() {
             match err {
                 &DiskError::FileCorrupt if opts.scan_mode != HealScanMode::Deep => {
                     // Instead of returning an error when a bitrot error is detected
                     // during a normal heal scan, heal again with bitrot flag enabled.
                     inner_opts.scan_mode = HealScanMode::Deep;
-                    let (result, err) = self
-                        .heal_object_with_explicit_version_regen(
+                    let (result, err) = pin_object_heal_future(|| {
+                        self.heal_object_with_explicit_version_regen(
                             bucket,
                             object,
                             version_id,
@@ -3799,8 +3808,9 @@ impl SetDisks {
                             },
                             absence,
                         )
-                        .await
-                        .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+                    })
+                    .await
+                    .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
                     return Ok(finalize_object_heal_result(
                         result,
                         err.map(Into::into),

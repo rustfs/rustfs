@@ -20,3 +20,4 @@
 pub(crate) mod io_primitives;
 pub(in crate::set_disk) mod metadata_quorum;
 pub(in crate::set_disk) mod metadata_read;
+pub(in crate::set_disk) mod multipart_source;
