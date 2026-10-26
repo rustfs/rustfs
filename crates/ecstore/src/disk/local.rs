@@ -301,9 +301,10 @@ fn read_all_data_std(
     let size = usize::try_from(metadata.len()).map_err(|err| ReadAllError::Disk(DiskError::other(err)))?;
     let mut bytes = Vec::new();
     bytes
-        .try_reserve_exact(size)
+        .try_reserve_exact(size.saturating_add(1))
         .map_err(|err| ReadAllError::Disk(Error::other(err)))?;
-    std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|err| ReadAllError::Disk(to_file_error(err).into()))?;
+    std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, metadata.len()), &mut bytes)
+        .map_err(|err| ReadAllError::Disk(to_file_error(err).into()))?;
 
     let modtime = metadata.modified().ok().map(OffsetDateTime::from);
     Ok((bytes, modtime))
@@ -8379,7 +8380,7 @@ impl LocalDisk {
             return Err(DiskError::FileNotFound);
         }
 
-        let meta_path = path_join(&[file_path.as_ref(), Path::new(STORAGE_FORMAT_FILE)]);
+        let meta_path = file_path.as_ref().join(STORAGE_FORMAT_FILE);
 
         let res = {
             if read_data {
@@ -8415,8 +8416,7 @@ impl LocalDisk {
     }
 
     #[hotpath::measure(impl_type = "LocalDisk")]
-    async fn read_metadata_with_dmtime(&self, file_path: impl AsRef<Path>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
-        check_path_length(file_path.as_ref().to_string_lossy().as_ref())?;
+    async fn read_metadata_with_dmtime(&self, file_path: PathBuf) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
         let io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
 
         // HP-12 item 1 (sub-change A): fold the open + fstat + bounded xl.meta
@@ -8429,9 +8429,7 @@ impl LocalDisk {
         //  - is_dir           -> Error::FileNotFound (NOT to_file_error(EISDIR))
         //  - metadata failure -> to_file_error
         //  - parse failure    -> propagated verbatim from read_xl_meta_no_data_sync (`?`)
-        let (data, modtime) = self
-            .run_metadata_read(io_permit, file_path.as_ref().to_path_buf(), read_metadata_only_std)
-            .await??;
+        let (data, modtime) = self.run_metadata_read(io_permit, file_path, read_metadata_only_std).await??;
 
         Ok((data, modtime))
     }
@@ -10575,7 +10573,21 @@ fn local_disk_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBu
     Ok(path)
 }
 
+#[cfg(not(windows))]
+#[inline]
+fn is_clean_relative_segment(s: &str) -> bool {
+    let b = s.as_bytes();
+    !matches!(b.first(), None | Some(b'/' | b'.')) && !b.ends_with(b"/") && !b.windows(2).any(|w| matches!(w, b"//" | b"/."))
+}
+
 fn build_local_disk_object_path(root: &Path, bucket: &str, key: &str) -> (PathBuf, PathBuf) {
+    #[cfg(not(windows))]
+    if is_clean_relative_segment(bucket) && is_clean_relative_segment(key) {
+        let bucket_path = root.join(bucket);
+        let path = bucket_path.join(key);
+        return (bucket_path, path);
+    }
+
     let cache_key = if key.is_empty() {
         bucket.to_string()
     } else {
@@ -10740,9 +10752,10 @@ fn reject_local_disk_symlink_components(root: &Path, path: &Path) -> Result<()> 
 fn normalize_path_cow(path: &Path) -> std::borrow::Cow<'_, Path> {
     // Windows prefixes retain the existing PathBuf reconstruction semantics.
     #[cfg(not(windows))]
-    if !path
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
+    if !path.as_os_str().as_encoded_bytes().contains(&b'.')
+        || !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
     {
         return std::borrow::Cow::Borrowed(path);
     }

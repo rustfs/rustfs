@@ -31,6 +31,7 @@ mod multipart_fence_acceptance_test;
 mod multipart_rpc_delay_test;
 mod object_lock_test;
 mod observability_test;
+mod publication_log;
 mod replication_delete_marker_test;
 mod replication_quota_test;
 mod s3_basic_test;

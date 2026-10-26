@@ -317,6 +317,17 @@ impl Sets {
         &self.ctx
     }
 
+    #[cfg(test)]
+    pub(crate) async fn stop_endpoint_monitor_for_test(&self) {
+        if let Some(exit_signal) = &self.exit_signal {
+            let _ = exit_signal.send(());
+            // Wait for an in-flight reconnect pass as well as its receiver to exit.
+            while exit_signal.receiver_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
     /// Keep simulated peers' metadata ownership separate while sharing disks and lock clients.
     #[cfg(test)]
     pub(crate) fn set_instance_ctx_for_test(&mut self, ctx: Arc<InstanceContext>) {

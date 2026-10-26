@@ -3221,6 +3221,9 @@ mod tests {
     #[serial_test::serial]
     async fn full_format_heal_lost_after_last_save_does_not_publish_or_renew_and_latches() {
         let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), store.pools[0].stop_endpoint_monitor_for_test())
+            .await
+            .expect("endpoint reconnection must stop before the format-loss fixture takes ownership");
         let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
         store.pools[0].disk_set[0].disks.write().await[3] = None;
         let barrier = HealFormatAfterSaveBarrier::install(&store.pools[0], 3);

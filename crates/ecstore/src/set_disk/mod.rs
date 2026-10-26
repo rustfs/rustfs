@@ -934,10 +934,18 @@ pub(in crate::set_disk) struct GetObjectFileInfo {
 }
 
 struct OwnedGetObjectFileInfo {
-    fi: FileInfo,
-    parts_metadata: Vec<FileInfo>,
-    online_disks: Vec<Option<DiskStore>>,
+    payload: OwnedGetObjectFileInfoPayload,
     verified_inline_body: Option<Bytes>,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum OwnedGetObjectFileInfoPayload {
+    Direct {
+        fi: FileInfo,
+        parts_metadata: Vec<FileInfo>,
+        online_disks: Vec<Option<DiskStore>>,
+    },
+    Published(Arc<GetObjectMetadataCacheEntry>),
 }
 
 enum LateMetadataFanout {
@@ -951,9 +959,11 @@ impl GetObjectFileInfo {
     fn owned(fi: FileInfo, parts_metadata: Vec<FileInfo>, online_disks: Vec<Option<DiskStore>>) -> Self {
         Self {
             owned: Some(OwnedGetObjectFileInfo {
-                fi,
-                parts_metadata,
-                online_disks,
+                payload: OwnedGetObjectFileInfoPayload::Direct {
+                    fi,
+                    parts_metadata,
+                    online_disks,
+                },
                 verified_inline_body: None,
             }),
             shared: None,
@@ -962,15 +972,21 @@ impl GetObjectFileInfo {
         }
     }
 
-    fn owned_with_late_metadata_fanout(
-        fi: FileInfo,
-        parts_metadata: Vec<FileInfo>,
-        online_disks: Vec<Option<DiskStore>>,
-        late_metadata_fanout_disks: Vec<Option<DiskStore>>,
-    ) -> Self {
-        let mut snapshot = Self::owned(fi, parts_metadata, online_disks);
-        snapshot.late_metadata_fanout = Some(LateMetadataFanout::CapturedDisks(late_metadata_fanout_disks));
-        snapshot
+    fn owned_published(entry: Arc<GetObjectMetadataCacheEntry>) -> Self {
+        let condition_stopped = entry.capability == GetObjectMetadataCacheCapability::ConditionOnly;
+        Self {
+            owned: Some(OwnedGetObjectFileInfo {
+                payload: OwnedGetObjectFileInfoPayload::Published(entry),
+                verified_inline_body: None,
+            }),
+            shared: None,
+            condition_stopped,
+            late_metadata_fanout: None,
+        }
+    }
+
+    fn set_late_metadata_fanout_disks(&mut self, late_metadata_fanout_disks: Vec<Option<DiskStore>>) {
+        self.late_metadata_fanout = Some(LateMetadataFanout::CapturedDisks(late_metadata_fanout_disks));
     }
 
     fn shared(entry: Arc<GetObjectMetadataCacheEntry>) -> Self {
@@ -989,28 +1005,31 @@ impl GetObjectFileInfo {
         snapshot
     }
 
-    fn fi(&self) -> &FileInfo {
+    fn as_parts(&self) -> (&FileInfo, &[FileInfo], &[Option<DiskStore>]) {
         match (&self.owned, &self.shared) {
-            (Some(snapshot), None) => &snapshot.fi,
-            (None, Some(entry)) => &entry.fi,
+            (Some(snapshot), None) => match &snapshot.payload {
+                OwnedGetObjectFileInfoPayload::Direct {
+                    fi,
+                    parts_metadata,
+                    online_disks,
+                } => (fi, parts_metadata, online_disks),
+                OwnedGetObjectFileInfoPayload::Published(entry) => (&entry.fi, &entry.parts_metadata, &entry.online_disks),
+            },
+            (None, Some(entry)) => (&entry.fi, &entry.parts_metadata, &entry.online_disks),
             _ => unreachable!("GET metadata snapshot representation must be exclusive"),
         }
+    }
+
+    fn fi(&self) -> &FileInfo {
+        self.as_parts().0
     }
 
     fn parts_metadata(&self) -> &[FileInfo] {
-        match (&self.owned, &self.shared) {
-            (Some(snapshot), None) => &snapshot.parts_metadata,
-            (None, Some(entry)) => &entry.parts_metadata,
-            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
-        }
+        self.as_parts().1
     }
 
     fn online_disks(&self) -> &[Option<DiskStore>] {
-        match (&self.owned, &self.shared) {
-            (Some(snapshot), None) => &snapshot.online_disks,
-            (None, Some(entry)) => &entry.online_disks,
-            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
-        }
+        self.as_parts().2
     }
 
     fn has_late_metadata_fanout(&self) -> bool {
@@ -1024,17 +1043,28 @@ impl GetObjectFileInfo {
     }
 
     fn take_verified_inline_body(&mut self) -> Option<Bytes> {
-        self.owned.as_mut().and_then(|owned| owned.verified_inline_body.take())
+        match (&mut self.owned, &self.shared) {
+            (Some(owned), None) => owned.verified_inline_body.take().or_else(|| match &owned.payload {
+                OwnedGetObjectFileInfoPayload::Direct { .. } => None,
+                OwnedGetObjectFileInfoPayload::Published(entry) => entry.verified_inline_body.clone(),
+            }),
+            (None, Some(entry)) => entry.verified_inline_body.clone(),
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
+    }
+
+    fn into_payload(self) -> (OwnedGetObjectFileInfoPayload, Option<LateMetadataFanout>) {
+        match (self.owned, self.shared) {
+            (Some(snapshot), None) => (snapshot.payload, self.late_metadata_fanout),
+            (None, Some(entry)) => (OwnedGetObjectFileInfoPayload::Published(entry), self.late_metadata_fanout),
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
     }
 
     fn into_object_info(self, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
-        match (self.owned, self.shared) {
-            (Some(snapshot), None) => ObjectInfo::from_owned_file_info(snapshot.fi, bucket, object, versioned),
-            (None, Some(entry)) => match Arc::try_unwrap(entry) {
-                Ok(entry) => ObjectInfo::from_owned_file_info(entry.fi, bucket, object, versioned),
-                Err(entry) => ObjectInfo::from_file_info(&entry.fi, bucket, object, versioned),
-            },
-            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        match self.into_payload().0 {
+            OwnedGetObjectFileInfoPayload::Direct { fi, .. } => ObjectInfo::from_owned_file_info(fi, bucket, object, versioned),
+            OwnedGetObjectFileInfoPayload::Published(entry) => ObjectInfo::from_file_info(&entry.fi, bucket, object, versioned),
         }
     }
 
@@ -1044,24 +1074,17 @@ impl GetObjectFileInfo {
     }
 
     fn into_owned_with_late_metadata_fanout(self) -> OwnedGetObjectFileInfoParts {
-        let Self {
-            owned,
-            shared,
-            late_metadata_fanout,
-            ..
-        } = self;
-        match (owned, shared) {
-            (Some(snapshot), None) => (snapshot.fi, snapshot.parts_metadata, snapshot.online_disks, late_metadata_fanout),
-            (None, Some(entry)) => match Arc::try_unwrap(entry) {
-                Ok(entry) => (entry.fi, entry.parts_metadata, entry.online_disks, late_metadata_fanout),
-                Err(entry) => (
-                    entry.fi.clone(),
-                    entry.parts_metadata.clone(),
-                    entry.online_disks.clone(),
-                    late_metadata_fanout,
-                ),
-            },
-            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        let (payload, late_metadata_fanout) = self.into_payload();
+        match payload {
+            OwnedGetObjectFileInfoPayload::Direct {
+                fi,
+                parts_metadata,
+                online_disks,
+            } => (fi, parts_metadata, online_disks, late_metadata_fanout),
+            OwnedGetObjectFileInfoPayload::Published(entry) => {
+                let entry = Arc::unwrap_or_clone(entry);
+                (entry.fi, entry.parts_metadata, entry.online_disks, late_metadata_fanout)
+            }
         }
     }
 
@@ -1446,6 +1469,7 @@ mod prepared_get_object_metadata_tests {
             fi,
             online_disks: vec![None],
             read_quorum: 0,
+            verified_inline_body: None,
         });
         let snapshot = GetObjectFileInfo::shared(Arc::clone(&cached));
 
@@ -4901,7 +4925,7 @@ enum GetObjectMetadataCacheCapability {
     ConditionOnly,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct GetObjectMetadataCacheEntry {
     #[allow(dead_code)] // Kept for debugging; moka handles TTL internally
     created_at: Instant,
@@ -4910,6 +4934,7 @@ struct GetObjectMetadataCacheEntry {
     online_disks: Vec<Option<DiskStore>>,
     read_quorum: usize,
     capability: GetObjectMetadataCacheCapability,
+    verified_inline_body: Option<Bytes>,
 }
 
 #[derive(Clone, Debug)]
@@ -8780,17 +8805,31 @@ mod tests {
             metrics::with_local_recorder(&recorder, || {
                 rustfs_io_metrics::set_put_stage_metrics_enabled(true);
                 runtime.block_on(async {
-                    let healthy: Arc<dyn LockClient> =
-                        Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
-                    let failing: Arc<dyn LockClient> = Arc::new(FailingClient);
                     let ctx = Arc::new(InstanceContext::new());
                     ctx.update_erasure_type(SetupType::DistErasure).await;
-                    let set = make_test_set_disks_with_ctx(vec![healthy, failing], ctx).await;
+                    let set = make_test_set_disks_with_ctx(Vec::new(), ctx).await;
+                    // A real acquire can time out before the failing client is scheduled.
+                    let err = resolve_put_object_commit_lock_acquire_result(
+                        &set,
+                        "put_object_commit",
+                        "bucket",
+                        "object",
+                        Err(LockError::QuorumNotReached {
+                            required: 2,
+                            achieved: 1,
+                        }),
+                    )
+                    .expect_err("a quorum failure must remain a lock error");
                     assert!(
-                        set.acquire_write_lock_diag("put_object_commit", "bucket", "object")
-                            .await
-                            .is_err(),
-                        "one healthy locker must not satisfy the PUT commit write quorum"
+                        matches!(
+                            err,
+                            StorageError::NamespaceLockQuorumUnavailable {
+                                required: 2,
+                                achieved: 1,
+                                ..
+                            }
+                        ),
+                        "expected the typed quorum error, got: {err:?}"
                     );
                     rustfs_io_metrics::set_put_stage_metrics_enabled(false);
                 });
