@@ -25,13 +25,14 @@
 //! absent from the report because this store refuses them on every write
 //! (`is_valid_object_prefix`), so no stored key can carry one.
 
-use crate::admin::auth::authorize_admin_request;
-use crate::admin::handlers::admin_json_response;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::handlers::owned_admin_json_response;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::current_object_store_handle;
 use crate::admin::storage_api::contract::bucket::{BucketOperations as _, BucketOptions};
 use crate::admin::storage_api::contract::list::ListOperations as _;
-use crate::admin::storage_api::s3::{self, Body, S3ErrorCode, S3Request, S3Response, S3Result};
+use crate::admin::storage_api::s3::{self, S3ErrorCode, S3Result};
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
 use http::StatusCode;
@@ -228,9 +229,9 @@ pub struct GatewayKeyInventoryHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GatewayKeyInventoryHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let cred = authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::InspectDataAction)]).await?;
-        let query = parse_inventory_query(req.uri.query())?;
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let cred = authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::InspectDataAction)]).await?;
+        let query = parse_inventory_query(req.uri().query())?;
         let store =
             current_object_store_handle().ok_or_else(|| s3::error(S3ErrorCode::InternalError, "object store not initialized"))?;
 
@@ -266,7 +267,7 @@ impl Operation for GatewayKeyInventoryHandler {
             }
         }
 
-        admin_json_response(req.uri.path(), &cred.secret_key, StatusCode::OK, &report)
+        owned_admin_json_response(req.uri().path(), &cred.secret_key, StatusCode::OK, &report)
     }
 }
 
@@ -274,6 +275,7 @@ impl Operation for GatewayKeyInventoryHandler {
 mod tests {
     use super::*;
     use http::HeaderMap;
+    use rustfs_s3_types::Body;
 
     #[test]
     fn keys_the_gateway_reaches_are_not_reported() {
@@ -400,17 +402,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_without_credentials_is_refused_before_any_listing() {
-        let req = S3Request {
-            input: Body::from(String::new()),
-            method: Method::GET,
-            uri: http::Uri::from_static("/rustfs/admin/v3/gateway-key-inventory"),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let req = crate::admin::operation::test_support::TestRequest::new(Method::GET, "/rustfs/admin/v3/gateway-key-inventory")
+            .headers(HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::from(String::new()))
+            .build();
 
         let err = GatewayKeyInventoryHandler {}
             .call(req, Params::new())

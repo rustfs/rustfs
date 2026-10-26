@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::authorize_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{current_action_credentials, object_store_from_extensions};
+use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
+use crate::admin::runtime_sources::{current_action_credentials, object_store_from_envelope};
 use crate::admin::storage_api::bucket::{is_reserved_or_invalid_bucket, utils::is_valid_object_prefix};
 use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::lifecycle::{
@@ -37,8 +38,8 @@ use crate::admin::storage_api::lifecycle::{
 };
 use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::storage_api::s3::{S3ErrorCode as AdminS3ErrorCode, error as admin_s3_error};
-use crate::admin::utils::json_response;
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::admin::utils::owned_json_response;
+use crate::server::ADMIN_PREFIX;
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
@@ -50,13 +51,12 @@ use rand::RngExt;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::{
     MaskedAccessKey, base64_decode_url_safe_no_pad, base64_encode_url_safe_no_pad,
     crypto::hex_sha256,
     http::{AMZ_REQUEST_ID, REQUEST_ID_HEADER},
 };
-use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -394,10 +394,8 @@ fn admin_request_id(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.to_str().ok())
 }
 
-fn admin_remote_addr(req: &S3Request<Body>) -> Option<String> {
-    req.extensions
-        .get::<Option<RemoteAddr>>()
-        .and_then(|opt| opt.map(|addr| addr.0.to_string()))
+fn admin_remote_addr(req: &AdminRequest) -> Option<String> {
+    req.remote_addr().map(|addr| addr.to_string())
 }
 
 fn log_manual_transition_rejected(reason: &str, request_id: &str, actor: &str, remote_addr: &str) {
@@ -478,31 +476,31 @@ fn log_manual_transition_completed(
     );
 }
 
-async fn authorize_manual_transition_request(req: &S3Request<Body>) -> S3Result<String> {
+async fn authorize_manual_transition_request(req: &AdminRequest) -> S3Result<String> {
     authorize_transition_admin_request(req, AdminAction::SetTierAction).await
 }
 
 /// Recovery endpoints bind their audit actor to the authenticated access key
 /// (hashed, never the presented key itself); the credential pre-check keeps
 /// this endpoint family's historical missing-credentials message.
-async fn authorize_recovery_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<String> {
-    if req.credentials.is_none() {
+async fn authorize_recovery_admin_request(req: &AdminRequest, action: AdminAction) -> S3Result<String> {
+    if req.credentials().is_none() {
         return Err(admin_s3_error(AdminS3ErrorCode::InvalidRequest, "authentication required"));
     }
-    let credentials = authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    let credentials = authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await?;
     Ok(recovery_actor_sha256(&credentials))
 }
 
 /// The credential pre-check keeps this endpoint family's historical
 /// missing-credentials message (the shared gate reports "get cred failed") and
 /// still yields the masked actor every transition audit log records.
-async fn authorize_transition_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<String> {
-    let Some(input_cred) = req.credentials.as_ref() else {
+async fn authorize_transition_admin_request(req: &AdminRequest, action: AdminAction) -> S3Result<String> {
+    let Some(input_cred) = req.credentials() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
-    let actor = MaskedAccessKey(&input_cred.access_key).to_string();
+    let actor = MaskedAccessKey(input_cred.access_key()).to_string();
 
-    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await?;
 
     Ok(actor)
 }
@@ -1571,18 +1569,18 @@ pub struct ManualTransitionRunHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ManualTransitionRunHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let request_id = admin_request_id(req.headers()).unwrap_or_default().to_string();
         let remote_addr = admin_remote_addr(&req).unwrap_or_default();
         let actor = authorize_manual_transition_request(&req).await?;
-        let (bucket, options, run_mode) = match parse_manual_transition_query(req.uri.query()) {
+        let (bucket, options, run_mode) = match parse_manual_transition_query(req.uri().query()) {
             Ok(parsed) => parsed,
             Err(err) => {
                 log_manual_transition_rejected("invalid_query_parameters", &request_id, &actor, &remote_addr);
                 return Err(err);
             }
         };
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             log_manual_transition_rejected("object_store_not_initialized", &request_id, &actor, &remote_addr);
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
@@ -1599,10 +1597,10 @@ impl Operation for ManualTransitionRunHandler {
                         cancel_endpoint: Some(status_endpoint),
                         report: record.report,
                     };
-                    return json_response(StatusCode::ACCEPTED, &response);
+                    return owned_json_response(StatusCode::ACCEPTED, &response);
                 }
                 StartManualTransitionJobResult::Conflict(response) => {
-                    return json_response(StatusCode::CONFLICT, &response);
+                    return owned_json_response(StatusCode::CONFLICT, &response);
                 }
             }
         }
@@ -1638,7 +1636,7 @@ impl Operation for ManualTransitionRunHandler {
             report,
         };
 
-        json_response(StatusCode::OK, &response)
+        owned_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -1646,10 +1644,10 @@ pub struct ManualTransitionJobStatusHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ManualTransitionJobStatusHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_manual_transition_request(&req).await?;
         let job_id = manual_transition_job_id_from_params(&params)?;
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
         let mut record = load_manual_transition_job_record(store.clone(), job_id)
@@ -1678,7 +1676,7 @@ impl Operation for ManualTransitionJobStatusHandler {
                 release_manual_transition_admission(store, &record);
             }
         }
-        json_response(StatusCode::OK, &manual_transition_job_response(record))
+        owned_json_response(StatusCode::OK, &manual_transition_job_response(record))
     }
 }
 
@@ -1686,10 +1684,10 @@ pub struct ManualTransitionJobCancelHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ManualTransitionJobCancelHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_manual_transition_request(&req).await?;
         let job_id = manual_transition_job_id_from_params(&params)?;
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
         let record = request_manual_transition_job_cancel(store, job_id)
@@ -1700,7 +1698,7 @@ impl Operation for ManualTransitionJobCancelHandler {
         {
             cancel_token.cancel();
         }
-        json_response(StatusCode::OK, &manual_transition_job_response(record))
+        owned_json_response(StatusCode::OK, &manual_transition_job_response(record))
     }
 }
 
@@ -1708,16 +1706,16 @@ pub struct IlmRecoveryControlListHandler {}
 
 #[async_trait::async_trait]
 impl Operation for IlmRecoveryControlListHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_transition_admin_request(&req, AdminAction::ListTierAction).await?;
-        let query = parse_recovery_control_list_query(req.uri.query())?;
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let query = parse_recovery_control_list_query(req.uri().query())?;
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(admin_s3_error(AdminS3ErrorCode::InternalError, "object store is not initialized"));
         };
         let page = list_recovery_controls(store, query.protocol, query.classification, query.limit, query.marker)
             .await
             .map_err(map_recovery_control_error)?;
-        json_response(StatusCode::OK, &page)
+        owned_json_response(StatusCode::OK, &page)
     }
 }
 
@@ -1725,10 +1723,10 @@ pub struct IlmRecoveryControlInspectHandler {}
 
 #[async_trait::async_trait]
 impl Operation for IlmRecoveryControlInspectHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let actor_sha256 = authorize_recovery_admin_request(&req, AdminAction::ListTierAction).await?;
         let control_id = recovery_control_id_from_params(&params)?;
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(admin_s3_error(AdminS3ErrorCode::InternalError, "object store is not initialized"));
         };
         let control = inspect_recovery_control(store.clone(), &control_id)
@@ -1786,7 +1784,7 @@ impl Operation for IlmRecoveryControlInspectHandler {
             }
             Err(_) => (false, Some("fleet_or_source_not_ready"), None, None, None, None),
         };
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &IlmRecoveryControlInspectResponse {
                 control,
@@ -1807,15 +1805,19 @@ pub struct IlmRecoveryRecordMutationHandler {}
 
 #[async_trait::async_trait]
 impl Operation for IlmRecoveryRecordMutationHandler {
-    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let actor_sha256 = authorize_recovery_admin_request(&req, AdminAction::SetTierAction).await?;
         let control_id = recovery_control_id_from_params(&params)?;
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(admin_s3_error(AdminS3ErrorCode::InternalError, "object store is not initialized"));
         };
-        let body = req.input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await.map_err(|_| {
-            admin_s3_error(AdminS3ErrorCode::InvalidRequest, "ILM recovery request body is too large or unreadable")
-        })?;
+        let body = req
+            .take_body()
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
+            .await
+            .map_err(|_| {
+                admin_s3_error(AdminS3ErrorCode::InvalidRequest, "ILM recovery request body is too large or unreadable")
+            })?;
         let request = parse_recovery_record_mutation_request(&body)?;
         let mutation = validate_recovery_record_mutation_request(&request)?;
         let now = OffsetDateTime::now_utc();
@@ -1842,7 +1844,7 @@ impl Operation for IlmRecoveryRecordMutationHandler {
                     export_id: created.export_id,
                     export_sha256: created.content_sha256,
                 };
-                json_response(StatusCode::OK, &response)
+                owned_json_response(StatusCode::OK, &response)
             }
             ValidatedIlmRecoveryRecordMutation::AbandonDryRun {
                 observation_receipt,
@@ -1872,7 +1874,7 @@ impl Operation for IlmRecoveryRecordMutationHandler {
                     IlmRecoveryReceiptMode::Execute,
                     execute_receipt_now,
                 )?;
-                json_response(
+                owned_json_response(
                     StatusCode::OK,
                     &IlmRecoveryDispositionDryRunResponse {
                         action: IlmRecoveryReceiptAction::AbandonRemoteCleanup,
@@ -1910,7 +1912,7 @@ impl Operation for IlmRecoveryRecordMutationHandler {
                         .await
                         .map_err(map_recovery_disposition_error)?;
                 let state = recovery_disposition_response_state(execution.state)?;
-                json_response(
+                owned_json_response(
                     StatusCode::OK,
                     &IlmRecoveryDispositionExecuteResponse {
                         action: IlmRecoveryReceiptAction::AbandonRemoteCleanup,
@@ -1938,7 +1940,7 @@ impl Operation for IlmRecoveryRecordMutationHandler {
                 {
                     return Err(map_transition_operator_error(TransitionOperatorError::StaleRecoveryControl));
                 }
-                json_response(
+                owned_json_response(
                     StatusCode::OK,
                     &IlmTransitionRecoveryRetryDryRunResponse {
                         action: "retry_transition_recovery",
@@ -1959,7 +1961,7 @@ impl Operation for IlmRecoveryRecordMutationHandler {
                 )
                 .await
                 .map_err(map_transition_operator_error)?;
-                json_response(
+                owned_json_response(
                     StatusCode::OK,
                     &IlmTransitionRecoveryRetryExecuteResponse {
                         action: "retry_transition_recovery",
@@ -1976,17 +1978,17 @@ pub struct IlmRecoveryExportDownloadHandler {}
 
 #[async_trait::async_trait]
 impl Operation for IlmRecoveryExportDownloadHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_transition_admin_request(&req, AdminAction::SetTierAction).await?;
         let export_id = recovery_export_id_from_params(&params)?;
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(admin_s3_error(AdminS3ErrorCode::InternalError, "object store is not initialized"));
         };
         let export = load_recovery_export(store, &export_id)
             .await
             .map_err(map_recovery_export_error)?;
         let headers = recovery_export_download_headers(&export_id, export.encoded.len())?;
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(export.encoded)), headers))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(export.encoded), headers))
     }
 }
 
@@ -1994,16 +1996,16 @@ pub struct TransitionReconcileInspectHandler {}
 
 #[async_trait::async_trait]
 impl Operation for TransitionReconcileInspectHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_transition_admin_request(&req, AdminAction::ListTierAction).await?;
         let transaction_id = transition_transaction_id_from_params(&params)?;
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
         let status = inspect_transition_transaction_for_operator(store, transaction_id)
             .await
             .map_err(map_transition_operator_error)?;
-        json_response(StatusCode::OK, &status)
+        owned_json_response(StatusCode::OK, &status)
     }
 }
 
@@ -2011,15 +2013,15 @@ pub struct TransitionReconcileApplyHandler {}
 
 #[async_trait::async_trait]
 impl Operation for TransitionReconcileApplyHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let request_id = admin_request_id(req.headers()).unwrap_or_default().to_string();
         let remote_addr = admin_remote_addr(&req).unwrap_or_default();
         let actor = authorize_transition_admin_request(&req, AdminAction::SetTierAction).await?;
         let transaction_id = transition_transaction_id_from_params(&params)?;
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
-        let mut input = req.input;
+        let mut input = req.take_body();
         let body = input
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
@@ -2038,7 +2040,7 @@ impl Operation for TransitionReconcileApplyHandler {
                     "exact_delete_completed_journal_already_finalized"
                 };
                 log_transition_reconcile_applied(transaction_id, "delete_candidate", outcome, &request_id, &actor, &remote_addr);
-                json_response(StatusCode::OK, &TransitionCandidateDeleteResponse { outcome, result })
+                owned_json_response(StatusCode::OK, &TransitionCandidateDeleteResponse { outcome, result })
             }
             ValidatedTransitionReconcileAction::FinalizeMissing => {
                 finalize_missing_transition_transaction_for_operator(store, transaction_id)
@@ -2052,7 +2054,7 @@ impl Operation for TransitionReconcileApplyHandler {
                     &actor,
                     &remote_addr,
                 );
-                json_response(
+                owned_json_response(
                     StatusCode::OK,
                     &TransitionFinalizeMissingResponse {
                         outcome: "journal_finalized",
@@ -2069,17 +2071,17 @@ pub struct LegacyTransitionStateReconcileInspectHandler {}
 
 #[async_trait::async_trait]
 impl Operation for LegacyTransitionStateReconcileInspectHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_transition_admin_request(&req, AdminAction::ListTierAction).await?;
-        let selector = parse_legacy_transition_state_reconcile_query(req.uri.query())?;
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let selector = parse_legacy_transition_state_reconcile_query(req.uri().query())?;
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(admin_s3_error(AdminS3ErrorCode::InternalError, "object store is not initialized"));
         };
         let response: LegacyTransitionStateReconcileResponse = store
             .inspect_legacy_transition_state(selector)
             .await
             .map_err(map_legacy_transition_state_reconcile_error)?;
-        json_response(StatusCode::OK, &response)
+        owned_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -2087,11 +2089,11 @@ pub struct LegacyTransitionStateReconcileApplyHandler {}
 
 #[async_trait::async_trait]
 impl Operation for LegacyTransitionStateReconcileApplyHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_transition_admin_request(&req, AdminAction::SetTierAction).await?;
-        let selector = parse_legacy_transition_state_reconcile_query(req.uri.query())?;
-        let store = object_store_from_extensions(&req.extensions);
-        let mut input = req.input;
+        let selector = parse_legacy_transition_state_reconcile_query(req.uri().query())?;
+        let store = object_store_from_envelope(req.envelope());
+        let mut input = req.take_body();
         let body = input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await.map_err(|_| {
             admin_s3_error(
                 AdminS3ErrorCode::InvalidRequest,
@@ -2113,7 +2115,7 @@ impl Operation for LegacyTransitionStateReconcileApplyHandler {
             .reconcile_legacy_transition_state(request)
             .await
             .map_err(map_legacy_transition_state_reconcile_error)?;
-        json_response(StatusCode::OK, &response)
+        owned_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -2411,7 +2413,7 @@ mod tests {
             "async fn authorize_recovery_admin_request",
             "async fn authorize_transition_admin_request",
         );
-        assert!(gate.contains("let credentials = authorize_admin_request("));
+        assert!(gate.contains("let credentials = authorize_admin_envelope("));
         assert!(gate.contains("recovery_actor_sha256(&credentials)"));
         assert!(!gate.contains("MaskedAccessKey"));
     }
@@ -2681,18 +2683,12 @@ mod tests {
         );
     }
 
-    fn credential_less_admin_request(method: Method, path: &'static str) -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method,
-            uri: path.parse().expect("valid route"),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn credential_less_admin_request(method: Method, path: &'static str) -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(method, path.parse::<http::Uri>().expect("valid route"))
+            .headers(HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::empty())
+            .build()
     }
 
     #[test]
@@ -3168,16 +3164,16 @@ mod tests {
         );
 
         assert_eq!(
-            wrapper.matches("authorize_admin_request(").count(),
+            wrapper.matches("authorize_admin_envelope(").count(),
             1,
             "the transition wrapper must use exactly one shared gate"
         );
         assert!(
-            wrapper.contains("authorize_admin_request(req, vec![Action::AdminAction(action)])"),
+            wrapper.contains("authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)])"),
             "the transition wrapper must forward its parameterized action unchanged"
         );
         assert!(
-            wrapper.contains("MaskedAccessKey(&input_cred.access_key)"),
+            wrapper.contains("MaskedAccessKey(input_cred.access_key())"),
             "the transition wrapper must keep returning the masked actor"
         );
         assert!(!production.contains("check_key_valid(get_session_token"));
