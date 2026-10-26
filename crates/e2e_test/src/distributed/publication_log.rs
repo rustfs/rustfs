@@ -325,7 +325,7 @@ mod tests {
     fn root_nested_escaped_and_duplicate_fields_match_the_old_reader() {
         let file = tempfile::NamedTempFile::new().expect("log file");
         let root = event("root");
-        let mut nested = json!({"timestamp":root["timestamp"],"fields":root.clone()});
+        let mut nested = json!({"timestamp":root["timestamp"],"fields":root});
         nested["fields"]["extra"] = json!({"unicode":"é"});
         let null = json!({"fields":null,"event":"object_namespace_lock","op":"data_movement_publication","bucket":"bucket","object":"object"});
         let escaped = root
