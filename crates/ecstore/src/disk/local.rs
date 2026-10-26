@@ -91,7 +91,7 @@ use metrics::gauge;
 use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock};
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
-    ValidationMode, get_file_info_from_bytes, read_xl_meta_no_data_sync,
+    ValidationMode, get_file_info, read_xl_meta_no_data_sync,
 };
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::os::get_info;
@@ -13218,8 +13218,8 @@ impl DiskAPI for LocalDisk {
 
         let decode_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let file_info_result: Result<FileInfo> = (|| {
-            let fi = get_file_info_from_bytes(
-                &Bytes::from(data),
+            let fi = get_file_info(
+                &data,
                 volume,
                 path,
                 version_id,

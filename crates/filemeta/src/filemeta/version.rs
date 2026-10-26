@@ -4374,29 +4374,6 @@ pub struct FileInfoOpts {
 pub fn get_file_info(buf: &[u8], volume: &str, path: &str, version_id: &str, opts: FileInfoOpts) -> Result<FileInfo> {
     FileMeta::decode_fileinfo_from_buf(
         buf,
-        None,
-        volume,
-        path,
-        version_id,
-        FileInfoDecodeOptions {
-            read_data: opts.data,
-            include_free_versions: opts.include_free_versions,
-            all_parts: true,
-            include_part_checksums: opts.include_part_checksums,
-        },
-    )
-}
-
-pub fn get_file_info_from_bytes(
-    buf: &bytes::Bytes,
-    volume: &str,
-    path: &str,
-    version_id: &str,
-    opts: FileInfoOpts,
-) -> Result<FileInfo> {
-    FileMeta::decode_fileinfo_from_buf(
-        buf.as_ref(),
-        Some(buf),
         volume,
         path,
         version_id,

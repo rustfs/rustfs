@@ -2999,14 +2999,6 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             let object_size = usize::try_from(fi.size)
                 .map_err(|_| to_object_err(Error::other("inline fast path object size is invalid"), vec![bucket, object]))?;
 
-            let checksum_info = fi.erasure.get_checksum_info(fi.parts[0].number);
-            let checksum_algo =
-                if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
-                    rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
-                } else {
-                    checksum_info.algorithm
-                };
-
             if can_try_inline_data_shards_direct(object_size, fi.erasure.block_size)
                 && let Some(body) = verified_inline_body.filter(|body| body.len() == object_size)
             {
@@ -3044,6 +3036,14 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 };
                 return Ok(reader);
             }
+
+            let checksum_info = fi.erasure.get_checksum_info(fi.parts[0].number);
+            let checksum_algo =
+                if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
+                    rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                } else {
+                    checksum_info.algorithm
+                };
 
             if can_try_inline_data_shards_direct(object_size, fi.erasure.block_size)
                 && let Some(data_files) = collect_inline_data_shard_fileinfos_by_index(files, fi, data_shards, |index| {
@@ -16906,6 +16906,7 @@ mod transition_commit_failure_tests {
                     parts_metadata,
                     online_disks,
                     read_quorum: 2,
+                    verified_inline_body: None,
                 }),
             )
             .await;

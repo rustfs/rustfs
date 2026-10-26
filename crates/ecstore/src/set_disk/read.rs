@@ -442,7 +442,7 @@ impl SetDisks {
             .cache_get_object_fileinfo_owned(
                 identity,
                 generation,
-                (fi.clone(), capability),
+                (fi.clone(), capability, None),
                 parts_metadata.to_vec(),
                 online_disks.to_vec(),
                 read_quorum,
@@ -454,14 +454,16 @@ impl SetDisks {
         &self,
         identity: (&str, &str),
         generation: Option<GetObjectMetadataCacheGeneration>,
-        selected: (FileInfo, GetObjectMetadataCacheCapability),
+        selected: (FileInfo, GetObjectMetadataCacheCapability, Option<Bytes>),
         parts_metadata: Vec<FileInfo>,
         online_disks: Vec<Option<DiskStore>>,
         read_quorum: usize,
     ) -> GetObjectFileInfo {
-        let (fi, capability) = selected;
+        let (fi, capability, verified_inline_body) = selected;
         if fi.deleted || !fi.has_valid_erasure_geometry() {
-            return GetObjectFileInfo::owned(fi, parts_metadata, online_disks);
+            let mut snapshot = GetObjectFileInfo::owned(fi, parts_metadata, online_disks);
+            snapshot.set_verified_inline_body(verified_inline_body);
+            return snapshot;
         }
         let (bucket, object) = identity;
 
@@ -472,7 +474,9 @@ impl SetDisks {
                 GET_METADATA_CACHE_DECISION_REJECT,
                 GET_METADATA_CACHE_REASON_STALE_PUBLICATION,
             );
-            return GetObjectFileInfo::owned(fi, parts_metadata, online_disks);
+            let mut snapshot = GetObjectFileInfo::owned(fi, parts_metadata, online_disks);
+            snapshot.set_verified_inline_body(verified_inline_body);
+            return snapshot;
         };
 
         let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
@@ -483,6 +487,7 @@ impl SetDisks {
             online_disks,
             read_quorum,
             capability,
+            verified_inline_body,
         });
         self.insert_get_object_metadata_cache_entry_after_insert(key, generation, Arc::clone(&entry), || {})
             .await;
@@ -885,7 +890,9 @@ impl SetDisks {
                 "metadata_read_error",
             )
             .await;
-            GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks)
+            let mut snapshot = GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks);
+            snapshot.set_verified_inline_body(verified_inline_body);
+            snapshot
         } else if use_metadata_cache
             && (metadata_fanout_complete
                 || condition_stopped
@@ -910,6 +917,7 @@ impl SetDisks {
                     } else {
                         GetObjectMetadataCacheCapability::QuorumSelected
                     },
+                    verified_inline_body,
                 ),
                 parts_metadata,
                 op_online_disks,
@@ -917,14 +925,15 @@ impl SetDisks {
             )
             .await
         } else {
-            GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks)
+            let mut snapshot = GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks);
+            snapshot.set_verified_inline_body(verified_inline_body);
+            snapshot
         };
         record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_METADATA_RESOLVE, metadata_resolve_stage_start);
         if needs_late_metadata_fanout {
             snapshot.set_late_metadata_fanout_disks(disks);
         }
         snapshot.condition_stopped = condition_stopped;
-        snapshot.set_verified_inline_body(verified_inline_body);
         Ok(snapshot)
     }
 
@@ -4051,6 +4060,7 @@ mod metadata_cache_tests {
                     parts_metadata: vec![fi],
                     online_disks: vec![None],
                     read_quorum: 1,
+                    verified_inline_body: None,
                 }),
             )
             .await;
@@ -4712,6 +4722,7 @@ mod metadata_cache_tests {
             online_disks: Vec::new(),
             read_quorum: 0,
             capability,
+            verified_inline_body: None,
         })
     }
 
@@ -5204,6 +5215,7 @@ mod metadata_cache_tests {
                     parts_metadata: vec![fi],
                     online_disks: vec![None],
                     read_quorum: 1,
+                    verified_inline_body: None,
                 }),
             )
             .await;
@@ -5322,6 +5334,7 @@ mod metadata_cache_tests {
             parts_metadata: vec![fi],
             online_disks: Vec::new(),
             read_quorum: 0,
+            verified_inline_body: None,
         });
 
         set.insert_get_object_metadata_cache_entry_after_insert(key, generation, entry, || {
@@ -5457,6 +5470,7 @@ mod metadata_cache_tests {
                 fi,
                 online_disks: Vec::new(),
                 read_quorum: 0,
+                verified_inline_body: None,
             })
         };
 

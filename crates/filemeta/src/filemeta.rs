@@ -1103,7 +1103,6 @@ impl FileMeta {
             self.versions.len(),
             self.versions.iter().map(|ver| Ok((ver.header.clone(), ver.meta.as_slice()))),
             self.data.as_slice(),
-            None,
             volume,
             path,
             version_id,
@@ -1113,7 +1112,6 @@ impl FileMeta {
 
     fn decode_fileinfo_from_buf(
         buf: &[u8],
-        inline_owner: Option<&bytes::Bytes>,
         volume: &str,
         path: &str,
         version_id: &str,
@@ -1150,7 +1148,6 @@ impl FileMeta {
             versions_len,
             (0..versions_len).map(|_| Self::read_next_shallow_slice(meta, &mut cur, header_ver)),
             inline_buf,
-            inline_owner,
             volume,
             path,
             version_id,
@@ -1158,12 +1155,10 @@ impl FileMeta {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn select_and_decode_fileinfo<'a, I>(
         versions_len: usize,
         versions: I,
         inline_data: &[u8],
-        inline_owner: Option<&bytes::Bytes>,
         volume: &str,
         path: &str,
         version_id: &str,
@@ -1256,9 +1251,7 @@ impl FileMeta {
                         }
 
                         if opts.read_data && fi.inline_data() {
-                            fi.data = Self::find_inline_data_slice(inline_data, fi.version_id)?.map(|slice| {
-                                inline_owner.map_or_else(|| bytes::Bytes::copy_from_slice(slice), |owner| owner.slice_ref(slice))
-                            });
+                            fi.data = Self::find_inline_data_in_slice(inline_data, fi.version_id)?.map(bytes::Bytes::from);
                         }
 
                         Ok(fi)

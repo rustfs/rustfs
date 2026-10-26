@@ -1043,7 +1043,14 @@ impl GetObjectFileInfo {
     }
 
     fn take_verified_inline_body(&mut self) -> Option<Bytes> {
-        self.owned.as_mut().and_then(|owned| owned.verified_inline_body.take())
+        match (&mut self.owned, &self.shared) {
+            (Some(owned), None) => owned.verified_inline_body.take().or_else(|| match &owned.payload {
+                OwnedGetObjectFileInfoPayload::Direct { .. } => None,
+                OwnedGetObjectFileInfoPayload::Published(entry) => entry.verified_inline_body.clone(),
+            }),
+            (None, Some(entry)) => entry.verified_inline_body.clone(),
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
     }
 
     fn into_payload(self) -> (OwnedGetObjectFileInfoPayload, Option<LateMetadataFanout>) {
@@ -1057,10 +1064,7 @@ impl GetObjectFileInfo {
     fn into_object_info(self, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
         match self.into_payload().0 {
             OwnedGetObjectFileInfoPayload::Direct { fi, .. } => ObjectInfo::from_owned_file_info(fi, bucket, object, versioned),
-            OwnedGetObjectFileInfoPayload::Published(entry) => match Arc::try_unwrap(entry) {
-                Ok(entry) => ObjectInfo::from_owned_file_info(entry.fi, bucket, object, versioned),
-                Err(entry) => ObjectInfo::from_file_info(&entry.fi, bucket, object, versioned),
-            },
+            OwnedGetObjectFileInfoPayload::Published(entry) => ObjectInfo::from_file_info(&entry.fi, bucket, object, versioned),
         }
     }
 
@@ -1465,6 +1469,7 @@ mod prepared_get_object_metadata_tests {
             fi,
             online_disks: vec![None],
             read_quorum: 0,
+            verified_inline_body: None,
         });
         let snapshot = GetObjectFileInfo::shared(Arc::clone(&cached));
 
@@ -4929,6 +4934,7 @@ struct GetObjectMetadataCacheEntry {
     online_disks: Vec<Option<DiskStore>>,
     read_quorum: usize,
     capability: GetObjectMetadataCacheCapability,
+    verified_inline_body: Option<Bytes>,
 }
 
 #[derive(Clone, Debug)]
