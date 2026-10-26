@@ -23,7 +23,7 @@ use hyper_util::{
     server::conn::auto,
 };
 use prost::Message as _;
-use rustfs_protos::proto_gen::node_service::{DeleteRequest, ReadVersionRequest};
+use rustfs_protos::proto_gen::node_service::{DeleteRequest, ReadVersionRequest, RenameDataResponse};
 use std::{
     collections::HashSet,
     io,
@@ -54,6 +54,9 @@ struct PauseState {
     methods: Vec<&'static str>,
     scope: Option<Vec<u8>>,
     limit: usize,
+    retain_after_disconnect: bool,
+    refused_mutations: AtomicUsize,
+    responses: AtomicUsize,
     matched: AtomicUsize,
     blocked: AtomicUsize,
     forwarded: AtomicUsize,
@@ -63,6 +66,7 @@ struct PauseState {
 }
 
 type PauseSlot = Arc<Mutex<Option<Arc<PauseState>>>>;
+type LateRequests = Arc<Mutex<Option<Vec<tokio::task::AbortHandle>>>>;
 
 pub(crate) struct RpcPause {
     state: Arc<PauseState>,
@@ -74,13 +78,21 @@ impl RpcPause {
         self.state.blocked.load(Ordering::SeqCst)
     }
 
-    /// Selected RPCs whose backend returned a response, excluding discarded packets.
+    /// Selected RPCs with successful HTTP/gRPC headers, excluding discarded packets.
     pub(crate) fn forwarded(&self) -> usize {
         self.state.forwarded.load(Ordering::SeqCst)
     }
 
     pub(crate) fn forwarded_routes(&self) -> usize {
         self.state.forwarded_routes.lock().expect("RPC route observations").len()
+    }
+
+    pub(crate) fn responses(&self) -> usize {
+        self.state.responses.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn refused_mutations(&self) -> usize {
+        self.state.refused_mutations.load(Ordering::SeqCst)
     }
 
     pub(crate) async fn wait_for_hits(&self, count: usize) -> io::Result<()> {
@@ -121,7 +133,11 @@ impl RpcPause {
 
 impl Drop for RpcPause {
     fn drop(&mut self) {
-        self.release();
+        if self.state.retain_after_disconnect {
+            self.discard_pending();
+        } else {
+            self.release();
+        }
         let mut slot = self.slot.lock().expect("RPC pause slot");
         if slot.as_ref().is_some_and(|current| Arc::ptr_eq(current, &self.state)) {
             *slot = None;
@@ -133,6 +149,8 @@ pub(crate) struct RpcFaultProxy {
     address: SocketAddr,
     slot: PauseSlot,
     task: JoinHandle<()>,
+    late_requests: LateRequests,
+    transport_passthrough: watch::Sender<bool>,
 }
 
 impl RpcFaultProxy {
@@ -141,6 +159,9 @@ impl RpcFaultProxy {
         let address = listener.local_addr()?;
         let slot: PauseSlot = Arc::new(Mutex::new(None));
         let active = slot.clone();
+        let late_requests: LateRequests = Arc::new(Mutex::new(Some(Vec::new())));
+        let late = late_requests.clone();
+        let (transport_passthrough, transport_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
             let h1: ProxyClient = Client::builder(TokioExecutor::new()).build_http();
             let h2: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(true).build_http();
@@ -148,16 +169,53 @@ impl RpcFaultProxy {
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
-                        let Ok((socket, _)) = accepted else { break };
+                        let Ok((mut socket, _)) = accepted else { break };
                         let h1 = h1.clone();
                         let h2 = h2.clone();
                         let active = active.clone();
+                        let late = late.clone();
+                        let mut transport = transport_rx.clone();
                         connections.spawn(async move {
+                            if *transport.borrow_and_update() {
+                                // Seed legacy streaming traffic without HTTP adaptation.
+                                // Switching to method faults retires every raw connection.
+                                tokio::select! {
+                                    _ = transport.changed() => {},
+                                    _ = async {
+                                        let mut server = tokio::net::TcpStream::connect(target).await?;
+                                        tokio::io::copy_bidirectional(&mut socket, &mut server).await?;
+                                        Ok::<_, io::Error>(())
+                                    } => {},
+                                }
+                                return;
+                            }
                             let service = service_fn(move |request: Request<Incoming>| {
                                 let client = if request.version() == http::Version::HTTP_2 { h2.clone() } else { h1.clone() };
                                 let pause = active.lock().expect("RPC pause slot").clone();
-                                forward_request(request, client, target, pause)
-
+                                let retain = pause.as_ref().is_some_and(|pause| {
+                                    pause.retain_after_disconnect
+                                        && request.uri().path().strip_prefix("/node_service.NodeService/")
+                                            .is_some_and(|method| pause.methods.contains(&method))
+                                });
+                                let late = late.clone();
+                                async move {
+                                    if !retain {
+                                        return forward_request(request, client, target, pause).await;
+                                    }
+                                    // This opt-in fault owns the packet after client cancellation.
+                                    // Proxy teardown still aborts every retained request.
+                                    let task = tokio::spawn(forward_request(request, client, target, pause));
+                                    {
+                                        let mut requests = late.lock().expect("late RPC ownership");
+                                        if let Some(requests) = requests.as_mut() {
+                                            requests.retain(|request| !request.is_finished());
+                                            requests.push(task.abort_handle());
+                                        } else {
+                                            task.abort();
+                                        }
+                                    }
+                                    task.await.map_err(io::Error::other)?
+                                }
                             });
                             let _ = auto::Builder::new(TokioExecutor::new())
                                 .serve_connection(TokioIo::new(socket), service).await;
@@ -167,7 +225,17 @@ impl RpcFaultProxy {
                 }
             }
         });
-        Ok(Self { address, slot, task })
+        Ok(Self {
+            address,
+            slot,
+            task,
+            late_requests,
+            transport_passthrough,
+        })
+    }
+
+    pub(crate) fn set_transport_passthrough(&self, enabled: bool) {
+        self.transport_passthrough.send_replace(enabled);
     }
 
     pub(crate) fn local_addr(&self) -> SocketAddr {
@@ -177,6 +245,27 @@ impl RpcFaultProxy {
     /// Pause at most limit requests to the named unary methods; other streams
     /// on the same HTTP/2 connection continue forwarding.
     pub(crate) fn pause(&self, methods: &[&'static str], limit: usize, scope: Option<&str>) -> io::Result<RpcPause> {
+        self.pause_with_lifetime(methods, limit, scope, false)
+    }
+
+    /// Retain bounded control packets until explicit delivery after caller retirement.
+    pub(crate) fn pause_late(&self, methods: &[&'static str], limit: usize, scope: &str) -> io::Result<RpcPause> {
+        if limit > 64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "late RPC limit exceeds control-packet budget",
+            ));
+        }
+        self.pause_with_lifetime(methods, limit, Some(scope), true)
+    }
+
+    fn pause_with_lifetime(
+        &self,
+        methods: &[&'static str],
+        limit: usize,
+        scope: Option<&str>,
+        retain_after_disconnect: bool,
+    ) -> io::Result<RpcPause> {
         let mut slot = self.slot.lock().expect("RPC pause slot");
         if slot.is_some() || methods.is_empty() || limit == 0 || scope.is_some_and(str::is_empty) {
             return Err(io::Error::new(
@@ -189,6 +278,9 @@ impl RpcFaultProxy {
             methods: methods.to_vec(),
             scope: scope.map(|scope| scope.as_bytes().to_vec()),
             limit,
+            retain_after_disconnect,
+            refused_mutations: AtomicUsize::new(0),
+            responses: AtomicUsize::new(0),
             matched: AtomicUsize::new(0),
             blocked: AtomicUsize::new(0),
             forwarded: AtomicUsize::new(0),
@@ -232,7 +324,7 @@ async fn forward_request(
     client: ProxyClient,
     target: SocketAddr,
     pause: Option<Arc<PauseState>>,
-) -> io::Result<hyper::Response<Incoming>> {
+) -> io::Result<hyper::Response<ProxyBody>> {
     let (mut parts, body) = request.into_parts();
     let mut body = body.map_err(io::Error::other).boxed();
     let mut observed = None;
@@ -279,7 +371,11 @@ async fn forward_request(
                 if disposition == Disposition::Discard {
                     return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "injected RPC packet loss"));
                 }
-                observed = Some((pause, route));
+                observed = Some((
+                    pause,
+                    route,
+                    matches!(method, "RenameData" | "RenameDataAtIncarnation" | "RenameDataWithQuotaFence"),
+                ));
             }
         }
     }
@@ -301,20 +397,46 @@ async fn forward_request(
         .request(Request::from_parts(parts, body))
         .await
         .map_err(io::Error::other)?;
-    if let Some((pause, route)) = observed
-        && response.status().is_success()
-        && response.headers().get("grpc-status").is_none_or(|status| status == "0")
-    {
-        pause.forwarded.fetch_add(1, Ordering::SeqCst);
-        if let Some(route) = route {
-            pause.forwarded_routes.lock().expect("RPC route observations").insert(route);
+    if let Some((pause, route, rename)) = observed {
+        pause.responses.fetch_add(1, Ordering::SeqCst);
+        if response.status().is_success() && response.headers().get("grpc-status").is_none_or(|status| status == "0") {
+            pause.forwarded.fetch_add(1, Ordering::SeqCst);
+            if let Some(route) = route {
+                pause.forwarded_routes.lock().expect("RPC route observations").insert(route);
+            }
+        }
+        if pause.retain_after_disconnect {
+            let (parts, body) = response.into_parts();
+            let collected = Limited::new(body, 1024 * 1024).collect().await.map_err(io::Error::other)?;
+            let trailers = collected.trailers().cloned();
+            let bytes = collected.to_bytes();
+            let status = parts
+                .headers
+                .get("grpc-status")
+                .or_else(|| trailers.as_ref()?.get("grpc-status"));
+            if rename && parts.status.is_success() && status.is_none_or(|status| status == "0") {
+                let result = RenameDataResponse::decode(unary_payload(&bytes)?).map_err(io::Error::other)?;
+                if !result.success && result.error.is_some() {
+                    pause.refused_mutations.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            let body = Full::new(bytes)
+                .map_err(|never| match never {})
+                .with_trailers(async move { trailers.map(Ok::<_, io::Error>) })
+                .boxed();
+            return Ok(hyper::Response::from_parts(parts, body));
         }
     }
-    Ok(response)
+    Ok(response.map(|body| body.map_err(io::Error::other).boxed()))
 }
 
 impl Drop for RpcFaultProxy {
     fn drop(&mut self) {
+        if let Some(requests) = self.late_requests.lock().expect("late RPC ownership").take() {
+            for request in requests {
+                request.abort();
+            }
+        }
         self.task.abort();
     }
 }
@@ -354,7 +476,11 @@ mod tests {
                                 let received = received.clone();
                                 async move {
                                 received.fetch_add(1, Ordering::SeqCst);
-                                let authority = request.headers().get(http::header::HOST).cloned();
+                                let authority = request.headers().get(http::header::HOST).cloned().or_else(|| {
+                                    request.uri().authority().map(|authority| {
+                                        http::HeaderValue::from_str(authority.as_str()).expect("valid HTTP authority")
+                                    })
+                                });
                                 let body = request.into_body().collect().await?.to_bytes();
                                 let mut trailers = http::HeaderMap::new();
                                 trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
@@ -405,18 +531,21 @@ mod tests {
             let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback address"), backend.address)
                 .await
                 .expect("proxy");
-            for h2 in [false, true] {
-                let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(h2).build_http();
-                let response = call(&client, proxy.local_addr(), "ReadVersion")
-                    .await
-                    .expect("transparent request");
-                assert_eq!(response.version(), if h2 { http::Version::HTTP_2 } else { http::Version::HTTP_11 });
-                assert_eq!(response.headers()["x-original-authority"], proxy.local_addr().to_string());
-                let collected = response.into_body().collect().await.expect("complete body and trailers");
-                let trailers = collected.trailers().expect("gRPC trailers must survive both proxy hops");
-                assert_eq!(trailers["grpc-status"], "0");
-                assert_eq!(trailers["x-proof"], "unchanged-proof");
-                assert_eq!(collected.to_bytes(), Bytes::from_static(b"opaque signed protobuf"));
+            for transport in [true, false] {
+                proxy.set_transport_passthrough(transport);
+                for h2 in [false, true] {
+                    let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(h2).build_http();
+                    let response = call(&client, proxy.local_addr(), "ReadVersion")
+                        .await
+                        .expect("transparent request");
+                    assert_eq!(response.version(), if h2 { http::Version::HTTP_2 } else { http::Version::HTTP_11 });
+                    assert_eq!(response.headers()["x-original-authority"], proxy.local_addr().to_string());
+                    let collected = response.into_body().collect().await.expect("complete body and trailers");
+                    let trailers = collected.trailers().expect("gRPC trailers must survive both proxy hops");
+                    assert_eq!(trailers["grpc-status"], "0");
+                    assert_eq!(trailers["x-proof"], "unchanged-proof");
+                    assert_eq!(collected.to_bytes(), Bytes::from_static(b"opaque signed protobuf"));
+                }
             }
         })
         .await
@@ -571,7 +700,88 @@ mod tests {
         })
         .await
         .expect("scoped discard deadline");
+        assert_late_packet_ownership().await;
     }
+    async fn assert_late_packet_ownership() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let backend = backend().await.expect("backend listener");
+            {
+                let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback"), backend.address)
+                    .await
+                    .expect("live late-mode proxy");
+                let pause = proxy
+                    .pause_late(&["WriteMetadata"], 1, "late-upload")
+                    .expect("retain live packet");
+                let address = proxy.local_addr();
+                let caller = tokio::spawn(async move {
+                    let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(true).build_http();
+                    call_body(&client, address, "WriteMetadata", Bytes::from_static(b"signed late-upload control")).await
+                });
+                pause.wait_for_hits(1).await.expect("live caller reaches pause");
+                pause.release();
+                let response = caller.await.expect("live caller task").expect("live response");
+                let collected = response.into_body().collect().await.expect("retained response body");
+                let trailers = collected.trailers().expect("retained response trailers");
+                assert_eq!(trailers["grpc-status"], "0");
+                assert_eq!(trailers["x-proof"], "unchanged-proof");
+                assert_eq!(collected.to_bytes(), Bytes::from_static(b"signed late-upload control"));
+            }
+            for disposition in ["deliver", "drop_proxy", "drop_pause"] {
+                let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback"), backend.address)
+                    .await
+                    .expect("late proxy");
+                let pause = proxy.pause_late(&["WriteMetadata"], 1, "late-upload").expect("retain packet");
+                let address = proxy.local_addr();
+                let caller = tokio::spawn(async move {
+                    let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(true).build_http();
+                    call_body(&client, address, "WriteMetadata", Bytes::from_static(b"signed late-upload control")).await
+                });
+                pause.wait_for_hits(1).await.expect("packet retained before cancellation");
+                caller.abort();
+                assert!(caller.await.expect_err("caller cancelled").is_cancelled());
+                let before = backend.received.load(Ordering::SeqCst);
+                assert_eq!(pause.responses(), 0);
+                let handles = proxy
+                    .late_requests
+                    .lock()
+                    .expect("retained tasks")
+                    .as_ref()
+                    .expect("open registry")
+                    .clone();
+                assert_eq!(handles.len(), 1, "the intercepted packet must have supervised ownership");
+                match disposition {
+                    "deliver" => {
+                        pause.release();
+                        while handles.iter().any(|task| !task.is_finished()) {
+                            tokio::task::yield_now().await;
+                        }
+                        assert_eq!(pause.responses(), 1);
+                        assert_eq!(backend.received.load(Ordering::SeqCst), before + 1);
+                    }
+                    "drop_proxy" => {
+                        drop(proxy);
+                        while handles.iter().any(|task| !task.is_finished()) {
+                            tokio::task::yield_now().await;
+                        }
+                        pause.release();
+                        assert_eq!(backend.received.load(Ordering::SeqCst), before, "teardown must cancel retained packets");
+                        assert_eq!(pause.responses(), 0);
+                    }
+                    "drop_pause" => {
+                        drop(pause);
+                        while handles.iter().any(|task| !task.is_finished()) {
+                            tokio::task::yield_now().await;
+                        }
+                        assert_eq!(backend.received.load(Ordering::SeqCst), before, "late delivery must be explicit");
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        })
+        .await
+        .expect("late proxy ownership deadline");
+    }
+
     #[test]
     fn delete_scope_matches_only_the_upload_root() {
         let frame = |volume: &str, path: &str| {

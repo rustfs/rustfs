@@ -429,6 +429,10 @@ pub mod data_usage {
 pub mod disk {
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
     pub use crate::disk::local::{ReplacementExecutionLease, ScanGuard};
+    #[cfg(feature = "test-util")]
+    pub use crate::disk::local::{local_durability_modes, set_local_rename_data_fail_after_metadata_commit};
+    #[cfg(all(feature = "test-util", unix))]
+    pub use crate::disk::os::set_local_dir_fsync_failure;
     #[cfg(all(feature = "test-util", not(windows)))]
     pub use crate::disk::os::{LocalPublicationPause, LocalPublicationStage};
     pub use crate::disk::{
@@ -513,13 +517,16 @@ pub mod metrics {
 pub mod notification {
     pub use crate::services::notification_sys::{
         ClusterTierDailyStats, CrossPoolFenceFleetProofToken, IlmRecoveryExportFleetProofToken,
-        LegacyTransitionStateReconcileFleetProofToken, NotificationPeerErr, NotificationSys, ScannerPublicationLeaseGrant,
-        acquire_cross_pool_fence_fleet_proof, acquire_ilm_recovery_export_fleet_proof,
-        acquire_legacy_transition_state_reconcile_fleet_proof, configured_fleet_topology_fingerprint,
-        cross_pool_fence_fleet_proof_matches, get_global_notification_sys, ilm_recovery_export_fleet_proof_matches,
-        ilm_recovery_export_local_process_epoch, ilm_recovery_export_member_epochs_sha256,
-        ilm_recovery_export_topology_generation, legacy_transition_state_reconcile_fleet_proof_matches,
-        new_global_notification_sys, scanner_peer_transport_error_message_is_retryable, start_remote_version_state_fleet_probe,
+        LegacyTransitionStateReconcileFleetProofToken, MrfLifecycleWriterFleetProofToken, NotificationPeerErr, NotificationSys,
+        ScannerPublicationLeaseGrant, acquire_cross_pool_fence_fleet_proof, acquire_ilm_recovery_export_fleet_proof,
+        acquire_legacy_transition_state_reconcile_fleet_proof, acquire_mrf_lifecycle_writer_fleet_proof,
+        configured_fleet_topology_fingerprint, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
+        ilm_recovery_export_fleet_proof_matches, ilm_recovery_export_local_process_epoch,
+        ilm_recovery_export_member_epochs_sha256, ilm_recovery_export_topology_generation,
+        legacy_transition_state_reconcile_fleet_proof_matches, mrf_lifecycle_reader_local_process_epoch,
+        mrf_lifecycle_writer_fleet_proof_current, mrf_lifecycle_writer_fleet_proof_matches, new_global_notification_sys,
+        scanner_peer_transport_error_message_is_retryable, start_remote_version_state_fleet_probe,
+        with_mrf_lifecycle_writer_fleet_proof,
     };
     #[cfg(any(test, feature = "test-util"))]
     pub use crate::services::notification_sys::{

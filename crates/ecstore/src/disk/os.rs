@@ -92,9 +92,6 @@ pub(crate) mod fsync_dir_recorder {
     static LIMITED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static GROUPED: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
     #[cfg(unix)]
-    static FAILURES: std::sync::LazyLock<Mutex<HashMap<PathBuf, io::ErrorKind>>> =
-        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-    #[cfg(unix)]
     static BEFORE_LIMITED: std::sync::LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
         std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
     static BEFORE_GROUP_BATCH: std::sync::LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
@@ -156,15 +153,12 @@ pub(crate) mod fsync_dir_recorder {
 
     #[cfg(unix)]
     pub(crate) fn set_failure(dir: &Path, kind: io::ErrorKind) {
-        FAILURES
-            .lock()
-            .expect("fsync dir failure hook poisoned")
-            .insert(dir.to_path_buf(), kind);
+        super::dir_fsync_failures::set(dir, kind);
     }
 
     #[cfg(unix)]
     pub(crate) fn take_failure(dir: &Path) -> Option<io::ErrorKind> {
-        remove_path_keyed(&FAILURES, dir, "fsync dir failure hook poisoned")
+        super::dir_fsync_failures::take(dir)
     }
 
     #[cfg(unix)]
@@ -261,6 +255,49 @@ pub(crate) mod fsync_dir_recorder {
     pub(crate) fn take_grouped_failure(dir: &Path) -> Option<io::ErrorKind> {
         remove_path_keyed(&GROUPED_FAILURES, dir, "grouped fsync failure hook poisoned")
     }
+}
+
+#[cfg(all(any(test, feature = "test-util"), unix))]
+mod dir_fsync_failures {
+    use super::*;
+
+    static FAILURES: LazyLock<Mutex<HashMap<PathBuf, io::ErrorKind>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) fn set(dir: &Path, kind: io::ErrorKind) {
+        FAILURES.lock().insert(dir.to_path_buf(), kind);
+    }
+
+    pub(super) fn take(dir: &Path) -> Option<io::ErrorKind> {
+        let mut failures = FAILURES.lock();
+        if failures.is_empty() {
+            return None;
+        }
+        if let Some(kind) = failures.remove(dir) {
+            return Some(kind);
+        }
+        let canonical = dir.canonicalize().ok();
+        let matching_key = failures
+            .keys()
+            .find(|registered| {
+                registered.as_path() == dir
+                    || canonical.as_ref().is_some_and(|canonical| *registered == canonical)
+                    || registered.canonicalize().ok().is_some_and(|registered_canonical| {
+                        registered_canonical == dir || canonical.as_ref() == Some(&registered_canonical)
+                    })
+            })
+            .cloned();
+        matching_key.and_then(|key| failures.remove(&key))
+    }
+}
+
+/// Inject one error at the real directory-fsync boundary for a local path.
+#[cfg(all(feature = "test-util", unix))]
+pub fn set_local_dir_fsync_failure(disk: &crate::disk::Disk, volume: &str, path: &str, kind: io::ErrorKind) -> Result<()> {
+    let path = disk
+        .get_object_path_for_io_if_local(volume, path)
+        .ok_or(DiskError::DiskNotFound)??;
+    dir_fsync_failures::set(&path, kind);
+    Ok(())
 }
 
 /// Pause a real namespace mutation inside its physical executor.
@@ -500,8 +537,8 @@ pub(crate) fn fsync_directory_handle_std(dir: &Path, opened: Option<&std::fs::Fi
     fsync_dir_recorder::record(dir);
     #[cfg(unix)]
     {
-        #[cfg(test)]
-        if let Some(kind) = fsync_dir_recorder::take_failure(dir) {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(kind) = dir_fsync_failures::take(dir) {
             return Err(io::Error::from(kind));
         }
         match opened {
@@ -4383,6 +4420,17 @@ impl RenameDestinationPathGuard {
         sync_file: bool,
         sync_parent: bool,
     ) -> io::Result<()> {
+        self.write_file_for_path_access_guarded(file_path, data, sync_file, sync_parent, || Ok(()))
+    }
+
+    fn write_file_for_path_access_guarded(
+        &self,
+        file_path: &Path,
+        data: &[u8],
+        sync_file: bool,
+        sync_parent: bool,
+        before_publish: impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
         #[cfg(windows)]
         {
             if file_path.parent() != Some(self.directory.as_path()) {
@@ -4418,7 +4466,9 @@ impl RenameDestinationPathGuard {
             // the separate publication handle as the identity anchor and close
             // the writer before issuing the handle-relative rename.
             drop(writer);
-            if let Err(rename_err) = rename_windows_prepared(file_path, &self._directory_guard, &publication, 0) {
+            if let Err(rename_err) =
+                before_publish().and_then(|()| rename_windows_prepared(file_path, &self._directory_guard, &publication, 0))
+            {
                 if let Err(cleanup_err) = set_windows_file_delete_on_close(&publication, true) {
                     return Err(io::Error::new(
                         rename_err.kind(),
@@ -4437,6 +4487,7 @@ impl RenameDestinationPathGuard {
         #[cfg(not(windows))]
         {
             let _ = self;
+            before_publish()?;
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -5155,6 +5206,7 @@ pub(crate) fn compare_and_update_control_file(
     replacement: Option<&[u8]>,
     sync_metadata: bool,
     publication_root: &PublicationRoot,
+    before_publish: impl Fn() -> io::Result<()>,
 ) -> io::Result<ConditionalFileUpdate> {
     use windows_sys::{
         Wdk::Storage::FileSystem::{
@@ -5204,7 +5256,7 @@ pub(crate) fn compare_and_update_control_file(
             directory: parent.to_path_buf(),
             _directory_guard: parent_guard,
         }
-        .write_file_for_path_access(file_path, replacement, sync_metadata, sync_metadata)?,
+        .write_file_for_path_access_guarded(file_path, replacement, sync_metadata, sync_metadata, before_publish)?,
         None => {
             let file_name = file_path
                 .file_name()
@@ -5220,6 +5272,7 @@ pub(crate) fn compare_and_update_control_file(
                 true,
             )?;
             validate_windows_owned_file(&file)?;
+            before_publish()?;
             set_windows_file_delete_on_close(&file, true)?;
             drop(file);
             if sync_metadata {
@@ -5451,8 +5504,22 @@ pub(crate) fn mkdir_all_below_existing_base_std(
         let base = publication_root.open_directory(base_dir)?.into();
         #[cfg(not(target_os = "linux"))]
         let base = {
-            let _ = publication_root;
-            rustix::fs::open(base_dir, flags, Mode::empty()).map_err(io::Error::from)?
+            // The configured endpoint is trusted; every component beneath it
+            // must remain an existing non-symlink directory, even when the
+            // caller supplies a deep base rather than the volume root.
+            let base_relative = existing_base_directory_suffix(base_dir, publication_root.path())?;
+            let root_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+            let mut base = rustix::fs::open(publication_root.path(), root_flags, Mode::empty()).map_err(io::Error::from)?;
+            for component in base_relative.components() {
+                if matches!(component, Component::CurDir) {
+                    continue;
+                }
+                let Component::Normal(component) = component else {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid existing base component"));
+                };
+                base = openat(&base, Path::new(component), flags, Mode::empty()).map_err(io::Error::from)?;
+            }
+            base
         };
         let mut parents = vec![base];
 
@@ -6181,6 +6248,45 @@ mod tests {
         assert_eq!(default_global_file_sync_limit(64, 1024), MAX_GLOBAL_FILE_SYNCS);
         assert_eq!(default_global_file_sync_limit(64, 128), 64);
         assert_eq!(default_global_file_sync_limit(0, 0), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_base_preparation_rejects_symlink_ancestors() {
+        let root = tempdir().expect("publication root");
+        let outside = tempdir().expect("outside publication root");
+        std::fs::create_dir(outside.path().join("upload")).expect("outside existing base");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("hash")).expect("replace an intermediate component");
+        let publication_root = PublicationRoot::new(root.path()).expect("root identity");
+        let base = root.path().join("hash/upload");
+        let result = super::mkdir_all_below_existing_base_std(&base.join("recovery"), &base, &publication_root);
+        assert!(
+            result.is_err(),
+            "an existing base must not follow an ancestor outside the publication root"
+        );
+        assert!(!outside.path().join("upload/recovery").exists());
+
+        let valid = root.path().join("valid/upload");
+        std::fs::create_dir_all(&valid).expect("ordinary nested base");
+        super::mkdir_all_below_existing_base_std(&valid.join("recovery"), &valid, &publication_root)
+            .expect("an existing ordinary base remains usable");
+        assert!(valid.join("recovery").is_dir());
+        assert!(
+            super::mkdir_all_below_existing_base_std(&outside.path().join("direct"), outside.path(), &publication_root,).is_err()
+        );
+        assert!(!outside.path().join("direct").exists());
+        #[cfg(not(target_os = "linux"))]
+        {
+            let alias_directory = tempdir().expect("configured alias directory");
+            let configured = alias_directory.path().join("endpoint");
+            std::os::unix::fs::symlink(root.path(), &configured).expect("configured endpoint alias");
+            let aliased_root = PublicationRoot::new(&configured).expect("trusted configured endpoint");
+            let aliased_base = configured.join("valid/upload");
+            super::mkdir_all_below_existing_base_std(&aliased_base.join("alias-recovery"), &aliased_base, &aliased_root)
+                .expect("configured endpoint aliases remain supported");
+            assert!(valid.join("alias-recovery").is_dir());
+            std::fs::remove_file(configured).expect("remove the test endpoint alias");
+        }
     }
 
     #[tokio::test]

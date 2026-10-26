@@ -135,6 +135,36 @@ A missing specific-version DELETE first recovers hidden transactions and then
 reads the current version again. It must not acknowledge an unresolved hidden
 version as an idempotent no-op.
 
+## Historical heal backups
+
+Classify a retained backup from its original evidence before requesting any
+mutation. A readable current object, matching ETag or modification time does
+not prove that the transaction which created the backup completed.
+
+| Class | Evidence and handling |
+| --- | --- |
+| A: proven completed publication | The successful heal operation still owns its bucket, object and commit fences and has the exact backup returned by that publication. Its storage owner may unlink that backup. A historical pathname cannot reconstruct this authority after restart. |
+| B: identified unfinished transaction | A validated prepared journal or commit receipt identifies the delete/rollback owner. Use the existing transaction recovery path; do not treat its backup as a separate heal-cleanup candidate. |
+| C: unknown or conflicting history | Keep the backup and report its scope and inspection evidence. This includes a live write/heal backup without a durable success receipt, even when its metadata matches the current object. |
+
+For a known backup directory UUID, the existing
+`DiskAPI::inspect_delete_transaction(bucket, key, uuid)` reads the local or
+remote participant's evidence without settling it. Record the bucket
+incarnation, pool/set, UUID, metadata digests and inspection fingerprint. A
+result with no journal and a present `backup_digest` remains class C. In
+particular, delete state `Absent` can mean a matching live write backup rather
+than an absent file; it grants no cleanup permission. Delete discovery and
+administrator heal dry-run deliberately exclude those live backups, so their
+counts are not a complete inventory of historical heal files.
+
+Keep the original bytes through classification and repeated inspection. A
+changed fingerprint or scope requires a new inspection, not a retry of an old
+cleanup decision. Bucket recreation and active rebalance/decommission must
+reject or defer the original recovery admission. Ordinary object versions and
+tier free versions retain their own owners; local backup classification never
+authorizes deleting a remote tier object. There is no automatic historical-A
+cleaner for backups lacking the original publication authority.
+
 ## Upgrade and failure handling
 
 Upgrade all participating nodes before relying on the new protocol. Recovery
