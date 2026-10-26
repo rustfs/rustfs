@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::authorize_admin_request;
+use crate::admin::auth::authorize_admin_envelope;
 use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{
-    AppContext, app_context_from_req, current_notification_system_for_context, current_replication_pool_handle,
-    current_replication_stats_handle_for_context, current_runtime_port, object_store_from_req,
+    AppContext, app_context_from_envelope, current_notification_system_for_context, current_replication_pool_handle,
+    current_replication_stats_handle_for_context, current_runtime_port, object_store_from_envelope,
 };
 use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
@@ -39,6 +40,7 @@ use crate::admin::utils::{extract_query_params, read_compatible_admin_body};
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
 use crate::storage::storage_api::lock_bucket_targets_metadata;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use jiff::Timestamp;
@@ -46,9 +48,7 @@ use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr as _;
@@ -631,8 +631,8 @@ pub fn register_replication_route(r: &mut S3Router<AdminOperation>) -> std::io::
     Ok(())
 }
 
-async fn validate_replication_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<Credentials> {
-    authorize_admin_request(req, vec![Action::AdminAction(action)]).await
+async fn validate_replication_admin_request(req: &AdminRequest, action: AdminAction) -> S3Result<Credentials> {
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await
 }
 pub(crate) async fn cluster_replication_stats(bucket: &str, context: Option<Arc<AppContext>>) -> BucketStats {
     let Some(stats) = current_replication_stats_handle_for_context(context.clone()) else {
@@ -698,10 +698,10 @@ pub struct GetReplicationMetricsHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetReplicationMetricsHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_replication_admin_request(&req, AdminAction::GetReplicationMetricsAction).await?;
 
-        let queries = extract_query_params(&req.uri);
+        let queries = extract_query_params(req.uri());
 
         let Some(bucket) = queries.get("bucket") else {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
@@ -711,7 +711,7 @@ impl Operation for GetReplicationMetricsHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         }
 
-        let Some(store) = object_store_from_req(&req) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -732,7 +732,7 @@ impl Operation for GetReplicationMetricsHandler {
             return Err(ApiError::from(err).into());
         }
 
-        let bucket_stats = cluster_replication_stats(bucket, app_context_from_req(&req)).await;
+        let bucket_stats = cluster_replication_stats(bucket, app_context_from_envelope(req.envelope())).await;
 
         // Same minio-go `replication.Metrics` wire shape as
         // `?replication-metrics` — the internal snake_case stats are the peer
@@ -743,7 +743,7 @@ impl Operation for GetReplicationMetricsHandler {
         .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "serialize failed"))?;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), headers))
     }
 }
 
@@ -751,17 +751,17 @@ pub struct SetRemoteTargetHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SetRemoteTargetHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_replication_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
-        let app_context = app_context_from_req(&req);
+        let app_context = app_context_from_envelope(req.envelope());
 
-        let queries = extract_query_params(&req.uri);
+        let queries = extract_query_params(req.uri());
 
         let Some(bucket) = queries.get("bucket") else {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         };
 
-        let (update, replace_unreadable) = parse_remote_target_write_modes(&req.uri)?;
+        let (update, replace_unreadable) = parse_remote_target_write_modes(req.uri())?;
 
         warn!("set remote target, bucket: {}, update: {}", bucket, update);
 
@@ -769,7 +769,7 @@ impl Operation for SetRemoteTargetHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         }
 
-        let Some(store) = object_store_from_req(&req) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -779,7 +779,9 @@ impl Operation for SetRemoteTargetHandler {
             .map_err(ApiError::from)?;
 
         let body =
-            match read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key).await {
+            match read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, req.uri().path(), &cred.secret_key)
+                .await
+            {
                 Ok(body) => body,
                 Err(e) => {
                     warn!("get body failed, e: {:?}", e);
@@ -855,7 +857,7 @@ impl Operation for SetRemoteTargetHandler {
             let _targets_guard = lock_bucket_targets_metadata(bucket).await;
             let arn = persist_remote_target_repair(bucket, remote_target, incarnation).await?;
             let arn_str = serde_json::to_string(&arn).map_err(|_| s3_error!(InternalError, "Failed to serialize target ARN"))?;
-            return Ok(S3Response::new((StatusCode::OK, Body::from(arn_str))));
+            return Ok(AdminResponse::new(StatusCode::OK, Body::from(arn_str)));
         }
 
         let incarnation = metadata_sys::capture_bucket_metadata_incarnation(bucket)
@@ -888,7 +890,7 @@ impl Operation for SetRemoteTargetHandler {
                 if exists && !arn.is_empty() {
                     let body = serde_json::to_string(&arn)
                         .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize target ARN"))?;
-                    return Ok(S3Response::new((StatusCode::OK, Body::from(body))));
+                    return Ok(AdminResponse::new(StatusCode::OK, Body::from(body)));
                 }
             }
             metadata
@@ -987,7 +989,7 @@ impl Operation for SetRemoteTargetHandler {
 
         // MinIO-compatible clients encrypt the request payload for this endpoint,
         // but they parse the success response directly as plain JSON string ARN.
-        Ok(S3Response::new((StatusCode::OK, Body::from(arn_str))))
+        Ok(AdminResponse::new(StatusCode::OK, Body::from(arn_str)))
     }
 }
 
@@ -995,10 +997,10 @@ pub struct ListRemoteTargetHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ListRemoteTargetHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_replication_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
 
-        let queries = extract_query_params(&req.uri);
+        let queries = extract_query_params(req.uri());
 
         if let Some(bucket) = queries.get("bucket") {
             if bucket.is_empty() {
@@ -1006,7 +1008,7 @@ impl Operation for ListRemoteTargetHandler {
                 return Err(s3_error!(InvalidRequest, "bucket is required"));
             }
 
-            let Some(store) = object_store_from_req(&req) else {
+            let Some(store) = object_store_from_envelope(req.envelope()) else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
             };
 
@@ -1039,7 +1041,7 @@ impl Operation for ListRemoteTargetHandler {
             let mut header = HeaderMap::new();
             header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-            return Ok(S3Response::with_headers((StatusCode::OK, Body::from(json_targets)), header));
+            return Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(json_targets), header));
         }
 
         let targets: Vec<BucketTarget> = Vec::new();
@@ -1052,7 +1054,7 @@ impl Operation for ListRemoteTargetHandler {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(json_targets)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(json_targets), header))
     }
 }
 
@@ -1060,12 +1062,12 @@ pub struct RemoveRemoteTargetHandler {}
 
 #[async_trait::async_trait]
 impl Operation for RemoveRemoteTargetHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_replication_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
-        let app_context = app_context_from_req(&req);
+        let app_context = app_context_from_envelope(req.envelope());
 
         debug!("remove remote target called");
-        let queries = extract_query_params(&req.uri);
+        let queries = extract_query_params(req.uri());
         let Some(bucket) = queries.get("bucket") else {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         };
@@ -1080,7 +1082,7 @@ impl Operation for RemoveRemoteTargetHandler {
             return Err(s3_error!(InvalidRequest, "arn is required"));
         };
 
-        let Some(store) = object_store_from_req(&req) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
         };
 
@@ -1161,7 +1163,7 @@ impl Operation for RemoveRemoteTargetHandler {
 
         notify_remote_target_metadata_reload(&notification_bucket, app_context, "remove_remote_target").await;
 
-        Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
+        Ok(AdminResponse::new(StatusCode::NO_CONTENT, Body::from("".to_string())))
     }
 }
 
@@ -1302,15 +1304,15 @@ pub struct ReplicationDiffHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ReplicationDiffHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_replication_admin_request(&req, AdminAction::ReplicationDiff).await?;
 
-        let queries = extract_query_params(&req.uri);
+        let queries = extract_query_params(req.uri());
         let Some(bucket) = queries.get("bucket").filter(|b| !b.is_empty()).cloned() else {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         };
 
-        let Some(store) = object_store_from_req(&req) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1334,7 +1336,8 @@ impl Operation for ReplicationDiffHandler {
         // Optional prefix can be supplied either as a query parameter (MinIO
         // clients) or, for RustFS clients, as a small JSON body.
         let mut prefix = queries.get("prefix").cloned().unwrap_or_default();
-        let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key).await?;
+        let body =
+            read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, req.uri().path(), &cred.secret_key).await?;
         if prefix.is_empty() && !body.trim_ascii().is_empty() {
             match serde_json::from_slice::<ReplicationDiffRequest>(&body) {
                 Ok(parsed) => prefix = parsed.prefix,
@@ -1422,7 +1425,7 @@ impl Operation for ReplicationDiffHandler {
         if is_truncated {
             headers.insert("x-rustfs-replication-diff-truncated", HeaderValue::from_static("true"));
         }
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), headers))
     }
 }
 
@@ -1715,8 +1718,8 @@ pub struct ReplicationMrfHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ReplicationMrfHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let queries = extract_query_params(&req.uri);
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let queries = extract_query_params(req.uri());
         let aggregate = queries.get("aggregate").map(String::as_str) == Some("true");
         // The default stream enumerates object names and version ids, which
         // a metrics-only principal must not see; gate it on the same action
@@ -1733,7 +1736,7 @@ impl Operation for ReplicationMrfHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         };
 
-        let Some(store) = object_store_from_req(&req) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1760,7 +1763,7 @@ impl Operation for ReplicationMrfHandler {
         }
 
         let durable = crate::admin::storage_api::replication::read_durable_mrf_backlog(store).await;
-        let bucket_stats = cluster_replication_stats(&bucket, app_context_from_req(&req)).await;
+        let bucket_stats = cluster_replication_stats(&bucket, app_context_from_envelope(req.envelope())).await;
         let response = build_mrf_response(bucket, &bucket_stats, &durable);
 
         if !durable.available && !aggregate {
@@ -1794,7 +1797,7 @@ impl Operation for ReplicationMrfHandler {
             );
         }
         ensure_complete_mrf_stream(truncated)?;
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), headers))
     }
 }
 
@@ -3222,28 +3225,23 @@ mod target_repair_tests {
         (temp, env)
     }
 
-    fn request(method: Method, query: &str, body: Vec<u8>) -> S3Request<Body> {
+    fn request(method: Method, query: &str, body: Vec<u8>) -> AdminRequest {
         let operation = match method {
             Method::GET => "list-remote-targets",
             Method::DELETE => "remove-remote-target",
             _ => "set-remote-target",
         };
-        S3Request {
-            input: Body::from(body),
+        crate::admin::operation::test_support::TestRequest::new(
             method,
-            uri: format!("/rustfs/admin/v3/{operation}?bucket={BUCKET}&{query}")
-                .parse()
+            format!("/rustfs/admin/v3/{operation}?bucket={BUCKET}&{query}")
+                .parse::<http::Uri>()
                 .expect("admin URI"),
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: Some(s3s::auth::Credentials {
-                access_key: ACCESS_KEY.to_string(),
-                secret_key: s3s::auth::SecretKey::from(SECRET_KEY.to_string()),
-            }),
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+        )
+        .headers(HeaderMap::new())
+        .extensions(Extensions::new())
+        .body(Body::from(body))
+        .credentials(ACCESS_KEY, SECRET_KEY, None)
+        .build()
     }
 
     async fn seed_unreadable(env: &rustfs_test_utils::TestECStoreEnv) {
@@ -3267,8 +3265,9 @@ mod target_repair_tests {
         let response = SetRemoteTargetHandler {}
             .call(request(Method::PUT, query, body), Params::new())
             .await?;
-        assert_eq!(response.output.0, StatusCode::OK);
-        let body = response.output.1.collect().await.expect("collect target ARN").to_bytes();
+        let (status, _, body) = response.into_parts();
+        assert_eq!(status, StatusCode::OK);
+        let body = body.collect().await.expect("collect target ARN").to_bytes();
         Ok(serde_json::from_slice(&body).expect("plain JSON ARN"))
     }
 
@@ -3324,13 +3323,14 @@ mod target_repair_tests {
                         .secret_key,
                     "remote-secret"
                 );
-                let list = ListRemoteTargetHandler {}
+                let (list_status, _, list_body) = ListRemoteTargetHandler {}
                     .call(request(Method::GET, "", Vec::new()), Params::new())
                     .await
-                    .expect("list repaired targets");
-                assert_eq!(list.output.0, StatusCode::OK);
+                    .expect("list repaired targets")
+                    .into_parts();
+                assert_eq!(list_status, StatusCode::OK);
                 let listed: serde_json::Value =
-                    serde_json::from_slice(&list.output.1.collect().await.expect("collect target list").to_bytes())
+                    serde_json::from_slice(&list_body.collect().await.expect("collect target list").to_bytes())
                         .expect("decode list");
                 assert_eq!(listed.as_array().expect("targets list").len(), 1);
                 assert_eq!(listed[0]["arn"], arn);
@@ -3598,7 +3598,8 @@ mod target_repair_tests {
         let response = RemoveRemoteTargetHandler {}
             .call(request(Method::DELETE, &query, Vec::new()), Params::new())
             .await?;
-        assert_eq!(response.output.0, StatusCode::NO_CONTENT);
+        let (status, _, _) = response.into_parts();
+        assert_eq!(status, StatusCode::NO_CONTENT);
         Ok(())
     }
 

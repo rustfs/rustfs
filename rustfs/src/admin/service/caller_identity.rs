@@ -144,13 +144,6 @@ impl CallerIdentity {
     }
 
     /// Envelope form of [`Self::resolve`] for handlers on the owned boundary.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-        )
-    )]
     pub(crate) async fn resolve_envelope(envelope: &RequestEnvelope) -> S3Result<Self> {
         let Some(input_cred) = envelope.credentials() else {
             return Err(s3::error(S3ErrorCode::InvalidRequest, "authentication required"));

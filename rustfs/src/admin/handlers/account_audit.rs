@@ -200,13 +200,6 @@ impl AccountAuditContext {
     }
 
     /// Envelope form of [`Self::from_request`] for handlers on the owned boundary.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-        )
-    )]
     pub(crate) fn from_envelope(envelope: &RequestEnvelope) -> Self {
         let user_agent = get_request_user_agent(envelope.headers());
         let request_context = envelope.request_context().cloned();

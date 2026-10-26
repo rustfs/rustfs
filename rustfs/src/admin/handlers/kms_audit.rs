@@ -202,13 +202,6 @@ impl KmsAdminAudit {
     }
 
     /// Build the audit state from the owned request envelope.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used as admin handlers move to the owned request boundary in T1.12 (rustfs/backlog#2788)"
-        )
-    )]
     pub(super) fn from_envelope(envelope: &RequestEnvelope, cred: &Credentials) -> Self {
         let source_ip = envelope.remote_addr().map(|addr| addr.ip().to_string());
         let request_id = envelope.request_context().map(|context| context.request_id.clone());
