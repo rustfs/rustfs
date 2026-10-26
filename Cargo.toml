@@ -66,6 +66,7 @@ members = [
     "crates/io-metrics", # I/O metrics collection for performance analysis
     "crates/io-core", # Buffered Bytes, mmap-then-copy, and aligned pread I/O helpers
     "crates/zip", # ZIP file handling and compression
+    "crates/zstd-compat", # Fixed codec for dependencies requiring zstd 0.13
 ]
 resolver = "3"
 
@@ -260,7 +261,7 @@ aws-smithy-http-client = { default-features = false, version = "1.5.1" }
 aws-smithy-runtime-api = { version = "1.19.1" }
 aws-smithy-types = { version = "1.9.0" }
 base64-simd = "0.8.0"
-brotli = "9.0.0"
+brotli = "9.1.0"
 clap = { version = "4.6.7" }
 const-str = { version = "1.1.0" }
 convert_case = "0.12.0"
@@ -355,7 +356,7 @@ winapi-util = "0.1.11"
 windows = { version = "0.62.2" }
 windows-sys = "0.61.2"
 xxhash-rust = { version = "0.8.19" }
-zip = "9.1.0"
+zip = "9.1.2"
 zstd = "0.14.3"
 
 # Observability and Metrics
@@ -376,7 +377,7 @@ libunftp = { version = "0.23.1" }
 unftp-core = "0.1.0"
 suppaftp = { version = "12.2.1" }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
-russh = { version = "0.64.1" }
+russh = { version = "0.65.0" }
 russh-sftp = "3.0.1"
 
 # WebDAV
@@ -385,7 +386,7 @@ dav-server = "0.11.0"
 # Performance Analysis and Memory Profiling
 rustfs-mimalloc = { version = "0.7.2" }
 # Preserve Unicode focus filters until rustfs/backlog#2302 is resolved.
-hotpath = { version = "0.29.1", default-features = false }
+hotpath = { version = "0.29.2", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.49" }
 
@@ -425,6 +426,7 @@ strip = "none"
 
 # Pin upstream fixes until compatible crates.io releases are available.
 [patch.crates-io]
+zstd = { path = "crates/zstd-compat" }
 # Preserve RustFS OIDC flows while migrating the old elliptic-curve dependency chain.
 # Upstream: openidconnect-rs#244 and oauth2-rs#352.
 openidconnect = { git = "https://github.com/ramosbugs/openidconnect-rs", rev = "2f77ee73bc4554e1cb6279adb386005429fb4e41" }
