@@ -2338,6 +2338,7 @@ async fn rename_table_body_rejects_declared_and_streamed_oversize_payloads() {
     .await
     .expect_err("oversized streamed body should fail");
     assert_eq!(streamed.code(), &S3ErrorCode::InvalidRequest);
+    assert_eq!(streamed.message(), Some("failed to read request body: length limit exceeded"));
 }
 
 fn assert_rejects_unknown_field<T>(target: &str, value: serde_json::Value)

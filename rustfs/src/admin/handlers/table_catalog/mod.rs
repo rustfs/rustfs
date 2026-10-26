@@ -1991,7 +1991,13 @@ async fn read_limited_body(mut input: Body, max_size: usize, timeout: StdDuratio
                 |operation| S3Error::from(ApiError::invalid_request(format!("timed out reading {operation} request body"))),
             )
         })?
-        .map_err(|err| S3Error::from(ApiError::invalid_request(format!("failed to read request body: {err}"))))
+        .map_err(|err| {
+            if err.is::<rustfs_s3_types::BodyTooLarge>() {
+                S3Error::from(ApiError::invalid_request("failed to read request body: length limit exceeded"))
+            } else {
+                S3Error::from(ApiError::invalid_request(format!("failed to read request body: {err}")))
+            }
+        })
 }
 
 async fn read_json_body<T: DeserializeOwned>(input: Body) -> S3Result<T> {
