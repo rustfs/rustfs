@@ -517,12 +517,24 @@ def _unwrap_uri(expr: str) -> str:
     m = re.fullmatch(rf"({_STR})\s*\.parse\(\)\s*\.(?:unwrap|expect)\([^()]*\)", expr, re.S)
     if m:
         return m.group(1)
+    # A non-literal `.parse()` lost the `uri: Uri` field annotation that drove
+    # type inference; make the target type explicit.
+    m = re.fullmatch(r"(.*?)\.parse\(\)(\s*\.(?:unwrap|expect)\([^()]*\))?", expr, re.S)
+    if m and "::<" not in expr:
+        return f"{m.group(1)}.parse::<http::Uri>(){m.group(2) or ''}"
     return expr
 
 
 def _unwrap_into(expr: str) -> str:
-    m = re.fullmatch(rf"({_STR})\s*\.into\(\)", expr, re.S)
-    return m.group(1) if m else expr
+    """Strip the owned-string conversions a literal does not need: the owned
+    ``TestRequest::credentials`` takes ``&str``."""
+    while True:
+        m = re.fullmatch(rf"({_STR})\s*\.(?:into|to_string|to_owned)\(\)", expr, re.S)
+        if m is None:
+            m = re.fullmatch(rf"String::from\(\s*({_STR})\s*\)", expr, re.S)
+        if m is None:
+            return expr
+        expr = m.group(1)
 
 
 def _unwrap_secret(expr: str) -> str:
@@ -953,6 +965,10 @@ def normalize_mut(text: str, ctx: Ctx) -> str:
                 continue
             name = m.group(2)
             needs = re.search(_MUT_NEED_TMPL.format(name=re.escape(name)), body) is not None
+            # `let mut req = req;` rebinds the parameter; the parameter itself
+            # must then stay immutable or rustc reports `unused_mut`.
+            if re.search(rf"let\s+mut\s+{re.escape(name)}\s*=\s*{re.escape(name)}\s*;", body):
+                needs = False
             has = m.group(1) is not None
             abs_start = f.params[0] + m.start()
             if needs and not has:

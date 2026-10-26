@@ -158,6 +158,7 @@ impl AdminRequest {
 }
 
 /// The raw HTTP response produced by an owned admin operation.
+#[derive(Debug)]
 pub(crate) struct AdminResponse {
     status: StatusCode,
     headers: HeaderMap,
