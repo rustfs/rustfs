@@ -26,7 +26,9 @@ use super::super::{
 };
 use crate::disk::health_state::DriveMembershipSnapshot;
 use crate::disk::{DiskAPI, new_disk};
+use crate::layout::disks_layout::MAX_ERASURE_SET_DRIVE_COUNT;
 use crate::runtime::sources as runtime_sources;
+use futures::{StreamExt, stream};
 use rand::prelude::SliceRandom;
 use rustfs_utils::path::object_name_disk_identity;
 #[cfg(test)]
@@ -326,35 +328,31 @@ impl SetDisks {
     }
 
     async fn connect_disks_with_active_monitoring(&self, active_monitoring: bool) {
-        let rl = self.disks.read().await;
+        let disks = self.get_disks_internal().await;
+        // A slow failed endpoint must not hold back other returning drives.
+        // Keep the fanout within one set and release the inventory lock before I/O.
+        stream::iter(disks.into_iter().enumerate())
+            .for_each_concurrent(MAX_ERASURE_SET_DRIVE_COUNT, |(i, opdisk)| async move {
+                if let Some(disk) = opdisk {
+                    if !active_monitoring
+                        && disk.get_disk_location().set_idx.is_some()
+                        && let disk::Disk::Local(local) = disk.as_ref()
+                        && local.can_skip_background_probe().await
+                    {
+                        return;
+                    }
+                    if disk.is_online().await && disk.get_disk_location().set_idx.is_some() {
+                        return;
+                    }
 
-        let disks = rl.clone();
-
-        // Explicitly release the lock
-        drop(rl);
-
-        for (i, opdisk) in disks.iter().enumerate() {
-            if let Some(disk) = opdisk {
-                if !active_monitoring
-                    && disk.get_disk_location().set_idx.is_some()
-                    && let disk::Disk::Local(local) = disk.as_ref()
-                    && local.can_skip_background_probe().await
-                {
-                    continue;
+                    let _ = disk.close().await;
                 }
-                if disk.is_online().await && disk.get_disk_location().set_idx.is_some() {
-                    info!("Disk {:?} is online", disk.to_string());
-                    continue;
+
+                if let Some(endpoint) = self.set_endpoints.get(i) {
+                    self.renew_disk(endpoint).await;
                 }
-
-                let _ = disk.close().await;
-            }
-
-            if let Some(endpoint) = self.set_endpoints.get(i) {
-                info!("will renew disk, opdisk: {:?}", opdisk);
-                self.renew_disk(endpoint).await;
-            }
-        }
+            })
+            .await;
     }
 
     pub async fn renew_disk(&self, ep: &Endpoint) {
