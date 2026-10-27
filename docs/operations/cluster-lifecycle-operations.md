@@ -70,7 +70,7 @@ Heal knobs (`RUSTFS_HEAL_*`) and their defaults are documented once, in [scanner
 
 ListObjects uses the disk walker; the experimental `RUSTFS_LIST_OBJECTS_INDEX_*` provider is retired. New writers no longer update its namespace mutation journal. An older node can therefore mistake a persistent index snapshot for a current one and omit newly written keys. Deployments that never used persistent index snapshots need no additional rollout step.
 
-After all nodes have upgraded to the literal ListObjectVersions marker format, restart any unfinished version-listing pagination from the beginning. This includes manual transition jobs resumed from older checkpoints. During a mixed-version rollout, old and new nodes interpret cache-shaped key markers differently, so do not continue those pagination chains until the upgrade is complete.
+After all nodes have upgraded to literal listing markers, restart any unfinished version-listing pagination from the beginning, including manual transition jobs resumed from older checkpoints. Restart V1 pagination chains holding escaped markers as well. During a mixed-version rollout, old and new nodes interpret cache-shaped key markers differently, so do not continue those pagination chains until the upgrade is complete.
 
 For deployments that used persistent snapshots:
 

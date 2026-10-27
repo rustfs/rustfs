@@ -619,8 +619,7 @@ fn versioned_prefix_page_boundary_key<'a>(
 /// old-readable escape until legacy tag parsing can be removed.
 // RUSTFS_COMPAT_TODO(listing-cursor-legacy-tag): Remove after the minimum upgrade source stops issuing tagged cursors.
 fn escape_list_marker(marker: String) -> String {
-    // Both the legacy request parser and scanner cursor comparison recognize
-    // cache-shaped suffixes. One old-readable outer tag protects the literal key.
+    // One old-readable outer tag protects a literal cache-shaped key.
     if marker
         .rfind(LIST_CACHE_MARKER_PREFIX)
         .is_some_and(|start| marker[start..].contains(']'))
@@ -939,7 +938,9 @@ impl ECStore {
     ) -> Result<ListObjectsV2Info> {
         let marker = {
             if continuation_token.is_none() {
-                start_after
+                // StartAfter is a literal object key, even if it resembles a
+                // legacy cursor. Protect it from the compatibility parser.
+                start_after.map(escape_list_marker)
             } else {
                 continuation_token.clone()
             }
@@ -4451,9 +4452,7 @@ mod test {
             assert_eq!(page.is_truncated, index + 1 < keys.len());
             marker = page.next_continuation_token;
 
-            // ListObjects (V1) returns the same cursor as NextMarker and the
-            // client sends it back as `marker`, which reaches this layer as
-            // StartAfter.
+            // V1 sends the literal NextMarker back as StartAfter.
             let v1_page = store
                 .clone()
                 .inner_list_objects_v2(bucket, "", None, None, 1, false, v1_marker, false)
@@ -4461,7 +4460,7 @@ mod test {
                 .expect("list next object through the V1 marker path");
             assert_eq!(v1_page.objects.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(), [key]);
             assert_eq!(v1_page.is_truncated, index + 1 < keys.len());
-            v1_marker = v1_page.next_continuation_token;
+            v1_marker = v1_page.is_truncated.then(|| key.to_owned());
 
             let versions = store
                 .clone()
@@ -4481,6 +4480,13 @@ mod test {
         assert!(key_marker.is_none());
 
         let literal = "b[rustfs_cache:v1,return:]";
+        let after_literal = store
+            .clone()
+            .inner_list_objects_v2(bucket, "", None, None, 1, false, Some(literal.to_owned()), false)
+            .await
+            .expect("start after a caller-supplied literal key");
+        assert_eq!(after_literal.objects[0].name, "c[rustfs_cache:v2,id:x]suffix");
+
         let resumed = store
             .clone()
             .inner_list_object_versions(bucket, "", Some(literal.to_owned()), None, None, 1)
