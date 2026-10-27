@@ -93,7 +93,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
-          ref: 351bd12031099b955c984868ff6a40bad7fb937a
+          ref: 0de223d8e6a27daed18417cc6d208202d94ecd93
           persist-credentials: false
 
       - name: Determine build strategy
@@ -244,7 +244,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
-          ref: 351bd12031099b955c984868ff6a40bad7fb937a
+          ref: 0de223d8e6a27daed18417cc6d208202d94ecd93
           persist-credentials: false
           fetch-depth: 0
 
