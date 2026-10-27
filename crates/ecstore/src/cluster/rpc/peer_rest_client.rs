@@ -668,6 +668,136 @@ impl ScannerPublicationLease {
     }
 }
 
+struct ScannerPublicationLeaseLocalError {
+    reason: &'static str,
+    detail: String,
+}
+
+impl std::fmt::Debug for ScannerPublicationLeaseLocalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScannerPublicationLeaseLocalError")
+            .field("reason", &self.reason)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for ScannerPublicationLeaseLocalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for ScannerPublicationLeaseLocalError {}
+
+struct ScannerPublicationLeaseRemoteRejection(String);
+
+impl std::fmt::Debug for ScannerPublicationLeaseRemoteRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ScannerPublicationLeaseRemoteRejection")
+    }
+}
+
+impl std::fmt::Display for ScannerPublicationLeaseRemoteRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ScannerPublicationLeaseRemoteRejection {}
+
+pub(crate) fn scanner_publication_lease_remote_rejection(detail: String) -> Error {
+    Error::other(ScannerPublicationLeaseRemoteRejection(detail))
+}
+
+fn scanner_publication_lease_local_error(reason: &'static str, detail: &'static str) -> Error {
+    Error::other(ScannerPublicationLeaseLocalError {
+        reason,
+        detail: detail.to_owned(),
+    })
+}
+
+fn scanner_publication_lease_local_io_error(reason: &'static str, error: std::io::Error) -> Error {
+    Error::Io(std::io::Error::new(
+        error.kind(),
+        ScannerPublicationLeaseLocalError {
+            reason,
+            detail: error.to_string(),
+        },
+    ))
+}
+
+#[derive(Debug)]
+pub(crate) struct ScannerPublicationLeaseErrorClass {
+    pub reason: Option<&'static str>,
+    pub reported_reason: Option<&'static str>,
+}
+
+pub(crate) fn scanner_publication_lease_error_class(error: &Error) -> ScannerPublicationLeaseErrorClass {
+    let mut result = ScannerPublicationLeaseErrorClass {
+        reason: None,
+        reported_reason: None,
+    };
+    match error {
+        Error::RemoteClientUnavailable(_) => result.reason = Some("client_unavailable"),
+        Error::RemoteNotInitialized => result.reason = Some("peer_not_initialized"),
+        Error::Timeout => result.reason = Some("timeout"),
+        Error::Io(error) => {
+            if let Some(local) = error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<ScannerPublicationLeaseLocalError>())
+            {
+                result.reason = Some(local.reason);
+            } else if let Some(remote) = error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<ScannerPublicationLeaseRemoteRejection>())
+            {
+                // These are the exact Display strings currently produced by
+                // the peer's lease acquisition path, not arbitrary suffixes.
+                result.reported_reason = match remote.0.as_str() {
+                    "Io error: scanner publication lease capacity is exhausted" => Some("capacity_exhausted"),
+                    "Io error: scanner publication lease generation is stale" => Some("generation_stale"),
+                    "Io error: scanner publication lease is blocked by data movement" => Some("blocked_by_data_movement"),
+                    _ => None,
+                };
+            } else if let Some(status) = embedded_tonic_status(error) {
+                result.reason = Some(match status.code() {
+                    tonic::Code::Ok => "rpc_ok",
+                    tonic::Code::Cancelled => "rpc_cancelled",
+                    tonic::Code::Unknown => "rpc_unknown",
+                    tonic::Code::InvalidArgument => "rpc_invalid_argument",
+                    tonic::Code::DeadlineExceeded => "rpc_deadline_exceeded",
+                    tonic::Code::NotFound => "rpc_not_found",
+                    tonic::Code::AlreadyExists => "rpc_already_exists",
+                    tonic::Code::PermissionDenied => "rpc_permission_denied",
+                    tonic::Code::ResourceExhausted => "rpc_resource_exhausted",
+                    tonic::Code::FailedPrecondition => "rpc_failed_precondition",
+                    tonic::Code::Aborted => "rpc_aborted",
+                    tonic::Code::OutOfRange => "rpc_out_of_range",
+                    tonic::Code::Unimplemented => "rpc_unimplemented",
+                    tonic::Code::Internal => "rpc_internal",
+                    tonic::Code::Unavailable => "rpc_unavailable",
+                    tonic::Code::DataLoss => "rpc_data_loss",
+                    tonic::Code::Unauthenticated => "rpc_unauthenticated",
+                });
+            } else {
+                result.reason = match error.kind() {
+                    std::io::ErrorKind::TimedOut => Some("io_timeout"),
+                    std::io::ErrorKind::ConnectionRefused => Some("io_connection_refused"),
+                    std::io::ErrorKind::ConnectionReset => Some("io_connection_reset"),
+                    std::io::ErrorKind::ConnectionAborted => Some("io_connection_aborted"),
+                    std::io::ErrorKind::BrokenPipe => Some("io_broken_pipe"),
+                    std::io::ErrorKind::UnexpectedEof => Some("io_unexpected_eof"),
+                    std::io::ErrorKind::NotConnected => Some("io_not_connected"),
+                    _ => None,
+                };
+            }
+        }
+        _ => {}
+    }
+    result
+}
+
 fn validate_scanner_publication_lease_response_fields(
     response: &ScannerPublicationLeaseResponse,
     expected_session_id: &str,
@@ -675,7 +805,7 @@ fn validate_scanner_publication_lease_response_fields(
     expected_observational_only: bool,
 ) -> Result<(Uuid, String)> {
     if !response.success {
-        return Err(Error::other(
+        return Err(scanner_publication_lease_remote_rejection(
             response
                 .error
                 .as_ref()
@@ -684,24 +814,39 @@ fn validate_scanner_publication_lease_response_fields(
         ));
     }
     if response.movement_generation != expected_generation {
-        return Err(Error::other("peer returned a different scanner publication lease generation"));
+        return Err(scanner_publication_lease_local_error(
+            "generation_mismatch",
+            "peer returned a different scanner publication lease generation",
+        ));
     }
     if response.session_id != expected_session_id {
-        return Err(Error::other("peer returned a different scanner publication lease session"));
+        return Err(scanner_publication_lease_local_error(
+            "session_mismatch",
+            "peer returned a different scanner publication lease session",
+        ));
     }
     if response.observational_only != expected_observational_only {
-        return Err(Error::other("peer returned a different scanner publication lease purpose"));
+        return Err(scanner_publication_lease_local_error(
+            "purpose_mismatch",
+            "peer returned a different scanner publication lease purpose",
+        ));
     }
     let owner_id = Uuid::parse_str(&response.owner_id)
         .ok()
         .filter(|owner_id| !owner_id.is_nil())
         .map(|owner_id| owner_id.to_string())
-        .ok_or_else(|| Error::other("peer returned an invalid scanner publication lease owner"))?;
+        .ok_or_else(|| {
+            scanner_publication_lease_local_error("invalid_owner", "peer returned an invalid scanner publication lease owner")
+        })?;
     if response.lease_ttl_ms != crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS {
-        return Err(Error::other("peer returned an unsupported scanner publication lease TTL"));
+        return Err(scanner_publication_lease_local_error(
+            "unsupported_ttl",
+            "peer returned an unsupported scanner publication lease TTL",
+        ));
     }
-    let token = Uuid::from_slice(response.token.as_ref())
-        .map_err(|_| Error::other("peer returned an invalid scanner publication lease token"))?;
+    let token = Uuid::from_slice(response.token.as_ref()).map_err(|_| {
+        scanner_publication_lease_local_error("invalid_token", "peer returned an invalid scanner publication lease token")
+    })?;
     Ok((token, owner_id))
 }
 
@@ -712,16 +857,27 @@ fn scanner_publication_lease_deadline(
 ) -> Result<std::time::Instant> {
     let lease_window = Duration::from_millis(lease_ttl_ms)
         .checked_sub(SCANNER_PUBLICATION_LEASE_SAFETY_MARGIN)
-        .ok_or_else(|| Error::other("scanner publication lease TTL is shorter than its safety margin"))?;
-    let elapsed = response_received
-        .checked_duration_since(request_started)
-        .ok_or_else(|| Error::other("scanner publication lease response clock moved backwards"))?;
+        .ok_or_else(|| {
+            scanner_publication_lease_local_error(
+                "ttl_below_safety_margin",
+                "scanner publication lease TTL is shorter than its safety margin",
+            )
+        })?;
+    let elapsed = response_received.checked_duration_since(request_started).ok_or_else(|| {
+        scanner_publication_lease_local_error(
+            "response_clock_backwards",
+            "scanner publication lease response clock moved backwards",
+        )
+    })?;
     if elapsed >= lease_window {
-        return Err(Error::other("scanner publication lease response arrived after its safety window"));
+        return Err(scanner_publication_lease_local_error(
+            "response_after_safety_window",
+            "scanner publication lease response arrived after its safety window",
+        ));
     }
-    request_started
-        .checked_add(lease_window)
-        .ok_or_else(|| Error::other("scanner publication lease deadline overflowed"))
+    request_started.checked_add(lease_window).ok_or_else(|| {
+        scanner_publication_lease_local_error("deadline_overflow", "scanner publication lease deadline overflowed")
+    })
 }
 
 /// A peer's readiness view of one drive served by another host.
@@ -876,6 +1032,11 @@ fn tier_mutation_failed_response_error(version: u32, failure_class: i32, error_i
     Error::other(message)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScannerLeaseConnectionFailure {
+    ChannelAcquisitionTimedOut,
+}
+
 impl PeerRestClient {
     fn recovery_monitor_span(grid_host: &str) -> tracing::Span {
         tracing::info_span!(
@@ -1003,19 +1164,37 @@ impl PeerRestClient {
     }
 
     pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
+        self.get_client_with_connection_failure().await.map_err(|(error, _)| error)
+    }
+
+    async fn get_client_with_connection_failure(
+        &self,
+    ) -> std::result::Result<
+        NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>,
+        (Error, Option<ScannerLeaseConnectionFailure>),
+    > {
         if self.offline.load(Ordering::Acquire) {
             self.mark_offline_and_spawn_recovery();
-            return Err(Error::RemoteClientUnavailable(format!("peer {} is temporarily offline", self.grid_host)));
+            return Err((
+                Error::RemoteClientUnavailable(format!("peer {} is temporarily offline", self.grid_host)),
+                None,
+            ));
         }
 
         node_service_time_out_client(&self.grid_host, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
             .map_err(|err| {
+                // Channel acquisition reports its deadline as a top-level
+                // typed I/O timeout. Do not infer kinds from dial error text.
+                let failure = err
+                    .downcast_ref::<std::io::Error>()
+                    .filter(|error| error.kind() == std::io::ErrorKind::TimedOut)
+                    .map(|_| ScannerLeaseConnectionFailure::ChannelAcquisitionTimedOut);
                 let storage_err = Error::RemoteClientUnavailable(format!("can not get client, err: {err}"));
                 if Self::is_network_like_error(&storage_err) {
                     self.mark_offline_and_spawn_recovery();
                 }
-                storage_err
+                (storage_err, failure)
             })
     }
 
@@ -2508,54 +2687,91 @@ impl PeerRestClient {
         expected_generation: u64,
         observational_only: bool,
     ) -> Result<ScannerPublicationLease> {
-        let request_started = std::time::Instant::now();
-        self.finalize_result(
-            async {
-                let challenge = Uuid::new_v4();
-                let mut client = self
-                    .get_client()
-                    .await?
-                    .max_decoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE)
-                    .max_encoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE);
-                let mut request = Request::new(ScannerPublicationLeaseRequest {
-                    challenge: challenge.as_bytes().to_vec().into(),
-                    expected_movement_generation: expected_generation,
-                    ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
-                    expected_session_id: expected_session_id.to_string(),
-                    token: Bytes::new(),
-                    observational_only,
-                });
-                let canonical = rustfs_protos::canonical_scanner_publication_lease_request_body(request.get_ref())
-                    .map_err(|_| Error::other("scanner publication lease request is too large to authenticate"))?;
-                set_tonic_canonical_body_digest(&mut request, &canonical)?;
-                let response = client.acquire_scanner_publication_lease(request).await?.into_inner();
-                let response_body =
-                    rustfs_protos::canonical_scanner_publication_lease_response_body(challenge.as_bytes(), &response)
-                        .map_err(|_| Error::other("scanner publication lease response is too large to authenticate"))?;
-                verify_tonic_rpc_response_proof(&response_body, &response.response_proof)
-                    .map_err(|_| Error::other("peer returned an invalid scanner publication lease proof"))?;
-                let (token, owner_id) = validate_scanner_publication_lease_response_fields(
-                    &response,
-                    expected_session_id,
-                    expected_generation,
-                    observational_only,
-                )?;
-                Ok(ScannerPublicationLease {
-                    token,
-                    movement_generation: response.movement_generation,
-                    observational_only,
-                    owner_id,
-                    session_id: response.session_id,
-                    expires_at: scanner_publication_lease_deadline(
-                        request_started,
-                        std::time::Instant::now(),
-                        response.lease_ttl_ms,
-                    )?,
-                })
-            }
-            .await,
+        self.acquire_scanner_publication_lease_with_connection_failure(
+            expected_session_id,
+            expected_generation,
+            observational_only,
         )
         .await
+        .map_err(|(error, _)| error)
+    }
+
+    pub(crate) async fn acquire_scanner_publication_lease_with_connection_failure(
+        &self,
+        expected_session_id: &str,
+        expected_generation: u64,
+        observational_only: bool,
+    ) -> std::result::Result<ScannerPublicationLease, (Error, Option<ScannerLeaseConnectionFailure>)> {
+        let request_started = std::time::Instant::now();
+        let mut connection_failure = None;
+        let result = self
+            .finalize_result(
+                async {
+                    let challenge = Uuid::new_v4();
+                    let mut client = self
+                        .get_client_with_connection_failure()
+                        .await
+                        .map_err(|(error, failure)| {
+                            connection_failure = failure;
+                            error
+                        })?
+                        .max_decoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE)
+                        .max_encoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE);
+                    let mut request = Request::new(ScannerPublicationLeaseRequest {
+                        challenge: challenge.as_bytes().to_vec().into(),
+                        expected_movement_generation: expected_generation,
+                        ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
+                        expected_session_id: expected_session_id.to_string(),
+                        token: Bytes::new(),
+                        observational_only,
+                    });
+                    let canonical =
+                        rustfs_protos::canonical_scanner_publication_lease_request_body(request.get_ref()).map_err(|_| {
+                            scanner_publication_lease_local_error(
+                                "request_too_large",
+                                "scanner publication lease request is too large to authenticate",
+                            )
+                        })?;
+                    set_tonic_canonical_body_digest(&mut request, &canonical)
+                        .map_err(|error| scanner_publication_lease_local_io_error("request_digest_failed", error))?;
+                    let response = client.acquire_scanner_publication_lease(request).await?.into_inner();
+                    let response_body =
+                        rustfs_protos::canonical_scanner_publication_lease_response_body(challenge.as_bytes(), &response)
+                            .map_err(|_| {
+                                scanner_publication_lease_local_error(
+                                    "response_too_large",
+                                    "scanner publication lease response is too large to authenticate",
+                                )
+                            })?;
+                    verify_tonic_rpc_response_proof(&response_body, &response.response_proof).map_err(|_| {
+                        scanner_publication_lease_local_error(
+                            "invalid_proof",
+                            "peer returned an invalid scanner publication lease proof",
+                        )
+                    })?;
+                    let (token, owner_id) = validate_scanner_publication_lease_response_fields(
+                        &response,
+                        expected_session_id,
+                        expected_generation,
+                        observational_only,
+                    )?;
+                    Ok(ScannerPublicationLease {
+                        token,
+                        movement_generation: response.movement_generation,
+                        observational_only,
+                        owner_id,
+                        session_id: response.session_id,
+                        expires_at: scanner_publication_lease_deadline(
+                            request_started,
+                            std::time::Instant::now(),
+                            response.lease_ttl_ms,
+                        )?,
+                    })
+                }
+                .await,
+            )
+            .await;
+        result.map_err(|error| (error, connection_failure))
     }
 
     /// Revalidate the exact token immediately before the coordinator commits
@@ -3146,6 +3362,162 @@ mod tests {
         let error = scanner_publication_lease_deadline(started, started + Duration::from_secs(55), 60_000)
             .expect_err("a response arriving at the safety boundary must fail closed");
         assert!(error.to_string().contains("after its safety window"));
+        assert_eq!(scanner_publication_lease_error_class(&error).reason, Some("response_after_safety_window"));
+        assert!(
+            error
+                .to_string()
+                .ends_with("scanner publication lease response arrived after its safety window")
+        );
+    }
+
+    #[test]
+    fn scanner_publication_lease_validation_errors_are_typed_without_changing_display() {
+        let valid = ScannerPublicationLeaseResponse {
+            success: true,
+            token: Uuid::new_v4().as_bytes().to_vec().into(),
+            movement_generation: 7,
+            lease_ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
+            error: None,
+            response_proof: Bytes::new(),
+            owner_id: Uuid::new_v4().to_string(),
+            session_id: "session-a".to_owned(),
+            observational_only: false,
+        };
+        let cases = [
+            (
+                ScannerPublicationLeaseResponse {
+                    movement_generation: 6,
+                    ..valid.clone()
+                },
+                "generation_mismatch",
+                "peer returned a different scanner publication lease generation",
+            ),
+            (
+                ScannerPublicationLeaseResponse {
+                    session_id: "other".to_owned(),
+                    ..valid.clone()
+                },
+                "session_mismatch",
+                "peer returned a different scanner publication lease session",
+            ),
+            (
+                ScannerPublicationLeaseResponse {
+                    observational_only: true,
+                    ..valid.clone()
+                },
+                "purpose_mismatch",
+                "peer returned a different scanner publication lease purpose",
+            ),
+            (
+                ScannerPublicationLeaseResponse {
+                    owner_id: Uuid::nil().to_string(),
+                    ..valid.clone()
+                },
+                "invalid_owner",
+                "peer returned an invalid scanner publication lease owner",
+            ),
+            (
+                ScannerPublicationLeaseResponse {
+                    lease_ttl_ms: 0,
+                    ..valid.clone()
+                },
+                "unsupported_ttl",
+                "peer returned an unsupported scanner publication lease TTL",
+            ),
+            (
+                ScannerPublicationLeaseResponse {
+                    token: Bytes::from_static(b"short"),
+                    ..valid.clone()
+                },
+                "invalid_token",
+                "peer returned an invalid scanner publication lease token",
+            ),
+        ];
+        for (response, reason, message) in cases {
+            let error = validate_scanner_publication_lease_response_fields(&response, "session-a", 7, false)
+                .expect_err("invalid lease response must be rejected");
+            let class = scanner_publication_lease_error_class(&error);
+            assert_eq!(class.reason, Some(reason));
+            assert_eq!(class.reported_reason, None);
+            assert_eq!(error.to_string(), format!("Io error: {message}"));
+            assert!(matches!(error, Error::Io(ref io) if io.kind() == std::io::ErrorKind::Other));
+        }
+
+        for (reason, message) in [
+            ("request_too_large", "scanner publication lease request is too large to authenticate"),
+            ("response_too_large", "scanner publication lease response is too large to authenticate"),
+            ("invalid_proof", "peer returned an invalid scanner publication lease proof"),
+            ("deadline_overflow", "scanner publication lease deadline overflowed"),
+        ] {
+            let error = scanner_publication_lease_local_error(reason, message);
+            assert_eq!(scanner_publication_lease_error_class(&error).reason, Some(reason));
+            assert_eq!(error.to_string(), format!("Io error: {message}"));
+            assert!(matches!(error, Error::Io(ref io) if io.kind() == std::io::ErrorKind::Other));
+        }
+
+        let original = std::io::Error::new(std::io::ErrorKind::InvalidInput, "digest rejected");
+        let expected = format!("Io error: {original}");
+        let wrapped = scanner_publication_lease_local_io_error("request_digest_failed", original);
+        assert_eq!(scanner_publication_lease_error_class(&wrapped).reason, Some("request_digest_failed"));
+        assert_eq!(wrapped.to_string(), expected);
+        assert!(matches!(wrapped, Error::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidInput));
+    }
+
+    #[test]
+    fn scanner_publication_lease_error_class_keeps_remote_reports_separate_from_local_errors() {
+        for (remote_message, reported) in [
+            ("Io error: scanner publication lease capacity is exhausted", Some("capacity_exhausted")),
+            ("Io error: scanner publication lease generation is stale", Some("generation_stale")),
+            (
+                "Io error: scanner publication lease is blocked by data movement",
+                Some("blocked_by_data_movement"),
+            ),
+            ("remote-secret Io error: scanner publication lease generation is stale", None),
+            ("not Io error: scanner publication lease generation is stale", None),
+            ("scanner publication lease generation is stale", None),
+            ("Io error: scanner publication lease generation is stale ", None),
+            ("Io error: scanner publication lease is blocked by pending namespace commit", None),
+            ("Io error: scanner publication lease namespace changed during acquisition", None),
+        ] {
+            let rejected = ScannerPublicationLeaseResponse {
+                success: false,
+                error: Some(rustfs_protos::proto_gen::node_service::Error {
+                    code: 0,
+                    error_info: remote_message.to_owned(),
+                }),
+                ..Default::default()
+            };
+            let error = validate_scanner_publication_lease_response_fields(&rejected, "session", 0, false)
+                .expect_err("peer rejection must be returned");
+            let class = scanner_publication_lease_error_class(&error);
+            assert_eq!(class.reason, None);
+            assert_eq!(class.reported_reason, reported);
+            assert_eq!(error.to_string(), format!("Io error: {remote_message}"));
+            assert!(!format!("{error:?}").contains("remote-secret"));
+        }
+
+        let forged = Error::other("peer returned a different scanner publication lease generation");
+        let class = scanner_publication_lease_error_class(&forged);
+        assert_eq!(class.reason, None, "untyped error text must not be promoted to a local diagnosis");
+        assert_eq!(class.reported_reason, None, "untyped text must not be attributed to a peer response");
+
+        for (error, expected) in [
+            (Error::RemoteClientUnavailable("remote-secret".to_owned()), "client_unavailable"),
+            (Error::RemoteClientUnavailable("pretend timed out".to_owned()), "client_unavailable"),
+            (Error::Timeout, "timeout"),
+            (tonic::Status::unavailable("remote-secret").into(), "rpc_unavailable"),
+            (tonic::Status::deadline_exceeded("remote-secret").into(), "rpc_deadline_exceeded"),
+            (tonic::Status::permission_denied("remote-secret").into(), "rpc_permission_denied"),
+            (
+                Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "remote-secret")),
+                "io_timeout",
+            ),
+        ] {
+            let class = scanner_publication_lease_error_class(&error);
+            assert_eq!(class.reason, Some(expected));
+            assert_eq!(class.reported_reason, None);
+            assert!(!format!("{class:?}").contains("remote-secret"));
+        }
     }
 
     #[test]

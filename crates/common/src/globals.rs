@@ -261,6 +261,20 @@ pub async fn cached_connection(addr: &str) -> Option<Channel> {
     GLOBAL_CONN_MAP.read().await.get(addr).cloned()
 }
 
+/// Holds the connection cache write lock for an isolated test process.
+#[cfg(any(test, feature = "test-util"))]
+pub struct ConnectionCacheReadBlockerForTest {
+    _guard: tokio::sync::RwLockWriteGuard<'static, HashMap<String, Channel>>,
+}
+
+/// Block cache reads until the returned test guard is dropped.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn block_connection_cache_reads_for_test() -> ConnectionCacheReadBlockerForTest {
+    ConnectionCacheReadBlockerForTest {
+        _guard: GLOBAL_CONN_MAP.write().await,
+    }
+}
+
 /// Cache a gRPC connection for the given address.
 pub async fn cache_connection(addr: String, channel: Channel) {
     GLOBAL_CONN_MAP.write().await.insert(addr, channel);

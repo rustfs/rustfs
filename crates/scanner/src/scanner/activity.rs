@@ -14,7 +14,7 @@
 /// Cycle wake/backoff policy and scanner activity observation (probing, generations, topology digest).
 use super::*;
 use crate::storage_api::ScannerStorage;
-use crate::storage_api::scan::SCANNER_ACTIVITY_V6_PROTOCOL_VERSION;
+use crate::storage_api::scan::{SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, ScannerPublicationLeaseFailureInfo};
 use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -239,7 +239,7 @@ pub(crate) fn scanner_publication_proof_retry_delay(consecutive_failures: u32) -
 }
 
 pub(crate) fn scanner_publication_activity_error_is_retryable(error: &str) -> bool {
-    crate::storage_api::scanner_peer_transport_error_message_is_retryable(error)
+    crate::storage_api::scan::scanner_peer_transport_error_message_is_retryable(error)
 }
 
 pub(crate) fn scanner_publication_lease_error_is_retryable(error: &str) -> bool {
@@ -256,12 +256,19 @@ pub(crate) enum ScannerPublicationProofWait<T, E> {
     Cancelled,
 }
 
+pub(crate) struct ScannerPublicationProofContext {
+    pub cycle: u64,
+    pub stage: &'static str,
+    pub leader_epoch: Option<u64>,
+    pub lease_purpose: Option<&'static str>,
+}
+
 pub(crate) async fn await_scanner_publication_proof<T, E, F, Fut, Retryable>(
     ctx: &CancellationToken,
-    cycle: u64,
-    stage: &'static str,
+    context: ScannerPublicationProofContext,
     mut proof: F,
     retryable: Retryable,
+    failure_info: for<'a> fn(&'a E) -> Option<ScannerPublicationLeaseFailureInfo<'a>>,
 ) -> ScannerPublicationProofWait<T, E>
 where
     F: FnMut() -> Fut,
@@ -269,6 +276,12 @@ where
     E: std::fmt::Display,
     Retryable: Fn(&E) -> bool,
 {
+    let ScannerPublicationProofContext {
+        cycle,
+        stage,
+        leader_epoch,
+        lease_purpose,
+    } = context;
     let started_at = Instant::now();
     let mut consecutive_failures = 0u32;
 
@@ -288,6 +301,8 @@ where
                         state = "publication_proof_recovered",
                         cycle,
                         stage,
+                        leader_epoch,
+                        lease_purpose,
                         attempts = consecutive_failures.saturating_add(1),
                         pending_duration = ?started_at.elapsed(),
                         "Scanner publication proof recovered"
@@ -296,6 +311,11 @@ where
                 return ScannerPublicationProofWait::Ready(value);
             }
             Err(err) if !retryable(&err) => {
+                let failure = failure_info(&err);
+                let peer = failure.and_then(|info| info.peer);
+                let failure_kind = failure.map(|info| info.kind);
+                let reason = failure.and_then(|info| info.reason);
+                let reported_reason = failure.and_then(|info| info.reported_reason);
                 warn!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_CYCLE_STATE,
@@ -304,7 +324,12 @@ where
                     state = "publication_proof_rejected",
                     cycle,
                     stage,
-                    error = %err,
+                    leader_epoch,
+                    lease_purpose,
+                    peer,
+                    failure_kind,
+                    reason,
+                    reported_reason,
                     "Scanner publication proof failed with a non-retryable cluster state"
                 );
                 return ScannerPublicationProofWait::Rejected(err);
@@ -312,6 +337,11 @@ where
             Err(err) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 let retry_delay = scanner_publication_proof_retry_delay(consecutive_failures);
+                let failure = failure_info(&err);
+                let peer = failure.and_then(|info| info.peer);
+                let failure_kind = failure.map(|info| info.kind);
+                let reason = failure.and_then(|info| info.reason);
+                let reported_reason = failure.and_then(|info| info.reported_reason);
                 if consecutive_failures == 1 || consecutive_failures.is_multiple_of(20) {
                     warn!(
                         target: "rustfs::scanner",
@@ -321,10 +351,15 @@ where
                         state = "publication_proof_pending",
                         cycle,
                         stage,
+                        leader_epoch,
+                        lease_purpose,
+                        peer,
+                        failure_kind,
+                        reason,
+                        reported_reason,
                         attempt = consecutive_failures,
                         retry_delay = ?retry_delay,
                         pending_duration = ?started_at.elapsed(),
-                        error = %err,
                         "Scanner is waiting for publication proof"
                     );
                 } else {
@@ -336,9 +371,14 @@ where
                         state = "publication_proof_retry",
                         cycle,
                         stage,
+                        leader_epoch,
+                        lease_purpose,
+                        peer,
+                        failure_kind,
+                        reason,
+                        reported_reason,
                         attempt = consecutive_failures,
                         retry_delay = ?retry_delay,
-                        error = %err,
                         "Scanner publication activity proof retry scheduled"
                     );
                 }
@@ -363,9 +403,18 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<ScannerActivitySnapshot, String>>,
 {
-    match await_scanner_publication_proof(ctx, cycle, stage, probe, |err: &String| {
-        scanner_publication_activity_error_is_retryable(err)
-    })
+    match await_scanner_publication_proof(
+        ctx,
+        ScannerPublicationProofContext {
+            cycle,
+            stage,
+            leader_epoch: None,
+            lease_purpose: None,
+        },
+        probe,
+        |err: &String| scanner_publication_activity_error_is_retryable(err),
+        |_| None,
+    )
     .await
     {
         ScannerPublicationProofWait::Ready(snapshot) => Ok(snapshot),
