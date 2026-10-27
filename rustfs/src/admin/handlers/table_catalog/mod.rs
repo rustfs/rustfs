@@ -177,9 +177,6 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "POST /v1/{prefix}/namespaces/{namespace}/views/{view}",
     "DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}",
 ];
-const TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS: &[&str] =
-    &["POST /v1/{prefix}/catalog/backup", "POST /v1/{prefix}/catalog/restore"];
-
 static GET_CONFIG_HANDLER: GetCatalogConfigHandler = GetCatalogConfigHandler {};
 static ENABLE_TABLE_BUCKET_HANDLER: EnableTableBucketHandler = EnableTableBucketHandler {};
 static DISABLE_TABLE_BUCKET_HANDLER: DisableTableBucketHandler = DisableTableBucketHandler {};
@@ -1037,10 +1034,7 @@ fn catalog_config_response(warehouse: Option<&str>) -> S3Result<CatalogConfigRes
     if let Some(warehouse) = warehouse {
         defaults.insert(PREFIX_PROPERTY.to_string(), warehouse.to_string());
     }
-    let mut endpoints = TABLE_CATALOG_ENDPOINTS.to_vec();
-    if backing_mode == crate::table_catalog::TableCatalogBackingMode::DurableStrong {
-        endpoints.extend_from_slice(TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS);
-    }
+    let endpoints = TABLE_CATALOG_ENDPOINTS.to_vec();
     Ok(CatalogConfigResponse {
         defaults,
         overrides,

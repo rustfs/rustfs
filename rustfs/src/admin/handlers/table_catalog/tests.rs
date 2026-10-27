@@ -1182,29 +1182,14 @@ fn catalog_config_response_lists_standard_rest_endpoints() {
 
 #[test]
 #[serial_test::serial]
-fn catalog_config_response_reports_durable_strong_backing_override() {
-    let response = temp_env::with_var(
+fn catalog_config_response_rejects_retired_durable_strong_backing() {
+    let error = temp_env::with_var(
         crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
         Some(crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG),
         || catalog_config_response(None),
     )
-    .expect("catalog config should build");
-
-    assert_eq!(
-        response.overrides.get(CATALOG_BACKING_CONFIG_KEY).map(String::as_str),
-        Some(crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG)
-    );
-    assert!(
-        response
-            .endpoints
-            .contains(&"POST /v1/{prefix}/namespaces/{namespace}/properties")
-    );
-    assert!(response.endpoints.contains(&"POST /v1/{prefix}/tables/rename"));
-    assert!(response.endpoints.ends_with(TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS));
-    assert_eq!(
-        response.endpoints.len(),
-        TABLE_CATALOG_ENDPOINTS.len() + TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS.len()
-    );
+    .expect_err("retired durable-strong backing must fail closed");
+    assert!(error.to_string().contains("has been retired"));
 }
 
 #[test]
