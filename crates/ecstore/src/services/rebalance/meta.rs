@@ -154,7 +154,8 @@ impl RebalanceMeta {
             ver => return Err(rebalance_meta_load_unknown_version_error(ver)),
         }
 
-        let meta: Self = rmp_serde::from_read(Cursor::new(&data[4..]))?;
+        let meta: Self = rmp_serde::from_read(Cursor::new(&data[4..]))
+            .map_err(|source| Error::other(RebalanceMetadataLoadError::Decode(source)))?;
         *self = meta;
 
         self.last_refreshed_at = Some(OffsetDateTime::now_utc());
@@ -259,16 +260,28 @@ pub(super) fn first_rebalance_bucket(pool_stat: &RebalanceStats) -> Option<Strin
     pool_stat.buckets.first().cloned()
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RebalanceMetadataLoadError {
+    #[error("rebalance metadata load failed: metadata payload is too short")]
+    PayloadTooShort,
+    #[error("rebalance metadata load failed: unknown format {0}")]
+    UnknownFormat(u16),
+    #[error("rebalance metadata load failed: unknown version {0}")]
+    UnknownVersion(u16),
+    #[error("rebalance metadata load failed: payload decode failed: {0}")]
+    Decode(#[source] rmp_serde::decode::Error),
+}
+
 pub(super) fn rebalance_meta_load_no_data_error() -> Error {
-    Error::other("rebalance metadata load failed: metadata payload is too short")
+    Error::other(RebalanceMetadataLoadError::PayloadTooShort)
 }
 
 pub(super) fn rebalance_meta_load_unknown_format_error(fmt: u16) -> Error {
-    Error::other(format!("rebalance metadata load failed: unknown format {fmt}"))
+    Error::other(RebalanceMetadataLoadError::UnknownFormat(fmt))
 }
 
 pub(super) fn rebalance_meta_load_unknown_version_error(ver: u16) -> Error {
-    Error::other(format!("rebalance metadata load failed: unknown version {ver}"))
+    Error::other(RebalanceMetadataLoadError::UnknownVersion(ver))
 }
 
 pub fn encode_rebalance_stop_propagation_record(record: &RebalanceStopPropagationRecord) -> String {
