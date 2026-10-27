@@ -185,16 +185,17 @@ pub(crate) async fn list_objects_v2(
     }
 
     for page_index in 0..TABLE_LIST_MAX_RAW_PAGES {
+        // Table cursors store literal object names, not ecstore continuation tokens.
         let raw = store
             .clone()
             .list_objects_v2(
                 bucket,
                 prefix,
-                marker.clone(),
+                None,
                 None,
                 TABLE_LIST_RAW_PAGE_SIZE,
                 false,
-                raw_start_after.take(),
+                marker.clone().or_else(|| raw_start_after.take()),
                 incl_deleted,
             )
             .await
