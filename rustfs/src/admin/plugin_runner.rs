@@ -484,10 +484,40 @@ fn replay_status_error(status: StatusCode) -> S3Error {
     }
 }
 
+static RUNNER_CLIENT: tokio::sync::Mutex<RunnerClientCache> = tokio::sync::Mutex::const_new(RunnerClientCache(None));
+
+struct RunnerClientCache(Option<(u64, Client)>);
+
+impl RunnerClientCache {
+    fn client(&mut self, tls: &rustfs_tls_runtime::GlobalPublishedOutboundTlsState) -> S3Result<Client> {
+        let generation = tls.generation.0;
+        if let Some((cached_generation, client)) = &self.0
+            && *cached_generation == generation
+        {
+            return Ok(client.clone());
+        }
+        let client = build_client(tls)?;
+        // A request holding an older TLS snapshot must not replace a newer pool.
+        if self
+            .0
+            .as_ref()
+            .is_none_or(|(cached_generation, _)| *cached_generation <= generation)
+        {
+            self.0 = Some((generation, client.clone()));
+        }
+        Ok(client)
+    }
+}
+
 async fn configured_client() -> S3Result<Client> {
     let tls = runtime_sources::current_outbound_tls_state().await;
+    RUNNER_CLIENT.lock().await.client(&tls)
+}
+
+fn build_client(tls: &rustfs_tls_runtime::GlobalPublishedOutboundTlsState) -> S3Result<Client> {
     let identity = tls
         .mtls_identity
+        .as_ref()
         .ok_or_else(|| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner client identity unavailable"))?;
     let mut identity_pem = Vec::with_capacity(identity.cert_pem.len() + identity.key_pem.len() + 1);
     identity_pem.extend_from_slice(&identity.cert_pem);
@@ -498,12 +528,13 @@ async fn configured_client() -> S3Result<Client> {
 
     let mut builder = Client::builder()
         .no_proxy()
+        .pool_max_idle_per_host(10)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(15))
         .identity(identity);
-    if let Some(root_pem) = tls.root_ca_pem.filter(|pem| !pem.is_empty()) {
-        let roots = reqwest::Certificate::from_pem_bundle(&root_pem)
+    if let Some(root_pem) = tls.root_ca_pem.as_ref().filter(|pem| !pem.is_empty()) {
+        let roots = reqwest::Certificate::from_pem_bundle(root_pem)
             .map_err(|_| s3::error(S3ErrorCode::ServiceUnavailable, "plugin runner trust roots invalid"))?;
         for root in roots {
             builder = builder.add_root_certificate(root);
@@ -590,6 +621,97 @@ pub(crate) fn valid_idempotency_key(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_tls_state(generation: u64) -> rustfs_tls_runtime::GlobalPublishedOutboundTlsState {
+        let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        rustfs_tls_runtime::GlobalPublishedOutboundTlsState {
+            generation: rustfs_tls_runtime::TlsGeneration(generation),
+            root_ca_pem: Some(cert.pem().into_bytes()),
+            mtls_identity: Some(rustfs_common::MtlsIdentityPem {
+                cert_pem: cert.pem().into_bytes(),
+                key_pem: signing_key.serialize_pem().into_bytes(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_client_reuses_connections_and_rotates_by_tls_generation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = connections.clone();
+        let server = tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                accepted.fetch_add(1, Ordering::SeqCst);
+                tasks.spawn(async move {
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            hyper_util::rt::TokioIo::new(socket),
+                            hyper::service::service_fn(|_| async {
+                                Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                    http_body_util::Empty::<bytes::Bytes>::new(),
+                                ))
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        let mut cache = RunnerClientCache(None);
+        let mut tls = test_tls_state(1);
+        for generation in [1, 1, 2, 2] {
+            tls.generation = rustfs_tls_runtime::TlsGeneration(generation);
+            cache
+                .client(&tls)
+                .unwrap()
+                .get(&url)
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            assert_eq!(connections.load(Ordering::SeqCst), generation as usize);
+        }
+        // An in-flight older snapshot cannot displace the current pool.
+        tls.generation = rustfs_tls_runtime::TlsGeneration(1);
+        cache.client(&tls).unwrap();
+        tls.generation = rustfs_tls_runtime::TlsGeneration(2);
+        cache
+            .client(&tls)
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn runner_client_does_not_fall_back_after_identity_removal_or_corruption() {
+        let mut cache = RunnerClientCache(None);
+        let mut tls = test_tls_state(1);
+        cache.client(&tls).unwrap();
+        tls.generation = rustfs_tls_runtime::TlsGeneration(2);
+        tls.mtls_identity.as_mut().unwrap().key_pem = b"invalid private key".to_vec();
+        assert_eq!(cache.client(&tls).unwrap_err().code(), &S3ErrorCode::ServiceUnavailable);
+        tls.mtls_identity = None;
+        assert_eq!(cache.client(&tls).unwrap_err().code(), &S3ErrorCode::ServiceUnavailable);
+        cache.client(&test_tls_state(3)).unwrap();
+        assert_eq!(cache.0.as_ref().unwrap().0, 3);
+    }
 
     #[test]
     fn runner_endpoint_must_be_https_and_exact_path() {

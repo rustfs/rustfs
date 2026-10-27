@@ -6,6 +6,8 @@
 
 Runner owns scheduling, leases, container execution and result publication. RustFS provides original-user delegation, scoped temporary credentials and authenticated task API forwarding. Inputs and outputs use ordinary versioned S3 buckets; event-driven jobs use the existing bucket notification/Webhook path. Managed artifact sealing, inventory, garbage collection and backup retention require separate storage contracts and are outside this integration.
 
+Set `RUSTFS_PLUGIN_RUNNER_URL` to the Controller HTTPS URL ending in `/v1/ingress/manual/jobs`, and `RUSTFS_PLUGIN_RUNNER_DEPLOYMENT` to the delegation deployment. Forwarding requires the published outbound mTLS client identity and uses the published trust roots when configured. Connections are reused within a TLS generation; publishing new TLS material replaces the pool, and removing the client identity rejects new forwarding requests.
+
 ## Authority
 
 A delegation is an immutable restriction record owned by an ordinary IAM user. It is neither a permission grant nor a credential. Creating it requires that user's real signed request and `admin:CreatePluginDelegation`; reading and revoking require the corresponding `admin:GetPluginDelegation` and `admin:RevokePluginDelegation` actions. Root, temporary credentials and service accounts cannot own records.
