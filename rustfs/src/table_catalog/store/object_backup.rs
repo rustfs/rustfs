@@ -177,7 +177,12 @@ where
                     .ok_or_else(|| TableCatalogStoreError::Conflict("catalog backup disappeared after conflict".to_string()))?;
                 let existing: ObjectCatalogBackup = serde_json::from_slice(&existing.data)
                     .map_err(|error| TableCatalogStoreError::Invalid(format!("existing catalog backup is invalid: {error}")))?;
-                if existing != backup {
+                let same_identity = existing.version == backup.version
+                    && existing.backup_id == backup.backup_id
+                    && existing.table_bucket == backup.table_bucket
+                    && existing.source_catalog_etag == backup.source_catalog_etag
+                    && existing.objects == backup.objects;
+                if !same_identity {
                     return Err(TableCatalogStoreError::Conflict(
                         "catalog backup identity is already occupied by different content".to_string(),
                     ));

@@ -1854,9 +1854,6 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
 
     let _: &EnableTableBucketHandler = &ENABLE_TABLE_BUCKET_HANDLER;
     let _: &GetTableBucketHandler = &GET_TABLE_BUCKET_HANDLER;
-    let _: &GetTableCatalogMigrationHandler = &GET_TABLE_CATALOG_MIGRATION_HANDLER;
-    let _: &MaterializeTableCatalogMigrationHandler = &MATERIALIZE_TABLE_CATALOG_MIGRATION_HANDLER;
-    let _: &CancelTableCatalogMigrationHandler = &CANCEL_TABLE_CATALOG_MIGRATION_HANDLER;
     let _: &CreateTableCatalogBackupHandler = &CREATE_TABLE_CATALOG_BACKUP_HANDLER;
     let _: &RestoreTableCatalogBackupHandler = &RESTORE_TABLE_CATALOG_BACKUP_HANDLER;
     let _: &RestListNamespacesHandler = &LIST_NAMESPACES_HANDLER;
