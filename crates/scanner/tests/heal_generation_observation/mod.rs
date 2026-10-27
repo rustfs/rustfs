@@ -14,7 +14,6 @@
 
 //! One local process exercises the scanner, heal manager, and real ECStore.
 
-use rustfs_ecstore::api::object::{ShardIntegrityWriteMode, WriteCommitGuard, WriteCompletion};
 use rustfs_heal::{
     HealChannelProcessor,
     heal::{
@@ -30,7 +29,6 @@ use rustfs_heal_contracts::{
 use rustfs_scanner::{
     ScannerObjectOptions, ScannerPutObjReader, SizeSummary, scanner_folder::ScannerItem, scanner_heal_observation_status,
 };
-use rustfs_storage_api::{NamespaceLocking, ObjectIO, ObjectOperations};
 use rustfs_test_utils::TestECStoreEnv;
 use std::{
     collections::HashMap,
@@ -38,6 +36,10 @@ use std::{
     time::Duration,
 };
 use time::OffsetDateTime;
+
+use super::storage_api::lifecycle::{
+    NamespaceLocking, ObjectIO, ObjectOperations, ShardIntegrityWriteMode, WriteCommitGuard, WriteCompletion,
+};
 
 #[derive(Default)]
 struct CounterRecorder(Mutex<HashMap<metrics::Key, Arc<AtomicU64>>>);
@@ -94,8 +96,37 @@ async fn put_protected(env: &TestECStoreEnv, bucket: &str, object: &str, fill: u
         .expect("write protected object to the real erasure set");
 }
 
-#[tokio::test]
-async fn overwritten_unversioned_generation_is_only_a_data_dir_observation() {
+#[test]
+#[serial_test::serial]
+fn overwritten_unversioned_generation_is_only_a_data_dir_observation() {
+    const CHILD_ENV: &str = "RUSTFS_TEST_SCANNER_HEAL_GENERATION_CHILD";
+    const CHILD_STARTED: &str = "scanner-heal-generation-child-started";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("heal_generation_observation::overwritten_unversioned_generation_is_only_a_data_dir_observation")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run scanner-heal test in an isolated process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains(CHILD_STARTED),
+            "scanner-heal child failed or was not selected:\n{}\n{}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    println!("{CHILD_STARTED}");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("scanner-heal test runtime")
+        .block_on(run_overwritten_unversioned_generation_observation());
+}
+
+async fn run_overwritten_unversioned_generation_observation() {
     let root = tempfile::tempdir().expect("local erasure-set fixture");
     let env = TestECStoreEnv::builder().base_dir(root.path()).build().await;
     let bucket = "scanner-generation";
