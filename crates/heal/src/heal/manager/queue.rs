@@ -13,15 +13,23 @@
 // limitations under the License.
 /// The priority heal queue and its per-key dedup index.
 use super::*;
+use std::collections::BTreeMap;
 
-/// Per-key bookkeeping for the queued-request dedup index: how many queued
-/// requests hold the key, and the id of the first request that opened it —
-/// the O(1) stand-in for the former heap scan when a merge receipt needs to
-/// name a queued representative.
+/// Per-key bookkeeping for the queued-request dedup index. The legacy
+/// representative is retained for existing non-scanner callers; scanner
+/// receipts use the separately tracked queued holders.
 #[derive(Debug)]
 pub(super) struct DedupKeyEntry {
     pub(super) refcount: usize,
     pub(super) representative_request_id: String,
+    pub(super) scanner_queued_owners: ScannerQueuedOwners,
+}
+
+#[derive(Debug)]
+pub(super) enum ScannerQueuedOwners {
+    Single(u64),
+    // Once a key has forced duplicates, keep every live holder until it is released.
+    Indexed(BTreeMap<u64, String>),
 }
 
 /// Priority queue wrapper for heal requests
@@ -306,11 +314,7 @@ impl PriorityHealQueue {
 
     #[cfg(test)]
     pub(super) fn pop_next(&mut self) -> Option<HealRequest> {
-        self.heap.pop().map(|item| {
-            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
-            self.remove_best_effort_count(item.request.source);
-            item.request
-        })
+        self.heap.pop().map(|item| self.remove_queued_item(item))
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -332,14 +336,32 @@ impl PriorityHealQueue {
         // also reserves the dedup key for later non-forced duplicates. The first
         // request that opens the key becomes the named representative for merge
         // receipts (taken before `request` moves into the heap).
-        self.dedup_keys
-            .entry(key.clone())
-            .or_insert_with(|| DedupKeyEntry {
-                refcount: 0,
-                representative_request_id: request.id.clone(),
-            })
-            .refcount += 1;
         self.sequence += 1;
+        if let Some(entry) = self.dedup_keys.get_mut(&key) {
+            match &mut entry.scanner_queued_owners {
+                ScannerQueuedOwners::Single(first_sequence) => {
+                    let mut owners = BTreeMap::new();
+                    if entry.refcount == 1 {
+                        owners.insert(*first_sequence, entry.representative_request_id.clone());
+                    }
+                    owners.insert(self.sequence, request.id.clone());
+                    entry.scanner_queued_owners = ScannerQueuedOwners::Indexed(owners);
+                }
+                ScannerQueuedOwners::Indexed(owners) => {
+                    owners.insert(self.sequence, request.id.clone());
+                }
+            }
+            entry.refcount += 1;
+        } else {
+            self.dedup_keys.insert(
+                key.clone(),
+                DedupKeyEntry {
+                    refcount: 1,
+                    representative_request_id: request.id.clone(),
+                    scanner_queued_owners: ScannerQueuedOwners::Single(self.sequence),
+                },
+            );
+        }
         let source = request.source;
         self.heap.push(PriorityQueueItem {
             priority: request.priority,
@@ -402,7 +424,7 @@ impl PriorityHealQueue {
         self.heap = retained;
 
         let displaced = displaced.map(|item| {
-            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item);
             self.remove_best_effort_count(item.request.source);
             self.refresh_dedup_representative(&item.dedup_key);
             item.request
@@ -446,11 +468,7 @@ impl PriorityHealQueue {
 
     #[cfg(test)]
     pub(super) fn pop(&mut self) -> Option<HealRequest> {
-        self.heap.pop().map(|item| {
-            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
-            self.remove_best_effort_count(item.request.source);
-            item.request
-        })
+        self.heap.pop().map(|item| self.remove_queued_item(item))
     }
 
     pub(super) fn pop_runnable_with_skips<F, G>(&mut self, can_run: F, skip_label: G) -> (Option<HealRequest>, Vec<String>)
@@ -475,14 +493,7 @@ impl PriorityHealQueue {
 
         self.restore_deferred_items(deferred);
 
-        (
-            selected.map(|item| {
-                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
-                self.remove_best_effort_count(item.request.source);
-                item.request
-            }),
-            skipped,
-        )
+        (selected.map(|item| self.remove_queued_item(item)), skipped)
     }
 
     pub(super) fn pop_runnable_with_fairness<F, G>(&mut self, can_run: F, skip_label: G) -> (Option<HealRequest>, Vec<String>)
@@ -554,13 +565,17 @@ impl PriorityHealQueue {
         self.heap = BinaryHeap::from(items);
 
         let chosen = chosen.map(|item| {
-            let request = item.request;
-            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
-            self.remove_best_effort_count(request.source);
+            let request = self.remove_queued_item(item);
             self.record_dispatch(&request);
             request
         });
         (chosen, skipped)
+    }
+
+    fn remove_queued_item(&mut self, item: PriorityQueueItem) -> HealRequest {
+        Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item);
+        self.remove_best_effort_count(item.request.source);
+        item.request
     }
 
     fn record_dispatch(&mut self, request: &HealRequest) {
@@ -667,10 +682,19 @@ impl PriorityHealQueue {
         }
     }
 
-    pub(super) fn decrement_or_remove_dedup_key(dedup_keys: &mut HashMap<String, DedupKeyEntry>, key: &str) {
-        if let Some(entry) = dedup_keys.get_mut(key) {
+    fn decrement_or_remove_dedup_key(dedup_keys: &mut HashMap<String, DedupKeyEntry>, item: &PriorityQueueItem) {
+        if let Some(entry) = dedup_keys.get_mut(&item.dedup_key) {
+            match &mut entry.scanner_queued_owners {
+                ScannerQueuedOwners::Single(sequence) if entry.refcount != 1 || *sequence != item.sequence => {
+                    entry.scanner_queued_owners = ScannerQueuedOwners::Indexed(BTreeMap::new());
+                }
+                ScannerQueuedOwners::Single(_) => {}
+                ScannerQueuedOwners::Indexed(owners) => {
+                    owners.remove(&item.sequence);
+                }
+            }
             if entry.refcount <= 1 {
-                dedup_keys.remove(key);
+                dedup_keys.remove(&item.dedup_key);
             } else {
                 entry.refcount -= 1;
             }
@@ -747,15 +771,19 @@ impl PriorityHealQueue {
         self.dedup_keys.get(key).map(|entry| entry.representative_request_id.as_str())
     }
 
-    /// Re-elect the representative for `key` from the queue entries holding
-    /// it. Needed after a holder leaves the queue *without* becoming active
-    /// (canceled by id, or displaced): the former opener may be the request
-    /// that just left, and a merge receipt must never name an id that
-    /// resolves nowhere. The scheduler pop path does not need this — the
-    /// popped request surfaces in `active_heals` under the same id and the
-    /// duplicate pre-check consults active heals before the queue. No-op for
-    /// released keys; the survivor scan only runs when a key still has
-    /// holders, which under forced duplicates is the rare admin path.
+    pub(super) fn scanner_queued_request_id_for_dedup_key(&self, key: &str) -> Option<&str> {
+        let entry = self.dedup_keys.get(key)?;
+        match &entry.scanner_queued_owners {
+            ScannerQueuedOwners::Single(_) if entry.refcount == 1 => Some(entry.representative_request_id.as_str()),
+            ScannerQueuedOwners::Indexed(owners) if owners.len() == entry.refcount => {
+                owners.first_key_value().map(|(_, id)| id.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// Re-elect the legacy representative from the heap after cancellation or
+    /// displacement. Dequeue leaves it unchanged for existing callers.
     pub(super) fn refresh_dedup_representative(&mut self, key: &str) {
         if !self.dedup_keys.contains_key(key) {
             return;
@@ -786,7 +814,7 @@ impl PriorityHealQueue {
         while let Some(item) = self.heap.pop() {
             if removed.is_none() && item.request.id == request_id {
                 let key = item.dedup_key.clone();
-                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item);
                 self.remove_best_effort_count(item.request.source);
                 affected_key = Some(key);
                 removed = Some(item.request);
@@ -812,7 +840,7 @@ impl PriorityHealQueue {
 
         while let Some(item) = self.heap.pop() {
             if should_remove(&item.request) {
-                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item);
                 self.remove_best_effort_count(item.request.source);
                 affected_keys.push(item.dedup_key);
                 removed.push(item.request);
