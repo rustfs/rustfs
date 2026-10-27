@@ -481,6 +481,156 @@ async fn dropped_lease_wait_does_not_report_a_finished_outcome() {
     assert_eq!(finished, 0, "a dropped future has no observed outcome: {logs}");
 }
 
+#[test]
+fn publication_lease_retries_local_channel_deadline_and_stops_on_cancel() {
+    const CHILD_MARKER: &str = "RUSTFS_TEST_SCANNER_LEASE_DIAL_RETRY_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        let module = module_path!()
+            .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
+            .unwrap_or(module_path!());
+        let name = format!("{module}::publication_lease_retries_local_channel_deadline_and_stops_on_cancel");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", &name, "--nocapture"])
+            .env(CHILD_MARKER, "1")
+            .env(rustfs_config::ENV_INTERNODE_CONNECT_TIMEOUT_SECS, "0")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .output()
+            .expect("channel deadline test subprocess");
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "channel deadline subprocess failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        use crate::storage_api::scan::EcstorePeerRestClient;
+        use rustfs_utils::net::XHost;
+
+        async fn channel_deadline_error(
+            notification: &crate::storage_api::EcstoreNotificationSys,
+            target: &str,
+        ) -> EcstoreError {
+            let error = match notification
+                .acquire_scanner_publication_leases(vec![(target.to_owned(), "session".into(), 3)])
+                .await
+            {
+                Ok(_) => panic!("the stalled channel cannot grant a lease"),
+                Err(error) => error,
+            };
+            let info = crate::storage_api::scan::scanner_publication_lease_failure_info(&error)
+                .expect("local channel deadline must carry structured diagnostics");
+            assert_eq!(info.kind, "peer_request_failed");
+            assert_eq!(info.reason, Some("channel_acquisition_timed_out"));
+            assert_eq!(info.reported_reason, None);
+            assert!(!scanner_publication_lease_error_is_retryable(&error.to_string()));
+            error
+        }
+
+        // The local endpoint never completes TLS or receives an RPC.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("local listener");
+        let address = listener.local_addr().expect("listener address");
+        let target = format!("https://{address}");
+        let client = EcstorePeerRestClient::new(
+            XHost {
+                name: "127.0.0.1".to_owned(),
+                port: address.port(),
+                is_port_set: true,
+            },
+            target.clone(),
+        );
+        let mut notification = crate::storage_api::EcstoreNotificationSys::new(EndpointServerPools::default()).await;
+        notification.peer_clients.push(Some(client));
+
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+        let attempts = AtomicUsize::new(0);
+        let started_at = Instant::now();
+        let result = ScannerCyclePublicationPlan::Authoritative
+            .await_leases(&ctx, &budget, 701, 51, |_| {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                let target = target.clone();
+                let notification = &notification;
+                async move {
+                    if attempt > 0 {
+                        return Ok(());
+                    }
+                    Err(channel_deadline_error(notification, &target).await)
+                }
+            })
+            .await;
+        assert!(matches!(result, ScannerPublicationProofWait::Ready(())));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(started_at.elapsed() >= scanner_publication_proof_retry_delay(1));
+
+        for detail in [
+            "channel_acquisition_timed_out",
+            "scanner publication lease acquisition failed: peer=peer-a:9000, purpose=authoritative: Io error: internode channel acquisition deadline elapsed",
+        ] {
+            let attempts = AtomicUsize::new(0);
+            let result = ScannerCyclePublicationPlan::Authoritative
+                .await_leases(&ctx, &budget, 702, 52, |_| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    async move { Err::<(), _>(EcstoreError::other(detail)) }
+                })
+                .await;
+            assert!(matches!(result, ScannerPublicationProofWait::Rejected(_)));
+            assert_eq!(attempts.load(Ordering::SeqCst), 1, "remote text must not create a local diagnosis");
+        }
+
+        let cancel_ctx = CancellationToken::new();
+        let cancel_budget = ScannerCycleBudget::new(&cancel_ctx, ScannerCycleBudgetConfig::default());
+        let attempts = AtomicUsize::new(0);
+        let started_at = Instant::now();
+        let result = ScannerCyclePublicationPlan::Authoritative
+            .await_leases(&cancel_ctx, &cancel_budget, 703, 53, |_| {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                let target = target.clone();
+                let notification = &notification;
+                let cancel_ctx = cancel_ctx.clone();
+                async move {
+                    assert_eq!(attempt, 0, "cancellation must stop the scheduled retry");
+                    let error = channel_deadline_error(notification, &target).await;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        cancel_ctx.cancel();
+                    });
+                    Err::<(), _>(error)
+                }
+            })
+            .await;
+        assert!(matches!(result, ScannerPublicationProofWait::Cancelled));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(started_at.elapsed() < scanner_publication_proof_retry_delay(1));
+
+        let progress_ctx = CancellationToken::new();
+        let progress_budget = ScannerCycleBudget::new(&progress_ctx, ScannerCycleBudgetConfig::default());
+        let attempts = AtomicUsize::new(0);
+        let started_at = Instant::now();
+        let result = ScannerCyclePublicationPlan::ProgressOnly
+            .await_leases(&progress_ctx, &progress_budget, 704, 54, |observational| {
+                assert!(observational);
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let target = target.clone();
+                let notification = &notification;
+                async move { Err::<(), _>(channel_deadline_error(notification, &target).await) }
+            })
+            .await;
+        assert!(matches!(result, ScannerPublicationProofWait::Cancelled));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(started_at.elapsed() < scanner_publication_proof_retry_delay(1));
+        drop(listener);
+    });
+}
+
 #[tokio::test]
 #[serial]
 async fn exhausted_budget_still_proves_peer_movement_without_namespace_authority() {
