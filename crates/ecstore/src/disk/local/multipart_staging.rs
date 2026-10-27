@@ -411,15 +411,23 @@ impl LocalDisk {
             }
             let _attempt = os::mkdir_all_below_existing_base_std(&private_object, &base, &publication_root)?;
             if incoming.data.is_none() && !incoming.is_remote() {
+                let source_data_dir = source_object.join(source_dir.to_string());
+                let pinned_source_data = (!incoming.parts.is_empty())
+                    .then(|| os::pin_multipart_source_directory(&source_data_dir, &base, &publication_root))
+                    .transpose()?;
                 let mut names = Vec::with_capacity(incoming.parts.len().saturating_mul(3));
                 for part in &incoming.parts {
                     if cancelled() {
                         return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "multipart staging cancelled"));
                     }
-                    let path = source_object
-                        .join(source_dir.to_string())
-                        .join(format!("part.{}.meta", part.number));
-                    let bytes = os::read_multipart_source_metadata(&path, &base, &publication_root)?;
+                    let meta_name = format!("part.{}.meta", part.number);
+                    let bytes = os::read_multipart_source_metadata_in_pinned(
+                        pinned_source_data.as_ref().expect("pinned source data directory"),
+                        &source_data_dir,
+                        std::ffi::OsStr::new(&meta_name),
+                        &base,
+                        &publication_root,
+                    )?;
                     let actual = rustfs_filemeta::ObjectPartInfo::unmarshal(&bytes).map_err(std::io::Error::other)?;
                     let normalized = i64::try_from(actual.size)
                         .map_err(std::io::Error::other)?
@@ -441,13 +449,13 @@ impl LocalDisk {
                     // Preserve the native completed-MPU directory format. This
                     // immutable, validated generation record is distinct from
                     // the upload's mutable top-level xl.meta.
-                    names.push(format!("part.{}.meta", part.number));
+                    names.push(meta_name);
                     if let Some(integrity) = &part.integrity {
                         names.push(integrity.file_name());
                     }
                 }
                 os::hardlink_multipart_source_files(
-                    &source_object.join(source_dir.to_string()),
+                    &source_data_dir,
                     &private_object.join(final_dir.to_string()),
                     &names,
                     &base,

@@ -170,7 +170,7 @@ impl LocalDisk {
             recovery: loaded.state.as_ref().and_then(|state| state.recovery.clone()),
             negative_certificate,
             ready_certificate,
-            root_missing: store.root_missing().await?,
+            root_missing: loaded.root_missing,
             abort_round: loaded
                 .state
                 .as_ref()
