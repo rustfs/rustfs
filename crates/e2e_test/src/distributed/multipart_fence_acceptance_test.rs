@@ -86,7 +86,8 @@ async fn fixture_from_binary(
         ("NO_PROXY", "127.0.0.1,::1,localhost"),
         ("HTTP_PROXY", ""),
         ("HTTPS_PROXY", ""),
-        ("RUST_LOG", "warn"),
+        ("RUSTFS_OBJECT_LOCK_DIAG_ENABLE", "true"),
+        ("RUST_LOG", "warn,rustfs_ecstore::object_lock_diag=trace"),
     ] {
         cluster.set_env(name, value);
     }
@@ -970,7 +971,8 @@ async fn phase_quorum_matrix(
                         .key(&key)
                         .body(ByteStream::from(previous.clone()))
                         .send()
-                        .await?;
+                        .await
+                        .map_err(|error| format!("setup PutObject phase={phase} key={key}: {error:?}"))?;
                     Some(previous)
                 } else {
                     None
@@ -999,7 +1001,8 @@ async fn phase_quorum_matrix(
                             .part_number(1)
                             .body(ByteStream::from(body.clone()))
                             .send()
-                            .await?,
+                            .await
+                            .map_err(|error| format!("setup UploadPart phase={phase} key={key}: {error:?}"))?,
                     )
                 } else {
                     None
@@ -1080,7 +1083,8 @@ async fn phase_quorum_matrix(
                             .upload_id(upload_id);
                         let result =
                             with_paused_peers(proxies, methods, &limits, &scope, async move { request.send().await }).await?;
-                        quorum_outcome(result, unavailable == unavailable_at_quorum, locks)?;
+                        quorum_outcome(result, unavailable == unavailable_at_quorum, locks)
+                            .map_err(|error| format!("injected Abort phase={phase} key={key}: {error}"))?;
                     }
                     _ => unreachable!(),
                 }
