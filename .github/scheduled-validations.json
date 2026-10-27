@@ -18,7 +18,6 @@
     "never_ran_grace_until": "2026-09-08T00:00:00Z"
   },
   { "workflow": ".github/workflows/nightly-gnu.yml", "max_age_hours": 36 },
-  { "workflow": ".github/workflows/performance-ab.yml", "max_age_hours": 36 },
   {
     "workflow": ".github/workflows/runner-hygiene.yml",
     "max_age_hours": 792,
