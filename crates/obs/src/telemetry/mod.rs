@@ -43,6 +43,8 @@
 pub mod dial9;
 mod filter;
 mod guard;
+#[cfg(test)]
+mod isolation_probe_tests;
 mod local;
 mod otel;
 mod recorder;
