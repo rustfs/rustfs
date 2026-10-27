@@ -1234,16 +1234,23 @@ async fn try_create_bitrot_readers_via_batch_pread(
     skip_verify_bitrot: bool,
 ) -> Option<BitrotReaderSetup> {
     use crate::disk::local::batch_shard_pread;
+    use rustfs_io_metrics::{LocalBatchReadDecision, record_local_batch_read_decision};
     use std::io::Cursor;
 
+    let prepare_started = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+    let record_decision = |decision| {
+        record_local_batch_read_decision(decision, prepare_started.map(|started| started.elapsed()));
+    };
     let (adj_off, adj_len) = adjust_shard_read_params(read_offset, read_length, shard_size, &checksum_algo);
     if adj_len > object_mmap_read_max_length() {
+        record_decision(LocalBatchReadDecision::ReadCapExceeded);
         return None;
     }
 
     let mut batch_items: Vec<(usize, std::path::PathBuf, usize, usize)> = Vec::new();
     for (idx, disk_op) in disks.iter().enumerate() {
         if files.get(idx).is_some_and(|fi| fi.data.is_some()) {
+            record_decision(LocalBatchReadDecision::InlineData);
             return None;
         }
         if let Some(disk) = disk_op.as_ref() {
@@ -1251,12 +1258,20 @@ async fn try_create_bitrot_readers_via_batch_pread(
             let path_str = format!("{object}/{data_dir}/part.{part_number}");
             match disk.get_object_path_for_io_if_local(bucket, &path_str) {
                 Some(Ok(p)) => batch_items.push((idx, p, adj_off, adj_len)),
-                _ => return None,
+                Some(Err(_)) => {
+                    record_decision(LocalBatchReadDecision::InvalidPath);
+                    return None;
+                }
+                None => {
+                    record_decision(LocalBatchReadDecision::NonLocalShard);
+                    return None;
+                }
             }
         }
     }
 
     if batch_items.is_empty() {
+        record_decision(LocalBatchReadDecision::NoLocalShards);
         return None;
     }
 
@@ -1265,6 +1280,7 @@ async fn try_create_bitrot_readers_via_batch_pread(
     for (disk_index, _, _, _) in &batch_items {
         disk_call_counters::record(object, disk_call_counters::KIND_DISK_SHARD_OPEN, *disk_index);
     }
+    record_decision(LocalBatchReadDecision::Selected);
     let batch_results = batch_shard_pread(requests).await;
 
     let mut setup = BitrotReaderSetup::new(disks.len());
@@ -1313,6 +1329,7 @@ async fn try_create_bitrot_readers_via_batch_pread(
     _checksum_algo: HashAlgorithm,
     _skip_verify_bitrot: bool,
 ) -> Option<BitrotReaderSetup> {
+    rustfs_io_metrics::record_local_batch_read_decision(rustfs_io_metrics::LocalBatchReadDecision::UnsupportedPlatform, None);
     None
 }
 
@@ -1476,11 +1493,19 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
 ) -> BitrotReaderSetup {
     let strategy = get_bitrot_reader_setup_strategy(mode, prefer_data_blocks_first);
 
-    if use_mmap_read
-        && !matches!(
-            crate::set_disk::get_object_read_policy(),
-            crate::set_disk::GetObjectReadPolicy::CopySource
-        )
+    let batch_read_enabled = if !use_mmap_read {
+        rustfs_io_metrics::record_local_batch_read_decision(rustfs_io_metrics::LocalBatchReadDecision::MmapDisabled, None);
+        false
+    } else if matches!(
+        crate::set_disk::get_object_read_policy(),
+        crate::set_disk::GetObjectReadPolicy::CopySource
+    ) {
+        rustfs_io_metrics::record_local_batch_read_decision(rustfs_io_metrics::LocalBatchReadDecision::CopySource, None);
+        false
+    } else {
+        true
+    };
+    if batch_read_enabled
         && let Some(mut setup) = try_create_bitrot_readers_via_batch_pread(
             files,
             disks,
@@ -7883,6 +7908,228 @@ mod tests {
             disks.push(Some(disk));
         }
         (dirs, disks)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_batch_read_decisions_follow_the_actual_reader_setup_entry() {
+        use crate::test_metrics::CapturingRecorder;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("reader setup validation runtime");
+        let recorder = CapturingRecorder::default();
+        let previous = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(temp_env::async_with_vars(
+                [
+                    (rustfs_config::ENV_OBJECT_MMAP_READ_MAX_LENGTH, Some("4")),
+                    (rustfs_config::ENV_INTERNODE_PREWARM, Some("false")),
+                ],
+                async {
+                    let bucket = "batch-path-attribution";
+                    let object = "object";
+                    let (_dirs, disks) = call_counter_local_disks(bucket, 2).await;
+                    let data_dir = Uuid::new_v4();
+                    let mut files = vec![FileInfo::new(object, 1, 1); 2];
+                    for (file, disk) in files.iter_mut().zip(&disks) {
+                        file.data_dir = Some(data_dir);
+                        disk.as_ref()
+                            .expect("local disk")
+                            .write_all(bucket, &format!("{object}/{data_dir}/part.1"), Bytes::from_static(b"data"))
+                            .await
+                            .expect("write batch fixture");
+                    }
+                    assert_eq!(object_mmap_read_max_length(), 4, "cap must be controlled by this test");
+                    for length in [3, 4] {
+                        let setup = create_bitrot_readers_until_quorum_with_preference(
+                            &files,
+                            &disks,
+                            bucket,
+                            object,
+                            1,
+                            0,
+                            length,
+                            4,
+                            HashAlgorithm::None,
+                            false,
+                            true,
+                            1,
+                            1,
+                            BitrotReaderSetupMode::ReadQuorum,
+                            false,
+                            None,
+                            None,
+                        )
+                        .await;
+                        assert_eq!(setup.readers.iter().flatten().count(), 2);
+                    }
+                    assert!(
+                        try_create_bitrot_readers_via_batch_pread(
+                            &files,
+                            &disks,
+                            bucket,
+                            object,
+                            1,
+                            0,
+                            5,
+                            4,
+                            HashAlgorithm::None,
+                            false,
+                        )
+                        .await
+                        .is_none(),
+                        "a read above the adjusted-length cap must fall back"
+                    );
+                    assert!(
+                        try_create_bitrot_readers_via_batch_pread(
+                            &files,
+                            &disks,
+                            bucket,
+                            object,
+                            1,
+                            0,
+                            4,
+                            4,
+                            HashAlgorithm::HighwayHash256S,
+                            false,
+                        )
+                        .await
+                        .is_none(),
+                        "checksum overhead must be included in the read cap"
+                    );
+                    let mut inline_files = files.clone();
+                    inline_files[0].data = Some(Bytes::from_static(b"data"));
+                    assert!(
+                        try_create_bitrot_readers_via_batch_pread(
+                            &inline_files,
+                            &disks,
+                            bucket,
+                            object,
+                            1,
+                            0,
+                            4,
+                            4,
+                            HashAlgorithm::None,
+                            false,
+                        )
+                        .await
+                        .is_none()
+                    );
+                    let mut endpoint = Endpoint::try_from("http://127.0.0.1:1/disk").expect("remote placeholder endpoint");
+                    endpoint.is_local = false;
+                    let remote = new_disk(
+                        &endpoint,
+                        &DiskOption {
+                            cleanup: false,
+                            health_check: false,
+                        },
+                    )
+                    .await
+                    .expect("remote placeholder must initialize without a connection");
+                    assert!(
+                        try_create_bitrot_readers_via_batch_pread(
+                            &files,
+                            &[Some(remote), None],
+                            bucket,
+                            object,
+                            1,
+                            0,
+                            4,
+                            4,
+                            HashAlgorithm::None,
+                            false,
+                        )
+                        .await
+                        .is_none(),
+                        "any remote shard must keep the setup out of the local batch path"
+                    );
+                    assert!(
+                        try_create_bitrot_readers_via_batch_pread(
+                            &files,
+                            &disks,
+                            bucket,
+                            "../outside",
+                            1,
+                            0,
+                            4,
+                            4,
+                            HashAlgorithm::None,
+                            false,
+                        )
+                        .await
+                        .is_none()
+                    );
+                    let missing = vec![None, None];
+                    assert!(
+                        try_create_bitrot_readers_via_batch_pread(
+                            &files,
+                            &missing,
+                            bucket,
+                            object,
+                            1,
+                            0,
+                            4,
+                            4,
+                            HashAlgorithm::None,
+                            false,
+                        )
+                        .await
+                        .is_none()
+                    );
+                    for (use_mmap, policy) in [
+                        (false, crate::set_disk::GetObjectReadPolicy::Default),
+                        (true, crate::set_disk::GetObjectReadPolicy::CopySource),
+                    ] {
+                        crate::set_disk::with_get_object_read_policy(policy, async {
+                            create_bitrot_readers_until_quorum_with_preference(
+                                &files,
+                                &missing,
+                                bucket,
+                                object,
+                                1,
+                                0,
+                                4,
+                                4,
+                                HashAlgorithm::None,
+                                false,
+                                use_mmap,
+                                1,
+                                1,
+                                BitrotReaderSetupMode::ReadQuorum,
+                                false,
+                                None,
+                                None,
+                            )
+                            .await;
+                        })
+                        .await;
+                    }
+                },
+            ));
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous);
+        let metric = "rustfs_io_get_object_local_batch_decisions_total";
+        for (decision, expected) in [
+            ("selected", 2),
+            ("read_cap_exceeded", 2),
+            ("inline_data", 1),
+            ("invalid_path", 1),
+            ("non_local_shard", 1),
+            ("no_local_shards", 1),
+            ("mmap_disabled", 1),
+            ("copy_source", 1),
+        ] {
+            assert_eq!(recorder.counter_value(metric, &[("decision", decision)]), expected, "{decision}");
+        }
+        assert_eq!(
+            recorder.counter_value("rustfs_io_get_object_local_batch_shards_total", &[("outcome", "success")]),
+            4
+        );
+        assert_eq!(recorder.counter_value("rustfs_io_get_object_local_batch_read_bytes_total", &[]), 14);
+        assert_eq!(recorder.histogram_sample_count("rustfs_io_get_object_local_batch_prepare_seconds"), 8);
     }
 
     async fn reopen_local_disk(dir: &TempDir) -> DiskStore {
