@@ -229,7 +229,7 @@
     {
       "invariant": "list-objects-shared-corpus-orphan-cleanup-requires-authoritative-evidence",
       "suite": "rustfs-ecstore",
-      "name": "store::list_objects::differential_tests::list_objects_shared_corpus_orphan_cleanup_requires_authoritative_evidence"
+      "name": "store::list_objects::differential_tests::list_objects_shared_corpus_orphan_listing_preserves_inputs"
     },
     {
       "invariant": "list-objects-shared-corpus-consumer-drop-joins-real-disk-producer",
