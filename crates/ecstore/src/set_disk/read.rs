@@ -926,7 +926,7 @@ impl SetDisks {
                 None
             }
         };
-        let (read_quorum, _) = match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
+        let (read_quorum, write_quorum) = match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
             .map_err(|err| dangling_not_found(&err).unwrap_or(err))
             .map_err(|err| to_object_err(err.into(), vec![bucket, object, &vid]))
         {
@@ -944,6 +944,8 @@ impl SetDisks {
         };
         let read_quorum =
             usize::try_from(read_quorum).map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]))?;
+        let write_quorum = usize::try_from(write_quorum)
+            .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![bucket, object]))?;
         if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
             if let Some(not_found) = dangling_not_found(&err) {
                 rustfs_io_metrics::record_get_object_metadata_quorum_result(metadata_metrics_path, "not_found");
@@ -964,14 +966,19 @@ impl SetDisks {
             return Err(to_object_err(err.into(), vec![bucket, object, &vid]));
         }
 
-        let (op_online_disks, mut fi) = match Self::select_valid_fileinfo(&disks, &parts_metadata, &errs, read_quorum) {
-            Ok(selection) => selection,
-            Err(err) => {
-                let err = StorageError::from(err);
-                rustfs_io_metrics::record_get_object_metadata_quorum_result(metadata_metrics_path, metadata_quorum_outcome(&err));
-                return Err(err);
-            }
-        };
+        let (op_online_disks, mut fi) =
+            match Self::select_fileinfo_for_read(bucket, &disks, &parts_metadata, &errs, vid.as_str(), read_quorum, write_quorum)
+            {
+                Ok(selection) => selection,
+                Err(err) => {
+                    let err = StorageError::from(err);
+                    rustfs_io_metrics::record_get_object_metadata_quorum_result(
+                        metadata_metrics_path,
+                        metadata_quorum_outcome(&err),
+                    );
+                    return Err(err);
+                }
+            };
         let include_part_checksums =
             opts.include_part_checksums || opts.part_number.is_some() || opts.data_movement || opts.raw_data_movement_read;
         if include_part_checksums {
@@ -2448,15 +2455,18 @@ impl SetDisks {
         let (mut parts_metadata, errs, diagnostics) = metadata_read.into_legacy();
         diagnostics.record(metrics_path);
 
-        let (read_quorum, _) = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, expected.parity_blocks)
+        let (read_quorum, write_quorum) = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, expected.parity_blocks)
             .map_err(|err| to_object_err(err.into(), vec![bucket, object]))?;
         let read_quorum =
             usize::try_from(read_quorum).map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]))?;
+        let write_quorum = usize::try_from(write_quorum)
+            .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![bucket, object]))?;
         if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
             return Err(to_object_err(err.into(), vec![bucket, object]));
         }
 
-        let (mut online_disks, full_fi) = SetDisks::select_valid_fileinfo(fallback_disks, &parts_metadata, &errs, read_quorum)?;
+        let (mut online_disks, full_fi) =
+            SetDisks::select_fileinfo_for_read(bucket, fallback_disks, &parts_metadata, &errs, "", read_quorum, write_quorum)?;
         if !late_metadata_read_identity_matches(expected, &full_fi) {
             return Err(to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]));
         }

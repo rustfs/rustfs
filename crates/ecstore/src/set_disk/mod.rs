@@ -12154,6 +12154,47 @@ mod tests {
     }
 
     #[test]
+    fn test_system_bucket_reads_keep_the_commit_proof_rule() {
+        let old_mod_time = OffsetDateTime::now_utc();
+        let new_mod_time = old_mod_time + time::Duration::seconds(1);
+        let old_data_dir = Uuid::new_v4();
+        let new_data_dir = Uuid::new_v4();
+        let old = |index| quorum_test_fileinfo(old_mod_time, old_data_dir, "part-etag-old", index);
+        let new = |index| quorum_test_fileinfo(new_mod_time, new_data_dir, "part-etag-new", index);
+
+        // A PREPARE/COMMIT split of pool metadata must stay unreadable so that
+        // native recovery, not an ordinary read, decides whether it committed.
+        for (metas, errs) in [
+            (vec![old(1), old(2), new(3), new(4)], vec![None, None, None, None]),
+            (
+                vec![new(1), new(2), old(3), FileInfo::default()],
+                vec![None, None, None, Some(DiskError::DiskNotFound)],
+            ),
+        ] {
+            let disks = vec![None; metas.len()];
+            let (_, served) = SetDisks::select_fileinfo_for_read("bucket", &disks, &metas, &errs, "", 2, 3)
+                .expect("an S3 read serves the newer side at read quorum");
+            assert_eq!(served.data_dir, Some(new_data_dir));
+
+            let internal = SetDisks::select_fileinfo_for_read(crate::disk::RUSTFS_META_BUCKET, &disks, &metas, &errs, "", 2, 3);
+            assert!(matches!(internal, Err(DiskError::ErasureReadQuorum)));
+        }
+
+        let committed = vec![new(1), new(2), new(3), old(4)];
+        let (_, internal) = SetDisks::select_fileinfo_for_read(
+            crate::disk::RUSTFS_META_BUCKET,
+            &vec![None; committed.len()],
+            &committed,
+            &[None, None, None, None],
+            "",
+            2,
+            3,
+        )
+        .expect("a write-quorum version stays readable in the system bucket");
+        assert_eq!(internal.data_dir, Some(new_data_dir));
+    }
+
+    #[test]
     fn test_latest_fileinfo_selection_picks_version_stack_shape_in_disk_order() {
         let mod_time = OffsetDateTime::now_utc();
         let data_dir = Uuid::new_v4();
