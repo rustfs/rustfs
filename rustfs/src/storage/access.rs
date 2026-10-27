@@ -241,6 +241,30 @@ impl TableDataPlaneListCursor {
 }
 
 impl TableDataPlaneListAccess {
+    #[cfg(test)]
+    pub(crate) fn test_listing_fixture(bucket: &str) -> Self {
+        let resource = |table: &str, prefix: &str, allowed| TableDataPlaneListResource {
+            resource: crate::table_catalog::TableDataPlaneResource {
+                table_bucket: bucket.to_owned(),
+                namespace: "test".to_owned(),
+                table: table.to_owned(),
+                table_id: table.to_owned(),
+                warehouse_object_prefix: prefix.to_owned(),
+            },
+            allowed,
+        };
+        Self {
+            bucket: bucket.to_owned(),
+            principal_fingerprint: "principal".to_owned(),
+            snapshot_fingerprint: "snapshot".to_owned(),
+            cursor_key: [0x42; 32],
+            resources: vec![
+                resource("table-id", "tables/table-id/", true),
+                resource("denied-id", "tables/zz-denied/", false),
+            ],
+        }
+    }
+
     pub(crate) fn allows_object(&self, object: &str) -> bool {
         if crate::table_catalog::is_reserved_table_object_key(object) {
             return false;
@@ -3733,71 +3757,6 @@ mod tests {
                 allowed,
             }],
         }
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn protected_table_list_resumes_after_a_literal_cache_shaped_key() {
-        use crate::app::table_list_isolation::{ListObjectsV2Request, list_objects_v2};
-
-        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
-        let bucket = format!("table-marker-{}", uuid::Uuid::new_v4().simple());
-        store
-            .make_bucket(&bucket, &MakeBucketOptions::default())
-            .await
-            .expect("create test bucket");
-        let keys = [
-            "tables/table-id/a0",
-            "tables/table-id/a1",
-            "tables/table-id/a[rustfs_cache:v2,return:]",
-            "tables/table-id/z",
-        ];
-        for key in keys.into_iter().chain(["tables/zz-denied/hidden"]) {
-            store
-                .put_object(
-                    &bucket,
-                    key,
-                    &mut crate::storage::PutObjReader::from_vec(vec![1]),
-                    &crate::storage::ObjectOptions::default(),
-                )
-                .await
-                .expect("seed object");
-        }
-        let mut access = table_list_access(true);
-        access.bucket = bucket.clone();
-        access.resources.push(TableDataPlaneListResource {
-            resource: crate::table_catalog::TableDataPlaneResource {
-                table_bucket: bucket.clone(),
-                namespace: "private".to_owned(),
-                table: "denied".to_owned(),
-                table_id: "denied-id".to_owned(),
-                warehouse_object_prefix: "tables/zz-denied/".to_owned(),
-            },
-            allowed: false,
-        });
-        let mut token = None;
-        for (index, key) in keys.into_iter().enumerate() {
-            let page = list_objects_v2(
-                store.clone(),
-                &access,
-                ListObjectsV2Request {
-                    bucket: &bucket,
-                    prefix: "",
-                    continuation_token: token.as_deref(),
-                    delimiter: None,
-                    max_keys: 1,
-                    start_after: None,
-                    incl_deleted: false,
-                    opaque_cursor_supported: true,
-                },
-            )
-            .await
-            .expect("list next protected page");
-            assert_eq!(page.objects.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(), [key]);
-            assert_eq!(page.is_truncated, index + 1 < keys.len());
-            token = page.next_continuation_token;
-        }
-        assert!(token.is_none());
     }
 
     #[test]

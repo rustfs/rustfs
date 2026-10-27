@@ -635,6 +635,59 @@ mod tests {
     use crate::app::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
     use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartInfo;
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn protected_table_list_resumes_after_a_literal_cache_shaped_key() {
+        use super::{ListObjectsV2Request, list_objects_v2};
+        use crate::app::storage_api::bucket_usecase::access::TableDataPlaneListAccess;
+        use crate::app::storage_api::test::StoragePutObjReader;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::app::storage_api::test::contract::object::ObjectIO as _;
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let bucket = format!("table-marker-{}", uuid::Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create test bucket");
+        let keys = [
+            "tables/table-id/a0",
+            "tables/table-id/a1",
+            "tables/table-id/a[rustfs_cache:v2,return:]",
+            "tables/table-id/z",
+        ];
+        for key in keys.into_iter().chain(["tables/zz-denied/hidden"]) {
+            store
+                .put_object(&bucket, key, &mut StoragePutObjReader::from_vec(vec![1]), &Default::default())
+                .await
+                .expect("seed object");
+        }
+        let access = TableDataPlaneListAccess::test_listing_fixture(&bucket);
+        let mut token = None;
+        for (index, key) in keys.into_iter().enumerate() {
+            let page = list_objects_v2(
+                store.clone(),
+                &access,
+                ListObjectsV2Request {
+                    bucket: &bucket,
+                    prefix: "",
+                    continuation_token: token.as_deref(),
+                    delimiter: None,
+                    max_keys: 1,
+                    start_after: None,
+                    incl_deleted: false,
+                    opaque_cursor_supported: true,
+                },
+            )
+            .await
+            .expect("list next protected page");
+            assert_eq!(page.objects.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(), [key]);
+            assert_eq!(page.is_truncated, index + 1 < keys.len());
+            token = page.next_continuation_token;
+        }
+        assert!(token.is_none());
+    }
+
     #[test]
     fn object_list_entry_keeps_an_object_without_a_delimiter() {
         let object = ObjectInfo {
