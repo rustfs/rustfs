@@ -1,224 +1,234 @@
-# Copyright 2024 RustFS Team
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-name: Windows Filesystem Tests
+# Temporary verification of the test-only diagnostic isolation prototype.
+# Both sinks are in memory; this does not verify OTLP wire serialization.
+name: TLS diagnostic isolation observation
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - "crates/ecstore/src/disk/**"
-      - "crates/ecstore/src/layout/**"
-      - "crates/ecstore/src/store/init_format.rs"
-      - "crates/ecstore/src/set_disk/ops/locking.rs"
-      - "crates/ecstore/src/object_api/write_commit_context.rs"
-      - "crates/ecstore/src/bucket/utils.rs"
-      - "crates/ecstore/Cargo.toml"
-      - "crates/utils/src/dunce.rs"
-      - "crates/utils/src/os/**"
-      - "crates/utils/Cargo.toml"
-      - "crates/utils/src/path.rs"
-      - "rustfs/build.rs"
-      - "rustfs/Cargo.toml"
-      - "rustfs/src/main.rs"
-      - "rustfs/src/server/runtime.rs"
-      - "rustfs/src/startup_*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/actions/setup/**"
-      - ".github/workflows/windows-filesystem.yml"
-  pull_request:
-    branches: [ main ]
-    paths:
-      - "crates/ecstore/src/disk/**"
-      - "crates/ecstore/src/layout/**"
-      - "crates/ecstore/src/store/init_format.rs"
-      - "crates/ecstore/src/set_disk/ops/locking.rs"
-      - "crates/ecstore/src/object_api/write_commit_context.rs"
-      - "crates/ecstore/src/bucket/utils.rs"
-      - "crates/ecstore/Cargo.toml"
-      - "crates/utils/src/dunce.rs"
-      - "crates/utils/src/os/**"
-      - "crates/utils/Cargo.toml"
-      - "crates/utils/src/path.rs"
-      - "rustfs/build.rs"
-      - "rustfs/Cargo.toml"
-      - "rustfs/src/main.rs"
-      - "rustfs/src/server/runtime.rs"
-      - "rustfs/src/startup_*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/actions/setup/**"
-      - ".github/workflows/windows-filesystem.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_TERM_COLOR: always
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  RUST_BACKTRACE: 1
-
 jobs:
-  rename-safety:
-    name: Rename Safety
-    runs-on: windows-latest
-    timeout-minutes: 60
+  isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: red
+            revision: 9cc6f43a9f6bd1ed8f6177ba408480bed49fc74e
+            tree: 21a99e7ab9a9593fa739feb34898edaf76b71b57
+          - kind: green
+            revision: 64048df6e865dede7cbbff91367c700198280e35
+            tree: 7cf6320949801c0edfe110185a8a2bca2009cc9a
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: "0"
+      CONTROL_TEST: telemetry::isolation_probe_tests::parent_none_alone_keeps_json_parent_and_otel_thread_context
+      ISOLATION_TEST: telemetry::isolation_probe_tests::diagnostic_fixture_is_detached_for_both_sinks_and_restores_context
     steps:
-      - name: Checkout repository
+      - name: Checkout fixed test source
+        id: source
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
+          ref: ${{ matrix.revision }}
+          clean: false
           persist-credentials: false
 
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: build-x86_64-pc-windows-msvc
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-          install-test-tools: 'false'
-
-      - name: Check production Windows dependencies
-        shell: pwsh
-        run: cargo check -p rustfs-ecstore --lib
-
-      - name: Test guarded rename publication
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib rename_all_ -- --nocapture
-
-      - name: Test multipart parent durability barriers
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib multipart_owned_record_parent_barriers_ -- --nocapture
-
-      - name: Test Windows path conversion
-        shell: pwsh
-        run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"
-
-      - name: Test Windows volume and disk-space probes
-        shell: pwsh
-        run: |
-          # Map a drive letter to the temp drive's administrative share so the
-          # remote-volume probe also covers mapped network drives.
-          $drive = (Split-Path -Qualifier ([System.IO.Path]::GetTempPath())).TrimEnd(':')
-          net use R: "\\localhost\$drive`$" /persistent:no
-          if ($LASTEXITCODE -eq 0) {
-            $env:RUSTFS_TEST_WINDOWS_MAPPED_DRIVE = 'R:'
-          } else {
-            Write-Output "::warning::could not map R: to \\localhost\$drive`$; mapped-drive test will skip"
-          }
-          cargo test -p rustfs-utils --features os --lib os:: -- --nocapture
-          $status = $LASTEXITCODE
-          if ($env:RUSTFS_TEST_WINDOWS_MAPPED_DRIVE) { net use R: /delete /y | Out-Null }
-          exit $status
-
-      - name: Test Windows handle guards
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib windows_ -- --nocapture
-
-      - name: Test endpoint path parsing
-        shell: pwsh
-        run: "cargo test -p rustfs-ecstore --lib layout::endpoint:: -- --nocapture"
-
-      - name: Test startup temporary-directory cleanup
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib cleanup_tmp_on_startup_ -- --nocapture
-
-      - name: Test object key Windows admission
-        shell: pwsh
-        run: "cargo test -p rustfs-ecstore --lib bucket::utils:: -- --nocapture"
-
-      - name: Test Windows file-name rules
-        shell: pwsh
-        run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"
-
-      - name: Test fresh format publication
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib fresh_format_load_initializes_all_disks -- --nocapture
-
-  # The native Windows main thread only gets the 1 MiB PE stack reserve, while
-  # Linux and macOS hand out 8 MiB. Startup runs the whole root future on the
-  # thread that calls `block_on`, so a debug server once overflowed before it
-  # listened on Windows only. Start a real server to keep that covered.
-  startup-smoke:
-    name: Startup Smoke
-    runs-on: windows-latest
-    timeout-minutes: 90
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: build-x86_64-pc-windows-msvc
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-          install-test-tools: 'false'
-
-      - name: Build debug server binary
-        shell: pwsh
-        run: cargo build --locked -p rustfs --bin rustfs
-
-      - name: Print version
-        shell: pwsh
-        run: |
-          & .\target\debug\rustfs.exe --version
-          if ($LASTEXITCODE -ne 0) { throw "rustfs --version exited with $LASTEXITCODE" }
-
-      - name: Start server and wait for readiness
-        shell: pwsh
+      - name: Verify source and create private evidence directories
+        id: identity
         env:
-          RUSTFS_ACCESS_KEY: rustfsadmin
-          RUSTFS_SECRET_KEY: rustfsadmin
+          EXPECTED_REVISION: ${{ matrix.revision }}
+          EXPECTED_TREE: ${{ matrix.tree }}
+          TEST_KIND: ${{ matrix.kind }}
+          WORKFLOW_REVISION: ${{ github.sha }}
         run: |
-          $volume = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke'
-          $stdout = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke.out.log'
-          $stderr = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke.err.log'
-          New-Item -ItemType Directory -Force -Path $volume | Out-Null
-          $server = Start-Process -FilePath .\target\debug\rustfs.exe `
-            -ArgumentList @('--address', '127.0.0.1:9000', "`"$volume`"") `
-            -RedirectStandardOutput $stdout -RedirectStandardError $stderr `
-            -NoNewWindow -PassThru
-          # Cache the process handle now; otherwise ExitCode reads back empty.
-          $null = $server.Handle
-          $ready = $false
-          try {
-            for ($i = 0; $i -lt 180; $i++) {
-              if ($server.HasExited) { break }
-              try {
-                $response = Invoke-WebRequest -Uri 'http://127.0.0.1:9000/health/ready' -UseBasicParsing -NoProxy -TimeoutSec 2
-                if ($response.StatusCode -eq 200) { $ready = $true; break }
-              } catch {}
-              Start-Sleep -Seconds 1
-            }
-          } finally {
-            if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force }
-            $server.WaitForExit()
-            Write-Host '--- server stdout (tail) ---'
-            Get-Content $stdout -Tail 100 -ErrorAction SilentlyContinue
-            Write-Host '--- server stderr (tail) ---'
-            Get-Content $stderr -Tail 100 -ErrorAction SilentlyContinue
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          umask 077
+          mkdir "$RUNNER_TEMP/tls-isolation-private"
+          mkdir "$RUNNER_TEMP/tls-isolation-evidence"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          test = Path('crates/obs/src/telemetry/isolation_probe_tests.rs').read_bytes()
+          identity = {
+              'kind': os.environ['TEST_KIND'],
+              'source_revision': os.environ['EXPECTED_REVISION'],
+              'source_tree': os.environ['EXPECTED_TREE'],
+              'workflow_revision': os.environ['WORKFLOW_REVISION'],
+              'test_sha256': hashlib.sha256(test).hexdigest(),
           }
-          if (-not $ready) {
-            throw ("rustfs did not report ready on /health/ready (exit code: {0})" -f $server.ExitCode)
+          output = Path(os.environ['RUNNER_TEMP'], 'tls-isolation-evidence', 'identity.json')
+          output.write_text(json.dumps(identity, sort_keys=True) + '\n')
+          PY
+
+      - name: Install system dependencies
+        id: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev ripgrep
+
+      - name: Install protoc
+        id: protoc
+        uses: rustfs/setup-protoc@a3705324d8f9bf5b6c3573fb6cf8ae421db55dd6 # v3.0.1
+        with:
+          version: "35.1"
+          repo-token: ${{ github.token }}
+
+      - name: Install flatc
+        id: flatc
+        uses: Nugine/setup-flatc@698800de72a96bfb22cf60431dc21a2ff9a7e07b # v1
+        with:
+          version: "25.12.19"
+
+      - name: Install Rust
+        id: rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Record toolchain identity
+        id: toolchain
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          versions = {}
+          for program in ('rustc', 'cargo'):
+              version = subprocess.run([program, '--version'], check=True, capture_output=True, text=True).stdout.strip()
+              if not re.fullmatch(program + r' [a-zA-Z0-9+(). _-]{1,120}', version):
+                  raise SystemExit('Toolchain version format was unexpected; raw output withheld.')
+              versions[program] = version
+          output = Path(os.environ['RUNNER_TEMP'], 'tls-isolation-evidence', 'toolchain.json')
+          output.write_text(json.dumps(versions, sort_keys=True) + '\n')
+          PY
+
+      - name: Compile the library test binary
+        id: compile
+        run: |
+          set -euo pipefail
+          if ! cargo test --locked -p rustfs-obs --lib --no-run >"$RUNNER_TEMP/tls-isolation-private/build.log" 2>&1; then
+            echo "The library test binary did not compile; raw output withheld."
+            exit 1
+          fi
+
+      - name: Run control and isolation assertions
+        id: assertions
+        env:
+          TEST_KIND: ${{ matrix.kind }}
+          EXPECTED_REVISION: ${{ matrix.revision }}
+          EXPECTED_TREE: ${{ matrix.tree }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          control_status=0
+          cargo test --offline --locked -p rustfs-obs --lib "$CONTROL_TEST" -- --exact --color never >"$RUNNER_TEMP/tls-isolation-private/control.log" 2>&1 || control_status=$?
+          isolation_status=0
+          cargo test --offline --locked -p rustfs-obs --lib "$ISOLATION_TEST" -- --exact --color never >"$RUNNER_TEMP/tls-isolation-private/isolation.log" 2>&1 || isolation_status=$?
+          test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          export CONTROL_STATUS="$control_status" ISOLATION_STATUS="$isolation_status"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ['RUNNER_TEMP'])
+          limit = 16 * 1024 * 1024
+
+          def inspect(name, test):
+              path = root / 'tls-isolation-private' / name
+              if not path.is_file():
+                  return {'state': 'missing', 'selected': False, 'ok': False, 'failed': False, 'baggage_assertion': False}
+              if path.stat().st_size > limit:
+                  return {'state': 'truncated', 'selected': False, 'ok': False, 'failed': False, 'baggage_assertion': False}
+              lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+              return {
+                  'state': 'available',
+                  'selected': lines.count('running 1 test') == 1,
+                  'ok': lines.count(f'test {test} ... ok') == 1,
+                  'failed': lines.count(f'test {test} ... FAILED') == 1,
+                  'baggage_assertion': lines.count('ambient baggage must be hidden') == 1,
+              }
+
+          control = inspect('control.log', os.environ['CONTROL_TEST'])
+          isolation = inspect('isolation.log', os.environ['ISOLATION_TEST'])
+          control_status = int(os.environ['CONTROL_STATUS'])
+          isolation_status = int(os.environ['ISOLATION_STATUS'])
+          control_ok = control['state'] == 'available' and control['selected'] and control['ok'] and control_status == 0
+          if os.environ['TEST_KIND'] == 'red':
+              isolation_ok = (isolation['state'] == 'available' and isolation['selected'] and isolation['failed']
+                              and isolation['baggage_assertion'] and isolation_status == 101)
+          else:
+              isolation_ok = (os.environ['TEST_KIND'] == 'green' and isolation['state'] == 'available'
+                              and isolation['selected'] and isolation['ok'] and not isolation['baggage_assertion']
+                              and isolation_status == 0)
+          result = {
+              'kind': os.environ['TEST_KIND'],
+              'control': control,
+              'control_exit_code': control_status,
+              'isolation': isolation,
+              'isolation_exit_code': isolation_status,
+              'expectation_met': control_ok and isolation_ok,
           }
+          output = root / 'tls-isolation-evidence' / 'result.json'
+          output.write_text(json.dumps(result, sort_keys=True) + '\n')
+          if not result['expectation_met']:
+              raise SystemExit('The test result did not match the expected assertion; raw output withheld.')
+          print('The control and expected isolation outcome were observed.')
+          PY
+
+      - name: Record stage outcomes
+        if: always()
+        env:
+          SOURCE: ${{ steps.source.outcome }}
+          IDENTITY: ${{ steps.identity.outcome }}
+          DEPENDENCIES: ${{ steps.dependencies.outcome }}
+          PROTOC: ${{ steps.protoc.outcome }}
+          FLATC: ${{ steps.flatc.outcome }}
+          RUST: ${{ steps.rust.outcome }}
+          TOOLCHAIN: ${{ steps.toolchain.outcome }}
+          COMPILE: ${{ steps.compile.outcome }}
+          ASSERTIONS: ${{ steps.assertions.outcome }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/tls-isolation-evidence"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          names = ('SOURCE', 'IDENTITY', 'DEPENDENCIES', 'PROTOC', 'FLATC', 'RUST', 'TOOLCHAIN', 'COMPILE', 'ASSERTIONS')
+          allowed = {'success', 'failure', 'cancelled', 'skipped'}
+          stages = {name.lower(): os.environ.get(name) if os.environ.get(name) in allowed else 'missing' for name in names}
+          output = Path(os.environ['RUNNER_TEMP'], 'tls-isolation-evidence', 'stages.json')
+          output.write_text(json.dumps(stages, sort_keys=True) + '\n')
+          PY
+
+      - name: Upload sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tls-isolation-${{ matrix.kind }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/tls-isolation-evidence/
+          retention-days: 7
+          if-no-files-found: error
