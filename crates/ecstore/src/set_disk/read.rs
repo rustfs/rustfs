@@ -10590,6 +10590,38 @@ mod dangling_read_tests {
             panic!("a metadata update of a version below write quorum must be refused");
         };
         assert!(is_write_quorum_error(&err), "the metadata update keeps the write-quorum error: {err:?}");
+        let v4 = Uuid::new_v4();
+        let mut source = head(&set, bucket, object, None).await.expect("latest HEAD");
+        source.version_only = true;
+        let Err(err) = set
+            .copy_object(
+                bucket,
+                object,
+                bucket,
+                object,
+                &mut source,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+                &ObjectOptions {
+                    version_id: Some(v4.to_string()),
+                    versioned: true,
+                    object_lock_config_snapshot: Some(Arc::new(crate::object_api::ObjectLockConfigSnapshot::new(
+                        crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("a version-only copy of a version below write quorum must be refused");
+        };
+        assert!(is_write_quorum_error(&err), "the version-only copy keeps the write-quorum error: {err:?}");
+        assert!(
+            version_metadata(&set, bucket, object, v4).await.iter().all(Option::is_none),
+            "a refused version-only copy must not write the new version to any drive"
+        );
         for (disk, metadata) in version_metadata(&set, bucket, object, v1).await.iter().enumerate() {
             assert!(
                 metadata.as_ref().is_none_or(|metadata| {
@@ -10598,6 +10630,41 @@ mod dangling_read_tests {
                 }),
                 "drive {disk} must not be written by a refused update"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_status_writeback_never_walks_past_dangling_versions() {
+        // A replication terminal CAS stays side-effect free: it keeps the
+        // read-quorum error instead of resolving the latest version, so it
+        // neither queues heal for the dangling version nor writes version one.
+        let bucket = "dangling-latest-replication-cas";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        let (v1, _) = put_committed_below_dangling(&set, bucket, object).await;
+
+        let Err(err) = set
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    eval_metadata: Some(HashMap::from([("x-amz-meta-probe".to_string(), "written".to_string())])),
+                    replication_status_writeback: Some(Box::new(crate::object_api::ReplicationStatusWritebackCondition {
+                        mode: crate::object_api::ReplicationStatusWritebackMode::ValidateOnly,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("a replication terminal CAS must not resolve past a dangling version");
+        };
+        assert!(is_read_quorum_error(&err), "the CAS keeps the read-quorum error: {err:?}");
+        for (disk, metadata) in version_metadata(&set, bucket, object, v1).await.iter().enumerate() {
+            let metadata = metadata.as_ref().expect("version one is on every drive");
+            assert!(!metadata.contains_key("x-amz-meta-probe"), "drive {disk} must not be written");
         }
     }
 

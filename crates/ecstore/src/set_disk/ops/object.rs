@@ -9481,6 +9481,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 }
             }
 
+            // A version-only copy writes and then reverts on a quorum miss;
+            // refuse it before writing when the served version's disks cannot
+            // reach its write quorum even if every write succeeds.
+            let reachable = online_disks
+                .iter()
+                .map(|disk| disk.is_none().then_some(DiskError::DiskNotFound))
+                .collect::<Vec<_>>();
+            if let Some(err) = reduce_write_quorum_errs(&reachable, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+                return Err(to_object_err(err.into(), vec![src_bucket, src_object]));
+            }
             Self::write_unique_file_info(&online_disks, "", src_bucket, src_object, &metas, write_quorum)
                 .await
                 .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
@@ -11185,10 +11195,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 // The merged latest version can be one a failed PUT left below
                 // quorum; resolve it like a latest GET before the dangling
                 // cleanup below can report a key with a committed version absent.
-                if let Some(snapshot) = self
-                    .select_latest_past_dangling_versions(bucket, object, opts, false, &disks, &err)
-                    .await
-                {
+                // A replication terminal CAS stays side-effect free: the walk
+                // queues heal for the versions it skips, so it does not run.
+                let resolved = if opts.replication_status_writeback.is_none() {
+                    self.select_latest_past_dangling_versions(bucket, object, opts, false, &disks, &err)
+                        .await
+                } else {
+                    None
+                };
+                if let Some(snapshot) = resolved {
                     let (fi, _, online_disks) = snapshot.into_owned();
                     (online_disks, fi)
                 } else {
