@@ -50,6 +50,240 @@ def structure(types, field, size=8):
     return blob(types + [typ(4, size, "Root", count=1) + member])
 
 
+class LayoutFixture:
+    def __init__(self):
+        self.strings = bytearray(b'\0')
+        self.types = []
+
+    def name(self, value):
+        if not value:
+            return 0
+        offset = len(self.strings)
+        self.strings.extend(value.encode() + b'\0')
+        return offset
+
+    def add(self, kind, third, name='', payload=b'', count=0, kflag=False):
+        self.types.append(struct.pack('<III', self.name(name), (kind << 24) | count | (int(kflag) << 31), third) + payload)
+        return len(self.types)
+
+    def integer(self, size=8, encoding=None, **header):
+        if encoding is None:
+            encoding = size * 8
+        return self.add(1, size, 'integer', struct.pack('<I', encoding), **header)
+
+    def structure(self, name, size, members, kflag=False, kind=4):
+        raw = b''.join(struct.pack('<III', self.name(n), ty, offset) for n, ty, offset in members)
+        return self.add(kind, size, name, raw, len(members), kflag)
+
+    def blob(self):
+        raw = b''.join(self.types)
+        return struct.pack('<HBBIIIII', 0xEB9F, 1, 0, 24, 0, len(raw), len(raw), len(self.strings)) + raw + self.strings
+
+
+class ScalarFieldTests(unittest.TestCase):
+    def inspect(self, fixture, fields=('value',)):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'input.btf'
+            raw = fixture.blob()
+            path.write_bytes(raw)
+            result = reader.inspect_scalar_fields(path, 'Root', fields)
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertEqual(result['source']['sha256'], hashlib.sha256(raw).hexdigest())
+            self.assertFalse(result['runtime_ABI_verified'])
+            return result
+
+    def run_cli(self, fixture, *options):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'input.btf'
+            path.write_bytes(fixture.blob())
+            return subprocess.run([sys.executable, '-B', str(HERE / 'inspect_btf_prototypes.py'),
+                                   '--btf', str(path), *options], capture_output=True, timeout=10)
+
+    def test_nested_offsets_and_qualifier_ids(self):
+        f = LayoutFixture()
+        small, wide = f.integer(4), f.integer()
+        alias = f.add(8, wide, 'Counter')
+        const = f.add(10, alias)
+        inner = f.structure('Inner', 16, [('pad', small, 0), ('count', const, 64)])
+        f.structure('Root', 24, [('kind', small, 0), ('nested', inner, 64)])
+        report = self.inspect(f, ['nested.count', 'kind'])
+        count, kind = report['scalar_fields']
+        self.assertEqual((count['path'], count['byte_offset'], count['bytes']), ('nested.count', 16, 8))
+        self.assertEqual(count['integer'], {'encoding_flags': 0, 'bit_offset': 0, 'bits': 64})
+        self.assertEqual([t['ID'] for t in count['steps'][1]['qualifiers']], [const, alias, wide])
+        self.assertEqual((kind['byte_offset'], kind['bytes']), (0, 4))
+
+    def test_full_integer_widths_and_encoding_flags(self):
+        for size, flags in ((1, 0), (2, 1), (4, 0), (8, 1), (1, 2), (1, 4)):
+            with self.subTest(size=size, flags=flags):
+                f = LayoutFixture()
+                value = f.integer(size, (flags << 24) | size * 8)
+                f.structure('Root', size, [('value', value, 0)])
+                report = self.inspect(f)['scalar_fields'][0]
+                self.assertEqual((report['bytes'], report['integer']['encoding_flags']), (size, flags))
+
+    def test_kind_flag_normal_member_is_not_a_bitfield(self):
+        f = LayoutFixture()
+        value = f.integer()
+        f.structure('Root', 16, [('bits', value, 3 << 24), ('value', value, 64)], kflag=True)
+        self.assertEqual(self.inspect(f)['scalar_fields'][0]['byte_offset'], 8)
+        with self.assertRaisesRegex(ValueError, 'non_bitfield'):
+            self.inspect(f, ['bits'])
+
+    def test_legacy_integer_bitfields_are_rejected(self):
+        for encoding in (7, (1 << 16) | 8):
+            f = LayoutFixture()
+            value = f.integer(4, encoding)
+            f.structure('Root', 4, [('value', value, 0)])
+            with self.assertRaisesRegex(ValueError, 'complete_byte_scalar'):
+                self.inspect(f)
+
+    def test_unsupported_and_reserved_integer_encodings(self):
+        for encoding in ((3 << 24) | 32, (8 << 24) | 32, (1 << 31) | 32, (1 << 8) | 32):
+            f = LayoutFixture()
+            value = f.integer(4, encoding)
+            f.structure('Root', 4, [('value', value, 0)])
+            with self.assertRaisesRegex(ValueError, 'supported_integer_encoding'):
+                self.inspect(f)
+
+    def test_integer_headers_and_unsupported_width(self):
+        for kwargs in ({'count': 1}, {'kflag': True}, {'size': 16}):
+            f = LayoutFixture()
+            value = f.integer(**kwargs)
+            f.structure('Root', 16, [('value', value, 0)])
+            with self.assertRaises(ValueError):
+                self.inspect(f)
+
+    def test_unaligned_and_out_of_container_members(self):
+        for offset in (1, 8, 64):
+            f = LayoutFixture()
+            value = f.integer()
+            f.structure('Root', 8, [('value', value, offset)])
+            with self.assertRaises(ValueError):
+                self.inspect(f)
+
+    def test_nested_container_extent_is_checked(self):
+        f = LayoutFixture()
+        value = f.integer()
+        inner = f.structure('Inner', 16, [('value', value, 0)])
+        f.structure('Root', 8, [('nested', inner, 0)])
+        with self.assertRaisesRegex(ValueError, 'span_within'):
+            self.inspect(f, ['nested.value'])
+
+    def test_pointer_and_non_integer_leaves_are_not_sized(self):
+        for kind in (2, 3, 5, 7):
+            f = LayoutFixture()
+            value = f.integer()
+            payload = struct.pack('<III', value, value, 1) if kind == 3 else b''
+            leaf = f.add(kind, value if kind == 2 else 0, payload=payload)
+            f.structure('Root', 16, [('value', leaf, 0)])
+            with self.assertRaisesRegex(ValueError, 'actual_scalar_integer'):
+                self.inspect(f)
+
+    def test_paths_never_cross_pointers(self):
+        f = LayoutFixture()
+        value = f.integer()
+        inner = f.structure('Inner', 8, [('value', value, 0)])
+        pointer = f.add(2, inner)
+        f.structure('Root', 8, [('pointer', pointer, 0)])
+        with self.assertRaisesRegex(ValueError, 'cannot_cross_pointer'):
+            self.inspect(f, ['pointer.value'])
+
+    def test_by_value_cycles_are_rejected(self):
+        f = LayoutFixture()
+        value = f.integer()
+        f.structure('Root', 8, [('value', value, 0), ('self', 2, 0)])
+        with self.assertRaisesRegex(ValueError, 'acyclic_struct'):
+            self.inspect(f, ['self.value'])
+
+    def test_missing_type_and_qualifier_cycles_are_not_defaulted(self):
+        for target in (0, 999, 1):
+            f = LayoutFixture()
+            alias = f.add(8, target, 'Alias')
+            f.structure('Root', 8, [('value', alias, 0)])
+            with self.assertRaises(ValueError):
+                self.inspect(f)
+
+    def test_missing_or_duplicate_member(self):
+        for names in (['other'], ['value', 'value']):
+            f = LayoutFixture()
+            value = f.integer()
+            f.structure('Root', 8, [(n, value, 0) for n in names])
+            with self.assertRaisesRegex(ValueError, 'unique_actual_named_struct_member'):
+                self.inspect(f)
+
+    def test_duplicate_root_and_invalid_member_name_offset(self):
+        f = LayoutFixture()
+        value = f.integer()
+        f.structure('Root', 8, [('value', value, 0)])
+        f.structure('Root', 8, [('value', value, 0)])
+        with self.assertRaisesRegex(ValueError, 'unique_actual_named_type'):
+            self.inspect(f)
+        f = LayoutFixture()
+        value = f.integer()
+        f.add(4, 8, 'Root', struct.pack('<III', 9999, value, 0), count=1)
+        with self.assertRaisesRegex(ValueError, 'string_offset'):
+            self.inspect(f)
+
+    def test_selector_bounds_are_checked_before_source_io(self):
+        for fields in ([], ['value', 'value'], [''], ['a..b'], ['a[0]'], ['a'] * 17,
+                       ['.'.join(['a'] * 33)], [None], 'value'):
+            with self.subTest(fields=fields):
+                with self.assertRaisesRegex(ValueError, 'member_paths_required'):
+                    reader.inspect_scalar_fields('missing', 'Root', fields)
+        for name in ('', None, 'Root\0'):
+            with self.assertRaisesRegex(ValueError, 'struct_name_required'):
+                reader.inspect_scalar_fields('missing', name, ['value'])
+
+    def test_full_path_count_and_depth_boundaries(self):
+        f = LayoutFixture()
+        value = f.integer(1)
+        fields = ['field_' + str(i) for i in range(16)]
+        f.structure('Root', 16, [(name, value, i * 8) for i, name in enumerate(fields)])
+        report = self.inspect(f, list(reversed(fields)))
+        self.assertEqual([r['path'] for r in report['scalar_fields']], list(reversed(fields)))
+        f = LayoutFixture()
+        value = f.integer(1)
+        for i in range(32):
+            value = f.structure('Root' if i == 31 else 'Level_' + str(i), 1, [('next', value, 0)])
+        field = self.inspect(f, ['.'.join(['next'] * 32)])['scalar_fields'][0]
+        self.assertEqual((len(field['steps']), field['byte_offset'], field['bytes']), (32, 0, 1))
+
+    def test_qualifier_record_boundary(self):
+        for aliases in (31, 32):
+            f = LayoutFixture()
+            value = f.integer()
+            for i in range(aliases):
+                value = f.add(8, value, 'Alias_' + str(i))
+            f.structure('Root', 8, [('value', value, 0)])
+            if aliases == 31:
+                field = self.inspect(f)['scalar_fields'][0]
+                self.assertEqual(len(field['steps'][0]['qualifiers']), 32)
+            else:
+                with self.assertRaisesRegex(ValueError, 'qualifier_chain'):
+                    self.inspect(f)
+
+    def test_cli_success_and_later_failure_has_no_partial_json(self):
+        f = LayoutFixture()
+        value = f.integer()
+        f.structure('Root', 8, [('value', value, 0)])
+        result = self.run_cli(f, '--struct', 'Root', '--field', 'value')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertFalse(report['runtime_ABI_verified'])
+        self.assertEqual(report['scalar_fields'][0]['byte_offset'], 0)
+        failed = self.run_cli(f, '--struct', 'Root', '--field', 'value', '--field', 'missing')
+        self.assertEqual((failed.returncode, failed.stdout), (2, b''))
+
+    def test_cli_modes_and_incomplete_selection_are_rejected(self):
+        f = LayoutFixture()
+        for args in (['--struct', 'Root'], ['--field', 'value'], ['--struct', ''],
+                     ['--function', 'demo', '--field', 'value'],
+                     ['--struct', 'Root', '--field', 'value', '--function', 'demo']):
+            result = self.run_cli(f, *args)
+            self.assertEqual((result.returncode, result.stdout), (2, b''))
+
+
 class VoidBoundaryTests(unittest.TestCase):
     def test_scalar_and_existing_pointer_declarations_are_retained(self):
         result = reader._BTF(function([integer(), typ(2, 1)], 1, [2])).prototype("demo")
@@ -345,7 +579,88 @@ class NativeCaptureTests(unittest.TestCase):
             bounded_reference_command([sys.executable, "-c", "import threading; threading.Event().wait()"], timeout=0.1)
 
 
-def native_reference(path):
+def native_scalar_reference(path, records, layout_reference, original):
+    """Use bpftool's member records and a compiler's offsets, not the BTF reader."""
+    def number(record, field):
+        value = re.search(r'\b' + field + r'=(\d+)', record['extra'])
+        if not value:
+            raise ValueError('missing_native_' + field)
+        return int(value.group(1))
+
+    def unwrap(ident):
+        chain = []
+        while True:
+            if ident in chain or len(chain) >= 32:
+                raise ValueError('native_field_qualifier_cycle_or_bound')
+            chain.append(ident)
+            value = records[ident]
+            if value['kind'] not in ('TYPEDEF', 'CONST', 'VOLATILE', 'RESTRICT', 'TYPE_TAG'):
+                return ident, value, chain
+            ident = number(value, 'type_id')
+
+    with Path(layout_reference).open('rb') as source:
+        raw = source.read(65537)
+    if len(raw) > 65536:
+        raise ValueError('compiler_layout_reference_bound')
+    compiler = json.loads(raw)
+    expected_members = {'rustfs_btf_layout': ['kind', 'nested.count', 'flags', 'slot'],
+                        'rustfs_btf_packed': ['value']}
+    if set(compiler) != set(expected_members):
+        raise ValueError('compiler_layout_membership')
+    for name, fields in expected_members.items():
+        roots = [(ident, record) for ident, record in records.items()
+                 if record['kind'] == 'STRUCT' and record['name'] == name]
+        if len(roots) != 1 or list(compiler[name]['fields']) != fields:
+            raise ValueError('unique_native_struct_and_compiler_fields')
+        root_id, root = roots[0]
+        command = [sys.executable, '-B', str(HERE / 'inspect_btf_prototypes.py'),
+                   '--btf', str(path), '--struct', name]
+        for field in fields:
+            command.extend(['--field', field])
+        result = bounded_reference_command(command)
+        report = json.loads(result)
+        if (report['source']['sha256'] != hashlib.sha256(original).hexdigest()
+                or report['source']['bytes'] != len(original)
+                or report['runtime_ABI_verified'] is not False or report['struct']['ID'] != root_id
+                or report['struct']['size_or_type'] != compiler[name]['size']
+                or compiler[name]['size'] != number(root, 'size')
+                or [row['path'] for row in report['scalar_fields']] != fields):
+            raise ValueError('native_scalar_root_or_membership')
+        for actual in report['scalar_fields']:
+            current, current_id, absolute = root, root_id, 0
+            if len(actual['steps']) != len(actual['path'].split('.')):
+                raise ValueError('native_scalar_step_count')
+            for step, member_name in zip(actual['steps'], actual['path'].split('.')):
+                matches = [row for row in current['members'] if row[0] == member_name]
+                if len(matches) != 1:
+                    raise ValueError('unique_native_scalar_member')
+                _, ty, offset, bits = matches[0]
+                leaf_id, leaf, chain = unwrap(ty)
+                if (bits or offset % 8 or step['container_ID'] != current_id
+                        or step['member'] != member_name or step['member_type_ID'] != ty
+                        or step['member_bit_offset'] != offset
+                        or [r['ID'] for r in step['qualifiers']] != chain):
+                    raise ValueError('native_scalar_member_or_chain')
+                absolute += offset
+                current, current_id = leaf, leaf_id
+            if leaf['kind'] != 'INT' or actual['leaf']['ID'] != leaf_id:
+                raise ValueError('native_scalar_leaf')
+            encoding = re.search(r'\bencoding=(\S+)', leaf['extra']).group(1)
+            flags = {'(none)': 0, 'SIGNED': 1, 'CHAR': 2, 'BOOL': 4}[encoding]
+            expected = [absolute // 8, number(leaf, 'size')]
+            if ([actual['byte_offset'], actual['bytes']] != expected
+                    or compiler[name]['fields'][actual['path']] != expected
+                    or actual['integer'] != {'encoding_flags': flags,
+                                             'bit_offset': number(leaf, 'bits_offset'),
+                                             'bits': number(leaf, 'nr_bits')}):
+                raise ValueError('native_scalar_layout_or_payload')
+    with Path(path).open('rb') as source:
+        if source.read(65537) != original:
+            raise ValueError('native_scalar_source_changed')
+    print('Validated scalar layouts against bpftool and independent compiler offsetof/sizeof')
+
+
+def native_reference(path, layout_reference=None):
     """Compare a small compiler-produced fixture with bpftool, not this decoder."""
     path = Path(path)
     with path.open("rb") as source:
@@ -359,13 +674,19 @@ def native_reference(path):
         match = re.fullmatch(r"\[(\d+)\] (\w+) '(.*)'(?: (.*))?", line)
         if match:
             ident, kind, name, extra = match.groups()
-            current = {"kind": kind, "name": name, "extra": extra or "", "args": []}
+            current = {"kind": kind, "name": name, "extra": extra or "", "args": [], "members": []}
             records[int(ident)] = current
         elif current is not None and current["kind"] == "FUNC_PROTO":
             argument = re.fullmatch(r"\s*'(.*)' type_id=(\d+)", line)
             if not argument:
                 raise ValueError("unexpected_native_prototype_row")
             current["args"].append((argument.group(1), int(argument.group(2))))
+        elif current is not None and current['kind'] == 'STRUCT':
+            member = re.fullmatch(r"\s*'(.*)' type_id=(\d+) bits_offset=(\d+)(?: bitfield_size=(\d+))?", line)
+            if not member:
+                raise ValueError('unexpected_native_struct_member_row')
+            field, ty, offset, bits = member.groups()
+            current['members'].append((field, int(ty), int(offset), int(bits or 0)))
     names = ["rustfs_btf_probe", "rustfs_btf_void"]
     command = [sys.executable, "-B", str(HERE / "inspect_btf_prototypes.py"), "--btf", str(path)]
     for name in names:
@@ -445,10 +766,14 @@ def native_reference(path):
                     if int(re.search(r"\btype_id=(\d+)", record["extra"]).group(1)) != qualifier["size_or_type"]:
                         raise ValueError("native_reference_qualifier_mismatch")
     print("Validated both compiler-produced prototypes against independent bpftool output")
+    if layout_reference is not None:
+        native_scalar_reference(path, records, layout_reference, raw)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "--native-reference":
-        native_reference(sys.argv[2])
+    if len(sys.argv) in (3, 5) and sys.argv[1] == "--native-reference":
+        if len(sys.argv) == 5 and sys.argv[3] != '--layout-reference':
+            raise ValueError('expected_layout_reference')
+        native_reference(sys.argv[2], sys.argv[4] if len(sys.argv) == 5 else None)
     else:
         unittest.main()
