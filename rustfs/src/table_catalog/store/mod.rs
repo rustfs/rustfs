@@ -2165,7 +2165,7 @@ where
         }
     }
 
-    pub(crate) async fn create_durable_catalog_backup(
+    pub(crate) async fn create_catalog_backup(
         &self,
         table_bucket: &str,
         expected_snapshot_etag: Option<&str>,
@@ -2180,7 +2180,7 @@ where
         }
     }
 
-    pub(crate) async fn restore_durable_catalog_backup(
+    pub(crate) async fn restore_catalog_backup(
         &self,
         table_bucket: &str,
         backup_id: &str,

@@ -156,7 +156,7 @@ impl Operation for CreateTableCatalogBackupHandler {
         let store = table_catalog_store_from_extensions(&req.extensions)?;
         let started = Instant::now();
         let result = store
-            .create_durable_catalog_backup(&warehouse, request.expected_snapshot_etag.as_deref())
+            .create_catalog_backup(&warehouse, request.expected_snapshot_etag.as_deref())
             .await
             .map_err(catalog_store_error);
         record_table_catalog_admin_operation_result("catalog-backup", &warehouse, "", "", started, &result);
@@ -178,7 +178,7 @@ impl Operation for RestoreTableCatalogBackupHandler {
         let store = table_catalog_store_from_extensions(&req.extensions)?;
         let started = Instant::now();
         let result = store
-            .restore_durable_catalog_backup(
+            .restore_catalog_backup(
                 &warehouse,
                 &request.backup_id,
                 request.expected_snapshot_etag.as_deref(),
