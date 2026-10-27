@@ -196,7 +196,6 @@ async fn receipt_requires_independent_deep_verification() {
                 &object,
                 None,
                 &HealOpts {
-                    no_lock: true,
                     scan_mode: HealScanMode::Normal,
                     ..Default::default()
                 },
@@ -209,13 +208,19 @@ async fn receipt_requires_independent_deep_verification() {
             HealObjectDisposition::MetadataHealthy,
             "a presence scan must not be promoted to payload VerifiedHealthy"
         );
+        assert!(
+            normal_receipt
+                .resolved_data_dir
+                .is_some_and(|generation| !generation.is_nil()),
+            "the Normal scan must have a locked, selected generation"
+        );
+        assert!(!normal_receipt.payload_integrity_verified);
         let result = storage
             .heal_object_with_receipt(
                 bucket,
                 &object,
                 None,
                 &HealOpts {
-                    no_lock: true,
                     scan_mode: HealScanMode::Deep,
                     ..Default::default()
                 },
@@ -224,10 +229,31 @@ async fn receipt_requires_independent_deep_verification() {
         if corrupt_count == 1 {
             let result = result.expect("recoverable repair");
             assert!(result.error.is_none());
+            let receipt = result.receipt.expect("verified repair receipt");
             assert_eq!(
-                result.receipt.expect("verified repair receipt").disposition,
+                receipt.disposition,
                 HealObjectDisposition::Repaired,
                 "presence alone must not produce VerifiedHealthy"
+            );
+            assert!(receipt.payload_integrity_verified, "Deep repair verified the protected payload");
+            let unowned = storage
+                .heal_object_with_receipt(
+                    bucket,
+                    &object,
+                    None,
+                    &HealOpts {
+                        no_lock: true,
+                        scan_mode: HealScanMode::Deep,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("unowned Deep inspection");
+            assert!(unowned.item.integrity_verified, "the storage scan did read the payload");
+            assert!(unowned.item.resolved_data_dir.is_none(), "no namespace owner was retained");
+            assert!(
+                !unowned.receipt.expect("unowned result receipt").payload_integrity_verified,
+                "an unowned scan cannot be published as payload proof"
             );
         } else if let Ok(result) = result {
             assert!(result.error.is_some(), "below quorum cannot be a success");
@@ -357,6 +383,10 @@ fn admin_pool_set_repairs_five_shards_and_retains_exact_terminal_after_restart()
                             .find(|receipt| receipt.identity.bucket == *bucket && receipt.identity.object == *object)
                             .expect("one receipt per exact fault");
                         assert_eq!(receipt.disposition, HealObjectDisposition::Repaired);
+                        assert!(
+                            !receipt.payload_integrity_verified,
+                            "erasure-set checkpoint outcomes do not retain local payload proof"
+                        );
                         assert_eq!((receipt.identity.pool_index, receipt.identity.set_index), (Some(0), Some(0)));
                         assert!(receipt.identity.version_id.is_some());
                         assert_eq!(
@@ -528,6 +558,7 @@ fn admin_normal_protected_repairs_report_repaired_for_data_and_parity() {
                             .find(|receipt| receipt.identity.bucket == bucket && receipt.identity.object == *object)
                             .expect("one receipt per repaired object");
                         assert_eq!(receipt.disposition, HealObjectDisposition::Repaired);
+                        assert!(!receipt.payload_integrity_verified, "Normal repair has no Deep payload proof");
                         assert_eq!((receipt.identity.pool_index, receipt.identity.set_index), (Some(0), Some(0)));
                         assert!(receipt.identity.version_id.is_some());
                         assert_eq!(

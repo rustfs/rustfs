@@ -1603,7 +1603,7 @@ impl FolderScanner {
         let candidate_type = pending_scanner_heal_candidate_type(kind);
         let priority = request.priority;
         let scan_mode = request.scan_mode.unwrap_or(self.scan_mode);
-        let result = match send_scanner_heal_request(candidate_type, request).await {
+        let result = match send_scanner_heal_request(candidate_type, request, None).await {
             Ok(result) => result,
             Err(err) => {
                 self.update_pending_scanner_heal_after_admission(

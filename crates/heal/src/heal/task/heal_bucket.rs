@@ -852,6 +852,8 @@ impl HealTask {
                                     }
                                 };
                                 self.outcome.write().await.record(HealObjectOutcome {
+                                    payload_integrity_verified: false,
+                                    resolved_data_dir: None,
                                     identity,
                                     disposition,
                                     detail: None,
@@ -970,6 +972,8 @@ impl HealTask {
 
                     if !recorded_authoritative_outcome {
                         self.outcome.write().await.record(HealObjectOutcome {
+                            payload_integrity_verified: false,
+                            resolved_data_dir: None,
                             identity,
                             disposition,
                             detail,
@@ -1005,6 +1009,8 @@ impl HealTask {
                 // No detached sleepers survive abort.
                 for item in deferred.objects.into_iter().chain(inline_retry) {
                     self.outcome.write().await.record(HealObjectOutcome {
+                        payload_integrity_verified: false,
+                        resolved_data_dir: None,
                         identity: self.outcome_identity(
                             bucket,
                             &item.name,
