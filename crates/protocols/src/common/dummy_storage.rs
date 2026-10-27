@@ -254,6 +254,7 @@ impl Inner {
 pub struct DummyBackend {
     inner: Arc<Mutex<Inner>>,
     deny_authorization: bool,
+    stall_authorization: bool,
 }
 
 // Drivers whose trait bounds require `Debug` (for example FtpsDriver) cannot be
@@ -278,6 +279,7 @@ impl DummyBackend {
         Self {
             inner: Arc::new(Mutex::new(Inner::new())),
             deny_authorization: false,
+            stall_authorization: false,
         }
     }
 
@@ -291,6 +293,13 @@ impl DummyBackend {
 
     pub fn deny_authorization(mut self) -> Self {
         self.deny_authorization = true;
+        self
+    }
+
+    /// Make every authorize_operation await std::future::pending, so a
+    /// caller's authorization deadline elapses instead of an allow or deny.
+    pub fn stall_authorization(mut self) -> Self {
+        self.stall_authorization = true;
         self
     }
 
@@ -695,6 +704,9 @@ impl StorageBackend for DummyBackend {
         if self.deny_authorization {
             return Err(crate::common::gateway::AuthorizationError::AccessDenied);
         }
+        if self.stall_authorization {
+            std::future::pending::<()>().await;
+        }
         crate::common::gateway::authorize_operation(session, action, bucket, object).await
     }
 
@@ -858,10 +870,14 @@ impl StorageBackend for DummyBackend {
         let _ = session_context;
         let mut inner = self.inner.lock().expect("lock");
         inner.last_session_list_context = Some((request_headers.clone(), secure_transport));
-        inner
-            .session_list_buckets
-            .pop_front()
-            .unwrap_or_else(|| Ok(ListBucketsOutput::default()))
+        // Fail closed when nothing is queued, like the trait default for
+        // backends without session-aware listing.
+        inner.session_list_buckets.pop_front().unwrap_or_else(|| {
+            Err(s3s::S3Error::with_message(
+                s3s::S3ErrorCode::AccessDenied,
+                "Session-aware bucket listing is not supported",
+            ))
+        })
     }
 
     /// Capacity reporting is opt-in; an empty queue models a backend without

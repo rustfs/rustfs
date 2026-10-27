@@ -302,9 +302,11 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     }
 
     /// Like authorize, but a policy deny returns Ok(false) instead of
-    /// PermissionDenied and is not logged, for callers that fall back
-    /// to a narrower operation when the action is denied. IamUnavailable
-    /// and the deadline are handled exactly as in authorize.
+    /// PermissionDenied, without the SFTP driver's access_denied warn,
+    /// for callers that fall back to a narrower operation when the
+    /// action is denied. The storage layer may still log the denial.
+    /// IamUnavailable and the deadline are handled exactly as in
+    /// authorize.
     pub(super) async fn is_authorized(&self, action: &S3Action, bucket: &str, key: Option<&str>) -> Result<bool, SftpError> {
         let auth_fut = self.storage.authorize_operation(&self.session_context, action, bucket, key);
         let mut denied = false;

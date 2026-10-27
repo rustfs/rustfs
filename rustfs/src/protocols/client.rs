@@ -652,7 +652,30 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let input = ListBucketsInput::builder().build().map_err(|e| {
             s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build ListBucketsInput: {}", e))
         })?;
-        let request = session_list_buckets_request(input, session_context, request_headers, secure_transport);
+        let context = self.fs.server_ctx().installed_app_context().ok_or_else(|| {
+            s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, "protocol server application context is not initialized")
+        })?;
+        // The session identity is captured at login. Re-check the key as
+        // authorize_protocol_request does for every other operation, so a key
+        // disabled or expired since then stops listing buckets. An invalid key
+        // is an access denial, as in authorize_operation.
+        let (credentials, is_owner) =
+            crate::auth::check_key_valid_with_context("", session_context.access_key(), Some(context.as_ref()))
+                .await
+                .map_err(|e| match e.code() {
+                    s3s::S3ErrorCode::InvalidAccessKeyId => s3s::S3Error::new(s3s::S3ErrorCode::AccessDenied),
+                    _ => e,
+                })?;
+        let mut request = session_list_buckets_request(input, session_context, request_headers, secure_transport);
+        request.credentials = Some(s3s::auth::Credentials {
+            access_key: credentials.access_key.clone(),
+            secret_key: credentials.secret_key.clone().into(),
+        });
+        if let Some(info) = request.extensions.get_mut::<ReqInfo>() {
+            info.cred = Some(credentials);
+            info.is_owner = is_owner;
+        }
+        request.extensions.insert(self.fs.server_ctx().clone());
         self.fs.list_buckets(request).await.map(|response| response.output)
     }
 
@@ -1130,7 +1153,7 @@ mod tests {
         assert!(copied.is_service_account());
     }
 
-    #[cfg(feature = "webdav")]
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
     #[test]
     fn request_extensions_preserve_authenticated_identity_and_source_ip() {
         use std::collections::HashMap;

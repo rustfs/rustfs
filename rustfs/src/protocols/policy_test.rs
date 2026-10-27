@@ -679,3 +679,105 @@ fn protocol_object_creation_operation_preserves_multipart_staging() {
         }
     });
 }
+
+#[cfg(any(feature = "webdav", feature = "sftp"))]
+#[test]
+#[serial_test::serial]
+fn protocol_session_bucket_listing_revalidates_the_session_key() {
+    crate::app::gating_test_env::run_large_stack_test("protocol-session-bucket-listing", || async {
+        let root = Credentials {
+            access_key: "listing-policy-root".into(),
+            secret_key: "listing-policy-root-secret".into(),
+            status: "on".into(),
+            ..Default::default()
+        };
+        let (_temp, context, iam) = protocol_test_context(root).await;
+        let store = context.object_store();
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(context));
+        let backend = crate::init::protocol_storage_client_for_server(slot);
+        for bucket in ["listing-visible", "listing-hidden"] {
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+        }
+        iam.create_user(
+            "listing-parent",
+            &rustfs_madmin::AddOrUpdateUserReq {
+                secret_key: "listing-parent-secret".into(),
+                policy: None,
+                status: rustfs_madmin::AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("create parent user");
+        let allow = json!({"Effect":"Allow", "Action":["s3:ListBucket","s3:GetBucketLocation"],
+            "Resource":"arn:aws:s3:::listing-visible"});
+        iam.set_policy(
+            "listing-policy",
+            decode_policy(json!({"Version":"2012-10-17","Statement":[allow]})).expect("parse listing policy"),
+        )
+        .await
+        .expect("save listing policy");
+        iam.policy_db_set("listing-parent", UserType::Reg, false, "listing-policy")
+            .await
+            .expect("attach listing policy");
+        iam.new_service_account(
+            "listing-parent",
+            None,
+            rustfs_iam::sys::NewServiceAccountOpts {
+                access_key: "listing-service-account".into(),
+                secret_key: "listing-service-account-secret".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create service account");
+        let identity = iam
+            .check_key("listing-service-account")
+            .await
+            .expect("load service account")
+            .0
+            .expect("service account exists");
+        // The identity is captured once, at login, like a protocol session does.
+        let session = SessionContext::new(
+            ProtocolPrincipal::new(Arc::new(identity)),
+            Protocol::Sftp,
+            "127.0.0.1".parse().expect("loopback"),
+        );
+        let list = || backend.list_buckets_for_session(&session, &session.request_headers, session.secure_transport);
+
+        let visible: Vec<_> = list()
+            .await
+            .expect("bucket-scoped listing")
+            .buckets
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|b| b.name)
+            .collect();
+        assert_eq!(visible, ["listing-visible"], "listing is filtered to buckets the principal may list");
+
+        iam.update_service_account(
+            "listing-service-account",
+            rustfs_iam::sys::UpdateServiceAccountOpts {
+                session_policy: None,
+                secret_key: None,
+                name: None,
+                description: None,
+                expiration: None,
+                status: Some("off".into()),
+                parent_user: None,
+                allow_site_replicator_account: false,
+            },
+        )
+        .await
+        .expect("disable service account");
+
+        let after_disable = list().await;
+        assert!(
+            matches!(&after_disable, Err(e) if *e.code() == s3s::S3ErrorCode::AccessDenied),
+            "a key disabled after login must stop listing buckets: {after_disable:?}"
+        );
+    });
+}
