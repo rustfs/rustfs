@@ -39,6 +39,8 @@ pub(crate) use rustfs_ecstore::api::data_usage::{NativeScannerPauseBacklogWriteF
 
 pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys as EcstoreBucketTargetSys;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc as EcstoreLcEventSrc;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::ExpiryState as EcstoreExpiryState;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::{
     apply_expiry_rule as ecstore_apply_expiry_rule, apply_transition_rule as ecstore_apply_transition_rule,
     lifecycle_version_delete_target as ecstore_lifecycle_version_delete_target,
@@ -161,6 +163,8 @@ pub(crate) mod ecstore_diagnostic {
 pub(crate) type EcstoreHealResultItem = <EcstoreStore as storage_contracts::HealOperations>::HealResultItem;
 
 pub(crate) mod owner {
+    #[cfg(test)]
+    pub(crate) use super::EcstoreExpiryState;
     #[cfg(test)]
     pub(crate) use super::ecstore_set_object_store_resolver;
     #[cfg(test)]

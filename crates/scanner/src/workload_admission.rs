@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 
 use rustfs_concurrency::adaptive::{NodeAdmission, NodePermit};
@@ -25,6 +26,12 @@ static SCANNER_NODE_ADMISSION: OnceLock<Arc<NodeAdmission>> = OnceLock::new();
 
 tokio::task_local! {
     static SCANNER_NODE_REQUESTS: ScannerNodeRequestSender;
+    static SCANNER_NODE_OPERATION_CANCEL: CancellationToken;
+}
+
+/// Cancellation for the currently admitted scanner operation, when present.
+pub(crate) fn scanner_node_operation_cancellation() -> Option<CancellationToken> {
+    SCANNER_NODE_OPERATION_CANCEL.try_with(Clone::clone).ok()
 }
 
 pub(crate) struct ScannerNodeRequest {
@@ -58,6 +65,7 @@ pub(crate) async fn with_scanner_node_requests<F: std::future::Future>(
 #[cfg(test)]
 tokio::task_local! {
     pub(crate) static TEST_SCANNER_NODE_ADMISSION: Arc<NodeAdmission>;
+    pub(crate) static TEST_SCANNER_AFTER_NODE_ACQUIRE: Arc<dyn Fn() + Send + Sync>;
 }
 
 /// Install the heal manager's node owner before starting scanner workers.
@@ -85,6 +93,7 @@ pub(crate) async fn run_scanner_node_operation<T, E>(
     let Some(owner) = owner else {
         return Ok(operation.await);
     };
+    let operation = SCANNER_NODE_OPERATION_CANCEL.scope(cancel.clone(), operation);
     if cancel.is_cancelled() {
         return Err(ScannerError::Other("Operation cancelled".to_string()));
     }
@@ -113,8 +122,29 @@ pub(crate) async fn run_scanner_node_operation<T, E>(
             }
         }
     };
-    let result = operation.await;
-    if result.is_ok() {
+    #[cfg(test)]
+    let _ = TEST_SCANNER_AFTER_NODE_ACQUIRE.try_with(|hook| hook());
+    let operation_started = AtomicBool::new(false);
+    tokio::pin!(operation);
+    let observed = std::future::poll_fn(|context| {
+        operation_started.store(true, Ordering::Relaxed);
+        std::future::Future::poll(operation.as_mut(), context)
+    });
+    tokio::pin!(observed);
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            // The node slot belongs to the waiter, not the native operation.
+            drop(permit);
+            if !operation_started.load(Ordering::Relaxed) {
+                return Err(ScannerError::Other("Operation cancelled".to_string()));
+            }
+            // Keep polling the started operation under its existing locks.
+            return Ok(observed.await);
+        }
+        result = &mut observed => result,
+    };
+    if result.is_ok() && !cancel.is_cancelled() {
         permit.complete();
     }
     Ok(result)

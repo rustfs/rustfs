@@ -118,6 +118,106 @@ async fn scanner_node_admission_precancellation_never_polls_storage() {
     assert_eq!(gate.snapshot().active, 0);
 }
 
+#[tokio::test]
+async fn scanner_without_node_admission_preserves_existing_cancellation_scope() {
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let result = run_scanner_node_operation(None, &cancel, async {
+        assert!(crate::workload_admission::scanner_node_operation_cancellation().is_none());
+        Ok::<_, std::io::Error>(())
+    })
+    .await;
+    assert!(matches!(result, Ok(Ok(()))));
+}
+
+#[tokio::test]
+async fn scanner_node_cancellation_after_acquire_does_not_start_operation() {
+    let gate = owner(true);
+    let cancel = CancellationToken::new();
+    let polled = std::cell::Cell::new(false);
+    let hook_cancel = cancel.clone();
+    let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || hook_cancel.cancel());
+    let result = crate::workload_admission::TEST_SCANNER_AFTER_NODE_ACQUIRE
+        .scope(
+            hook,
+            run_scanner_node_operation(Some(&gate), &cancel, async {
+                polled.set(true);
+                Ok::<_, std::io::Error>(())
+            }),
+        )
+        .await;
+    assert!(matches!(result, Err(ScannerError::Other(message)) if message == "Operation cancelled"));
+    assert!(!polled.get());
+    assert_eq!(gate.snapshot().active, 0);
+    assert_eq!(gate.completed(), Some(0));
+}
+
+#[tokio::test]
+async fn scanner_node_cancellation_returns_capacity_without_abandoning_operation() {
+    let gate = owner(true);
+    let cancel = CancellationToken::new();
+    let (finish, completed) = tokio::sync::oneshot::channel();
+    let mut running = Box::pin(run_scanner_node_operation(Some(&gate), &cancel, async move {
+        completed.await.expect("the original operation remains owned");
+        Ok::<_, std::io::Error>(())
+    }));
+
+    assert!(futures::poll!(&mut running).is_pending());
+    assert_eq!(gate.snapshot().active, 1);
+    cancel.cancel();
+    assert!(futures::poll!(&mut running).is_pending());
+    assert_eq!(gate.snapshot().active, 0, "cancellation returns the shared node slot");
+    assert_eq!(gate.completed(), Some(0));
+
+    let other = gate.try_acquire().expect("healthy work can use the released slot");
+    drop(other);
+    finish.send(()).expect("the original operation was not dropped");
+    running
+        .await
+        .expect("admission succeeded")
+        .expect("the original operation completed");
+    assert_eq!(gate.snapshot().active, 0);
+    assert_eq!(gate.completed(), Some(0), "cancelled work is not reported as progress");
+}
+
+#[tokio::test]
+async fn scanner_node_cancellation_wins_when_started_operation_becomes_ready() {
+    let gate = owner(true);
+    let cancel = CancellationToken::new();
+    let (finish, completed) = tokio::sync::oneshot::channel();
+    let mut running = Box::pin(run_scanner_node_operation(Some(&gate), &cancel, async move {
+        completed.await.expect("the original operation remains owned");
+        Ok::<_, std::io::Error>(())
+    }));
+    assert!(futures::poll!(&mut running).is_pending());
+    finish.send(()).expect("the operation is still waiting");
+    cancel.cancel();
+    running
+        .await
+        .expect("admission succeeded")
+        .expect("the original operation completed");
+    assert_eq!(gate.snapshot().active, 0);
+    assert_eq!(gate.completed(), Some(0), "cancellation wins over a simultaneous result");
+}
+
+#[tokio::test]
+async fn scanner_node_cancellation_during_ready_poll_is_not_progress() {
+    let gate = owner(true);
+    let cancel = CancellationToken::new();
+    let operation_cancel = cancel.clone();
+    run_scanner_node_operation(Some(&gate), &cancel, async move {
+        assert!(!crate::workload_admission::scanner_node_operation_cancellation().is_some_and(|token| token.is_cancelled()));
+        operation_cancel.cancel();
+        assert!(crate::workload_admission::scanner_node_operation_cancellation().is_some_and(|token| token.is_cancelled()));
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .expect("admission succeeded")
+    .expect("the original operation completed");
+    assert_eq!(gate.snapshot().active, 0);
+    assert_eq!(gate.completed(), Some(0), "cancellation during the ready poll is not progress");
+}
+
 #[tokio::test(start_paused = true)]
 async fn scanner_node_admission_shrink_keeps_running_unit_and_preserves_errors() {
     let gate = owner(true);
@@ -701,4 +801,507 @@ async fn scanner_node_admission_usage_updates_preserve_totals_across_mid_walk_ha
         receiver.try_recv().is_err(),
         "resumption must retain the original one-minute update throttle"
     );
+}
+
+#[cfg(unix)]
+fn held_read_metadata_fixture() -> Vec<u8> {
+    let old_id = Uuid::new_v4();
+    let mut meta = FileMeta::new();
+    meta.add_version(FileInfo {
+        volume: "bucket".to_string(),
+        name: "object".to_string(),
+        version_id: Some(old_id),
+        transition_status: crate::TRANSITION_COMPLETE.to_string(),
+        transitioned_objname: "remote/object".to_string(),
+        transition_version_id: Some(Uuid::new_v4()),
+        transition_tier: "WARM".to_string(),
+        mod_time: Some(OffsetDateTime::now_utc()),
+        ..Default::default()
+    })
+    .expect("add transitioned version");
+    let mut deleted = FileInfo {
+        volume: "bucket".to_string(),
+        name: "object".to_string(),
+        version_id: Some(old_id),
+        mod_time: Some(OffsetDateTime::now_utc()),
+        ..Default::default()
+    };
+    deleted.set_tier_free_version_id(&Uuid::new_v4().to_string());
+    meta.delete_version(&deleted).expect("create free version");
+    let mut live = FileInfo::new("object", 4, 2);
+    live.volume = "bucket".to_string();
+    live.name = "object".to_string();
+    live.version_id = Some(Uuid::new_v4());
+    live.versioned = true;
+    live.mod_time = Some(OffsetDateTime::now_utc());
+    live.size = 1;
+    meta.add_version(live).expect("add live version");
+    let versions = meta
+        .get_file_info_versions("bucket", "object", false)
+        .expect("fixture versions");
+    assert_eq!(versions.versions.len(), 1);
+    assert_eq!(versions.free_versions.len(), 1);
+    meta.marshal_msg().expect("marshal real metadata fixture")
+}
+
+#[cfg(unix)]
+fn enable_held_read_test(scanner: &mut FolderScanner, node: &Arc<NodeAdmission>, cancel: &CancellationToken) {
+    scanner.node_admission = Some(node.clone());
+    scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest);
+    scanner.budget = ScannerCycleBudget::new_with_progress_tracking(cancel, Default::default());
+    scanner.tier_registry.names = Arc::from(["WARM".to_string()]);
+}
+
+#[cfg(unix)]
+async fn held_read_positive_dispatch_control() {
+    let (mut scanner, root) = build_test_scanner().await;
+    let _root = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    write_test_object_metadata_bytes(&root, "bucket", "object", &held_read_metadata_fixture()).await;
+    let cancel = CancellationToken::new();
+    let node = owner(true);
+    enable_held_read_test(&mut scanner, &node, &cancel);
+    let (tx, mut stages) = tokio::sync::mpsc::unbounded_channel();
+    let mut entry = DataUsageEntry::default();
+    TEST_SIZE_DISPATCH_BOUNDARIES
+        .scope(
+            tx,
+            scanner.scan_folder(
+                cancel,
+                CachedFolder {
+                    name: "bucket".to_string(),
+                    parent: None,
+                    object_heal_prob_div: 1,
+                },
+                &mut entry,
+            ),
+        )
+        .await
+        .expect("uncancelled real metadata scan");
+    assert_eq!(stages.try_recv().expect("actual action boundary"), "apply_actions");
+    assert_eq!(stages.try_recv().expect("actual free-version boundary"), "free_version_dispatch");
+    assert!(stages.try_recv().is_err());
+}
+
+#[cfg(unix)]
+async fn held_read_cancelled_scan(corrupt: bool) {
+    use rustfs_concurrency::adaptive::AdaptiveAdmission;
+    use rustfs_ecstore::api::disk::{LocalPublicationPause, LocalPublicationStage};
+    use std::task::Poll;
+
+    let (mut scanner, root) = build_test_scanner().await;
+    let _root = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    let bytes = if corrupt {
+        b"invalid xl metadata".to_vec()
+    } else {
+        held_read_metadata_fixture()
+    };
+    write_test_object_metadata_bytes(&root, "bucket", "object", &bytes).await;
+    let healthy_path = root.join("healthy-read-probe");
+    tokio::fs::write(&healthy_path, b"ready")
+        .await
+        .expect("write healthy fixture");
+    let node = owner(true);
+    let physical = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one physical unit"), 1);
+    let physical_unit = physical.acquire().await;
+    let cancel = CancellationToken::new();
+    enable_held_read_test(&mut scanner, &node, &cancel);
+    let mut paused = LocalPublicationPause::install(
+        scanner.local_disk.as_ref(),
+        "bucket",
+        "object/xl.meta",
+        LocalPublicationStage::MetadataReadAfterOpen,
+    )
+    .expect("pause opened original metadata in its native worker");
+    let (tx, mut stages) = tokio::sync::mpsc::unbounded_channel();
+    let child_cancel = cancel.clone();
+    let mut original = Box::pin(TEST_SIZE_DISPATCH_BOUNDARIES.scope(
+        tx,
+        rustfs_ecstore::with_background_resource_unit(physical_unit, async move {
+            rustfs_ecstore::with_background_disk_io(child_cancel.clone(), async move {
+                let mut entry = DataUsageEntry::default();
+                let result = scanner
+                    .scan_folder(
+                        child_cancel,
+                        CachedFolder {
+                            name: "bucket".to_string(),
+                            parent: None,
+                            object_heal_prob_div: 1,
+                        },
+                        &mut entry,
+                    )
+                    .await;
+                (result, scanner, entry)
+            })
+            .await
+        }),
+    ));
+    let observation = Duration::from_secs(rustfs_config::DEFAULT_DRIVE_METADATA_TIMEOUT_SECS);
+    let mut early_result = None;
+    let entered = tokio::time::timeout(observation, async {
+        tokio::select! {
+            result = paused.entered() => result.is_ok(),
+            result = original.as_mut() => { early_result = Some(result); false }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    let node_before = node.snapshot().active;
+    let physical_before = physical.snapshot().active;
+    let completed_before = node.completed();
+    cancel.cancel();
+    let after_cancel = if entered {
+        Some(futures::poll!(original.as_mut()))
+    } else {
+        None
+    };
+    let original_pending = matches!(&after_cancel, Some(Poll::Pending));
+    let node_after = node.snapshot().active;
+    let physical_after = physical.snapshot().active;
+    let healthy_cancel = CancellationToken::new();
+    let mut healthy = if entered && original_pending && node_after == 0 {
+        node.update(
+            &mut FeedbackController::new(),
+            Some(FeedbackObservation {
+                generation: 2,
+                max_concurrency: 1,
+                pressure: ResourcePressure::Unknown,
+                completed_units: None,
+            }),
+        );
+        Some(Box::pin(run_scanner_node_operation(
+            Some(&node),
+            &healthy_cancel,
+            tokio::fs::read(&healthy_path),
+        )))
+    } else {
+        None
+    };
+    let mut healthy_result = None;
+    let mut original_during_healthy = None;
+    let healthy_in_time = if let Some(healthy_future) = healthy.as_mut() {
+        tokio::time::timeout(observation, async {
+            tokio::select! {
+                biased;
+                result = original.as_mut() => { original_during_healthy = Some(result); false }
+                result = healthy_future.as_mut() => { healthy_result = Some(result); true }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    } else {
+        false
+    };
+    let completed_after_healthy = node.completed();
+    drop(paused);
+    let captured = match after_cancel {
+        Some(Poll::Ready(result)) => Some(result),
+        _ => early_result.or(original_during_healthy),
+    };
+    let (joined_in_time, (joined, scanner, entry)) = match captured {
+        Some(result) => (true, result),
+        None => match tokio::time::timeout(observation, original.as_mut()).await {
+            Ok(result) => (true, result),
+            Err(_) => (false, original.as_mut().await),
+        },
+    };
+    // A failed observation stays failed, but the same healthy read is still joined.
+    if healthy_result.is_none() {
+        if let Some(healthy_future) = healthy.as_mut() {
+            healthy_result = Some(healthy_future.as_mut().await);
+        }
+    }
+    drop(healthy);
+    // Drop the completed scope before waiting for the native unit's final return.
+    drop(original);
+    let released_in_time = tokio::time::timeout(observation, async {
+        while physical.snapshot().active != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    if !released_in_time {
+        while physical.snapshot().active != 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let mut observed_stages = Vec::new();
+    while let Ok(stage) = stages.try_recv() {
+        observed_stages.push(stage);
+    }
+    assert!(entered, "real xl.meta was opened before cancellation");
+    assert!(completed_before.is_some());
+    assert_eq!(node_before, 1);
+    assert_eq!(physical_before, 1);
+    assert!(original_pending, "the same operation stays pending until release");
+    assert_eq!(node_after, 0, "cancellation immediately returns the node unit");
+    assert_eq!(physical_after, 1, "the original physical scope remains held");
+    assert!(healthy_in_time, "the healthy read completed before the original observation deadline");
+    assert_eq!(
+        healthy_result
+            .expect("node released")
+            .expect("healthy node admitted")
+            .expect("healthy file read"),
+        b"ready"
+    );
+    let expected = completed_before.map(|count| count.saturating_add(1));
+    assert_eq!(completed_after_healthy, expected, "only healthy work completed");
+    assert!(joined_in_time, "the original scan joined inside the original observation bound");
+    assert!(joined.is_err(), "the original scan reports cancellation");
+    assert_eq!(node.completed(), expected, "cancelled work cannot claim node progress");
+    assert_eq!(node.snapshot().active, 0);
+    assert!(released_in_time);
+    assert!(
+        observed_stages.is_empty(),
+        "cancelled metadata cannot enter action or free-version dispatch: {observed_stages:?}"
+    );
+    assert_eq!(entry.failed_objects, 0, "cancellation is not corrupt metadata");
+    assert!(
+        scanner.new_cache.info.failed_objects.is_empty(),
+        "cancellation creates no failed-object record"
+    );
+    assert!(scanner.new_cache.info.pending_heals.is_empty(), "cancellation creates no pending heal");
+    assert!(!scanner.pending_heals_changed, "cancellation cannot change the heal ledger");
+    assert_eq!(
+        scanner.checkpoint_objects, 0,
+        "cancelled read is not published as completed object progress"
+    );
+    assert_eq!(scanner.budget.progress().0, 0, "cancelled object must not enter budget progress");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn cancelled_held_metadata_returns_node_without_dispatch_or_failed_record() {
+    held_read_positive_dispatch_control().await;
+    held_read_cancelled_scan(false).await;
+    held_read_cancelled_scan(true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn held_metadata_native_worker_retains_physical_unit_after_parent_future_drop() {
+    use rustfs_concurrency::adaptive::AdaptiveAdmission;
+    use rustfs_ecstore::api::disk::{LocalPublicationPause, LocalPublicationStage};
+
+    let (scanner, root) = build_test_scanner().await;
+    let _root = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    write_test_object_metadata(&root, "bucket", "object").await;
+    let disk = scanner.local_disk.clone();
+    let mut opened =
+        LocalPublicationPause::install(disk.as_ref(), "bucket", "object/xl.meta", LocalPublicationStage::MetadataReadAfterOpen)
+            .expect("pause the actual opened file");
+    let mut read_finished =
+        LocalPublicationPause::install(disk.as_ref(), "bucket", "object/xl.meta", LocalPublicationStage::MetadataReadAfterRead)
+            .expect("observe the actual native read finishing");
+    let physical = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one physical unit"), 1);
+    let physical_unit = physical.acquire().await;
+    let mut original = Box::pin(rustfs_ecstore::with_background_resource_unit(physical_unit, async move {
+        rustfs_ecstore::with_background_disk_io(CancellationToken::new(), async move {
+            crate::storage_api::EcstoreDiskAPI::read_metadata(disk.as_ref(), "bucket", "object/xl.meta").await
+        })
+        .await
+    }));
+    let observation = Duration::from_secs(rustfs_config::DEFAULT_DRIVE_METADATA_TIMEOUT_SECS);
+    let entered = tokio::time::timeout(observation, async {
+        tokio::select! {
+            result = opened.entered() => result.is_ok(),
+            _ = original.as_mut() => false,
+        }
+    })
+    .await
+    .unwrap_or(false);
+    let physical_before_drop = physical.snapshot().active;
+    // No scanner cache lock is acquired: only the actual disk read and its physical owner exist.
+    drop(original);
+    let physical_after_drop = physical.snapshot().active;
+    drop(opened);
+    let finished = tokio::time::timeout(observation, read_finished.entered())
+        .await
+        .is_ok_and(|result| result.is_ok());
+    let physical_at_native_read_completion = physical.snapshot().active;
+    drop(read_finished);
+    let released_in_time = tokio::time::timeout(observation, async {
+        while physical.snapshot().active != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    if !released_in_time {
+        while physical.snapshot().active != 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    assert!(entered, "the original native worker opened xl.meta");
+    assert_eq!(physical_before_drop, 1);
+    assert_eq!(
+        physical_after_drop, 1,
+        "the native worker retains the unit after its parent future is gone"
+    );
+    assert!(finished, "the same native worker completes its actual read after release");
+    assert_eq!(
+        physical_at_native_read_completion, 1,
+        "the unit stays held through native read completion"
+    );
+    assert!(released_in_time, "native worker exit returns the physical unit");
+}
+
+#[cfg(unix)]
+async fn join_real_heal_scan<F>(
+    mut scan: std::pin::Pin<&mut F>,
+    receiver: &mut rustfs_heal_contracts::heal_channel::HealReceiptReceiver,
+    received: &mut Vec<(String, Option<String>, Option<String>)>,
+) -> Result<(), ScannerError>
+where
+    F: std::future::Future<Output = Result<(), ScannerError>>,
+{
+    loop {
+        tokio::select! {
+            result = scan.as_mut() => return result,
+            Some(command) = receiver.recv() => {
+                let rustfs_heal_contracts::heal_channel::HealReceiptCommand { request, response_tx } = command;
+                received.push((request.bucket.clone(), request.object_prefix.clone(), request.object_version_id.clone()));
+                let _ = response_tx.send(Ok(rustfs_heal_contracts::heal_channel::HealAdmissionReceipt {
+                    result: HealAdmissionResult::Accepted,
+                    task_id: request.id,
+                }));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn real_heal_channel_case(
+    cancel_held_read: bool,
+    receiver: &mut rustfs_heal_contracts::heal_channel::HealReceiptReceiver,
+) -> (bool, bool, Result<(), ScannerError>, Vec<(String, Option<String>, Option<String>)>, Uuid) {
+    use rustfs_ecstore::api::disk::{LocalPublicationPause, LocalPublicationStage};
+    use std::task::Poll;
+
+    let (mut scanner, root) = build_test_scanner().await;
+    let _root = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    let version = Uuid::new_v4();
+    write_test_object_metadata_bytes(&root, "bucket", "object", &metadata_for_object_version("bucket", "object", Some(version)))
+        .await;
+    let cancel = CancellationToken::new();
+    let node = owner(true);
+    enable_held_read_test(&mut scanner, &node, &cancel);
+    scanner.heal_object_select = 1;
+    let mut paused = if cancel_held_read {
+        Some(
+            LocalPublicationPause::install(
+                scanner.local_disk.as_ref(),
+                "bucket",
+                "object/xl.meta",
+                LocalPublicationStage::MetadataReadAfterOpen,
+            )
+            .expect("pause actual metadata open"),
+        )
+    } else {
+        None
+    };
+    let physical = rustfs_concurrency::adaptive::AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
+    let physical_unit = physical.acquire().await;
+    let mut entry = DataUsageEntry::default();
+    let scan = scanner.scan_folder(
+        cancel.clone(),
+        CachedFolder {
+            name: "bucket".to_string(),
+            parent: None,
+            object_heal_prob_div: 1,
+        },
+        &mut entry,
+    );
+    let mut original = Box::pin(rustfs_ecstore::with_background_resource_unit(
+        physical_unit,
+        rustfs_ecstore::with_background_disk_io(cancel.clone(), scan),
+    ));
+    let observation = Duration::from_secs(rustfs_config::DEFAULT_DRIVE_METADATA_TIMEOUT_SECS);
+    let mut early_result = None;
+    let (entered, pending) = if let Some(pause) = paused.as_mut() {
+        let entered = tokio::time::timeout(observation, async {
+            tokio::select! {
+                result = pause.entered() => result.is_ok(),
+                result = original.as_mut() => { early_result = Some(result); false }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        cancel.cancel();
+        let observed = if entered {
+            Some(futures::poll!(original.as_mut()))
+        } else {
+            None
+        };
+        let pending = matches!(&observed, Some(Poll::Pending));
+        if let Some(Poll::Ready(result)) = observed {
+            early_result = Some(result);
+        }
+        (entered, pending)
+    } else {
+        (true, true)
+    };
+    drop(paused);
+    let mut received = Vec::new();
+    let (joined_in_time, result) = match early_result {
+        Some(result) => (false, result),
+        None => {
+            let mut joined = Box::pin(join_real_heal_scan(original.as_mut(), receiver, &mut received));
+            match tokio::time::timeout(observation, joined.as_mut()).await {
+                Ok(result) => (true, result),
+                Err(_) => (false, joined.as_mut().await),
+            }
+        }
+    };
+    drop(original);
+    let physical_in_time = tokio::time::timeout(observation, async {
+        while physical.snapshot().active != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    if !physical_in_time {
+        while physical.snapshot().active != 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    while let Ok(command) = receiver.try_recv() {
+        let rustfs_heal_contracts::heal_channel::HealReceiptCommand { request, response_tx } = command;
+        received.push((request.bucket.clone(), request.object_prefix.clone(), request.object_version_id.clone()));
+        let _ = response_tx.send(Ok(rustfs_heal_contracts::heal_channel::HealAdmissionReceipt {
+            result: HealAdmissionResult::Accepted,
+            task_id: request.id,
+        }));
+    }
+    (entered && pending, joined_in_time && physical_in_time, result, received, version)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn held_read_cancellation_prevents_real_heal_receipt_command() {
+    let (_commands, mut receiver) = rustfs_heal_contracts::heal_channel::init_heal_channels().expect("isolated heal channel");
+    let (positive_observed, positive_joined, positive, positive_requests, version) =
+        real_heal_channel_case(false, &mut receiver).await;
+    let (cancel_observed, cancel_joined, cancelled, cancelled_requests, _) = real_heal_channel_case(true, &mut receiver).await;
+    assert!(positive_observed && positive_joined);
+    assert!(positive.is_ok(), "uncancelled scan completes");
+    assert_eq!(
+        positive_requests,
+        vec![("bucket".to_string(), Some("object".to_string()), Some(version.to_string()))]
+    );
+    assert!(cancel_observed && cancel_joined, "same held original must be cancelled and joined");
+    assert!(cancelled.is_err(), "cancelled scan reports cancellation");
+    assert!(cancelled_requests.is_empty(), "cancelled metadata must not submit an actual heal request");
 }

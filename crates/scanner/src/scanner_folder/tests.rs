@@ -2266,7 +2266,7 @@ async fn test_heal_actions_returns_actual_size_without_inline_heal() {
     };
     let mut size_summary = SizeSummary::default();
 
-    let size = item.heal_actions(&object_info, 123, &mut size_summary).await;
+    let size = item.heal_actions(&object_info, 123, &mut size_summary, None).await;
     assert_eq!(size, 123);
 }
 

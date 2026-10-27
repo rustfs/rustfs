@@ -333,6 +333,8 @@ pub(crate) mod prepared_publication_test_hooks {
         PreparedRename,
         Rename,
         Remove,
+        MetadataReadAfterOpen,
+        MetadataReadAfterRead,
         #[cfg(test)]
         Rollback,
         #[cfg(test)]
@@ -457,6 +459,8 @@ pub enum LocalPublicationStage {
     PreparedRename,
     Rename,
     Remove,
+    MetadataReadAfterOpen,
+    MetadataReadAfterRead,
 }
 
 #[cfg(all(feature = "test-util", not(windows)))]
@@ -469,6 +473,8 @@ impl LocalPublicationPause {
             LocalPublicationStage::PreparedRename => prepared_publication_test_hooks::Stage::PreparedRename,
             LocalPublicationStage::Rename => prepared_publication_test_hooks::Stage::Rename,
             LocalPublicationStage::Remove => prepared_publication_test_hooks::Stage::Remove,
+            LocalPublicationStage::MetadataReadAfterOpen => prepared_publication_test_hooks::Stage::MetadataReadAfterOpen,
+            LocalPublicationStage::MetadataReadAfterRead => prepared_publication_test_hooks::Stage::MetadataReadAfterRead,
         };
         let (entered_tx, entered) = oneshot::channel();
         let (release, release_rx) = std::sync::mpsc::channel::<()>();

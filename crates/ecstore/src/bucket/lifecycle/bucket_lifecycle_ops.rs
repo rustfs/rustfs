@@ -1086,8 +1086,9 @@ impl ExpiryState {
         }))
     }
 
-    #[cfg(test)]
-    fn new_with_unconsumed_worker_channel(capacity: usize) -> Arc<RwLock<Self>> {
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn new_with_unconsumed_worker_channel(capacity: usize) -> Arc<RwLock<Self>> {
         let (tx, rx) = mpsc::channel(capacity);
         Arc::new(RwLock::new(Self {
             tasks_tx: vec![tx],

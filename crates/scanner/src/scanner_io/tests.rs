@@ -46,6 +46,7 @@ use uuid::Uuid;
 
 mod checkpoint_coverage_identity;
 mod collector_lifecycle;
+mod expiry_lock;
 mod listing_window_scope;
 mod node_admission;
 mod partial_bucket_carry;

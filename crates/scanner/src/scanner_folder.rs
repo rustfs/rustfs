@@ -2307,14 +2307,17 @@ impl FolderScanner {
                 };
                 wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, budgeted_bytes)).await?;
 
-                let sz = match run_scanner_node_operation(self.node_admission.as_ref(), &ctx, async {
+                let size_result = run_scanner_node_operation(self.node_admission.as_ref(), &ctx, async {
                     self.object_metadata_visits.increment(1);
                     self.local_disk
                         .get_size_with_tier_names(item.clone(), &self.tier_registry.names)
                         .await
                 })
-                .await?
-                {
+                .await?;
+                if self.node_admission.is_some() && ctx.is_cancelled() {
+                    return Err(ScannerError::Other("Operation cancelled".to_string()));
+                }
+                let sz = match size_result {
                     Ok(sz) => sz,
                     Err(e) => {
                         let failure_action = classify_get_size_failure(&item, &e);
@@ -3478,3 +3481,15 @@ pub(crate) use tests::checkpoint_fixture::run_checkpoint_fixture;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_SIZE_DISPATCH_BOUNDARIES: tokio::sync::mpsc::UnboundedSender<&'static str>;
+}
+
+#[cfg(test)]
+pub(crate) fn observe_test_size_dispatch_boundary(stage: &'static str) -> bool {
+    TEST_SIZE_DISPATCH_BOUNDARIES
+        .try_with(|sender| sender.send(stage).is_ok())
+        .unwrap_or(false)
+}
