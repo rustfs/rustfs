@@ -183,17 +183,7 @@ impl Settlement {
             "insufficient_scan"
         } else {
             match (candidate.identity.as_ref(), completion.object.as_ref()) {
-                (Some(expected), Some(actual)) if expected != &actual.identity => "identity_mismatch",
-                (Some(expected), Some(_))
-                    if expected.bucket_incarnation_id.is_some_and(|id| !id.is_nil())
-                        && expected.pool_index.is_some()
-                        && expected.set_index.is_some()
-                        && expected.version_id.as_ref().is_some_and(|version| !version.is_empty()) =>
-                {
-                    // Even an exact version and VerifiedHealthy do not bind the
-                    // candidate's content and leader epoch with today's contract.
-                    "content_and_leader_unknown"
-                }
+                (Some(expected), Some(actual)) => Self::identity_scope(expected, &actual.identity),
                 _ => "identity_unknown",
             }
         };
@@ -206,6 +196,46 @@ impl Settlement {
             disposition,
             scope,
             mode: candidate.mode,
+        }
+    }
+
+    fn identity_scope(expected: &HealObjectIdentity, actual: &HealObjectIdentity) -> &'static str {
+        let expected_version = expected.version_id.as_deref().filter(|version| !version.is_empty());
+        let actual_version = actual.version_id.as_deref().filter(|version| !version.is_empty());
+        let expected_incarnation = expected.bucket_incarnation_id.filter(|id| !id.is_nil());
+        let actual_incarnation = actual.bucket_incarnation_id.filter(|id| !id.is_nil());
+        if expected.kind != actual.kind
+            || expected.bucket != actual.bucket
+            || expected.object != actual.object
+            || expected_version
+                .zip(actual_version)
+                .is_some_and(|(left, right)| left != right)
+            || expected_incarnation
+                .zip(actual_incarnation)
+                .is_some_and(|(left, right)| left != right)
+            || expected
+                .pool_index
+                .zip(actual.pool_index)
+                .is_some_and(|(left, right)| left != right)
+            || expected
+                .set_index
+                .zip(actual.set_index)
+                .is_some_and(|(left, right)| left != right)
+        {
+            "identity_mismatch"
+        } else if expected_version.is_none()
+            || actual_version.is_none()
+            || expected_incarnation.is_none()
+            || actual_incarnation.is_none()
+            || expected.pool_index.is_none()
+            || actual.pool_index.is_none()
+            || expected.set_index.is_none()
+            || actual.set_index.is_none()
+        {
+            "identity_unknown"
+        } else {
+            // Matching identities still do not bind content and leader epoch.
+            "content_and_leader_unknown"
         }
     }
 
