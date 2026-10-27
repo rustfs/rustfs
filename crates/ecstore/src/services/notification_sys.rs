@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::bucket::lifecycle::tier_last_day_stats::DailyAllTierStats;
+use crate::cluster::rpc::peer_rest_client::{ScannerLeaseConnectionFailure, scanner_publication_lease_error_class};
 use crate::cluster::rpc::{
     PeerRestClient, ScannerDirtyUsageAcknowledgement, ScannerPeerActivity, ScannerPeerDirtyUsageSnapshot,
     ScannerPublicationLease, TierConfigReloadOutcome,
@@ -158,16 +159,132 @@ struct PeerAdminCache {
     last_server_success: Option<SystemTime>,
 }
 
-fn scanner_publication_lease_acquisition_error(host: &str, observational_only: bool, error: Error) -> Error {
+enum ScannerPublicationLeaseFailure {
+    DuplicateTarget {
+        peer: String,
+    },
+    PeerUnavailable {
+        peer: String,
+    },
+    RequestFailed {
+        peer: String,
+        purpose: &'static str,
+        detail: String,
+        reason: Option<&'static str>,
+        reported_reason: Option<&'static str>,
+    },
+}
+
+impl std::fmt::Debug for ScannerPublicationLeaseFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ScannerPublicationLeaseFailure")
+    }
+}
+
+impl std::fmt::Display for ScannerPublicationLeaseFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateTarget { peer } => write!(formatter, "duplicate scanner publication lease target: {peer}"),
+            Self::PeerUnavailable { peer } => write!(formatter, "scanner publication lease peer {peer} is unavailable"),
+            Self::RequestFailed {
+                peer, purpose, detail, ..
+            } => write!(
+                formatter,
+                "scanner publication lease acquisition failed: peer={peer}, purpose={purpose}: {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ScannerPublicationLeaseFailure {}
+
+/// Bounded details from the target that actually failed lease acquisition.
+#[derive(Clone, Copy, Debug)]
+pub struct ScannerPublicationLeaseFailureInfo<'a> {
+    pub peer: Option<&'a str>,
+    pub kind: &'static str,
+    pub reason: Option<&'static str>,
+    pub reported_reason: Option<&'static str>,
+}
+
+fn scanner_publication_lease_target_peer(target: &str) -> Option<&str> {
+    if target.len() > 267 {
+        return None;
+    }
+    let (peer, parse_target) = if let Some(peer) = target.strip_prefix("http://").or_else(|| target.strip_prefix("https://")) {
+        (peer, std::borrow::Cow::Borrowed(target))
+    } else {
+        (target, std::borrow::Cow::Owned(format!("http://{target}")))
+    };
+    if peer.is_empty()
+        || peer.len() > 259
+        || peer.ends_with(':')
+        || !peer
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-_:[]".contains(&byte))
+    {
+        return None;
+    }
+    let parsed = url::Url::parse(&parse_target).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    Some(peer)
+}
+
+/// Return structured lease failure context without parsing remote error text.
+pub fn scanner_publication_lease_failure_info(error: &Error) -> Option<ScannerPublicationLeaseFailureInfo<'_>> {
+    let Error::Io(error) = error else { return None };
+    let failure = error.get_ref()?.downcast_ref::<ScannerPublicationLeaseFailure>()?;
+    let (peer, kind, reason, reported_reason) = match failure {
+        ScannerPublicationLeaseFailure::DuplicateTarget { peer } => (peer, "duplicate_target", None, None),
+        ScannerPublicationLeaseFailure::PeerUnavailable { peer } => (peer, "peer_unavailable", None, None),
+        ScannerPublicationLeaseFailure::RequestFailed {
+            peer,
+            reason,
+            reported_reason,
+            ..
+        } => (peer, "peer_request_failed", *reason, *reported_reason),
+    };
+    let safe_peer = scanner_publication_lease_target_peer(peer);
+    Some(ScannerPublicationLeaseFailureInfo {
+        peer: safe_peer,
+        kind,
+        reason,
+        reported_reason,
+    })
+}
+
+fn scanner_publication_lease_acquisition_error(
+    host: &str,
+    observational_only: bool,
+    error: Error,
+    connection_failure: Option<ScannerLeaseConnectionFailure>,
+) -> Error {
     let purpose = if observational_only {
         "observational"
     } else {
         "authoritative"
     };
     // Retry classification depends on the original error suffix.
-    Error::other(format!(
-        "scanner publication lease acquisition failed: peer={host}, purpose={purpose}: {error}"
-    ))
+    let class = scanner_publication_lease_error_class(&error);
+    Error::other(ScannerPublicationLeaseFailure::RequestFailed {
+        peer: host.to_owned(),
+        purpose,
+        detail: error.to_string(),
+        reason: match connection_failure {
+            Some(ScannerLeaseConnectionFailure::ChannelAcquisitionTimedOut) => Some("channel_acquisition_timed_out"),
+            None => class.reason,
+        },
+        reported_reason: class.reported_reason,
+    })
 }
 
 #[derive(Default)]
@@ -3161,7 +3278,7 @@ impl NotificationSys {
         targets.sort_by(|left, right| left.0.cmp(&right.0));
         for pair in targets.windows(2) {
             if pair[0].0 == pair[1].0 {
-                return Err(Error::other(format!("duplicate scanner publication lease target: {}", pair[0].0)));
+                return Err(Error::other(ScannerPublicationLeaseFailure::DuplicateTarget { peer: pair[0].0.clone() }));
             }
         }
 
@@ -3175,16 +3292,21 @@ impl NotificationSys {
                 .cloned()
             else {
                 let _ = self.release_scanner_publication_leases(grants).await;
-                return Err(Error::other(format!("scanner publication lease peer {host} is unavailable")));
+                return Err(Error::other(ScannerPublicationLeaseFailure::PeerUnavailable { peer: host }));
             };
             match client
-                .acquire_scanner_publication_lease(&session_id, generation, observational_only)
+                .acquire_scanner_publication_lease_with_connection_failure(&session_id, generation, observational_only)
                 .await
             {
                 Ok(lease) => grants.push(ScannerPublicationLeaseGrant { host, lease }),
-                Err(err) => {
+                Err((err, connection_failure)) => {
                     let _ = self.release_scanner_publication_leases(grants).await;
-                    return Err(scanner_publication_lease_acquisition_error(&host, observational_only, err));
+                    return Err(scanner_publication_lease_acquisition_error(
+                        &host,
+                        observational_only,
+                        err,
+                        connection_failure,
+                    ));
                 }
             }
         }
@@ -4185,18 +4307,241 @@ mod tests {
 
     #[test]
     fn scanner_lease_acquisition_error_identifies_peer_and_preserves_retry_suffix() {
+        use crate::cluster::rpc::peer_rest_client::scanner_publication_lease_remote_rejection;
+
         for (observational_only, purpose) in [(false, "authoritative"), (true, "observational")] {
-            let reason = "scanner publication lease is blocked by pending namespace commit";
-            let error = scanner_publication_lease_acquisition_error(
-                "peer-a.example.invalid:9000",
-                observational_only,
-                Error::other(reason),
-            )
-            .to_string();
-            assert!(error.contains("peer-a.example.invalid:9000"), "missing peer: {error}");
-            assert!(error.contains(purpose), "missing purpose: {error}");
-            assert!(error.ends_with(reason), "retry classification must retain the original suffix");
+            let reason = "scanner publication lease capacity is exhausted";
+            let source = scanner_publication_lease_remote_rejection(format!("Io error: {reason}"));
+            let expected = format!(
+                "Io error: scanner publication lease acquisition failed: peer=peer-a.example.invalid:9000, purpose={purpose}: {source}"
+            );
+            let error =
+                scanner_publication_lease_acquisition_error("peer-a.example.invalid:9000", observational_only, source, None);
+            let info = scanner_publication_lease_failure_info(&error).expect("structured failure source");
+            assert_eq!(info.peer, Some("peer-a.example.invalid:9000"));
+            assert_eq!(info.kind, "peer_request_failed");
+            assert_eq!(info.reason, None);
+            assert_eq!(info.reported_reason, Some("capacity_exhausted"));
+            assert_eq!(error.to_string(), expected);
+            assert!(
+                error.to_string().ends_with(reason),
+                "retry classification must retain the original suffix"
+            );
+            let cloned = error.clone();
+            assert_eq!(cloned.to_string(), expected);
+            assert!(
+                scanner_publication_lease_failure_info(&cloned).is_none(),
+                "a cloned generic I/O error must not invent lost structured context"
+            );
         }
+    }
+
+    #[test]
+    fn scanner_lease_failure_info_uses_the_actual_target_and_rejects_unbounded_peers() {
+        for (failure, expected_display, expected_kind) in [
+            (
+                ScannerPublicationLeaseFailure::DuplicateTarget {
+                    peer: "peer-a:9000".to_owned(),
+                },
+                "Io error: duplicate scanner publication lease target: peer-a:9000",
+                "duplicate_target",
+            ),
+            (
+                ScannerPublicationLeaseFailure::PeerUnavailable {
+                    peer: "peer-a:9000".to_owned(),
+                },
+                "Io error: scanner publication lease peer peer-a:9000 is unavailable",
+                "peer_unavailable",
+            ),
+        ] {
+            let error = Error::other(failure);
+            let info = scanner_publication_lease_failure_info(&error).expect("structured failure source");
+            assert_eq!(info.peer, Some("peer-a:9000"));
+            assert_eq!(info.kind, expected_kind);
+            assert_eq!(info.reason, None);
+            assert_eq!(info.reported_reason, None);
+            assert_eq!(error.to_string(), expected_display);
+        }
+
+        let forged =
+            Error::other("scanner publication lease acquisition failed: peer=forged:9000, purpose=authoritative: rejected");
+        assert!(
+            scanner_publication_lease_failure_info(&forged).is_none(),
+            "raw error text must not establish peer identity"
+        );
+        for invalid in [
+            "peer-a:9000\nforged",
+            "user:secret@peer-a:9000",
+            "http://user:secret@peer-a:9000",
+            "http://@peer-a:9000",
+            "http://peer-a:65536",
+            "https://peer-a:bad",
+            "https://peer-a:",
+            "http://[2001:db8::1",
+            "http://[2001:db8::1]:bad",
+            "https://peer-a:9000/path",
+            "https://peer-a:9000?token=secret",
+            "https://peer-a:9000#secret",
+            "https://peer-a%2eexample:9000",
+            "ftp://peer-a:9000",
+            "",
+        ] {
+            let error = scanner_publication_lease_acquisition_error(invalid, false, Error::other("remote-secret"), None);
+            let info = scanner_publication_lease_failure_info(&error).expect("structured failure source");
+            assert_eq!(info.peer, None, "invalid target must not reach logs");
+            assert_eq!(info.reported_reason, None, "unrecognized remote text must not become a reason");
+            assert!(!format!("{error:?}").contains("remote-secret"), "Debug must not expose remote error text");
+        }
+        let oversized = format!("https://{}:9000", "a".repeat(260));
+        let error = scanner_publication_lease_acquisition_error(&oversized, false, Error::other("remote-secret"), None);
+        assert_eq!(scanner_publication_lease_failure_info(&error).and_then(|info| info.peer), None);
+    }
+
+    #[test]
+    fn scanner_lease_failure_info_accepts_real_grid_host_urls() {
+        use crate::cluster::rpc::peer_rest_client::scanner_publication_lease_remote_rejection;
+        use crate::layout::endpoint::Endpoint;
+
+        for (endpoint, expected) in [
+            ("http://peer-a.example:9000/export", "peer-a.example:9000"),
+            ("https://peer-b.example:9443/export", "peer-b.example:9443"),
+            ("http://[2001:db8::1]:9000/export", "[2001:db8::1]:9000"),
+            ("https://peer-c.example/export", "peer-c.example"),
+        ] {
+            let target = Endpoint::try_from(endpoint).expect("valid endpoint").grid_host();
+            let source = scanner_publication_lease_remote_rejection(
+                "Io error: scanner publication lease capacity is exhausted".to_owned(),
+            );
+            let expected_display =
+                format!("Io error: scanner publication lease acquisition failed: peer={target}, purpose=observational: {source}");
+            let error = scanner_publication_lease_acquisition_error(&target, true, source, None);
+            let info = scanner_publication_lease_failure_info(&error).expect("structured failure source");
+            assert_eq!(info.peer, Some(expected));
+            assert_eq!(info.reason, None);
+            assert_eq!(info.reported_reason, Some("capacity_exhausted"));
+            assert_eq!(error.to_string(), expected_display);
+            assert!(error.to_string().ends_with("scanner publication lease capacity is exhausted"));
+        }
+    }
+
+    #[test]
+    fn scanner_lease_failure_info_preserves_typed_connection_failures_without_logging_details() {
+        for (source, reason) in [
+            (Error::RemoteClientUnavailable("remote-secret".to_owned()), "client_unavailable"),
+            (Error::Timeout, "timeout"),
+            (tonic::Status::unavailable("remote-secret").into(), "rpc_unavailable"),
+            (tonic::Status::deadline_exceeded("remote-secret").into(), "rpc_deadline_exceeded"),
+        ] {
+            let expected = format!(
+                "Io error: scanner publication lease acquisition failed: peer=https://peer-a:9000, purpose=authoritative: {source}"
+            );
+            let error = scanner_publication_lease_acquisition_error("https://peer-a:9000", false, source, None);
+            let info = scanner_publication_lease_failure_info(&error).expect("structured failure source");
+            assert_eq!(info.peer, Some("peer-a:9000"));
+            assert_eq!(info.kind, "peer_request_failed");
+            assert_eq!(info.reason, Some(reason));
+            assert_eq!(info.reported_reason, None);
+            assert_eq!(error.to_string(), expected);
+            assert!(!format!("{info:?}").contains("remote-secret"));
+        }
+
+        let spoofed = scanner_publication_lease_acquisition_error(
+            "https://peer-a:9000",
+            false,
+            Error::other("peer returned a different scanner publication lease generation"),
+            None,
+        );
+        let info = scanner_publication_lease_failure_info(&spoofed).expect("structured failure source");
+        assert_eq!(info.reason, None);
+        assert_eq!(info.reported_reason, None);
+    }
+
+    #[test]
+    fn scanner_lease_channel_deadline_preserves_public_error_and_diagnostic() {
+        const CHILD_MARKER: &str = "RUSTFS_TEST_SCANNER_LEASE_CHANNEL_DEADLINE_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            // Isolate the zero deadline from concurrently running tests.
+            let module = module_path!()
+                .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
+                .unwrap_or(module_path!());
+            let name = format!("{module}::scanner_lease_channel_deadline_preserves_public_error_and_diagnostic");
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", &name, "--nocapture"])
+                .env(CHILD_MARKER, "1")
+                .env(rustfs_config::ENV_INTERNODE_CONNECT_TIMEOUT_SECS, "0")
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .env("no_proxy", "127.0.0.1,localhost")
+                .output()
+                .expect("deadline test subprocess");
+            assert!(
+                output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "deadline subprocess failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            // Keep the address unique to this isolated subprocess.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("local listener");
+            let address = listener.local_addr().expect("listener address");
+            let target = format!("https://{address}");
+            let make_client = || {
+                PeerRestClient::new(
+                    XHost {
+                        name: "127.0.0.1".to_owned(),
+                        port: address.port(),
+                        is_port_set: true,
+                    },
+                    target.clone(),
+                )
+            };
+            // Block the real channel cache read so the acquisition deadline
+            // wins independently of OS-specific connection or TLS errors.
+            let cache_read_blocker = rustfs_common::block_connection_cache_reads_for_test().await;
+            let public_error = match make_client().get_client().await {
+                Ok(_) => panic!("a stalled connection must exceed the channel deadline"),
+                Err(error) => error,
+            };
+            assert!(matches!(&public_error, Error::RemoteClientUnavailable(_)));
+            assert!(
+                public_error
+                    .to_string()
+                    .contains("internode channel acquisition deadline elapsed")
+            );
+
+            let mut notification = NotificationSys::new(EndpointServerPools::default()).await;
+            notification.peer_clients.push(Some(make_client()));
+            let lease_error = match notification
+                .acquire_scanner_publication_leases(vec![(target.clone(), "session".into(), 3)])
+                .await
+            {
+                Ok(_) => panic!("a stalled connection cannot grant a lease"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                lease_error.to_string(),
+                format!(
+                    "Io error: scanner publication lease acquisition failed: peer={target}, purpose=authoritative: {public_error}"
+                )
+            );
+            let info = scanner_publication_lease_failure_info(&lease_error).expect("structured lease failure");
+            let expected_peer = address.to_string();
+            assert_eq!(info.peer, Some(expected_peer.as_str()));
+            assert_eq!(info.reason, Some("channel_acquisition_timed_out"));
+            assert_eq!(info.reported_reason, None);
+            assert_eq!(
+                scanner_peer_transport_error_message_is_retryable(&lease_error.to_string()),
+                scanner_peer_transport_error_message_is_retryable(&public_error.to_string())
+            );
+            drop(cache_read_blocker);
+            drop(listener);
+        });
     }
 
     fn ring(total_size: u64) -> LastDayTierStats {
