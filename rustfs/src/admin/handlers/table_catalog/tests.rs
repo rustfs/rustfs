@@ -1680,6 +1680,26 @@ fn enable_table_bucket_response_fences_before_marker_and_catalog_entry() {
 }
 
 #[test]
+fn table_bucket_toggle_handlers_reload_peer_metadata_after_publication() {
+    let src = table_catalog_handler_source();
+    let enable = operation_block(&src, "EnableTableBucketHandler");
+    let disable = operation_block(&src, "DisableTableBucketHandler");
+
+    for (block, response, operation) in [
+        (enable, "enable_table_bucket_response", "enable table bucket"),
+        (disable, "disable_table_bucket_response", "disable table bucket"),
+    ] {
+        let response_offset = block
+            .find(&format!("let response = {response}"))
+            .expect("table bucket toggle should publish local state");
+        let reload = block
+            .find(&format!("notify_table_bucket_metadata_reload(warehouse.clone(), \"{operation}\""))
+            .expect("table bucket toggle should reload peer metadata");
+        assert!(response_offset < reload, "peer reload must follow local publication");
+    }
+}
+
+#[test]
 fn table_commit_publication_acquires_migration_permits_before_publication_lock() {
     let src = table_catalog_handler_source();
     let block = function_block(&src, "async fn begin_bucket_publication");
