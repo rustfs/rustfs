@@ -255,6 +255,8 @@ pub struct DummyBackend {
     inner: Arc<Mutex<Inner>>,
     deny_authorization: bool,
     stall_authorization: bool,
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
+    stall_session_listing: bool,
 }
 
 // Drivers whose trait bounds require `Debug` (for example FtpsDriver) cannot be
@@ -280,6 +282,8 @@ impl DummyBackend {
             inner: Arc::new(Mutex::new(Inner::new())),
             deny_authorization: false,
             stall_authorization: false,
+            #[cfg(any(feature = "webdav", feature = "sftp"))]
+            stall_session_listing: false,
         }
     }
 
@@ -300,6 +304,12 @@ impl DummyBackend {
     /// caller's authorization deadline elapses instead of an allow or deny.
     pub fn stall_authorization(mut self) -> Self {
         self.stall_authorization = true;
+        self
+    }
+
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
+    pub fn stall_session_listing(mut self) -> Self {
+        self.stall_session_listing = true;
         self
     }
 
@@ -868,6 +878,9 @@ impl StorageBackend for DummyBackend {
         secure_transport: bool,
     ) -> s3s::S3Result<ListBucketsOutput> {
         let _ = session_context;
+        if self.stall_session_listing {
+            std::future::pending::<()>().await;
+        }
         let mut inner = self.inner.lock().expect("lock");
         inner.last_session_list_context = Some((request_headers.clone(), secure_transport));
         // Fail closed when nothing is queued, like the trait default for

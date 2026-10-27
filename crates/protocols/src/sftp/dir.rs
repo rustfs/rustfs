@@ -512,7 +512,12 @@ mod tests {
         let backend = Arc::new(DummyBackend::new());
         backend.queue_list_buckets_ok(buckets(&["alpha", "beta"]));
         backend.queue_session_list_buckets_ok(buckets(&["beta"]));
-        let driver = build_driver(backend.clone(), TEST_PART_SIZE);
+        let mut driver = build_driver(backend.clone(), TEST_PART_SIZE);
+        driver
+            .session_context
+            .request_headers
+            .insert("user-agent", http::HeaderValue::from_static("sftp-listing-test"));
+        driver.session_context.secure_transport = false;
 
         let files = with_test_auth_override(deny_list_all_my_buckets, driver.fetch_bucket_list())
             .await
@@ -567,6 +572,18 @@ mod tests {
         assert!(backend.last_session_list_context().is_none(), "a timeout is not a policy deny");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn root_listing_fallback_respects_the_backend_deadline() {
+        let backend = Arc::new(DummyBackend::new().stall_session_listing());
+        let driver = build_driver_with_timeout(backend, TEST_PART_SIZE, 1);
+
+        let err = with_test_auth_override(deny_list_all_my_buckets, driver.fetch_bucket_list())
+            .await
+            .expect_err("session listing deadline");
+
+        assert_eq!(err.0, StatusCode::Failure);
+    }
+
     #[tokio::test]
     async fn root_listing_session_error_other_than_access_denied_is_failure() {
         let backend = Arc::new(DummyBackend::new());
@@ -585,18 +602,18 @@ mod tests {
 
     #[tokio::test]
     async fn root_listing_fallback_is_truncated_at_the_root_listing_limit() {
-        let backend = Arc::new(DummyBackend::new());
-        let many: Vec<String> = (0..=super::ROOT_LISTING_MAX_ENTRIES)
-            .map(|i| format!("bucket-{i:05}"))
-            .collect();
-        backend.queue_session_list_buckets_ok(buckets(&many.iter().map(String::as_str).collect::<Vec<_>>()));
-        let driver = build_driver(backend.clone(), TEST_PART_SIZE);
+        for count in [super::ROOT_LISTING_MAX_ENTRIES, super::ROOT_LISTING_MAX_ENTRIES + 1] {
+            let backend = Arc::new(DummyBackend::new());
+            let many: Vec<String> = (0..count).map(|i| format!("bucket-{i:05}")).collect();
+            backend.queue_session_list_buckets_ok(buckets(&many.iter().map(String::as_str).collect::<Vec<_>>()));
+            let driver = build_driver(backend, TEST_PART_SIZE);
 
-        let files = with_test_auth_override(deny_list_all_my_buckets, driver.fetch_bucket_list())
-            .await
-            .expect("bucket-scoped listing");
+            let files = with_test_auth_override(deny_list_all_my_buckets, driver.fetch_bucket_list())
+                .await
+                .expect("bucket-scoped listing");
 
-        assert_eq!(files.len(), super::ROOT_LISTING_MAX_ENTRIES);
+            assert_eq!(files.len(), super::ROOT_LISTING_MAX_ENTRIES, "bucket count {count}");
+        }
     }
 
     #[tokio::test]
