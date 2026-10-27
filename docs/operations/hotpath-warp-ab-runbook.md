@@ -1,7 +1,7 @@
 # Hotpath warp runbook (A/B gate and ABBA evidence)
 
-**Use this when:** you need S3-face (PutObject / GetObject / mixed) performance evidence for a code change: the nightly relative-budget gate, a quick local A/B, or a formal ABBA run whose numbers will be quoted in a PR.
-**Source of truth:** `scripts/run_hotpath_warp_ab.sh` (quick A/B rig), `scripts/run_hotpath_warp_abba.sh` (ABBA runner; also what CI executes), `scripts/hotpath_warp_ab_gate.sh` (relative-budget gate), `scripts/run_object_batch_bench_enhanced.sh` (warp driver, medians, `baseline_compare.csv`), `.github/workflows/performance-ab.yml` (CI gate).
+**Use this when:** you need S3-face (PutObject / GetObject / mixed) performance evidence for a code change: a quick local A/B, or a formal ABBA run whose numbers will be quoted in a PR.
+**Source of truth:** `scripts/run_hotpath_warp_ab.sh` (quick A/B rig), `scripts/run_hotpath_warp_abba.sh` (ABBA runner), `scripts/hotpath_warp_ab_gate.sh` (relative-budget gate), `scripts/run_object_batch_bench_enhanced.sh` (warp driver, medians, `baseline_compare.csv`).
 
 This runbook compares two binaries. To sweep one `RUSTFS_*` runtime knob at a time against a fixed binary, use [object-io-tuning-ab-matrix.md](object-io-tuning-ab-matrix.md) instead.
 
@@ -10,7 +10,7 @@ Two entry points share one workload matrix, one gate, and one deploy-hook shape:
 | Entry | Script | Legs per cell | Use |
 | --- | --- | --- | --- |
 | Quick A/B | `scripts/run_hotpath_warp_ab.sh` | baseline → candidate | local smoke, fast triage of a suspected regression |
-| ABBA | `scripts/run_hotpath_warp_abba.sh` | A1 baseline → B1 candidate → B2 candidate → A2 baseline | formal evidence; the CI gate |
+| ABBA | `scripts/run_hotpath_warp_abba.sh` | A1 baseline → B1 candidate → B2 candidate → A2 baseline | formal evidence |
 
 This rig is the only entry point for S3-face performance coverage. There is deliberately no in-process criterion benchmark for those operations: a criterion harness that stands up an embedded server measures the harness, not the S3 path. Micro-benchmarks stay at function level (EC encode, `xl.meta` parse, `rename_data`). Knob-level sweeps against a fixed binary are a different question; see [object-io-tuning-ab-matrix.md](object-io-tuning-ab-matrix.md).
 
@@ -163,16 +163,6 @@ After each window confirm the `.json.gz` profile and its `.syms.json` sidecar ar
 
 Instrumented builds (features in `rustfs/Cargo.toml`): `--features hotpath-alloc` for allocation attribution, `--features hotpath-cpu` for CPU hotpath sections. Compare instrumented binaries only with other builds of the same mode; never use them for throughput acceptance, because the instrumentation changes what is measured.
 
-## CI gate (`performance-ab.yml`)
+## Performance gate status
 
-| Aspect | Value |
-| --- | --- |
-| Triggers | `schedule` (nightly cron `31 6 * * *` UTC against `main`) and `workflow_dispatch` (inputs `duration`, default `12s`; `allow_regression`, boolean). No `pull_request` trigger and no label gating. |
-| Jobs | `warp-ab` (runner `sm-standard-2`, `timeout-minutes: 180`); `alert-on-failure` (opens the scheduled-failure issue; scheduled runs only). |
-| Baseline commit | scheduled: head of the last successful scheduled run (falls back to the candidate itself when there is none); dispatch: `origin/main`. The baseline must be an ancestor of the candidate. |
-| Binary cache | `actions/cache` inside `warp-ab`, key `rustfs-baseline-<baseline_sha>`. Miss: source build (same-commit runs build once and reuse the binary for both phases); a run whose gate passes saves the candidate binary under `rustfs-baseline-<candidate_sha>` for the next night. |
-| Command | `scripts/run_hotpath_warp_abba.sh --duration <input> --rounds 3 --cooldown 5 --health-timeout 180 --baseline-revision <sha> --candidate-revision <sha> --baseline-bin ... --candidate-bin ...` |
-| Exemption | `allow_regression=true` on dispatch adds `--allow-regression --exemption-reason "workflow dispatch override"`. |
-| Artifacts | `hotpath-warp-ab-<run_number>` containing `target/hotpath-abba/` (14-day retention); the step summary renders `candidate_gate.md`, or the server-log tails when the rig failed before the gate. The `Enforce gate` step fails the job on a non-zero rig exit. |
-
-The nightly detects a regression within a day of landing; it does not block a merge. For pre-merge evidence run the ABBA procedure above and attach the outputs to the PR.
+There is no scheduled CI performance gate. The ABBA procedure above is the evidence path for performance comparisons; attach its outputs to the PR that claims a performance effect. A scheduled regression gate requires calibrated budgets: on the previous gate's runner, measured drift between identical binaries at the default 12-second rounds exceeded the former 10% fail budget, so the scheduled entry never seeded a baseline (the workflow only ever passed on its pre-removal push trigger). Restore a scheduled gate only after a noise study grounds the budgets on the target runner.

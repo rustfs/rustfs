@@ -21,18 +21,21 @@
 
 use super::super::{
     Arc, DiskError, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, Endpoint, Error, FormatV3, HealChannelPriority, LockResult,
-    NamespaceLock, NamespaceLockWrapper, ObjectKey, Result, SetDisks, StorageError, debug, disk, info, load_format_erasure,
-    send_heal_replacement_disk, warn,
+    NamespaceLock, NamespaceLockWrapper, ObjectKey, Result, SetDisks, StorageError, debug, disk, load_format_erasure, warn,
 };
 use crate::disk::health_state::DriveMembershipSnapshot;
 use crate::disk::{DiskAPI, new_disk};
 use crate::layout::disks_layout::MAX_ERASURE_SET_DRIVE_COUNT;
 use crate::runtime::sources as runtime_sources;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, stream, stream::FuturesUnordered};
 use rand::prelude::SliceRandom;
+use rustfs_heal_contracts::heal_channel::{create_auto_replacement_disks_request, send_heal_request};
 use rustfs_utils::path::object_name_disk_identity;
 #[cfg(test)]
 use uuid::Uuid;
+
+// Bound batching when another reconnect is still pending.
+const REPLACEMENT_BATCH_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
@@ -329,33 +332,82 @@ impl SetDisks {
 
     async fn connect_disks_with_active_monitoring(&self, active_monitoring: bool) {
         let disks = self.get_disks_internal().await;
-        // A slow failed endpoint must not hold back other returning drives.
-        // Keep the fanout within one set and release the inventory lock before I/O.
-        stream::iter(disks.into_iter().enumerate())
-            .for_each_concurrent(MAX_ERASURE_SET_DRIVE_COUNT, |(i, opdisk)| async move {
+        // Reconnect drives concurrently without holding the inventory lock.
+        let mut reconnects = stream::iter(disks.into_iter().enumerate())
+            .map(|(i, opdisk)| async move {
                 if let Some(disk) = opdisk {
                     if !active_monitoring
                         && disk.get_disk_location().set_idx.is_some()
                         && let disk::Disk::Local(local) = disk.as_ref()
                         && local.can_skip_background_probe().await
                     {
-                        return;
+                        return None;
                     }
                     if disk.is_online().await && disk.get_disk_location().set_idx.is_some() {
-                        return;
+                        return None;
                     }
 
                     let _ = disk.close().await;
                 }
 
-                if let Some(endpoint) = self.set_endpoints.get(i) {
-                    self.renew_disk(endpoint).await;
-                }
+                let endpoint = self.set_endpoints.get(i)?;
+                self.reconnect_disk(endpoint).await.then(|| endpoint.to_string())
             })
-            .await;
+            .buffer_unordered(MAX_ERASURE_SET_DRIVE_COUNT);
+        let mut submissions = FuturesUnordered::new();
+        let mut batch = Vec::new();
+        let mut deadline = None;
+        let mut reconnects_done = false;
+        loop {
+            if reconnects_done && submissions.is_empty() {
+                break;
+            }
+            tokio::select! {
+                result = reconnects.next(), if !reconnects_done => match result {
+                    Some(Some(endpoint)) => {
+                        batch.push(endpoint);
+                        deadline.get_or_insert_with(|| tokio::time::Instant::now() + REPLACEMENT_BATCH_WAIT);
+                    }
+                    Some(None) => {}
+                    None => {
+                        reconnects_done = true;
+                        if !batch.is_empty() {
+                            submissions.push(self.submit_replacement_heal(std::mem::take(&mut batch)));
+                        }
+                        deadline = None;
+                    }
+                },
+                _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {
+                    submissions.push(self.submit_replacement_heal(std::mem::take(&mut batch)));
+                    deadline = None;
+                }
+                _ = submissions.next(), if !submissions.is_empty() => {}
+            }
+        }
+    }
+
+    async fn submit_replacement_heal(&self, replacements: Vec<String>) {
+        if replacements.is_empty() {
+            return;
+        }
+        // Queue admission deduplicates by set, so publish ready targets together.
+        let request = create_auto_replacement_disks_request(
+            self.pool_index,
+            self.set_index,
+            replacements,
+            Some(HealChannelPriority::Normal),
+        );
+        let _ = send_heal_request(request).await;
     }
 
     pub async fn renew_disk(&self, ep: &Endpoint) {
+        if self.reconnect_disk(ep).await {
+            self.submit_replacement_heal(vec![ep.to_string()]).await;
+        }
+    }
+
+    /// Return whether this reconnect attached a verified unformatted target.
+    async fn reconnect_disk(&self, ep: &Endpoint) -> bool {
         debug!("renew_disk: start {:?}", ep);
 
         let previous_disk = {
@@ -375,28 +427,17 @@ impl SetDisks {
             Err(e) => {
                 warn!("renew_disk: connect_endpoint err {:?}", &e);
                 if !matches!(e, DiskError::UnformattedDisk | DiskError::Io(_)) {
-                    return;
+                    return false;
                 }
 
                 let attached = match self.attach_unformatted_replacement_disk(ep).await {
                     Ok(attached) => attached,
                     Err(err) => {
                         warn!(endpoint = %ep, error = ?err, "renew_disk: unformatted replacement probe failed");
-                        return;
+                        return false;
                     }
                 };
-                if !attached {
-                    return;
-                }
-
-                info!("renew_disk attached unformatted replacement and will trigger heal_disk, {:?}", ep);
-                let (Ok(pool_index), Ok(set_index)) = (usize::try_from(ep.pool_idx), usize::try_from(ep.set_idx)) else {
-                    warn!("renew_disk: replacement target has invalid pool or set index, {:?}", ep);
-                    return;
-                };
-                let _ =
-                    send_heal_replacement_disk(pool_index, set_index, ep.to_string(), Some(HealChannelPriority::Normal)).await;
-                return;
+                return attached;
             }
         };
 
@@ -404,7 +445,7 @@ impl SetDisks {
             Ok(res) => res,
             Err(e) => {
                 warn!("renew_disk: find_disk_index err {:?}", e);
-                return;
+                return false;
             }
         };
 
@@ -422,7 +463,7 @@ impl SetDisks {
                 expected_set_index = self.set_index,
                 "renew_disk rejected a drive whose endpoint and format do not identify the same topology slot"
             );
-            return;
+            return false;
         }
 
         let _ = new_disk.set_disk_id(Some(fm.erasure.this)).await;
@@ -442,7 +483,7 @@ impl SetDisks {
                 new_disk.enable_health_check();
                 *slot = Some(new_disk);
             }
-            return;
+            return false;
         }
 
         new_disk.enable_health_check();
@@ -464,6 +505,7 @@ impl SetDisks {
 
         let mut disk_lock = self.disks.write().await;
         disk_lock[disk_idx] = Some(new_disk);
+        false
     }
 
     /// Attach a replacement target only after proving that the exact local slot
@@ -1100,6 +1142,162 @@ mod tests {
         );
 
         drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn reconnect_sweep_collects_all_blank_targets_and_excludes_original_disks() {
+        use rustfs_heal_contracts::heal_channel::{HealAdmissionResult, HealChannelCommand, init_heal_channel};
+
+        const CHILD: &str = "RUSTFS_TEST_GROUPED_RECONNECT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // The heal sender is process-global; keep this receiver isolated.
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "set_disk::ops::locking::tests::reconnect_sweep_collects_all_blank_targets_and_excludes_original_disks",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .expect("isolated reconnect test should run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "isolated reconnect test failed: {stdout} {stderr}");
+            assert!(stdout.contains("1 passed"), "child must execute the reconnect test: {stdout}");
+            return;
+        }
+        let mut heal_rx = init_heal_channel().expect("isolated heal receiver");
+        let disk_count = 4;
+        let format = FormatV3::new(1, disk_count);
+        let mut directories = Vec::new();
+        let mut endpoints = Vec::new();
+        let mut disks = Vec::new();
+        for disk_idx in 0..2 {
+            let (directory, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            directories.push(directory);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+        for disk_idx in 2..disk_count {
+            let directory = tempfile::tempdir().expect("replacement directory");
+            let mut endpoint =
+                Endpoint::try_from(directory.path().to_str().expect("UTF-8 replacement path")).expect("replacement endpoint");
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(disk_idx);
+            directories.push(directory);
+            endpoints.push(endpoint);
+            disks.push(None);
+        }
+        let mut ready_targets = endpoints[2..].iter().map(ToString::to_string).collect::<Vec<_>>();
+        ready_targets.sort_unstable();
+        // Disk 1 returns with its format and data; disks 2 and 3 are blank.
+        disks[1]
+            .take()
+            .expect("original disk handle")
+            .close()
+            .await
+            .expect("close original disk");
+        let retained_data = directories[1].path().join("retained-data");
+        tokio::fs::write(&retained_data, b"original data")
+            .await
+            .expect("write original data");
+        let set = Arc::new(
+            SetDisks::new(
+                "reconnect-sweep".to_string(),
+                Arc::new(RwLock::new(disks)),
+                disk_count,
+                2,
+                0,
+                0,
+                endpoints.clone(),
+                format,
+                Vec::new(),
+            )
+            .await,
+        );
+
+        // Block disk 0's format check, then make it a late blank replacement.
+        let slow = set.get_disks_internal().await[0].clone().expect("original disk");
+        assert!(slow.is_online().await, "initialize original disk identity");
+        let disk::Disk::Local(wrapper) = slow.as_ref() else {
+            panic!("fixture must use a local disk");
+        };
+        let slow_local = wrapper.get_disk();
+        let mut slow_format_guard = slow_local.format_info.write().await;
+        slow_format_guard.last_check = None;
+        std::fs::remove_file(
+            directories[0]
+                .path()
+                .join(disk::RUSTFS_META_BUCKET)
+                .join(disk::FORMAT_CONFIG_FILE),
+        )
+        .expect("make the blocked disk a blank replacement");
+        let sweep = tokio::spawn({
+            let set = set.clone();
+            async move { set.connect_disks_with_active_monitoring(true).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let attached = set.get_disks_internal().await;
+                if attached[1..].iter().all(Option::is_some) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("other drives must reconnect while the first drive is blocked");
+        let command = tokio::time::timeout(std::time::Duration::from_secs(10), heal_rx.recv())
+            .await
+            .expect("ready targets must be submitted while a drive is blocked")
+            .expect("heal receiver should remain open");
+        let HealChannelCommand::Start { request, response_tx } = command else {
+            panic!("expected a replacement heal request");
+        };
+        assert_eq!(request.heal_endpoints, ready_targets, "ready blank disks must share one request");
+        assert!(!sweep.is_finished(), "the blocked drive must still be pending");
+        drop(slow_format_guard);
+        // Do not acknowledge the first request yet: a delayed admission
+        // response must not stop the late drive reconnecting and submitting.
+        let late_command = tokio::time::timeout(std::time::Duration::from_secs(10), heal_rx.recv())
+            .await
+            .expect("late target must be submitted while the first response is pending")
+            .expect("heal receiver should remain open");
+        let HealChannelCommand::Start {
+            request: late_request,
+            response_tx: late_response,
+        } = late_command
+        else {
+            panic!("expected a late replacement heal request");
+        };
+        assert_eq!(late_request.heal_endpoints, [endpoints[0].to_string()]);
+        response_tx
+            .send(Ok(HealAdmissionResult::Accepted))
+            .expect("acknowledge ready targets");
+        late_response
+            .send(Ok(HealAdmissionResult::Accepted))
+            .expect("acknowledge late target");
+        sweep.await.expect("reconnect sweep should finish");
+        assert!(heal_rx.try_recv().is_err(), "no duplicate request should be sent");
+        let attached = set.get_disks_internal().await;
+        for (index, disk) in attached.iter().enumerate() {
+            let disk = disk.as_ref().expect("each verified endpoint should be attached");
+            let format = load_format_erasure(disk, false).await;
+            if index == 1 {
+                assert!(format.is_ok(), "original disk must retain its format");
+            } else {
+                assert_eq!(format.expect_err("replacement must remain unformatted"), DiskError::UnformattedDisk);
+                assert!(!disk.health_check_enabled_for_test(), "format must precede replacement health checks");
+            }
+            disk.close().await.expect("close test disk");
+        }
+        assert_eq!(tokio::fs::read(&retained_data).await.expect("read original data"), b"original data");
+        let local_map = runtime_sources::local_disk_map_handle();
+        let mut local_map = local_map.write().await;
+        for endpoint in endpoints {
+            local_map.remove(&endpoint.to_string());
+        }
     }
 
     #[tokio::test]

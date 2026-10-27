@@ -105,6 +105,12 @@ locking, and movement guards still apply. Prefix recovery settles only matching
 keys, including transactions hidden from listings. Dry-run inspects and reports without
 settling transactions.
 
+LIST does not remove historical residue on updated nodes. During a rolling
+upgrade, older nodes can still remove it while serving LIST. A bucket with
+hidden residue can still fail DeleteBucket; recover known keys with an
+unconditional exact-key DELETE, or inspect and remove eligible residue through
+administrator heal.
+
 An unconditional DELETE of a missing exact key, or an administrator heal with
 `remove` enabled, can authorize historical residue removal only when the
 bucket is authoritatively never-versioned and has no Object Lock. Every

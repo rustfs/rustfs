@@ -106,6 +106,7 @@ impl SourceHead {
 }
 
 pub(super) struct LoadedSource {
+    pub root_missing: bool,
     pub state: Option<SourceState>,
     pub head: Option<SourceHead>,
     pub original: Option<Bytes>,
@@ -224,11 +225,31 @@ pub(super) fn read_optional(path: &Path, base: &Path, root: &os::PublicationRoot
         Err(error) => Err(error.into()),
     }
 }
+pub(super) fn read_optional_in_pinned(
+    pinned: &os::ExistingBaseDirectoryGuard,
+    parent: &Path,
+    name: &str,
+    base: &Path,
+    root: &os::PublicationRoot,
+) -> Result<Option<Bytes>> {
+    match os::read_multipart_source_metadata_in_pinned(pinned, parent, std::ffi::OsStr::new(name), base, root) {
+        Ok(bytes) => Ok(Some(Bytes::from(bytes))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
 /// Canonical source mutations are admitted under SourceRW at the syscall,
 /// not on the earlier async caller that may have timed out.
 pub(super) fn validate_source_mutation(source: &Path, base: &Path, root: &os::PublicationRoot, initial: bool) -> Result<()> {
-    let state = read_optional(&source.join(STATE), base, root)?;
-    let head = read_optional(&source.join(STORAGE_FORMAT_FILE), base, root)?;
+    let pinned = match os::pin_multipart_source_directory(source, base, root) {
+        Ok(pinned) => pinned,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return if initial { Ok(()) } else { Err(DiskError::FileNotFound) };
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let state = read_optional_in_pinned(&pinned, source, STATE, base, root)?;
+    let head = read_optional_in_pinned(&pinned, source, STORAGE_FORMAT_FILE, base, root)?;
     let Some(head) = head else {
         return if initial && state.is_none() {
             Ok(())
@@ -348,6 +369,9 @@ impl SourceStore {
         .map_err(DiskError::from)?
     }
     pub async fn persist(&self, state: &SourceState) -> Result<()> {
+        self.persist_with_source_sync(state, false).await
+    }
+    async fn persist_with_source_sync(&self, state: &SourceState, sync_source_before: bool) -> Result<()> {
         state.validate(self.disk_id, &self.path)?;
         let raw = encode(state)?;
         let source = self.source.clone();
@@ -365,6 +389,9 @@ impl SourceStore {
         });
         os::run_blocking_namespace_operation(self.lease.clone(), move || {
             let _pin = os::pin_multipart_source_directory(&source, &base, &root)?;
+            if sync_source_before {
+                os::fsync_dir_std(&source)?;
+            }
             if let Some(path) = terminal {
                 os::replace_multipart_source_metadata(&path, &raw, &base, &root)?;
             }
@@ -373,6 +400,7 @@ impl SourceStore {
         .await
         .map_err(DiskError::from)
     }
+    #[cfg(test)]
     pub async fn original(&self, state: &SourceState) -> Result<Bytes> {
         let path = original_path(&self.source, state.backup_owner);
         let base = self.base.clone();
@@ -490,7 +518,7 @@ impl SourceStore {
         if encode(actual)? != encode(state)? {
             return Err(DiskError::ConditionalDeleteConflict);
         }
-        let raw = self.original(state).await?;
+        let raw = loaded.original.as_ref().ok_or(DiskError::FileCorrupt)?;
         let allowed = match loaded.head.as_ref() {
             None => {
                 state.phase == MultipartSourcePhase::Recovering
@@ -551,7 +579,7 @@ impl SourceStore {
         if !allowed {
             return Err(DiskError::ConditionalDeleteConflict);
         }
-        let mut info = file_info(&raw, RUSTFS_META_MULTIPART_BUCKET, &self.path, state.lineage.original_version_id)?;
+        let mut info = file_info(raw, RUSTFS_META_MULTIPART_BUCKET, &self.path, state.lineage.original_version_id)?;
         strip_native_controls(&mut info.metadata);
         mark_native_source(&mut info);
         set_source_status(
@@ -772,13 +800,32 @@ pub(super) fn load_source(
     physical_slot: usize,
     disk_ids: &[Uuid],
 ) -> Result<LoadedSource> {
-    let state_raw = read_optional(&source.join(STATE), base, root)?;
+    let pinned = match os::pin_multipart_source_directory(source, base, root) {
+        Ok(pinned) => pinned,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LoadedSource {
+                root_missing: true,
+                state: None,
+                head: None,
+                original: None,
+                info: None,
+                snapshot: None,
+                head_matches_state: false,
+                head_matches_activation: false,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let state_raw = read_optional_in_pinned(&pinned, source, STATE, base, root)?;
     let state: Option<SourceState> = state_raw.as_deref().map(decode).transpose()?;
-    if state.is_none() && os::multipart_source_has_native_controls(source, base, root)? {
+    if state.is_none() && os::multipart_source_has_native_controls_in_pinned(source, &pinned)? {
         return Err(DiskError::ConditionalDeleteConflict);
     }
-    let head_path = source.join(STORAGE_FORMAT_FILE);
-    let head = if let Some(state) = state.as_ref() {
+    let head = if let Some(state) = state
+        .as_ref()
+        .filter(|state| state.prepared_length.is_some_and(|len| len > 64 * 1024))
+    {
+        let head_path = source.join(STORAGE_FORMAT_FILE);
         let maximum = state
             .prepared_length
             .unwrap_or(0)
@@ -789,7 +836,8 @@ pub(super) fn load_source(
                 let raw = if is_proxy {
                     None
                 } else {
-                    let raw = read_optional(&head_path, base, root)?.ok_or(DiskError::FileCorrupt)?;
+                    let raw = read_optional_in_pinned(&pinned, source, STORAGE_FORMAT_FILE, base, root)?
+                        .ok_or(DiskError::FileCorrupt)?;
                     if raw_sha(&raw) != sha256 {
                         return Err(DiskError::FileCorrupt);
                     }
@@ -801,10 +849,17 @@ pub(super) fn load_source(
             Err(error) => return Err(error.into()),
         }
     } else {
-        read_optional(&head_path, base, root)?.map(|raw| SourceHead {
-            sha256: raw_sha(&raw),
-            length: raw.len() as u64,
-            raw: Some(raw),
+        read_optional_in_pinned(&pinned, source, STORAGE_FORMAT_FILE, base, root)?.map(|raw| {
+            let sha256 = raw_sha(&raw);
+            let length = raw.len() as u64;
+            let is_proxy = state
+                .as_ref()
+                .is_some_and(|state| Some(sha256) == state.prepared_sha256 && Some(length) == state.prepared_length);
+            SourceHead {
+                sha256,
+                length,
+                raw: (!is_proxy).then_some(raw),
+            }
         })
     };
     let mut original = None;
@@ -950,6 +1005,7 @@ pub(super) fn load_source(
         head_matches_state = true;
     }
     Ok(LoadedSource {
+        root_missing: false,
         state,
         head,
         original,
@@ -1587,10 +1643,8 @@ impl NativeMultipartPublication {
             }
         }
         self.store.sync_target_with_lease(&self.publication, target_lease).await?;
-        let source = self.store.source.clone();
-        os::run_blocking_namespace_operation(self.store.lease.clone(), move || os::fsync_dir_std(&source)).await?;
         state.advance(MultipartSourcePhase::ConsumedUnsealed)?;
-        self.store.persist(&state).await?;
+        self.store.persist_with_source_sync(&state, true).await?;
         *self.state.lock() = state;
         let loaded = self.store.load().await?;
         let snapshot = loaded.snapshot.ok_or(DiskError::FileCorrupt)?;
