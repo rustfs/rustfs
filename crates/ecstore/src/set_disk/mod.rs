@@ -11976,22 +11976,100 @@ mod tests {
     }
 
     #[test]
-    fn test_latest_fileinfo_selection_rejects_same_time_identity_tie() {
+    fn test_latest_fileinfo_selection_breaks_same_time_tie_in_disk_order() {
         let mod_time = OffsetDateTime::now_utc();
         let data_dir = Uuid::new_v4();
-        let metas = vec![
-            quorum_test_fileinfo(mod_time, data_dir, "part-etag-a", 1),
-            quorum_test_fileinfo(mod_time, data_dir, "part-etag-a", 2),
-            quorum_test_fileinfo(mod_time, data_dir, "part-etag-b", 3),
-            quorum_test_fileinfo(mod_time, data_dir, "part-etag-b", 4),
-        ];
+        let tagged = |index, tag: &str| {
+            let mut fi = quorum_test_fileinfo(mod_time, data_dir, "part-etag", index);
+            fi.metadata.insert("x-amz-tagging".to_string(), tag.to_string());
+            fi
+        };
         let errs = vec![None, None, None, None];
 
-        let result = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2);
+        // A tagging write that failed after reaching half the drives.
+        for (metas, expected) in [
+            (vec![tagged(1, "a=1"), tagged(2, "a=1"), tagged(3, "a=2"), tagged(4, "a=2")], "a=1"),
+            (vec![tagged(1, "a=2"), tagged(2, "a=1"), tagged(3, "a=1"), tagged(4, "a=2")], "a=2"),
+        ] {
+            // Each call hashes into fresh maps; a map-order choice would flip.
+            for _ in 0..32 {
+                let (_, selected) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2)
+                    .expect("a same-time half split serves the side on the lowest-index disk");
+                let healed =
+                    SetDisks::find_file_info_in_quorum(&metas, &Some(mod_time), &None, 2).expect("heal resolves the same split");
 
+                assert_eq!(selected.metadata.get("x-amz-tagging").map(String::as_str), Some(expected));
+                assert_eq!(healed.metadata.get("x-amz-tagging").map(String::as_str), Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn test_latest_fileinfo_selection_requires_the_versions_own_data_blocks() {
+        let old_mod_time = OffsetDateTime::now_utc();
+        let new_mod_time = old_mod_time + time::Duration::seconds(1);
+        let old = |index| quorum_test_fileinfo(old_mod_time, Uuid::from_u128(1), "part-etag-old", index);
+        let new = |index| {
+            let mut fi = quorum_test_fileinfo(new_mod_time, Uuid::from_u128(2), "part-etag-new", index);
+            fi.erasure.data_blocks = 3;
+            fi.erasure.parity_blocks = 1;
+            fi
+        };
+        let errs = vec![None, None, None, None];
+
+        // Read quorum two comes from the 2+2 copies; the newer 3+1 version
+        // wins the time tie but cannot be decoded from two shards.
+        let metas = vec![old(1), old(2), new(3), new(4)];
+        let result = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2);
+        assert!(matches!(result, Err(DiskError::ErasureReadQuorum)));
+
+        let metas = vec![old(1), new(2), new(3), new(4)];
+        let (_, selected) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2)
+            .expect("three copies decode a 3+1 version");
+        assert_eq!(selected.mod_time, Some(new_mod_time));
+    }
+
+    #[tokio::test]
+    async fn update_object_meta_below_write_quorum_writes_nothing() {
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::storage_api_contracts::object::ObjectIO as _;
+
+        let (_dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks(4, 2).await;
+        let (bucket, object) = ("metadata-write-quorum", "object");
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        set.put_object(
+            bucket,
+            object,
+            &mut crate::object_api::PutObjReader::from_vec(b"body".to_vec()),
+            &ObjectOptions::default(),
+        )
+        .await
+        .expect("object should commit on every drive");
+        let disks = set.get_disks_internal().await;
+        let (metadata, _) = SetDisks::read_all_fileinfo(&disks, "", bucket, object, "", false, false, false)
+            .await
+            .expect("committed metadata should be readable");
+        let mut update = metadata[0].clone();
+        update.metadata.insert("x-amz-meta-probe".to_string(), "written".to_string());
+
+        // A read that selected one side of a 2+2 split returns two disks.
+        let mut targets = disks.clone();
+        targets[2] = None;
+        targets[3] = None;
+        let err = set
+            .update_object_meta(bucket, object, update, &targets)
+            .await
+            .expect_err("two of four disks cannot reach write quorum");
+
+        assert_eq!(err, DiskError::ErasureWriteQuorum);
+        let (after, _) = SetDisks::read_all_fileinfo(&disks, "", bucket, object, "", false, false, false)
+            .await
+            .expect("metadata should stay readable");
         assert!(
-            matches!(result, Err(DiskError::ErasureReadQuorum)),
-            "two identities with the same time and count cannot be ordered"
+            after.iter().all(|fi| !fi.metadata.contains_key("x-amz-meta-probe")),
+            "a refused update must not reach any disk"
         );
     }
 
@@ -12370,9 +12448,14 @@ mod tests {
             assert_eq!(selected.is_remote(), expect_remote);
         }
 
-        let tied = vec![local(1), local(2), remote(3), remote(4)];
-        let result = SetDisks::select_valid_fileinfo(&vec![None; tied.len()], &tied, &[None, None, None, None], 2);
-        assert!(matches!(result, Err(DiskError::ErasureReadQuorum)));
+        for (tied, expect_remote) in [
+            (vec![local(1), local(2), remote(3), remote(4)], false),
+            (vec![remote(1), local(2), local(3), remote(4)], true),
+        ] {
+            let (_, selected) = SetDisks::select_valid_fileinfo(&vec![None; tied.len()], &tied, &[None, None, None, None], 2)
+                .expect("a same-time half split serves the side on the lowest-index disk");
+            assert_eq!(selected.is_remote(), expect_remote);
+        }
     }
 
     #[test]

@@ -592,9 +592,11 @@ impl SetDisks {
     /// that failed after reaching exactly `read_quorum` copies is readable
     /// instead of failing until heal runs, as listing already shows it.
     ///
-    /// Two content identities that share the selected time and the top count
-    /// cannot be ordered. The read fails instead of picking one by hash
-    /// order, which could serve different content on every request.
+    /// `read_quorum` follows the parity most copies agree on, which delete
+    /// markers and empty versions can lower below the selected version's own
+    /// data blocks; like MinIO's `getLatestFileInfo`, a version with local
+    /// shards also needs that many copies, or HEAD would report a version
+    /// GET cannot decode.
     pub(super) fn select_valid_fileinfo(
         disks: &[Option<DiskStore>],
         parts_metadata: &[FileInfo],
@@ -602,8 +604,8 @@ impl SetDisks {
         read_quorum: usize,
     ) -> disk::error::Result<(Vec<Option<DiskStore>>, FileInfo)> {
         let (online_disks, mod_time, etag) = Self::list_online_disks(disks, parts_metadata, errs, read_quorum);
-        let (fi, tied) = Self::find_file_info_in_quorum_with_tie(parts_metadata, &mod_time, &etag, read_quorum)?;
-        if tied {
+        let (fi, copies) = Self::find_file_info_in_quorum_counted(parts_metadata, &mod_time, &etag, read_quorum)?;
+        if !fi.deleted && !fi.is_remote() && fi.size > 0 && copies < fi.erasure.data_blocks {
             return Err(DiskError::ErasureReadQuorum);
         }
 
@@ -848,18 +850,23 @@ impl SetDisks {
         etag: &Option<String>,
         quorum: usize,
     ) -> disk::error::Result<FileInfo> {
-        Self::find_file_info_in_quorum_with_tie(metas, mod_time, etag, quorum).map(|(fi, _)| fi)
+        Self::find_file_info_in_quorum_counted(metas, mod_time, etag, quorum).map(|(fi, _)| fi)
     }
 
-    /// `find_file_info_in_quorum`, also reporting whether a second content
-    /// identity reached the selected one's count. Only the hashed fallback
-    /// can tie: the first-candidate shortcut requires a strict majority.
-    fn find_file_info_in_quorum_with_tie(
+    /// `find_file_info_in_quorum`, also returning how many copies carry the
+    /// selected content identity.
+    ///
+    /// Two identities can share the top count only in a data = parity set
+    /// split exactly in half at one modification time, such as a metadata
+    /// update that failed after reaching half the drives. The identity held
+    /// by the lowest-index disk wins, so every read and heal picks the same
+    /// side and a retried metadata write can repair the split.
+    fn find_file_info_in_quorum_counted(
         metas: &[FileInfo],
         mod_time: &Option<OffsetDateTime>,
         etag: &Option<String>,
         quorum: usize,
-    ) -> disk::error::Result<(FileInfo, bool)> {
+    ) -> disk::error::Result<(FileInfo, usize)> {
         if quorum < 1 {
             warn!("find_file_info_in_quorum: quorum < 1");
             return Err(DiskError::ErasureReadQuorum);
@@ -888,7 +895,7 @@ impl SetDisks {
             if same_count >= quorum && same_count > total_valid - same_count {
                 let mut fi = first.clone();
                 fi.is_latest = fi.successor_mod_time.is_none();
-                return Ok((fi, false));
+                return Ok((fi, same_count));
             }
         }
 
@@ -941,15 +948,12 @@ impl SetDisks {
             *count_map.entry(hash).or_insert(0) += 1;
         }
 
-        let mut max_val = None;
-        let mut max_count = 0;
-
-        for (&val, &count) in &count_map {
-            if count > max_count {
-                max_val = Some(val);
-                max_count = count;
-            }
-        }
+        let max_count = count_map.values().copied().max().unwrap_or(0);
+        let max_val = meta_hashes
+            .iter()
+            .flatten()
+            .find(|hash| count_map.get(*hash) == Some(&max_count))
+            .copied();
 
         if max_count < quorum {
             warn!(
@@ -1007,8 +1011,7 @@ impl SetDisks {
                 fi.is_latest = props.successor_mod_time.is_none();
             }
 
-            let tied = count_map.values().filter(|&&count| count == max_count).count() > 1;
-            return Ok((fi, tied));
+            return Ok((fi, max_count));
         }
 
         warn!("find_file_info_in_quorum: fileinfo not found");
