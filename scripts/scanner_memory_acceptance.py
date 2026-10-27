@@ -247,6 +247,25 @@ class S3:
         require(len(raw) <= 4 * 1024 * 1024, "admin response exceeds bound")
         return json.loads(raw)
 
+    def storage_paths(self):
+        # Ask the serving process for its expanded, effective disk inventory;
+        # Docker Config.Env and /proc/environ alone do not describe CLI overrides.
+        info = self.admin("/rustfs/admin/v3/storageinfo").get("info", {})
+        observations = info.get("observations", [])
+        require(len(observations) == 1 and observations[0].get("status") == "succeeded"
+                and observations[0].get("cached") is False,
+                "storage inventory must be a fresh single-node observation")
+        disks = info.get("disks", [])
+        backend = info.get("backend", {})
+        drives, sets = backend.get("DrivesPerSet", []), backend.get("TotalSets", [])
+        require(drives and len(drives) == len(sets)
+                and all(type(n) is int and n > 0 for n in drives + sets)
+                and sum(n * count for n, count in zip(drives, sets)) == len(disks),
+                "storage inventory does not cover the configured topology")
+        require(all(disk.get("local") is True and disk.get("state") == "ok" for disk in disks),
+                "storage inventory must contain only healthy local disks")
+        return [disk.get("path") for disk in disks]
+
     def status(self, enabled):
         status = self.admin("/rustfs/admin/v3/scanner/status")
         require(status.get("enabled") is enabled, "scanner enabled state differs from required phase")
@@ -404,8 +423,49 @@ def native_endpoint_matches(tables, owned_sockets, endpoint):
     return found
 
 
+def storage_directory(value):
+    require(type(value) is str and value.startswith("/") and str(Path(value)) == value
+            and ".." not in Path(value).parts and not any(char in value for char in "\0\n\r\t"),
+            "storage directory must be an unambiguous absolute path")
+    return Path(value)
+
+
+def owned_storage_paths(owned, paths):
+    owned = storage_directory(owned)
+    require(type(paths) is list and 0 < len(paths) <= 1024, "storage disk paths are unavailable")
+    paths = [storage_directory(path) for path in paths]
+    require(all(path == owned or owned in path.parents for path in paths),
+            "effective storage disk is outside the owned storage root")
+    return sorted(paths)
+
+
+def check_storage_mounts(owned, mountinfo):
+    lines = mountinfo.decode().splitlines()
+    require(lines, "storage mount inventory is unavailable")
+    for line in lines:
+        fields = line.split()
+        require(len(fields) >= 10 and "-" in fields[6:], "storage mount inventory is malformed")
+        mount = storage_directory(re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), fields[4]))
+        require(Path(owned) not in mount.parents, "nested mounts under owned storage are unsupported")
+
+
+def native_storage(process, owned, paths, mountinfo):
+    # Host path resolution is valid only in the serving process's namespace/root.
+    require((process / "ns/mnt").samefile("/proc/self/ns/mnt") and (process / "root").samefile("/"),
+            "native storage requires the observer's mount namespace and root")
+    owned = storage_directory(owned)
+    require(owned.resolve(strict=True) == owned, "owned storage root changed")
+    paths = sorted(str(storage_directory(path).resolve(strict=True)) for path in paths)
+    resolved = owned_storage_paths(str(owned), paths)
+    check_storage_mounts(owned, mountinfo)
+    require(owned.is_dir() and all(path.is_dir() and path.stat().st_dev == owned.stat().st_dev for path in resolved),
+            "effective storage disks do not share the owned filesystem")
+    binding = digest({"owned": str(owned), "paths": paths, "device": owned.stat().st_dev})
+    return f"native 0 0 {shutil.disk_usage(owned).free // 1024} 0 /".encode(), binding
+
+
 class Runtime:
-    def __init__(self, evidence, container=None, pid=None, metrics_url=None):
+    def __init__(self, evidence, container=None, pid=None, metrics_url=None, storage_paths=None):
         require(bool(container) != bool(pid), "select exactly one owned container or native PID")
         self.evidence, self.plan = evidence, evidence.plan
         self.container, self.pid = container, pid or 1
@@ -417,9 +477,10 @@ class Runtime:
             local_url(f"{parsed.scheme}://{parsed.netloc}")
             require(not parsed.query and not parsed.fragment, "metrics URL must not contain query or fragment")
         self.verified = set()
+        self.storage_paths = storage_paths
 
     def read_files(self):
-        names = ("stat", "status", "smaps_rollup", "cgroup", "environ")
+        names = ("stat", "status", "smaps_rollup", "cgroup", "environ", "mountinfo")
         if self.container:
             raw = json.loads(command(["docker", "inspect", self.container]))
             require(len(raw) == 1, "ambiguous container identity")
@@ -441,15 +502,31 @@ class Runtime:
                           if mount.get("Type") == "bind" and Path(mount["Source"]).resolve() == Path(self.plan["data_root"])]
             require(len(mounts) == 1 and mounts[0].get("RW") is True, "container storage does not match the immutable manifest")
             storage_path = mounts[0]["Destination"]
+            require(callable(self.storage_paths), "effective storage inventory is required")
+            paths = [str(path) for path in owned_storage_paths(storage_path, self.storage_paths())]
             identity = {"container_id": item["Id"], "started_at": item["State"]["StartedAt"],
                         "restart_count": item["RestartCount"], "pid": self.pid}
-            script = 'for n in stat status smaps_rollup cgroup environ; do printf "\\n__FILE_%s__\\n" "$n"; cat "/proc/$1/$n" || exit 1; done; '
+            script = '[ "$(stat -Lc "%d:%i" /proc/$1/ns/mnt)" = "$(stat -Lc "%d:%i" /proc/self/ns/mnt)" ] || exit 1; '
+            script += '[ "$(stat -Lc "%d:%i" /proc/$1/root)" = "$(stat -Lc "%d:%i" /)" ] || exit 1; '
+            script += 'for n in stat status smaps_rollup cgroup environ mountinfo; do printf "\\n__FILE_%s__\\n" "$n"; cat "/proc/$1/$n" || exit 1; done; '
             script += 'printf "\\n__FILE_exe_inode__\\n"; stat -Lc "%d:%i" "/proc/$1/exe"; '
             script += 'for n in memory.current memory.max memory.peak memory.stat memory.events memory.swap.current memory.swap.max; do printf "\\n__FILE_%s__\\n" "$n"; cat "/sys/fs/cgroup/$n" 2>/dev/null || true; done'
             script += '; printf "\\n__FILE_storage__\\n"; df -Pk "$2" | tail -n 1'
-            data = command(["docker", "exec", item["Id"], "sh", "-c", script, "sh", str(self.pid), storage_path])
+            script += '; printf "\\n__FILE_storage_root__\\n"; readlink -f -- "$2" || exit 1'
+            script += '; printf "\\n__FILE_storage_devices__\\n"; storage=$2; shift 2; stat -Lc "%d" -- "$storage" "$@" || exit 1'
+            script += '; printf "\\n__FILE_volume_paths__\\n"; for p; do [ -d "$p" ] || exit 1; readlink -f -- "$p" || exit 1; done'
+            data = command(["docker", "exec", item["Id"], "sh", "-c", script, "sh", str(self.pid), storage_path, *paths])
             chunks = re.split(rb"\n__FILE_([A-Za-z_.]+)__\n", data)
             files = {chunks[index].decode(): chunks[index + 1].strip(b"\n") for index in range(1, len(chunks), 2)}
+            require(files["storage_root"].decode() == storage_path, "owned storage mount is not canonical")
+            resolved = files["volume_paths"].decode().splitlines()
+            require(len(resolved) == len(paths), "effective storage paths could not be resolved")
+            owned_storage_paths(storage_path, resolved)
+            check_storage_mounts(storage_path, files["mountinfo"])
+            devices = files["storage_devices"].splitlines()
+            require(len(devices) == len(paths) + 1 and devices[0].isdigit() and len(set(devices)) == 1,
+                    "effective storage disks do not share the owned filesystem")
+            identity["storage_binding_sha256"] = digest({"mount": mounts[0], "paths": resolved, "devices": [value.decode() for value in devices]})
         else:
             require(self.plan["data_volume"] is None, "native PID sampling requires a host data root")
             root = Path("/proc") / str(self.pid)
@@ -478,8 +555,10 @@ class Runtime:
                 files[name] = (group / name).read_bytes() if (group / name).exists() else b""
             info = (root / "exe").stat()
             files["exe_inode"] = f"{info.st_dev}:{info.st_ino}".encode()
-            files["storage"] = f"native 0 0 {shutil.disk_usage(self.plan['data_root']).free // 1024} 0 /".encode()
-            identity = {"boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(), "pid": self.pid}
+            require(callable(self.storage_paths), "effective storage inventory is required")
+            files["storage"], binding = native_storage(root, self.plan["data_root"], self.storage_paths(), files["mountinfo"])
+            identity = {"boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(), "pid": self.pid,
+                        "storage_binding_sha256": binding}
         identity.update(start_ticks=parse_proc_stat(files["stat"].decode()), executable_inode=files["exe_inode"].decode())
         key = digest(identity)
         if key not in self.verified:
@@ -846,7 +925,7 @@ def main(argv=None):
                     if args.action == "verify":
                         result = api.verify(deadline=time.monotonic() + args.seconds)
                     else:
-                        runtime = Runtime(evidence, args.container, args.pid, args.allocator_metrics_url)
+                        runtime = Runtime(evidence, args.container, args.pid, args.allocator_metrics_url, api.storage_paths)
                         result = {"load": run_load, "probe": run_probe, "burst": run_burst}[args.action](evidence, api, runtime, args)
                     evidence.append("phase_result", result=result)
                     summarize(evidence)

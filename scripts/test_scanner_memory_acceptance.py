@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from types import SimpleNamespace
 import uuid
 
@@ -114,8 +114,7 @@ class AcceptanceTest(unittest.TestCase):
             self.assertEqual(command.call_count, 1)
             self.assertEqual(command.call_args.args[0][:2], ["docker", "inspect"])
 
-    def test_owned_container_collects_real_fields_without_emitting_private_environment(self):
-        runtime = acceptance.Runtime(self.evidence, container="owned")
+    def container_observation(self):
         container = {"Id": "owned-id", "Config": {"Labels": {acceptance.LABEL: self.plan["run_id"]}},
                      "State": {"Running": True, "OOMKilled": False, "StartedAt": "2026-01-01T00:00:00Z"},
                      "HostConfig": {"Memory": self.plan["memory_bytes"]}, "RestartCount": 0,
@@ -123,17 +122,38 @@ class AcceptanceTest(unittest.TestCase):
                      "NetworkSettings": {"Ports": {"9000/tcp": [{"HostPort": "19000", "HostIp": "127.0.0.1"}]}}}
         files = {"stat": "1 (rustfs) " + " ".join(["S"] + ["0"] * 18 + ["1234"]),
                  "status": "VmRSS: 20 kB\nRssAnon: 12 kB", "smaps_rollup": "Anonymous: 12 kB",
-                 "cgroup": "0::/", "environ": "RUSTFS_SCANNER_ENABLED=false\0RUSTFS_SECRET_KEY=private-test-value\0",
+                 "cgroup": "0::/", "environ": "RUSTFS_VOLUMES=/data\0RUSTFS_SCANNER_ENABLED=false\0RUSTFS_SECRET_KEY=private-test-value\0",
                  "exe_inode": "1:5678", "memory.max": str(self.plan["memory_bytes"]), "memory.current": "40960",
                  "memory.peak": "50000", "memory.stat": "anon 12288\nfile 20000", "memory.events": "oom 0\noom_kill 0",
-                 "storage": "disk 100 10 90 10% /data"}
-        raw = "".join(f"\n__FILE_{name}__\n{value}\n" for name, value in files.items()).encode()
+                 "storage": "disk 100 10 90 10% /data", "storage_root": "/data",
+                 "storage_devices": "1\n1", "volume_paths": "/data",
+                 "mountinfo": "1 0 0:1 / / rw - ext4 disk rw\n2 1 0:2 / /data rw - ext4 disk rw"}
         def command(argv, **_):
             if argv[:2] == ["docker", "inspect"]:
                 return json.dumps([container]).encode()
             if argv[3] == "sha256sum":
                 return (self.plan["binary_sha256"] + "  /proc/1/exe\n").encode()
-            return raw
+            return "".join(f"\n__FILE_{name}__\n{value}\n" for name, value in files.items()).encode()
+        return container, files, command
+
+    def test_capacity_rejects_unused_owned_mount_before_load_writes(self):
+        runtime = acceptance.Runtime(self.evidence, container="owned")
+        runtime.storage_paths = lambda: ["/foreign"]
+        _, files, command = self.container_observation()
+        files["environ"] = "RUSTFS_VOLUMES=/foreign\0"
+        files["storage"] = "disk 20000000 10 10000000 10% /data"
+        api = SimpleNamespace(owned=Mock(), client=Mock(), status=lambda _: {}, verify=lambda **_: {})
+        args = SimpleNamespace(seconds=10, interval=1, workers=1, batch=1)
+        with patch.object(acceptance, "command", side_effect=command):
+            with self.assertRaisesRegex(acceptance.AcceptanceError, "storage"):
+                acceptance.run_load(self.evidence, api, runtime, args)
+        api.owned.assert_not_called()
+        api.client.put_object.assert_not_called()
+
+    def test_owned_container_collects_real_fields_without_emitting_private_environment(self):
+        runtime = acceptance.Runtime(self.evidence, container="owned")
+        runtime.storage_paths = lambda: ["/data"]
+        container, files, command = self.container_observation()
         with patch.object(acceptance, "command", side_effect=command) as calls:
             sample = runtime.sample()
             runtime.sample()
@@ -145,6 +165,119 @@ class AcceptanceTest(unittest.TestCase):
         container["NetworkSettings"]["Ports"] = {}
         with patch.object(acceptance, "command", side_effect=command), self.assertRaises(acceptance.AcceptanceError):
             runtime.sample()
+
+    def test_storage_inventory_uses_complete_live_server_configuration(self):
+        api = acceptance.S3.__new__(acceptance.S3)
+        info = {"observations": [{"status": "succeeded", "cached": False}],
+                "disks": [{"path": "/data/one", "local": True, "state": "ok"},
+                          {"path": "/data/two", "local": True, "state": "ok"}],
+                "backend": {"DrivesPerSet": [2], "TotalSets": [1]}}
+        api.admin = Mock(return_value={"info": info})
+        self.assertEqual(api.storage_paths(), ["/data/one", "/data/two"])
+        api.admin.assert_called_once_with("/rustfs/admin/v3/storageinfo")
+        bad = []
+        for field, value in (("observations", []), ("disks", info["disks"][:1]),
+                             ("backend", {})):
+            bad.append({**info, field: value})
+        for field, value in (("status", "failed"), ("cached", True)):
+            bad.append({**info, "observations": [{**info["observations"][0], field: value}]})
+        bad.append({**info, "observations": info["observations"] * 2})
+        for field, value in (("local", False), ("state", "offline")):
+            bad.append({**info, "disks": [{**disk, field: value} for disk in info["disks"]]})
+        for invalid in bad:
+            with self.subTest(inventory=invalid), self.assertRaises(acceptance.AcceptanceError):
+                api.admin.return_value = {"info": invalid}
+                api.storage_paths()
+
+    def test_effective_storage_paths_fail_closed_on_ambiguous_or_foreign_roots(self):
+        for paths in (["/foreign"], ["/data-other"], ["/data", "/foreign"], ["data"],
+                      ["/data/../foreign"], ["http://node/data"], ["/data/"], [None], []):
+            with self.subTest(paths=paths), self.assertRaises(acceptance.AcceptanceError):
+                acceptance.owned_storage_paths("/data", paths)
+        self.assertEqual(acceptance.owned_storage_paths("/data", ["/data", "/data/disk1"]),
+                         [Path("/data"), Path("/data/disk1")])
+
+    def test_container_rejects_symlink_escape_nested_mount_and_foreign_filesystem(self):
+        runtime = acceptance.Runtime(self.evidence, container="owned", storage_paths=lambda: ["/data"])
+        for field, value in (("volume_paths", "/foreign"), ("storage_root", "/foreign"),
+                             ("storage_devices", "1\n2"), ("volume_paths", ""),
+                             ("mountinfo", "1 0 0:1 / / rw - ext4 disk rw\n2 1 0:2 / /data/nested rw - ext4 disk rw")):
+            with self.subTest(field=field, value=value):
+                _, files, command = self.container_observation()
+                files[field] = value
+                with patch.object(acceptance, "command", side_effect=command), self.assertRaises(acceptance.AcceptanceError):
+                    runtime.sample()
+
+    def test_container_uses_effective_inventory_instead_of_shadowed_environment(self):
+        runtime = acceptance.Runtime(self.evidence, container="owned", storage_paths=lambda: ["/data"])
+        _, files, command = self.container_observation()
+        # The serving process reports /data after positional CLI args override this env value.
+        files["environ"] += "RUSTFS_VOLUMES=/foreign\0"
+        with patch.object(acceptance, "command", side_effect=command):
+            first = runtime.sample()
+            runtime.storage_paths = lambda: ["/foreign"]
+            with self.assertRaises(acceptance.AcceptanceError):
+                runtime.sample()
+        self.assertIn("storage_binding_sha256", first["identity"])
+        self.assertNotIn("/foreign", json.dumps(first))
+
+    def test_storage_identity_is_stable_when_disk_inventory_order_changes(self):
+        paths = ["/data/one", "/data/two"]
+        runtime = acceptance.Runtime(self.evidence, container="owned", storage_paths=lambda: paths)
+        _, files, command = self.container_observation()
+        files["volume_paths"] = "/data/one\n/data/two"
+        files["storage_devices"] = "1\n1\n1"
+        with patch.object(acceptance, "command", side_effect=command) as calls:
+            first = runtime.sample()
+            paths.reverse()
+            second = runtime.sample()
+        self.assertEqual(first["identity_sha256"], second["identity_sha256"])
+        observations = [call.args[0] for call in calls.call_args_list if call.args[0][3:5] == ["sh", "-c"]]
+        self.assertEqual([argv[-2:] for argv in observations], [["/data/one", "/data/two"]] * 2)
+
+    def test_named_volume_requires_effective_disks_inside_owned_mount(self):
+        self.evidence.plan["data_root"] = None
+        self.evidence.plan["data_volume"] = "owned-volume"
+        container, _, command = self.container_observation()
+        container["Mounts"] = [{"Type": "volume", "Name": "owned-volume", "Destination": "/data", "RW": True}]
+        def inspect_volume(argv, **kwargs):
+            if argv[:3] == ["docker", "volume", "inspect"]:
+                return json.dumps([{"Labels": {acceptance.LABEL: self.plan["run_id"]}}]).encode()
+            return command(argv, **kwargs)
+        runtime = acceptance.Runtime(self.evidence, container="owned", storage_paths=lambda: ["/data"])
+        with patch.object(acceptance, "command", side_effect=inspect_volume):
+            runtime.sample()
+            runtime.storage_paths = lambda: ["/foreign"]
+            with self.assertRaises(acceptance.AcceptanceError):
+                runtime.sample()
+
+    def test_native_capacity_binds_actual_disk_paths_before_observing_free_space(self):
+        owned = self.plan["data_root"]
+        child = Path(owned) / "disk"
+        child.mkdir()
+        foreign = self.root / "foreign"
+        foreign.mkdir()
+        link = Path(owned) / "alias"
+        link.symlink_to(foreign, target_is_directory=True)
+        mountinfo = b"1 0 0:1 / / rw - ext4 disk rw"
+        with patch.object(Path, "samefile", return_value=True), patch.object(acceptance.shutil, "disk_usage") as usage:
+            usage.return_value = SimpleNamespace(free=4096)
+            storage, binding = acceptance.native_storage(Path("/proc/123"), owned, [str(child)], mountinfo)
+            self.assertEqual(storage.split()[3], b"4")
+            self.assertEqual(len(binding), 64)
+            usage.assert_called_once_with(Path(owned))
+            for paths in ([str(foreign)], [str(link)], [owned, str(foreign)], []):
+                usage.reset_mock()
+                with self.subTest(paths=paths), self.assertRaises(acceptance.AcceptanceError):
+                    acceptance.native_storage(Path("/proc/123"), owned, paths, mountinfo)
+                usage.assert_not_called()
+            nested = mountinfo + f"\n2 1 0:2 / {owned}/nested rw - ext4 disk rw".encode()
+            usage.reset_mock()
+            with self.assertRaises(acceptance.AcceptanceError):
+                acceptance.native_storage(Path("/proc/123"), owned, [owned], nested)
+            usage.assert_not_called()
+        with patch.object(Path, "samefile", return_value=False), self.assertRaises(acceptance.AcceptanceError):
+            acceptance.native_storage(Path("/proc/123"), owned, [owned], mountinfo)
 
     def test_memory_separates_rss_anonymous_page_cache_and_unknown_heap(self):
         runtime = acceptance.Runtime(self.evidence, pid=123)
