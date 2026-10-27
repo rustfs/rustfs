@@ -54,6 +54,7 @@ jobs:
           packages=()
           command -v clang >/dev/null || packages+=(clang)
           command -v llvm-objcopy >/dev/null || packages+=(llvm)
+          command -v gcc >/dev/null || packages+=(gcc)
           select_bpftool >/dev/null || packages+=(linux-tools-generic)
           if (( ${#packages[@]} )); then
             sudo apt-get update
@@ -63,8 +64,12 @@ jobs:
           selected_bpftool="$(select_bpftool)"
           "$selected_bpftool" version
           printf 'BPFTOOL=%s\n' "$selected_bpftool" >> "$GITHUB_ENV"
-      - name: Compare compiled declarations with bpftool
+      - name: Compare declarations and layouts with independent references
         run: |
           clang -target bpf -O2 -g -c scripts/fixtures/btf_prototypes.c -o "$RUNNER_TEMP/prototypes.o"
           llvm-objcopy --dump-section ".BTF=$RUNNER_TEMP/prototypes.btf" "$RUNNER_TEMP/prototypes.o"
-          python3 -B scripts/test_inspect_btf_prototypes.py --native-reference "$RUNNER_TEMP/prototypes.btf"
+          gcc -std=c11 -Wall -Wextra -Werror -DRUSTFS_BTF_LAYOUT_REFERENCE \
+            scripts/fixtures/btf_prototypes.c -o "$RUNNER_TEMP/layout-reference"
+          "$RUNNER_TEMP/layout-reference" > "$RUNNER_TEMP/layout-reference.json"
+          python3 -B scripts/test_inspect_btf_prototypes.py --native-reference "$RUNNER_TEMP/prototypes.btf" \
+            --layout-reference "$RUNNER_TEMP/layout-reference.json"
