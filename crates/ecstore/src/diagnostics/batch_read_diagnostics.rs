@@ -76,6 +76,11 @@ pub fn current_request_id() -> Option<Arc<str>> {
     REQUEST_ID.try_with(Clone::clone).ok().flatten()
 }
 
+/// Capture before spawning the legacy producer; task locals are not inherited.
+pub(crate) fn with_captured_request_context<F: std::future::Future>(future: F) -> impl std::future::Future<Output = F::Output> {
+    REQUEST_ID.scope(current_request_id(), future)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Stage {
     Execution,
@@ -360,6 +365,20 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(current_request_id().as_deref(), Some("server-outer"));
         });
+        assert!(current_request_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn captured_request_context_crosses_spawn_without_leaking_to_caller() {
+        let original: Arc<str> = Arc::from("server-detached-producer");
+        let task = in_request_context(Some(&original), || {
+            tokio::spawn(with_captured_request_context(async {
+                tokio::task::yield_now().await;
+                current_request_id()
+            }))
+        });
+        assert!(current_request_id().is_none());
+        assert_eq!(task.await.expect("detached diagnostic context").as_deref(), Some(original.as_ref()));
         assert!(current_request_id().is_none());
     }
 
