@@ -298,7 +298,9 @@ impl TableCatalogBackingMode {
     fn parse(value: &str) -> TableCatalogStoreResult<Self> {
         match value.trim() {
             "" | TABLE_CATALOG_BACKING_OBJECT => Ok(Self::ObjectBacked),
-            TABLE_CATALOG_BACKING_DURABLE_STRONG => Ok(Self::DurableStrong),
+            TABLE_CATALOG_BACKING_DURABLE_STRONG => Err(TableCatalogStoreError::Invalid(
+                format!("{TABLE_CATALOG_BACKING_DURABLE_STRONG} table catalog backing has been retired; use {TABLE_CATALOG_BACKING_OBJECT}"),
+            )),
             value => Err(TableCatalogStoreError::Invalid(format!(
                 "unsupported table catalog backing {value}; expected {TABLE_CATALOG_BACKING_OBJECT} or {TABLE_CATALOG_BACKING_DURABLE_STRONG}"
             ))),
