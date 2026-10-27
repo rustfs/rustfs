@@ -451,6 +451,63 @@ async fn admin_overlap_normal_start_cannot_enter_force_start_cancellation_window
 }
 
 #[tokio::test]
+async fn admin_force_start_rechecks_request_id_after_cancelling_overlaps() {
+    for source in [HealRequestSource::Scanner, HealRequestSource::Internal] {
+        let manager = manager_with_policy(HealOverlapPolicy::Merge);
+        let previous_id = install_owner(&manager, admin_prefix_request("bucket", "scope/child/"), OwnerState::Active).await;
+        let aliases = manager.task_aliases.lock().await;
+        let mut replacement = admin_prefix_request("bucket", "scope/");
+        replacement.force_start = true;
+        let request_id = replacement.id.clone();
+        let mut forced = Box::pin(manager.submit_heal_request_with_receipt(replacement));
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                assert!(
+                    std::pin::pin!(tokio::task::unconstrained(forced.as_mut()))
+                        .poll(cx)
+                        .is_pending()
+                );
+                if manager.active_heals.try_lock().is_ok() {
+                    Poll::Ready(())
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("forceStart reaches cancellation with registry locks released");
+
+        let mut competing = HealRequest::object("other-bucket".to_string(), "object".to_string(), None);
+        competing.id = request_id.clone();
+        competing.source = source;
+        competing.options.recreate_missing = false;
+        let receipt = manager
+            .submit_heal_request_with_receipt(competing)
+            .await
+            .expect("non-admin admission during forceStart cancellation");
+        assert_eq!(receipt.result, HealAdmissionResult::Accepted);
+        assert_eq!(receipt.task_id, request_id);
+
+        drop(aliases);
+        let receipt = forced.await.expect("forceStart returns a conflict");
+        assert_eq!(receipt.result, HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning));
+        assert_eq!(receipt.task_id, request_id);
+        let queue = manager.heal_queue.lock().await;
+        let same_id: Vec<_> = queue.requests().filter(|request| request.id == request_id).collect();
+        assert_eq!(same_id.len(), 1, "conflicting requests must not share an id");
+        assert_eq!(same_id[0].source, source);
+        drop(queue);
+        assert!(
+            matches!(manager.get_task_status(&previous_id).await, Ok(HealTaskStatus::Cancelled)),
+            "overlapping admin cancellation precedes the conflict recheck"
+        );
+    }
+}
+
+#[tokio::test]
 async fn admin_overlap_cancel_cannot_miss_a_queued_to_active_transition() {
     let manager = manager_with_policy(HealOverlapPolicy::Merge);
     let owner = install_owner(&manager, admin_prefix_request("bucket", "scope/"), OwnerState::Queued).await;
