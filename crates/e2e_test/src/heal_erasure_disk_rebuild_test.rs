@@ -1701,10 +1701,10 @@ mod tests {
 
         let mut cluster = RustFSTestClusterEnvironment::with_topology(topology.cluster_topology()).await?;
         let bucket = "heal-restart-during-rebuild";
-        let mrf_hold = if !background_enabled {
-            let path = PathBuf::from(&cluster.temp_dir).join("hold-outage-mrf");
+        let mrf_fallback_scope = if !background_enabled {
+            let path = PathBuf::from(&cluster.temp_dir).join("skip-outage-mrf-fallback");
             std::fs::write(&path, format!("{bucket}/cluster/written-while-node-down-"))?;
-            cluster.set_env("RUSTFS_E2E_HOLD_MRF_PATH", path.to_string_lossy().into_owned());
+            cluster.set_env("RUSTFS_E2E_SKIP_MRF_FALLBACK_PATH", path.to_string_lossy().into_owned());
             Some(path)
         } else {
             None
@@ -1952,15 +1952,16 @@ mod tests {
             }
         };
 
-        if let Some(path) = &mrf_hold {
+        if let Some(path) = &mrf_fallback_scope {
             let observed = path.with_extension("observed");
+            let expected = format!("{bucket}/{outage_key}");
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
-                if tokio::fs::read_to_string(&observed).await.ok().as_deref() == Some(&format!("{bucket}/{outage_key}")) {
+                if tokio::fs::read_to_string(&observed).await.ok().as_deref() == Some(expected.as_str()) {
                     break;
                 }
                 if Instant::now() >= deadline {
-                    return Err("durable outage repair did not reach the test hold before target rejoin".into());
+                    return Err("outage repair did not reach the isolated best-effort fallback before target rejoin".into());
                 }
                 sleep(Duration::from_millis(50)).await;
             }
@@ -2580,7 +2581,7 @@ mod tests {
             );
         }
 
-        if let Some(path) = &mrf_hold {
+        if let Some(path) = &mrf_fallback_scope {
             std::fs::remove_file(path)?;
         }
 

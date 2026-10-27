@@ -9150,6 +9150,10 @@ impl SetDisks {
             // cannot safely target the object name after bucket recreation.
             return Ok(());
         };
+        #[cfg(feature = "e2e-test-hooks")]
+        if crate::set_disk::skip_e2e_mrf_fallback(bucket, object).await {
+            return Ok(());
+        }
         let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
             bucket.to_string(),
             Some(object.to_string()),

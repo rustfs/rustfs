@@ -5120,6 +5120,12 @@ impl SetDisks {
         if request.expected_bucket_incarnation_id.is_none() {
             return Ok(());
         }
+        #[cfg(feature = "e2e-test-hooks")]
+        if let Some(object) = request.object_prefix.as_deref()
+            && skip_e2e_mrf_fallback(&request.bucket, object).await
+        {
+            return Ok(());
+        }
         request.source = rustfs_heal_contracts::heal_channel::HealRequestSource::Mrf;
         #[cfg(test)]
         {
@@ -5820,6 +5826,25 @@ impl SetDisks {
 
     //     Ok(())
     // }
+}
+
+// The isolated root-heal test suppresses only the direct best-effort fallback.
+// Persisted MRF responsibilities and their replay keep their normal behavior.
+#[cfg(feature = "e2e-test-hooks")]
+pub(in crate::set_disk) async fn skip_e2e_mrf_fallback(bucket: &str, object: &str) -> bool {
+    let Some(path) = std::env::var_os("RUSTFS_E2E_SKIP_MRF_FALLBACK_PATH") else {
+        return false;
+    };
+    let path = std::path::PathBuf::from(path);
+    let Ok(prefix) = tokio::fs::read_to_string(&path).await else {
+        return false;
+    };
+    let key = format!("{bucket}/{object}");
+    if prefix.is_empty() || !key.starts_with(&prefix) {
+        return false;
+    }
+    let _ = tokio::fs::write(path.with_extension("observed"), key).await;
+    true
 }
 
 fn is_explicit_null_version(version_id: Option<Uuid>) -> bool {

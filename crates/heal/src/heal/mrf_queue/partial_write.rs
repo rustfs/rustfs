@@ -36,25 +36,6 @@ const MAX_UNVERIFIED_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 const MRF_RETIREMENT_PROOF_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 const MRF_IDENTITY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
-// Keep the durable responsibility in the journal while an isolated E2E test
-// establishes which recovery owner publishes an outage object.
-#[cfg(feature = "e2e-test-hooks")]
-async fn hold_e2e_partial_write(intent: &MrfIntent) -> bool {
-    let Some(path) = std::env::var_os("RUSTFS_E2E_HOLD_MRF_PATH") else {
-        return false;
-    };
-    let path = std::path::PathBuf::from(path);
-    let Ok(prefix) = tokio::fs::read_to_string(&path).await else {
-        return false;
-    };
-    let key = format!("{}/{}", intent.bucket, intent.object);
-    if prefix.is_empty() || !key.starts_with(&prefix) {
-        return false;
-    }
-    let _ = tokio::fs::write(path.with_extension("observed"), key).await;
-    true
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct PartialWriteKey {
     identity: MrfQueueKey,
@@ -980,10 +961,6 @@ impl PartialWrites {
                 continue;
             };
             entry.next_attempt = Instant::now() + config.admission_backoff;
-            #[cfg(feature = "e2e-test-hooks")]
-            if hold_e2e_partial_write(&entry.intent).await {
-                continue;
-            }
             if entry.attempt_in_flight
                 && let Some(in_flight) = in_flight.as_ref()
             {
