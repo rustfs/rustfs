@@ -3685,6 +3685,19 @@ fn is_decommission_source_cleanup_retryable_error(err: &Error) -> bool {
 #[error("{0}")]
 struct DecommissionCopyQuorumFailure(#[source] Error);
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct DecommissionPreparePutLockTimeout(#[source] Error);
+
+const DECOMMISSION_TARGET_PREPARATION_LOCK_BLOCKED: &str = "target preparation lock blocked";
+
+fn decommission_prepare_put_lock_deferral(err: Error) -> Error {
+    data_movement::data_movement_context_error(
+        format!("{DECOMMISSION_TARGET_PREPARATION_LOCK_BLOCKED}: {err}"),
+        DecommissionPreparePutLockTimeout(err),
+    )
+}
+
 fn is_decommission_copy_quorum_error(err: &Error) -> bool {
     if data_movement::is_data_movement_source_read_error(err) {
         return false;
@@ -5428,6 +5441,9 @@ fn record_decommission_deferral_cause(recorded: &mut Option<(bool, String)>, err
     {
         let cause = if source_cleanup {
             format!("{DECOMMISSION_SOURCE_CLEANUP_BLOCKED}: {err}")
+        } else if let Some(lock_timeout) = data_movement::data_movement_stage_source_as::<DecommissionPreparePutLockTimeout>(err)
+        {
+            format!("{DECOMMISSION_TARGET_PREPARATION_LOCK_BLOCKED}: {}", lock_timeout.0)
         } else {
             err.to_string()
         };
@@ -5454,12 +5470,16 @@ fn ensure_decommission_deferred_drained(
     }
     let remaining =
         format!("decommission bucket {bucket} set {set_idx} finished with {deferred_remaining} deferred entries remaining");
-    // A source cleanup pause leads with its own label so the persisted reason
-    // does not read as a target capacity problem.
-    if let Some(cause) = deferral_cause.and_then(|cause| cause.strip_prefix(DECOMMISSION_SOURCE_CLEANUP_BLOCKED)) {
-        return Err(decommission_capacity_blocked_error(format!(
-            "{DECOMMISSION_SOURCE_CLEANUP_BLOCKED}: {remaining}; deferral cause{cause}"
-        )));
+    // Preserve non-capacity pause reasons instead of reporting a full drive.
+    for label in [
+        DECOMMISSION_SOURCE_CLEANUP_BLOCKED,
+        DECOMMISSION_TARGET_PREPARATION_LOCK_BLOCKED,
+    ] {
+        if let Some(cause) = deferral_cause.and_then(|cause| cause.strip_prefix(label)) {
+            return Err(decommission_capacity_blocked_error(format!(
+                "{label}: {remaining}; deferral cause{cause}"
+            )));
+        }
     }
     let cause = deferral_cause
         .map(|cause| format!("; deferral cause: {cause}"))
@@ -5467,21 +5487,21 @@ fn ensure_decommission_deferred_drained(
     Err(decommission_capacity_blocked_error(format!("{remaining}{cause}")))
 }
 
-/// The reason persisted for a durable decommission pause. A source cleanup
-/// pause keeps only its own message; the capacity wording of the carrier error
-/// would misreport it.
+/// Keep a non-capacity pause reason from inheriting the carrier's capacity wording.
 fn decommission_pause_reason(err: &Error) -> String {
-    source_cleanup_blocked_message(err).map_or_else(|| err.to_string(), str::to_owned)
+    specific_decommission_blocked_message(err).map_or_else(|| err.to_string(), str::to_owned)
 }
 
-/// The source cleanup pause message of `err`, seen through stage wrappers the
-/// same way `is_decommission_capacity_blocked_error` sees through them.
-fn source_cleanup_blocked_message(err: &Error) -> Option<&str> {
+/// Find a specific pause reason through the same stage wrappers as capacity errors.
+fn specific_decommission_blocked_message(err: &Error) -> Option<&str> {
     match err {
-        Error::DecommissionCapacityBlocked { message } if message.starts_with(DECOMMISSION_SOURCE_CLEANUP_BLOCKED) => {
+        Error::DecommissionCapacityBlocked { message }
+            if message.starts_with(DECOMMISSION_SOURCE_CLEANUP_BLOCKED)
+                || message.starts_with(DECOMMISSION_TARGET_PREPARATION_LOCK_BLOCKED) =>
+        {
             Some(message.as_str())
         }
-        _ => data_movement::data_movement_stage_source(err).and_then(source_cleanup_blocked_message),
+        _ => data_movement::data_movement_stage_source(err).and_then(specific_decommission_blocked_message),
     }
 }
 
@@ -5786,7 +5806,10 @@ enum DecommissionEntryOutcome {
 /// version and the next attempt copies it again. Every other failure stays
 /// terminal.
 fn resolve_decommission_entry_failure(err: Error) -> Result<DecommissionEntryOutcome> {
-    if is_decommission_source_cleanup_retryable_error(&err) || is_decommission_copy_quorum_deferral(&err) {
+    if is_decommission_source_cleanup_retryable_error(&err)
+        || is_decommission_copy_quorum_deferral(&err)
+        || data_movement::data_movement_stage_source_as::<DecommissionPreparePutLockTimeout>(&err).is_some()
+    {
         return Ok(DecommissionEntryOutcome::Deferred(err));
     }
     match classify_decommission_capacity_failure(&err) {
@@ -18482,6 +18505,11 @@ impl ECStore {
                     failure = true;
                     source_read_failed = false;
                     if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                        // Target preparation has not started the write; a timed-out
+                        // acquisition can be retried without cleaning the source.
+                        if data_movement::is_data_movement_prepare_put_lock_timeout(&err) {
+                            return Err(decommission_prepare_put_lock_deferral(err));
+                        }
                         error!(
                             event = EVENT_DECOMMISSION_ENTRY,
                             component = LOG_COMPONENT_ECSTORE,
@@ -27892,6 +27920,124 @@ mod tests {
         let target = fixture.target_versions().await.expect("the marker must reach the target");
         assert_eq!(target.versions.len(), 1);
         assert!(target.versions[0].deleted);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_defers_target_lookup_lock_timeout_and_retries_without_losing_source() {
+        use tokio::io::AsyncReadExt as _;
+
+        let fixture = NullVersionDecommission::new(NullVersionTop::NewerVersion).await;
+        let object = fixture.object;
+        let injected = Arc::new(AtomicUsize::new(0));
+        let attempted = Arc::new(AtomicUsize::new(0));
+        let fault = DecommissionTestFaultGuard::install_with_error(
+            Arc::new({
+                let injected = Arc::clone(&injected);
+                let attempted = Arc::clone(&attempted);
+                move |stage, _, faulted, _, success| {
+                    let target = stage == "before_target_commit" && faulted == object && success;
+                    let should_inject = target && attempted.fetch_add(1, Ordering::SeqCst) > 0;
+                    if should_inject {
+                        injected.fetch_add(1, Ordering::SeqCst);
+                    }
+                    should_inject
+                }
+            }),
+            Some(Arc::new(|_, bucket, object| {
+                data_movement::data_movement_stage_error_for_test(
+                    "decommission_object",
+                    "prepare_put_object",
+                    bucket,
+                    object,
+                    Error::Lock(rustfs_lock::LockError::timeout(
+                        format!("{bucket}/{object}@latest"),
+                        std::time::Duration::from_secs(5),
+                    )),
+                )
+            })),
+        );
+        let (outcome, _) = fixture.run_entry().await;
+        assert_eq!(injected.load(Ordering::SeqCst), DECOMMISSION_VERSION_COPY_ATTEMPTS);
+        fixture.assert_source_retained().await;
+        assert_eq!(
+            fixture
+                .target_versions()
+                .await
+                .expect("the first version was copied")
+                .versions
+                .len(),
+            1,
+            "one version must commit before the next version times out"
+        );
+        assert!(matches!(outcome, DecommissionEntryOutcome::Deferred(_)), "{outcome:?}");
+        assert_eq!(
+            fixture.store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("active decommission")
+                .items_decommission_failed,
+            0,
+            "a deferred entry must not be counted as a permanent failure"
+        );
+        drop(fault);
+        let (outcome, _) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        fixture.assert_moved().await;
+        let mut reader = fixture.store.pools[1]
+            .get_object_reader(
+                fixture.bucket,
+                fixture.object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(fixture.seeded.versions[0].version_id.expect("newer version").to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the newer version must remain readable");
+        let mut actual = Vec::new();
+        reader.stream.read_to_end(&mut actual).await.expect("read the newer version");
+        assert_eq!(actual, b"written after versioning was enabled");
+    }
+
+    #[test]
+    fn decommission_defers_only_prepare_put_lock_timeouts() {
+        let timeout = || Error::Lock(rustfs_lock::LockError::timeout("bucket/object", std::time::Duration::from_secs(5)));
+        let wrapped =
+            |stage, error| data_movement::data_movement_stage_error_for_test("decommission_object", stage, "b", "o", error);
+        assert!(data_movement::is_data_movement_prepare_put_lock_timeout(&wrapped(
+            "prepare_put_object",
+            timeout()
+        )));
+        assert!(!data_movement::is_data_movement_prepare_put_lock_timeout(&wrapped(
+            "put_object",
+            timeout()
+        )));
+        assert!(!data_movement::is_data_movement_prepare_put_lock_timeout(&timeout()));
+        assert!(!data_movement::is_data_movement_prepare_put_lock_timeout(&wrapped(
+            "prepare_put_object",
+            Error::NamespaceLockQuorumUnavailable {
+                mode: "write",
+                bucket: "bucket".into(),
+                object: "object".into(),
+                required: 2,
+                achieved: 1,
+            },
+        )));
+        let deferred = decommission_prepare_put_lock_deferral(wrapped("prepare_put_object", timeout()));
+        let mut recorded = None;
+        record_decommission_deferral_cause(&mut recorded, &deferred);
+        let reason = recorded.as_ref().map(|(_, reason)| reason.as_str());
+        let blocked = ensure_decommission_deferred_drained("b", 0, 1, reason).expect_err("unresolved entry");
+        let reason = decommission_pause_reason(&blocked);
+        assert!(reason.starts_with(DECOMMISSION_TARGET_PREPARATION_LOCK_BLOCKED), "{reason}");
+        assert!(!reason.contains("free drive threshold"), "{reason}");
+        assert!(matches!(
+            resolve_decommission_entry_failure(deferred),
+            Ok(DecommissionEntryOutcome::Deferred(_))
+        ));
     }
 
     /// The null version is committed to the target but the copy reports a
