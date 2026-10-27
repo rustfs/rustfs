@@ -2282,13 +2282,22 @@ impl HealManager {
             None
         };
 
+        let scanner_queued_owner_required = request.source == HealRequestSource::Scanner
+            && mrf_notice_target.is_none()
+            && request.expected_mrf_bucket_incarnation_id.is_none();
         let duplicate = (!request.force_start && rejection.is_none()).then(|| {
             active_heal_for_dedup_key(&active_heals, &dedup_key)
                 .map(|(task_id, _)| (task_id, "active"))
                 .or_else(|| {
-                    queue
-                        .queued_request_id_for_dedup_key(&dedup_key)
-                        .map(|queued_id| (queued_id.to_string(), "queued"))
+                    let queued_id = if scanner_queued_owner_required {
+                        queue.scanner_queued_request_id_for_dedup_key(&dedup_key)
+                    } else {
+                        queue.queued_request_id_for_dedup_key(&dedup_key)
+                    };
+                    queued_id.map(|queued_id| (queued_id.to_string(), "queued")).or_else(|| {
+                        (scanner_queued_owner_required && queue.dedup_keys.contains_key(&dedup_key))
+                            .then(|| (request.id.clone(), "queued_owner_unknown"))
+                    })
                 })
                 .or_else(|| retrying_heal_for_dedup_key(&retrying_heals, &dedup_key).map(|(task_id, _)| (task_id, "retrying")))
         });
@@ -2296,12 +2305,12 @@ impl HealManager {
             // HS-06: under the minio_error overlap policy an exact duplicate
             // admin start reports the typed AlreadyRunning rejection instead
             // of the silent merge (MinIO's ErrHealAlreadyRunning).
-            let mut admission = if (request.source == HealRequestSource::Admin
-                && config.overlap_policy == HealOverlapPolicy::MinioError)
+            let mut admission = if duplicate_state == "queued_owner_unknown"
+                || (request.source == HealRequestSource::Admin && config.overlap_policy == HealOverlapPolicy::MinioError)
                 || (duplicate_state != "queued" && mrf_notice_target.as_ref().is_some_and(|target| target.kind.is_durable()))
             {
-                // A running/retrying task may have observed the object before
-                // this write committed. Its receipt cannot prove the new lease.
+                // An unknown queued owner cannot certify a receipt. A running or
+                // retrying task may have observed the object before this write.
                 HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
             } else {
                 Self::duplicate_admission_for_request(&request, &config)
@@ -2514,10 +2523,17 @@ impl HealManager {
                 .remove(&request_id, &request_heal_type, request_source)
                 .await?;
         }
-        if admission == HealAdmissionResult::Merged
-            && let Some(queued_id) = queue.queued_request_id_for_dedup_key(&dedup_key)
-        {
-            task_id = queued_id.to_owned();
+        if admission == HealAdmissionResult::Merged {
+            let queued_id = if scanner_queued_owner_required {
+                queue.scanner_queued_request_id_for_dedup_key(&dedup_key)
+            } else {
+                queue.queued_request_id_for_dedup_key(&dedup_key)
+            };
+            if let Some(queued_id) = queued_id {
+                task_id = queued_id.to_owned();
+            } else if scanner_queued_owner_required {
+                return Err(Error::Other("Scanner queued owner is unavailable".to_owned()));
+            }
         }
         let should_notify = matches!(admission, HealAdmissionResult::Accepted) && config.event_driven_scheduler_enable;
         let displaced_task_id = admission_decision.displaced_task_id().map(ToOwned::to_owned);
