@@ -2913,6 +2913,44 @@ fn mrf_task_for_item(object: &str, item: HealResultItem) -> (HealTask, Arc<MockS
 }
 
 #[tokio::test]
+async fn durable_mrf_slowdown_remains_retryable_without_a_storage_receipt() {
+    let (task, storage) = mrf_task_for_item("object", HealResultItem::default());
+    *storage.heal_object_outcome.lock().unwrap() = Some(MockHealObjectOutcome::RetryableSlowDown);
+
+    let error = task
+        .execute()
+        .await
+        .expect_err("a failed repair cannot discharge the responsibility");
+    assert!(matches!(error, Error::Storage(EcstoreError::SlowDown)), "{error:?}");
+    assert!(error.is_recoverable_heal());
+    assert_eq!(task.get_outcome().await.counters.healed, 0);
+}
+
+#[tokio::test]
+async fn durable_mrf_grace_remains_owned_by_the_responsibility() {
+    let (task, storage) = mrf_task_for_item("object", HealResultItem::default());
+    *storage.heal_object_outcome.lock().unwrap() = Some(MockHealObjectOutcome::DanglingGraceDeferred);
+
+    let error = task.execute().await.expect_err("grace must retain the responsibility");
+    assert!(error.is_dangling_delete_grace());
+    assert!(!error.is_recoverable_heal());
+    assert_eq!(task.get_outcome().await.counters.healed, 0);
+}
+
+#[tokio::test]
+async fn durable_mrf_unverified_object_names_cannot_change_retry_classification() {
+    for object in ["ordinary", "timed out", "network error"] {
+        let (task, _) = mrf_task_for_item(object, HealResultItem::default());
+        let error = task
+            .execute()
+            .await
+            .expect_err("missing proof must retain the responsibility");
+        assert!(!error.is_recoverable_heal(), "object name must not change retry classification: {object}");
+        assert_eq!(task.get_outcome().await.counters.healed, 0);
+    }
+}
+
+#[tokio::test]
 async fn mrf_legacy_object_names_cannot_change_retry_classification() {
     for object in [
         "ordinary",
