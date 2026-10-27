@@ -4456,6 +4456,7 @@ mod test {
                 .expect("seed literal object");
         }
         let mut marker = None;
+        let mut v1_marker = None;
         let mut key_marker = None;
         let mut version_marker = None;
         for (index, key) in keys.into_iter().enumerate() {
@@ -4468,6 +4469,18 @@ mod test {
             assert_eq!(page.is_truncated, index + 1 < keys.len());
             marker = page.next_continuation_token;
 
+            // ListObjects (V1) returns the same cursor as NextMarker and the
+            // client sends it back as `marker`, which reaches this layer as
+            // StartAfter.
+            let v1_page = store
+                .clone()
+                .inner_list_objects_v2(bucket, "", None, None, 1, false, v1_marker, false)
+                .await
+                .expect("list next object through the V1 marker path");
+            assert_eq!(v1_page.objects.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(), [key]);
+            assert_eq!(v1_page.is_truncated, index + 1 < keys.len());
+            v1_marker = v1_page.next_continuation_token;
+
             let versions = store
                 .clone()
                 .inner_list_object_versions(bucket, "", key_marker, version_marker, None, 1)
@@ -4479,6 +4492,7 @@ mod test {
             version_marker = versions.next_version_idmarker;
         }
         assert!(marker.is_none());
+        assert!(v1_marker.is_none());
         assert!(key_marker.is_none());
     }
 

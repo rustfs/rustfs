@@ -396,9 +396,12 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
         .as_deref()
         .and_then(|token| decode_list_objects_v2_continuation_token(token).ok())
     {
-        // Only cache-shaped literal keys carry this server-generated escape.
-        let marker = marker.strip_suffix("[rustfs_cache:v2,return:]").unwrap_or(&marker);
-        return Some(encode_list_output_value(marker.to_owned(), v2.encoding_type.as_ref()));
+        // Keep the escape that wraps cache-shaped literal keys: a V1 client
+        // sends NextMarker back as `marker`, and the listing layer strips one
+        // legacy cursor tag from it while that compatibility window is open.
+        // Unwrapping it here would make the next page restart at the key's
+        // stem and return the same key forever.
+        return Some(encode_list_output_value(marker, v2.encoding_type.as_ref()));
     }
 
     let last_key = v2
@@ -584,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn test_list_objects_next_marker_unwraps_only_the_literal_key_escape() {
+    fn test_list_objects_next_marker_keeps_the_literal_key_escape() {
         let key = "key[rustfs_cache:v2,return:]";
         let cursor = format!("{key}[rustfs_cache:v2,return:]");
         let v2 = ListObjectsV2Output {
@@ -593,7 +596,9 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(build_list_objects_output(v2, None).next_marker.as_deref(), Some(key));
+        // The client sends this back as `marker`; the listing layer strips the
+        // outer escape and resumes after the literal key.
+        assert_eq!(build_list_objects_output(v2, None).next_marker.as_deref(), Some(cursor.as_str()));
     }
 
     #[test]
