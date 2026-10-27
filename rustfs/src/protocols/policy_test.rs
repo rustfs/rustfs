@@ -776,7 +776,7 @@ fn protocol_session_bucket_listing_revalidates_the_session_key() {
 
         let after_disable = list().await;
         assert!(
-            matches!(&after_disable, Err(e) if *e.code() == s3s::S3ErrorCode::AccessDenied),
+            matches!(&after_disable, Err(e) if e.code().as_str() == "AccessDenied"),
             "a key disabled after login must stop listing buckets: {after_disable:?}"
         );
     });
