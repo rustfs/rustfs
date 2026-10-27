@@ -100,7 +100,7 @@ their issue closes.
 | Entry | Status | Purpose | Wiring / docs |
 |---|---|---|---|
 | `run_hotpath_warp_ab.sh` | dev-tool | Linux warp A/B rig for the hotpath series (quick local A/B) | `docs/operations/hotpath-warp-ab-runbook.md` |
-| `run_hotpath_warp_abba.sh` | ci-gate | Formal ABBA warp runner (baseline/candidate interleaved, `--rounds >= 3`); the runner performance-ab.yml executes | performance-ab.yml (scheduled); `docs/operations/hotpath-warp-ab-runbook.md` |
+| `run_hotpath_warp_abba.sh` | dev-tool | Formal ABBA warp runner (baseline/candidate interleaved, `--rounds >= 3`) | `docs/operations/hotpath-warp-ab-runbook.md` |
 | `hotpath_warp_ab_gate.sh` | dev-tool | Relative-budget gate evaluated over the warp A/B results | used by `run_hotpath_warp_ab.sh`; hotpath runbook |
 | `run_internode_grpc_ab_bench.sh` | dev-tool | One-click A/B driver for the internode gRPC optimization stages | `docs/operations/internode-grpc-benchmark-runbook.md` |
 | `run_internode_transport_baseline.sh` | dev-tool | Internode transport baseline runner | internode runbook; `crates/io-metrics/README.md` |

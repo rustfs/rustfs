@@ -29,7 +29,6 @@ on:
       - 'scripts/test_package_service_scripts.sh'
       - 'scripts/test_package_versions.sh'
       - 'scripts/test_docker_workflow.py'
-      - 'scripts/security/check_performance_ab_workflow.sh'
       - 'scripts/security/check_preview_release_workflow.sh'
       - 'scripts/security/check_tier_artifact_workflow.sh'
       - 'scripts/security/check_workflow_pins.sh'
@@ -48,7 +47,6 @@ on:
       - 'scripts/test_package_service_scripts.sh'
       - 'scripts/test_package_versions.sh'
       - 'scripts/test_docker_workflow.py'
-      - 'scripts/security/check_performance_ab_workflow.sh'
       - 'scripts/security/check_preview_release_workflow.sh'
       - 'scripts/security/check_tier_artifact_workflow.sh'
       - 'scripts/security/check_workflow_pins.sh'
@@ -154,9 +152,6 @@ jobs:
 
       - name: Check preview release workflow policy
         run: ./scripts/security/check_preview_release_workflow.sh
-
-      - name: Check performance A/B workflow trust boundary
-        run: ./scripts/security/check_performance_ab_workflow.sh
 
       - name: Check tier evidence workflow isolation
         run: ./scripts/security/check_tier_artifact_workflow.sh
