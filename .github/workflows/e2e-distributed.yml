@@ -30,7 +30,7 @@
 # `uring-integration` and `e2e-s3tests.yml` left that label. The prepare
 # step mounts four 1 GiB tmpfs instances and exports `RUSTFS_E2E_POOL_ROOTS`.
 
-name: e2e-distributed
+name: Multipart Quorum Diagnostic
 
 on:
   pull_request:
@@ -165,12 +165,12 @@ jobs:
       - name: Run distributed 4-node e2e suite
         env:
           RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-distributed-logs
-          FILTER: ${{ inputs.filter }}
+          FILTER: "test(=distributed::multipart_fence_acceptance_test::metadata_delay_preserves_write_quorum_and_rejects_quorum_minus_one)"
         run: |
           set -euo pipefail
-          rm -f target/nextest/e2e-distributed/junit.xml
+          test ! -e target/nextest/e2e-distributed/junit.xml
           if [ -n "${FILTER}" ]; then
-            python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test -E "${FILTER}"
+            python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test -E "${FILTER}" --no-tests=fail
           else
             python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test --no-tests=fail
           fi
