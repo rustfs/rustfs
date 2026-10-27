@@ -606,7 +606,16 @@ impl SetDisks {
         let (online_disks, mod_time, etag) = Self::list_online_disks(disks, parts_metadata, errs, read_quorum);
         let (fi, copies) = Self::find_file_info_in_quorum_counted(parts_metadata, &mod_time, &etag, read_quorum)?;
         if !fi.deleted && !fi.is_remote() && fi.size > 0 && copies < fi.erasure.data_blocks {
-            return Err(DiskError::ErasureReadQuorum);
+            // The shortcut counts byte-identical copies only; count every copy
+            // of the content identity before refusing the version.
+            let identity = Self::file_info_quorum_hash(&fi);
+            let copies = parts_metadata
+                .iter()
+                .filter(|meta| file_info_is_valid_for_metadata(meta) && Self::file_info_quorum_hash(meta) == identity)
+                .count();
+            if copies < fi.erasure.data_blocks {
+                return Err(DiskError::ErasureReadQuorum);
+            }
         }
 
         Ok((online_disks, fi))

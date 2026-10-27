@@ -12027,6 +12027,22 @@ mod tests {
         let (_, selected) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2)
             .expect("three copies decode a 3+1 version");
         assert_eq!(selected.mod_time, Some(new_mod_time));
+
+        // Replication-status drift does not change the content identity, so
+        // the drifted copy still counts toward the version's data blocks.
+        let replication_status_key = format!(
+            "{}{}",
+            rustfs_utils::http::RUSTFS_INTERNAL_PREFIX,
+            rustfs_utils::http::SUFFIX_REPLICATION_STATUS
+        );
+        let mut drifted = new(4);
+        drifted
+            .metadata
+            .insert(replication_status_key, "target-a=PENDING;".to_string());
+        let metas = vec![old(1), new(2), new(3), drifted];
+        let (_, selected) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2)
+            .expect("a replication-status drift still leaves three copies of the version");
+        assert_eq!(selected.mod_time, Some(new_mod_time));
     }
 
     #[tokio::test]
