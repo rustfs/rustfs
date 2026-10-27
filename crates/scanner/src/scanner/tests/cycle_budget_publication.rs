@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::storage_api::scan::ScannerPublicationLeaseFailureInfo;
 use rustfs_utils::path::path_join_buf;
 
 #[derive(Clone)]
@@ -273,9 +274,9 @@ async fn exercise_interleaved_lease_waits() {
     // Verify event serialization independently of the ecstore tests that
     // exercise the local and remote error producers.
     for cycle in [606, 607, 608] {
-        let info: for<'a> fn(&'a String) -> Option<crate::storage_api::ScannerPublicationLeaseFailureInfo<'a>> = if cycle == 607 {
+        let info: for<'a> fn(&'a String) -> Option<ScannerPublicationLeaseFailureInfo<'a>> = if cycle == 607 {
             |_| {
-                Some(crate::storage_api::ScannerPublicationLeaseFailureInfo {
+                Some(ScannerPublicationLeaseFailureInfo {
                     peer: None,
                     kind: "peer_request_failed",
                     reason: None,
@@ -284,7 +285,7 @@ async fn exercise_interleaved_lease_waits() {
             }
         } else if cycle == 606 {
             |_| {
-                Some(crate::storage_api::ScannerPublicationLeaseFailureInfo {
+                Some(ScannerPublicationLeaseFailureInfo {
                     peer: None,
                     kind: "peer_request_failed",
                     reason: Some("invalid_proof"),
@@ -293,7 +294,7 @@ async fn exercise_interleaved_lease_waits() {
             }
         } else {
             |_| {
-                Some(crate::storage_api::ScannerPublicationLeaseFailureInfo {
+                Some(ScannerPublicationLeaseFailureInfo {
                     peer: None,
                     kind: "peer_request_failed",
                     reason: Some("channel_acquisition_timed_out"),
