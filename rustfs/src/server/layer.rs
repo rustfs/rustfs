@@ -73,6 +73,10 @@ const HTTP_REQUEST_INFLIGHT_SLOW_EVENT: &str = "http_request_inflight_slow";
 const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
 const REDACTED_QUERY_VALUE: &str = "redacted";
+#[cfg(feature = "diagnostic-local-batch")]
+type BatchDiagnosticRequest = Option<Arc<str>>;
+#[cfg(not(feature = "diagnostic-local-batch"))]
+type BatchDiagnosticRequest = ();
 const OBJECT_ZIP_DOWNLOADS_PATH: &str = "/v3/object-zip-downloads/";
 const HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 static HTTP_SERVER_ERROR_LOGS: [rustfs_utils::LogThrottle; 100] = [const { rustfs_utils::LogThrottle::new(5_000) }; 100];
@@ -285,6 +289,12 @@ where
         } else {
             req.headers().get(REQUEST_ID_HEADER).cloned()
         };
+        #[cfg(feature = "diagnostic-local-batch")]
+        let diagnostic_request = is_s3
+            .then(|| rustfs_ecstore::batch_read_diagnostics::request_context(&request_context.request_id))
+            .flatten();
+        #[cfg(not(feature = "diagnostic-local-batch"))]
+        let diagnostic_request = ();
         req.extensions_mut().insert(request_context);
 
         // This outer boundary includes readiness, rate-limit and auth
@@ -300,6 +310,13 @@ where
             .flatten();
         let head_request = req.method() == Method::HEAD;
         let mut metrics = is_s3.then(|| s3_http_request_guard(req.method().as_str()));
+        #[cfg(feature = "diagnostic-local-batch")]
+        let inner =
+            rustfs_ecstore::batch_read_diagnostics::in_request_context(diagnostic_request.as_ref(), || match metrics.as_mut() {
+                Some(metrics) => metrics.in_scope(|| self.inner.call(req)),
+                None => self.inner.call(req),
+            });
+        #[cfg(not(feature = "diagnostic-local-batch"))]
         let inner = match metrics.as_mut() {
             Some(metrics) => metrics.in_scope(|| self.inner.call(req)),
             None => self.inner.call(req),
@@ -309,6 +326,7 @@ where
         }
         ExternalRequestContextFuture {
             inner,
+            diagnostic_request,
             request_id,
             is_s3,
             metrics,
@@ -358,6 +376,7 @@ pin_project! {
     pub struct ExternalRequestContextFuture<F> {
         #[pin]
         inner: F,
+        diagnostic_request: BatchDiagnosticRequest,
         request_id: Option<HeaderValue>,
         is_s3: bool,
         metrics: Option<S3HttpRequestGuard>,
@@ -374,6 +393,15 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
+        #[cfg(feature = "diagnostic-local-batch")]
+        let result = rustfs_ecstore::batch_read_diagnostics::in_request_context(this.diagnostic_request.as_ref(), || match this
+            .metrics
+            .as_mut()
+        {
+            Some(metrics) => metrics.in_scope(|| this.inner.poll(cx)),
+            None => this.inner.poll(cx),
+        });
+        #[cfg(not(feature = "diagnostic-local-batch"))]
         let result = match this.metrics.as_mut() {
             Some(metrics) => metrics.in_scope(|| this.inner.poll(cx)),
             None => this.inner.poll(cx),
@@ -2608,6 +2636,92 @@ fn rewrite_double_slash_root(uri: &Uri) -> Option<Uri> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "diagnostic-local-batch")]
+    #[test]
+    fn diagnostic_external_request_uses_server_id_not_client_header() {
+        const CHILD: &str = "RUSTFS_TEST_BATCH_REQUEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .args([
+                    "--exact",
+                    "server::layer::tests::diagnostic_external_request_uses_server_id_not_client_header",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("RUSTFS_DIAGNOSTIC_LOCAL_BATCH_SAMPLE_EVERY", "1")
+                .status()
+                .expect("run isolated request correlation test");
+            assert!(status.success(), "isolated request correlation test failed");
+            return;
+        }
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let inner = tower::service_fn(|request: HttpRequest<Full<Bytes>>| {
+                let context = request
+                    .extensions()
+                    .get::<RequestContext>()
+                    .expect("canonical request context");
+                let expected = context.request_id.clone();
+                assert_ne!(expected, "client-controlled-id");
+                assert_eq!(
+                    rustfs_ecstore::batch_read_diagnostics::current_request_id().as_deref(),
+                    Some(expected.as_str())
+                );
+                async move {
+                    assert_eq!(
+                        rustfs_ecstore::batch_read_diagnostics::current_request_id().as_deref(),
+                        Some(expected.as_str())
+                    );
+                    Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::new())))
+                }
+            });
+            let mut service = ExternalRequestContextLayer::new(false).layer(inner);
+            let request = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("/diagnostic-bucket/object")
+                .header(REQUEST_ID_HEADER, "client-controlled-id")
+                .body(Full::new(Bytes::new()))
+                .expect("test request");
+            let response = futures::executor::block_on(service.call(request)).expect("correlated response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(rustfs_ecstore::batch_read_diagnostics::current_request_id().is_none());
+        });
+    }
+
+    #[cfg(feature = "diagnostic-local-batch")]
+    #[test]
+    fn diagnostic_request_scope_is_present_on_every_poll_and_restored() {
+        let mut polls = 0;
+        let inner = std::future::poll_fn(|cx| {
+            assert_eq!(
+                rustfs_ecstore::batch_read_diagnostics::current_request_id().as_deref(),
+                Some("server-owned-test")
+            );
+            polls += 1;
+            if polls == 1 {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok::<_, std::convert::Infallible>(Response::new(http_body_util::Full::new(Bytes::new()))))
+            }
+        });
+        let future = ExternalRequestContextFuture {
+            inner,
+            diagnostic_request: Some(Arc::from("server-owned-test")),
+            request_id: None,
+            is_s3: false,
+            metrics: None,
+            feedback: None,
+            head_request: false,
+        };
+        let response = futures::executor::block_on(future).expect("diagnostic request future");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(polls, 2);
+        assert!(rustfs_ecstore::batch_read_diagnostics::current_request_id().is_none());
+    }
     #[tokio::test]
     async fn foreground_feedback_unobserved_body_is_a_direct_passthrough() {
         struct EndProbe(Full<Bytes>);

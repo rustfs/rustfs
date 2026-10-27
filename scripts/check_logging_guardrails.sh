@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 checked_files=(
+  "crates/ecstore/src/batch_read_diagnostics.rs"
   "rustfs/src/main.rs"
   "rustfs/src/startup_entrypoint.rs"
   "rustfs/src/init.rs"

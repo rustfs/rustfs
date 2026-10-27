@@ -33,6 +33,8 @@ macro_rules! hp_guard {
 }
 
 pub mod api;
+#[cfg(feature = "diagnostic-local-batch")]
+pub mod batch_read_diagnostics;
 mod bucket;
 mod cache_value;
 mod cluster;

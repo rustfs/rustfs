@@ -11309,33 +11309,80 @@ impl LocalDisk {
 #[cfg(unix)]
 pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, usize)>) -> Vec<Result<Bytes>> {
     let n = requests.len();
+    #[cfg(feature = "diagnostic-local-batch")]
+    let diagnostic = crate::batch_read_diagnostics::Sample::capture();
     tokio::task::spawn_blocking(move || {
         use std::os::unix::fs::FileExt;
 
+        // The disabled build expands directly to the original operation.
+        macro_rules! diagnostic_stage {
+            ($stage:ident, $index:expr, $operation:expr) => {{
+                #[cfg(feature = "diagnostic-local-batch")]
+                {
+                    crate::batch_read_diagnostics::measure(
+                        diagnostic.as_ref(),
+                        crate::batch_read_diagnostics::Stage::$stage,
+                        $index,
+                        $operation,
+                    )
+                }
+                #[cfg(not(feature = "diagnostic-local-batch"))]
+                {
+                    $operation()
+                }
+            }};
+        }
+        #[cfg(feature = "diagnostic-local-batch")]
+        let _dispatch = diagnostic
+            .as_ref()
+            .map(|sample| tracing::dispatcher::set_default(sample.dispatch()));
+        #[cfg(feature = "diagnostic-local-batch")]
+        let execution = diagnostic.as_ref().map(|sample| {
+            sample.worker_started();
+            sample.start()
+        });
         let mut results = Vec::with_capacity(n);
-        for (file_path, offset, length) in requests {
+        for (_index, (file_path, offset, length)) in requests.into_iter().enumerate() {
+            let mut total = 0usize;
             let r = (|| -> Result<Bytes> {
-                let meta = std::fs::metadata(&file_path).map_err(DiskError::from)?;
+                let meta = diagnostic_stage!(Metadata, _index, || std::fs::metadata(&file_path).map_err(DiskError::from))?;
                 let end = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
                 if meta.len() < u64::try_from(end).unwrap_or(u64::MAX) {
                     return Err(DiskError::FileCorrupt);
                 }
 
-                let file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
-                let mut buf = vec![0u8; length];
-                let mut total = 0usize;
-                while total < length {
-                    let nbytes = file
-                        .read_at(&mut buf[total..], u64::try_from(offset + total).unwrap_or(u64::MAX))
-                        .map_err(DiskError::from)?;
-                    if nbytes == 0 {
-                        return Err(DiskError::FileCorrupt);
-                    }
-                    total += nbytes;
+                let file = diagnostic_stage!(Open, _index, || std::fs::File::open(&file_path).map_err(DiskError::from))?;
+                let mut buf = diagnostic_stage!(Allocation, _index, || Ok::<_, DiskError>(vec![0u8; length]))?;
+                if length > 0 {
+                    diagnostic_stage!(Read, _index, || {
+                        while total < length {
+                            let nbytes = file
+                                .read_at(&mut buf[total..], u64::try_from(offset + total).unwrap_or(u64::MAX))
+                                .map_err(DiskError::from)?;
+                            if nbytes == 0 {
+                                return Err(DiskError::FileCorrupt);
+                            }
+                            total += nbytes;
+                        }
+                        Ok::<_, DiskError>(())
+                    })?;
                 }
                 Ok(Bytes::from(buf))
             })();
+            #[cfg(feature = "diagnostic-local-batch")]
+            if let Some(sample) = &diagnostic {
+                sample.shard_result(_index, length, total, r.is_ok());
+            }
             results.push(r);
+        }
+        #[cfg(feature = "diagnostic-local-batch")]
+        if let (Some(sample), Some(started)) = (&diagnostic, execution) {
+            sample.finish(
+                crate::batch_read_diagnostics::Stage::Execution,
+                None,
+                started,
+                results.iter().all(Result::is_ok),
+            );
         }
         results
     })
