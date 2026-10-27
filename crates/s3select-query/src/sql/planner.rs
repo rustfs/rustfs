@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{convert::Infallible, ops::ControlFlow};
+use std::{collections::HashMap, convert::Infallible, ops::ControlFlow};
 
 use async_trait::async_trait;
 use datafusion::sql::{
     planner::{IdentNormalizer, SqlToRel},
     sqlparser::ast::{
-        AccessExpr, Expr, GroupByExpr, Ident, JsonPath, JsonPathElem, ObjectNamePart, OrderByKind, Query, Select, SelectFlavor,
-        SetExpr, Statement, Subscript, TableAlias, TableFactor, Value, Visit, VisitMut, Visitor, VisitorMut,
+        AccessExpr, Expr, GroupByExpr, Ident, JsonPath, JsonPathElem, ObjectNamePart, OrderBy, OrderByKind, Query, Select,
+        SelectFlavor, SelectItem, SetExpr, Statement, Subscript, TableAlias, TableFactor, Value, Visit, VisitMut, Visitor,
+        VisitorMut, visit_expressions,
     },
 };
 use rustfs_s3select_api::{
@@ -150,7 +151,99 @@ pub(crate) fn prepare_s3_select_statement(statement: &mut Statement) -> QueryRes
     };
     let mut normalizer = PartiQlSubscriptNormalizer;
     let _ = VisitMut::visit(query, &mut normalizer);
+    if let SetExpr::Select(select) = query.body.as_mut() {
+        alias_path_projections(select, query.order_by.as_ref());
+    }
     Ok(source)
+}
+
+/// Names an unaliased path projection after its last key, as AWS does
+/// (`s.obj0.id` -> `id`), instead of DataFusion's `s.obj0[id]`. Names that
+/// could collide with another output name keep DataFusion's name. Wildcard
+/// columns are unknown here, so a wildcard disables aliasing; ORDER BY columns
+/// count because DataFusion adds missing sort columns to the projection.
+fn alias_path_projections(select: &mut Select, order_by: Option<&OrderBy>) {
+    if select
+        .projection
+        .iter()
+        .any(|item| matches!(item, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)))
+    {
+        return;
+    }
+    let normalizer = IdentNormalizer::default();
+    let qualifier = match select.from.first().map(|table| &table.relation) {
+        Some(TableFactor::Table { alias: Some(alias), .. }) => normalizer.normalize(alias.name.clone()),
+        Some(TableFactor::Table { name, .. }) => match name.0.first() {
+            Some(ObjectNamePart::Identifier(table_name)) => normalizer.normalize(table_name.clone()),
+            _ => return,
+        },
+        _ => return,
+    };
+    let names: Vec<Option<String>> = select
+        .projection
+        .iter()
+        .map(|item| {
+            let ident = match item {
+                SelectItem::UnnamedExpr(expr) => column_name(expr),
+                SelectItem::ExprWithAlias { alias, .. } => Some(alias),
+                _ => None,
+            };
+            ident.map(|ident| normalizer.normalize(ident.clone()))
+        })
+        .collect();
+    let mut counts = HashMap::<String, usize>::new();
+    for name in names.iter().flatten() {
+        *counts.entry(name.clone()).or_default() += 1;
+    }
+    if let Some(OrderBy {
+        kind: OrderByKind::Expressions(sort_exprs),
+        ..
+    }) = order_by
+    {
+        let projected = |expr: &Expr| {
+            select
+                .projection
+                .iter()
+                .any(|item| matches!(item, SelectItem::UnnamedExpr(projected) if projected == expr))
+        };
+        for sort_expr in sort_exprs.iter().filter(|sort_expr| !projected(&sort_expr.expr)) {
+            let _ = visit_expressions(&sort_expr.expr, |expr| {
+                if let Some(ident) = column_name(expr) {
+                    *counts.entry(normalizer.normalize(ident.clone())).or_default() += 1;
+                }
+                ControlFlow::<()>::Continue(())
+            });
+        }
+    }
+    for (item, name) in select.projection.iter_mut().zip(&names) {
+        let SelectItem::UnnamedExpr(expr) = item else {
+            continue;
+        };
+        let Expr::CompoundIdentifier(parts) = expr else {
+            continue;
+        };
+        let path = match parts.split_first() {
+            Some((first, rest)) if normalizer.normalize(first.clone()) == qualifier => rest,
+            _ => parts.as_slice(),
+        };
+        let unique = name.as_deref().is_some_and(|name| counts.get(name) == Some(&1));
+        if path.len() < 2 || !unique {
+            continue;
+        }
+        let alias = path[path.len() - 1].clone();
+        let expr = std::mem::replace(expr, Expr::Identifier(Ident::new("")));
+        *item = SelectItem::ExprWithAlias { expr, alias };
+    }
+}
+
+/// The output name DataFusion gives a column reference: its last part.
+fn column_name(expr: &Expr) -> Option<&Ident> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident),
+        Expr::CompoundIdentifier(parts) => parts.last(),
+        Expr::Nested(inner) => column_name(inner),
+        _ => None,
+    }
 }
 
 struct PartiQlSubscriptNormalizer;
@@ -593,6 +686,52 @@ mod tests {
                 ),
                 "query should reject an unsafe array index: {sql}"
             );
+        }
+    }
+
+    fn prepared(sql: &str) -> String {
+        let mut statement = parse_statement(sql);
+        prepare_s3_select_statement(&mut statement).expect("statement should be supported");
+        statement.to_string()
+    }
+
+    #[test]
+    fn unaliased_path_projections_are_named_after_their_last_key() {
+        for (sql, expected) in [
+            ("SELECT s.obj0.id FROM S3Object AS s", "SELECT s.obj0.id AS id FROM S3Object AS s"),
+            (
+                "SELECT s.a.b.c, s.x.\"Y\" FROM S3Object AS s",
+                "SELECT s.a.b.c AS c, s.x.\"Y\" AS \"Y\" FROM S3Object AS s",
+            ),
+            ("SELECT obj0.id FROM S3Object", "SELECT obj0.id AS id FROM S3Object"),
+            (
+                "SELECT s.obj0.id FROM S3Object AS s WHERE s.obj0.id = 'a' ORDER BY s.obj0.id",
+                "SELECT s.obj0.id AS id FROM S3Object AS s WHERE s.obj0.id = 'a' ORDER BY s.obj0.id",
+            ),
+        ] {
+            assert_eq!(prepared(sql), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn projections_keep_their_names_when_a_key_alias_is_absent_or_ambiguous() {
+        for sql in [
+            "SELECT s.id FROM S3Object AS s",
+            "SELECT S3Object.id FROM S3Object",
+            "SELECT s.tags[1] FROM S3Object AS s",
+            "SELECT s.obj0.id AS x FROM S3Object AS s",
+            "SELECT s.obj0.id, s.obj1.id FROM S3Object AS s",
+            "SELECT s.obj0.ID, s.obj1.id FROM S3Object AS s",
+            "SELECT s.obj0.id, s.id FROM S3Object AS s",
+            "SELECT s.obj0.id, s.name AS id FROM S3Object AS s",
+            "SELECT s.obj0.\"Id\", s.obj1.\"Id\" FROM S3Object AS s",
+            "SELECT *, s.obj0.id FROM S3Object AS s",
+            "SELECT s.*, s.obj0.id FROM S3Object AS s",
+            "SELECT s.obj0.id FROM S3Object AS s ORDER BY s.id",
+            "SELECT s.obj0.id FROM S3Object AS s ORDER BY upper(id)",
+            "SELECT s.obj0.id, (s.id) FROM S3Object AS s",
+        ] {
+            assert_eq!(prepared(sql), sql);
         }
     }
 

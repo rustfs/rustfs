@@ -1804,6 +1804,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn path_projections_are_named_after_their_last_key() {
+        const DATA: &[u8] = b"{\"obj0\":{\"id\":\"id0\",\"inner\":{\"Key\":1}}}\n";
+        for (sql, expected) in [
+            ("SELECT s.obj0.id, s.obj0.inner.\"Key\" FROM S3Object s", ["id", "Key"].as_slice()),
+            ("SELECT obj0.id FROM S3Object", &["id"]),
+            ("SELECT s.obj0.id FROM S3Object s ORDER BY s.obj0.id", &["id"]),
+            ("SELECT s.obj0.id, COUNT(*) FROM S3Object s GROUP BY s.obj0.id", &["id", "count(*)"]),
+        ] {
+            let schema = json_lines_plan_schema(DATA, sql).await;
+            assert_eq!(field_names(schema.fields()), expected, "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn path_projection_names_do_not_clash_with_other_columns() {
+        const DATA: &[u8] = b"{\"id\":\"top\",\"obj0\":{\"id\":\"id0\"}}\n";
+        for sql in ["SELECT *, s.obj0.id FROM S3Object s", "SELECT s.*, s.obj0.id FROM S3Object s"] {
+            let schema = json_lines_plan_schema(DATA, sql).await;
+            assert_eq!(field_names(schema.fields()), ["id", "obj0", "s.obj0[id]"], "{sql}");
+        }
+        for sql in [
+            "SELECT s.obj0.id FROM S3Object s ORDER BY s.id",
+            "SELECT s.obj0.id FROM S3Object s ORDER BY id",
+            "SELECT s.obj0.id FROM S3Object s ORDER BY upper(s.id)",
+        ] {
+            let schema = json_lines_plan_schema(DATA, sql).await;
+            assert_eq!(field_names(schema.fields()), ["s.obj0[id]"], "{sql}");
+        }
+        let schema = json_lines_plan_schema(DATA, "SELECT s.obj0.id, (s.id) FROM S3Object s").await;
+        assert_eq!(field_names(schema.fields()), ["s.obj0[id]", "id"]);
+    }
+
+    #[tokio::test]
     async fn csv_query_uses_custom_record_delimiter_across_file_partitions() {
         const ROW_COUNT: usize = 200_000;
 
