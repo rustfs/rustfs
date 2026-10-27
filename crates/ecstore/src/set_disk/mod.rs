@@ -6841,6 +6841,17 @@ impl SetDisks {
         Ok(())
     }
 
+    /// Whether any drive holds `version_id` of the key, including a copy on
+    /// fewer drives than read quorum that object reads report as absent.
+    pub(crate) async fn holds_version_on_any_drive(&self, bucket: &str, object: &str, version_id: Uuid) -> bool {
+        let disks = self.disk_inventory().await;
+        let (copies, _) = Self::read_all_raw_file_info(&disks, bucket, object, false).await;
+        copies
+            .iter()
+            .flatten()
+            .any(|copy| FileMeta::load(&copy.buf).is_ok_and(|meta| meta.find_version(Some(version_id)).is_ok()))
+    }
+
     /// Publish an internal tier free-version record without changing its
     /// delete-marker shape or remote-tier identity. The caller holds the
     /// source and target object locks; a write quorum is required before the

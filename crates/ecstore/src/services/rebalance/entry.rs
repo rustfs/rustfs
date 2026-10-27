@@ -1782,6 +1782,164 @@ mod tests {
         fixture.assert_moved().await;
     }
 
+    /// Drives of `object`'s set on `pool` whose `xl.meta` holds `version_id`.
+    #[cfg(feature = "test-util")]
+    async fn drives_holding_version(store: &ECStore, pool: usize, bucket: &str, object: &str, version_id: uuid::Uuid) -> usize {
+        use crate::disk::DiskAPI as _;
+        let set = store.pools[pool].get_disks_by_key(object);
+        let mut holding = 0;
+        for disk in set.disks.read().await.iter().flatten() {
+            let path = disk.path().join(bucket).join(object).join(crate::disk::STORAGE_FORMAT_FILE);
+            let Ok(bytes) = tokio::fs::read(&path).await else {
+                continue;
+            };
+            if FileMeta::load(&bytes).is_ok_and(|meta| meta.find_version(Some(version_id)).is_ok()) {
+                holding += 1;
+            }
+        }
+        holding
+    }
+
+    /// An earlier attempt that lost write quorum can leave a version on one
+    /// drive of a target pool. Object reads report such a copy as absent, so
+    /// a retry that placed the version on another pool left it in two pools
+    /// (the rebalance kill-resume e2e case). Each retry must reuse the pool
+    /// holding the copy: the delete marker's on pool 1, the object version's
+    /// on pool 2. Several keys keep a random placement from passing by chance.
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_retry_reuses_the_pool_holding_a_dangling_copy() {
+        run_large_stack_async_test("rebalance-dangling-target-copy", || async {
+            const REBALANCE_ID: &str = "rebalance-dangling-target-copy";
+            const KEYS: usize = 6;
+            let (_temp_dirs, store, _peer) =
+                crate::services::rebalance::test_three_pool_stores_with_four_disk_sets_with_isolated_node_contexts(None).await;
+            let bucket = "rebalance-dangling-target";
+            Box::pin(store.make_bucket(bucket, &MakeBucketOptions::default()))
+                .await
+                .expect("create bucket");
+            let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+            let mut rebalance_meta = active_rebalance_meta(REBALANCE_ID);
+            // Keep the run below its free-space goal so every key is migrated.
+            rebalance_meta.pool_stats[0].init_capacity = 1 << 50;
+            rebalance_meta.pool_stats.push(RebalanceStats::default());
+            rebalance_meta
+                .save(Arc::clone(&store.pools[0]))
+                .await
+                .expect("persist the active rebalance run");
+            *store.rebalance_meta.write().await = Some(rebalance_meta);
+            let versioned = ObjectOptions {
+                versioned: true,
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            };
+
+            for key in 0..KEYS {
+                let object = format!("versioned/{key:02}.bin");
+                let object = object.as_str();
+                let source_set = store.pools[0].get_disks_by_key(object);
+                Box::pin(source_set.put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x5a; 2048]), &versioned))
+                    .await
+                    .expect("seed the object version");
+                let marker = Box::pin(source_set.delete_object(bucket, object, versioned.clone()))
+                    .await
+                    .expect("seed the delete marker");
+                assert!(marker.delete_marker);
+                let seeded = source_set
+                    .load_file_info_versions_exact(bucket, object)
+                    .await
+                    .expect("read seeded versions")
+                    .expect("seeded versions must exist");
+                let [marker, version] = seeded.versions.as_slice() else {
+                    panic!("expected a delete marker over one version: {seeded:?}");
+                };
+                let marker_id = marker.version_id.expect("the marker has a version id");
+                let version_id = version.version_id.expect("the object version has a version id");
+
+                // The earlier attempt: the marker on pool 1 and the object
+                // version on pool 2, each left on one of four drives.
+                Box::pin(store.pools[1].get_disks_by_key(object).delete_object(
+                    bucket,
+                    object,
+                    super::super::migration::rebalance_delete_marker_opts(
+                        marker,
+                        Some(marker_id.to_string()),
+                        0,
+                        Some(incarnation),
+                    ),
+                ))
+                .await
+                .expect("publish the earlier marker copy");
+                Box::pin(store.pools[2].get_disks_by_key(object).put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(vec![0x5a; 2048]),
+                    &ObjectOptions {
+                        version_id: Some(version_id.to_string()),
+                        mod_time: version.mod_time,
+                        ..versioned.clone()
+                    },
+                ))
+                .await
+                .expect("publish the earlier object version copy");
+                for pool in [1, 2] {
+                    use crate::disk::DiskAPI as _;
+                    let set = store.pools[pool].get_disks_by_key(object);
+                    for disk in set.disks.read().await.iter().flatten().skip(1) {
+                        tokio::fs::remove_dir_all(disk.path().join(bucket).join(object))
+                            .await
+                            .expect("drop the copy from the drives the attempt missed");
+                    }
+                }
+                assert_eq!(drives_holding_version(&store, 1, bucket, object, marker_id).await, 1);
+                assert_eq!(drives_holding_version(&store, 2, bucket, object, version_id).await, 1);
+
+                let entry = metacache_entry_from_source(&source_set, bucket, object).await;
+                let outcome = Box::pin(Arc::clone(&store).rebalance_entry(
+                    RebalanceEntryTarget {
+                        bucket: bucket.to_string(),
+                        pool_index: 0,
+                    },
+                    entry,
+                    Arc::clone(&source_set),
+                    Arc::new(RebalanceBucketConfigs {
+                        bucket_incarnation_id: Some(incarnation),
+                        ..Default::default()
+                    }),
+                    Arc::from(REBALANCE_ID),
+                    CancellationToken::new(),
+                ))
+                .await
+                .expect("rebalance entry");
+                assert_eq!(outcome, RebalanceEntryOutcome::Completed, "{object}");
+                assert!(
+                    source_set
+                        .load_file_info_versions_exact(bucket, object)
+                        .await
+                        .expect("read source versions")
+                        .is_none(),
+                    "{object}: the source entry must be cleaned up"
+                );
+
+                for (version, expected_pool) in [(marker_id, 1), (version_id, 2)] {
+                    let mut holders = Vec::new();
+                    for pool in 0..store.pools.len() {
+                        let drives = drives_holding_version(&store, pool, bucket, object, version).await;
+                        if drives > 0 {
+                            holders.push((pool, drives));
+                        }
+                    }
+                    assert_eq!(
+                        holders,
+                        vec![(expected_pool, 4)],
+                        "{object}: version {version} must end on every drive of the pool that held its copy"
+                    );
+                }
+            }
+        });
+    }
+
     /// An `ExpiredObjectAllVersions` expiry is a prefix delete that takes the
     /// bucket lifecycle write lock, while the entry holds that lock for read
     /// through its bucket incarnation fence. Applied inline, it waited out the
