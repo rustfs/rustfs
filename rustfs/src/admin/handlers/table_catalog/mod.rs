@@ -181,10 +181,6 @@ static GET_CONFIG_HANDLER: GetCatalogConfigHandler = GetCatalogConfigHandler {};
 static ENABLE_TABLE_BUCKET_HANDLER: EnableTableBucketHandler = EnableTableBucketHandler {};
 static DISABLE_TABLE_BUCKET_HANDLER: DisableTableBucketHandler = DisableTableBucketHandler {};
 static GET_TABLE_BUCKET_HANDLER: GetTableBucketHandler = GetTableBucketHandler {};
-static GET_TABLE_CATALOG_MIGRATION_HANDLER: GetTableCatalogMigrationHandler = GetTableCatalogMigrationHandler {};
-static MATERIALIZE_TABLE_CATALOG_MIGRATION_HANDLER: MaterializeTableCatalogMigrationHandler =
-    MaterializeTableCatalogMigrationHandler {};
-static CANCEL_TABLE_CATALOG_MIGRATION_HANDLER: CancelTableCatalogMigrationHandler = CancelTableCatalogMigrationHandler {};
 static CREATE_TABLE_CATALOG_BACKUP_HANDLER: CreateTableCatalogBackupHandler = CreateTableCatalogBackupHandler {};
 static RESTORE_TABLE_CATALOG_BACKUP_HANDLER: RestoreTableCatalogBackupHandler = RestoreTableCatalogBackupHandler {};
 static BACKFILL_TABLE_WAREHOUSE_INDEX_HANDLER: BackfillTableWarehouseIndexHandler = BackfillTableWarehouseIndexHandler {};

@@ -19,6 +19,7 @@ use crate::storage_api::table::{WriteCommitGuard, WriteCompletion};
 mod backup;
 mod migration;
 mod object;
+mod object_backup;
 mod strong;
 
 pub(crate) use backup::{TableCatalogBackupReport, TableCatalogRestoreReport};
@@ -2170,9 +2171,7 @@ where
         expected_snapshot_etag: Option<&str>,
     ) -> TableCatalogStoreResult<TableCatalogBackupReport> {
         match self {
-            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
-                "durable catalog backup requires durable-strong backing".to_string(),
-            )),
+            Self::ObjectBacked(store) => store.create_object_catalog_backup(table_bucket, expected_snapshot_etag).await,
             Self::DurableStrong(store) => {
                 store
                     .create_durable_catalog_backup(table_bucket, expected_snapshot_etag)
@@ -2189,9 +2188,11 @@ where
         allow_replace: bool,
     ) -> TableCatalogStoreResult<TableCatalogRestoreReport> {
         match self {
-            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
-                "durable catalog restore requires durable-strong backing".to_string(),
-            )),
+            Self::ObjectBacked(store) => {
+                store
+                    .restore_object_catalog_backup(table_bucket, backup_id, expected_snapshot_etag, allow_replace)
+                    .await
+            }
             Self::DurableStrong(store) => {
                 store
                     .restore_durable_catalog_backup(table_bucket, backup_id, expected_snapshot_etag, allow_replace)
