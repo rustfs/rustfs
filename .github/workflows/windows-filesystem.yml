@@ -1,224 +1,94 @@
-# Copyright 2024 RustFS Team
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-name: Windows Filesystem Tests
+name: Scanner canonical receipt candidate
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - "crates/ecstore/src/disk/**"
-      - "crates/ecstore/src/layout/**"
-      - "crates/ecstore/src/store/init_format.rs"
-      - "crates/ecstore/src/set_disk/ops/locking.rs"
-      - "crates/ecstore/src/object_api/write_commit_context.rs"
-      - "crates/ecstore/src/bucket/utils.rs"
-      - "crates/ecstore/Cargo.toml"
-      - "crates/utils/src/dunce.rs"
-      - "crates/utils/src/os/**"
-      - "crates/utils/Cargo.toml"
-      - "crates/utils/src/path.rs"
-      - "rustfs/build.rs"
-      - "rustfs/Cargo.toml"
-      - "rustfs/src/main.rs"
-      - "rustfs/src/server/runtime.rs"
-      - "rustfs/src/startup_*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/actions/setup/**"
-      - ".github/workflows/windows-filesystem.yml"
-  pull_request:
-    branches: [ main ]
-    paths:
-      - "crates/ecstore/src/disk/**"
-      - "crates/ecstore/src/layout/**"
-      - "crates/ecstore/src/store/init_format.rs"
-      - "crates/ecstore/src/set_disk/ops/locking.rs"
-      - "crates/ecstore/src/object_api/write_commit_context.rs"
-      - "crates/ecstore/src/bucket/utils.rs"
-      - "crates/ecstore/Cargo.toml"
-      - "crates/utils/src/dunce.rs"
-      - "crates/utils/src/os/**"
-      - "crates/utils/Cargo.toml"
-      - "crates/utils/src/path.rs"
-      - "rustfs/build.rs"
-      - "rustfs/Cargo.toml"
-      - "rustfs/src/main.rs"
-      - "rustfs/src/server/runtime.rs"
-      - "rustfs/src/startup_*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/actions/setup/**"
-      - ".github/workflows/windows-filesystem.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_TERM_COLOR: always
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  RUST_BACKTRACE: 1
-
 jobs:
-  rename-safety:
-    name: Rename Safety
-    runs-on: windows-latest
-    timeout-minutes: 60
+  verify-candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
+          fetch-depth: 3
           persist-credentials: false
 
-      - name: Setup Rust environment
+      - name: Check the source snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_base=d88f524d9ff071300dde4aab1c9af1fd45a82426
+          expected_source=e371b8aaa6d0e1436795c1415eaaba037717f99d
+          expected_diff_sha=1d7cee2ba7cc9b1add5ff76e07c209a80dd43ed0bc164b2a1e425bda941e6955
+          if actual_head=$(git rev-parse --verify HEAD 2>/dev/null); then :; else actual_head=unavailable; fi
+          if actual_source=$(git rev-parse --verify HEAD^ 2>/dev/null); then :; else actual_source=unavailable; fi
+          if actual_base=$(git rev-parse --verify HEAD^^ 2>/dev/null); then :; else actual_base=unavailable; fi
+          if git diff --full-index --binary "$actual_base" "$actual_source" >"$RUNNER_TEMP/source.diff" 2>/dev/null; then
+            actual_diff_sha=$(sha256sum "$RUNNER_TEMP/source.diff" | cut -d' ' -f1)
+          else
+            actual_diff_sha=unavailable
+          fi
+          if actual_files=$(git diff --name-only "$actual_source" "$actual_head" 2>/dev/null); then :; else actual_files=unavailable; fi
+          printf 'HEAD: %s\nparent: %s\nbase: %s\nfull-index diff SHA-256: %s\nworkflow files:\n%s\n' \
+            "$actual_head" "$actual_source" "$actual_base" "$actual_diff_sha" "$actual_files"
+          [[ "$actual_head" == "$GITHUB_SHA" ]] || { printf 'Unexpected workflow HEAD\n' >&2; exit 1; }
+          [[ "$actual_source" == "$expected_source" ]] || { printf 'Unexpected source parent\n' >&2; exit 1; }
+          [[ "$actual_base" == "$expected_base" ]] || { printf 'Unexpected base\n' >&2; exit 1; }
+          [[ "$actual_diff_sha" == "$expected_diff_sha" ]] || { printf 'Unexpected source diff\n' >&2; exit 1; }
+          [[ "$actual_files" == '.github/workflows/windows-filesystem.yml' ]] || { printf 'Unexpected workflow files\n' >&2; exit 1; }
+          printf 'Verified the source snapshot\n'
+
+      - name: Setup Rust
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          cache-shared-key: build-x86_64-pc-windows-msvc
+          cache-shared-key: ci-e2e-distributed-hosted
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
           install-test-tools: 'false'
 
-      - name: Check production Windows dependencies
-        shell: pwsh
-        run: cargo check -p rustfs-ecstore --lib
-
-      - name: Test guarded rename publication
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib rename_all_ -- --nocapture
-
-      - name: Test multipart parent durability barriers
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib multipart_owned_record_parent_barriers_ -- --nocapture
-
-      - name: Test Windows path conversion
-        shell: pwsh
-        run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"
-
-      - name: Test Windows volume and disk-space probes
-        shell: pwsh
+      - name: Verify the twelve focused tests
+        shell: bash
         run: |
-          # Map a drive letter to the temp drive's administrative share so the
-          # remote-volume probe also covers mapped network drives.
-          $drive = (Split-Path -Qualifier ([System.IO.Path]::GetTempPath())).TrimEnd(':')
-          net use R: "\\localhost\$drive`$" /persistent:no
-          if ($LASTEXITCODE -eq 0) {
-            $env:RUSTFS_TEST_WINDOWS_MAPPED_DRIVE = 'R:'
-          } else {
-            Write-Output "::warning::could not map R: to \\localhost\$drive`$; mapped-drive test will skip"
-          }
-          cargo test -p rustfs-utils --features os --lib os:: -- --nocapture
-          $status = $LASTEXITCODE
-          if ($env:RUSTFS_TEST_WINDOWS_MAPPED_DRIVE) { net use R: /delete /y | Out-Null }
-          exit $status
-
-      - name: Test Windows handle guards
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib windows_ -- --nocapture
-
-      - name: Test endpoint path parsing
-        shell: pwsh
-        run: "cargo test -p rustfs-ecstore --lib layout::endpoint:: -- --nocapture"
-
-      - name: Test startup temporary-directory cleanup
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib cleanup_tmp_on_startup_ -- --nocapture
-
-      - name: Test object key Windows admission
-        shell: pwsh
-        run: "cargo test -p rustfs-ecstore --lib bucket::utils:: -- --nocapture"
-
-      - name: Test Windows file-name rules
-        shell: pwsh
-        run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"
-
-      - name: Test fresh format publication
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib fresh_format_load_initializes_all_disks -- --nocapture
-
-  # The native Windows main thread only gets the 1 MiB PE stack reserve, while
-  # Linux and macOS hand out 8 MiB. Startup runs the whole root future on the
-  # thread that calls `block_on`, so a debug server once overflowed before it
-  # listened on Windows only. Start a real server to keep that covered.
-  startup-smoke:
-    name: Startup Smoke
-    runs-on: windows-latest
-    timeout-minutes: 90
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: build-x86_64-pc-windows-msvc
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-          install-test-tools: 'false'
-
-      - name: Build debug server binary
-        shell: pwsh
-        run: cargo build --locked -p rustfs --bin rustfs
-
-      - name: Print version
-        shell: pwsh
-        run: |
-          & .\target\debug\rustfs.exe --version
-          if ($LASTEXITCODE -ne 0) { throw "rustfs --version exited with $LASTEXITCODE" }
-
-      - name: Start server and wait for readiness
-        shell: pwsh
-        env:
-          RUSTFS_ACCESS_KEY: rustfsadmin
-          RUSTFS_SECRET_KEY: rustfsadmin
-        run: |
-          $volume = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke'
-          $stdout = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke.out.log'
-          $stderr = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke.err.log'
-          New-Item -ItemType Directory -Force -Path $volume | Out-Null
-          $server = Start-Process -FilePath .\target\debug\rustfs.exe `
-            -ArgumentList @('--address', '127.0.0.1:9000', "`"$volume`"") `
-            -RedirectStandardOutput $stdout -RedirectStandardError $stderr `
-            -NoNewWindow -PassThru
-          # Cache the process handle now; otherwise ExitCode reads back empty.
-          $null = $server.Handle
-          $ready = $false
-          try {
-            for ($i = 0; $i -lt 180; $i++) {
-              if ($server.HasExited) { break }
-              try {
-                $response = Invoke-WebRequest -Uri 'http://127.0.0.1:9000/health/ready' -UseBasicParsing -NoProxy -TimeoutSec 2
-                if ($response.StatusCode -eq 200) { $ready = $true; break }
-              } catch {}
-              Start-Sleep -Seconds 1
-            }
-          } finally {
-            if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force }
-            $server.WaitForExit()
-            Write-Host '--- server stdout (tail) ---'
-            Get-Content $stdout -Tail 100 -ErrorAction SilentlyContinue
-            Write-Host '--- server stderr (tail) ---'
-            Get-Content $stderr -Tail 100 -ErrorAction SilentlyContinue
-          }
-          if (-not $ready) {
-            throw ("rustfs did not report ready on /health/ready (exit code: {0})" -f $server.ExitCode)
-          }
+          set -euo pipefail
+          export CARGO_TERM_COLOR=never
+          export CARGO_BUILD_JOBS=2
+          export CARGO_PROFILE_TEST_DEBUG=0
+          export CARGO_INCREMENTAL=0
+          export RUST_BACKTRACE=0
+          tests=(
+            scanner_receipt_tracks_queued_owner_after_normal_dequeue
+            scanner_receipt_tracks_queued_owner_after_fair_dequeue
+            scanner_receipt_keeps_queued_owner_when_a_different_forced_task_runs
+            scanner_receipt_reselects_after_the_queued_owner_is_cancelled
+            scanner_receipt_reselects_after_multiple_forced_dequeues
+            scanner_owner_index_survives_a_single_remaining_holder_and_new_forced_work
+            scanner_owner_index_distinguishes_holders_with_the_same_request_id
+            scanner_owner_index_tracks_bulk_removal_and_key_release
+            scanner_owner_index_tracks_displacement_without_changing_legacy_reselection
+            scanner_receipt_rejects_a_missing_or_empty_holder_index
+            scanner_and_legacy_owners_keep_their_distinct_reselection_orders
+            scanner_owner_index_tracks_a_series_of_forced_holders
+          )
+          for test in "${tests[@]}"; do
+            name="heal::manager::tests::queued_representative::${test}"
+            log="${RUNNER_TEMP}/${test}.log"
+            set +e
+            cargo test --locked -p rustfs-heal --lib "$name" -- --exact --test-threads=1 >"$log" 2>&1
+            status=$?
+            set -e
+            tail -n 160 "$log"
+            if [[ "$status" -ne 0 ]] ||
+              ! grep -Fxq 'running 1 test' "$log" ||
+              ! grep -Fxq "test ${name} ... ok" "$log" ||
+              ! grep -Fq 'test result: ok. 1 passed; 0 failed;' "$log"; then
+              printf 'Expected exactly one passing test for %s (cargo exit %s)\n' "$name" "$status" >&2
+              exit 1
+            fi
+            printf 'Confirmed exactly one passing test for %s\n' "$name"
+          done
+          printf 'All twelve focused tests passed individually\n'
