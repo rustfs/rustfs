@@ -11342,7 +11342,9 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
             sample.start()
         });
         let mut results = Vec::with_capacity(n);
-        for (_index, (file_path, offset, length)) in requests.into_iter().enumerate() {
+        for (file_path, offset, length) in requests {
+            #[cfg(feature = "diagnostic-local-batch")]
+            let _index = results.len();
             let mut total = 0usize;
             let r = (|| -> Result<Bytes> {
                 let meta = diagnostic_stage!(Metadata, _index, || std::fs::metadata(&file_path).map_err(DiskError::from))?;
