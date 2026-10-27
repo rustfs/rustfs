@@ -6,6 +6,7 @@ use rustfs_concurrency::{
     WorkloadAdmissionSnapshotProvider,
     workload::{ForegroundPressure, foreground_pressure},
 };
+use rustfs_heal_contracts::heal_channel::HealRequestSource;
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::Mutex, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -21,12 +22,13 @@ pub(crate) enum PacingDecision {
     Wait(Option<ForegroundPressure>),
 }
 
-/// Cooperative pacing for one admin execution, not a storage admission permit.
+/// Cooperative pacing for one heal execution, not a storage admission permit.
 pub(crate) struct MainlinePacer {
     provider: Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>,
     read_high: usize,
     write_high: usize,
     pause: Duration,
+    source: HealRequestSource,
     state: Mutex<PacingState>,
 }
 
@@ -36,6 +38,7 @@ impl MainlinePacer {
         read_high: usize,
         write_high: usize,
         pause: Duration,
+        source: HealRequestSource,
     ) -> Option<Self> {
         if (read_high == 0 && write_high == 0) || pause.is_zero() {
             return None;
@@ -45,6 +48,7 @@ impl MainlinePacer {
             read_high: read_high.min(100),
             write_high: write_high.min(100),
             pause: pause.min(Duration::from_secs(1)),
+            source,
             state: Mutex::new(PacingState::default()),
         })
     }
@@ -108,7 +112,7 @@ impl MainlinePacer {
         }
         metrics::counter!(
             "rustfs_heal_mainline_throttle_total",
-            "source" => "admin",
+            "source" => self.source.as_str(),
             "result" => "delayed",
             "reason" => pressure.or(observed).map_or("recovery_window", |pressure| pressure.reason())
         )
@@ -170,6 +174,7 @@ mod tests {
                 if class == WorkloadClass::ForegroundRead { 40 } else { 0 },
                 if class == WorkloadClass::ForegroundWrite { 40 } else { 0 },
                 pause,
+                HealRequestSource::Admin,
             )
             .expect("enabled pacer");
             let cancel = CancellationToken::new();
@@ -192,9 +197,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn running_mainline_huge_pause_is_capped_and_disabled_classes_do_not_sleep() {
         let provider = Arc::new(TestPressure::new(WorkloadClass::ForegroundRead, 100));
-        assert!(MainlinePacer::new(provider.clone(), 0, 0, Duration::from_secs(1)).is_none());
-        assert!(MainlinePacer::new(provider.clone(), 80, 80, Duration::ZERO).is_none());
-        let pacer = MainlinePacer::new(provider, 80, 80, Duration::from_secs(3600)).expect("pacer");
+        assert!(MainlinePacer::new(provider.clone(), 0, 0, Duration::from_secs(1), HealRequestSource::Admin).is_none());
+        assert!(MainlinePacer::new(provider.clone(), 80, 80, Duration::ZERO, HealRequestSource::Admin).is_none());
+        let pacer = MainlinePacer::new(provider, 80, 80, Duration::from_secs(3600), HealRequestSource::Admin).expect("pacer");
         let before = Instant::now();
         pacer.wait(&CancellationToken::new()).await.expect("hard-capped pause");
         assert_eq!(Instant::now() - before, Duration::from_secs(1));
@@ -203,7 +208,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn running_mainline_waiters_cancel_and_task_latches_are_isolated() {
         let provider = Arc::new(TestPressure::new(WorkloadClass::ForegroundRead, 100));
-        let paced = Arc::new(MainlinePacer::new(provider.clone(), 80, 80, Duration::from_secs(1)).expect("pacer"));
+        let paced = Arc::new(
+            MainlinePacer::new(provider.clone(), 80, 80, Duration::from_secs(1), HealRequestSource::Admin).expect("pacer"),
+        );
         let cancel_first = CancellationToken::new();
         let first = tokio::spawn({
             let paced = paced.clone();
@@ -221,7 +228,8 @@ mod tests {
         cancel_second.cancel();
         assert!(matches!(second.await.expect("queued waiter"), Err(Error::TaskCancelled)));
         provider.active.store(0, Ordering::SeqCst);
-        let other_task = MainlinePacer::new(provider.clone(), 80, 80, Duration::from_secs(1)).expect("independent task");
+        let other_task = MainlinePacer::new(provider.clone(), 80, 80, Duration::from_secs(1), HealRequestSource::Admin)
+            .expect("independent task");
         let before = Instant::now();
         other_task
             .wait(&CancellationToken::new())

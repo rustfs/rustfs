@@ -2480,6 +2480,93 @@ mod decommission_lock_order_tests {
         });
     }
 
+    /// A node killed mid-copy leaves its namespace lock on the peers until the
+    /// lock lease expires, so the resumed decommission times out acquiring the
+    /// lock of the key it was copying through every in-place retry. The entry
+    /// is deferred and copied once the lease is gone; it is never counted as a
+    /// failed object, which would fail the whole decommission.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_defers_a_copy_that_timed_out_on_a_stale_namespace_lock() {
+        run_large_stack_async_test("decommission-copy-lock-timeout", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("copy-lock-timeout");
+            let object = "external/005.bin";
+            let payload = vec![0x3c; 2048];
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create the bucket");
+            put_source_object(&store, &bucket, object, payload.clone()).await;
+
+            // The stale lease outlives every in-place attempt of the first
+            // pass and has expired by the deferred replay.
+            let stale_lease_calls = crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS;
+            let copy_calls = Arc::new(AtomicUsize::new(0));
+            let _fault = DecommissionTestFaultGuard::install_with_error(
+                Arc::new({
+                    let copy_calls = Arc::clone(&copy_calls);
+                    let bucket = bucket.clone();
+                    move |stage, entry_bucket, entry_object, _, _| {
+                        stage == "before_target_commit"
+                            && entry_bucket == bucket
+                            && entry_object == object
+                            && copy_calls.fetch_add(1, Ordering::AcqRel) < stale_lease_calls
+                    }
+                }),
+                Some(Arc::new(|_, bucket, object| {
+                    // The shape the target write reports when the lock domain
+                    // still holds the previous incarnation's lock.
+                    data_movement::data_movement_stage_error_for_test(
+                        "decommission_object",
+                        "prepare_put_object",
+                        bucket,
+                        object,
+                        crate::error::Error::Lock(rustfs_lock::LockError::timeout(
+                            format!("{bucket}/{object}@latest"),
+                            Duration::from_secs(5),
+                        )),
+                    )
+                })),
+            );
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("the decommission routine should return");
+
+            assert_eq!(
+                copy_calls.load(Ordering::Acquire),
+                stale_lease_calls + 1,
+                "the first pass exhausts its in-place retries and the replay copies the object once"
+            );
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert_eq!(
+                info.items_decommission_failed, 0,
+                "a lock held until its lease expires is not a permanent failure: {info:?}"
+            );
+            assert!(
+                info.complete && !info.failed && !info.canceled && info.capacity_blocked_reason.is_none(),
+                "the replayed entry must complete the decommission: {info:?}"
+            );
+            drop(local);
+
+            assert!(exact_versions(&store, 0, &bucket, object).await.is_empty(), "the source is cleaned up");
+            let mut reader = store
+                .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the migrated object stays readable");
+            let mut body = Vec::new();
+            reader.stream.read_to_end(&mut body).await.expect("read the migrated object");
+            assert_eq!(body, payload);
+        });
+    }
+
     /// Seed `object` in pool 0 with three 2 KiB data versions and a newest
     /// delete marker; returns the data versions oldest first.
     async fn seed_versioned_entry_with_marker(

@@ -241,6 +241,30 @@ impl TableDataPlaneListCursor {
 }
 
 impl TableDataPlaneListAccess {
+    #[cfg(test)]
+    pub(crate) fn test_listing_fixture(bucket: &str) -> Self {
+        let resource = |table: &str, prefix: &str, allowed| TableDataPlaneListResource {
+            resource: crate::table_catalog::TableDataPlaneResource {
+                table_bucket: bucket.to_owned(),
+                namespace: "test".to_owned(),
+                table: table.to_owned(),
+                table_id: table.to_owned(),
+                warehouse_object_prefix: prefix.to_owned(),
+            },
+            allowed,
+        };
+        Self {
+            bucket: bucket.to_owned(),
+            principal_fingerprint: "principal".to_owned(),
+            snapshot_fingerprint: "snapshot".to_owned(),
+            cursor_key: [0x42; 32],
+            resources: vec![
+                resource("table-id", "tables/table-id/", true),
+                resource("denied-id", "tables/zz-denied/", false),
+            ],
+        }
+    }
+
     pub(crate) fn allows_object(&self, object: &str) -> bool {
         if crate::table_catalog::is_reserved_table_object_key(object) {
             return false;

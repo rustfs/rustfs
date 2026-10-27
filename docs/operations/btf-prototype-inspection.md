@@ -1,6 +1,7 @@
-# Read-only BTF prototype inspection
+# Read-only BTF declaration inspection
 
-Use `scripts/inspect_btf_prototypes.py` to inspect declared function types in a
+Use `scripts/inspect_btf_prototypes.py` to inspect declared function types or selected
+integer member layouts in a
 raw, little-endian BTF v1 regular file. Symlinks, devices and pipes are rejected.
 The command reads the named file and writes one
 JSON document to stdout. It does not load BPF, attach probes, read kernel memory,
@@ -18,14 +19,37 @@ parameter type IDs, qualifier chains, and resolved declarations. A missing or
 ambiguous function is an error, rather than a substitute selected by proximity.
 The schema version is `1`.
 
-Selected type records expose their common BTF headers. Kind-specific payloads
-and recursive layouts are not decoded by this command; use an independent BTF
-dump when those records are required. A reported declaration is not a complete
-C type, layout proof or runtime calling convention.
+Prototype records expose common BTF headers. A reported prototype is not a
+complete C type, recursive layout proof or runtime calling convention.
+
+For integer counters, select one exact struct and one or more named member paths:
+
+```bash
+python3 scripts/inspect_btf_prototypes.py \
+  --btf /sys/kernel/btf/vmlinux \
+  --struct bpf_ringbuf \
+  --field mask --field consumer_pos --field producer_pos --field pending_pos
+```
+
+This mode validates the selected struct member records, qualifier chains and
+integer payloads. `scalar_fields` preserves request order and reports each
+declared byte offset, width, integer encoding flags and member path. Nested
+structs are supported; every selected span must fit its declared container.
+Only complete 1, 2, 4 or 8-byte integers are supported. Bitfields (including
+legacy integer-offset encodings), pointer traversal, pointer/array/union leaves,
+ambiguous members, missing types and by-value cycles are errors. No pointer
+width is inferred. Byte alignment does not guarantee natural machine alignment.
+
+`--struct` requires `--field` and cannot be combined with `--function`. Up to
+16 unique paths, each containing at most 32 named members, are accepted. A
+failure in any selected path rejects the whole report before emitting JSON.
+The mode sets `runtime_ABI_verified` to `false`: it does not bind BTF to executing
+machine code, pointer values, loaded images or an observer's admission contract.
+Only requested paths are validated, not the complete BTF graph or all C layouts.
 
 The reader supports BTF kinds 1 through 19, indexes at most 500,000 records,
 reads at most 32 MiB plus one overflow-detection byte, limits names to 4,096
-bytes, follows at most 32 qualifier records, and accepts at most 16 parameters
+bytes, follows at most 32 type records per qualifier chain, and accepts at most 16 parameters
 per selected prototype. Reports above 1 MiB are rejected before any JSON prefix
 is emitted. Invalid/truncated/unsupported source, missing resolved type IDs,
 malformed pointer/qualifier headers, and ambiguous selectors exit nonzero with
@@ -47,8 +71,11 @@ python3 -B scripts/test_inspect_btf_prototypes.py
 
 The `BTF prototype reference` workflow additionally compiles a small C fixture,
 extracts its raw `.BTF` section, and independently compares both selected
-declarations and resolved types against `bpftool` output. The object is never
-loaded. The workflow selects a concrete `bpftool` executable by availability and
+prototypes, scalar layouts and resolved types against `bpftool` output. A separate
+ordinary C executable uses compiler `offsetof`/`sizeof` to check layout offsets
+and widths, including nested and packed members; it does not parse BTF or load
+probes. The BPF object is never loaded. The workflow selects a concrete
+`bpftool` executable by availability and
 version before comparing data; it does not depend on the hosted kernel's tools
 wrapper or switch tools after a comparison failure. The native
 [file-dump mode](https://github.com/libbpf/bpftool/blob/main/docs/bpftool-btf.rst)
