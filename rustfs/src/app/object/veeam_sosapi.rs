@@ -316,9 +316,7 @@ fn bucket_used(info: &DataUsageInfo, bucket: &str) -> u64 {
 }
 
 async fn load_hard_quota(usecase: &DefaultObjectUsecase, bucket: &str) -> Option<u64> {
-    let Some(metadata) = usecase.bucket_metadata_sys() else {
-        return None;
-    };
+    let metadata = usecase.bucket_metadata_sys()?;
     let checker = QuotaChecker::new(metadata);
     match checker.get_quota_config(bucket).await {
         Ok(quota) => hard_quota_bytes(&quota),
