@@ -13,8 +13,8 @@
 // limitations under the License.
 /// Cycle wake/backoff policy and scanner activity observation (probing, generations, topology digest).
 use super::*;
-use crate::storage_api::scan::SCANNER_ACTIVITY_V6_PROTOCOL_VERSION;
-use crate::storage_api::{ScannerPublicationLeaseFailureInfo, ScannerStorage};
+use crate::storage_api::ScannerStorage;
+use crate::storage_api::scan::{SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, ScannerPublicationLeaseFailureInfo};
 use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -239,7 +239,7 @@ pub(crate) fn scanner_publication_proof_retry_delay(consecutive_failures: u32) -
 }
 
 pub(crate) fn scanner_publication_activity_error_is_retryable(error: &str) -> bool {
-    crate::storage_api::scanner_peer_transport_error_message_is_retryable(error)
+    crate::storage_api::scan::scanner_peer_transport_error_message_is_retryable(error)
 }
 
 pub(crate) fn scanner_publication_lease_error_is_retryable(error: &str) -> bool {

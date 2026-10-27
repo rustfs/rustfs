@@ -109,9 +109,6 @@ pub(crate) use rustfs_ecstore::api::layout::{
     SetupType as EcstoreSetupType,
 };
 pub(crate) use rustfs_ecstore::api::notification::NotificationSys as EcstoreNotificationSys;
-pub(crate) use rustfs_ecstore::api::notification::{
-    ScannerPublicationLeaseFailureInfo, scanner_peer_transport_error_message_is_retryable, scanner_publication_lease_failure_info,
-};
 pub(crate) use rustfs_ecstore::api::object::{
     SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, ScannerPublicationCommitScope, ScannerPublicationCommitState,
 };
@@ -367,6 +364,12 @@ pub(crate) mod scan {
         SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
         SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES,
     };
+    pub(crate) use rustfs_ecstore::api::notification::{
+        ScannerPublicationLeaseFailureInfo, scanner_peer_transport_error_message_is_retryable,
+        scanner_publication_lease_failure_info,
+    };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::rpc::PeerRestClient as EcstorePeerRestClient;
 }
 
 pub(crate) mod scanner_io {

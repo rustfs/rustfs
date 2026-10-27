@@ -3947,11 +3947,11 @@ impl ScannerCyclePublicationPlan {
             || acquire(self.uses_observational_lease()),
             |err| {
                 // The structured reason comes from local acquisition, not a peer report.
-                crate::storage_api::scanner_publication_lease_failure_info(err)
+                crate::storage_api::scan::scanner_publication_lease_failure_info(err)
                     .is_some_and(|info| info.reason == Some("channel_acquisition_timed_out"))
                     || scanner_publication_lease_error_is_retryable(&err.to_string())
             },
-            crate::storage_api::scanner_publication_lease_failure_info,
+            crate::storage_api::scan::scanner_publication_lease_failure_info,
         );
         let (proof, timed_out) = if self == Self::ProgressOnly {
             // Object/directory budgets can expire with no runtime deadline.

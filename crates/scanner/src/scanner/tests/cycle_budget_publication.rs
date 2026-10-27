@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::storage_api::scan::ScannerPublicationLeaseFailureInfo;
 use rustfs_utils::path::path_join_buf;
 
 #[derive(Clone)]
@@ -273,9 +274,9 @@ async fn exercise_interleaved_lease_waits() {
     // Verify event serialization independently of the ecstore tests that
     // exercise the local and remote error producers.
     for cycle in [606, 607, 608] {
-        let info: for<'a> fn(&'a String) -> Option<crate::storage_api::ScannerPublicationLeaseFailureInfo<'a>> = if cycle == 607 {
+        let info: for<'a> fn(&'a String) -> Option<ScannerPublicationLeaseFailureInfo<'a>> = if cycle == 607 {
             |_| {
-                Some(crate::storage_api::ScannerPublicationLeaseFailureInfo {
+                Some(ScannerPublicationLeaseFailureInfo {
                     peer: None,
                     kind: "peer_request_failed",
                     reason: None,
@@ -284,7 +285,7 @@ async fn exercise_interleaved_lease_waits() {
             }
         } else if cycle == 606 {
             |_| {
-                Some(crate::storage_api::ScannerPublicationLeaseFailureInfo {
+                Some(ScannerPublicationLeaseFailureInfo {
                     peer: None,
                     kind: "peer_request_failed",
                     reason: Some("invalid_proof"),
@@ -293,7 +294,7 @@ async fn exercise_interleaved_lease_waits() {
             }
         } else {
             |_| {
-                Some(crate::storage_api::ScannerPublicationLeaseFailureInfo {
+                Some(ScannerPublicationLeaseFailureInfo {
                     peer: None,
                     kind: "peer_request_failed",
                     reason: Some("channel_acquisition_timed_out"),
@@ -511,7 +512,7 @@ fn publication_lease_retries_local_channel_deadline_and_stops_on_cancel() {
         .build()
         .expect("test runtime");
     runtime.block_on(async {
-        use rustfs_ecstore::api::rpc::PeerRestClient;
+        use crate::storage_api::scan::EcstorePeerRestClient;
         use rustfs_utils::net::XHost;
 
         async fn channel_deadline_error(
@@ -525,7 +526,7 @@ fn publication_lease_retries_local_channel_deadline_and_stops_on_cancel() {
                 Ok(_) => panic!("the stalled channel cannot grant a lease"),
                 Err(error) => error,
             };
-            let info = crate::storage_api::scanner_publication_lease_failure_info(&error)
+            let info = crate::storage_api::scan::scanner_publication_lease_failure_info(&error)
                 .expect("local channel deadline must carry structured diagnostics");
             assert_eq!(info.kind, "peer_request_failed");
             assert_eq!(info.reason, Some("channel_acquisition_timed_out"));
@@ -538,7 +539,7 @@ fn publication_lease_retries_local_channel_deadline_and_stops_on_cancel() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("local listener");
         let address = listener.local_addr().expect("listener address");
         let target = format!("https://{address}");
-        let client = PeerRestClient::new(
+        let client = EcstorePeerRestClient::new(
             XHost {
                 name: "127.0.0.1".to_owned(),
                 port: address.port(),
