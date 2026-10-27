@@ -2082,7 +2082,7 @@ where
         None
     } else if let Some(notification_system) = storeapi.scanner_notification_system() {
         let lease_result = publication_plan
-            .await_leases(ctx, &cycle_budget, cycle_info.current, |observational_lease| {
+            .await_leases(ctx, &cycle_budget, cycle_info.current, leader_epoch, |observational_lease| {
                 let targets = remote_publication_lease_targets.clone();
                 let notification_system = Arc::clone(&notification_system);
                 async move {
@@ -3892,17 +3892,17 @@ impl ScannerCyclePublicationPlan {
         self != Self::Authoritative
     }
 
-    async fn await_leases<T, E, F, Fut>(
+    async fn await_leases<T, F, Fut>(
         self,
         parent: &CancellationToken,
         budget: &ScannerCycleBudget,
         cycle: u64,
+        leader_epoch: u64,
         mut acquire: F,
-    ) -> ScannerPublicationProofWait<T, E>
+    ) -> ScannerPublicationProofWait<T, EcstoreError>
     where
-        E: std::fmt::Display,
         F: FnMut(bool) -> Fut,
-        Fut: Future<Output = Result<T, E>>,
+        Fut: Future<Output = Result<T, EcstoreError>>,
     {
         // Exhausting the walk budget must not cancel the movement proof needed
         // to save partial progress. No usage update means namespace stability
@@ -3912,6 +3912,17 @@ impl ScannerCyclePublicationPlan {
         } else {
             budget.token()
         };
+        let started_at = Instant::now();
+        let publication_kind = match self {
+            Self::ProgressOnly => "progress_only",
+            Self::Observational => "observational",
+            Self::Authoritative => "authoritative",
+        };
+        let lease_purpose = if self.uses_observational_lease() {
+            "observational"
+        } else {
+            "authoritative"
+        };
         debug!(
             target: "rustfs::scanner",
             event = EVENT_SCANNER_CYCLE_STATE,
@@ -3919,30 +3930,61 @@ impl ScannerCyclePublicationPlan {
             subsystem = LOG_SUBSYSTEM_RUNTIME,
             state = "publication_proof_started",
             cycle,
+            leader_epoch,
             stage = "lease_acquire",
-            publication_kind = match self {
-                Self::ProgressOnly => "progress_only",
-                Self::Observational => "observational",
-                Self::Authoritative => "authoritative",
-            },
+            publication_kind,
+            lease_purpose,
             "Scanner is acquiring peer publication proof"
         );
         let proof = await_scanner_publication_proof(
             &proof_ctx,
-            cycle,
-            "lease_acquire",
+            ScannerPublicationProofContext {
+                cycle,
+                stage: "lease_acquire",
+                leader_epoch: Some(leader_epoch),
+                lease_purpose: Some(lease_purpose),
+            },
             || acquire(self.uses_observational_lease()),
             |err| scanner_publication_lease_error_is_retryable(&err.to_string()),
+            crate::storage_api::scanner_publication_lease_failure_info,
         );
-        if self == Self::ProgressOnly {
+        let (proof, timed_out) = if self == Self::ProgressOnly {
             // Object/directory budgets can expire with no runtime deadline.
             // Bound the control-plane drain independently of the walk budget.
-            tokio::time::timeout(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, proof)
-                .await
-                .unwrap_or(ScannerPublicationProofWait::Cancelled)
+            match tokio::time::timeout(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, proof).await {
+                Ok(proof) => (proof, false),
+                Err(_) => (ScannerPublicationProofWait::Cancelled, true),
+            }
         } else {
-            proof.await
-        }
+            (proof.await, false)
+        };
+        let outcome = if timed_out {
+            "timed_out"
+        } else {
+            match &proof {
+                ScannerPublicationProofWait::Ready(_) => "acquired",
+                ScannerPublicationProofWait::Rejected(_) => "rejected",
+                ScannerPublicationProofWait::Cancelled => "cancelled",
+            }
+        };
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_CYCLE_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "publication_lease_wait_finished",
+            cycle,
+            leader_epoch,
+            stage = "lease_acquire",
+            publication_kind,
+            lease_purpose,
+            outcome,
+            parent_cancelled_at_return = parent.is_cancelled(),
+            proof_token_cancelled_at_return = proof_ctx.is_cancelled(),
+            elapsed = ?started_at.elapsed(),
+            "Scanner peer publication lease wait finished"
+        );
+        proof
     }
 }
 

@@ -109,7 +109,9 @@ pub(crate) use rustfs_ecstore::api::layout::{
     SetupType as EcstoreSetupType,
 };
 pub(crate) use rustfs_ecstore::api::notification::NotificationSys as EcstoreNotificationSys;
-pub(crate) use rustfs_ecstore::api::notification::scanner_peer_transport_error_message_is_retryable;
+pub(crate) use rustfs_ecstore::api::notification::{
+    ScannerPublicationLeaseFailureInfo, scanner_peer_transport_error_message_is_retryable, scanner_publication_lease_failure_info,
+};
 pub(crate) use rustfs_ecstore::api::object::{
     SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, ScannerPublicationCommitScope, ScannerPublicationCommitState,
 };

@@ -15,6 +15,471 @@
 use super::*;
 use rustfs_utils::path::path_join_buf;
 
+#[derive(Clone)]
+struct LeaseLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LeaseLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("lease log mutex").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn publication_lease_observations_keep_cycle_epoch_purpose_and_outcome() {
+    use tracing::instrument::WithSubscriber as _;
+
+    let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = LeaseLogWriter(Arc::clone(&output));
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let _interest_guard = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+    async {
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+        let ready = ScannerCyclePublicationPlan::ProgressOnly
+            .await_leases(&ctx, &budget, 501, 17, |_| async { Ok::<_, EcstoreError>(()) })
+            .await;
+        assert!(matches!(ready, ScannerPublicationProofWait::Ready(())));
+        let next_leader = ScannerCyclePublicationPlan::Observational
+            .await_leases(&ctx, &budget, 501, 22, |_| async { Ok::<_, EcstoreError>(()) })
+            .await;
+        assert!(matches!(next_leader, ScannerPublicationProofWait::Ready(())));
+        let rejected = ScannerCyclePublicationPlan::Observational
+            .await_leases(&ctx, &budget, 502, 18, |_| async {
+                Err::<(), _>(EcstoreError::other("protocol mismatch"))
+            })
+            .await;
+        assert!(matches!(rejected, ScannerPublicationProofWait::Rejected(_)));
+        ctx.cancel();
+        let cancelled = ScannerCyclePublicationPlan::Authoritative
+            .await_leases(&ctx, &budget, 503, 19, |_| async { Ok::<_, EcstoreError>(()) })
+            .await;
+        assert!(matches!(cancelled, ScannerPublicationProofWait::Cancelled));
+        let timeout_ctx = CancellationToken::new();
+        let timeout_budget = ScannerCycleBudget::new(&timeout_ctx, ScannerCycleBudgetConfig::default());
+        let timed_out = ScannerCyclePublicationPlan::ProgressOnly
+            .await_leases(&timeout_ctx, &timeout_budget, 504, 20, |_| async {
+                std::future::pending::<Result<(), EcstoreError>>().await
+            })
+            .await;
+        assert!(matches!(timed_out, ScannerPublicationProofWait::Cancelled));
+        let budget_ctx = CancellationToken::new();
+        let stopped_budget = ScannerCycleBudget::new(&budget_ctx, ScannerCycleBudgetConfig::default());
+        stopped_budget.cancel_for_runtime();
+        let budget_cancelled = ScannerCyclePublicationPlan::Observational
+            .await_leases(&budget_ctx, &stopped_budget, 505, 21, |_| async { Ok::<_, EcstoreError>(()) })
+            .await;
+        assert!(matches!(budget_cancelled, ScannerPublicationProofWait::Cancelled));
+    }
+    .with_subscriber(subscriber)
+    .await;
+
+    let bytes = output.lock().expect("lease log mutex").clone();
+    let logs = String::from_utf8(bytes).expect("lease logs are UTF-8");
+    let entries: Vec<serde_json::Value> = logs
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("lease logs are JSON"))
+        .collect();
+    for (cycle, epoch, kind, purpose, outcome, parent_cancelled, proof_cancelled) in [
+        (501, 17, "progress_only", "observational", "acquired", false, false),
+        (502, 18, "observational", "observational", "rejected", false, false),
+        (503, 19, "authoritative", "authoritative", "cancelled", true, true),
+        (504, 20, "progress_only", "observational", "timed_out", false, false),
+        (505, 21, "observational", "observational", "cancelled", false, true),
+        (501, 22, "observational", "observational", "acquired", false, false),
+    ] {
+        let started: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| entry.get("fields"))
+            .filter(|fields| {
+                fields["state"] == "publication_proof_started" && fields["cycle"] == cycle && fields["leader_epoch"] == epoch
+            })
+            .collect();
+        assert_eq!(started.len(), 1, "missing or duplicated started event for cycle {cycle}: {logs}");
+        assert_eq!(started[0]["leader_epoch"], epoch);
+        assert_eq!(started[0]["publication_kind"], kind);
+        assert_eq!(started[0]["lease_purpose"], purpose);
+        let finished: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| entry.get("fields"))
+            .filter(|fields| {
+                fields["state"] == "publication_lease_wait_finished"
+                    && fields["cycle"] == cycle
+                    && fields["leader_epoch"] == epoch
+            })
+            .collect();
+        assert_eq!(finished.len(), 1, "missing or duplicated finished event for cycle {cycle}: {logs}");
+        let fields = finished[0];
+        assert_eq!(fields["leader_epoch"], epoch);
+        assert_eq!(fields["publication_kind"], kind);
+        assert_eq!(fields["lease_purpose"], purpose);
+        assert_eq!(fields["outcome"], outcome);
+        assert_eq!(fields["parent_cancelled_at_return"], parent_cancelled);
+        assert_eq!(fields["proof_token_cancelled_at_return"], proof_cancelled);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn publication_lease_retry_logs_identify_interleaved_epochs() {
+    use tracing::instrument::WithSubscriber as _;
+
+    for level in [tracing::Level::WARN, tracing::Level::INFO, tracing::Level::DEBUG] {
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = LeaseLogWriter(Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_env_filter(format!("off,rustfs::scanner={level}"))
+            .with_current_span(true)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _interest_guard = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+        exercise_interleaved_lease_waits().with_subscriber(subscriber).await;
+
+        let bytes = output.lock().expect("lease log mutex").clone();
+        let logs = String::from_utf8(bytes).expect("lease logs are UTF-8");
+        assert!(!logs.contains("remote-secret"), "untrusted error text must not enter logs");
+        assert!(!logs.contains("forged:9000"), "unstructured error text must not establish a peer");
+        let entries: Vec<serde_json::Value> = logs
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("lease logs are JSON"))
+            .collect();
+        let find_lease_event = |state: &str| {
+            entries
+                .iter()
+                .position(|entry| entry["state"] == state && entry["stage"] == "lease_acquire")
+                .unwrap_or_else(|| panic!("missing {state} at {level}: {logs}"))
+        };
+        let pending = find_lease_event("publication_proof_pending");
+        let rejected = find_lease_event("publication_proof_rejected");
+        assert!(pending < rejected, "waits must interleave: {logs}");
+        for (index, epoch, purpose) in [(pending, 41, "observational"), (rejected, 42, "authoritative")] {
+            assert_eq!(entries[index]["cycle"], 601);
+            assert_eq!(entries[index]["leader_epoch"], epoch, "{logs}");
+            assert_eq!(entries[index]["lease_purpose"], purpose, "{logs}");
+        }
+        assert_eq!(entries[rejected]["peer"], "peer-a:9000", "{logs}");
+        assert_eq!(entries[rejected]["failure_kind"], "peer_unavailable", "{logs}");
+        let ipv6 = entries
+            .iter()
+            .find(|entry| entry["state"] == "publication_proof_rejected" && entry["cycle"] == 604)
+            .expect("IPv6 target failure should be logged");
+        assert_eq!(ipv6["peer"], "[2001:db8::1]:9443", "{logs}");
+        let secret_target = entries
+            .iter()
+            .find(|entry| entry["state"] == "publication_proof_rejected" && entry["cycle"] == 605)
+            .expect("credential-bearing target failure should be logged");
+        assert!(secret_target["peer"].is_null(), "credential-bearing target must not be logged");
+        assert!(!logs.contains("target-secret"), "target credentials must not enter logs");
+        let local = entries
+            .iter()
+            .find(|entry| entry["state"] == "publication_proof_rejected" && entry["cycle"] == 606)
+            .expect("local diagnostic should be logged");
+        assert_eq!(local["reason"], "invalid_proof");
+        assert!(local["reported_reason"].is_null());
+        let reported = entries
+            .iter()
+            .find(|entry| entry["state"] == "publication_proof_rejected" && entry["cycle"] == 607)
+            .expect("remote report should be logged");
+        assert!(reported["reason"].is_null());
+        assert_eq!(reported["reported_reason"], "generation_stale");
+        let timeout = entries
+            .iter()
+            .find(|entry| entry["state"] == "publication_proof_rejected" && entry["cycle"] == 608)
+            .expect("channel deadline should be logged");
+        assert_eq!(timeout["reason"], "channel_acquisition_timed_out");
+        assert!(timeout["reported_reason"].is_null());
+        assert!(!logs.contains("diagnostic-secret"), "error text must not enter logs");
+        if level != tracing::Level::WARN {
+            let recovered = find_lease_event("publication_proof_recovered");
+            assert!(rejected < recovered, "waits must interleave: {logs}");
+            assert_eq!(entries[recovered]["leader_epoch"], 41, "{logs}");
+            assert_eq!(entries[recovered]["lease_purpose"], "observational", "{logs}");
+        }
+        if level == tracing::Level::DEBUG {
+            let retry = find_lease_event("publication_proof_retry");
+            let recovered = find_lease_event("publication_proof_recovered");
+            assert!(rejected < retry && retry < recovered, "retry must remain interleaved: {logs}");
+            assert_eq!(entries[retry]["leader_epoch"], 41, "{logs}");
+            assert_eq!(entries[retry]["lease_purpose"], "observational", "{logs}");
+        }
+        let unknown = entries
+            .iter()
+            .find(|entry| entry["state"] == "publication_proof_rejected" && entry["stage"] == "postscan")
+            .expect("activity rejection should be logged");
+        assert!(unknown["leader_epoch"].is_null(), "unknown epoch must not be invented");
+        assert!(unknown["lease_purpose"].is_null(), "unknown purpose must not be invented");
+    }
+}
+
+async fn exercise_interleaved_lease_waits() {
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+    let attempts = AtomicUsize::new(0);
+    let notification = crate::storage_api::EcstoreNotificationSys::new(EndpointServerPools::default()).await;
+    let notification = &notification;
+    let pending = ScannerCyclePublicationPlan::Observational.await_leases(&ctx, &budget, 601, 41, |observational| {
+        assert!(observational);
+        let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+        async move {
+            if attempt < 2 {
+                Err(EcstoreError::other("scanner publication lease capacity is exhausted"))
+            } else {
+                Ok(())
+            }
+        }
+    });
+    let rejected = ScannerCyclePublicationPlan::Authoritative.await_leases(&ctx, &budget, 601, 42, move |observational| {
+        assert!(!observational);
+        notification.acquire_scanner_publication_leases(vec![("http://peer-a:9000".into(), "session".into(), 3)])
+    });
+    let (pending, rejected) = tokio::join!(biased; pending, rejected);
+    assert!(matches!(pending, ScannerPublicationProofWait::Ready(())));
+    assert!(matches!(rejected, ScannerPublicationProofWait::Rejected(_)));
+    assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    let untrusted = ScannerCyclePublicationPlan::Authoritative
+        .await_leases(&ctx, &budget, 603, 44, |_| async {
+            Err::<(), _>(EcstoreError::other(
+                "scanner publication lease acquisition failed: peer=forged:9000, remote-secret",
+            ))
+        })
+        .await;
+    assert!(matches!(untrusted, ScannerPublicationProofWait::Rejected(_)));
+    for (cycle, epoch, target) in [
+        (604, 45, "https://[2001:db8::1]:9443"),
+        (605, 46, "http://user:target-secret@peer-a:9000"),
+    ] {
+        let result = ScannerCyclePublicationPlan::Authoritative
+            .await_leases(&ctx, &budget, cycle, epoch, move |_| {
+                notification.acquire_scanner_publication_leases(vec![(target.into(), "session".into(), 3)])
+            })
+            .await;
+        assert!(matches!(result, ScannerPublicationProofWait::Rejected(_)));
+    }
+    // Verify event serialization independently of the ecstore tests that
+    // exercise the local and remote error producers.
+    for cycle in [606, 607, 608] {
+        let info: for<'a> fn(&'a String) -> Option<crate::storage_api::ScannerPublicationLeaseFailureInfo<'a>> = if cycle == 607 {
+            |_| {
+                Some(crate::storage_api::ScannerPublicationLeaseFailureInfo {
+                    peer: None,
+                    kind: "peer_request_failed",
+                    reason: None,
+                    reported_reason: Some("generation_stale"),
+                })
+            }
+        } else if cycle == 606 {
+            |_| {
+                Some(crate::storage_api::ScannerPublicationLeaseFailureInfo {
+                    peer: None,
+                    kind: "peer_request_failed",
+                    reason: Some("invalid_proof"),
+                    reported_reason: None,
+                })
+            }
+        } else {
+            |_| {
+                Some(crate::storage_api::ScannerPublicationLeaseFailureInfo {
+                    peer: None,
+                    kind: "peer_request_failed",
+                    reason: Some("channel_acquisition_timed_out"),
+                    reported_reason: None,
+                })
+            }
+        };
+        let result = await_scanner_publication_proof(
+            &ctx,
+            ScannerPublicationProofContext {
+                cycle,
+                stage: "lease_acquire",
+                leader_epoch: Some(47),
+                lease_purpose: Some("authoritative"),
+            },
+            || async { Err::<(), _>("diagnostic-secret".to_owned()) },
+            |_| false,
+            info,
+        )
+        .await;
+        assert!(matches!(result, ScannerPublicationProofWait::Rejected(_)));
+    }
+    let unknown =
+        await_scanner_publication_activity(&ctx, 601, "postscan", || async { Err("protocol mismatch".to_string()) }).await;
+    assert!(unknown.is_err());
+}
+
+#[derive(Clone, Debug, Default)]
+struct CapturedOtelLogs(Arc<std::sync::Mutex<Vec<opentelemetry_sdk::logs::SdkLogRecord>>>);
+
+impl opentelemetry_sdk::logs::LogProcessor for CapturedOtelLogs {
+    fn emit(&self, data: &mut opentelemetry_sdk::logs::SdkLogRecord, _: &opentelemetry::InstrumentationScope) {
+        self.0.lock().expect("OTLP log mutex").push(data.clone());
+    }
+
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        Ok(())
+    }
+
+    fn shutdown_with_timeout(&self, _: std::time::Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn publication_lease_events_include_context_in_otlp_without_span_export() {
+    use opentelemetry::logs::AnyValue;
+    use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+    use tracing::{Instrument as _, instrument::WithSubscriber as _};
+    use tracing_subscriber::prelude::*;
+
+    for level in [tracing::Level::WARN, tracing::Level::INFO, tracing::Level::DEBUG] {
+        let captured = CapturedOtelLogs::default();
+        let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+            .with_log_processor(captured.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(format!("off,rustfs::scanner={level}")))
+            .with(OpenTelemetryTracingBridge::new(&provider));
+        let _interest_guard = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        async {
+            // The bridge is configured like production: no tracing exporter or
+            // span attribute copying. A parent span must not supply these fields.
+            let unrelated = tracing::warn_span!(
+                target: "rustfs::scanner",
+                "unrelated_parent",
+                leader_epoch = 999,
+                lease_purpose = "unrelated"
+            );
+            exercise_interleaved_lease_waits().instrument(unrelated).await;
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        let records = captured.0.lock().expect("OTLP log mutex").clone();
+        let attribute = |record: &opentelemetry_sdk::logs::SdkLogRecord, name: &str| {
+            record
+                .attributes_iter()
+                .find(|(key, _)| key.as_str() == name)
+                .map(|(_, value)| value.clone())
+        };
+        let find = |state: &'static str, cycle: i64, stage: &'static str| {
+            records
+                .iter()
+                .find(|record| {
+                    attribute(record, "state") == Some(AnyValue::from(state))
+                        && attribute(record, "cycle") == Some(AnyValue::Int(cycle))
+                        && attribute(record, "stage") == Some(AnyValue::from(stage))
+                })
+                .unwrap_or_else(|| panic!("missing {state} at {level}"))
+        };
+        let pending = find("publication_proof_pending", 601, "lease_acquire");
+        let rejected = find("publication_proof_rejected", 601, "lease_acquire");
+        for (record, epoch, purpose) in [(pending, 41, "observational"), (rejected, 42, "authoritative")] {
+            assert_eq!(attribute(record, "leader_epoch"), Some(AnyValue::Int(epoch)));
+            assert_eq!(attribute(record, "lease_purpose"), Some(AnyValue::from(purpose)));
+        }
+        assert_eq!(attribute(rejected, "peer"), Some(AnyValue::from("peer-a:9000")));
+        assert_eq!(attribute(rejected, "failure_kind"), Some(AnyValue::from("peer_unavailable")));
+        let ipv6 = find("publication_proof_rejected", 604, "lease_acquire");
+        assert_eq!(attribute(ipv6, "peer"), Some(AnyValue::from("[2001:db8::1]:9443")));
+        let secret_target = find("publication_proof_rejected", 605, "lease_acquire");
+        assert!(attribute(secret_target, "peer").is_none());
+        let local = find("publication_proof_rejected", 606, "lease_acquire");
+        assert_eq!(attribute(local, "reason"), Some(AnyValue::from("invalid_proof")));
+        assert!(attribute(local, "reported_reason").is_none());
+        let reported = find("publication_proof_rejected", 607, "lease_acquire");
+        assert!(attribute(reported, "reason").is_none());
+        assert_eq!(attribute(reported, "reported_reason"), Some(AnyValue::from("generation_stale")));
+        let timeout = find("publication_proof_rejected", 608, "lease_acquire");
+        assert_eq!(attribute(timeout, "reason"), Some(AnyValue::from("channel_acquisition_timed_out")));
+        assert!(attribute(timeout, "reported_reason").is_none());
+        if level != tracing::Level::WARN {
+            let recovered = find("publication_proof_recovered", 601, "lease_acquire");
+            assert_eq!(attribute(recovered, "leader_epoch"), Some(AnyValue::Int(41)));
+            assert_eq!(attribute(recovered, "lease_purpose"), Some(AnyValue::from("observational")));
+        }
+        if level == tracing::Level::DEBUG {
+            let retry = find("publication_proof_retry", 601, "lease_acquire");
+            assert_eq!(attribute(retry, "leader_epoch"), Some(AnyValue::Int(41)));
+            assert_eq!(attribute(retry, "lease_purpose"), Some(AnyValue::from("observational")));
+        }
+        let unknown = find("publication_proof_rejected", 601, "postscan");
+        assert!(attribute(unknown, "leader_epoch").is_none());
+        assert!(attribute(unknown, "lease_purpose").is_none());
+        let untrusted = find("publication_proof_rejected", 603, "lease_acquire");
+        assert!(attribute(untrusted, "peer").is_none());
+        assert!(!format!("{records:?}").contains("remote-secret"));
+        assert!(!format!("{records:?}").contains("forged:9000"));
+        assert!(!format!("{records:?}").contains("target-secret"));
+        assert!(!format!("{records:?}").contains("diagnostic-secret"));
+    }
+}
+
+#[tokio::test]
+async fn dropped_lease_wait_does_not_report_a_finished_outcome() {
+    use tracing::instrument::WithSubscriber as _;
+
+    let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = LeaseLogWriter(Arc::clone(&output));
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let _interest_guard = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+    async {
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+        let entered = AtomicBool::new(false);
+        {
+            let proof = ScannerCyclePublicationPlan::Observational.await_leases(&ctx, &budget, 602, 43, |_| {
+                entered.store(true, Ordering::Relaxed);
+                std::future::pending::<Result<(), EcstoreError>>()
+            });
+            tokio::pin!(proof);
+            assert!(futures::poll!(&mut proof).is_pending());
+            assert!(entered.load(Ordering::Relaxed));
+        }
+        assert!(!ctx.is_cancelled());
+        assert!(!budget.token().is_cancelled());
+    }
+    .with_subscriber(subscriber)
+    .await;
+
+    let bytes = output.lock().expect("lease log mutex").clone();
+    let logs = String::from_utf8(bytes).expect("lease logs are UTF-8");
+    let entries: Vec<serde_json::Value> = logs
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("lease logs are JSON"))
+        .collect();
+    let started = entries
+        .iter()
+        .filter(|entry| entry["fields"]["state"] == "publication_proof_started" && entry["fields"]["cycle"] == 602)
+        .count();
+    let finished = entries
+        .iter()
+        .filter(|entry| entry["fields"]["state"] == "publication_lease_wait_finished" && entry["fields"]["cycle"] == 602)
+        .count();
+    assert_eq!(started, 1, "the wait was polled: {logs}");
+    assert_eq!(finished, 0, "a dropped future has no observed outcome: {logs}");
+}
+
 #[tokio::test]
 #[serial]
 async fn exhausted_budget_still_proves_peer_movement_without_namespace_authority() {
@@ -33,7 +498,7 @@ async fn exhausted_budget_still_proves_peer_movement_without_namespace_authority
     let calls = AtomicUsize::new(0);
 
     let proof = plan
-        .await_leases(&ctx, &budget, 352, |observational| {
+        .await_leases(&ctx, &budget, 352, 19, |observational| {
             calls.fetch_add(1, Ordering::Relaxed);
             store.acquire_scanner_publication_lease_with_purpose(generation, Duration::from_secs(60), observational)
         })
@@ -57,7 +522,7 @@ async fn exhausted_budget_still_proves_peer_movement_without_namespace_authority
     assert!(store.release_scanner_publication_lease(token).await);
 
     let stale = plan
-        .await_leases(&ctx, &budget, 352, |observational| {
+        .await_leases(&ctx, &budget, 352, 19, |observational| {
             store.acquire_scanner_publication_lease_with_purpose(generation + 1, Duration::from_secs(60), observational)
         })
         .await;
@@ -71,7 +536,7 @@ async fn exhausted_budget_still_proves_peer_movement_without_namespace_authority
     assert!(store.scanner_data_movement_pause_status().await.paused);
     let current_generation = store.scanner_data_movement_generation();
     let moving = plan
-        .await_leases(&ctx, &budget, 352, |observational| {
+        .await_leases(&ctx, &budget, 352, 19, |observational| {
             store.acquire_scanner_publication_lease_with_purpose(current_generation, Duration::from_secs(60), observational)
         })
         .await;
@@ -101,15 +566,21 @@ async fn emitted_updates_keep_budget_cancellation_and_publication_purpose() {
         let ctx = CancellationToken::new();
         let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
         let ready = plan
-            .await_leases(&ctx, &budget, 352, |observational| async move { Ok::<_, String>(observational) })
+            .await_leases(
+                &ctx,
+                &budget,
+                352,
+                19,
+                |observational| async move { Ok::<_, EcstoreError>(observational) },
+            )
             .await;
         assert!(matches!(ready, ScannerPublicationProofWait::Ready(observational) if observational == plan.is_observational()));
         budget.cancel_for_runtime();
         let calls = AtomicUsize::new(0);
         let cancelled = plan
-            .await_leases(&ctx, &budget, 352, |_| {
+            .await_leases(&ctx, &budget, 352, 19, |_| {
                 calls.fetch_add(1, Ordering::Relaxed);
-                async { Ok::<(), String>(()) }
+                async { Ok::<(), EcstoreError>(()) }
             })
             .await;
         assert!(matches!(cancelled, ScannerPublicationProofWait::Cancelled));
@@ -124,9 +595,9 @@ async fn progress_proof_honors_parent_cancellation() {
     ctx.cancel();
     let calls = AtomicUsize::new(0);
     let proof = ScannerCyclePublicationPlan::ProgressOnly
-        .await_leases(&ctx, &budget, 352, |_| {
+        .await_leases(&ctx, &budget, 352, 19, |_| {
             calls.fetch_add(1, Ordering::Relaxed);
-            async { Ok::<_, String>(()) }
+            async { Ok::<_, EcstoreError>(()) }
         })
         .await;
     assert!(matches!(proof, ScannerPublicationProofWait::Cancelled));
@@ -149,13 +620,13 @@ async fn progress_proof_is_bounded_without_a_runtime_budget() {
         let calls = AtomicUsize::new(0);
         let started = Instant::now();
         let proof = ScannerCyclePublicationPlan::ProgressOnly
-            .await_leases(&ctx, &budget, 352, |_| {
+            .await_leases(&ctx, &budget, 352, 19, |_| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 async move {
                     if stalled {
                         std::future::pending::<()>().await;
                     }
-                    Err::<(), _>("scanner publication lease capacity is exhausted")
+                    Err::<(), _>(EcstoreError::other("scanner publication lease capacity is exhausted"))
                 }
             })
             .await;
