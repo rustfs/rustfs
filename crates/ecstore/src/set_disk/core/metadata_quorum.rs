@@ -597,10 +597,8 @@ mod tests {
                         .iter()
                         .map(|slot| slot.file_info().expect("every disk must have arrived").clone())
                         .collect::<Vec<_>>();
-                    let (_, selected, selection_quorum) =
-                        SetDisks::select_valid_fileinfo(&vec![None; 4], &completed_metadata, &vec![None; 4], "", 2, 3)
-                            .expect("three matching B disks must select the current identity");
-                    assert_eq!(selection_quorum, 3);
+                    let (_, selected) = SetDisks::select_valid_fileinfo(&vec![None; 4], &completed_metadata, &vec![None; 4], 2)
+                        .expect("three matching B disks must select the current identity");
                     assert_eq!(selected.version_id, expected_current.version_id);
                     assert_eq!(selected.mod_time, expected_current.mod_time);
                     assert_eq!(selected.data_dir, expected_current.data_dir);
