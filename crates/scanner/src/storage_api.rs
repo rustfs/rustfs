@@ -368,6 +368,8 @@ pub(crate) mod scan {
         ScannerPublicationLeaseFailureInfo, scanner_peer_transport_error_message_is_retryable,
         scanner_publication_lease_failure_info,
     };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::rpc::PeerRestClient as EcstorePeerRestClient;
 }
 
 pub(crate) mod scanner_io {
