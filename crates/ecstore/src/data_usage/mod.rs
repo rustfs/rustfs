@@ -28,7 +28,7 @@ use crate::{
     error::{Error, classify_system_path_failure_reason},
     object_api::{ObjectInfo, ObjectOptions, PutObjReader},
     runtime::sources as runtime_sources,
-    store::{ECStore, list_objects::list_marker_key},
+    store::ECStore,
 };
 pub use local_snapshot::{LocalUsageSnapshot, read_snapshot as read_local_snapshot, snapshot_path};
 use rustfs_data_usage::{
@@ -1966,8 +1966,8 @@ fn advance_version_listing_cursor(
     let next_version_marker = next_version_marker
         .filter(|next_version_marker| !next_version_marker.is_empty())
         .ok_or_else(|| Error::other(format!("bucket {bucket} version listing was truncated without a version marker")))?;
-    let current_key_marker = marker.as_deref().map(list_marker_key);
-    let next_key_marker = list_marker_key(&next_marker);
+    let current_key_marker = marker.as_deref();
+    let next_key_marker = next_marker.as_str();
     if current_key_marker == Some(next_key_marker) && version_marker.as_deref() == Some(next_version_marker.as_str()) {
         return Err(Error::other(format!(
             "bucket {bucket} version listing returned a repeated continuation marker"
@@ -5167,20 +5167,20 @@ mod tests {
         );
         assert!(ensure_truncated_version_page_has_entries("bucket-a", 0).is_err());
         ensure_truncated_version_page_has_entries("bucket-a", 1).expect("a truncated page with an entry can advance");
+    }
 
-        let mut tagged_marker = Some("object-a[rustfs_cache:v2,id:old]".to_string());
-        let mut tagged_version_marker = Some("version-a".to_string());
-        assert!(
-            advance_version_listing_cursor(
-                "bucket-a",
-                &mut tagged_marker,
-                &mut tagged_version_marker,
-                Some("object-a[rustfs_cache:v2,id:new]".to_string()),
-                Some("version-a".to_string()),
-            )
-            .is_err(),
-            "different cache tags for the same logical marker must not count as progress"
-        );
+    #[test]
+    fn version_listing_cursor_compares_literal_cache_shaped_keys() {
+        let mut marker = Some("object-a".to_string());
+        let mut version_marker = Some("version-a".to_string());
+        advance_version_listing_cursor(
+            "bucket-a",
+            &mut marker,
+            &mut version_marker,
+            Some("object-a[rustfs_cache:v2,id:old]".to_string()),
+            Some("version-a".to_string()),
+        )
+        .expect("a distinct literal key advances the cursor");
     }
 
     #[test]
