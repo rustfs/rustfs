@@ -6,7 +6,17 @@
 - Route every new sync/flush through the durability-mode and bucket override
   gates; mode `none` must not pay the new fsync.
 - Keep blocking filesystem/CPU work off async runtime threads, but do not split
-  one small operation into many `spawn_blocking` round trips.
+  one small operation into many `spawn_blocking` round trips; coalesce `open`,
+  `read`/`write`, `fsync`, and `close` into one blocking closure per disk.
+- Check for per-disk syscall amplification (`disks × parts/files`): pin a
+  directory once (`openat2` on Linux) and reuse the handle across sibling reads
+  instead of re-walking ancestor components per file or re-opening identical
+  `source_parent == destination_parent` directories.
+- After `fstat`/`file.metadata()`, require `Vec::with_capacity(len + 1)` before
+  `read_to_end` so small metadata reads do not trigger 6–7 exponential-growth
+  `read()` syscalls.
+- Avoid redundant `store.load()` or `root_missing()` round-trips under the same
+  exclusive lock when the state or original bytes were just loaded or persisted.
 - Measure lock hold time across I/O and compare acquisition order for ABBA.
 - Keep cleanup, extra stat/rename, and diagnostics out of the PUT commit critical
   section when they need not be there.
