@@ -4291,20 +4291,20 @@ impl ECStore {
                 .select_decommission_capacity_target_pool(owner, expected_data_bytes)
                 .await;
         }
-        if let Some(pool_idx) = self
+        let holder = self
             .data_movement_pool_holding_version(bucket, object, opts.version_id.as_deref(), opts.src_pool_idx)
+            .await;
+        self.get_available_pool_idx_preferring(bucket, object, size, None, holder)
             .await
-        {
-            return Ok(pool_idx);
-        }
-
-        self.get_available_pool_idx(bucket, object, size).await.ok_or(Error::DiskFull)
+            .ok_or(Error::DiskFull)
     }
 
     /// The target pool that already holds a copy of the exact version being
     /// moved. An attempt that lost write quorum can leave that copy on fewer
     /// drives than read quorum, which the pool lookup reports as absent; a
     /// retry that placed the version on another pool would leave it in two.
+    /// Callers still subject the holder to the free-space checks, so a full
+    /// holder cannot pin every retry of a deferred entry.
     async fn data_movement_pool_holding_version(
         &self,
         bucket: &str,
@@ -5451,13 +5451,11 @@ impl ECStore {
                     None => {
                         if let Some(owner) = DecommissionCapacityOwner::from_options(&opts) {
                             self.select_decommission_capacity_target_pool(owner, 0).await?
-                        } else if let Some(pool_idx) = self
-                            .data_movement_pool_holding_version(bucket, object, opts.version_id.as_deref(), opts.src_pool_idx)
-                            .await
-                        {
-                            pool_idx
                         } else {
-                            self.get_available_pool_idx_excluding(bucket, object, 0, opts.src_pool_idx)
+                            let holder = self
+                                .data_movement_pool_holding_version(bucket, object, opts.version_id.as_deref(), opts.src_pool_idx)
+                                .await;
+                            self.get_available_pool_idx_preferring(bucket, object, 0, Some(opts.src_pool_idx), holder)
                                 .await
                                 .ok_or(Error::DiskFull)?
                         }
