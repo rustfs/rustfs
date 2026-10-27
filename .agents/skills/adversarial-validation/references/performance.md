@@ -7,16 +7,20 @@
   gates; mode `none` must not pay the new fsync.
 - Keep blocking filesystem/CPU work off async runtime threads, but do not split
   one small operation into many `spawn_blocking` round trips; coalesce `open`,
-  `read`/`write`, `fsync`, and `close` into one blocking closure per disk.
+  `read`/`write`, `fsync`, and `close` into one blocking closure per disk. When
+  coalescing steps across execution lanes, route the combined closure to the
+  dedicated fsync lane whenever any step performs file or directory sync so
+  stalled syncs cannot starve foreground metadata reads.
 - Check for per-disk syscall amplification (`disks × parts/files`): pin a
   directory once (`openat2` on Linux) and reuse the handle across sibling reads
-  instead of re-walking ancestor components per file or re-opening identical
-  `source_parent == destination_parent` directories.
-- After `fstat`/`file.metadata()`, require `Vec::with_capacity(len + 1)` before
-  `read_to_end` so small metadata reads do not trigger 6–7 exponential-growth
-  `read()` syscalls.
-- Avoid redundant `store.load()` or `root_missing()` round-trips under the same
-  exclusive lock when the state or original bytes were just loaded or persisted.
+  or same-directory renames instead of re-walking ancestor components per file
+  or re-opening the same parent directory twice.
+- When the file size is already known from `fstat` metadata, pre-size the
+  destination buffer (`len + 1`) before reading to EOF so small metadata reads
+  complete in a single `read()` + EOF check rather than exponential-growth
+  reallocations and syscalls.
+- Avoid redundant disk re-reads or existence checks under the same exclusive
+  lock when the state or raw bytes were just loaded or persisted.
 - Measure lock hold time across I/O and compare acquisition order for ABBA.
 - Keep cleanup, extra stat/rename, and diagnostics out of the PUT commit critical
   section when they need not be there.

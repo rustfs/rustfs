@@ -441,9 +441,11 @@ pub(crate) mod ecstore_bucket {
 
 pub(crate) mod ecstore_capacity {
     pub(crate) use rustfs_ecstore::api::capacity::{
-        DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolMeta, PoolStatus, get_total_usable_capacity,
+        DecommissionUnresolvedEntry, PoolAdminDiagnostic, PoolDecommissionInfo, PoolMeta, PoolStatus, get_total_usable_capacity,
         get_total_usable_capacity_free, is_pool_activation_fleet_proof_error, is_reserved_or_invalid_bucket,
     };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::capacity::{PoolAvailability, PoolCapacityStatus, PoolDiagnosticStatus};
 }
 
 pub(crate) mod ecstore_client {
