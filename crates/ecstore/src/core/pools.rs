@@ -28002,6 +28002,50 @@ mod tests {
         assert_eq!(actual, b"written after versioning was enabled");
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_target_selection_returns_timeout_for_a_held_object_lock() {
+        let fixture = NullVersionDecommission::new(NullVersionTop::NewerVersion).await;
+        let target_set = fixture.store.pools[1].get_disks_by_key(fixture.object);
+        let lock = target_set
+            .new_ns_lock(fixture.bucket, fixture.object)
+            .await
+            .expect("target lock");
+        let guard = lock
+            .get_write_lock(std::time::Duration::from_secs(5))
+            .await
+            .expect("hold target lock");
+        let opts = ObjectOptions {
+            data_movement: true,
+            src_pool_idx: 0,
+            version_id: Some(uuid::Uuid::nil().to_string()),
+            ..Default::default()
+        };
+        let result = tokio::time::timeout(
+            get_lock_acquire_timeout() + std::time::Duration::from_secs(15),
+            fixture
+                .store
+                .select_data_movement_pool_idx(fixture.bucket, fixture.object, 1, &opts, false),
+        )
+        .await
+        .expect("target selection must terminate");
+        drop(guard);
+        match result {
+            Err(Error::Lock(rustfs_lock::LockError::Timeout { resource, .. })) => {
+                assert!(resource.contains(fixture.bucket) && resource.contains(fixture.object), "{resource}");
+            }
+            other => panic!("expected an object lock timeout, got {other:?}"),
+        }
+        assert_eq!(
+            fixture
+                .store
+                .select_data_movement_pool_idx(fixture.bucket, fixture.object, 1, &opts, false)
+                .await
+                .expect("target selection must recover once the lock is released"),
+            1
+        );
+    }
+
     #[test]
     fn decommission_defers_only_prepare_put_lock_timeouts() {
         let timeout = || Error::Lock(rustfs_lock::LockError::timeout("bucket/object", std::time::Duration::from_secs(5)));
