@@ -28,11 +28,12 @@ use datafusion::{
         record_batch::RecordBatch,
     },
     datasource::{
-        file_format::{csv::CsvFormat, json::JsonFormat},
+        file_format::{DEFAULT_SCHEMA_INFER_MAX_RECORD, csv::CsvFormat, json::JsonFormat},
         listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
     },
     error::Result as DFResult,
     execution::{RecordBatchStream, SendableRecordBatchStream},
+    object_store::ObjectStoreExt as _,
     sql::sqlparser::parser::ParserError,
 };
 use futures::Stream;
@@ -61,7 +62,7 @@ use tokio::{
 };
 
 use crate::{
-    dispatcher::{json_document_table::JsonDocumentTable, parquet_table::ParquetSelectTable},
+    dispatcher::{json_document_table::JsonDocumentTable, json_lines_schema, parquet_table::ParquetSelectTable},
     execution::factory::QueryExecutionFactoryRef,
     instance::{DEFAULT_MAX_CONCURRENT_QUERIES, DEFAULT_QUERY_TIMEOUT_SECS},
     metadata::{ContextProviderExtension, MetadataProvider, TableHandleProviderRef, base_table::BaseTableProvider},
@@ -508,7 +509,11 @@ impl SimpleQueryDispatcher {
                 return Err(SelectError::InvalidDataSource.into());
             };
 
-        let resolve_schema = listing_options.infer_schema(session.inner(), &table_path).await?;
+        let resolve_schema = if self.input.request.input_serialization.json.is_some() {
+            infer_json_lines_schema(session, &table_path).await?
+        } else {
+            listing_options.infer_schema(session.inner(), &table_path).await?
+        };
         let config = if need_rename_volume_name {
             let mut new_fields = Vec::new();
             for (i, field) in resolve_schema.fields().iter().enumerate() {
@@ -547,6 +552,14 @@ impl SimpleQueryDispatcher {
 
         Ok(current_session_table_provider)
     }
+}
+
+/// Reads the object like DataFusion's `JsonFormat::infer_schema` does, but
+/// keeps the source key order (see `json_lines_schema::infer_schema`).
+async fn infer_json_lines_schema(session: &SessionCtx, table_path: &ListingTableUrl) -> DFResult<SchemaRef> {
+    let store = session.inner().runtime_env().object_store(table_path.object_store())?;
+    let bytes = store.get(table_path.prefix()).await?.bytes().await?;
+    Ok(Arc::new(json_lines_schema::infer_schema(&bytes, DEFAULT_SCHEMA_INFER_MAX_RECORD)?))
 }
 
 fn is_json_document_input(input: &SelectObjectContentInput) -> bool {
@@ -1725,6 +1738,69 @@ mod tests {
             }
             assert_eq!(values, ["selected"], "key={key}, json={json}");
         }
+    }
+
+    async fn json_lines_plan_schema(data: &'static [u8], sql: &str) -> SchemaRef {
+        let mut input = test_input();
+        input.key = "records.json".to_owned();
+        input.request.input_serialization.csv = None;
+        input.request.input_serialization.json = Some(JSONInput {
+            type_: Some(JSONType::from_static(JSONType::LINES)),
+        });
+        let input = Arc::new(input);
+        let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
+        let dispatcher = test_dispatcher_for_input(
+            Arc::clone(&input),
+            Arc::new(Semaphore::new(1)),
+            Duration::from_secs(30),
+            Arc::new(SqlQueryExecutionFactory::new(optimizer, Arc::new(LocalScheduler {}))),
+        );
+        let query = Query::new(QueryContext { input }, sql.to_owned());
+        let machine = dispatcher.build_query_state_machine(query).await.expect("build query state");
+        let store_url = ObjectStoreUrl::parse("s3://test-bucket").expect("test store URL");
+        let store = machine
+            .session
+            .inner()
+            .runtime_env()
+            .object_store(&store_url)
+            .expect("test store");
+        store
+            .put(&Path::from("records.json"), data.into())
+            .await
+            .expect("write JSON LINES object");
+        let Plan::Query(plan) = dispatcher
+            .build_logical_plan(machine)
+            .await
+            .expect("plan JSON LINES query")
+            .expect("select plan");
+        Arc::new(plan.df_plan.schema().as_arrow().clone())
+    }
+
+    fn field_names(fields: &datafusion::arrow::datatypes::Fields) -> Vec<&str> {
+        fields.iter().map(|field| field.name().as_str()).collect()
+    }
+
+    fn struct_fields(data_type: &DataType) -> &datafusion::arrow::datatypes::Fields {
+        match data_type {
+            DataType::Struct(fields) => fields,
+            DataType::List(item) => struct_fields(item.data_type()),
+            other => panic!("expected a struct or list of structs, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn json_lines_select_star_keeps_source_field_order() {
+        let schema = json_lines_plan_schema(
+            b"{\"z\":1,\"a b\":{\"y\":true,\"B\":[{\"k2\":1,\"k1\":2}]},\"A\":\"x\"}\n\n  \r\n{\"A\":\"y\",\"$c\":2,\"a b\":{\"x\":1}}\r\n",
+            "SELECT * FROM S3Object",
+        )
+        .await;
+
+        assert_eq!(field_names(schema.fields()), ["z", "a b", "A", "$c"]);
+        let nested = struct_fields(schema.field_with_name("a b").expect("nested field").data_type());
+        assert_eq!(field_names(nested), ["y", "B", "x"]);
+        let listed = struct_fields(nested.find("B").expect("list field").1.data_type());
+        assert_eq!(field_names(listed), ["k2", "k1"]);
     }
 
     #[tokio::test]
