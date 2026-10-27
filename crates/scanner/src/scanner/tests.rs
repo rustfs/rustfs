@@ -9204,8 +9204,12 @@ async fn publication_lease_retries_pending_namespace_commit_until_it_clears() {
 
     let result = await_scanner_publication_proof(
         &ctx,
-        17,
-        "lease_acquire",
+        ScannerPublicationProofContext {
+            cycle: 17,
+            stage: "lease_acquire",
+            leader_epoch: None,
+            lease_purpose: None,
+        },
         move || {
             let attempt = proof_attempts.fetch_add(1, Ordering::SeqCst);
             async move {
@@ -9217,6 +9221,7 @@ async fn publication_lease_retries_pending_namespace_commit_until_it_clears() {
             }
         },
         |error| scanner_publication_lease_error_is_retryable(error),
+        |_| None,
     )
     .await;
 

@@ -107,6 +107,10 @@ bytes.workspace = true
 hex-simd.workspace = true
 
 [dev-dependencies]
+opentelemetry.workspace = true
+opentelemetry-appender-tracing = { workspace = true, features = ["experimental_span_attributes", "experimental_metadata_attributes"] }
+opentelemetry_sdk.workspace = true
+rustfs-common = { workspace = true, features = ["test-util"] }
 rustfs-heal.workspace = true
 rustfs-test-utils.workspace = true
 tracing-subscriber = { workspace = true, features = ["json", "env-filter", "time"] }

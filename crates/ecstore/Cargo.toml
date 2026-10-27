@@ -245,6 +245,7 @@ windows-sys = { workspace = true, features = ["Win32_System_Ioctl"] }
 
 [dev-dependencies]
 aws-smithy-async.workspace = true
+rustfs-common = { workspace = true, features = ["test-util"] }
 rustfs-s3-ops.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "fs"] }
 criterion = { workspace = true, features = ["html_reports"] }
