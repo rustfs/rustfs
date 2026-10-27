@@ -1411,6 +1411,19 @@ impl TableCatalogObjectPaths {
         )
     }
 
+    pub fn catalog_backup_fence_lock_path(&self, table_bucket: &str) -> String {
+        format!(
+            "{}/{}/{}/fence.lock",
+            self.catalog_root,
+            TABLE_CATALOG_BACKUP_ROOT,
+            table_catalog_path_hash(table_bucket)
+        )
+    }
+
+    pub fn catalog_backup_global_fence_lock_path(&self) -> String {
+        format!("{}/{}/global-fence.lock", self.catalog_root, TABLE_CATALOG_BACKUP_ROOT)
+    }
+
     pub fn catalog_backup_restore_intent_path(&self, table_bucket: &str) -> String {
         format!(
             "{}/{}/{}/{}",

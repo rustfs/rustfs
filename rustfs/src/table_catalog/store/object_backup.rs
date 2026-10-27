@@ -64,11 +64,11 @@ where
         let paths = TableCatalogObjectPaths::default();
         let global = self
             .backend
-            .acquire_write_lock(RUSTFS_META_BUCKET, &paths.backing_migration_global_fence_lock_path())
+            .acquire_write_lock(RUSTFS_META_BUCKET, &paths.catalog_backup_global_fence_lock_path())
             .await?;
         let bucket = self
             .backend
-            .acquire_write_lock(RUSTFS_META_BUCKET, &paths.backing_migration_fence_lock_path(table_bucket))
+            .acquire_write_lock(RUSTFS_META_BUCKET, &paths.catalog_backup_fence_lock_path(table_bucket))
             .await?;
         let publication = self
             .backend
