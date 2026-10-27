@@ -80,6 +80,82 @@ pub(in crate::scanner_folder) async fn ordered_entries(
 
 #[tokio::test]
 #[serial]
+async fn namespace_child_io_failure_preserves_healthy_sibling_as_partial() {
+    let (scanner, root) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    let bad_dir = scanner.local_disk.path().join("bucket/a-bad");
+    tokio::fs::create_dir_all(&bad_dir)
+        .await
+        .expect("create unreadable child fixture");
+    write_test_object_metadata(&root, "bucket", "z-good/healthy").await;
+    let _order = OrderedDirectory::new(&scanner.local_disk.path().join("bucket"));
+    let _fault = OrderedDirectory::fail_open(&bad_dir, ErrorKind::PermissionDenied);
+
+    let mut cache = DataUsageCache::default();
+    cache.info.name = "bucket".to_string();
+    cache.info.skip_healing = true;
+    assert!(cache.info.scan_progress.is_none(), "exercise the non-checkpoint scan");
+
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&parent, Default::default());
+    let logs = CapturedLogs::default();
+    let result = logs
+        .capture(
+            tracing::Level::DEBUG,
+            scan_data_folder(
+                budget.token(),
+                budget,
+                vec![scanner.local_disk.clone()],
+                scanner.local_disk,
+                cache,
+                None,
+                HealScanMode::Normal,
+                DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest),
+            ),
+        )
+        .await;
+
+    let events = logs
+        .contents()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("scanner JSON event"))
+        .collect::<Vec<_>>();
+    let failure = events
+        .iter()
+        .position(|event| event["fields"]["state"] == "child_scan_failed" && event["fields"]["child_folder"] == "bucket/a-bad")
+        .expect("the injected child directory I/O failure must be observed");
+    let healthy_open = events
+        .iter()
+        .position(|event| {
+            event["fields"]["state"] == "dir_open"
+                && event["fields"]["dir_path"]
+                    .as_str()
+                    .is_some_and(|path| path.contains("z-good"))
+        })
+        .expect("the healthy sibling directory must be opened");
+    assert!(failure < healthy_open, "the healthy sibling must be scanned after the child failure");
+    let (cache, partial) = match result {
+        Ok(cache) => (cache, false),
+        Err(ScannerError::PartialCache(cache)) => (*cache, true),
+        Err(error) => panic!("a failed child must not abort scanning its healthy sibling: {error}"),
+    };
+    let healthy = cache
+        .checked_flatten("bucket/z-good")
+        .expect("retain the independently scanned healthy sibling");
+    assert_eq!(healthy.objects, 1, "the healthy sibling must make progress after the child failure");
+    println!("Observed the child I/O failure before scanning the healthy sibling");
+    println!("Observed partial={partial} snapshot_complete={}", cache.info.snapshot_complete);
+    assert!(
+        partial && !cache.info.snapshot_complete,
+        "a child directory I/O failure must leave the bucket partial; partial={partial}, snapshot_complete={}",
+        cache.info.snapshot_complete
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn erasure_candidate_finds_late_part_without_scanning_data_children() {
     let (mut scanner, root) = build_test_scanner().await;
     let _guard = TestGuard {
