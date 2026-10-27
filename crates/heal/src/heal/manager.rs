@@ -625,6 +625,37 @@ fn request_matches_request(request: &HealRequest, existing: &HealRequest) -> boo
         && request.heal_endpoints == existing.heal_endpoints
 }
 
+fn lookup_request_id_admission(
+    request: &HealRequest,
+    active_heals: &HashMap<String, Arc<HealTask>>,
+    queue: &PriorityHealQueue,
+    retrying_heals: &HashMap<String, RetryingHeal>,
+    durable_owners: &[HealRequest],
+) -> Option<(bool, &'static str)> {
+    active_heals
+        .get(&request.id)
+        .map(|task| (request_matches_task(request, task), "active"))
+        .or_else(|| {
+            queue
+                .requests()
+                .find(|queued| queued.id == request.id)
+                .map(|queued| (request_matches_request(request, queued), "queued"))
+        })
+        .or_else(|| {
+            retrying_heals
+                .get(&request.id)
+                .map(|retrying| (request_matches_request(request, &retrying.request), "retrying"))
+        })
+        // A durable-only owner must be resumed by recovery, not overwritten
+        // with a new execution budget by a replay before recovery completes.
+        .or_else(|| {
+            durable_owners
+                .iter()
+                .find(|owner| owner.id == request.id)
+                .map(|_| (false, "durable"))
+        })
+}
+
 fn retrying_heal_for_dedup_key(retrying_heals: &HashMap<String, RetryingHeal>, key: &str) -> Option<(String, HealType)> {
     retrying_heals
         .iter()
@@ -2119,28 +2150,59 @@ impl HealManager {
         let mut queue = self.heal_queue.lock().await;
         let mut retrying_heals = self.retrying_heals.lock().await;
 
-        let request_id_admission = active_heals
-            .get(&request.id)
-            .map(|task| (request_matches_task(&request, task), "active"))
-            .or_else(|| {
-                queue
-                    .requests()
-                    .find(|queued| queued.id == request.id)
-                    .map(|queued| (request_matches_request(&request, queued), "queued"))
-            })
-            .or_else(|| {
-                retrying_heals
-                    .get(&request.id)
-                    .map(|retrying| (request_matches_request(&request, &retrying.request), "retrying"))
-            })
-            // A durable-only owner must be resumed by recovery, not overwritten
-            // with a new execution budget by a replay before recovery completes.
-            .or_else(|| {
-                durable_owners
-                    .iter()
-                    .find(|owner| owner.id == request.id)
-                    .map(|_| (false, "durable"))
-            });
+        let mut request_id_admission =
+            lookup_request_id_admission(&request, &active_heals, &queue, &retrying_heals, &durable_owners);
+
+        if request_id_admission.is_none() && source == HealRequestSource::Admin && force_start {
+            let overlapping = active_heals
+                .values()
+                .map(|task| (&task.id, &task.heal_type, &task.options, task.source))
+                .chain(
+                    queue
+                        .requests()
+                        .chain(retrying_heals.values().map(|retrying| &retrying.request))
+                        .chain(durable_owners.iter())
+                        .map(|owner| (&owner.id, &owner.heal_type, &owner.options, owner.source)),
+                )
+                .filter(|(id, heal_type, options, source)| {
+                    **id != request.id
+                        && *source == HealRequestSource::Admin
+                        && heal_scopes_overlap(&request.heal_type, &request.options, heal_type, options)
+                            != OverlapVerdict::Disjoint
+                })
+                .map(|(id, _, _, _)| id.clone())
+                .collect::<HashSet<_>>();
+            drop(retrying_heals);
+            drop(queue);
+            drop(active_heals);
+            active_lock_hold += active_lock_acquired.elapsed();
+            for task_id in &overlapping {
+                match self.cancel_task(task_id).await {
+                    Ok(_) => info!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request.id,
+                        cancelled_task_id = %task_id,
+                        result = "force_start_cancelled_overlap",
+                        "Admin forceStart cancelled an overlapping heal task"
+                    ),
+                    Err(Error::TaskNotFound { .. }) => {} // The owner completed before cancellation acquired its state.
+                    Err(err) => return Err(err),
+                }
+            }
+            durable_owners.retain(|owner| !overlapping.contains(&owner.id));
+            let reacquire_start = Instant::now();
+            active_heals = self.active_heals.lock().await;
+            active_lock_acquired = Instant::now();
+            active_lock_wait += active_lock_acquired.duration_since(reacquire_start);
+            queue = self.heal_queue.lock().await;
+            retrying_heals = self.retrying_heals.lock().await;
+            // Non-admin admission can claim this id while cancellation drops the state locks.
+            request_id_admission = lookup_request_id_admission(&request, &active_heals, &queue, &retrying_heals, &durable_owners);
+        }
+
         if let Some((matches_existing, duplicate_state)) = request_id_admission {
             let admission = if matches_existing {
                 if accept_same_request_id_replay {
@@ -2187,54 +2249,6 @@ impl HealManager {
                 result: admission,
                 task_id: request.id,
             });
-        }
-
-        if source == HealRequestSource::Admin && force_start {
-            let overlapping = active_heals
-                .values()
-                .map(|task| (&task.id, &task.heal_type, &task.options, task.source))
-                .chain(
-                    queue
-                        .requests()
-                        .chain(retrying_heals.values().map(|retrying| &retrying.request))
-                        .chain(durable_owners.iter())
-                        .map(|owner| (&owner.id, &owner.heal_type, &owner.options, owner.source)),
-                )
-                .filter(|(id, heal_type, options, source)| {
-                    **id != request.id
-                        && *source == HealRequestSource::Admin
-                        && heal_scopes_overlap(&request.heal_type, &request.options, heal_type, options)
-                            != OverlapVerdict::Disjoint
-                })
-                .map(|(id, _, _, _)| id.clone())
-                .collect::<HashSet<_>>();
-            drop(retrying_heals);
-            drop(queue);
-            drop(active_heals);
-            active_lock_hold += active_lock_acquired.elapsed();
-            for task_id in &overlapping {
-                match self.cancel_task(task_id).await {
-                    Ok(_) => info!(
-                        target: "rustfs::heal::manager",
-                        event = EVENT_HEAL_QUEUE_ADMISSION,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_MANAGER,
-                        request_id = %request.id,
-                        cancelled_task_id = %task_id,
-                        result = "force_start_cancelled_overlap",
-                        "Admin forceStart cancelled an overlapping heal task"
-                    ),
-                    Err(Error::TaskNotFound { .. }) => {} // The owner completed before cancellation acquired its state.
-                    Err(err) => return Err(err),
-                }
-            }
-            durable_owners.retain(|owner| !overlapping.contains(&owner.id));
-            let reacquire_start = Instant::now();
-            active_heals = self.active_heals.lock().await;
-            active_lock_acquired = Instant::now();
-            active_lock_wait += active_lock_acquired.duration_since(reacquire_start);
-            queue = self.heal_queue.lock().await;
-            retrying_heals = self.retrying_heals.lock().await;
         }
 
         let rejection = if source == HealRequestSource::Admin {
