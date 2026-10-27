@@ -886,7 +886,7 @@ impl DistributedLock {
     }
 
     async fn acquire_lock_quorum_with_retry(&self, request: &LockRequest) -> Result<LockAcquireQuorumResult> {
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let mut attempt = 1;
         let mut last_result = None;
 
@@ -907,11 +907,13 @@ impl DistributedLock {
             }
 
             last_result = Some(result);
-            let backoff = Self::lock_acquire_retry_backoff(attempt, &mut rand::rng());
-            if start.elapsed().saturating_add(backoff) >= request.acquire_timeout {
+            let remaining = request.acquire_timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
                 break;
             }
-
+            // Keep time for another acquire attempt instead of abandoning the
+            // caller's remaining budget when the jittered backoff grows large.
+            let backoff = Self::lock_acquire_retry_backoff(attempt, &mut rand::rng()).min(remaining / 2);
             tokio::time::sleep(backoff).await;
             attempt += 1;
         }
