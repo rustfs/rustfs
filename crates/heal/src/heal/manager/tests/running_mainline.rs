@@ -6,6 +6,41 @@ use crate::heal::storage::HealListItem;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 
+#[tokio::test(start_paused = true)]
+async fn automatic_replacement_uses_running_foreground_pacing() {
+    let provider = Arc::new(super::super::super::pacing::TestPressure::new(WorkloadClass::ForegroundRead, 100));
+    let provider: Option<WorkloadSnapshotProviderRef> = Some(provider);
+    let mut config = HealConfig {
+        mainline_throttle_enable: true,
+        mainline_read_utilization_high_percent: 80,
+        mainline_max_sleep: Duration::from_millis(250),
+        ..HealConfig::default()
+    };
+    let mut request = HealRequest::new(
+        HealType::ErasureSet {
+            buckets: Vec::new(),
+            set_disk_id: "pool_0_set_0".to_owned(),
+        },
+        HealOptions::default(),
+        HealPriority::Low,
+    );
+    request.source = HealRequestSource::AutoHeal;
+    request.heal_endpoints = vec!["replacement-a".to_owned()];
+
+    let pacer = super::super::scheduler::running_mainline_pacer(&request, &config, &provider)
+        .expect("automatic replacement must pace under foreground pressure");
+    let started = tokio::time::Instant::now();
+    pacer.wait(&CancellationToken::new()).await.expect("bounded progress");
+    assert_eq!(started.elapsed(), Duration::from_millis(250));
+
+    assert!(super::super::scheduler::running_mainline_pacer(&request, &config, &None).is_none());
+    config.mainline_throttle_enable = false;
+    assert!(super::super::scheduler::running_mainline_pacer(&request, &config, &provider).is_none());
+    config.mainline_throttle_enable = true;
+    request.heal_endpoints.clear();
+    assert!(super::super::scheduler::running_mainline_pacer(&request, &config, &provider).is_none());
+}
+
 #[derive(Default)]
 struct PressureProbe {
     active: AtomicUsize,
