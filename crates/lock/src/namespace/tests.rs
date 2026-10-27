@@ -979,7 +979,7 @@ async fn test_namespace_lock_distributed_retries_transient_acquire_timeout() {
     drop(guard);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_namespace_lock_retries_when_backoff_exceeds_remaining_budget() {
     let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
     let flaky_clients = managers
