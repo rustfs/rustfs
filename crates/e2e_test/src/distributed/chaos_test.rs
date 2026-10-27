@@ -13,18 +13,20 @@
 // limitations under the License.
 
 use super::harness::{
-    DistCluster, DistLayout, TestResult, assert_object_bytes, payload_for, put_object, retrying_get_equals, unique_bucket,
-    wait_for_ready, wait_until,
+    DistCluster, DistLayout, TestResult, assert_object_bytes, cluster_admin_ok, get_object_bytes, payload_for, put_object,
+    retrying_get_equals, retrying_put, s3_probe_client, s3_probe_error_code, unique_bucket, wait_for_ready, wait_until,
 };
 use crate::chaos::{census_object_version_on_disk, signed_admin_post};
 use crate::common::{build_test_s3_config, init_logging};
 use crate::fault_proxy::FaultMode;
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::operation::{get_object::GetObjectError, put_object::PutObjectError};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Barrier, mpsc};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 
 #[tokio::test]
 async fn kill_and_restart_node_preserves_objects() -> TestResult {
@@ -41,6 +43,133 @@ async fn kill_and_restart_node_preserves_objects() -> TestResult {
     dist.cluster.start_node(3).await?;
     wait_for_ready(&dist.cluster).await?;
     assert_object_bytes(&dist.client(3)?, &bucket, "keep.bin", &body).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ec4_partial_node_return_restores_read_write_quorum() -> TestResult {
+    init_logging();
+    let mut dist = DistCluster::start_with_env(
+        DistLayout::FourByFour,
+        &[
+            ("RUSTFS_ERASURE_SET_DRIVE_COUNT", "16"),
+            ("RUSTFS_STORAGE_CLASS_STANDARD", "EC:4"),
+        ],
+    )
+    .await?;
+    let storage = cluster_admin_ok(&dist.cluster, http::Method::GET, "/rustfs/admin/v3/storageinfo", None).await?;
+    let storage: serde_json::Value = serde_json::from_str(&storage)?;
+    let storage: rustfs_madmin::StorageInfo = serde_json::from_value(storage["info"].clone())?;
+    assert_eq!(storage.disks.len(), 16);
+    assert_eq!(storage.backend.total_sets, vec![1]);
+    assert_eq!(storage.backend.drives_per_set, vec![16]);
+    assert_eq!(storage.backend.standard_sc_parity, Some(4));
+
+    let bucket = unique_bucket("partial-ec4");
+    dist.create_bucket(&bucket).await?;
+    let client = s3_probe_client(&dist.client(0)?);
+    let baseline = payload_for("partial-recovery/baseline", 8 * 1024 * 1024);
+    put_object(&client, &bucket, "baseline.bin", baseline.clone()).await?;
+    wait_until(
+        Duration::from_secs(30),
+        || async {
+            for node in &dist.cluster.nodes {
+                for directory in &node.data_dirs {
+                    let census = census_object_version_on_disk(std::path::Path::new(directory), &bucket, "baseline.bin", None)?;
+                    if !census.is_complete() {
+                        return Ok(false);
+                    }
+                    assert_eq!(census.data_blocks, Some(12), "the object must require twelve data shards");
+                    assert_eq!(census.parity_blocks, Some(4), "the object must have four parity shards");
+                    assert!(!census.expected_part_numbers.is_empty(), "the baseline must use physical shards");
+                }
+            }
+            Ok(true)
+        },
+        "the baseline is complete on all sixteen EC:4 drives",
+    )
+    .await?;
+
+    dist.cluster.stop_node(2)?;
+    dist.cluster.stop_node(3)?;
+    let read_error = timeout(Duration::from_secs(60), get_object_bytes(&client, &bucket, "baseline.bin"))
+        .await?
+        .expect_err("eight unavailable drives must prevent the baseline GET");
+    assert!(
+        matches!(
+            s3_probe_error_code(read_error.as_ref()),
+            Some("SlowDown" | "SlowDownRead" | "ServiceUnavailable")
+        ),
+        "quorum loss must produce an availability error: {read_error:?}"
+    );
+    assert_eq!(
+        read_error
+            .downcast_ref::<SdkError<GetObjectError>>()
+            .and_then(SdkError::raw_response)
+            .map(|response| response.status().as_u16()),
+        Some(503),
+        "read quorum loss must remain a service availability failure"
+    );
+    let write_error = timeout(Duration::from_secs(60), put_object(&client, &bucket, "unavailable.bin", baseline.clone()))
+        .await?
+        .expect_err("eight unavailable drives must prevent a successful PUT");
+    assert!(
+        matches!(s3_probe_error_code(write_error.as_ref()), Some("SlowDown" | "ServiceUnavailable")),
+        "quorum loss must produce an availability error: {write_error:?}"
+    );
+    assert_eq!(
+        write_error
+            .downcast_ref::<SdkError<PutObjectError>>()
+            .and_then(SdkError::raw_response)
+            .map(|response| response.status().as_u16()),
+        Some(503),
+        "write quorum loss must remain a service availability failure"
+    );
+
+    // Recover only four drives. The remaining node must stay stopped while
+    // every live coordinator serves old data and acknowledges new writes.
+    dist.cluster.start_node_process(2).await?;
+    let recovery_deadline = Instant::now() + Duration::from_secs(90);
+    let mut recovered_objects = Vec::new();
+    for node in 0..3 {
+        assert!(dist.cluster.nodes[3].process.is_none(), "the fourth node must remain unavailable");
+        let client = s3_probe_client(&dist.client(node)?);
+        retrying_get_equals(
+            &client,
+            &bucket,
+            "baseline.bin",
+            &baseline,
+            recovery_deadline.saturating_duration_since(Instant::now()),
+        )
+        .await?;
+        let key = format!("partial-{node}.bin");
+        let body = payload_for(&key, 1024 * 1024);
+        retrying_put(
+            &client,
+            &bucket,
+            &key,
+            body.clone(),
+            recovery_deadline.saturating_duration_since(Instant::now()),
+        )
+        .await?;
+        recovered_objects.push((key, body));
+    }
+    for node in 0..3 {
+        assert!(dist.cluster.nodes[3].process.is_none(), "reads must complete before all drives return");
+        let client = s3_probe_client(&dist.client(node)?);
+        assert_object_bytes(&client, &bucket, "baseline.bin", &baseline).await?;
+        for (key, body) in &recovered_objects {
+            assert_object_bytes(&client, &bucket, key, body).await?;
+        }
+    }
+
+    dist.cluster.start_node(3).await?;
+    wait_for_ready(&dist.cluster).await?;
+    let client = s3_probe_client(&dist.client(3)?);
+    assert_object_bytes(&client, &bucket, "baseline.bin", &baseline).await?;
+    for (key, body) in &recovered_objects {
+        assert_object_bytes(&client, &bucket, key, body).await?;
+    }
     Ok(())
 }
 

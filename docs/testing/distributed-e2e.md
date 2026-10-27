@@ -33,7 +33,7 @@ The expansion fixture is an all-current-binary fleet, so it initializes pool met
 - Pool expand, decommission, rebalance, checksum integrity, versioned and multipart data, and S3 during active movement
 - Bidirectional site-replication convergence plus enabled/synchronized peer state on both sites
 - A 24-worker mixed PUT/HEAD/GET/COPY/DELETE workload; concurrent PUT during active decommission
-- Node kill/restart, full process restart, node-facing TCP blackhole/recovery, in-flight streaming GETs across a peer kill, and fresh-drive replacement verified by physical `xl.meta`/part-shard census
+- Node kill/restart, full process restart, node-facing TCP blackhole/recovery, in-flight streaming GETs across a peer kill, and fresh-drive replacement verified by physical `xl.meta`/part-shard census. The EC:4 partial-return case pins one 16-drive set and actual 12+4 object metadata, stops two nodes (eight drives), then restores only one. All three live coordinators must read existing objects and write/read new objects while the fourth node remains stopped. This is a process-fault acceptance test, not physical disk-unmount evidence.
 - Multipart, cross-node listing, list-buckets agreement
 - Direct and rolling upgrade from the pinned previous release: historical objects, versioned history, and IAM user AK/SK still work afterwards
 - The `scanner_heal_topology_` protection matrix: versioned, locked and multipart inventory verified through every node across expansion, rebalance stop/restart and queued decommission, with kill and commit-failure injection at proven movement windows; gate map and timeouts in [scanner-heal-topology-gates.md](scanner-heal-topology-gates.md)
