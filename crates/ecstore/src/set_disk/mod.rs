@@ -1790,7 +1790,7 @@ mod prepared_get_object_metadata_tests {
         assert!(original.is_complete());
         let (original_metadata, original_errors, _) = original.into_legacy();
         assert!(original_errors.iter().all(Option::is_none));
-        let (_, generation_a, _) = SetDisks::select_valid_fileinfo(&disks, &original_metadata, &original_errors, "", 2, 3)
+        let (_, generation_a) = SetDisks::select_valid_fileinfo(&disks, &original_metadata, &original_errors, 2)
             .expect("generation A must have real metadata quorum");
         assert!(!generation_a.inline_data(), "fixture must use non-inline shard files");
         let order = bounded_metadata_fanout_order(bucket, &object, 4, 2);
@@ -1851,8 +1851,8 @@ mod prepared_get_object_metadata_tests {
                 assert!(replacement.is_complete());
                 let (replacement_metadata, replacement_errors, _) = replacement.into_legacy();
                 assert!(replacement_errors.iter().all(Option::is_none));
-                let (online, generation_b, _) =
-                    SetDisks::select_valid_fileinfo(&disks, &replacement_metadata, &replacement_errors, "", 2, 3)
+                let (online, generation_b) =
+                    SetDisks::select_valid_fileinfo(&disks, &replacement_metadata, &replacement_errors, 2)
                         .expect("replacement must have healthy real metadata quorum");
                 assert_eq!(online.iter().flatten().count(), 4);
                 assert_ne!(generation_a.data_dir, generation_b.data_dir);
@@ -6829,7 +6829,7 @@ impl SetDisks {
         let (metadata, errors) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false).await?;
         // Match delete_object_version_with_purge, independently of data parity or online inventory size.
         let quorum = self.set_drive_count / 2 + 1;
-        let (_, marker, _) = Self::select_valid_fileinfo(&disks, &metadata, &errors, version_id, quorum, quorum)
+        let (_, marker) = Self::select_valid_fileinfo(&disks, &metadata, &errors, quorum)
             .map_err(|error| to_object_err(error.into(), vec![bucket, object, version_id]))?;
         if !marker.deleted || marker.tier_free_version() || marker.version_id.unwrap_or_else(Uuid::nil) != requested_version {
             return Err(Error::DataMovementOverwriteErr(
@@ -11976,7 +11976,7 @@ mod tests {
     }
 
     #[test]
-    fn test_latest_fileinfo_selection_quorum_requires_write_quorum_when_full_metadata_is_available() {
+    fn test_latest_fileinfo_selection_rejects_same_time_identity_tie() {
         let mod_time = OffsetDateTime::now_utc();
         let data_dir = Uuid::new_v4();
         let metas = vec![
@@ -11987,30 +11987,16 @@ mod tests {
         ];
         let errs = vec![None, None, None, None];
 
-        let quorum = SetDisks::latest_fileinfo_selection_quorum("", &metas, &errs, 2, 3);
+        let result = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2);
 
-        assert_eq!(quorum, 3);
+        assert!(
+            matches!(result, Err(DiskError::ErasureReadQuorum)),
+            "two identities with the same time and count cannot be ordered"
+        );
     }
 
     #[test]
-    fn test_latest_fileinfo_selection_quorum_preserves_read_quorum_for_version_or_degraded_reads() {
-        let mod_time = OffsetDateTime::now_utc();
-        let data_dir = Uuid::new_v4();
-        let metas = vec![
-            quorum_test_fileinfo(mod_time, data_dir, "part-etag-a", 1),
-            quorum_test_fileinfo(mod_time, data_dir, "part-etag-a", 2),
-            FileInfo::default(),
-            FileInfo::default(),
-        ];
-        let degraded_errs = vec![None, None, Some(DiskError::DiskNotFound), Some(DiskError::DiskNotFound)];
-        let clean_errs = vec![None, None, None, None];
-
-        assert_eq!(SetDisks::latest_fileinfo_selection_quorum("", &metas, &degraded_errs, 2, 3), 2);
-        assert_eq!(SetDisks::latest_fileinfo_selection_quorum("version-id", &metas, &clean_errs, 2, 3), 2);
-    }
-
-    #[test]
-    fn test_latest_fileinfo_selection_quorum_keeps_read_quorum_for_partial_overwrite_with_read_error() {
+    fn test_latest_fileinfo_selection_keeps_older_majority_over_partial_overwrite() {
         let old_mod_time = OffsetDateTime::now_utc();
         let new_mod_time = old_mod_time + time::Duration::seconds(1);
         let old_data_dir = Uuid::new_v4();
@@ -12023,26 +12009,15 @@ mod tests {
         ];
         let errs = vec![None, None, None, Some(DiskError::DiskNotFound)];
 
-        let quorum = SetDisks::latest_fileinfo_selection_quorum("", &metas, &errs, 2, 3);
-        let (online_disks, mod_time, etag) = SetDisks::list_online_disks(&vec![None; metas.len()], &metas, &errs, quorum);
-        let fi = SetDisks::pick_valid_fileinfo(&metas, mod_time, etag, quorum)
-            .expect("old metadata should remain readable with read quorum");
-
-        assert_eq!(quorum, 2);
-        assert_eq!(online_disks.len(), metas.len());
-        assert_eq!(fi.data_dir, Some(old_data_dir));
-        assert_eq!(fi.parts[0].etag, "part-etag-old");
-
-        let (_, selected, selected_quorum) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, "", 2, 3)
+        let (_, selected) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2)
             .expect("old metadata should remain selectable with read quorum");
-        assert_eq!(selected_quorum, 2);
         assert_eq!(selected.data_dir, Some(old_data_dir));
         assert_eq!(selected.parts[0].etag, "part-etag-old");
         assert!(selected.is_latest);
     }
 
     #[test]
-    fn test_latest_fileinfo_selection_rejects_partial_latest_read_quorum_with_read_error() {
+    fn test_latest_fileinfo_selection_serves_newer_read_quorum_with_read_error() {
         let old_mod_time = OffsetDateTime::now_utc();
         let new_mod_time = old_mod_time + time::Duration::seconds(1);
         let old_data_dir = Uuid::new_v4();
@@ -12055,9 +12030,79 @@ mod tests {
         ];
         let errs = vec![None, None, None, Some(DiskError::DiskNotFound)];
 
-        let result = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, "", 2, 3);
+        // The new version may hold write quorum through the missing disk; the
+        // old one cannot, and heal converges the set to the new version.
+        let (_, selected) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2)
+            .expect("the newer version reaches read quorum");
 
-        assert!(matches!(result, Err(DiskError::ErasureReadQuorum)));
+        assert_eq!(selected.data_dir, Some(new_data_dir));
+        assert_eq!(selected.mod_time, Some(new_mod_time));
+    }
+
+    #[test]
+    fn test_latest_fileinfo_selection_serves_newer_side_of_complete_split() {
+        let old_mod_time = OffsetDateTime::now_utc();
+        let new_mod_time = old_mod_time + time::Duration::seconds(1);
+        let old_data_dir = Uuid::new_v4();
+        let new_data_dir = Uuid::new_v4();
+        let old = |index| quorum_test_fileinfo(old_mod_time, old_data_dir, "part-etag-old", index);
+        let new = |index| quorum_test_fileinfo(new_mod_time, new_data_dir, "part-etag-new", index);
+        let errs = vec![None, None, None, None];
+
+        for metas in [vec![old(1), old(2), new(3), new(4)], vec![new(1), old(2), new(3), old(4)]] {
+            let (_, selected) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2)
+                .expect("a 2+2 split with every disk answering serves the newer version");
+
+            assert_eq!(selected.data_dir, Some(new_data_dir));
+            assert_eq!(selected.parts[0].etag, "part-etag-new");
+            assert!(selected.is_latest);
+        }
+    }
+
+    #[test]
+    fn test_latest_fileinfo_selection_picks_version_stack_shape_in_disk_order() {
+        let mod_time = OffsetDateTime::now_utc();
+        let data_dir = Uuid::new_v4();
+        let successor = mod_time + time::Duration::seconds(1);
+        let shape = |index, successor_mod_time: Option<OffsetDateTime>, num_versions| {
+            let mut fi = quorum_test_fileinfo(mod_time, data_dir, "part-etag", index);
+            fi.successor_mod_time = successor_mod_time;
+            fi.is_latest = successor_mod_time.is_none();
+            fi.num_versions = num_versions;
+            fi
+        };
+        let errs = vec![None, None, None, None];
+
+        for (metas, expected) in [
+            (
+                vec![
+                    shape(1, Some(successor), 2),
+                    shape(2, None, 1),
+                    shape(3, Some(successor), 2),
+                    shape(4, None, 1),
+                ],
+                Some(successor),
+            ),
+            (
+                vec![
+                    shape(1, None, 1),
+                    shape(2, Some(successor), 2),
+                    shape(3, None, 1),
+                    shape(4, Some(successor), 2),
+                ],
+                None,
+            ),
+        ] {
+            // Each call hashes into fresh maps; a map-order choice would flip.
+            for _ in 0..32 {
+                let (_, selected) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2)
+                    .expect("one content identity reaches read quorum");
+
+                assert_eq!(selected.successor_mod_time, expected);
+                assert_eq!(selected.is_latest, expected.is_none());
+                assert_eq!(selected.num_versions, if expected.is_none() { 1 } else { 2 });
+            }
+        }
     }
 
     #[test]
@@ -12075,11 +12120,9 @@ mod tests {
         let metas = vec![first, second, FileInfo::default(), FileInfo::default()];
         let errs = vec![None, None, Some(DiskError::DiskNotFound), Some(DiskError::DiskNotFound)];
 
-        let (_, mut selected, selected_quorum) =
-            SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, "", 2, 3)
-                .expect("read quorum should remain enough when no competing latest is visible");
+        let (_, mut selected) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2)
+            .expect("read quorum should remain enough when no competing latest is visible");
 
-        assert_eq!(selected_quorum, 2);
         assert_eq!(selected.data_dir, Some(data_dir));
         assert_eq!(selected.parts[0].etag, "part-etag-old");
         assert!(selected.parts[0].checksums.is_none());
@@ -12106,7 +12149,7 @@ mod tests {
         let metas = vec![first, second, FileInfo::default(), FileInfo::default()];
         let errs = vec![None, None, Some(DiskError::DiskNotFound), Some(DiskError::DiskNotFound)];
 
-        let (_, mut selected, _) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, "", 2, 3)
+        let (_, mut selected) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2)
             .expect("winner selection should defer sidecar decoding");
         let err = SetDisks::hydrate_selected_fileinfo_part_checksums(&mut selected)
             .expect_err("a malformed degraded winner must fail closed when checksums are requested");
@@ -12173,10 +12216,9 @@ mod tests {
         let metas = vec![latest_meta, stale_stack_meta, newer_stack_meta, FileInfo::default()];
         let errs = vec![None, None, None, Some(DiskError::DiskNotFound)];
 
-        let (_, selected, selected_quorum) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, "", 2, 3)
+        let (_, selected) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2)
             .expect("same object version should stay readable despite derived version stack drift");
 
-        assert_eq!(selected_quorum, 3);
         assert_eq!(selected.data_dir, Some(data_dir));
         assert_eq!(selected.parts[0].etag, "part-etag");
         assert_eq!(selected.mod_time, Some(mod_time));
@@ -12269,81 +12311,72 @@ mod tests {
         let metas = vec![meta_a, meta_b, meta_c, FileInfo::default()];
         let errs = vec![None, None, None, Some(DiskError::DiskNotFound)];
 
-        let (_, selected, selected_quorum) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, "", 2, 3)
+        let (_, selected) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2)
             .expect("replication status drift should not split readable object identity");
 
-        assert_eq!(selected_quorum, 3);
         assert_eq!(selected.data_dir, Some(data_dir));
         assert_eq!(selected.parts[0].etag, "part-etag");
     }
 
     #[test]
-    fn test_latest_fileinfo_selection_rejects_same_modtime_metadata_split_without_write_quorum() {
+    fn test_latest_fileinfo_selection_serves_same_time_metadata_majority() {
         let mod_time = OffsetDateTime::now_utc();
         let data_dir = Uuid::new_v4();
-        let mut old_meta_a = quorum_test_fileinfo(mod_time, data_dir, "part-etag", 1);
-        let mut old_meta_b = quorum_test_fileinfo(mod_time, data_dir, "part-etag", 2);
-        let mut partial_meta = quorum_test_fileinfo(mod_time, data_dir, "part-etag", 3);
-        old_meta_a.metadata.insert("x-amz-meta-color".to_string(), "blue".to_string());
-        old_meta_b.metadata.insert("x-amz-meta-color".to_string(), "blue".to_string());
-        partial_meta
-            .metadata
-            .insert("x-amz-meta-color".to_string(), "red".to_string());
-        let metas = vec![old_meta_a, old_meta_b, partial_meta, FileInfo::default()];
+        let colored = |index, color: &str| {
+            let mut fi = quorum_test_fileinfo(mod_time, data_dir, "part-etag", index);
+            fi.metadata.insert("x-amz-meta-color".to_string(), color.to_string());
+            fi
+        };
         let errs = vec![None, None, None, Some(DiskError::DiskNotFound)];
 
-        let quorum = SetDisks::latest_fileinfo_selection_quorum("", &metas, &errs, 2, 3);
-        let result = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, "", 2, 3);
+        // With one disk missing, only the two-copy side can hold write quorum,
+        // whichever disk order the copies arrive in.
+        for (metas, expected) in [
+            (
+                vec![colored(1, "blue"), colored(2, "blue"), colored(3, "red"), FileInfo::default()],
+                "blue",
+            ),
+            (vec![colored(1, "blue"), colored(2, "red"), colored(3, "red"), FileInfo::default()], "red"),
+        ] {
+            let (_, selected) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2)
+                .expect("the read-quorum side of a same-time metadata split is served");
 
-        assert_eq!(quorum, 2);
+            assert_eq!(selected.metadata.get("x-amz-meta-color").map(String::as_str), Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_latest_fileinfo_selection_serves_same_time_transition_majority() {
+        let mod_time = OffsetDateTime::now_utc();
+        let data_dir = Uuid::new_v4();
+        let local = |index| quorum_test_fileinfo(mod_time, data_dir, "part-etag", index);
+        let remote = |index| {
+            let mut fi = quorum_test_fileinfo(mod_time, data_dir, "part-etag", index);
+            fi.transition_status = TRANSITION_COMPLETE.to_string();
+            fi.transition_tier = "WARM".to_string();
+            fi.transitioned_objname = "remote/object".to_string();
+            fi.transition_version_id = Some(Uuid::from_u128(7));
+            fi
+        };
+        let errs = vec![None, None, None, Some(DiskError::DiskNotFound)];
+
+        for (metas, expect_remote) in [
+            (vec![local(1), local(2), remote(3), FileInfo::default()], false),
+            (vec![local(1), remote(2), remote(3), FileInfo::default()], true),
+        ] {
+            let (_, selected) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2)
+                .expect("the read-quorum side of a same-time transition split is served");
+
+            assert_eq!(selected.is_remote(), expect_remote);
+        }
+
+        let tied = vec![local(1), local(2), remote(3), remote(4)];
+        let result = SetDisks::select_valid_fileinfo(&vec![None; tied.len()], &tied, &[None, None, None, None], 2);
         assert!(matches!(result, Err(DiskError::ErasureReadQuorum)));
     }
 
     #[test]
-    fn test_latest_fileinfo_selection_rejects_same_modtime_partial_metadata_read_quorum() {
-        let mod_time = OffsetDateTime::now_utc();
-        let data_dir = Uuid::new_v4();
-        let mut old_meta = quorum_test_fileinfo(mod_time, data_dir, "part-etag", 1);
-        let mut partial_meta_a = quorum_test_fileinfo(mod_time, data_dir, "part-etag", 2);
-        let mut partial_meta_b = quorum_test_fileinfo(mod_time, data_dir, "part-etag", 3);
-        old_meta.metadata.insert("x-amz-meta-color".to_string(), "blue".to_string());
-        partial_meta_a
-            .metadata
-            .insert("x-amz-meta-color".to_string(), "red".to_string());
-        partial_meta_b
-            .metadata
-            .insert("x-amz-meta-color".to_string(), "red".to_string());
-        let metas = vec![old_meta, partial_meta_a, partial_meta_b, FileInfo::default()];
-        let errs = vec![None, None, None, Some(DiskError::DiskNotFound)];
-
-        let result = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, "", 2, 3);
-
-        assert!(matches!(result, Err(DiskError::ErasureReadQuorum)));
-    }
-
-    #[test]
-    fn test_latest_fileinfo_selection_rejects_same_modtime_transition_split_without_write_quorum() {
-        let mod_time = OffsetDateTime::now_utc();
-        let data_dir = Uuid::new_v4();
-        let old_meta_a = quorum_test_fileinfo(mod_time, data_dir, "part-etag", 1);
-        let old_meta_b = quorum_test_fileinfo(mod_time, data_dir, "part-etag", 2);
-        let mut partial_meta = quorum_test_fileinfo(mod_time, data_dir, "part-etag", 3);
-        partial_meta.transition_status = TRANSITION_COMPLETE.to_string();
-        partial_meta.transition_tier = "WARM".to_string();
-        partial_meta.transitioned_objname = "remote/object".to_string();
-        partial_meta.transition_version_id = Some(Uuid::new_v4());
-        let metas = vec![old_meta_a, old_meta_b, partial_meta, FileInfo::default()];
-        let errs = vec![None, None, None, Some(DiskError::DiskNotFound)];
-
-        let quorum = SetDisks::latest_fileinfo_selection_quorum("", &metas, &errs, 2, 3);
-        let result = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, "", 2, 3);
-
-        assert_eq!(quorum, 2);
-        assert!(matches!(result, Err(DiskError::ErasureReadQuorum)));
-    }
-
-    #[test]
-    fn test_latest_fileinfo_selection_quorum_uses_write_quorum_for_degraded_committed_identity() {
+    fn test_latest_fileinfo_selection_serves_degraded_committed_identity() {
         let mod_time = OffsetDateTime::now_utc();
         let data_dir = Uuid::new_v4();
         let metas = vec![
@@ -12354,7 +12387,10 @@ mod tests {
         ];
         let errs = vec![None, None, None, Some(DiskError::DiskNotFound)];
 
-        assert_eq!(SetDisks::latest_fileinfo_selection_quorum("", &metas, &errs, 2, 3), 3);
+        let (_, selected) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, 2)
+            .expect("a committed identity stays readable with one disk missing");
+
+        assert_eq!(selected.parts[0].etag, "part-etag-a");
     }
 
     #[test]

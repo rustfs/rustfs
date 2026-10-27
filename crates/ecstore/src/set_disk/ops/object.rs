@@ -9319,10 +9319,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         };
 
-        let src_version_id = src_opts.version_id.as_deref().unwrap_or_default();
-        let (online_disks, mut fi, _) =
-            Self::select_valid_fileinfo(&disks, &metas, &errs, src_version_id, read_quorum, write_quorum)
-                .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
+        let (online_disks, mut fi) = Self::select_valid_fileinfo(&disks, &metas, &errs, read_quorum)
+            .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
 
         if fi.deleted {
             if src_opts.version_id.is_none() {
@@ -11147,8 +11145,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         };
 
-        let (read_quorum, write_quorum) = match Self::object_quorum_from_meta(&metas, &errs, self.default_parity_count) {
-            Ok((read_quorum, write_quorum)) => (read_quorum, write_quorum),
+        let read_quorum = match Self::object_quorum_from_meta(&metas, &errs, self.default_parity_count) {
+            Ok((read_quorum, _)) => read_quorum,
             Err(mut err) => {
                 // A replication terminal CAS is a validation/write-back
                 // attempt, never a heal operation. In particular,
@@ -11178,11 +11176,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         let read_quorum =
             usize::try_from(read_quorum).map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]))?;
-        let write_quorum = usize::try_from(write_quorum)
-            .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![bucket, object]))?;
 
-        let version_id = opts.version_id.as_deref().unwrap_or_default();
-        let (online_disks, mut fi, _) = Self::select_valid_fileinfo(&disks, &metas, &errs, version_id, read_quorum, write_quorum)
+        let (online_disks, mut fi) = Self::select_valid_fileinfo(&disks, &metas, &errs, read_quorum)
             .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
 
         if fi.deleted {

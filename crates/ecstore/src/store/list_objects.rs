@@ -6420,6 +6420,147 @@ mod test {
     }
 
     #[tokio::test]
+    async fn latest_get_follows_read_quorum_on_torn_writes() {
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::storage_api_contracts::object::ObjectOperations as _;
+
+        // HEAD and GET serve the version with the most copies once it reaches
+        // the object's data blocks, and a tie goes to the newer version, as in
+        // MinIO's getObjectFileInfo and as heal converges the set. GET used to
+        // demand write quorum whenever enough metadata answered, so a 2+2 or
+        // 8+8 split, or a newer side that could still hold write quorum
+        // through an offline drive, listed but answered 503.
+        let opts = ObjectOptions {
+            suppress_read_repair: true,
+            ..Default::default()
+        };
+        for (drives, parity) in [(4_usize, 2_usize), (16, 8), (16, 4)] {
+            let data = drives - parity;
+            let bucket = format!("torn-write-get-{drives}-{parity}");
+            let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks(drives, parity).await;
+            set.make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            // Two committed generations of one key give every drive its own
+            // inline shard of each generation; the cases copy them per drive.
+            let mut generations = Vec::new();
+            for body in [b"old generation".as_slice(), b"new generation".as_slice()] {
+                let info = set
+                    .put_object(
+                        &bucket,
+                        "template",
+                        &mut PutObjReader::from_vec(body.to_vec()),
+                        &ObjectOptions {
+                            no_lock: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("generation PUT should commit on every drive");
+                let mut metadata = Vec::with_capacity(drives);
+                for dir in &dirs {
+                    metadata.push(
+                        tokio::fs::read(dir.path().join(&bucket).join("template").join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("generation metadata should carry the inline shard"),
+                    );
+                }
+                generations.push((body, info.etag.expect("PUT should report an etag"), metadata));
+            }
+            let (new_body, new_etag, new) = generations.pop().expect("new generation");
+            let (old_body, old_etag, old) = generations.pop().expect("old generation");
+
+            // New copies occupy the first drives, so the offline drive always
+            // removes one new copy. Each phase reads its own keys so the GET
+            // metadata cache never answers for the other phase.
+            let mut cases = Vec::new();
+            for offline in [false, true] {
+                for copies in 1..drives {
+                    for overwrite in [false, true] {
+                        let name = format!(
+                            "{}-{}-{copies:02}",
+                            if offline { "offline" } else { "online" },
+                            if overwrite { "overwrite" } else { "new" }
+                        );
+                        for slot in 0..drives {
+                            let bytes = if slot < copies {
+                                &new[slot]
+                            } else if overwrite {
+                                &old[slot]
+                            } else {
+                                continue;
+                            };
+                            let path = dirs[slot].path().join(&bucket).join(&name);
+                            tokio::fs::create_dir_all(&path).await.expect("create object directory");
+                            tokio::fs::write(path.join(STORAGE_FORMAT_FILE), bytes)
+                                .await
+                                .expect("write generation metadata");
+                        }
+                        cases.push((offline, name, copies, overwrite));
+                    }
+                }
+            }
+
+            for offline in [false, true] {
+                let parked = if offline { set.disks.write().await[0].take() } else { None };
+                for (_, name, copies, overwrite) in cases.iter().filter(|case| case.0 == offline) {
+                    let new_copies = copies - usize::from(offline);
+                    let old_copies = if *overwrite { drives - copies } else { 0 };
+                    let expected = if new_copies >= data && new_copies >= old_copies {
+                        Some((&new_etag, new_body))
+                    } else if old_copies >= data {
+                        Some((&old_etag, old_body))
+                    } else {
+                        None
+                    };
+                    let context = format!("{drives} drives EC {data}+{parity}, {name}: {new_copies} new, {old_copies} old");
+                    let head = set.get_object_info(&bucket, name, &opts).await;
+                    let get = set.get_object_reader(&bucket, name, None, HeaderMap::new(), &opts).await;
+                    match (expected, head, get) {
+                        (Some((etag, body)), Ok(info), Ok(mut reader)) => {
+                            assert_eq!(info.etag.as_ref(), Some(etag), "{context}: HEAD");
+                            assert_eq!(reader.object_info.etag.as_ref(), Some(etag), "{context}: GET");
+                            let mut streamed = Vec::new();
+                            reader
+                                .stream
+                                .read_to_end(&mut streamed)
+                                .await
+                                .unwrap_or_else(|err| panic!("{context}: GET body: {err:?}"));
+                            assert_eq!(streamed, body, "{context}: GET body");
+                        }
+                        (Some((etag, _)), head, get) => panic!(
+                            "{context}: expected {etag}, HEAD {:?}, GET {:?}",
+                            head.map(|info| info.etag),
+                            get.map(|reader| reader.object_info.etag)
+                        ),
+                        (None, head, get) => {
+                            for (method, result) in [
+                                ("HEAD", head.map(|info| info.etag)),
+                                ("GET", get.map(|reader| reader.object_info.etag)),
+                            ] {
+                                let err = result.expect_err(&format!("{context}: {method} expected 404 or unavailable"));
+                                assert!(
+                                    matches!(
+                                        err,
+                                        StorageError::ObjectNotFound(..)
+                                            | StorageError::FileNotFound
+                                            | StorageError::ErasureReadQuorum
+                                            | StorageError::InsufficientReadQuorum(..)
+                                    ),
+                                    "{context}: {method} expected 404 or unavailable, got {err:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+                if offline {
+                    set.disks.write().await[0] = parked;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn latest_listing_and_get_agree_on_hermetic_set_states() {
         #[derive(Clone, Copy)]
         enum Generation {
@@ -6492,6 +6633,10 @@ mod test {
             ("e-torn-one", [Some(Generation::New), None, None, None]),
             ("f-stale-one", [None, None, None, Some(Generation::Old)]),
             (
+                "fa-overwrite-two-of-three",
+                [Some(Generation::New), Some(Generation::New), Some(Generation::Old), None],
+            ),
+            (
                 "g-overwrite-torn-one",
                 [
                     Some(Generation::New),
@@ -6535,6 +6680,7 @@ mod test {
             ("b-copied", &new_etag),
             ("c-split", &new_etag),
             ("d-torn-two", &new_etag),
+            ("fa-overwrite-two-of-three", &new_etag),
             ("g-overwrite-torn-one", &old_etag),
         ]
         .into_iter()
@@ -6561,12 +6707,6 @@ mod test {
                         "{name}: GET must serve the version LIST selected"
                     );
                 }
-                // Known divergence: when every drive answers, GET of the latest
-                // version demands write quorum (three of four), so a 2+2 split
-                // answers 503 although LIST shows the newer generation, as
-                // MinIO's listing does. F.0's dangling classification does not
-                // cover a split; a GET change is a separate decision.
-                (Some(_), Err(StorageError::InsufficientReadQuorum(..))) if name == "c-split" => {}
                 (Some(_), Err(err)) => assert!(
                     matches!(
                         err,

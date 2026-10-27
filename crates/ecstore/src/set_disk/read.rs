@@ -926,7 +926,7 @@ impl SetDisks {
                 None
             }
         };
-        let (read_quorum, write_quorum) = match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
+        let (read_quorum, _) = match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
             .map_err(|err| dangling_not_found(&err).unwrap_or(err))
             .map_err(|err| to_object_err(err.into(), vec![bucket, object, &vid]))
         {
@@ -944,8 +944,6 @@ impl SetDisks {
         };
         let read_quorum =
             usize::try_from(read_quorum).map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]))?;
-        let write_quorum = usize::try_from(write_quorum)
-            .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![bucket, object]))?;
         if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
             if let Some(not_found) = dangling_not_found(&err) {
                 rustfs_io_metrics::record_get_object_metadata_quorum_result(metadata_metrics_path, "not_found");
@@ -966,18 +964,14 @@ impl SetDisks {
             return Err(to_object_err(err.into(), vec![bucket, object, &vid]));
         }
 
-        let (op_online_disks, mut fi, fileinfo_selection_quorum) =
-            match Self::select_valid_fileinfo(&disks, &parts_metadata, &errs, vid.as_str(), read_quorum, write_quorum) {
-                Ok(selection) => selection,
-                Err(err) => {
-                    let err = StorageError::from(err);
-                    rustfs_io_metrics::record_get_object_metadata_quorum_result(
-                        metadata_metrics_path,
-                        metadata_quorum_outcome(&err),
-                    );
-                    return Err(err);
-                }
-            };
+        let (op_online_disks, mut fi) = match Self::select_valid_fileinfo(&disks, &parts_metadata, &errs, read_quorum) {
+            Ok(selection) => selection,
+            Err(err) => {
+                let err = StorageError::from(err);
+                rustfs_io_metrics::record_get_object_metadata_quorum_result(metadata_metrics_path, metadata_quorum_outcome(&err));
+                return Err(err);
+            }
+        };
         let include_part_checksums =
             opts.include_part_checksums || opts.part_number.is_some() || opts.data_movement || opts.raw_data_movement_read;
         if include_part_checksums {
@@ -987,7 +981,7 @@ impl SetDisks {
                 rustfs_utils::http::remove_str(&mut metadata.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS);
             }
         }
-        metadata_fanout_diagnostics.record_quorum_candidate_latency(metadata_metrics_path, fileinfo_selection_quorum);
+        metadata_fanout_diagnostics.record_quorum_candidate_latency(metadata_metrics_path, read_quorum);
         let needs_late_metadata_fanout = !metadata_fanout_complete
             && allow_early_stop
             && non_inline_data_read_early_stop_allowed(read_data, bucket, object)
@@ -1014,7 +1008,6 @@ impl SetDisks {
                     && allow_early_stop
                     && metadata_fanout_diagnostics.valid_responses() >= read_quorum
                     && errs.iter().all(Option::is_none)
-                    && fileinfo_selection_quorum >= read_quorum
                     && op_online_disks.iter().filter(|disk| disk.is_some()).count() >= read_quorum))
         {
             #[cfg(test)]
@@ -2455,18 +2448,15 @@ impl SetDisks {
         let (mut parts_metadata, errs, diagnostics) = metadata_read.into_legacy();
         diagnostics.record(metrics_path);
 
-        let (read_quorum, write_quorum) = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, expected.parity_blocks)
+        let (read_quorum, _) = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, expected.parity_blocks)
             .map_err(|err| to_object_err(err.into(), vec![bucket, object]))?;
         let read_quorum =
             usize::try_from(read_quorum).map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]))?;
-        let write_quorum = usize::try_from(write_quorum)
-            .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![bucket, object]))?;
         if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
             return Err(to_object_err(err.into(), vec![bucket, object]));
         }
 
-        let (mut online_disks, full_fi, _) =
-            SetDisks::select_valid_fileinfo(fallback_disks, &parts_metadata, &errs, "", read_quorum, write_quorum)?;
+        let (mut online_disks, full_fi) = SetDisks::select_valid_fileinfo(fallback_disks, &parts_metadata, &errs, read_quorum)?;
         if !late_metadata_read_identity_matches(expected, &full_fi) {
             return Err(to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]));
         }
@@ -4052,8 +4042,7 @@ mod metadata_cache_tests {
         assert!(original.is_complete());
         let (baseline, errors, _) = original.into_legacy();
         assert!(errors.iter().all(Option::is_none), "original real shards must all be readable");
-        let (_, selected, _) =
-            SetDisks::select_valid_fileinfo(&disks, &baseline, &errors, "", 2, 3).expect("original metadata quorum");
+        let (_, selected) = SetDisks::select_valid_fileinfo(&disks, &baseline, &errors, 2).expect("original metadata quorum");
         assert!(!selected.inline_data(), "late fixture must retain real non-inline shard files");
         let expected = LateMetadataIdentity::from_file_info(&selected);
         let (_, _, original_online) =
@@ -4086,7 +4075,7 @@ mod metadata_cache_tests {
                 .expect("read changed real disk metadata");
             assert!(changed.is_complete(), "late fixture must reach complete metadata observation");
             let (metadata, errors, _) = changed.into_legacy();
-            let (online, selected, _) = SetDisks::select_valid_fileinfo(&disks, &metadata, &errors, "", 2, 3)
+            let (online, selected) = SetDisks::select_valid_fileinfo(&disks, &metadata, &errors, 2)
                 .expect("changed metadata still reaches selection quorum");
             assert_eq!(online.iter().flatten().count(), 4, "the late identity guard must decide this failure");
             if changed_generation {
@@ -5135,7 +5124,7 @@ mod metadata_cache_tests {
         // This seam prepares a real, independently validated D1/P1/P2 quorum.
         // The hedge test separately exercises its production publication timing.
         let errs: Vec<Option<DiskError>> = (0..4).map(|_| None).collect();
-        let (online_disks, fi, _) = SetDisks::select_valid_fileinfo(&disks, &metadata, &errs, "", 2, 3)
+        let (online_disks, fi) = SetDisks::select_valid_fileinfo(&disks, &metadata, &errs, 2)
             .expect("three real members satisfy latest-generation selection");
         assert_eq!(online_disks.iter().flatten().count(), 3);
         assert_eq!(fi.metadata.get("etag"), committed.etag.as_ref());
@@ -6240,16 +6229,17 @@ mod tests {
         let parts_metadata = vec![first.clone(), second, third, FileInfo::default()];
         let errs = vec![None, None, None, None];
 
-        let (read_quorum, write_quorum) = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 2)
+        let (read_quorum, _) = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 2)
             .expect("partial early-stop metadata should preserve read quorum");
         let read_quorum = usize::try_from(read_quorum).expect("read quorum should be non-negative");
-        let write_quorum = usize::try_from(write_quorum).expect("write quorum should be non-negative");
-        let selection_quorum = SetDisks::latest_fileinfo_selection_quorum("", &parts_metadata, &errs, read_quorum, write_quorum);
+        let (_, latest) = SetDisks::select_valid_fileinfo(&vec![None; parts_metadata.len()], &parts_metadata, &errs, read_quorum)
+            .expect("partial early-stop metadata should select the candidate");
         let selected = SetDisks::pick_valid_fileinfo(&parts_metadata, None, Some("etag-1".to_string()), read_quorum)
             .expect("partial early-stop metadata should preserve selected FileInfo");
 
         assert_eq!(read_quorum, 2);
-        assert_eq!(selection_quorum, 3);
+        assert_eq!(latest.name, first.name);
+        assert_eq!(latest.get_etag(), first.get_etag());
         assert_eq!(selected.name, first.name);
         assert_eq!(selected.get_etag(), first.get_etag());
     }
