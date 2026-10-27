@@ -32,7 +32,7 @@
 #[cfg(feature = "webdav")]
 use crate::common::client::s3::SessionCapacityView;
 use crate::common::client::s3::StorageBackend;
-#[cfg(feature = "webdav")]
+#[cfg(any(feature = "webdav", feature = "sftp"))]
 use crate::common::session::SessionContext;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -848,7 +848,7 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    #[cfg(feature = "webdav")]
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
     async fn list_buckets_for_session(
         &self,
         session_context: &SessionContext,

@@ -225,16 +225,28 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     /// OPENDIR so a client without ListAllMyBuckets can still open the
     /// root directory handle.
     ///
+    /// A principal without ListAllMyBuckets (a bucket-scoped user) gets
+    /// the session-aware ListBuckets instead, which IAM filters to the
+    /// buckets the principal may ListBucket or GetBucketLocation, the
+    /// same as S3 ListBuckets and the WebDAV root. SSH is an encrypted
+    /// transport, so the request is marked secure for IAM conditions.
+    ///
     /// ListBuckets is not batched in the S3 API. A single response
     /// carries the full set. Truncate at ROOT_LISTING_MAX_ENTRIES so a
     /// principal with many visible buckets produces a bounded Vec and
     /// does not exceed the SSH channel window with a single response.
     pub(super) async fn fetch_bucket_list(&self) -> Result<Vec<File>, SftpError> {
-        self.authorize(&S3Action::ListBuckets, "", None).await?;
-
-        let out = self
-            .run_backend("list_buckets", self.storage.list_buckets(self.credentials()))
-            .await?;
+        let out = if self.is_authorized(&S3Action::ListBuckets, "", None).await? {
+            self.run_backend("list_buckets", self.storage.list_buckets(self.credentials()))
+                .await?
+        } else {
+            self.run_backend(
+                "list_buckets",
+                self.storage
+                    .list_buckets_for_session(&self.session_context, &http::HeaderMap::new(), true),
+            )
+            .await?
+        };
 
         let mut entries = Vec::new();
         let mut truncated_at: Option<usize> = None;
@@ -452,6 +464,74 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Notify;
     use tracing::Level;
+
+    fn buckets(names: &[&str]) -> s3s::dto::ListBucketsOutput {
+        s3s::dto::ListBucketsOutput {
+            buckets: Some(
+                names
+                    .iter()
+                    .map(|n| s3s::dto::Bucket {
+                        name: Some((*n).to_string()),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn names(files: &[russh_sftp::protocol::File]) -> Vec<&str> {
+        files.iter().map(|f| f.filename.as_str()).collect()
+    }
+
+    fn deny_list_all_my_buckets(action: &crate::common::gateway::S3Action, _: &str, _: Option<&str>) -> bool {
+        !matches!(action, crate::common::gateway::S3Action::ListBuckets)
+    }
+
+    #[tokio::test]
+    async fn root_listing_with_list_all_my_buckets_lists_every_bucket() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_list_buckets_ok(buckets(&["alpha", "beta"]));
+        backend.queue_session_list_buckets_ok(buckets(&["beta"]));
+        let driver = build_driver(backend.clone(), TEST_PART_SIZE);
+
+        let files = with_test_auth_override(|_, _, _| true, driver.fetch_bucket_list())
+            .await
+            .expect("global listing");
+
+        assert_eq!(names(&files), ["alpha", "beta"]);
+        assert!(backend.last_session_list_context().is_none(), "session listing must not run");
+    }
+
+    #[tokio::test]
+    async fn root_listing_without_list_all_my_buckets_lists_only_visible_buckets() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_list_buckets_ok(buckets(&["alpha", "beta"]));
+        backend.queue_session_list_buckets_ok(buckets(&["beta"]));
+        let driver = build_driver(backend.clone(), TEST_PART_SIZE);
+
+        let files = with_test_auth_override(deny_list_all_my_buckets, driver.fetch_bucket_list())
+            .await
+            .expect("bucket-scoped listing");
+
+        assert_eq!(names(&files), ["beta"]);
+        let (headers, secure) = backend.last_session_list_context().expect("session listing ran");
+        assert!(headers.is_empty(), "SFTP has no HTTP headers to forward");
+        assert!(secure, "SSH is an encrypted transport");
+    }
+
+    #[tokio::test]
+    async fn root_listing_without_any_visible_bucket_is_permission_denied() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_session_list_buckets_err(s3s::S3Error::new(s3s::S3ErrorCode::AccessDenied));
+        let driver = build_driver(backend.clone(), TEST_PART_SIZE);
+
+        let err = with_test_auth_override(deny_list_all_my_buckets, driver.fetch_bucket_list())
+            .await
+            .expect_err("no visible bucket");
+
+        assert_eq!(err.0, StatusCode::PermissionDenied);
+    }
 
     #[tokio::test]
     async fn opendir_and_readdir_authorize_the_same_listing_parameters() {

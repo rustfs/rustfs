@@ -100,7 +100,7 @@ fn trace_protocol_request(operation: &str, bucket: Option<&str>, object: Option<
     );
 }
 
-#[cfg(feature = "webdav")]
+#[cfg(any(feature = "webdav", feature = "sftp"))]
 fn session_list_buckets_request(
     input: ListBucketsInput,
     session_context: &SessionContext,
@@ -633,7 +633,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         }
     }
 
-    #[cfg(feature = "webdav")]
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
     async fn list_buckets_for_session(
         &self,
         session_context: &SessionContext,

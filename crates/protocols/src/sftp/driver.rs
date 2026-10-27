@@ -301,6 +301,26 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         self.await_authorization(action, bucket, key, auth_fut).await
     }
 
+    /// Like authorize, but a policy deny returns Ok(false) instead of
+    /// PermissionDenied and is not logged, for callers that fall back
+    /// to a narrower operation when the action is denied. IamUnavailable
+    /// and the deadline are handled exactly as in authorize.
+    pub(super) async fn is_authorized(&self, action: &S3Action, bucket: &str, key: Option<&str>) -> Result<bool, SftpError> {
+        let auth_fut = self.storage.authorize_operation(&self.session_context, action, bucket, key);
+        let mut denied = false;
+        let deny_as_ok = async {
+            match auth_fut.await {
+                Err(AuthorizationError::AccessDenied) => {
+                    denied = true;
+                    Ok(())
+                }
+                other => other,
+            }
+        };
+        self.await_authorization(action, bucket, key, deny_as_ok).await?;
+        Ok(!denied)
+    }
+
     pub(super) async fn authorize_list_objects(&self, input: &ListObjectsV2Input) -> Result<(), SftpError> {
         let auth_fut = self.storage.authorize_list_objects(&self.session_context, input);
         self.await_authorization(&S3Action::ListBucket, &input.bucket, input.prefix.as_deref(), auth_fut)
