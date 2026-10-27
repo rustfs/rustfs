@@ -1161,23 +1161,74 @@ impl SetDisks {
         // rewritten null version can carry different times on different drives.
         let mut newest = std::collections::HashMap::<Option<uuid::Uuid>, Option<time::OffsetDateTime>>::new();
         let mut truncated = false;
+        let mut metadata = Vec::with_capacity(raw.len());
         for raw in raw.into_iter().flatten() {
-            let meta = rustfs_filemeta::FileMeta::load(&raw.buf).ok()?;
-            let mut versions = meta.versions.iter().filter(|version| !version.header.free_version());
-            for version in versions.by_ref().take(MAX_DANGLING_LATEST_VERSIONS) {
+            let mut meta = rustfs_filemeta::FileMeta::load(&raw.buf).ok()?;
+            let mut versions = meta
+                .versions
+                .iter()
+                .enumerate()
+                .filter(|(_, version)| !version.header.free_version());
+            let mut retained_end = 0;
+            for (index, version) in versions.by_ref().take(MAX_DANGLING_LATEST_VERSIONS) {
                 let mod_time = newest.entry(version.header.version_id).or_insert(version.header.mod_time);
                 *mod_time = (*mod_time).max(version.header.mod_time);
+                retained_end = index + 1;
             }
             truncated |= versions.next().is_some();
+            meta.versions.truncate(retained_end);
+            metadata.push(meta);
         }
         let mut candidates = newest.into_iter().collect::<Vec<_>>();
         candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+        // Use the stored header for equal-time ordering: re-encoding a selected
+        // FileInfo can change legacy signatures or omit part-checksum metadata.
+        let selected_header = |snapshot: &GetObjectFileInfo| {
+            let mut selected = snapshot.fi().clone();
+            selected.data = None;
+            let version_id = selected.version_id.unwrap_or_else(uuid::Uuid::nil).to_string();
+            let include_part_checksums =
+                opts.include_part_checksums || opts.part_number.is_some() || opts.data_movement || opts.raw_data_movement_read;
+            metadata.iter().find_map(|meta| {
+                let version = meta
+                    .versions
+                    .iter()
+                    .filter(|version| !version.header.free_version())
+                    .take(MAX_DANGLING_LATEST_VERSIONS)
+                    .find(|version| {
+                        version.header.version_id.unwrap_or_else(uuid::Uuid::nil)
+                            == selected.version_id.unwrap_or_else(uuid::Uuid::nil)
+                            && version.header.mod_time == selected.mod_time
+                    })?;
+                let mut original = if include_part_checksums {
+                    meta.into_fileinfo(&selected.volume, &selected.name, &version_id, false, opts.incl_free_versions, true)
+                } else {
+                    meta.into_fileinfo_without_part_checksums(
+                        &selected.volume,
+                        &selected.name,
+                        &version_id,
+                        false,
+                        opts.incl_free_versions,
+                    )
+                }
+                .ok()?;
+                if !include_part_checksums {
+                    rustfs_utils::http::remove_str(&mut original.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS);
+                }
+                original.data = None;
+                original.is_latest = selected.is_latest;
+                original.successor_mod_time = selected.successor_mod_time;
+                original.num_versions = selected.num_versions;
+                (original == selected).then_some(version.header.clone())
+            })
+        };
 
         let mut best: Option<(Option<time::OffsetDateTime>, GetObjectFileInfo)> = None;
         let mut skipped = Vec::new();
         let mut settled = false;
         for (reads, (version_id, newest_mod_time)) in candidates.into_iter().enumerate() {
-            if best.as_ref().is_some_and(|(selected, _)| newest_mod_time <= *selected) {
+            if best.as_ref().is_some_and(|(selected, _)| newest_mod_time < *selected) {
                 settled = true;
                 break;
             }
@@ -1203,7 +1254,14 @@ impl SetDisks {
             {
                 Ok(snapshot) => {
                     let selected = snapshot.fi().mod_time;
-                    if best.as_ref().is_none_or(|(current, _)| selected > *current) {
+                    let replace = match best.as_ref() {
+                        Some((current, previous)) if selected == *current => {
+                            selected_header(&snapshot)?.sorts_before(&selected_header(previous)?)
+                        }
+                        Some((current, _)) => selected > *current,
+                        None => true,
+                    };
+                    if replace {
                         best = Some((selected, snapshot));
                     }
                 }
@@ -10329,6 +10387,109 @@ mod dangling_read_tests {
             .expect("the committed null rewrite must be served");
         assert_ne!(latest.version_id, Some(v1));
         assert_eq!(get(&set, bucket, object, None).await.expect("latest GET"), b"committed null");
+    }
+
+    #[tokio::test]
+    async fn latest_read_preserves_object_before_equal_time_marker() {
+        let bucket = "dangling-latest-equal-time-marker";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        let same_time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed source mtime");
+        for suspended in [false, true] {
+            let object = if suspended {
+                "torn/equal-time-null"
+            } else {
+                "torn/equal-time-versioned"
+            };
+            let object_id = if suspended { Uuid::nil() } else { Uuid::from_u128(2) };
+            set.put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(b"committed object".to_vec()),
+                &ObjectOptions {
+                    versioned: !suspended,
+                    version_suspended: suspended,
+                    replication_request: true,
+                    version_id: Some(object_id.to_string()),
+                    mod_time: Some(same_time),
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("commit object version");
+            set.delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    version_id: Some(Uuid::from_u128(1).to_string()),
+                    mod_time: Some(same_time),
+                    data_movement: true,
+                    delete_marker: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("recreate source delete marker during data movement");
+            let expected = head(&set, bucket, object, None)
+                .await
+                .expect("canonical latest before dangling write");
+            assert_eq!(expected.version_id, (!suspended).then_some(object_id));
+            assert!(!expected.delete_marker, "canonical header order prefers object to equal-time marker");
+            assert_eq!(get(&set, bucket, object, None).await.expect("canonical GET"), b"committed object");
+            let dangling_id = Uuid::from_u128(3);
+            set.put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(b"failed newer version".to_vec()),
+                &ObjectOptions {
+                    versioned: true,
+                    replication_request: true,
+                    version_id: Some(dangling_id.to_string()),
+                    mod_time: Some(same_time + time::Duration::seconds(1)),
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("commit newer version before modeling failed rollback");
+            drop_version_from(&set, bucket, object, dangling_id, 3..DRIVES).await;
+            let actual = head(&set, bucket, object, None)
+                .await
+                .expect("latest HEAD past dangling version");
+            let actual_get = get(&set, bucket, object, None).await;
+            assert_eq!(
+                actual.version_id, expected.version_id,
+                "{object}: unreadable newer version must preserve canonical equal-time latest; GET result: {actual_get:?}"
+            );
+            assert!(
+                !actual.delete_marker,
+                "{object}: fallback must preserve the object before its equal-time marker"
+            );
+            assert_eq!(actual_get.expect("latest GET"), b"committed object");
+
+            let checksum_opts = ObjectOptions {
+                include_part_checksums: true,
+                ..Default::default()
+            };
+            let checksum_head = set
+                .get_object_info(bucket, object, &checksum_opts)
+                .await
+                .expect("latest HEAD with part checksums");
+            assert_eq!(checksum_head.version_id, expected.version_id, "{object}: checksum HEAD version");
+            assert!(!checksum_head.delete_marker, "{object}: checksum HEAD must return the object");
+            let mut checksum_reader = set
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &checksum_opts)
+                .await
+                .expect("latest GET with part checksums");
+            let mut checksum_body = Vec::new();
+            checksum_reader
+                .stream
+                .read_to_end(&mut checksum_body)
+                .await
+                .expect("checksum GET should stream the committed bytes");
+            assert_eq!(checksum_body, b"committed object", "{object}: checksum GET bytes");
+        }
     }
 
     #[tokio::test]
