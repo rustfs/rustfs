@@ -81,6 +81,10 @@ pub use metrics::{
 };
 pub use telemetry::{HTTP_SERVER_LOG_TARGET, OtelGuard, Recorder};
 
+/// Target reserved for the bounded multipart lock-timeout event.
+/// The local JSON formatter must not attach request span fields to this event.
+pub const MULTIPART_CREATE_TIMEOUT_LOG_TARGET: &str = "rustfs::error::multipart_create_timeout";
+
 // Dial9 Tokio runtime telemetry
 // Re-export dial9 types at crate root level for easier access
 pub use telemetry::dial9;

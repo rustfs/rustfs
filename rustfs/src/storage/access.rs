@@ -22,7 +22,7 @@ use crate::auth::{
     get_request_auth_type_with_query, get_session_token, parse_presigned_multipart_max_total_object_size,
     parse_presigned_put_max_content_length, reject_unsigned_amz_headers_on_sigv4_request,
 };
-use crate::error::{ApiError, normalize_read_quorum_error};
+use crate::error::{ApiError, MultipartCreateBoundary, log_multipart_create_timeout, normalize_read_quorum_error};
 use crate::license::license_check;
 use crate::shared_types::RemoteAddr;
 use crate::storage::request_context::RequestContext;
@@ -462,6 +462,7 @@ static OBJECT_GENERATION_TEST_HOOK: OnceLock<std::sync::Mutex<Option<ObjectGener
 #[cfg(test)]
 tokio::task_local! {
     static PUT_GENERATION_READ_QUORUM_FAILURE: ();
+    static CREATE_MULTIPART_GENERATION_LOCK_TIMEOUT: ();
 }
 
 #[cfg(test)]
@@ -2429,28 +2430,52 @@ impl S3Access for FS {
 
     /// Checks whether the CreateMultipartUpload request has accesses to the resources.
     async fn create_multipart_upload(&self, req: &mut S3Request<CreateMultipartUploadInput>) -> S3Result<()> {
-        let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
+        let result = async {
+            let bucket = req.input.bucket.clone();
+            let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+            #[cfg(test)]
+            let bucket_generation = if CREATE_MULTIPART_GENERATION_LOCK_TIMEOUT.try_with(|_| ()).is_ok() {
+                Err(ApiError::from(StorageError::Lock(rustfs_lock::LockError::timeout(
+                    format!(".rustfs.sys/bucket-targets/{bucket}/transaction.lock@latest"),
+                    std::time::Duration::from_secs(5),
+                )))
+                .into())
+            } else {
+                bucket_generation
+            };
+            let req_info = ext_req_info_mut(&mut req.extensions)?;
+            req_info.bucket = Some(req.input.bucket.clone());
+            req_info.object = Some(req.input.key.clone());
 
-        let requested_retain_until = req.input.object_lock_retain_until_date.clone();
-        set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
-        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+            let requested_retain_until = req.input.object_lock_retain_until_date.clone();
+            set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
+            authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
 
-        authorize_replication_only_put_headers(req).await?;
+            authorize_replication_only_put_headers(req).await?;
 
-        if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
-            authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+            if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
+                authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+            }
+
+            if retention_write_requested(req.input.object_lock_mode.as_ref(), req.input.object_lock_retain_until_date.as_ref()) {
+                authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+            }
+
+            req.extensions.insert(bucket_generation?);
+            Ok(())
         }
-
-        if retention_write_requested(req.input.object_lock_mode.as_ref(), req.input.object_lock_retain_until_date.as_ref()) {
-            authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+        .await;
+        if let Err(error) = &result {
+            let context = request_context_from_req(req);
+            log_multipart_create_timeout(
+                error,
+                MultipartCreateBoundary::Access,
+                context.as_ref().map(|context| context.request_id.as_str()),
+                &req.input.bucket,
+                &req.input.key,
+            );
         }
-
-        req.extensions.insert(bucket_generation?);
-        Ok(())
+        result
     }
 
     /// Checks whether the DeleteBucket request has accesses to the resources.
@@ -5536,6 +5561,85 @@ mod tests {
             sys.remove(&bucket);
             sys.set_module_enabled(enabled_before);
         });
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn multipart_timeout_observes_only_the_authorized_final_error() {
+        use crate::error::multipart_timeout_test_log::Capture;
+        use crate::storage::request_context::RequestContext;
+        use tracing::instrument::WithSubscriber as _;
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let server_ctx = ServerContextSlot::new();
+        assert!(server_ctx.install(Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)))));
+        let fs = FS::with_server_ctx(server_ctx);
+
+        for effect in ["Allow", "Deny"] {
+            let bucket = format!("multipart-timeout-access-{}", uuid::Uuid::new_v4());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            let policy_json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"{effect}","Principal":{{"AWS":"*"}},"Action":["s3:PutObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+            );
+            let mut metadata = (*crate::storage::get_bucket_metadata(&bucket).await.expect("cached metadata")).clone();
+            metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("policy"));
+            metadata.policy_config_json = policy_json.into_bytes();
+            crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+                .await
+                .expect("install policy");
+
+            let input = CreateMultipartUploadInput::builder()
+                .bucket(bucket.clone())
+                .key("LEAK-private-key".to_string())
+                .build()
+                .expect("multipart input");
+            let mut req = build_request(input, Method::POST);
+            ensure_req_info(&mut req);
+            req.extensions.insert(fs.server_ctx().clone());
+            let context = RequestContext::from_external_headers(&req.headers);
+            let request_id = context.request_id.clone();
+            req.extensions.insert(context);
+
+            let capture = Capture::default();
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .flatten_event(true)
+                .with_current_span(true)
+                .with_span_list(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(capture.clone())
+                .finish();
+            let error = super::CREATE_MULTIPART_GENERATION_LOCK_TIMEOUT
+                .scope((), fs.create_multipart_upload(&mut req))
+                .with_subscriber(subscriber)
+                .await
+                .expect_err("generation timeout must not admit creation");
+            let rows = capture
+                .rows()
+                .into_iter()
+                .filter(|row| row["event"] == "multipart_create_lock_timeout")
+                .collect::<Vec<_>>();
+            if effect == "Allow" {
+                assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+                assert_eq!(error.headers().unwrap()["x-rustfs-error-cause"], "namespace_lock_timeout");
+                assert_eq!(error.headers().unwrap()[http::header::RETRY_AFTER], "1");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["boundary"], "access");
+                assert_eq!(rows[0]["request_id"], request_id);
+                assert_eq!(rows[0]["resource_class"], "bucket_transaction");
+                let output = rows[0].to_string();
+                assert!(!output.contains(&bucket));
+                assert!(!output.contains("LEAK-private-key"));
+            } else {
+                assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+                assert_eq!(error.status_code(), Some(http::StatusCode::FORBIDDEN));
+                assert!(rows.is_empty(), "a hidden generation error must not be logged");
+            }
+            assert!(req.extensions.get::<BucketGenerationGuard>().is_none());
+        }
     }
 
     #[tokio::test]

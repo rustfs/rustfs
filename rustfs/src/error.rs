@@ -656,6 +656,99 @@ fn service_unavailable_cause(source: &(dyn std::error::Error + 'static)) -> Opti
     timeout.or(cause)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum MultipartCreateBoundary {
+    Access,
+    Execute,
+}
+
+struct MultipartCreateTimeout {
+    resource_class: &'static str,
+    source_kind: &'static str,
+    timeout_ms: u64,
+}
+
+fn multipart_timeout_resource_class(resource: &str, bucket: &str, key: &str) -> &'static str {
+    if bucket.is_empty() {
+        return "unknown";
+    }
+
+    let request_resource = resource
+        .strip_suffix("@latest")
+        .and_then(|path| path.strip_prefix(bucket))
+        .and_then(|path| path.strip_prefix('/'));
+    let lifecycle = request_resource == Some("");
+    let transaction = resource
+        .strip_prefix(".rustfs.sys/bucket-targets/")
+        .and_then(|path| path.strip_suffix("/transaction.lock@latest"))
+        == Some(bucket);
+    let object = if key.is_empty() {
+        false
+    } else {
+        let encoded = rustfs_utils::path::encode_dir_object_ref(key);
+        let identity = rustfs_utils::path::object_name_disk_identity(encoded.as_ref());
+        request_resource == Some(identity.as_ref())
+    };
+
+    // A formatted key may be ambiguous; do not choose a class in that case.
+    match (lifecycle, transaction, object) {
+        (true, false, false) => "bucket_lifecycle",
+        (false, true, false) => "bucket_transaction",
+        (false, false, true) => "request_object",
+        _ => "unknown",
+    }
+}
+
+fn multipart_create_timeout_diagnostic(error: &S3Error, bucket: &str, key: &str) -> Option<MultipartCreateTimeout> {
+    if error.code() != &S3ErrorCode::ServiceUnavailable || error.status_code() != Some(StatusCode::SERVICE_UNAVAILABLE) {
+        return None;
+    }
+    let source = error.source()?;
+    let direct = matches!(source.downcast_ref::<StorageError>(), Some(StorageError::Lock(LockError::Timeout { .. })))
+        || matches!(source.downcast_ref::<LockError>(), Some(LockError::Timeout { .. }));
+    error_chain_find(source, |source| match source.downcast_ref::<LockError>() {
+        Some(LockError::Timeout { resource, timeout }) => Some(MultipartCreateTimeout {
+            resource_class: multipart_timeout_resource_class(resource, bucket, key),
+            source_kind: if direct { "direct" } else { "nested" },
+            timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        }),
+        _ => None,
+    })
+}
+
+pub(crate) fn log_multipart_create_timeout(
+    error: &S3Error,
+    boundary: MultipartCreateBoundary,
+    request_id: Option<&str>,
+    bucket: &str,
+    key: &str,
+) {
+    let Some(diagnostic) = multipart_create_timeout_diagnostic(error, bucket, key) else {
+        return;
+    };
+    let request_id = request_id
+        .filter(|value| uuid::Uuid::parse_str(value).is_ok())
+        .unwrap_or("unknown");
+    let boundary = match boundary {
+        MultipartCreateBoundary::Access => "access",
+        MultipartCreateBoundary::Execute => "execute",
+    };
+    tracing::error!(
+        target: rustfs_obs::MULTIPART_CREATE_TIMEOUT_LOG_TARGET,
+        parent: None,
+        event = "multipart_create_lock_timeout",
+        component = "storage",
+        subsystem = "object_lock",
+        state = "failed",
+        boundary,
+        request_id,
+        resource_class = diagnostic.resource_class,
+        timeout_source = diagnostic.source_kind,
+        timeout_budget_ms = diagnostic.timeout_ms,
+        "Multipart creation returned a lock timeout source"
+    );
+}
+
 impl From<ApiError> for S3Error {
     fn from(err: ApiError) -> Self {
         let status = custom_error_status(&err.code);
@@ -900,6 +993,51 @@ impl From<QuotaError> for ApiError {
 }
 
 #[cfg(test)]
+pub(crate) mod multipart_timeout_test_log {
+    use std::{
+        io,
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    pub(crate) struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    pub(crate) struct Writer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Writer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("log capture").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Capture {
+        type Writer = Writer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            Writer(self.0.clone())
+        }
+    }
+
+    impl Capture {
+        pub(crate) fn rows(&self) -> Vec<serde_json::Value> {
+            let data = self.0.lock().expect("log capture").clone();
+            String::from_utf8(data)
+                .expect("UTF-8 logs")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("JSON log"))
+                .collect()
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use metrics::with_local_recorder;
@@ -909,6 +1047,133 @@ mod tests {
     use s3s::stream::{aws_chunked_stream::AwsChunkedStreamError, upload_stream::UploadStreamError};
     use s3s::{S3Error, S3ErrorCode};
     use std::io::{Error as IoError, ErrorKind};
+
+    fn multipart_timeout_error(resource: &str) -> S3Error {
+        ApiError::from(StorageError::Lock(LockError::timeout(resource, std::time::Duration::from_secs(5)))).into()
+    }
+
+    #[test]
+    fn multipart_create_timeout_classifies_only_the_exact_known_resources() {
+        for (resource, key, expected) in [
+            ("bucket/@latest", "private-key", "bucket_lifecycle"),
+            ("bucket/private-key@latest", "private-key", "request_object"),
+            ("bucket/dir__XLDIR__@latest", "dir/", "request_object"),
+            (
+                ".rustfs.sys/bucket-targets/bucket/transaction.lock@latest",
+                "private-key",
+                "bucket_transaction",
+            ),
+            (".rustfs.sys/bucket-targets/other/transaction.lock@latest", "private-key", "unknown"),
+            ("bucket/private-key@older", "private-key", "unknown"),
+            ("bucket/other@latest", "private-key", "unknown"),
+        ] {
+            let error = multipart_timeout_error(resource);
+            let diagnostic = multipart_create_timeout_diagnostic(&error, "bucket", key).expect("typed timeout");
+            assert_eq!(diagnostic.resource_class, expected, "{resource}");
+            assert_eq!(diagnostic.source_kind, "direct");
+            assert_eq!(diagnostic.timeout_ms, 5_000);
+        }
+
+        let key = "a\\b";
+        let encoded = rustfs_utils::path::object_name_disk_identity(key);
+        let error = multipart_timeout_error(&format!("bucket/{encoded}@latest"));
+        assert_eq!(
+            multipart_create_timeout_diagnostic(&error, "bucket", key)
+                .unwrap()
+                .resource_class,
+            "request_object"
+        );
+
+        let error = multipart_timeout_error(".rustfs.sys/bucket-targets/bucket/transaction.lock@latest");
+        assert_eq!(
+            multipart_create_timeout_diagnostic(&error, ".rustfs.sys", "bucket-targets/bucket/transaction.lock")
+                .unwrap()
+                .resource_class,
+            "request_object"
+        );
+        let ambiguous = multipart_timeout_error(".rustfs.sys/bucket-targets/.rustfs.sys/transaction.lock@latest");
+        assert_eq!(
+            multipart_create_timeout_diagnostic(&ambiguous, ".rustfs.sys", "bucket-targets/.rustfs.sys/transaction.lock")
+                .unwrap()
+                .resource_class,
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn multipart_create_timeout_keeps_nested_and_untrusted_sources_distinct() {
+        let nested = S3Error::from(ApiError {
+            code: S3ErrorCode::ServiceUnavailable,
+            message: "unavailable".into(),
+            source: Some(Box::new(IoError::other(LockError::Network {
+                message: "LEAK-network-detail".into(),
+                source: Box::new(LockError::timeout("bucket/private-key@latest", std::time::Duration::from_secs(5))),
+            }))),
+        });
+        let diagnostic = multipart_create_timeout_diagnostic(&nested, "bucket", "private-key").expect("nested timeout");
+        assert_eq!(diagnostic.resource_class, "request_object");
+        assert_eq!(diagnostic.source_kind, "nested");
+
+        let forged = S3Error::from(ApiError {
+            code: S3ErrorCode::ServiceUnavailable,
+            message: "unavailable".into(),
+            source: Some(Box::new(IoError::other(
+                "Lock acquisition timeout for resource 'bucket/private-key@latest'",
+            ))),
+        });
+        assert!(multipart_create_timeout_diagnostic(&forged, "bucket", "private-key").is_none());
+        let mut denied = multipart_timeout_error("bucket/private-key@latest");
+        denied.set_code(S3ErrorCode::AccessDenied);
+        assert!(multipart_create_timeout_diagnostic(&denied, "bucket", "private-key").is_none());
+    }
+
+    #[test]
+    fn multipart_create_timeout_event_is_visible_at_warn_and_does_not_expose_source() {
+        use crate::error::multipart_timeout_test_log::Capture;
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(capture.clone())
+            .finish();
+        let error = multipart_timeout_error("private-bucket/LEAK-private-key@latest");
+        let request_id = "b8172a15-a428-4b42-9cef-1f4a7b96874e";
+        tracing::subscriber::with_default(subscriber, || {
+            log_multipart_create_timeout(
+                &error,
+                MultipartCreateBoundary::Execute,
+                Some(request_id),
+                "private-bucket",
+                "LEAK-private-key",
+            );
+            log_multipart_create_timeout(
+                &error,
+                MultipartCreateBoundary::Access,
+                Some("LEAK-invalid-request-id"),
+                "private-bucket",
+                "LEAK-private-key",
+            );
+        });
+        let rows = capture.rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["event"], "multipart_create_lock_timeout");
+        assert_eq!(rows[0]["boundary"], "execute");
+        assert_eq!(rows[0]["request_id"], request_id);
+        assert_eq!(rows[0]["resource_class"], "request_object");
+        assert_eq!(rows[0]["timeout_budget_ms"], 5_000);
+        let output = rows[0].to_string();
+        assert!(!output.contains("private-bucket"));
+        assert!(!output.contains("LEAK-private-key"));
+        assert!(!output.contains("LEAK-parent-span"));
+        assert_eq!(rows[1]["request_id"], "unknown");
+        assert!(!rows[1].to_string().contains("LEAK-invalid-request-id"));
+        assert_eq!(error.headers().unwrap()["x-rustfs-error-cause"], "namespace_lock_timeout");
+        assert_eq!(error.headers().unwrap()[http::header::RETRY_AFTER], "1");
+    }
 
     fn error_chain_has_type<T>(err: &(dyn std::error::Error + 'static)) -> bool
     where

@@ -181,11 +181,16 @@ fn resolve_log_cleanup_interval_seconds(config: &OtelConfig) -> u64 {
 #[derive(Clone, Debug)]
 struct RequestIdJsonFormat<T> {
     inner: Format<Json, T>,
+    multipart_timeout: Format<Json, T>,
 }
 
-impl<T> RequestIdJsonFormat<T> {
+impl<T: Clone> RequestIdJsonFormat<T> {
     fn new(inner: Format<Json, T>) -> Self {
-        Self { inner }
+        let multipart_timeout = inner.clone().with_current_span(false).with_span_list(false);
+        Self {
+            inner,
+            multipart_timeout,
+        }
     }
 }
 
@@ -201,6 +206,10 @@ where
         event: &tracing::Event<'_>,
     ) -> fmt::Result {
         let mut buffer = String::new();
+        if event.metadata().target() == crate::MULTIPART_CREATE_TIMEOUT_LOG_TARGET {
+            self.multipart_timeout.format_event(ctx, Writer::new(&mut buffer), event)?;
+            return writer.write_str(&buffer);
+        }
         self.inner.format_event(ctx, Writer::new(&mut buffer), event)?;
 
         let request_id = span_scope_request_id(ctx, event);
@@ -856,6 +865,156 @@ mod tests {
                 .clone(),
         )
         .expect("log output should be valid UTF-8")
+    }
+
+    #[test]
+    fn multipart_timeout_event_does_not_inherit_verbose_span_fields() {
+        for (level, span_events) in [
+            ("debug", FmtSpan::NONE),
+            ("debug", FmtSpan::CLOSE),
+            ("debug", FmtSpan::FULL),
+            ("trace", FmtSpan::NONE),
+            ("trace", FmtSpan::CLOSE),
+            ("trace", FmtSpan::FULL),
+        ] {
+            let writer = SharedWriter::default();
+            let layer = build_json_log_layer(writer.clone(), false, span_events, true);
+            let subscriber = Registry::default()
+                .with(tracing_subscriber::EnvFilter::new(level))
+                .with(layer);
+
+            tracing::subscriber::with_default(subscriber, || {
+                let sensitive = tracing::error_span!(
+                    "request",
+                    uri = "/bucket/LEAK-key?X-Amz-Signature=LEAK-signature",
+                    credential = "LEAK-credential"
+                );
+                let _guard = sensitive.enter();
+                tracing::error!(
+                    target: crate::MULTIPART_CREATE_TIMEOUT_LOG_TARGET,
+                    parent: None,
+                    event = "multipart_create_lock_timeout",
+                    request_id = "b8172a15-a428-4b42-9cef-1f4a7b96874e",
+                    resource_class = "request_object",
+                    "lock timeout"
+                );
+                tracing::error!(event = "unrelated_event", "normal logging still has its span");
+            });
+
+            let bytes = writer.inner.lock().expect("shared writer lock").clone();
+            let output = String::from_utf8(bytes).expect("UTF-8 logs");
+            let rows = output
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).expect("JSON log"))
+                .collect::<Vec<_>>();
+            let event = rows
+                .iter()
+                .find(|row| row["event"] == "multipart_create_lock_timeout")
+                .expect("timeout event");
+            assert_eq!(event["request_id"], "b8172a15-a428-4b42-9cef-1f4a7b96874e");
+            assert!(event.get("span").is_none());
+            assert!(event.get("spans").is_none());
+            assert!(!event.to_string().contains("LEAK-"));
+            let ordinary = rows
+                .iter()
+                .find(|row| row["event"] == "unrelated_event")
+                .expect("ordinary event");
+            assert!(
+                ordinary.to_string().contains("LEAK-key"),
+                "other events keep their configured span context"
+            );
+        }
+    }
+
+    #[test]
+    fn multipart_timeout_target_keeps_the_existing_error_module_filter() {
+        let writer = SharedWriter::default();
+        let layer = build_json_log_layer(writer.clone(), false, FmtSpan::NONE, true);
+        let subscriber = Registry::default()
+            .with(tracing_subscriber::EnvFilter::new("off,rustfs::error=warn"))
+            .with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(
+                target: crate::MULTIPART_CREATE_TIMEOUT_LOG_TARGET,
+                parent: None,
+                event = "multipart_create_lock_timeout",
+                "lock timeout"
+            );
+        });
+        let bytes = writer.inner.lock().expect("shared writer lock").clone();
+        let output = String::from_utf8(bytes).expect("UTF-8 logs");
+        let event: Value = serde_json::from_str(output.trim()).expect("filtered timeout event");
+        assert_eq!(event["event"], "multipart_create_lock_timeout");
+    }
+
+    #[test]
+    fn multipart_timeout_root_event_does_not_inherit_otlp_span_fields() {
+        use opentelemetry::InstrumentationScope;
+        use opentelemetry_appender_tracing::layer::{OpenTelemetryTracingBridge, TracingSpanAttributes};
+        use opentelemetry_sdk::{
+            error::OTelSdkResult,
+            logs::{LogProcessor, SdkLogRecord, SdkLoggerProvider},
+        };
+
+        #[derive(Clone, Debug, Default)]
+        struct Capture(Arc<Mutex<Vec<SdkLogRecord>>>);
+
+        impl LogProcessor for Capture {
+            fn emit(&self, record: &mut SdkLogRecord, _scope: &InstrumentationScope) {
+                self.0.lock().expect("captured records").push(record.clone());
+            }
+
+            fn force_flush(&self) -> OTelSdkResult {
+                Ok(())
+            }
+
+            fn shutdown_with_timeout(&self, _timeout: std::time::Duration) -> OTelSdkResult {
+                Ok(())
+            }
+        }
+
+        for copy_span_fields in [false, true] {
+            let capture = Capture::default();
+            let provider = SdkLoggerProvider::builder().with_log_processor(capture.clone()).build();
+            let bridge = if copy_span_fields {
+                OpenTelemetryTracingBridge::builder(&provider)
+                    .with_tracing_span_attributes(TracingSpanAttributes::all())
+                    .build()
+            } else {
+                OpenTelemetryTracingBridge::new(&provider)
+            };
+            let subscriber = Registry::default().with(bridge);
+            tracing::subscriber::with_default(subscriber, || {
+                let sensitive = tracing::error_span!(
+                    "request",
+                    uri = "/bucket/LEAK-key?X-Amz-Signature=LEAK-signature",
+                    credential = "LEAK-credential"
+                );
+                let _guard = sensitive.enter();
+                tracing::error!(
+                    target: crate::MULTIPART_CREATE_TIMEOUT_LOG_TARGET,
+                    parent: None,
+                    event = "multipart_create_lock_timeout",
+                    request_id = "b8172a15-a428-4b42-9cef-1f4a7b96874e",
+                    resource_class = "request_object",
+                    "lock timeout"
+                );
+                tracing::error!(event = "unrelated_event", "ordinary event");
+            });
+            let records = capture.0.lock().expect("captured records");
+            let timeout = records
+                .iter()
+                .find(|record| record.target().map(|target| target.as_ref()) == Some(crate::MULTIPART_CREATE_TIMEOUT_LOG_TARGET))
+                .expect("timeout event");
+            let output = format!("{timeout:?}");
+            assert!(output.contains("b8172a15-a428-4b42-9cef-1f4a7b96874e"));
+            assert!(!output.contains("LEAK-"));
+            let ordinary = records
+                .iter()
+                .find(|record| record.target().map(|target| target.as_ref()) != Some(crate::MULTIPART_CREATE_TIMEOUT_LOG_TARGET))
+                .expect("ordinary event");
+            assert_eq!(format!("{ordinary:?}").contains("LEAK-key"), copy_span_fields);
+        }
     }
 
     fn render_json_log_with_request_span() -> Value {

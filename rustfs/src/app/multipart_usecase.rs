@@ -17,7 +17,8 @@
 use super::storage_api::multipart_usecase::ECStore;
 use super::storage_api::multipart_usecase::access::{
     TableDataPlaneListAccess, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
-    has_bypass_governance_header, replication_request_authorized, retained_table_data_plane_publication_guards,
+    has_bypass_governance_header, replication_request_authorized, request_context_from_req,
+    retained_table_data_plane_publication_guards,
 };
 use super::storage_api::multipart_usecase::bucket::quota::checker::QuotaChecker;
 use super::storage_api::multipart_usecase::bucket::{
@@ -92,7 +93,7 @@ use crate::auth::{
     reject_presigned_put_max_content_length_for_other_operation,
 };
 use crate::capacity::record_capacity_write;
-use crate::error::ApiError;
+use crate::error::{ApiError, MultipartCreateBoundary, log_multipart_create_timeout};
 use crate::table_catalog;
 #[cfg(test)]
 use bytes::Bytes;
@@ -973,6 +974,24 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        let result = self.execute_create_multipart_upload_inner(&req).await;
+        if let Err(error) = &result {
+            let context = request_context_from_req(&req);
+            log_multipart_create_timeout(
+                error,
+                MultipartCreateBoundary::Execute,
+                context.as_ref().map(|context| context.request_id.as_str()),
+                &req.input.bucket,
+                &req.input.key,
+            );
+        }
+        result
+    }
+
+    async fn execute_create_multipart_upload_inner(
+        &self,
+        req: &S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let multipart_max_total_object_size = parse_presigned_multipart_max_total_object_size(
             &req.headers,
             req.uri.query(),
@@ -983,10 +1002,9 @@ impl DefaultMultipartUsecase {
             req.uri.query(),
             req.extensions.get::<VerifiedPresignedRequest>().is_some(),
         )?;
-        let helper =
-            OperationHelper::new(&req, EventName::ObjectCreatedCreateMultipartUpload, S3Operation::CreateMultipartUpload)
-                .suppress_event();
-        let replication_authorized = replication_request_authorized(&req);
+        let helper = OperationHelper::new(req, EventName::ObjectCreatedCreateMultipartUpload, S3Operation::CreateMultipartUpload)
+            .suppress_event();
+        let replication_authorized = replication_request_authorized(req);
         let CreateMultipartUploadInput {
             bucket,
             key,
@@ -1064,7 +1082,7 @@ impl DefaultMultipartUsecase {
 
         // The session data key is generated here, so this is where a multipart upload is held
         // to the KMS key it names. Parts and the completion reuse the resulting envelope.
-        let session_principal = SseKmsPrincipal::from_request(&req);
+        let session_principal = SseKmsPrincipal::from_request(req);
         let encryption_request = PrepareEncryptionRequest {
             bucket: &bucket,
             key: &key,
@@ -1139,7 +1157,7 @@ impl DefaultMultipartUsecase {
             put_opts_with_replication_authorization(&bucket, &key, version_id, &req.headers, metadata, replication_authorized)
                 .await
                 .map_err(ApiError::from)?;
-        apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
+        apply_bucket_generation_guard(req, &bucket, &mut opts)?;
 
         let dsc =
             must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
@@ -2682,6 +2700,71 @@ mod tests {
         let err = make_usecase().execute_abort_multipart_upload(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
         assert_eq!(s3_op_total(S3Operation::AbortMultipartUpload), before + 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_multipart_observes_the_actual_object_lock_timeout() {
+        use crate::app::storage_api::multipart_usecase::request_context::RequestContext;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::app::storage_api::test::contract::namespace::NamespaceLocking as _;
+        use crate::error::multipart_timeout_test_log::Capture;
+        use tracing::instrument::WithSubscriber as _;
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+        let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let bucket = format!("multipart-timeout-object-{}", Uuid::new_v4());
+        let key = "LEAK-private-key";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let _guard = store
+            .new_ns_lock(&bucket, key)
+            .await
+            .expect("create namespace lock")
+            .get_write_lock(Duration::from_secs(5))
+            .await
+            .expect("hold object lock");
+        let input = CreateMultipartUploadInput::builder()
+            .bucket(bucket.clone())
+            .key(key.to_string())
+            .build()
+            .expect("multipart input");
+        let mut req = build_request(input, Method::POST);
+        let request_context = RequestContext::from_external_headers(&req.headers);
+        let request_id = request_context.request_id.clone();
+        req.extensions.insert(request_context);
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_span_list(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(capture.clone())
+            .finish();
+        let error = DefaultMultipartUsecase::with_context(Some(context))
+            .execute_create_multipart_upload(req)
+            .with_subscriber(subscriber)
+            .await
+            .expect_err("the held object lock must time out");
+        assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(error.headers().unwrap()["x-rustfs-error-cause"], "namespace_lock_timeout");
+        let rows = capture
+            .rows()
+            .into_iter()
+            .filter(|row| row["event"] == "multipart_create_lock_timeout")
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["boundary"], "execute");
+        assert_eq!(rows[0]["request_id"], request_id);
+        assert_eq!(rows[0]["resource_class"], "request_object");
+        assert_eq!(rows[0]["timeout_source"], "direct");
+        assert!(!rows[0].to_string().contains(&bucket));
+        assert!(!rows[0].to_string().contains(key));
     }
 
     #[tokio::test]
