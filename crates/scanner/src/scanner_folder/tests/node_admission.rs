@@ -2,6 +2,11 @@
 // Licensed under the Apache License, Version 2.0.
 
 use super::*;
+#[cfg(unix)]
+use crate::storage_api::owner::{
+    EcstoreLocalPublicationPause as LocalPublicationPause, EcstoreLocalPublicationStage as LocalPublicationStage,
+    ecstore_with_background_disk_io, ecstore_with_background_resource_unit,
+};
 use rustfs_concurrency::adaptive::{FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure};
 use std::num::NonZeroU16;
 use std::sync::atomic::AtomicU64;
@@ -887,7 +892,6 @@ async fn held_read_positive_dispatch_control() {
 #[cfg(unix)]
 async fn held_read_cancelled_scan(corrupt: bool) {
     use rustfs_concurrency::adaptive::AdaptiveAdmission;
-    use rustfs_ecstore::api::disk::{LocalPublicationPause, LocalPublicationStage};
     use std::task::Poll;
 
     let (mut scanner, root) = build_test_scanner().await;
@@ -920,8 +924,8 @@ async fn held_read_cancelled_scan(corrupt: bool) {
     let child_cancel = cancel.clone();
     let mut original = Box::pin(TEST_SIZE_DISPATCH_BOUNDARIES.scope(
         tx,
-        rustfs_ecstore::with_background_resource_unit(physical_unit, async move {
-            rustfs_ecstore::with_background_disk_io(child_cancel.clone(), async move {
+        ecstore_with_background_resource_unit(physical_unit, async move {
+            ecstore_with_background_disk_io(child_cancel.clone(), async move {
                 let mut entry = DataUsageEntry::default();
                 let result = scanner
                     .scan_folder(
@@ -1087,7 +1091,6 @@ async fn cancelled_held_metadata_returns_node_without_dispatch_or_failed_record(
 #[serial]
 async fn held_metadata_native_worker_retains_physical_unit_after_parent_future_drop() {
     use rustfs_concurrency::adaptive::AdaptiveAdmission;
-    use rustfs_ecstore::api::disk::{LocalPublicationPause, LocalPublicationStage};
 
     let (scanner, root) = build_test_scanner().await;
     let _root = TestGuard {
@@ -1103,8 +1106,8 @@ async fn held_metadata_native_worker_retains_physical_unit_after_parent_future_d
             .expect("observe the actual native read finishing");
     let physical = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one physical unit"), 1);
     let physical_unit = physical.acquire().await;
-    let mut original = Box::pin(rustfs_ecstore::with_background_resource_unit(physical_unit, async move {
-        rustfs_ecstore::with_background_disk_io(CancellationToken::new(), async move {
+    let mut original = Box::pin(ecstore_with_background_resource_unit(physical_unit, async move {
+        ecstore_with_background_disk_io(CancellationToken::new(), async move {
             crate::storage_api::EcstoreDiskAPI::read_metadata(disk.as_ref(), "bucket", "object/xl.meta").await
         })
         .await
@@ -1183,7 +1186,6 @@ async fn real_heal_channel_case(
     cancel_held_read: bool,
     receiver: &mut rustfs_heal_contracts::heal_channel::HealReceiptReceiver,
 ) -> (bool, bool, Result<(), ScannerError>, Vec<(String, Option<String>, Option<String>)>, Uuid) {
-    use rustfs_ecstore::api::disk::{LocalPublicationPause, LocalPublicationStage};
     use std::task::Poll;
 
     let (mut scanner, root) = build_test_scanner().await;
@@ -1222,9 +1224,9 @@ async fn real_heal_channel_case(
         },
         &mut entry,
     );
-    let mut original = Box::pin(rustfs_ecstore::with_background_resource_unit(
+    let mut original = Box::pin(ecstore_with_background_resource_unit(
         physical_unit,
-        rustfs_ecstore::with_background_disk_io(cancel.clone(), scan),
+        ecstore_with_background_disk_io(cancel.clone(), scan),
     ));
     let observation = Duration::from_secs(rustfs_config::DEFAULT_DRIVE_METADATA_TIMEOUT_SECS);
     let mut early_result = None;

@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
 pub(crate) use rustfs_ecstore::with_background_disk_io as ecstore_with_background_disk_io;
+#[cfg(all(test, unix))]
+pub(crate) use rustfs_ecstore::with_background_resource_unit as ecstore_with_background_resource_unit;
 
 pub(crate) use s3s::dto::{
     BucketLifecycleConfiguration as EcstoreBucketLifecycleConfiguration, LifecycleRuleFilter as EcstoreLifecycleRuleFilter,
@@ -101,6 +103,10 @@ pub(crate) use rustfs_ecstore::api::disk::{
 pub(crate) use rustfs_ecstore::api::disk::{
     DiskOption as EcstoreDiskOption, DiskStore as EcstoreDiskStore, new_disk as ecstore_new_disk,
 };
+#[cfg(all(test, unix))]
+pub(crate) use rustfs_ecstore::api::disk::{
+    LocalPublicationPause as EcstoreLocalPublicationPause, LocalPublicationStage as EcstoreLocalPublicationStage,
+};
 pub(crate) use rustfs_ecstore::api::error::{
     Error as EcstoreErrorType, Result as EcstoreResultType, StorageError as EcstoreStorageError,
 };
@@ -169,6 +175,11 @@ pub(crate) mod owner {
     pub(crate) use super::ecstore_set_object_store_resolver;
     #[cfg(test)]
     pub(crate) use super::storage_contracts::DiskSetSelector;
+    #[cfg(all(test, unix))]
+    pub(crate) use super::{
+        EcstoreLocalPublicationPause, EcstoreLocalPublicationStage, ecstore_with_background_disk_io,
+        ecstore_with_background_resource_unit,
+    };
     pub(crate) use super::{
         MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
         ScannerPauseBacklogRetirementReplica, register_scanner_pause_backlog_retirement_planner,
