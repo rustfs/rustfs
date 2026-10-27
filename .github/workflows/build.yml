@@ -93,6 +93,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
+          ref: 351bd12031099b955c984868ff6a40bad7fb937a
           persist-credentials: false
 
       - name: Determine build strategy
@@ -189,7 +190,7 @@ jobs:
           # pins the glibc 2.31 floor on the same architecture; musl stays a
           # native cargo build.
           all='{"include":[
-            {"target_id":"linux-x86_64-musl","os":"sm-standard-4","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":"","glibc":""},
+            {"target_id":"linux-x86_64-musl","os":"ubuntu-latest","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":"","glibc":""},
             {"target_id":"linux-aarch64-musl","os":"ubicloud-standard-16-arm","target":"aarch64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":"","glibc":""},
             {"target_id":"linux-x86_64-gnu","os":"sm-standard-4","target":"x86_64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope","glibc":"2.31"},
             {"target_id":"linux-aarch64-gnu","os":"ubicloud-standard-16-arm","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope","glibc":"2.31"},
@@ -235,6 +236,7 @@ jobs:
       # `make build-profiling`); crates/obs/build.rs fails the compile if the
       # `dial9` feature is enabled without the flag.
       RUSTFLAGS: "${{ matrix.rustflags }}"
+      CARGO_BUILD_JOBS: 1
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.prepare-platform-matrix.outputs.matrix) }}
@@ -242,6 +244,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
+          ref: 351bd12031099b955c984868ff6a40bad7fb937a
           persist-credentials: false
           fetch-depth: 0
 
