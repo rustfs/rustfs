@@ -22,6 +22,7 @@ use tokio::io::AsyncReadExt;
 
 mod completed_compaction;
 mod deep_compacted;
+mod memory_budget;
 mod periodic_snapshot;
 mod segment_observation;
 
