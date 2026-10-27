@@ -75,6 +75,7 @@ pub const STATUS_ENABLED: &str = "enabled";
 pub const STATUS_DISABLED: &str = "disabled";
 
 pub const POLICYNAME: &str = "policy";
+pub const PLUGIN_ATTEMPT_CREDENTIAL_CLAIM: &str = "rustfs:plugin-attempt-v1";
 pub const SESSION_POLICY_NAME: &str = "sessionPolicy";
 pub const SESSION_POLICY_NAME_EXTRACTED: &str = "sessionPolicy-extracted";
 const VERIFIED_FEDERATED_POLICY_CLAIM: &str = "x-rustfs-internal-federated-policy";
@@ -168,6 +169,12 @@ enum PreparedServicePolicyMode {
 
 #[derive(Clone)]
 enum PreparedIamMode {
+    TerminalDeny,
+    PluginAttemptSts {
+        is_owner: bool,
+        combined_policy: Policy,
+        session_policy: PreparedSessionPolicy,
+    },
     Opa,
     Owner,
     Deny,
@@ -202,11 +209,16 @@ impl PreparedIamAuth {
     pub async fn needs_existing_object_tag_for_args(&self, args: &Args<'_>) -> bool {
         match &self.mode {
             PreparedIamMode::Opa => true,
-            PreparedIamMode::Owner | PreparedIamMode::Deny => false,
+            PreparedIamMode::Owner | PreparedIamMode::Deny | PreparedIamMode::TerminalDeny => false,
             PreparedIamMode::Regular { combined_policy } => {
                 policy_needs_existing_object_tag_for_args(combined_policy, args).await
             }
             PreparedIamMode::Sts {
+                combined_policy,
+                session_policy,
+                ..
+            }
+            | PreparedIamMode::PluginAttemptSts {
                 combined_policy,
                 session_policy,
                 ..
@@ -239,14 +251,56 @@ impl PreparedIamAuth {
     pub fn combined_policy_for_view(&self) -> Option<&Policy> {
         match &self.mode {
             PreparedIamMode::Regular { combined_policy } => Some(combined_policy),
-            PreparedIamMode::Sts { combined_policy, .. } => Some(combined_policy),
+            PreparedIamMode::Sts { combined_policy, .. } | PreparedIamMode::PluginAttemptSts { combined_policy, .. } => {
+                Some(combined_policy)
+            }
             PreparedIamMode::ServiceAccount { combined_policy, .. } => Some(combined_policy),
-            PreparedIamMode::Opa | PreparedIamMode::Owner | PreparedIamMode::Deny => None,
+            PreparedIamMode::Opa | PreparedIamMode::Owner | PreparedIamMode::Deny | PreparedIamMode::TerminalDeny => None,
         }
     }
 }
 
 impl<T: Store> IamSys<T> {
+    /// For the authenticated, explicitly configured broker handler only.
+    pub async fn read_active_plugin_delegation_for_broker(
+        &self,
+        id: &str,
+        now: u64,
+    ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
+        crate::delegation::read_active_for_broker(&self.store.api, id, now).await
+    }
+    pub async fn create_plugin_delegation(
+        &self,
+        owner: &str,
+        restrictions: crate::delegation::Restrictions,
+        now: u64,
+    ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
+        crate::delegation::create(&self.store.api, owner, restrictions, now).await
+    }
+    pub async fn revoke_plugin_delegation(
+        &self,
+        owner: &str,
+        id: &str,
+    ) -> std::result::Result<(), crate::delegation::DelegationError> {
+        crate::delegation::revoke(&self.store.api, owner, id).await
+    }
+    pub async fn read_active_plugin_delegation(
+        &self,
+        owner: &str,
+        id: &str,
+        now: u64,
+    ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
+        crate::delegation::read_active(&self.store.api, owner, id, now).await
+    }
+    /// Reads an owned delegation record for historical lookups, including expired or revoked records.
+    pub async fn read_owned_plugin_delegation(
+        &self,
+        owner: &str,
+        id: &str,
+    ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
+        crate::delegation::read_owned(&self.store.api, owner, id).await
+    }
+
     /// Create a new IamSys instance with the given IamCache store
     ///
     /// # Arguments
@@ -279,6 +333,16 @@ impl<T: Store> IamSys<T> {
         let policy_plugin_state = get_policy_plugin_state();
         let mut guard = policy_plugin_state.write().await;
         *guard = PolicyPluginState::Ready(client);
+    }
+
+    /// Restricted credentials require the built-in parent/session intersection.
+    /// External authorization bypasses that path, so only Disabled is supported.
+    pub async fn ensure_restricted_credential_vending() -> Result<()> {
+        if matches!(Self::policy_plugin_state().await, PolicyPluginState::Disabled) {
+            Ok(())
+        } else {
+            Err(Error::IAMActionNotAllowed)
+        }
     }
 
     pub async fn get_policy_plugin_client() -> Option<rustfs_policy::policy::opa::AuthZPlugin> {
@@ -1383,17 +1447,50 @@ impl<T: Store> IamSys<T> {
     /// 1) know whether policy evaluation may need `s3:ExistingObjectTag`, and
     /// 2) evaluate with final conditions without re-merging identity policies.
     pub async fn prepare_auth(&self, args: &Args<'_>) -> PreparedIamAuth {
-        if args.is_owner {
+        let marked = args.claims.contains_key(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM);
+        if args.is_owner && !marked {
             return PreparedIamAuth {
                 needs_existing_object_tag: false,
                 mode: PreparedIamMode::Owner,
             };
         }
-
-        if let Some(prepared) = Self::policy_plugin_state().await.prepared_iam_auth() {
+        // One observed state decides this request's path. Marked credentials
+        // never enter OPA, including after a restart or on another node.
+        let state = Self::policy_plugin_state().await;
+        if marked {
+            if args.is_owner
+                || args.claims.get(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM) != Some(&Value::Bool(true))
+                || !matches!(state, PolicyPluginState::Disabled)
+            {
+                return PreparedIamAuth {
+                    needs_existing_object_tag: false,
+                    mode: PreparedIamMode::TerminalDeny,
+                };
+            }
+            let prepared = self.prepare_builtin_auth(args).await;
+            let mode = match prepared.mode {
+                PreparedIamMode::Sts {
+                    is_owner,
+                    combined_policy,
+                    session_policy,
+                } => PreparedIamMode::PluginAttemptSts {
+                    is_owner,
+                    combined_policy,
+                    session_policy,
+                },
+                _ => PreparedIamMode::TerminalDeny,
+            };
+            return PreparedIamAuth {
+                needs_existing_object_tag: prepared.needs_existing_object_tag,
+                mode,
+            };
+        }
+        if let Some(prepared) = state.prepared_iam_auth() {
             return prepared;
         }
-
+        self.prepare_builtin_auth(args).await
+    }
+    async fn prepare_builtin_auth(&self, args: &Args<'_>) -> PreparedIamAuth {
         let Ok((is_svc, parent_user)) = self.is_service_account(args.account).await else {
             return PreparedIamAuth {
                 needs_existing_object_tag: false,
@@ -1425,6 +1522,20 @@ impl<T: Store> IamSys<T> {
     /// bucket policies on an IAM denial. An error must not become an implicit deny.
     pub async fn try_eval_prepared(&self, prepared: &PreparedIamAuth, args: &Args<'_>) -> Result<bool> {
         Ok(match &prepared.mode {
+            PreparedIamMode::TerminalDeny => return Err(Error::IAMActionNotAllowed),
+            PreparedIamMode::PluginAttemptSts {
+                is_owner,
+                combined_policy,
+                session_policy,
+            } => {
+                // A false IAM result permits bucket-policy fallback. Restricted
+                // plugin credentials must instead terminate authorization.
+                let session_allowed = evaluate_prepared_session_policy(session_policy, args).await == Some(true);
+                if !session_allowed || !(*is_owner || combined_policy.is_allowed(args).await) {
+                    return Err(Error::IAMActionNotAllowed);
+                }
+                true
+            }
             PreparedIamMode::Opa => {
                 let Some(opa_enable) = Self::get_policy_plugin_client().await else {
                     tracing::warn!("eval_prepared: OPA mode requested but plugin is unavailable");
@@ -2125,6 +2236,145 @@ mod tests {
         };
 
         assert!(prepared.combined_policy_for_view().is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn marked_signed_sts_denial_is_terminal_before_public_bucket_fallback() {
+        let iam = IamSys::new(IamCache::new(StsTestMockStore::new(false)).await.unwrap());
+        let previous = IamSys::<StsTestMockStore>::policy_plugin_state().await;
+        let signing_key = "c07-test-token-signing-key";
+        let mut metadata=HashMap::from([
+            ("parent".into(),Value::String("sts-fallback-test-parent".into())),
+            ("exp".into(),serde_json::json!((OffsetDateTime::now_utc()+time::Duration::hours(1)).unix_timestamp())),
+            (SESSION_POLICY_NAME.into(),Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::mybucket/inside"]}]}"#))),
+        ]);
+        metadata.insert(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM.into(), Value::Bool(true));
+        let mut marked = get_new_credentials_with_metadata(&metadata, signing_key).unwrap();
+        marked.parent_user = "sts-fallback-test-parent".into();
+        let marked_claims: HashMap<String, Value> = rustfs_policy::utils::extract_claims(&marked.session_token, signing_key)
+            .expect("signed test credentials must decode")
+            .claims;
+        let marked_user = UserIdentity::from(marked.clone());
+        iam.store
+            .cache
+            .add_or_update_sts_account(&marked.access_key, &marked_user, OffsetDateTime::now_utc());
+        metadata.remove(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM);
+        let mut ordinary = get_new_credentials_with_metadata(&metadata, signing_key).unwrap();
+        ordinary.parent_user = marked.parent_user.clone();
+        let ordinary_claims: HashMap<String, Value> = rustfs_policy::utils::extract_claims(&ordinary.session_token, signing_key)
+            .expect("signed test credentials must decode")
+            .claims;
+        iam.store.cache.add_or_update_sts_account(
+            &ordinary.access_key,
+            &UserIdentity::from(ordinary.clone()),
+            OffsetDateTime::now_utc(),
+        );
+        let groups = None;
+        let conditions = HashMap::new();
+        let args = Args {
+            account: &marked.access_key,
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "mybucket",
+            object: "outside",
+            conditions: &conditions,
+            is_owner: false,
+            claims: &marked_claims,
+            deny_only: false,
+        };
+        *get_policy_plugin_state().write().await = PolicyPluginState::Disabled;
+        let denied = iam.prepare_auth(&args).await;
+        let disabled_terminal = matches!(iam.try_eval_prepared(&denied, &args).await, Err(Error::IAMActionNotAllowed));
+        let inside = Args {
+            object: "inside",
+            ..args.clone()
+        };
+        let allowed = iam.prepare_auth(&inside).await;
+        let inside_allowed = matches!(iam.try_eval_prepared(&allowed, &inside).await, Ok(true));
+        let unmarked_args = Args {
+            account: &ordinary.access_key,
+            claims: &ordinary_claims,
+            ..args.clone()
+        };
+        let unmarked = iam.prepare_auth(&unmarked_args).await;
+        let ordinary_false = matches!(iam.try_eval_prepared(&unmarked, &unmarked_args).await, Ok(false));
+        let public:rustfs_policy::policy::BucketPolicy=serde_json::from_value(serde_json::json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["*"]},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::mybucket/*"]}]})).unwrap();
+        let public_allows = public
+            .is_allowed(&rustfs_policy::policy::BucketPolicyArgs {
+                account: &marked.access_key,
+                groups: &groups,
+                action: args.action,
+                bucket: args.bucket,
+                object: args.object,
+                conditions: &conditions,
+                is_owner: false,
+            })
+            .await;
+        IamSys::<StsTestMockStore>::set_policy_plugin_client(opa::AuthZPlugin::new(opa::Args {
+            url: "http://127.0.0.1:8181/allow".into(),
+            auth_token: String::new(),
+        }))
+        .await;
+        let opa_marked = iam.prepare_auth(&args).await;
+        let ready_terminal = matches!(iam.try_eval_prepared(&opa_marked, &args).await, Err(Error::IAMActionNotAllowed));
+        let opa_ordinary = iam.prepare_auth(&unmarked_args).await;
+        let ordinary_keeps_opa = matches!(opa_ordinary.mode, PreparedIamMode::Opa);
+        // The captured Disabled preparation stays on built-in intersection even
+        // if an external policy client becomes ready before evaluation.
+        let captured_still_terminal = matches!(iam.try_eval_prepared(&denied, &args).await, Err(Error::IAMActionNotAllowed));
+        *get_policy_plugin_state().write().await = PolicyPluginState::Initializing;
+        let pending = iam.prepare_auth(&args).await;
+        let initializing_terminal = matches!(iam.try_eval_prepared(&pending, &args).await, Err(Error::IAMActionNotAllowed));
+        *get_policy_plugin_state().write().await = PolicyPluginState::Failed;
+        let failed = iam.prepare_auth(&args).await;
+        let failed_terminal = matches!(iam.try_eval_prepared(&failed, &args).await, Err(Error::IAMActionNotAllowed));
+        *get_policy_plugin_state().write().await = previous;
+        assert!(public_allows, "C07_PUBLIC_BUCKET_CONTROL: real public policy permits outside object");
+        assert!(
+            disabled_terminal && captured_still_terminal,
+            "C07_SCOPE_TERMINAL_BOUND: bucket policy must not rescue restricted scope denial"
+        );
+        assert!(
+            ready_terminal && initializing_terminal && failed_terminal,
+            "C07_EXTERNAL_POLICY_BOUND: marked persisted STS cannot enter OPA"
+        );
+        assert!(
+            inside_allowed && ordinary_false && ordinary_keeps_opa,
+            "C07_UNMARKED_COMPAT: preserve ordinary STS and valid marked scope"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn restricted_vending_rejects_actual_external_policy_plugin_state() {
+        let previous = IamSys::<StsTestMockStore>::policy_plugin_state().await;
+        IamSys::<StsTestMockStore>::set_policy_plugin_client(opa::AuthZPlugin::new(opa::Args {
+            url: "http://127.0.0.1:8181/v1/data/rustfs/authz/allow".into(),
+            auth_token: String::new(),
+        }))
+        .await;
+        let active_rejected = IamSys::<StsTestMockStore>::ensure_restricted_credential_vending()
+            .await
+            .is_err();
+        *get_policy_plugin_state().write().await = PolicyPluginState::Initializing;
+        let initializing_rejected = IamSys::<StsTestMockStore>::ensure_restricted_credential_vending()
+            .await
+            .is_err();
+        *get_policy_plugin_state().write().await = PolicyPluginState::Failed;
+        let failed_rejected = IamSys::<StsTestMockStore>::ensure_restricted_credential_vending()
+            .await
+            .is_err();
+        *get_policy_plugin_state().write().await = PolicyPluginState::Disabled;
+        let disabled_allowed = IamSys::<StsTestMockStore>::ensure_restricted_credential_vending()
+            .await
+            .is_ok();
+        *get_policy_plugin_state().write().await = previous;
+        assert!(
+            active_rejected && initializing_rejected && failed_rejected,
+            "C07_EXTERNAL_POLICY_BOUND: external authorization cannot bypass minted session scope"
+        );
+        assert!(disabled_allowed);
     }
 
     #[tokio::test]

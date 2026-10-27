@@ -42,6 +42,7 @@ use tracing::{debug, error, warn};
 
 use crate::storage_api::object_store::{
     HTTPPreconditions, ListOperations, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations,
+    read_config_preserve_empty_with_metadata_opts,
 };
 
 pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam"));
@@ -611,6 +612,11 @@ impl ObjectStore {
         Ok(serde_json::from_slice(&outcome.plain)?)
     }
 
+    fn decode_iam_config_strict<Item: DeserializeOwned>(data: &[u8]) -> Result<Item> {
+        let outcome = Self::decrypt_data_with_source(data)?;
+        Ok(serde_json::from_slice(&outcome.plain)?)
+    }
+
     /// Parameterized core of [`Store::load_user_identity`].
     async fn load_user_identity_with(&self, name: &str, user_type: UserType, mode: LoadMode) -> Result<UserIdentity> {
         let mut u: UserIdentity = self
@@ -823,6 +829,12 @@ impl Store for ObjectStore {
     }
     async fn load_iam_config<Item: DeserializeOwned>(&self, path: impl AsRef<str> + Send) -> Result<Item> {
         self.load_iam_config_with(path, LoadMode::Locked).await
+    }
+    async fn load_iam_config_strict<Item: DeserializeOwned>(&self, path: impl AsRef<str> + Send) -> Result<Item> {
+        let (data, _) =
+            read_config_preserve_empty_with_metadata_opts(self.object_api.clone(), path.as_ref(), &LoadMode::Locked.read_opts())
+                .await?;
+        Self::decode_iam_config_strict(&data)
     }
     /// Saves IAM configuration with a retry mechanism on failure.
     ///
@@ -1456,6 +1468,40 @@ mod tests {
         }
         let result = ObjectStore::decrypt_data_with_source(&encrypted);
         assert!(result.is_err(), "corrupt stream_io data should fail decrypt");
+    }
+
+    #[test]
+    fn strict_revocation_load_keeps_real_crypto_failure_distinct_from_absence() {
+        let cred = test_cred();
+        let key = format!("{}:{}", cred.access_key, cred.secret_key);
+        let plain = br#"{"version":1,"id":"revoked"}"#;
+        let mut encrypted = rustfs_crypto::encrypt_stream_io(key.as_bytes(), plain).expect("real stored ciphertext");
+        // Exercise the exact decoder used after the actual object read.
+        assert!(ObjectStore::decode_iam_config_strict::<serde_json::Value>(&encrypted).is_ok());
+        encrypted[50] ^= 0xFF;
+        let error = ObjectStore::decode_iam_config_strict::<serde_json::Value>(&encrypted)
+            .expect_err("corrupt tombstone must not become missing");
+        assert!(
+            matches!(error, Error::CryptoError(_)),
+            "C07_REVOCATION_FAIL_CLOSED: preserve actual crypto error"
+        );
+        assert!(
+            !crate::error::is_err_config_not_found(&error),
+            "C07_REVOCATION_FAIL_CLOSED: corrupted revocation is not absence"
+        );
+        // The preserve-empty reader keeps an existing zero-byte object as
+        // Ok(empty); ecstore's read_config_preserve_empty_distinguishes_empty_object
+        // covers that storage boundary. Its payload must fail here, not become
+        // ConfigNotFound and reactivate a revoked delegation.
+        let empty =
+            ObjectStore::decode_iam_config_strict::<serde_json::Value>(&[]).expect_err("an existing empty tombstone is corrupt");
+        assert!(
+            !crate::error::is_err_config_not_found(&empty),
+            "C07_REVOCATION_FAIL_CLOSED: empty existing revocation is not absence"
+        );
+        let invalid_json =
+            ObjectStore::decode_iam_config_strict::<serde_json::Value>(br#"{"version": }"#).expect_err("invalid stored JSON");
+        assert!(!crate::error::is_err_config_not_found(&invalid_json));
     }
 
     #[test]
