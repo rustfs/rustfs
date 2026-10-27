@@ -30,7 +30,7 @@
 # `uring-integration` and `e2e-s3tests.yml` left that label. The prepare
 # step mounts four 1 GiB tmpfs instances and exports `RUSTFS_E2E_POOL_ROOTS`.
 
-name: e2e-distributed
+name: Multipart Quorum Diagnostic
 
 on:
   pull_request:
@@ -97,7 +97,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
+          fetch-depth: 3
           persist-credentials: false
+
+      - name: Verify source snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_head=$(git rev-parse HEAD)
+          actual_source=$(git rev-parse HEAD^)
+          actual_base=$(git rev-parse HEAD^^)
+          actual_tree=$(git rev-parse 'HEAD^^{tree}')
+          actual_diff=$(git diff --full-index --binary "$actual_base" "$actual_source" | sha256sum | cut -d' ' -f1)
+          actual_files=$(git diff --name-only "$actual_source" "$actual_head")
+          printf 'head %s source %s base %s tree %s diff %s files %s\n' "$actual_head" "$actual_source" "$actual_base" "$actual_tree" "$actual_diff" "$actual_files"
+          [[ "$actual_head" == "$GITHUB_SHA" ]]
+          [[ "$actual_source" == "b2aa044f33598d79c0e3655aac90f9dc4d484529" ]]
+          [[ "$actual_base" == "f879946ead08f90074a73079e29cb33e6746f9d1" ]]
+          [[ "$actual_tree" == "45e90781f4c7f52e0670b11cfcb192a9994d2439" ]]
+          [[ "$actual_diff" == "e958f9a147b79c5732a920a5e6960d95d1c121af5f646f57b1e1065f890cd20e" ]]
+          [[ "$actual_files" == ".github/workflows/e2e-distributed.yml" ]]
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -165,16 +184,17 @@ jobs:
       - name: Run distributed 4-node e2e suite
         env:
           RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-distributed-logs
-          FILTER: ${{ inputs.filter }}
+          FILTER: "test(=distributed::scanner_heal_topology_test::scanner_heal_topology_expand_one_to_four_pools_preserves_versions_and_placement) | test(=distributed::scanner_heal_topology_test::scanner_heal_topology_rebalance_survives_live_writes_stop_and_restart) | test(=distributed::scanner_heal_topology_test::scanner_heal_topology_rebalance_kill_before_source_cleanup_resumes_without_loss) | test(=distributed::scanner_heal_topology_test::scanner_heal_topology_decommission_queue_cancel_resume_and_last_pool_guard) | test(=distributed::scanner_heal_topology_test::scanner_heal_topology_decommission_kill_before_source_cleanup_resumes_without_loss) | test(=distributed::scanner_heal_topology_test::scanner_heal_topology_decommission_target_commit_failure_retains_source) | test(=distributed::scanner_heal_topology_test::scanner_heal_topology_decommission_kill_after_responsibility_persisted_before_ack_resumes) | test(=distributed::expand_decommission_rebalance_test::four_node_pool_expand_preserves_objects_then_rebalance) | test(=distributed::expand_decommission_rebalance_test::four_pool_decommission_moves_objects_without_loss)"
+          EXPECTED_TESTS: "distributed::scanner_heal_topology_test::scanner_heal_topology_expand_one_to_four_pools_preserves_versions_and_placement,distributed::scanner_heal_topology_test::scanner_heal_topology_rebalance_survives_live_writes_stop_and_restart,distributed::scanner_heal_topology_test::scanner_heal_topology_rebalance_kill_before_source_cleanup_resumes_without_loss,distributed::scanner_heal_topology_test::scanner_heal_topology_decommission_queue_cancel_resume_and_last_pool_guard,distributed::scanner_heal_topology_test::scanner_heal_topology_decommission_kill_before_source_cleanup_resumes_without_loss,distributed::scanner_heal_topology_test::scanner_heal_topology_decommission_target_commit_failure_retains_source,distributed::scanner_heal_topology_test::scanner_heal_topology_decommission_kill_after_responsibility_persisted_before_ack_resumes,distributed::expand_decommission_rebalance_test::four_node_pool_expand_preserves_objects_then_rebalance,distributed::expand_decommission_rebalance_test::four_pool_decommission_moves_objects_without_loss"
+          SELECTED_LISTING: ${{ runner.temp }}/rustfs-selected-topology.json
         run: |
           set -euo pipefail
-          rm -f target/nextest/e2e-distributed/junit.xml
-          if [ -n "${FILTER}" ]; then
-            python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test -E "${FILTER}"
-          else
-            python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test --no-tests=fail
-          fi
+          test ! -e target/nextest/e2e-distributed/junit.xml
+          cargo nextest list --profile e2e-distributed -p e2e_test -E "${FILTER}" --message-format json > "${SELECTED_LISTING}"
+          python3 -c 'import json,os,sys; d=json.load(open(sys.argv[1])); expected=set(os.environ["EXPECTED_TESTS"].split(",")); got=[n for s in d["rust-suites"].values() for n,t in s["testcases"].items() if t.get("filter-match",{}).get("status") == "matches" and t.get("ignored") is False]; print("Selected tests:",len(got),sorted(got)); assert len(got)==len(expected)==9 and set(got)==expected' "${SELECTED_LISTING}"
+          python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test -E "${FILTER}" --no-tests=fail
           test -s target/nextest/e2e-distributed/junit.xml
+          python3 -c 'import os,xml.etree.ElementTree as E; expected=set(os.environ["EXPECTED_TESTS"].split(",")); cases=list(E.parse("target/nextest/e2e-distributed/junit.xml").iter("testcase")); got=[c.get("name") for c in cases]; print("JUnit cases:",len(got),sorted(got)); assert len(cases)==len(expected)==9 and set(got)==expected and all(not any(c.find(t) is not None for t in ("failure","error","skipped")) for c in cases)'
 
       - name: Upload distributed e2e diagnostics
         if: always()
@@ -184,6 +204,7 @@ jobs:
           path: |
             target/nextest/e2e-distributed/junit.xml
             ${{ runner.temp }}/rustfs-e2e-distributed-list.json
+            ${{ runner.temp }}/rustfs-selected-topology.json
             ${{ runner.temp }}/rustfs-e2e-distributed-logs/
           retention-days: 7
           if-no-files-found: warn
