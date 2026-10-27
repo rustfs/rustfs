@@ -74,7 +74,6 @@ Notes:
 - `.github/workflows/e2e-s3tests.yml` (weekly full s3-tests sweep)
 - `.github/workflows/mint.yml` (weekly multi-SDK mint run)
 - `.github/workflows/fuzz.yml` (nightly fuzz corpus jobs)
-- `.github/workflows/performance-ab.yml` (nightly warp A/B gate)
 - **Pending:** the ci-7 e2e nightly-full workflow does not exist yet
   (backlog#1149 ci-7). When it lands, wire it up with the snippet above.
 
