@@ -143,3 +143,20 @@ python3 scripts/e2e_binary.py run --features e2e-test-hooks -- \
 `RUSTFS_E2E_LOG_FILTER` optionally overrides node log filtering for distributed fixtures; its absence preserves each fixture's existing filter. Use a narrow module filter when diagnosing RPC responses and keep logs with the matching server provenance.
 
 `RUSTFS_E2E_MPU_LOAD_ROUNDS` accepts 1–256 and defaults to three rounds. Allocate a private target directory and bounded CPU/memory resources before running the eight-process case. Temporary drive directories follow `TMPDIR`; use a task-owned directory on the intended filesystem. These are plaintext loopback processes and logical drives on one host, so passing them does not establish physical-drive independence, TLS behavior, the original incident cause, or a throughput improvement. Performance comparisons require a separate controlled baseline and drift-checked measurement.
+
+### Namespace owner release evidence
+
+For distributed MPU diagnostics, retain the HTTP request span as well as the lock events:
+
+```bash
+RUSTFS_OBJECT_LOCK_DIAG_ENABLE=true \
+RUSTFS_E2E_LOG_FILTER='warn,rustfs::server::http=info,rustfs_ecstore::object_lock_diag=trace,rustfs_lock::namespace_owner=trace' \
+RUSTFS_E2E_LOG_DIR=/path/to/isolated-run/logs \
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- \
+  cargo nextest run -p e2e_test --profile e2e-distributed --test-threads 1 \
+  -E 'test(=distributed::multipart_fence_acceptance_test::native_certified_partial_abort_retry_reclaims_survivors_below_metadata_quorum)'
+```
+
+Match the S3 response request ID to the retained `http-request` span. The `object_namespace_lock` acquired and guard-dropped events carry `lock_attempt_id` and the logical guard `lock_id`. Each `object_namespace_lock_peer` event maps that guard to an actual granted `peer_lock_id`; acquisition retries can give peers an ID different from the logical guard. Join `peer_lock_id` to the `lock_id` in `namespace_lock_release`. Its local `state=mapped` record identifies the process-local `physical_guard_id`; the separate `state=released` record is emitted only after the underlying manager actually releases that guard and unregisters it. A stale or disabled guard cannot produce that physical completion record. Remote `state=acknowledged` records require a successful unlock response without an error; they describe the remote response, while physical completion still requires the peer's local record. Batch acknowledgements retain each actual lock ID and peer. Missing, false or errored release responses do not produce an acknowledgement. Combine `process_id` and physical guard IDs with the retained node process/lifecycle provenance; guard IDs are unique only within one process.
+
+`guard_dropped` still means that logical guard ownership ended; asynchronous peer cleanup can follow it. The local mapping is logged after dropping the guard so logging does not delay that physical release; join records by identity rather than arrival order. A lock-acquisition failure or a fast local guard has no acquired distributed lock ID. Transport request IDs may differ from the S3 request ID; use the actual lock identity rather than assuming equality. These events describe ordinary namespace cleanup; forced release and lease reaping require separate evidence. They do not establish completion of native filesystem callbacks, snapshot leases or detached mutation tails. Preserve their separate physical-ownership evidence and the final scoped lock-table snapshots. This diagnostic configuration increases logging and is not a performance-measurement configuration.
