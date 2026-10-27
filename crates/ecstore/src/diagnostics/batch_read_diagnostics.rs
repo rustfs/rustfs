@@ -157,7 +157,7 @@ impl Sample {
             return None;
         }
         let batch_id = sequence.fetch_add(1, Ordering::Relaxed);
-        if batch_id % rate != 0 {
+        if !batch_id.is_multiple_of(rate) {
             return None;
         }
         Some(Self {
@@ -449,7 +449,7 @@ mod tests {
             let status = std::process::Command::new(std::env::current_exe().expect("current test executable"))
                 .args([
                     "--exact",
-                    "batch_read_diagnostics::tests::production_batch_diagnostic_survives_caller_cancellation",
+                    "diagnostics::batch_read_diagnostics::tests::production_batch_diagnostic_survives_caller_cancellation",
                     "--nocapture",
                 ])
                 .env(CHILD, "1")

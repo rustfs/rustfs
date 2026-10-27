@@ -11310,7 +11310,7 @@ impl LocalDisk {
 pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, usize)>) -> Vec<Result<Bytes>> {
     let n = requests.len();
     #[cfg(feature = "diagnostic-local-batch")]
-    let diagnostic = crate::batch_read_diagnostics::Sample::capture();
+    let diagnostic = crate::diagnostics::batch_read_diagnostics::Sample::capture();
     tokio::task::spawn_blocking(move || {
         use std::os::unix::fs::FileExt;
 
@@ -11319,9 +11319,9 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
             ($stage:ident, $index:expr, $operation:expr) => {{
                 #[cfg(feature = "diagnostic-local-batch")]
                 {
-                    crate::batch_read_diagnostics::measure(
+                    crate::diagnostics::batch_read_diagnostics::measure(
                         diagnostic.as_ref(),
-                        crate::batch_read_diagnostics::Stage::$stage,
+                        crate::diagnostics::batch_read_diagnostics::Stage::$stage,
                         $index,
                         $operation,
                     )
@@ -11378,7 +11378,7 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
         #[cfg(feature = "diagnostic-local-batch")]
         if let (Some(sample), Some(started)) = (&diagnostic, execution) {
             sample.finish(
-                crate::batch_read_diagnostics::Stage::Execution,
+                crate::diagnostics::batch_read_diagnostics::Stage::Execution,
                 None,
                 started,
                 results.iter().all(Result::is_ok),

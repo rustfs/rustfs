@@ -29,6 +29,8 @@ use crate::server::{
 };
 use crate::shared_types::ReadinessDegradedReason;
 use crate::storage_api::server::layer::apply_cors_headers;
+#[cfg(feature = "diagnostic-local-batch")]
+use crate::storage_api::server::layer::batch_diagnostic;
 use crate::storage_api::server::layer::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
 use bytes::{Bytes, BytesMut};
 use futures::future::Either;
@@ -291,7 +293,7 @@ where
         };
         #[cfg(feature = "diagnostic-local-batch")]
         let diagnostic_request = is_s3
-            .then(|| rustfs_ecstore::batch_read_diagnostics::request_context(&request_context.request_id))
+            .then(|| batch_diagnostic::request_context(&request_context.request_id))
             .flatten();
         #[cfg(not(feature = "diagnostic-local-batch"))]
         let diagnostic_request = ();
@@ -311,11 +313,10 @@ where
         let head_request = req.method() == Method::HEAD;
         let mut metrics = is_s3.then(|| s3_http_request_guard(req.method().as_str()));
         #[cfg(feature = "diagnostic-local-batch")]
-        let inner =
-            rustfs_ecstore::batch_read_diagnostics::in_request_context(diagnostic_request.as_ref(), || match metrics.as_mut() {
-                Some(metrics) => metrics.in_scope(|| self.inner.call(req)),
-                None => self.inner.call(req),
-            });
+        let inner = batch_diagnostic::in_request_context(diagnostic_request.as_ref(), || match metrics.as_mut() {
+            Some(metrics) => metrics.in_scope(|| self.inner.call(req)),
+            None => self.inner.call(req),
+        });
         #[cfg(not(feature = "diagnostic-local-batch"))]
         let inner = match metrics.as_mut() {
             Some(metrics) => metrics.in_scope(|| self.inner.call(req)),
@@ -394,10 +395,7 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         #[cfg(feature = "diagnostic-local-batch")]
-        let result = rustfs_ecstore::batch_read_diagnostics::in_request_context(this.diagnostic_request.as_ref(), || match this
-            .metrics
-            .as_mut()
-        {
+        let result = batch_diagnostic::in_request_context(this.diagnostic_request.as_ref(), || match this.metrics.as_mut() {
             Some(metrics) => metrics.in_scope(|| this.inner.poll(cx)),
             None => this.inner.poll(cx),
         });
@@ -2666,15 +2664,9 @@ mod tests {
                     .expect("canonical request context");
                 let expected = context.request_id.clone();
                 assert_ne!(expected, "client-controlled-id");
-                assert_eq!(
-                    rustfs_ecstore::batch_read_diagnostics::current_request_id().as_deref(),
-                    Some(expected.as_str())
-                );
+                assert_eq!(batch_diagnostic::current_request_id().as_deref(), Some(expected.as_str()));
                 async move {
-                    assert_eq!(
-                        rustfs_ecstore::batch_read_diagnostics::current_request_id().as_deref(),
-                        Some(expected.as_str())
-                    );
+                    assert_eq!(batch_diagnostic::current_request_id().as_deref(), Some(expected.as_str()));
                     Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::new())))
                 }
             });
@@ -2687,7 +2679,7 @@ mod tests {
                 .expect("test request");
             let response = futures::executor::block_on(service.call(request)).expect("correlated response");
             assert_eq!(response.status(), StatusCode::OK);
-            assert!(rustfs_ecstore::batch_read_diagnostics::current_request_id().is_none());
+            assert!(batch_diagnostic::current_request_id().is_none());
         });
     }
 
@@ -2696,10 +2688,7 @@ mod tests {
     fn diagnostic_request_scope_is_present_on_every_poll_and_restored() {
         let mut polls = 0;
         let inner = std::future::poll_fn(|cx| {
-            assert_eq!(
-                rustfs_ecstore::batch_read_diagnostics::current_request_id().as_deref(),
-                Some("server-owned-test")
-            );
+            assert_eq!(batch_diagnostic::current_request_id().as_deref(), Some("server-owned-test"));
             polls += 1;
             if polls == 1 {
                 cx.waker().wake_by_ref();
@@ -2720,7 +2709,7 @@ mod tests {
         let response = futures::executor::block_on(future).expect("diagnostic request future");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(polls, 2);
-        assert!(rustfs_ecstore::batch_read_diagnostics::current_request_id().is_none());
+        assert!(batch_diagnostic::current_request_id().is_none());
     }
     #[tokio::test]
     async fn foreground_feedback_unobserved_body_is_a_direct_passthrough() {
