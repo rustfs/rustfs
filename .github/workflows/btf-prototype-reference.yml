@@ -1,0 +1,44 @@
+name: BTF prototype reference
+
+on:
+  pull_request:
+    paths:
+      - "scripts/inspect_btf_prototypes.py"
+      - "scripts/test_inspect_btf_prototypes.py"
+      - "scripts/fixtures/btf_prototypes.c"
+      - ".github/workflows/btf-prototype-reference.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: btf-prototype-reference-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Check prototype and CLI contracts
+        run: python3 -B scripts/test_inspect_btf_prototypes.py
+      - name: Install only missing native reference tools
+        run: |
+          packages=()
+          command -v clang >/dev/null || packages+=(clang)
+          command -v llvm-objcopy >/dev/null || packages+=(llvm)
+          command -v bpftool >/dev/null || packages+=(bpftool)
+          if (( ${#packages[@]} )); then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y "${packages[@]}"
+          fi
+      - name: Compare compiled declarations with bpftool
+        run: |
+          clang -target bpf -O2 -g -c scripts/fixtures/btf_prototypes.c -o "$RUNNER_TEMP/prototypes.o"
+          llvm-objcopy --dump-section ".BTF=$RUNNER_TEMP/prototypes.btf" "$RUNNER_TEMP/prototypes.o"
+          python3 -B scripts/test_inspect_btf_prototypes.py --native-reference "$RUNNER_TEMP/prototypes.btf"
