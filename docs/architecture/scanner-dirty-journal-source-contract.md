@@ -86,6 +86,11 @@ owner-selected journal object in the storage metadata namespace, with the exact
 pool/set routing identity checked at admission and commit. The bootstrap object
 and unrelated metadata objects are outside the ticket's repair scope.
 
+User metadata, a decoded wire record or an authenticated RPC claim cannot
+construct a verified binding. A receiving storage peer must validate the
+bootstrap/ticket, target and native fence again before mutation; transport
+authentication alone is not this scope's repair authorization.
+
 The new head key is
 `scanner/dirty-journal-source/v1/<owner>/checkpoint.bin`, where `<owner>` is the
 canonical hash produced by `durable_dirty_usage_owner`. Immutable bootstrap
