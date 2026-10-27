@@ -5355,7 +5355,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn empty_delimiter_listing_hides_and_purges_committed_delete_residue() {
+    async fn empty_delimiter_listing_hides_and_preserves_committed_delete_residue() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
         use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
 
@@ -5400,15 +5400,22 @@ mod test {
         assert!(result.objects.is_empty());
         assert!(result.prefixes.is_empty(), "delete residue must not surface as a prefix");
         for dir in &dirs {
+            let residue = dir
+                .path()
+                .join(bucket)
+                .join("metrics/2026/object.parquet")
+                .join(data_dir.to_string());
+            assert_eq!(tokio::fs::read(residue.join("part.1")).await.expect("LIST preserves part"), b"stale");
             assert!(
-                !dir.path().join(bucket).join("metrics").join("2026").exists(),
-                "the empty delimiter listing should reclaim the committed delete residue under it"
+                residue
+                    .join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction))
+                    .exists()
             );
         }
     }
 
     #[tokio::test]
-    async fn empty_delimiter_listing_of_residue_ancestor_hides_and_purges_whole_tree() {
+    async fn empty_delimiter_listing_of_residue_ancestor_hides_and_preserves_whole_tree() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
         use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
 
@@ -5441,9 +5448,7 @@ mod test {
             .expect("committed delete marker should be written");
         }
 
-        // Browsing an ancestor of the deleted key must not show the empty
-        // date folders, and the empty result reclaims the whole residue tree
-        // in one pass instead of one level per listing.
+        // Browsing an ancestor must not expose the deleted key's date folders.
         let result = store
             .clone()
             .list_objects_generic(bucket, "metrics/", None, Some("/".to_owned()), 1000, false)
@@ -5452,15 +5457,22 @@ mod test {
         assert!(result.objects.is_empty());
         assert!(result.prefixes.is_empty(), "ancestors of delete residue must not surface as prefixes");
         for dir in &dirs {
+            let residue = dir
+                .path()
+                .join(bucket)
+                .join("metrics/kubelet/2026/08/28/23/74992556388248657933757.parquet")
+                .join(data_dir.to_string());
+            assert_eq!(tokio::fs::read(residue.join("part.1")).await.expect("LIST preserves part"), b"stale");
             assert!(
-                !dir.path().join(bucket).join("metrics").exists(),
-                "the empty delimiter listing should reclaim the committed delete residue tree under it"
+                residue
+                    .join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction))
+                    .exists()
             );
         }
     }
 
     #[tokio::test]
-    async fn empty_delimiter_listing_of_mixed_residue_ancestor_reclaims_only_committed_subtree() {
+    async fn empty_delimiter_listing_of_mixed_residue_ancestor_preserves_every_subtree() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
         use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
 
@@ -5533,9 +5545,18 @@ mod test {
         assert!(result.prefixes.is_empty(), "residue subtrees may not surface as prefixes");
         for dir in &dirs {
             let metrics = dir.path().join(bucket).join("metrics");
-            assert!(
-                !metrics.join("cpu").exists(),
-                "the committed subtree must be reclaimed even though a sibling subtree is blocked"
+            let committed = metrics.join("cpu/2026/08/28/22/a.parquet").join(committed_dir.to_string());
+            assert_eq!(
+                tokio::fs::read(committed.join("part.1"))
+                    .await
+                    .expect("LIST preserves committed part"),
+                b"stale"
+            );
+            assert_eq!(
+                tokio::fs::read(committed.join(crate::disk::STORAGE_FORMAT_FILE_BACKUP))
+                    .await
+                    .expect("LIST preserves backup"),
+                b"rollback metadata"
             );
             assert!(
                 metrics
@@ -5543,7 +5564,7 @@ mod test {
                     .join(unmarked_dir.to_string())
                     .join("part.1")
                     .exists(),
-                "residue without a committed marker must survive the purge"
+                "residue without a committed marker must survive the listing"
             );
             assert_eq!(
                 tokio::fs::read(
