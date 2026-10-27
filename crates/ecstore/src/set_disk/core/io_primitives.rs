@@ -6338,40 +6338,6 @@ impl SetDisks {
         Ok(purged)
     }
 
-    /// Reclaim metadata-less directory trees discovered by a recursive empty
-    /// bucket listing. The initial directory read fails closed if any slot is
-    /// unavailable; per-prefix purges then reuse the full cross-disk scan.
-    pub(crate) async fn purge_orphan_dir_objects_in_bucket(&self, bucket: &str) -> bool {
-        let disks = self.get_disks_internal().await;
-        if disks.is_empty() || disks.iter().any(Option::is_none) {
-            return false;
-        }
-
-        let mut prefixes = HashSet::new();
-        for disk in disks.iter().flatten() {
-            let entries = match disk.list_dir("", bucket, "", 0).await {
-                Ok(entries) => entries,
-                Err(_) => return false,
-            };
-            prefixes.extend(
-                entries
-                    .into_iter()
-                    .filter(|entry| entry.ends_with(SLASH_SEPARATOR) && is_safe_orphan_dir_entry(entry)),
-            );
-        }
-
-        let mut prefixes = prefixes.into_iter().collect::<Vec<_>>();
-        prefixes.sort_unstable();
-        let mut purged = false;
-        for prefix in prefixes {
-            match self.purge_orphan_dir_object(bucket, &prefix).await {
-                Ok(prefix_purged) => purged |= prefix_purged,
-                Err(_) => return false,
-            }
-        }
-        purged
-    }
-
     /// Orphan cleanup must not infer a complete scan from only the online
     /// subset of a set's disks.
     pub(crate) async fn orphan_purge_has_complete_disk_set(&self) -> bool {

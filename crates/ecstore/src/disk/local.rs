@@ -10009,9 +10009,7 @@ impl LocalDisk {
                             } {
                                 meta.name.push_str(SLASH_SEPARATOR);
                                 // Conservative listings verify physical prefixes. Never-versioned
-                                // buckets use the bounded fast path, which only has to rule out
-                                // the data dirs a deleted version leaves behind; an empty listing
-                                // of such a prefix then reclaims committed residue.
+                                // buckets first rule out the data dirs a deleted version leaves behind.
                                 let listable = if opts.recursive || opts.incl_deleted {
                                     true
                                 } else if opts.skip_hidden_prefix_check {
@@ -10165,17 +10163,19 @@ impl LocalDisk {
     /// Reads stay small on genuine prefixes: each directory is sampled with one
     /// bounded batch, the sampled children are probed depth-first, and the
     /// directory is only read in full once every sampled child proved to hold
-    /// nothing listable. A total read budget makes a residue tree larger than
-    /// the budget surface and be hidden one level down instead, so the cost on
-    /// a genuine prefix never exceeds its depth in small directory reads. A
-    /// directory that vanishes mid-probe holds nothing listable.
+    /// nothing listable. If the read budget is exhausted, verify the subtree
+    /// before exposing the prefix. A directory that vanishes mid-probe holds
+    /// nothing listable.
     async fn directory_is_delete_residue(&self, bucket: &str, dir_name: &str, stall: Option<Duration>) -> Result<bool> {
         let dir_name = dir_name.trim_end_matches(SLASH_SEPARATOR);
         let mut reads = 0usize;
         let mut pending = vec![ResidueProbeStep::Sample(dir_name.to_owned())];
         while let Some(step) = pending.pop() {
             if reads >= DELETE_RESIDUE_PROBE_READ_BUDGET {
-                return Ok(false);
+                return self
+                    .directory_has_listing_entry(bucket, dir_name, false, stall)
+                    .await
+                    .map(|listable| !listable);
             }
             reads += 1;
 
@@ -25245,11 +25245,13 @@ mod test {
         )
         .await;
 
-        // A prefix with more residue directories than the probe budget stays
-        // visible rather than costing an unbounded walk.
+        // A prefix larger than the fast-probe budget still needs a complete
+        // read-only check before it can appear in a delimiter listing.
         for hour in 0..(DELETE_RESIDUE_PROBE_READ_BUDGET + 1) {
             write_residue(&bucket_dir.join(format!("bulk/2026/08/28/{hour:02}/a.parquet")), false).await;
+            write_residue(&bucket_dir.join(format!("bulk-live/2026/08/28/{hour:02}/a.parquet")), false).await;
         }
+        write_object(&bucket_dir.join("bulk-live/live.parquet"), "bulk-live/live.parquet").await;
         // Exactly at the budget: `edge/` with N object dirs costs one sampled
         // read of `edge`, two reads per object dir (its own and its data dir),
         // and one remainder read of `edge` once its 8-entry sample was full.
@@ -25330,10 +25332,8 @@ mod test {
             vec!["logs/default/2026/08/28/23/".to_owned()]
         );
         assert_eq!(scan_names(&disk, bucket, "logs/").await, vec!["logs/default/".to_owned()]);
-        assert_eq!(scan_names(&disk, bucket, "bulk/2026/08/").await, vec!["bulk/2026/08/28/".to_owned()]);
-        // Listed directly, every object dir is probed on its own and hidden;
-        // the budget only bites where the whole tree hangs off one entry, so
-        // the root listing below shows `edge-show/` but not `edge-hide/`.
+        assert_eq!(scan_names(&disk, bucket, "bulk/2026/08/").await, Vec::<String>::new());
+        assert_eq!(scan_names(&disk, bucket, "bulk-live/").await, vec!["bulk-live/live.parquet".to_owned()]);
         assert_eq!(scan_names(&disk, bucket, "edge-hide/").await, Vec::<String>::new());
         assert_eq!(scan_names(&disk, bucket, "edge-show/").await, Vec::<String>::new());
         assert_eq!(scan_names(&disk, bucket, "stray/").await, vec!["stray/2026/".to_owned()]);
@@ -25341,8 +25341,7 @@ mod test {
         assert_eq!(
             scan_names(&disk, bucket, "").await,
             vec![
-                "bulk/".to_owned(),
-                "edge-show/".to_owned(),
+                "bulk-live/".to_owned(),
                 "logs/".to_owned(),
                 "odd/".to_owned(),
                 "stray/".to_owned(),

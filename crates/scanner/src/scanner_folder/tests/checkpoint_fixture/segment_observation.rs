@@ -250,7 +250,6 @@ async fn walk_and_save(observe: bool) -> (Vec<String>, serde_json::Value) {
     assert_ne!(before, after, "a changed key requires an observable successful fixture write");
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     let paths = Arc::new(Mutex::new(Vec::<String>::new()));
     let proposed_walked = Arc::new(Mutex::new(BTreeSet::<String>::new()));
     scanner.update_current_path = Arc::new({

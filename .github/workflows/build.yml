@@ -181,12 +181,18 @@ jobs:
             selected="all"
           fi
 
-
+          # linux-aarch64-* need a real aarch64 host (placement rule: hardware)
+          # so the packaged binary and console smoke execute the artifact.
+          # ubicloud-standard-16-arm is that host: Ubuntu 24.04 arm64, alias of
+          # ubicloud-standard-16-arm-ubuntu-2404 (16 vCPU, 48 GB). linux-x86_64-* stay on the
+          # ARC sm-standard-4 pool. GNU rows keep cross=true so cargo-zigbuild
+          # pins the glibc 2.31 floor on the same architecture; musl stays a
+          # native cargo build.
           all='{"include":[
             {"target_id":"linux-x86_64-musl","os":"sm-standard-4","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":"","glibc":""},
-            {"target_id":"linux-aarch64-musl","os":"sm-standard-4-arm","target":"aarch64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":"","glibc":""},
+            {"target_id":"linux-aarch64-musl","os":"ubicloud-standard-16-arm","target":"aarch64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":"","glibc":""},
             {"target_id":"linux-x86_64-gnu","os":"sm-standard-4","target":"x86_64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope","glibc":"2.31"},
-            {"target_id":"linux-aarch64-gnu","os":"sm-standard-4-arm","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope","glibc":"2.31"},
+            {"target_id":"linux-aarch64-gnu","os":"ubicloud-standard-16-arm","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope","glibc":"2.31"},
             {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":"","features":"pyroscope","glibc":""},
             {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":"","features":"","glibc":""}
           ]}'
@@ -244,7 +250,11 @@ jobs:
         with:
           rust-version: stable
           target: ${{ matrix.target }}
-          cache-shared-key: build-${{ matrix.target }}${{ matrix.glibc && format('-glibc-{0}', matrix.glibc) || '' }}
+          # rust-cache keys include OS and architecture but not the runner image.
+          # The Ubicloud aarch64 legs therefore use their own suffix so they
+          # cannot restore a cache written on a different arm64 image.
+          # x86_64, macOS, and Windows keys stay unsuffixed.
+          cache-shared-key: build-${{ matrix.target }}${{ matrix.glibc && format('-glibc-{0}', matrix.glibc) || '' }}${{ matrix.os == 'ubicloud-standard-16-arm' && '-ubicloud-arm' || '' }}
           # main only. A cache saved on refs/tags/X is scoped to that tag: no
           # other tag, no main run and no PR can restore it, so every release
           # cycle wrote up to 12 entries of 1-2GB (preview tag plus final tag,
@@ -764,9 +774,9 @@ jobs:
             exit 0
           fi
 
-          # The self-hosted Linux runners do not ship the aws CLI (GitHub-hosted
-          # images did). Install the official CLI bundle on demand so R2 uploads
-          # survive a fresh runner without relying on a distro package.
+          # ARC pods (the x86_64 legs) do not ship the aws CLI. Ubicloud arm64
+          # images follow the GitHub runner image and often do. Install the
+          # official CLI bundle when it is missing so R2 uploads work on either.
           if ! command -v aws >/dev/null 2>&1; then
             echo "aws CLI not found on runner; installing..."
             if command -v apt-get >/dev/null 2>&1; then

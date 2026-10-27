@@ -129,7 +129,7 @@ use rustfs_filemeta::{
 };
 use rustfs_heal_contracts::heal_channel::{
     DriveState, HealAdmissionResult, HealChannelPriority, HealItemType, HealOpts, HealRequestSource, HealScanMode,
-    send_heal_replacement_disk, send_heal_request_with_admission,
+    send_heal_request_with_admission,
 };
 use rustfs_io_metrics::{
     record_object_lock_diag_acquire_duration, record_object_lock_diag_enabled, record_object_lock_diag_hold_duration,
@@ -10475,13 +10475,6 @@ mod tests {
 
         assert!(!purged, "an incomplete disk scan must not claim the tree is an orphan");
         assert!(prefix_dir.join("nested/leaf").exists(), "online disk contents must remain untouched");
-
-        let bucket_purged = set.purge_orphan_dir_objects_in_bucket("bucket").await;
-        assert!(!bucket_purged, "bucket-wide cleanup must fail closed with an unavailable disk slot");
-        assert!(
-            prefix_dir.join("nested/leaf").exists(),
-            "bucket-wide cleanup must preserve the online tree"
-        );
     }
 
     // Cross-disk safety: if any drive still holds object data under the prefix, refuse
