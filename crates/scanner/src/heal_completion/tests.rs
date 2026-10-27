@@ -100,7 +100,8 @@ fn replacement_bucket_version_or_location_cannot_match_an_old_result() {
 
 #[test]
 fn missing_identity_fields_are_unknown_on_either_side() {
-    let changes: [(&str, fn(&mut HealObjectIdentity)); 6] = [
+    type IdentityChange = fn(&mut HealObjectIdentity);
+    let changes: [(&str, IdentityChange); 6] = [
         ("version", |identity| identity.version_id = None),
         ("empty version", |identity| identity.version_id = Some(String::new())),
         ("incarnation", |identity| identity.bucket_incarnation_id = None),
