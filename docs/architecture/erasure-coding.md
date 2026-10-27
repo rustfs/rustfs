@@ -5,7 +5,7 @@
 
 Status: normative. This document is the source of truth for how RustFS erasure-codes, stores, reads, reconstructs, and heals user data, and for the on-disk / on-wire compatibility contract that every future change must preserve. It governs the highest-risk code in the system: a regression here can silently corrupt or lose all user data, or make existing (and MinIO-migrated) objects permanently unreadable.
 
-Erasure coding, quorum/heal, and metadata/on-disk formats are **High-risk** per [AGENTS.md](../../AGENTS.md) ("Broad or High-Risk Changes"). Any behavior-affecting change to code this document governs requires adversarial review with the `adversarial-validation` skill and, for anything touching decode or the on-disk format, a regression test against real on-disk and MinIO-migrated samples before merge.
+Erasure coding, quorum/heal, and metadata/on-disk formats are **High-risk** per [AGENTS.md](../../AGENTS.md). Any behavior-affecting change to code this document governs requires adversarial review and, for anything touching decode or the on-disk format, a regression test against real on-disk and MinIO-migrated samples before merge.
 
 This document describes the algorithm as implemented on `main`. The *invariant* stated is always the rule the code must satisfy; where the code enforces it, the enforcing symbol is cited.
 
@@ -400,7 +400,7 @@ Decode tolerance
 
 ## 13. Change procedure and guardrails
 
-- **Risk tier.** All of the above is High-risk ([AGENTS.md](../../AGENTS.md) "Broad or High-Risk Changes"). Any behavior-affecting change requires adversarial review with the `adversarial-validation` skill.
+- **Risk tier.** All of the above is High-risk ([AGENTS.md](../../AGENTS.md)). Any behavior-affecting change requires adversarial review.
 - **Keep this document in sync.** A change to any governed behavior, formula, format field, or invariant must update this spec in the same PR; renaming a cited symbol must update its reference here. The spec is normative and is the checklist the next change is reviewed against, so drift is a correctness defect. References are symbol-based (not line numbers) specifically so ordinary refactors do not invalidate them — but semantic changes still must.
 - **Adding an on-disk field** must be additive: new msgpack key or a `minor`/`meta_ver` bump with a read path for the old value; keep decoders skipping unknown keys; write both internal-key prefixes; never repurpose or reorder existing keys or header array positions.
 - **Never make a decode boundary stricter** than what §11 allows without (a) proving no legitimate older-RustFS or MinIO-migrated shape is rejected, and (b) a regression test against real on-disk and MinIO fixtures. New validation belongs at the trust boundary and must fail *open to a tolerant default*, not closed to `FileCorrupt`, for anything recoverable. (Concretely: rejecting a negative `actual_size`, or hard-failing a non-16-byte `transitioned-versionID`, breaks existing data — see §11.)
