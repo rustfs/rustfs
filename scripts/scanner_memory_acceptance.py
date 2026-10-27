@@ -648,6 +648,11 @@ class Phase:
                 self.identity = memory["identity_sha256"]
             require(memory["identity_sha256"] == self.identity, "process changed during a phase; start a new phase after restart")
             status = self.api.status(self.enabled)
+            # Close the API window before Phase entry can authorize S3 writes.
+            # Runtime identity also binds the effective storage inventory.
+            memory = self.runtime.sample()
+            require(memory["identity_sha256"] == self.identity,
+                    "process or effective storage changed during status observation")
             self.check()
             row = self.evidence.append("sample", phase=self.label, phase_id=self.phase_id, stage=self.stage, memory=memory, scanner=status)
             self.latest = row

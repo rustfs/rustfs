@@ -403,6 +403,20 @@ sys.exit(1)
             with acceptance.Phase(self.evidence, runtime, api, "probe", True, args) as phase:
                 phase.verify()
 
+    def test_initial_status_restart_is_rejected_before_load_writes(self):
+        identity = SimpleNamespace(value="before-status")
+        runtime = SimpleNamespace(sample=lambda: {
+            "identity_sha256": identity.value, "storage_available_bytes": 1 << 50})
+        def status(_):
+            identity.value = "after-status"
+            return {"enabled": False, "metrics": {}}
+        api = SimpleNamespace(status=status, owned=Mock(), client=Mock(), verify=lambda **_: {})
+        args = SimpleNamespace(seconds=10, interval=300, workers=1, batch=7)
+        with self.assertRaises(acceptance.AcceptanceError):
+            acceptance.run_load(self.evidence, api, runtime, args)
+        api.owned.assert_not_called()
+        api.client.put_object.assert_not_called()
+
     def test_completed_burst_resume_reports_zero_new_requests(self):
         self.evidence.save({"plan_sha256": self.manifest["plan_sha256"], "next_object": 7, "load_complete": True,
                             "burst": {"id": str(uuid.uuid4()), "next": 7, "objects": 7}})
