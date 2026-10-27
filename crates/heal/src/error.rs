@@ -19,6 +19,7 @@ use thiserror::Error;
 use super::heal::{DiskError, EcstoreError};
 
 const HEAL_DANGLING_DELETE_GRACE_MESSAGE: &str = "dangling object deletion deferred by heal grace window";
+pub(crate) const MRF_MISSING_PROOF_PREFIX: &str = "Missing exact storage proof for durable MRF repair ";
 
 /// Custom error type for heal operations
 /// This enum defines various error variants that can occur during
@@ -221,6 +222,7 @@ pub(crate) fn classify_heal_error(error: &Error) -> HealErrorClass {
         Error::Storage(error) => classify_storage_error(error),
         Error::Disk(error) => classify_disk_error(error),
         Error::Io(error) => classify_io_error(error),
+        Error::TaskExecutionFailed { message } if message.starts_with(MRF_MISSING_PROOF_PREFIX) => HealErrorClass::Permanent,
         Error::TaskExecutionFailed { message } | Error::Other(message) => {
             classify_error_display(message).unwrap_or(HealErrorClass::Permanent)
         }
