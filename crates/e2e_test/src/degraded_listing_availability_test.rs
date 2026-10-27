@@ -20,15 +20,14 @@
 //! offline before heal converges, a strict latest-listing quorum of 3 can only
 //! ever observe 2 copies, so ListObjectsV2 silently dropped the object even
 //! though GetObject (read quorum 2) still succeeded. Exposed by the flaky
-//! "Mixed-version rolling upgrade from rc.2" CI lane (run 33478999853); the
-//! product fix relaxes the listing's required object quorum by the number of
-//! set drives the listing could not consult (see
-//! `latest_listing_required_object_quorum` in
-//! `crates/ecstore/src/store/list_objects.rs`).
+//! "Mixed-version rolling upgrade from rc.2" CI lane (run 33478999853). The
+//! listing now follows MinIO's rule: an entry needs `ceil(asked/2)` copies
+//! among the online drives it asked, so three online drives need two copies
+//! (see `SetDisks::list_path` in `crates/ecstore/src/store/list_objects.rs`).
 
 #[cfg(test)]
 mod tests {
-    use crate::common::{RustFSTestClusterEnvironment, init_logging};
+    use crate::common::{ClusterTopology, RustFSTestClusterEnvironment, init_logging};
     use aws_sdk_s3::Client;
     use bytes::Bytes;
     use std::collections::HashSet;
@@ -51,13 +50,13 @@ mod tests {
         format!("degraded-object-{idx:02}")
     }
 
-    async fn list_all_keys(client: &Client) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
+    async fn list_all_keys(client: &Client, bucket: &str) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
         let mut keys = HashSet::new();
         let mut continuation_token: Option<String> = None;
         loop {
             let response = client
                 .list_objects_v2()
-                .bucket(BUCKET)
+                .bucket(bucket)
                 .set_continuation_token(continuation_token.clone())
                 .send()
                 .await?;
@@ -147,7 +146,7 @@ mod tests {
         let expected: HashSet<String> = (0..OBJECT_COUNT).map(object_key).collect();
         let deadline = Instant::now() + LISTING_DEADLINE;
         let listed = loop {
-            let listed = match list_all_keys(&client).await {
+            let listed = match list_all_keys(&client, BUCKET).await {
                 Ok(keys) => keys,
                 Err(error) if Instant::now() < deadline => {
                     info!("retrying degraded listing: {error}");
@@ -168,6 +167,99 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(500)).await;
         };
         info!(listed = listed.len(), "degraded objects are listable while node 3 is offline");
+
+        Ok(())
+    }
+
+    /// 4-node x 4-drive cluster (one 16-drive set), #8828 shape:
+    /// 1. PUT objects while the storage class is EC:8, so each is 8+8.
+    /// 2. Restart with the EC:4 default, as after a storage-class change.
+    /// 3. Stop two nodes (8 drives). Each object keeps eight data shards, so
+    ///    GET succeeds and ListObjectsV2 must list every key: the listing
+    ///    quorum is half of the eight drives it can ask.
+    /// 4. Stop a third node. Four online drives are below the set's read
+    ///    quorum, so LIST must report 503 instead of a partial page.
+    #[tokio::test]
+    async fn ec8_objects_stay_listable_with_half_of_an_ec4_set_offline() -> TestResult {
+        const EC8_BUCKET: &str = "degraded-listing-ec8";
+        init_logging();
+
+        let mut cluster = RustFSTestClusterEnvironment::with_topology(ClusterTopology::single_pool_multidrive(4, 4)).await?;
+        cluster.set_env("RUSTFS_HEAL_ENABLED", "false");
+        cluster.set_env("RUSTFS_SCANNER_ENABLED", "false");
+        cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", "EC:8");
+        cluster.start().await?;
+        cluster.create_test_bucket(EC8_BUCKET).await?;
+        let client = cluster.create_s3_client(0)?;
+        for idx in 0..OBJECT_COUNT {
+            let key = object_key(idx);
+            client
+                .put_object()
+                .bucket(EC8_BUCKET)
+                .key(&key)
+                .body(Bytes::from(format!("ec8 listing payload {idx}")).into())
+                .send()
+                .await
+                .map_err(|error| format!("EC:8 PUT for {key} failed: {error}"))?;
+        }
+
+        info!("restarting with the EC:4 default storage class");
+        cluster.stop();
+        // A later entry for the same variable wins when the node process starts.
+        cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", "EC:4");
+        cluster.start().await?;
+        let client = cluster.create_s3_client(0)?;
+
+        info!("stopping nodes 2 and 3 (eight of sixteen drives)");
+        cluster.stop_node(2)?;
+        cluster.stop_node(3)?;
+        for idx in 0..OBJECT_COUNT {
+            let key = object_key(idx);
+            let deadline = Instant::now() + GET_RETRY_DEADLINE;
+            loop {
+                match client.get_object().bucket(EC8_BUCKET).key(&key).send().await {
+                    Ok(response) => {
+                        let body = response.body.collect().await?.into_bytes();
+                        assert_eq!(body.as_ref(), format!("ec8 listing payload {idx}").as_bytes());
+                        break;
+                    }
+                    Err(error) if Instant::now() < deadline => {
+                        info!("retrying EC:8 GET for {key}: {error}");
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    Err(error) => return Err(format!("EC:8 object {key} failed GET with eight drives: {error}").into()),
+                }
+            }
+        }
+
+        let expected: HashSet<String> = (0..OBJECT_COUNT).map(object_key).collect();
+        let deadline = Instant::now() + LISTING_DEADLINE;
+        loop {
+            match list_all_keys(&client, EC8_BUCKET).await {
+                Ok(listed) if listed == expected => break,
+                Ok(listed) => assert!(
+                    Instant::now() < deadline,
+                    "EC:8 objects readable with eight drives stayed missing from ListObjectsV2: listed={listed:?}"
+                ),
+                Err(error) => assert!(
+                    Instant::now() < deadline,
+                    "ListObjectsV2 kept failing with eight of sixteen drives online: {error}"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        info!("stopping node 1 (four of sixteen drives remain)");
+        cluster.stop_node(1)?;
+        let deadline = Instant::now() + LISTING_DEADLINE;
+        loop {
+            match client.list_objects_v2().bucket(EC8_BUCKET).send().await {
+                Err(error) if error.raw_response().is_some_and(|response| response.status().as_u16() == 503) => break,
+                Err(error) => assert!(Instant::now() < deadline, "below the set read quorum LIST must report 503, got {error}"),
+                Ok(response) => panic!("below the set read quorum LIST must fail, but listed {} keys", response.contents().len()),
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
 
         Ok(())
     }
