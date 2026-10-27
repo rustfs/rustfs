@@ -30,10 +30,6 @@ fn prepare_scanner(scanner: &mut FolderScanner, cache: DataUsageCache) {
         info: cache.info.clone(),
         ..Default::default()
     };
-    scanner.update_cache = DataUsageCache {
-        info: cache.info.clone(),
-        ..Default::default()
-    };
     scanner.old_cache = cache;
     scanner.is_erasure_mode = true;
     scanner.skip_heal.store(true, Ordering::SeqCst);

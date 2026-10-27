@@ -520,7 +520,6 @@ SCHEDULED_ALERT_CHECKOUT_OVERRIDES = {
     ".github/workflows/ci.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
     ".github/workflows/fuzz.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
     ".github/workflows/nightly-gnu.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
-    ".github/workflows/performance-ab.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
     ".github/workflows/runner-hygiene.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
     ".github/workflows/scheduled-validation-watchdog.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
     ".github/workflows/scheduled-validation-freshness.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
@@ -5953,7 +5952,6 @@ class SelfTests(unittest.TestCase):
             ".github/workflows/ci.yml",
             ".github/workflows/fuzz.yml",
             ".github/workflows/nightly-gnu.yml",
-            ".github/workflows/performance-ab.yml",
             ".github/workflows/runner-hygiene.yml",
         )
         with tempfile.TemporaryDirectory() as tmp:

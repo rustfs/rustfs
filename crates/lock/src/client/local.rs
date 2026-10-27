@@ -26,6 +26,9 @@ use crate::{
 
 /// Default shard count for guard storage (must be power of 2)
 const DEFAULT_GUARD_SHARD_COUNT: usize = 64;
+const EVENT_NAMESPACE_LOCK_RELEASE: &str = "namespace_lock_release";
+const LOG_COMPONENT_LOCK: &str = "lock";
+const LOG_SUBSYSTEM_NAMESPACE: &str = "namespace";
 
 type GuardShard = Arc<RwLock<HashMap<LockId, LocalGuardEntry>>>;
 type GuardStorage = Arc<Vec<GuardShard>>;
@@ -333,7 +336,22 @@ impl LockClient for LocalClient {
         };
         if let Some(guard) = guard {
             // Guard automatically releases the lock when dropped
+            let physical_guard_id = (!guard.guard.is_disabled()).then(|| guard.guard.guard_id());
             drop(guard.guard);
+            if let Some(physical_guard_id) = physical_guard_id {
+                tracing::trace!(
+                    target: "rustfs_lock::namespace_owner",
+                    event = EVENT_NAMESPACE_LOCK_RELEASE,
+                    component = LOG_COMPONENT_LOCK,
+                    subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                    state = "mapped",
+                    peer_kind = "local",
+                    lock_id = %lock_id,
+                    process_id = std::process::id(),
+                    physical_guard_id,
+                    "Namespace peer lock mapped to physical guard"
+                );
+            }
             Ok(true)
         } else {
             // Lock not found or already released
