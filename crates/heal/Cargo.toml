@@ -32,6 +32,7 @@ workspace = true
 [features]
 default = []
 test-util = []
+e2e-test-hooks = []
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",
