@@ -812,7 +812,15 @@ mod tests {
     fn scanner_status_serializes_cycle_schedule_contract() {
         let response = scanner_status_response(
             true,
-            ScannerMetricsReport::default(),
+            ScannerMetricsReport {
+                startup: rustfs_scanner_metrics::startup::ScannerStartupStatus {
+                    runtime_active: true,
+                    phase: rustfs_scanner_metrics::startup::ScannerStartupPhase::Waiting,
+                    planned_attempt_at_unix_secs: Some(123),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             rustfs_scanner::scanner_runtime_config_status(),
             rustfs_scanner::ScannerCycleScheduleStatus::default(),
             ScannerDataMovementPauseStatus::default(),
@@ -823,6 +831,10 @@ mod tests {
         );
 
         let encoded = serde_json::to_value(response).expect("scanner status should serialize");
+        assert_eq!(encoded["metrics"]["startup"]["phase"], "waiting");
+        assert_eq!(encoded["metrics"]["startup"]["runtime_active"], true);
+        assert_eq!(encoded["metrics"]["startup"]["planned_attempt_at_unix_secs"], 123);
+        assert!(encoded["metrics"]["startup"]["first_attempt_at_unix_secs"].is_null());
         assert_eq!(encoded["cycle_schedule"]["execution_role"], "unknown");
         assert_eq!(encoded["cycle_schedule"]["effective_interval_available"], false);
         assert_eq!(encoded["cycle_schedule"]["effective_interval_seconds"], 0);

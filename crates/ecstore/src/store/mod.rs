@@ -1409,7 +1409,7 @@ impl ECStore {
             Err(err) => Err(err),
         };
         if result.is_ok() {
-            list_objects::observe_list_objects_mutation(self, bucket).await;
+            list_objects::observe_scanner_namespace_mutations(bucket, 1);
         }
         result
     }
@@ -1449,6 +1449,15 @@ impl BucketOperations for ECStore {
     }
 }
 
+// Keep the large inherent COPY future out of the trait wrapper's polling frame.
+#[inline(never)]
+fn box_copy_object_handler<F>(make_future: impl FnOnce() -> F) -> std::pin::Pin<Box<F>>
+where
+    F: std::future::Future,
+{
+    Box::pin(make_future())
+}
+
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
     type Error = Error;
@@ -1483,14 +1492,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
     ) -> Result<ObjectInfo> {
         let result = enqueue_transition_after_write(
             self,
-            self.handle_copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
-                .await,
+            box_copy_object_handler(move || {
+                self.handle_copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+            })
+            .await,
             LcEventSrc::S3CopyObject,
             dst_opts,
         )
         .await;
         if result.is_ok() {
-            list_objects::observe_list_objects_mutation(self, dst_bucket).await;
+            list_objects::observe_scanner_namespace_mutations(dst_bucket, 1);
         }
         result
     }
@@ -1499,7 +1510,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
         let result = self.handle_delete_object_version(bucket, object, fi, force_del_marker).await;
         if result.is_ok() {
-            list_objects::observe_list_objects_mutation(self, bucket).await;
+            list_objects::observe_scanner_namespace_mutations(bucket, 1);
         }
         result
     }
@@ -1508,7 +1519,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         let result = self.handle_delete_object(bucket, object, opts).await;
         if result.is_ok() {
-            list_objects::observe_list_objects_mutation(self, bucket).await;
+            list_objects::observe_scanner_namespace_mutations(bucket, 1);
         }
         result
     }
@@ -1523,7 +1534,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
         let result = self.handle_delete_objects(bucket, objects, opts).await;
         let success_count = result.1.iter().filter(|err| err.is_none()).count();
         if success_count > 0 {
-            list_objects::observe_list_objects_mutations(self, bucket, success_count).await;
+            list_objects::observe_scanner_namespace_mutations(bucket, u64::try_from(success_count).unwrap_or(u64::MAX));
         }
         result
     }
@@ -1762,7 +1773,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for ECStore {
         )
         .await;
         if result.is_ok() {
-            list_objects::observe_list_objects_mutation(self.as_ref(), bucket).await;
+            list_objects::observe_scanner_namespace_mutations(bucket, 1);
         }
         result
     }

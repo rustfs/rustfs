@@ -764,6 +764,17 @@ pub(crate) fn is_valid_distribution(distribution: &[usize], n: usize) -> bool {
 }
 
 impl FileInfo {
+    pub fn distribution_start(bucket: &str, object: &str, cardinality: usize) -> usize {
+        if cardinality == 0 {
+            return 0;
+        }
+        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+        hasher.update(bucket.as_bytes());
+        hasher.update(b"/");
+        hasher.update(object.as_bytes());
+        (hasher.finalize() as u32 as usize) % cardinality
+    }
+
     pub fn new(object: &str, data_blocks: usize, parity_blocks: usize) -> Self {
         let indices = {
             let cardinality = data_blocks + parity_blocks;

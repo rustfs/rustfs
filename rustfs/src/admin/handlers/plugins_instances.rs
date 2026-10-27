@@ -15,21 +15,25 @@
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::{
     auth::authorize_admin_envelope,
-    handlers::audit_runtime_config::{load_server_config_from_store, remove_audit_target_config, set_audit_target_config},
+    handlers::audit_runtime_config::{remove_audit_target_config, set_audit_target_config},
     handlers::notify_runtime_access::{
-        load_notification_config_snapshot, remove_notification_target_config, set_notification_target_config,
+        load_notification_mutation_snapshot, remove_notification_target_config, set_notification_target_config,
     },
     handlers::target_descriptor::{
         AdminTargetSpec, RuntimeHealthStatus, TargetEndpointSource, TargetInstanceReadModel, admin_target_spec_from_builtin,
-        build_enabled_target_kvs, collect_runtime_statuses, collect_target_instances, find_target_instance,
-        owned_build_json_response, target_module_disabled_reason,
-        target_mutation_block_reason as shared_target_mutation_block_reason,
+        build_enabled_target_kvs, collect_target_instances, find_target_instance, owned_build_json_response,
+        target_module_disabled_reason, target_mutation_block_reason as shared_target_mutation_block_reason,
+    },
+    handlers::target_read::{
+        collect_audit_runtime_statuses, collect_notification_runtime_statuses, load_server_config_from_store,
+        load_target_read_snapshot,
     },
     plugin_contract::{
         PluginContractDomain, PluginInstanceDetail, PluginInstanceDiagnostic, PluginInstanceDiagnosticCode,
         PluginInstanceDiagnosticCount, PluginInstanceEntry, PluginInstanceSource, PluginInstancesResponse,
     },
     router::{AdminOperation, S3Router},
+    storage_api::s3::{self, S3ErrorCode},
 };
 use crate::server::{
     ADMIN_PREFIX, is_audit_module_enabled, is_notify_module_enabled, refresh_audit_module_enabled, refresh_notify_module_enabled,
@@ -37,7 +41,6 @@ use crate::server::{
 };
 use hyper::{Method, StatusCode, Uri};
 use matchit::Params;
-use rustfs_audit::audit_system;
 use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::server_config::{Config, KVS};
@@ -599,13 +602,15 @@ fn plugin_instance_mutation_block_reason(
 /// Reloads persisted module switches from the config store. Call once per
 /// admin request before evaluating [`module_disabled_block_reason`] so that
 /// list/detail paths do not hit the store once per domain or per instance.
-async fn refresh_persisted_module_switches() {
+async fn refresh_persisted_module_switches() -> S3Result<()> {
     if let Err(err) = refresh_persisted_module_switches_from_store().await {
         warn!(
             error = %err,
             "failed to reload persisted module switches before checking plugin instance operation gating"
         );
+        return Err(s3::error(S3ErrorCode::InternalError, "failed to refresh target module state"));
     }
+    Ok(())
 }
 
 fn module_disabled_block_reason(domain: PluginContractDomain, action: &str) -> Option<String> {
@@ -621,53 +626,53 @@ fn module_disabled_block_reason(domain: PluginContractDomain, action: &str) -> O
     }
 }
 
-async fn plugin_instance_operation_block_reason(context: PluginInstanceDomainContext, action: &str) -> Option<String> {
-    refresh_persisted_module_switches().await;
-    module_disabled_block_reason(context.domain, action)
+async fn plugin_instance_operation_block_reason(context: PluginInstanceDomainContext, action: &str) -> S3Result<Option<String>> {
+    refresh_persisted_module_switches().await?;
+    Ok(module_disabled_block_reason(context.domain, action))
 }
 
 async fn plugin_instance_runtime_statuses(
     context: PluginInstanceDomainContext,
-) -> S3Result<HashMap<(String, String), RuntimeHealthStatus>> {
+) -> HashMap<(String, String), RuntimeHealthStatus> {
     match context.domain {
-        PluginContractDomain::Notify => {
-            let (ns, _) = load_notification_config_snapshot().await?;
-            Ok(collect_runtime_statuses(ns.get_target_values().await).await)
-        }
-        PluginContractDomain::Audit => {
-            let mut runtime_statuses = HashMap::new();
-            if let Some(system) = audit_system() {
-                runtime_statuses = collect_runtime_statuses(system.get_target_values().await).await;
-            }
-            Ok(runtime_statuses)
-        }
+        PluginContractDomain::Notify => collect_notification_runtime_statuses().await,
+        PluginContractDomain::Audit => collect_audit_runtime_statuses().await,
     }
 }
 
-async fn plugin_instance_config_snapshot(context: PluginInstanceDomainContext) -> S3Result<Config> {
+async fn plugin_instance_mutation_config_snapshot(context: PluginInstanceDomainContext) -> S3Result<Config> {
     match context.domain {
-        PluginContractDomain::Notify => load_notification_config_snapshot().await.map(|(_, config)| config),
+        PluginContractDomain::Notify => load_notification_mutation_snapshot().await.map(|(_, config)| config),
         PluginContractDomain::Audit => load_server_config_from_store().await,
     }
 }
 
-async fn collect_domain_instances(context: PluginInstanceDomainContext) -> S3Result<Vec<PluginInstanceEntry>> {
-    let runtime_statuses = plugin_instance_runtime_statuses(context).await?;
-    let config = plugin_instance_config_snapshot(context).await?;
+fn collect_domain_instances(
+    context: PluginInstanceDomainContext,
+    config: &Config,
+    runtime_statuses: HashMap<(String, String), RuntimeHealthStatus>,
+) -> S3Result<Vec<PluginInstanceEntry>> {
     let module_disabled_reason = module_disabled_block_reason(context.domain, "listing plugin instances");
     let mut entries = Vec::new();
-    for instance in collect_target_instances(context.specs, context.route_prefix, &config, runtime_statuses)? {
+    for instance in collect_target_instances(context.specs, context.route_prefix, config, runtime_statuses)? {
         entries.push(plugin_instance_list_entry(instance, module_disabled_reason.clone()));
     }
     Ok(entries)
 }
 
 pub(super) async fn collect_all_instances() -> S3Result<Vec<PluginInstanceEntry>> {
-    refresh_persisted_module_switches().await;
-    let (mut notify_instances, audit_instances) = tokio::try_join!(
-        collect_domain_instances(plugin_instance_domain_context(PluginContractDomain::Notify)),
-        collect_domain_instances(plugin_instance_domain_context(PluginContractDomain::Audit))
-    )?;
+    refresh_persisted_module_switches().await?;
+    let notify_context = plugin_instance_domain_context(PluginContractDomain::Notify);
+    let audit_context = plugin_instance_domain_context(PluginContractDomain::Audit);
+    let (config, (notify_statuses, audit_statuses)) = load_target_read_snapshot(async {
+        tokio::join!(
+            plugin_instance_runtime_statuses(notify_context),
+            plugin_instance_runtime_statuses(audit_context)
+        )
+    })
+    .await?;
+    let mut notify_instances = collect_domain_instances(notify_context, &config, notify_statuses)?;
+    let audit_instances = collect_domain_instances(audit_context, &config, audit_statuses)?;
     notify_instances.extend(audit_instances);
     notify_instances.sort_by(|a, b| a.service.cmp(&b.service).then_with(|| a.account_id.cmp(&b.account_id)));
     Ok(notify_instances)
@@ -675,8 +680,7 @@ pub(super) async fn collect_all_instances() -> S3Result<Vec<PluginInstanceEntry>
 
 async fn find_plugin_instance(instance_id: &str) -> S3Result<Option<TargetInstanceReadModel>> {
     let context = plugin_instance_domain_context(parse_plugin_instance_id(instance_id)?.1);
-    let runtime_statuses = plugin_instance_runtime_statuses(context).await?;
-    let config = plugin_instance_config_snapshot(context).await?;
+    let (config, runtime_statuses) = load_target_read_snapshot(plugin_instance_runtime_statuses(context)).await?;
     find_target_instance(context.specs, context.route_prefix, &config, runtime_statuses, instance_id)
 }
 
@@ -744,7 +748,7 @@ impl Operation for GetPluginInstanceHandler {
             .get("id")
             .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'id'"))?;
 
-        refresh_persisted_module_switches().await;
+        refresh_persisted_module_switches().await?;
         let instance = find_plugin_instance(instance_id)
             .await?
             .ok_or_else(|| s3_error!(NoSuchKey, "plugin instance not found"))?;
@@ -771,7 +775,8 @@ impl Operation for PutPluginInstanceHandler {
         let resolved = resolve_plugin_instance_target(instance_id)?;
         let context = resolved.context;
 
-        if let Some(reason) = plugin_instance_operation_block_reason(context, "managing plugin instances from the console").await
+        if let Some(reason) =
+            plugin_instance_operation_block_reason(context, "managing plugin instances from the console").await?
         {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
@@ -784,7 +789,7 @@ impl Operation for PutPluginInstanceHandler {
         let mut body: PluginInstanceBody = serde_json::from_slice(&body_bytes)
             .map_err(|e| s3_error!(InvalidArgument, "invalid json body for plugin instance config: {}", e))?;
 
-        let config_snapshot = plugin_instance_config_snapshot(context).await?;
+        let config_snapshot = plugin_instance_mutation_config_snapshot(context).await?;
         if let Some(reason) = plugin_instance_mutation_block_reason(
             context,
             &config_snapshot,
@@ -835,12 +840,13 @@ impl Operation for DeletePluginInstanceHandler {
         let resolved = resolve_plugin_instance_target(instance_id)?;
         let context = resolved.context;
 
-        if let Some(reason) = plugin_instance_operation_block_reason(context, "managing plugin instances from the console").await
+        if let Some(reason) =
+            plugin_instance_operation_block_reason(context, "managing plugin instances from the console").await?
         {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
-        let config_snapshot = plugin_instance_config_snapshot(context).await?;
+        let config_snapshot = plugin_instance_mutation_config_snapshot(context).await?;
         if let Some(reason) = plugin_instance_mutation_block_reason(
             context,
             &config_snapshot,

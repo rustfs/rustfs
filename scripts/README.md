@@ -192,7 +192,6 @@ referenced only by other scripts in this same archived set. Reasons:
 | `prepare_gt1g_get_test_objects.sh` | >1 GiB GET investigation one-shot fixture prep |
 | `run_gt1g_multipart_put_server_path_focus.sh` | >1 GiB PUT investigation one-shot focus run |
 | `run_get_metrics_gate_smoke.sh` | One-shot GET metrics-gate smoke |
-| `run_listobjects_verified_bench.sh` | One-shot verified list-objects bench |
 | `run_object_batch_bench_abc.sh` | One-shot capacity/object profile A/B/C controller |
 | `run_object_data_cache_bench.sh` | One-shot GET bench for the object-data-cache rollout gate |
 | `setup-test-binaries.sh` | One-shot Docker-build test binary fixture |

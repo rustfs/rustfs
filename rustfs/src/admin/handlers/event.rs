@@ -15,7 +15,7 @@
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::{
     auth::authorize_admin_envelope,
-    handlers::notify_runtime_access::{get_notification_system, load_notification_config_snapshot},
+    handlers::notify_runtime_access::{get_notification_system, load_notification_mutation_snapshot},
     handlers::supervise_admin_mutation,
     handlers::target_descriptor::{
         AdminTargetSpec, EndpointKey, RuntimeHealthStatus, TargetEndpointSource, admin_target_spec_from_builtin,
@@ -23,6 +23,7 @@ use crate::admin::{
         merge_target_endpoints as shared_merge_target_endpoints, owned_build_json_response, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason,
     },
+    handlers::target_read::{collect_notification_runtime_statuses, load_target_read_snapshot},
     router::{AdminOperation, S3Router},
     runtime_sources::object_store_from_envelope,
     runtime_sources::{AppContext, app_context_from_envelope},
@@ -470,7 +471,7 @@ impl Operation for NotificationTarget {
             log_notification_target_operation_blocked!("set_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
-        let (ns, config_snapshot) = load_notification_config_snapshot().await?;
+        let (ns, config_snapshot) = load_notification_mutation_snapshot().await?;
         if let Some(reason) = target_mutation_block_reason(&config_snapshot, target_type, target_name)? {
             log_notification_target_operation_blocked!("set_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
@@ -547,8 +548,7 @@ impl Operation for ListNotificationTargets {
             s3_error!(InternalError, "failed to refresh notification module state")
         })?;
         let notify_enabled = refresh_notify_module_enabled();
-        let (ns, config) = load_notification_config_snapshot().await?;
-        let runtime_statuses = collect_runtime_statuses(ns.get_target_values().await).await;
+        let (config, runtime_statuses) = load_target_read_snapshot(collect_notification_runtime_statuses()).await?;
         let notification_endpoints = merge_notification_endpoints(&config, runtime_statuses)?;
 
         let data = serde_json::to_vec(&NotificationEndpointsResponse {
@@ -628,7 +628,7 @@ impl Operation for RemoveNotificationTarget {
             log_notification_target_operation_blocked!("remove_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
-        let (ns, config_snapshot) = load_notification_config_snapshot().await?;
+        let (ns, config_snapshot) = load_notification_mutation_snapshot().await?;
         if let Some(reason) = target_mutation_block_reason(&config_snapshot, target_type, target_name)? {
             log_notification_target_operation_blocked!("remove_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
@@ -696,6 +696,253 @@ mod tests {
             state: if online { "online" } else { "offline" }.to_string(),
             reason: if online { "reachable" } else { "unreachable" }.to_string(),
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn target_list_reads_durable_config_without_runtime_reconciliation() {
+        use crate::admin::handlers::{
+            audit::ListAuditTargets,
+            extensions::ListExtensionInstancesHandler,
+            plugins_instances::{GetPluginInstanceHandler, ListPluginInstancesHandler},
+            target_read::load_target_read_snapshot,
+        };
+        use crate::admin::storage_api::config::{
+            read_admin_config, save_admin_config, save_admin_server_config, with_admin_server_config_write_lock,
+        };
+        use crate::server::{mark_event_notifier_unreconciled, with_notify_runtime_reconcile_lock};
+        use http_body_util::BodyExt as _;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        async fn response_json(
+            call: impl std::future::Future<Output = S3Result<crate::admin::operation::AdminResponse>>,
+        ) -> S3Result<Value> {
+            let response = tokio::time::timeout(Duration::from_secs(10), call)
+                .await
+                .expect("destination inventory must not wait for runtime reconciliation")?;
+            let (status, _headers, body) = response.into_parts();
+            assert_eq!(status, StatusCode::OK);
+            let body = body.collect().await.expect("collect inventory response").to_bytes();
+            Ok(serde_json::from_slice(&body).expect("decode inventory response"))
+        }
+
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("notification-list-root".to_string()),
+            Some("notification-list-secret".to_string()),
+        );
+        let temp_dir = tempfile::tempdir().expect("create notification list test directory");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp_dir.path())
+            .disk_count(1)
+            .init_bucket_metadata(false)
+            .build()
+            .await;
+        crate::runtime_sources::install_test_app_context(Arc::clone(&env.ecstore)).await;
+
+        let credentials = crate::runtime_sources::current_action_credentials().expect("test root credentials");
+        let request = |uri: &str| {
+            crate::admin::operation::test_support::TestRequest::new(Method::GET, uri)
+                .credentials(&credentials.access_key, &credentials.secret_key, None)
+                .build()
+        };
+        let unsigned_request = |uri: &str| crate::admin::operation::test_support::TestRequest::new(Method::GET, uri).build();
+
+        temp_env::async_with_vars([(rustfs_config::ENV_NOTIFY_ENABLE, Some("true"))], async {
+            let mut config = Config::new();
+            let mut kvs = enabled_kvs("on");
+            kvs.insert(rustfs_config::WEBHOOK_ENDPOINT.to_string(), "http://127.0.0.1:9/hook".to_string());
+            kvs.insert(rustfs_config::WEBHOOK_AUTH_TOKEN.to_string(), "inventory-secret-token".to_string());
+            config
+                .0
+                .entry(rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS.to_string())
+                .or_default()
+                .insert("audit-unavailable".to_string(), kvs.clone());
+            config
+                .0
+                .entry(NOTIFY_WEBHOOK_SUB_SYS.to_string())
+                .or_default()
+                .insert("unavailable".to_string(), kvs);
+            save_admin_server_config(env.ecstore.clone(), &config)
+                .await
+                .expect("persist target without loading it into the runtime");
+
+            let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let store = env.ecstore.clone();
+            let writer = tokio::spawn(async move {
+                with_admin_server_config_write_lock(store, move |_guard| async move {
+                    locked_tx.send(()).expect("signal config write lock acquisition");
+                    release_rx.await.expect("release config writer");
+                })
+                .await
+                .expect("hold config write lock");
+            });
+            locked_rx.await.expect("config write lock should be held");
+            let (observing_tx, observing_rx) = tokio::sync::oneshot::channel();
+            let snapshot = tokio::spawn(load_target_read_snapshot(async move {
+                observing_tx.send(()).expect("signal runtime observation");
+            }));
+            tokio::time::timeout(Duration::from_secs(10), observing_rx)
+                .await
+                .expect("runtime observation must start while the durable read is blocked")
+                .expect("runtime observer should start");
+            assert!(!snapshot.is_finished(), "the snapshot must still await its blocked durable read");
+            release_tx.send(()).expect("release config write lock");
+            writer.await.expect("config writer task");
+            let (observed_config, ()) = snapshot.await.expect("snapshot task").expect("read durable snapshot");
+            assert!(observed_config.0[NOTIFY_WEBHOOK_SUB_SYS].contains_key("unavailable"));
+            mark_event_notifier_unreconciled();
+
+            with_notify_runtime_reconcile_lock(async {
+                for initialize_runtime in [false, true] {
+                    if initialize_runtime {
+                        rustfs_notify::ensure_live_events();
+                    }
+                    let value =
+                        response_json(ListNotificationTargets {}.call(request("/rustfs/admin/v3/target/list"), Params::new()))
+                            .await
+                            .expect("read configured destinations while the runtime is unavailable");
+                    assert_eq!(value["notify_enabled"], true);
+                    let endpoints = value["notification_endpoints"].as_array().expect("destination inventory");
+                    let endpoint = endpoints
+                        .iter()
+                        .find(|endpoint| endpoint["account_id"] == "unavailable" && endpoint["service"] == "webhook")
+                        .expect("persisted destination remains visible");
+                    assert_eq!(endpoint["status"], "offline");
+                    assert_eq!(endpoint["health_state"], "offline");
+                    assert_eq!(endpoint["health_reason"], "not_loaded_in_runtime");
+                    assert_eq!(endpoint["source"], "config");
+
+                    let audit =
+                        response_json(ListAuditTargets {}.call(request("/rustfs/admin/v3/audit/target/list"), Params::new()))
+                            .await
+                            .expect("read audit destinations without runtime initialization");
+                    assert!(
+                        audit["audit_endpoints"]
+                            .as_array()
+                            .expect("audit inventory")
+                            .iter()
+                            .any(|entry| {
+                                entry["account_id"] == "audit-unavailable" && entry["health_reason"] == "not_loaded_in_runtime"
+                            })
+                    );
+
+                    for value in [
+                        response_json(
+                            ListPluginInstancesHandler {}.call(request("/rustfs/admin/v4/plugins/instances"), Params::new()),
+                        )
+                        .await
+                        .expect("read plugin inventory without runtime reconciliation"),
+                        response_json(
+                            ListExtensionInstancesHandler {}
+                                .call(request("/rustfs/admin/v4/extensions/instances"), Params::new()),
+                        )
+                        .await
+                        .expect("read extension inventory without runtime reconciliation"),
+                    ] {
+                        let instances = value["instances"].as_array().expect("instance inventory");
+                        for (domain, account_id) in [("notify", "unavailable"), ("audit", "audit-unavailable")] {
+                            let entry = instances
+                                .iter()
+                                .find(|entry| entry["domain"] == domain && entry["account_id"] == account_id)
+                                .expect("both target domains remain visible");
+                            assert_eq!(entry["status"], "offline");
+                            assert_eq!(entry["config"][rustfs_config::WEBHOOK_AUTH_TOKEN], "***redacted***");
+                        }
+                        assert!(!value.to_string().contains("inventory-secret-token"));
+                    }
+
+                    let mut router = Router::new();
+                    router.insert("/{id}", ()).expect("plugin detail route");
+                    let matched = router
+                        .at("/builtin:webhook:notify:unavailable")
+                        .expect("plugin detail params");
+                    let detail = response_json(GetPluginInstanceHandler {}.call(
+                        request("/rustfs/admin/v4/plugins/instances/builtin:webhook:notify:unavailable"),
+                        matched.params,
+                    ))
+                    .await
+                    .expect("read plugin details without runtime reconciliation");
+                    assert_eq!(detail["config"][rustfs_config::WEBHOOK_AUTH_TOKEN], "***redacted***");
+                    assert!(!detail.to_string().contains("inventory-secret-token"));
+                    assert!(!crate::server::is_event_notifier_reconciled());
+                    if let Some(system) = rustfs_notify::notification_system() {
+                        assert_eq!(system.runtime_lifecycle_state(), rustfs_notify::NotificationRuntimeState::LiveOnly);
+                    }
+                }
+
+                let target = config.0[NOTIFY_WEBHOOK_SUB_SYS]["unavailable"].clone();
+                let targets = config.0.get_mut(NOTIFY_WEBHOOK_SUB_SYS).expect("notification target config");
+                targets.remove("unavailable");
+                targets.insert("latest".to_string(), target);
+                save_admin_server_config(env.ecstore.clone(), &config)
+                    .await
+                    .expect("persist a newer target configuration while runtime stays unreconciled");
+                let latest = response_json(
+                    ListPluginInstancesHandler {}.call(request("/rustfs/admin/v4/plugins/instances"), Params::new()),
+                )
+                .await
+                .expect("inventory must read the latest durable config");
+                let instances = latest["instances"].as_array().expect("latest inventory");
+                assert!(instances.iter().any(|entry| entry["account_id"] == "latest"));
+                assert!(!instances.iter().any(|entry| entry["account_id"] == "unavailable"));
+
+                let valid_config = read_admin_config(env.ecstore.clone(), "config/config.json")
+                    .await
+                    .expect("read valid config bytes for restoration");
+                save_admin_config(env.ecstore.clone(), "config/config.json", b"invalid-server-config".to_vec())
+                    .await
+                    .expect("inject corrupt persisted configuration");
+                let error = ListNotificationTargets {}
+                    .call(request("/rustfs/admin/v3/target/list"), Params::new())
+                    .await
+                    .expect_err("unreadable persisted config must not become an empty inventory");
+                assert_eq!(error.code(), &S3ErrorCode::InternalError);
+
+                let error = response_json(
+                    ListPluginInstancesHandler {}.call(request("/rustfs/admin/v4/plugins/instances"), Params::new()),
+                )
+                .await
+                .expect_err("plugin inventory must not hide corrupt durable config");
+                assert_eq!(error.code(), &S3ErrorCode::InternalError);
+                let error =
+                    tokio::time::timeout(Duration::from_secs(10), load_target_read_snapshot(std::future::pending::<()>()))
+                        .await
+                        .expect("a config read failure must cancel stalled runtime observations")
+                        .expect_err("config read failure must remain visible");
+                assert_eq!(error.code(), &S3ErrorCode::InternalError);
+
+                let unsigned = unsigned_request("/rustfs/admin/v3/target/list");
+                let error = ListNotificationTargets {}
+                    .call(unsigned, Params::new())
+                    .await
+                    .expect_err("authorization must precede persisted configuration access");
+                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+                assert_eq!(error.message(), Some("credentials not found"));
+
+                save_admin_config(env.ecstore.clone(), "config/config.json", valid_config)
+                    .await
+                    .expect("restore valid target configuration");
+                save_admin_config(env.ecstore.clone(), "config/module_switches.json", b"invalid-module-switches".to_vec())
+                    .await
+                    .expect("inject corrupt persisted module switches");
+                let error = response_json(
+                    ListPluginInstancesHandler {}.call(request("/rustfs/admin/v4/plugins/instances"), Params::new()),
+                )
+                .await
+                .expect_err("plugin diagnostics must not silently reuse stale module switches");
+                assert_eq!(error.code(), &S3ErrorCode::InternalError);
+                let unsigned = unsigned_request("/rustfs/admin/v4/plugins/instances");
+                let error = response_json(ListPluginInstancesHandler {}.call(unsigned, Params::new()))
+                    .await
+                    .expect_err("plugin authorization must precede module and config access");
+                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+                assert_eq!(error.message(), Some("authentication required"));
+            })
+            .await;
+        })
+        .await;
     }
 
     fn subscription_router() -> Router<()> {
@@ -1332,7 +1579,7 @@ mod tests {
             .find("let notify_enabled = refresh_notify_module_enabled();")
             .expect("target list should resolve the effective env and persisted module state");
         let load_index = list_block
-            .find("load_notification_config_snapshot().await?")
+            .find("load_target_read_snapshot(collect_notification_runtime_statuses()).await?")
             .expect("target list should load notification config");
         assert!(
             authorize_index < refresh_index && refresh_index < effective_state_index && effective_state_index < load_index,

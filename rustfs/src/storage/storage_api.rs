@@ -330,8 +330,8 @@ pub(crate) mod s3_api_consumer {
     pub(crate) mod bucket {
         pub(crate) use super::super::super::s3_api::bucket::{
             ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-            build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params,
-            parse_list_objects_v2_params,
+            build_list_objects_output, build_list_objects_v2_output, encode_list_objects_v2_continuation_token,
+            parse_list_object_versions_params, parse_list_objects_v2_params,
         };
 
         pub(crate) mod contract {
@@ -495,12 +495,17 @@ pub(crate) mod ecstore_disk {
         DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest,
         DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo,
         DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload,
-        GuardedFileInfoVersions, OldCurrentSize, PartTransactionAction, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
-        ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo,
-        WalkDirOptions, get_object_disk_read_timeout, is_quota_mutation_fence_path, validate_batch_read_version_item_count,
+        GuardedFileInfoVersions, MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartSourceOperation, MultipartSourceRequest,
+        MultipartSourceResponse, OldCurrentSize, POOL_META_NATIVE_CAS_METADATA_SUFFIX, PartTransactionAction,
+        PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
+        RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
+        SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout,
+        is_quota_mutation_fence_path, require_source_condition, validate_batch_read_version_item_count,
     };
     #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::disk::{CurrentDeleteGeneration, DiskOption, new_disk};
+    pub(crate) use rustfs_ecstore::api::disk::{
+        CurrentDeleteGeneration, DiskOption, capture_source_condition, new_disk, strip_native_controls,
+    };
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
 }
 
@@ -544,7 +549,8 @@ pub(crate) mod ecstore_notification {
     pub(crate) use rustfs_ecstore::api::notification::{
         ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
         configured_fleet_topology_fingerprint, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
-        ilm_recovery_export_local_process_epoch, new_global_notification_sys, start_remote_version_state_fleet_probe,
+        ilm_recovery_export_local_process_epoch, mrf_lifecycle_reader_local_process_epoch, new_global_notification_sys,
+        start_remote_version_state_fleet_probe,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::notification::{
@@ -1329,6 +1335,10 @@ pub(crate) fn start_remote_version_state_fleet_probe(topology_fingerprint: Strin
 
 pub(crate) fn ilm_recovery_export_local_process_epoch() -> uuid::Uuid {
     ecstore_notification::ilm_recovery_export_local_process_epoch()
+}
+
+pub(crate) fn mrf_lifecycle_reader_local_process_epoch() -> uuid::Uuid {
+    ecstore_notification::mrf_lifecycle_reader_local_process_epoch()
 }
 
 pub(crate) async fn read_config(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>> {

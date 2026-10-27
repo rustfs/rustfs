@@ -9,25 +9,25 @@
 # the PR that adds tests; lowering one is a reviewed statement that tests were
 # intentionally removed. Regenerate with:
 #   scripts/check_test_count_ratchet.sh --update
-e2e_test	956	20
-rustfs	5955	64
+e2e_test	988	20
+rustfs	5979	64
 rustfs-audit	70	0
 rustfs-checksums	26	0
 rustfs-common	36	0
-rustfs-concurrency	53	0
+rustfs-concurrency	54	0
 rustfs-config	43	0
 rustfs-connect-symbol-catalog	6	0
 rustfs-credentials	24	0
 rustfs-crypto	67	0
 rustfs-data-usage	55	0
-rustfs-ecstore	7081	1
+rustfs-ecstore	7312	2
 rustfs-extension-schema	23	0
-rustfs-filemeta	364	0
-rustfs-heal	984	3
+rustfs-filemeta	352	0
+rustfs-heal	1001	3
 rustfs-heal-contracts	7	0
 rustfs-iam	394	0
 rustfs-io-core	49	0
-rustfs-io-metrics	153	0
+rustfs-io-metrics	151	0
 rustfs-keystone	29	0
 rustfs-kms	715	25
 rustfs-license	2	0
@@ -38,10 +38,10 @@ rustfs-madmin	210	0
 rustfs-notify	137	0
 rustfs-object-capacity	92	0
 rustfs-object-data-cache	140	0
-rustfs-obs	379	0
-rustfs-policy	725	0
-rustfs-protocols	738	1
-rustfs-protos	66	0
+rustfs-obs	381	0
+rustfs-policy	733	0
+rustfs-protocols	739	1
+rustfs-protos	73	0
 rustfs-replication	209	0
 rustfs-rio	206	0
 rustfs-rio-v2	34	6
@@ -50,8 +50,8 @@ rustfs-s3-ops	8	0
 rustfs-s3-types	103	0
 rustfs-s3select-api	207	0
 rustfs-s3select-query	189	2
-rustfs-scanner	1205	20
-rustfs-scanner-metrics	87	0
+rustfs-scanner	1213	20
+rustfs-scanner-metrics	90	0
 rustfs-security-governance	20	0
 rustfs-signer	31	0
 rustfs-storage-api	34	0
@@ -61,3 +61,4 @@ rustfs-tls-runtime	43	0
 rustfs-trusted-proxies	68	0
 rustfs-utils	247	0
 rustfs-zip	30	0
+zstd	11	0

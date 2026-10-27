@@ -26,7 +26,9 @@ use super::super::{
 };
 use crate::disk::health_state::DriveMembershipSnapshot;
 use crate::disk::{DiskAPI, new_disk};
+use crate::layout::disks_layout::MAX_ERASURE_SET_DRIVE_COUNT;
 use crate::runtime::sources as runtime_sources;
+use futures::{StreamExt, stream};
 use rand::prelude::SliceRandom;
 use rustfs_utils::path::object_name_disk_identity;
 #[cfg(test)]
@@ -326,35 +328,31 @@ impl SetDisks {
     }
 
     async fn connect_disks_with_active_monitoring(&self, active_monitoring: bool) {
-        let rl = self.disks.read().await;
+        let disks = self.get_disks_internal().await;
+        // A slow failed endpoint must not hold back other returning drives.
+        // Keep the fanout within one set and release the inventory lock before I/O.
+        stream::iter(disks.into_iter().enumerate())
+            .for_each_concurrent(MAX_ERASURE_SET_DRIVE_COUNT, |(i, opdisk)| async move {
+                if let Some(disk) = opdisk {
+                    if !active_monitoring
+                        && disk.get_disk_location().set_idx.is_some()
+                        && let disk::Disk::Local(local) = disk.as_ref()
+                        && local.can_skip_background_probe().await
+                    {
+                        return;
+                    }
+                    if disk.is_online().await && disk.get_disk_location().set_idx.is_some() {
+                        return;
+                    }
 
-        let disks = rl.clone();
-
-        // Explicitly release the lock
-        drop(rl);
-
-        for (i, opdisk) in disks.iter().enumerate() {
-            if let Some(disk) = opdisk {
-                if !active_monitoring
-                    && disk.get_disk_location().set_idx.is_some()
-                    && let disk::Disk::Local(local) = disk.as_ref()
-                    && local.can_skip_background_probe().await
-                {
-                    continue;
+                    let _ = disk.close().await;
                 }
-                if disk.is_online().await && disk.get_disk_location().set_idx.is_some() {
-                    info!("Disk {:?} is online", disk.to_string());
-                    continue;
+
+                if let Some(endpoint) = self.set_endpoints.get(i) {
+                    self.renew_disk(endpoint).await;
                 }
-
-                let _ = disk.close().await;
-            }
-
-            if let Some(endpoint) = self.set_endpoints.get(i) {
-                info!("will renew disk, opdisk: {:?}", opdisk);
-                self.renew_disk(endpoint).await;
-            }
-        }
+            })
+            .await;
     }
 
     pub async fn renew_disk(&self, ep: &Endpoint) {
@@ -727,10 +725,6 @@ mod tests {
         let format = FormatV3::new(1, 1);
         let (_dir, endpoint, disk) = make_formatted_local_disk(0, &format).await;
         assert!(disk.is_online().await, "initialize the expected disk identity");
-        let disk::Disk::Local(wrapper) = disk.as_ref() else {
-            panic!("fixture must use a local disk");
-        };
-        let local = wrapper.get_disk();
         let set = SetDisks::new(
             "quiet-monitor".to_owned(),
             Arc::new(RwLock::new(vec![Some(disk.clone())])),
@@ -749,13 +743,136 @@ mod tests {
             (false, RuntimeDriveHealthState::Offline),
             (false, RuntimeDriveHealthState::Returning),
         ] {
+            let disk = set.get_disks_internal().await[0].clone().expect("current drive");
+            let disk::Disk::Local(wrapper) = disk.as_ref() else {
+                panic!("fixture must use a local disk");
+            };
+            let local = wrapper.get_disk();
             disk.force_runtime_state_for_test(state);
             local.format_info.write().await.last_check = None;
             set.connect_disks_with_active_monitoring(active).await;
+            let current = set.get_disks_internal().await[0].clone().expect("probed or renewed drive");
+            let disk::Disk::Local(wrapper) = current.as_ref() else {
+                panic!("fixture must use a local disk");
+            };
             assert!(
-                local.format_info.read().await.last_check.is_some(),
+                wrapper.get_disk().format_info.read().await.last_check.is_some(),
                 "probe required for active={active}, state={state:?}"
             );
+            current
+                .disk_info(&DiskInfoOptions::default())
+                .await
+                .expect("the probed or renewed drive must admit real I/O");
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_reconnect_restores_ec4_io_without_all_disks_returning() {
+        use crate::object_api::{ObjectOptions, PutObjReader};
+        use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+        use crate::storage_api_contracts::object::ObjectIO;
+        use disk::health_state::RuntimeDriveHealthState;
+        use http::HeaderMap;
+        use tokio::io::AsyncReadExt;
+
+        for active_monitoring in [true, false] {
+            let format = FormatV3::new(1, 16);
+            let mut dirs = Vec::new();
+            let mut endpoints = Vec::new();
+            let mut disks = Vec::new();
+            for index in 0..16 {
+                let (dir, endpoint, disk) = make_formatted_local_disk(index, &format).await;
+                assert!(disk.is_online().await, "initialize the original drive identity");
+                dirs.push(dir);
+                endpoints.push(endpoint);
+                disks.push(Some(disk));
+            }
+            let set = SetDisks::new(
+                "partial-reconnect".to_owned(),
+                Arc::new(RwLock::new(disks.clone())),
+                16,
+                4,
+                0,
+                0,
+                endpoints,
+                format,
+                Vec::new(),
+            )
+            .await;
+            let bucket = "partial-reconnect";
+            let opts = ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            };
+            set.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket before the outage");
+            let payload = vec![b'r'; 1_300_000];
+            set.put_object(bucket, "before", &mut PutObjReader::from_vec(payload.clone()), &opts)
+                .await
+                .expect("write the original object");
+
+            let mut saved_formats = Vec::new();
+            for (dir, disk) in dirs.iter().zip(&disks).take(8) {
+                let disk = disk.as_ref().expect("original disk");
+                disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+                let path = dir.path().join(disk::RUSTFS_META_BUCKET).join(disk::FORMAT_CONFIG_FILE);
+                saved_formats.push(tokio::fs::read(&path).await.expect("save original format"));
+                // A corrupt format makes reconnect fail without admitting a blank replacement.
+                tokio::fs::write(&path, b"invalid-format")
+                    .await
+                    .expect("make the original drive unavailable");
+                let disk::Disk::Local(local) = disk.as_ref() else {
+                    panic!("fixture must use local drives");
+                };
+                local.get_disk().format_info.write().await.last_check = None;
+            }
+            set.connect_disks_with_active_monitoring(active_monitoring).await;
+            let unavailable = set.get_disks_internal().await;
+            for (original, retained) in disks.iter().zip(&unavailable).take(8) {
+                assert!(
+                    Arc::ptr_eq(original.as_ref().expect("original"), retained.as_ref().expect("retained")),
+                    "failed reconnect must leave the old handle to exercise subsequent recovery"
+                );
+            }
+            assert!(
+                set.put_object(bucket, "during", &mut PutObjReader::from_vec(payload.clone()), &opts)
+                    .await
+                    .is_err(),
+                "eight available drives must not satisfy a 16-drive EC:4 write"
+            );
+
+            for (dir, saved) in dirs.iter().zip(&saved_formats).take(4) {
+                let path = dir.path().join(disk::RUSTFS_META_BUCKET).join(disk::FORMAT_CONFIG_FILE);
+                tokio::fs::write(path, saved)
+                    .await
+                    .expect("restore four original drive identities");
+            }
+            set.connect_disks_with_active_monitoring(active_monitoring).await;
+            assert_eq!(
+                set.drive_membership_snapshot().await.online.len(),
+                12,
+                "the four restored drives must be usable while four others remain unavailable"
+            );
+            set.put_object(bucket, "after", &mut PutObjReader::from_vec(payload.clone()), &opts)
+                .await
+                .expect("write at the restored EC:4 quorum");
+            for object in ["before", "after"] {
+                let mut reader = set
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("read at the restored EC:4 quorum");
+                let mut actual = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut actual)
+                    .await
+                    .expect("read every reconstructed byte");
+                assert_eq!(actual, payload, "the complete object must survive partial recovery");
+            }
+            for disk in set.get_disks_internal().await.into_iter().flatten() {
+                disk.close().await.expect("stop the recovered drive monitors");
+            }
         }
     }
 

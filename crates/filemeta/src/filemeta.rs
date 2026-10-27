@@ -116,6 +116,7 @@ pub(crate) fn data_key_for_version(version_id: Option<Uuid>) -> String {
     }
 }
 
+#[cfg(test)]
 fn legacy_data_key_for_version(version_id: Option<Uuid>) -> Option<String> {
     if version_id.is_none() || version_id == Some(Uuid::nil()) {
         Some(Uuid::nil().to_string())
@@ -155,7 +156,6 @@ pub fn is_skip_meta_key(key: &str) -> bool {
 }
 
 mod codec;
-pub(crate) use codec::{BorrowedFileMeta, reconcile_headers};
 mod inline_data;
 pub(crate) mod msgp_decode;
 mod validation;
@@ -349,19 +349,21 @@ impl FileMeta {
         self.versions.sort_by(cmp_shallow_versions_for_order);
     }
 
+    fn find_inline_data_slice(inline_data: &[u8], version_id: Option<Uuid>) -> Result<Option<&[u8]>> {
+        if let Some(vid) = version_id.filter(|v| !v.is_nil()) {
+            let mut buf = Uuid::encode_buffer();
+            let key = vid.hyphenated().encode_lower(&mut buf);
+            InlineData::find_slice_in_raw(inline_data, key)
+        } else {
+            if let Some(data) = InlineData::find_slice_in_raw(inline_data, NULL_VERSION_ID)? {
+                return Ok(Some(data));
+            }
+            InlineData::find_slice_in_raw(inline_data, "00000000-0000-0000-0000-000000000000")
+        }
+    }
+
     fn find_inline_data_in_slice(inline_data: &[u8], version_id: Option<Uuid>) -> Result<Option<Vec<u8>>> {
-        let key = data_key_for_version(version_id);
-        if let Some(data) = InlineData::find_in_slice(inline_data, key.as_str())? {
-            return Ok(Some(data));
-        }
-
-        if let Some(legacy_key) = legacy_data_key_for_version(version_id)
-            && legacy_key != key
-        {
-            return InlineData::find_in_slice(inline_data, legacy_key.as_str());
-        }
-
-        Ok(None)
+        Ok(Self::find_inline_data_slice(inline_data, version_id)?.map(<[u8]>::to_vec))
     }
 
     fn find_inline_data_for_version(&self, version_id: Option<Uuid>) -> Result<Option<Vec<u8>>> {

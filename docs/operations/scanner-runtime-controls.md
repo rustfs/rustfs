@@ -81,6 +81,49 @@ Budget cancellation alone does not publish complete usage or acknowledge dirty b
 
 When runtime configuration is applied, `metrics.cycle_interval_seconds`, `metrics.bitrot_cycle_enabled`, and the cycle-budget fields describe that configuration even before the first scan. They do not establish that a cycle is running; use `metrics.current_cycle_active`, `cycle_schedule`, `cycle_recovery`, leadership, and `data_movement_pause` to interpret inactivity. A running cycle retains its existing budget; a configuration update applies to later budget creation. Configuration refreshes retain timeout/no-progress diagnostics until a new cycle starts. If the first refresh fails validation, the retained effective configuration still initializes its metrics while the validation error remains reported; a failed refresh cannot replace a newer accepted configuration. Older releases initialized these configuration metrics only on the first cycle, so zero values during startup did not prove that scheduling was disabled.
 
+### Observing startup and a first publication
+
+The native status response exposes one node-local `metrics.startup` snapshot. Prometheus reads the same snapshot; it is not reconstructed from cycle counters or a persisted usage timestamp. These fields describe the latest local runtime and are not merged across nodes by the realtime API.
+
+| `metrics.startup.phase` | Prometheus `rustfs_scanner_startup_phase` | Meaning |
+|---|---:|---|
+| `unknown` | 0 | No runtime has been observed, or the report came from an older binary. |
+| `initializing` | 1 | Startup recovery-intent discovery/replay or maintenance/default configuration initialization is in progress. |
+| `usage_inspection` | 2 | The bounded read-only startup usage probe is in progress. No eventual attempt deadline has been chosen yet. |
+| `waiting` | 3 | The runtime is waiting for its actual sampled startup deadline. |
+| `attempted` | 4 | The runtime has entered the normal scanner leadership/recovery loop at least once. This does not prove leadership, an active bucket scan, or publication. |
+| `stopped` | 5 | The owner ended or was cancelled. Earlier start/attempt timestamps remain available; the planned wait is cleared. |
+
+`runtime_active` means the observation owner still exists, not that it is healthy or ready. `started_at_unix_secs` records that owner's creation. `phase_started_at_unix_secs` and `phase_age_seconds` describe its last transition or changed waiting deadline. `planned_attempt_at_unix_secs` is available only during an actual startup wait; it is a seconds-resolution estimate anchored to runtime start. The scheduler still uses its original monotonic deadline. `wait_remaining_seconds` and `wait_overdue_seconds` are derived from that deadline when read, so they do not require a polling task and remain useful if the wall clock changes. A deadline is eligibility to attempt the scanner's fenced path, not a promised scan-completion time.
+
+`first_attempt_at_unix_secs` is recorded immediately before the first normal scanner leadership acquisition attempt, after startup recovery-intent discovery/replay. Startup intent replay remains `initializing`, including any leadership locks it needs. Lock contention or recovery failure is still an attempt. Repeated attempts retain the first timestamp; restarting creates a fresh observation. Late updates from an older runtime cannot overwrite the new owner's state.
+
+Prometheus exports `rustfs_scanner_runtime_active`, `rustfs_scanner_startup_started_unix_seconds`, `rustfs_scanner_startup_phase_age_seconds`, `rustfs_scanner_startup_planned_attempt_unix_seconds`, `rustfs_scanner_startup_wait_remaining_seconds`, `rustfs_scanner_startup_wait_overdue_seconds`, and `rustfs_scanner_startup_first_attempt_unix_seconds` alongside the phase code. Optional times are zero when unavailable in Prometheus and null in native JSON. No bucket, path, or runtime-generation label is added.
+
+Do not gate every usage alert with `usage_last_durable_success > 0`: that timestamp is local to the process and starts at zero, so the guard hides a runtime that never publishes. It records a durable publication event, including observational publication; it is not proof that all buckets have authoritative converged usage. Keep separate checks for a missing runtime, an overdue startup attempt, no first publication within the expected workload window, and stale publications after a previous success.
+
+For an **expected-enabled SNSD job with no intentional recovery or movement pause**, these example expressions distinguish a missing runtime, stalled initialization, an overdue wait, and a missing first publication. Replace the job selector and windows with the deployment's expected startup and first-sweep times. The first-publication rule is not suitable for every distributed follower; check leadership, `cycle_recovery`, and `data_movement_pause` before applying it across a cluster.
+
+```yaml
+groups:
+  - name: rustfs-scanner-startup
+    rules:
+      - alert: RustFSScannerRuntimeMissing
+        expr: rustfs_scanner_runtime_active{job="rustfs-snsd"} == 0
+        for: 5m
+      - alert: RustFSScannerStartupInspectionStalled
+        expr: ((rustfs_scanner_startup_phase{job="rustfs-snsd"} == 1) or (rustfs_scanner_startup_phase{job="rustfs-snsd"} == 2)) and (rustfs_scanner_startup_phase_age_seconds{job="rustfs-snsd"} > 120)
+        for: 1m
+      - alert: RustFSScannerStartupAttemptOverdue
+        expr: (rustfs_scanner_startup_phase{job="rustfs-snsd"} == 3) and (rustfs_scanner_startup_wait_overdue_seconds{job="rustfs-snsd"} > 30)
+        for: 1m
+      - alert: RustFSScannerNoFirstUsagePublication
+        expr: (rustfs_scanner_startup_phase{job="rustfs-snsd"} == 4) and (rustfs_scanner_startup_phase_age_seconds{job="rustfs-snsd"} > 600) and (rustfs_scanner_usage_last_durable_success_unix_seconds{job="rustfs-snsd"} == 0)
+        for: 2m
+```
+
+An alert means the expected attempt or publication has not been observed; inspect progress, checkpoints, budgets, leadership, and pause reasons rather than treating every case as a dead scanner. None of these observations fills a missing success timestamp or acknowledges incomplete coverage.
+
 ### Walkers per disk
 
 The scanner walks the buckets of an erasure set with one walker per local disk by default, so a single-disk deployment walks one bucket at a time no matter how `scanner.max_concurrent_disk_scans` is set. `scanner.walkers_per_disk` (`RUSTFS_SCANNER_WALKERS_PER_DISK`) multiplies each local disk into that many walkers.

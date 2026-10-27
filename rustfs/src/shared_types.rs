@@ -95,6 +95,17 @@ pub struct StorageReadinessDetails {
     pub write_quorum_ready: bool,
     pub pool_metadata_write_ready: bool,
     pub unavailable_drives: Vec<UnavailableReadinessDrive>,
+    pub missing_drives: Vec<MissingReadinessDrive>,
+}
+
+/// Configured topology slots with no runtime disk handle. Reachability and
+/// runtime health are unknown for these slots, so neither is synthesized.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissingReadinessDrive {
+    pub pool_index: usize,
+    pub set_index: usize,
+    pub disk_index: usize,
 }
 
 /// Node-local reasons for excluding an inventoried drive from readiness quorum.

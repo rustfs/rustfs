@@ -15,13 +15,14 @@
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::{
     auth::authorize_admin_envelope,
-    handlers::audit_runtime_config::{load_server_config_from_store, update_audit_config_and_reload},
+    handlers::audit_runtime_config::update_audit_config_and_reload,
     handlers::target_descriptor::{
         AdminTargetSpec, EndpointKey, RuntimeHealthStatus, TargetEndpointSource, admin_target_spec_from_builtin,
-        build_enabled_target_kvs, collect_runtime_statuses, extract_supported_target_params,
-        merge_target_endpoints as shared_merge_target_endpoints, owned_build_json_response, target_module_disabled_reason,
+        build_enabled_target_kvs, extract_supported_target_params, merge_target_endpoints as shared_merge_target_endpoints,
+        owned_build_json_response, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason,
     },
+    handlers::target_read::{collect_audit_runtime_statuses, load_server_config_from_store, load_target_read_snapshot},
     router::{AdminOperation, S3Router},
 };
 use crate::server::{
@@ -30,7 +31,6 @@ use crate::server::{
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
-use rustfs_audit::audit_system;
 use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
 use rustfs_config::server_config::Config;
 use rustfs_config::{AUDIT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
@@ -349,12 +349,7 @@ impl Operation for ListAuditTargets {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_audit_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
 
-        let mut runtime_statuses = HashMap::new();
-        if let Some(system) = audit_system() {
-            runtime_statuses = collect_runtime_statuses(system.get_target_values().await).await;
-        }
-
-        let config = load_server_config_from_store().await?;
+        let (config, runtime_statuses) = load_target_read_snapshot(collect_audit_runtime_statuses()).await?;
         let audit_endpoints = merge_audit_endpoints(&config, runtime_statuses)?;
         let data = serde_json::to_vec(&AuditEndpointsResponse { audit_endpoints }).map_err(|e| {
             log_audit_target_request_failed!("list_audit_targets", "serialize_audit_targets_failed", None, None, e);

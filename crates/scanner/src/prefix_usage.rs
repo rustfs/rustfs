@@ -28,7 +28,7 @@ use crate::storage_api::owner::{
     EcstoreSetDisks, EcstoreStore, ecstore_is_reserved_or_invalid_bucket, ecstore_resolve_object_store_handle,
 };
 use futures::future::join_all;
-use rustfs_data_usage::{PrefixUsageEntry, PrefixUsageSummary};
+use rustfs_data_usage::{PrefixUsageEntry, PrefixUsageQuery, PrefixUsageSummary};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -133,6 +133,7 @@ async fn compute_prefix_usage(
 ) -> BucketPrefixUsageResponse {
     let sets: Vec<Arc<EcstoreSetDisks>> = store.all_set_disks();
     let sets_total = sets.len();
+    let per_set_max_entries = if sets_total <= 1 { max_entries } else { usize::MAX };
     let cache_name = format!("{bucket}/{DATA_USAGE_CACHE_NAME}");
 
     let per_set = join_all(sets.into_iter().map(|set| {
@@ -175,12 +176,25 @@ async fn compute_prefix_usage(
                 return None;
             }
             let last_update = loaded.info.last_update;
-            let query = loaded.prefix_usage(bucket, prefix, max_entries);
+            // Fetch all sub-prefixes per set when sets_total > 1 so cross-set
+            // aggregation merges every set's contribution before truncating
+            // to the caller's max_entries bound.
+            let query = loaded.prefix_usage(bucket, prefix, per_set_max_entries);
             Some((query, last_update))
         }
     }))
     .await;
 
+    aggregate_set_prefix_usage(bucket, prefix, max_entries, sets_total, per_set.into_iter().flatten())
+}
+
+fn aggregate_set_prefix_usage(
+    bucket: &str,
+    prefix: &str,
+    max_entries: usize,
+    sets_total: usize,
+    per_set: impl IntoIterator<Item = (Option<PrefixUsageQuery>, Option<SystemTime>)>,
+) -> BucketPrefixUsageResponse {
     let mut usage = PrefixUsageSummary::default();
     let mut sub_prefix_map: HashMap<String, PrefixUsageSummary> = HashMap::new();
     let mut sets_reporting = 0usize;
@@ -190,7 +204,7 @@ async fn compute_prefix_usage(
     let mut truncated = false;
     let mut last_update: Option<SystemTime> = None;
 
-    for (query, set_last_update) in per_set.into_iter().flatten() {
+    for (query, set_last_update) in per_set {
         // last_update counts every set that has scanned the bucket, even
         // when the prefix itself is absent on that set.
         if let Some(set_last_update) = set_last_update
@@ -229,8 +243,7 @@ async fn compute_prefix_usage(
             .cmp(&left.usage.size)
             .then_with(|| left.prefix.cmp(&right.prefix))
     });
-    // Merged rows can exceed max_entries only when per-set truncation
-    // already flagged; enforce the caller bound on the merged view too.
+    // Enforce the caller bound on the merged cross-set breakdown.
     if sub_prefixes.len() > max_entries {
         truncated = true;
         sub_prefixes.truncate(max_entries);
@@ -345,5 +358,85 @@ mod tests {
         let guard = PREFIX_USAGE_CACHE.lock().unwrap_or_else(|poison| poison.into_inner());
         let map = guard.as_ref().expect("seeded");
         assert!(map.len() <= CACHE_MAX_ENTRIES, "cache must stay bounded, got {}", map.len());
+    }
+
+    #[test]
+    fn multi_set_aggregation_merges_untruncated_set_breakdowns_before_applying_max_entries() {
+        use crate::data_usage_define::{DataUsageCache, DataUsageEntry};
+
+        let mut set0 = DataUsageCache::default();
+        set0.info.name = "bucket".to_string();
+        set0.replace(
+            "bucket",
+            "",
+            DataUsageEntry {
+                size: 190,
+                objects: 2,
+                versions: 2,
+                ..Default::default()
+            },
+        );
+        set0.replace(
+            "bucket/a",
+            "bucket",
+            DataUsageEntry {
+                size: 100,
+                objects: 1,
+                versions: 1,
+                ..Default::default()
+            },
+        );
+        set0.replace(
+            "bucket/b",
+            "bucket",
+            DataUsageEntry {
+                size: 90,
+                objects: 1,
+                versions: 1,
+                ..Default::default()
+            },
+        );
+
+        let mut set1 = DataUsageCache::default();
+        set1.info.name = "bucket".to_string();
+        set1.replace(
+            "bucket",
+            "",
+            DataUsageEntry {
+                size: 190,
+                objects: 2,
+                versions: 2,
+                ..Default::default()
+            },
+        );
+        set1.replace(
+            "bucket/c",
+            "bucket",
+            DataUsageEntry {
+                size: 100,
+                objects: 1,
+                versions: 1,
+                ..Default::default()
+            },
+        );
+        set1.replace(
+            "bucket/b",
+            "bucket",
+            DataUsageEntry {
+                size: 90,
+                objects: 1,
+                versions: 1,
+                ..Default::default()
+            },
+        );
+
+        let q0 = set0.prefix_usage("bucket", "", usize::MAX);
+        let q1 = set1.prefix_usage("bucket", "", usize::MAX);
+        let merged = super::aggregate_set_prefix_usage("bucket", "", 1, 2, vec![(q0, None), (q1, None)]);
+        assert!(merged.truncated);
+        assert_eq!(merged.sub_prefixes.len(), 1);
+        assert_eq!(merged.sub_prefixes[0].prefix, "b");
+        assert_eq!(merged.sub_prefixes[0].usage.size, 180);
+        assert_eq!(merged.sub_prefixes[0].usage.objects, 2);
     }
 }

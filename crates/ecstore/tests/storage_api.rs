@@ -66,11 +66,12 @@ pub(crate) mod cleanup_isolation {
     pub(crate) use rustfs_ecstore::api::disk::{DeleteOptions, DiskError};
 }
 
-#[cfg(all(feature = "test-util", not(windows)))]
+#[cfg(all(feature = "test-util", unix))]
 pub(crate) mod inline_heal_staging {
     pub(crate) use super::{DiskAPI, DiskOption, Endpoint, new_disk};
     pub(crate) use rustfs_ecstore::api::disk::{
-        DeleteOptions, DiskError, LocalPublicationPause, LocalPublicationStage, ReadOptions,
+        DeleteOptions, DiskError, LocalPublicationPause, LocalPublicationStage, ReadOptions, local_durability_modes,
+        set_local_dir_fsync_failure, set_local_rename_data_fail_after_metadata_commit,
     };
 }
 

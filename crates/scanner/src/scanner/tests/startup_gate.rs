@@ -34,6 +34,7 @@ pub(super) fn startup_config(entries: &[(&str, &str)]) -> rustfs_config::server_
 #[tokio::test(start_paused = true)]
 #[serial]
 async fn startup_preflight_timeout_drops_read_only_inspection() {
+    let runtime = ScannerRuntimeGuard::new();
     let ctx = CancellationToken::new();
     let (held, dropped) = tokio::sync::oneshot::channel::<()>();
     let inspection = async move {
@@ -42,7 +43,15 @@ async fn startup_preflight_timeout_drops_read_only_inspection() {
     };
     let started = Instant::now();
     assert!(
-        wait_for_scanner_startup(&ctx, inspection, false, scanner_maintenance_generation(), randomized_cycle_delay_for).await
+        wait_for_scanner_startup(
+            runtime.startup_token(),
+            &ctx,
+            inspection,
+            false,
+            scanner_maintenance_generation(),
+            randomized_cycle_delay_for
+        )
+        .await
     );
     assert_eq!(started.elapsed(), SCANNER_STARTUP_USAGE_INSPECTION_TIMEOUT);
     assert!(dropped.await.is_err(), "timeout should drop the pending read-only inspection");
@@ -51,6 +60,7 @@ async fn startup_preflight_timeout_drops_read_only_inspection() {
 #[tokio::test(start_paused = true)]
 #[serial]
 async fn startup_cancellation_interrupts_preflight_and_long_delay() {
+    let runtime = ScannerRuntimeGuard::new();
     let config = startup_config(&[("start_delay", "21600"), ("cycle", "21600")]);
     crate::runtime_config::apply_scanner_runtime_config(&config).expect("long startup configuration");
     for pending_inspection in [true, false] {
@@ -63,6 +73,7 @@ async fn startup_cancellation_interrupts_preflight_and_long_delay() {
         };
         let started = Instant::now();
         let mut gate = Box::pin(wait_for_scanner_startup(
+            runtime.startup_token(),
             &ctx,
             inspection,
             false,
@@ -80,10 +91,12 @@ async fn startup_cancellation_interrupts_preflight_and_long_delay() {
 #[tokio::test(start_paused = true)]
 #[serial]
 async fn startup_shorter_config_uses_elapsed_wait_instead_of_restarting() {
+    let runtime = ScannerRuntimeGuard::new();
     let config = startup_config(&[("start_delay", "21600"), ("cycle", "21600")]);
     crate::runtime_config::apply_scanner_runtime_config(&config).expect("long startup configuration");
     let ctx = CancellationToken::new();
     let mut gate = Box::pin(wait_for_scanner_startup(
+        runtime.startup_token(),
         &ctx,
         std::future::ready((false, true)),
         false,
@@ -102,11 +115,13 @@ async fn startup_shorter_config_uses_elapsed_wait_instead_of_restarting() {
 #[tokio::test(start_paused = true)]
 #[serial]
 async fn startup_unrelated_config_keeps_original_deadline() {
+    let runtime = ScannerRuntimeGuard::new();
     let config = startup_config(&[("start_delay", "120"), ("cycle", "21600")]);
     crate::runtime_config::apply_scanner_runtime_config(&config).expect("startup configuration");
     let ctx = CancellationToken::new();
     let started = Instant::now();
     let mut gate = Box::pin(wait_for_scanner_startup(
+        runtime.startup_token(),
         &ctx,
         std::future::ready((false, true)),
         false,
@@ -264,6 +279,7 @@ async fn startup_replication_discovery_does_not_inspect_irrelevant_lifecycle_tai
 #[tokio::test(start_paused = true)]
 #[serial]
 async fn startup_equivalent_policies_preserve_the_sampled_deadline() {
+    let runtime = ScannerRuntimeGuard::new();
     for explicit in [true, false] {
         let mut initial = vec![("cycle", "21600")];
         let mut updated = vec![("cycle", "43200")];
@@ -275,6 +291,7 @@ async fn startup_equivalent_policies_preserve_the_sampled_deadline() {
         let ctx = CancellationToken::new();
         let samples = std::cell::Cell::new(0);
         let mut gate = Box::pin(wait_for_scanner_startup(
+            runtime.startup_token(),
             &ctx,
             std::future::ready((false, true)),
             false,

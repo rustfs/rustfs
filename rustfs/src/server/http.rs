@@ -4792,6 +4792,7 @@ mod tests {
         let node = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
         let scanner = InterceptedService::new(storage::tonic_service::make_scanner_control_server(), check_auth);
         let service = RpcRequestPathService::new(Routes::new(node).add_service(scanner).prepare());
+        let service = crate::server::ReadinessGateLayer::new(Arc::new(rustfs_common::GlobalReadiness::new())).layer(service);
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("accept test connection");
             ConnBuilder::new(TokioExecutor::new())
@@ -4907,6 +4908,7 @@ mod tests {
             check_auth,
         );
         let service = RpcRequestPathService::new(Routes::new(node_service).add_service(heal_control_service).prepare());
+        let service = crate::server::ReadinessGateLayer::new(Arc::new(rustfs_common::GlobalReadiness::new())).layer(service);
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("test server should accept a connection");
             let builder = ConnBuilder::new(TokioExecutor::new());

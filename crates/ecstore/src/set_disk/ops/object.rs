@@ -3002,6 +3002,44 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             let object_size = usize::try_from(fi.size)
                 .map_err(|_| to_object_err(Error::other("inline fast path object size is invalid"), vec![bucket, object]))?;
 
+            if can_try_inline_data_shards_direct(object_size, fi.erasure.block_size)
+                && let Some(body) = verified_inline_body.filter(|body| body.len() == object_size)
+            {
+                if let Some(inline_prepare_stage_start) = inline_prepare_stage_start.take() {
+                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                        GET_OBJECT_PATH_INLINE_DIRECT,
+                        GET_STAGE_INLINE_PREPARE,
+                        object_class.as_str(),
+                        size_bucket,
+                        inline_prepare_stage_start.elapsed().as_secs_f64(),
+                    );
+                }
+                if rustfs_io_metrics::get_stage_metrics_enabled() {
+                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                        GET_OBJECT_PATH_INLINE_DIRECT,
+                        GET_STAGE_READER_SETUP,
+                        object_class.as_str(),
+                        size_bucket,
+                        0.0,
+                    );
+                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                        GET_OBJECT_PATH_INLINE_DIRECT,
+                        GET_STAGE_DECODE,
+                        object_class.as_str(),
+                        size_bucket,
+                        0.0,
+                    );
+                }
+                record_get_object_reader_path_observation(GET_OBJECT_PATH_INLINE_DIRECT, object_class, size_bucket);
+                let reader = GetObjectReader {
+                    stream: Box::new(Cursor::new(body.clone())),
+                    object_info,
+                    buffered_body: Some(body),
+                    body_source: GetObjectBodySource::Unprobed,
+                };
+                return Ok(reader);
+            }
+
             let checksum_info = fi.erasure.get_checksum_info(fi.parts[0].number);
             let checksum_algo =
                 if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
@@ -3015,42 +3053,6 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     disks.get(index).is_some_and(Option::is_some)
                 })
             {
-                if let Some(body) = verified_inline_body.filter(|body| body.len() == object_size) {
-                    if let Some(inline_prepare_stage_start) = inline_prepare_stage_start.take() {
-                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                            GET_OBJECT_PATH_INLINE_DIRECT,
-                            GET_STAGE_INLINE_PREPARE,
-                            object_class.as_str(),
-                            size_bucket,
-                            inline_prepare_stage_start.elapsed().as_secs_f64(),
-                        );
-                    }
-                    if rustfs_io_metrics::get_stage_metrics_enabled() {
-                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                            GET_OBJECT_PATH_INLINE_DIRECT,
-                            GET_STAGE_READER_SETUP,
-                            object_class.as_str(),
-                            size_bucket,
-                            0.0,
-                        );
-                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                            GET_OBJECT_PATH_INLINE_DIRECT,
-                            GET_STAGE_DECODE,
-                            object_class.as_str(),
-                            size_bucket,
-                            0.0,
-                        );
-                    }
-                    record_get_object_reader_path_observation(GET_OBJECT_PATH_INLINE_DIRECT, object_class, size_bucket);
-                    let reader = GetObjectReader {
-                        stream: Box::new(Cursor::new(body.clone())),
-                        object_info,
-                        buffered_body: Some(body),
-                        body_source: GetObjectBodySource::Unprobed,
-                    };
-                    return Ok(reader);
-                }
-
                 let read_length = inline_erasure_shard_file_offset(
                     0,
                     object_size,
@@ -4839,6 +4841,63 @@ impl SetDisks {
                 && let Some(err) = self.check_write_precondition(bucket, object, opts).await
             {
                 return Err(err);
+            }
+
+            if bucket == RUSTFS_META_BUCKET
+                && object == "pool.bin"
+                && rustfs_utils::http::metadata_compat::contains_key_str(
+                    &opts.user_defined,
+                    crate::disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+                )
+            {
+                // The logical If-Match above remains authoritative. Bind each
+                // disk mutation to its actual physical predecessor as well, so
+                // a lagging replica can converge without admitting late tails.
+                let condition = rustfs_utils::http::metadata_compat::get_consistent_str(
+                    &opts.user_defined,
+                    crate::disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+                )
+                .ok_or(DiskError::FileCorrupt)?;
+                let condition: crate::disk::PoolMetaNativeCasCondition =
+                    serde_json::from_str(condition).map_err(|_| DiskError::FileCorrupt)?;
+                let (parents, errors) =
+                    Self::read_all_fileinfo(&shuffle_disks, bucket, bucket, object, "", false, false, false).await?;
+                for (index, ((metadata, parent), error)) in parts_metadatas.iter_mut().zip(&parents).zip(&errors).enumerate() {
+                    let mut parent_raw_sha256 = None;
+                    let parent = match error {
+                        None => Some(crate::disk::PoolMetaNativeFileIdentity::from_file_info(parent)?),
+                        Some(DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound) => None,
+                        // An unavailable disk keeps the exact logical parent;
+                        // reconnecting cannot turn an unknown head into absence.
+                        Some(
+                            DiskError::DiskNotFound | DiskError::FaultyDisk | DiskError::DiskAccessDenied | DiskError::Timeout,
+                        ) => condition.parent.clone(),
+                        Some(DiskError::FileCorrupt) => {
+                            use sha2::Digest as _;
+                            let disk = shuffle_disks[index].as_ref().ok_or(DiskError::DiskNotFound)?;
+                            match disk
+                                .pool_meta_native_recovery(crate::disk::PoolMetaNativeRecoveryRequest::Inspect {
+                                    object: crate::disk::PoolMetaNativeObject::PoolBin,
+                                })
+                                .await?
+                            {
+                                crate::disk::PoolMetaNativeRecoveryResponse::Inspected(snapshot) => {
+                                    let raw = snapshot.current.ok_or(DiskError::ConditionalDeleteConflict)?;
+                                    parent_raw_sha256 = Some(sha2::Sha256::digest(&raw).into());
+                                    None
+                                }
+                                _ => return Err(DiskError::FileCorrupt.into()),
+                            }
+                        }
+                        Some(err) => return Err(err.clone().into()),
+                    };
+                    crate::disk::PoolMetaNativeCasCondition {
+                        attempt_id: condition.attempt_id,
+                        parent,
+                        parent_raw_sha256,
+                    }
+                    .insert_into(&mut metadata.metadata)?;
+                }
             }
 
             // Generate ordinary PUT timestamps under the commit lock so version
@@ -11049,7 +11108,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // shared lock and permit metadata caching can early-stop once write
         // quorum agrees on the object identity.
         let allow_early_stop = !opts.no_lock || opts.metadata_cache_safe;
-        let read = self.get_object_fileinfo(bucket, object, opts, true, allow_early_stop);
+        let read = self.get_object_fileinfo_for_object_read(bucket, object, opts, true, allow_early_stop);
         #[cfg(feature = "diagnostic-read-version-caller")]
         let read = crate::cluster::rpc::runtime_sources::with_read_version_entry(
             rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ObjectInfoRead,
@@ -12825,6 +12884,21 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
             disks.push(Some(disk));
         }
 
+        // This fixture owns a complete physical topology even when it shares
+        // the bootstrap service context with other independent hermetic sets.
+        let topology = crate::layout::endpoints::EndpointServerPools(vec![crate::layout::endpoints::PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: disk_count,
+            endpoints: endpoints.clone().into(),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]);
+        let (_, multipart_authority) = crate::disk::multipart_source::ProofVerificationContext::for_topology(&topology)
+            .expect("hermetic fixture should have a complete local topology");
+        crate::disk::multipart_source::bind_multipart_proof_snapshot(&disks, &multipart_authority)
+            .expect("hermetic local disks should bind to their fixture authority");
+
         let set_disks = SetDisks::new_with_instance_ctx(
             "hermetic-ops-test-owner".to_string(),
             Arc::new(RwLock::new(disks)),
@@ -12839,6 +12913,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         )
         .await;
 
+        set_disks.set_multipart_proof_authority_for_test(multipart_authority);
         (temp_dirs, disk_stores, set_disks)
     }
 }
@@ -16862,6 +16937,7 @@ mod transition_commit_failure_tests {
                     parts_metadata,
                     online_disks,
                     read_quorum: 2,
+                    verified_inline_body: None,
                 }),
             )
             .await;
@@ -22869,6 +22945,116 @@ mod put_object_tmp_cleanup_tests {
             set.get_object_info(bucket, object, &ObjectOptions::default()).await.is_err(),
             "failed fresh write must not become visible"
         );
+    }
+
+    /// Per-drive view of an object: every version (including free versions)
+    /// recorded in its xl.meta, and the data directories next to it. A missing
+    /// xl.meta and one without versions both hold no version.
+    async fn per_drive_object_state(
+        dirs: &[TempDir],
+        bucket: &str,
+        object: &str,
+    ) -> Vec<(Vec<(Option<Uuid>, Option<Uuid>, Option<OffsetDateTime>)>, Vec<String>)> {
+        let mut drives = Vec::with_capacity(dirs.len());
+        for dir in dirs {
+            let object_dir = dir.path().join(bucket).join(object);
+            let versions = match tokio::fs::read(object_dir.join(STORAGE_FORMAT_FILE)).await {
+                Ok(encoded) => {
+                    let all = FileMeta::load(&encoded)
+                        .expect("xl.meta should decode")
+                        .get_all_file_info_versions(bucket, object, true)
+                        .expect("xl.meta versions should be readable");
+                    all.versions
+                        .iter()
+                        .chain(all.free_versions.iter())
+                        .map(|version| (version.version_id, version.data_dir, version.mod_time))
+                        .collect()
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(err) => panic!("xl.meta at {object_dir:?} should be readable: {err}"),
+            };
+            let mut data_dirs = Vec::new();
+            if let Ok(mut entries) = tokio::fs::read_dir(&object_dir).await {
+                while let Some(entry) = entries.next_entry().await.expect("object directory entry should be readable") {
+                    if entry
+                        .file_type()
+                        .await
+                        .expect("object entry type should be readable")
+                        .is_dir()
+                    {
+                        data_dirs.push(entry.file_name().to_string_lossy().into_owned());
+                    }
+                }
+            }
+            data_dirs.sort();
+            drives.push((versions, data_dirs));
+        }
+        drives
+    }
+
+    /// Stage F lists any version present on half of the drives, so a PUT that
+    /// misses write quorum must not leave its version behind once its rollback
+    /// completes: no drive may keep the new xl.meta entry or its data directory.
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn failed_put_rollback_leaves_no_new_version_on_any_drive() {
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            for write_completion in [WriteCompletion::Quorum, WriteCompletion::TailDrained] {
+                for size in [4096, TEST_OBJECT_SIZE] {
+                    // (versioned, seed an earlier version first)
+                    for (versioned, seeded) in [(false, false), (false, true), (true, true)] {
+                        let case = format!("{write_completion:?} size={size} versioned={versioned} seeded={seeded}");
+                        let (dirs, disks, set) = hermetic_set_disks(4).await;
+                        let bucket = "put-rollback-no-residue";
+                        let object = "rolled-back-object";
+                        make_completion_test_bucket(&disks, bucket).await;
+                        if seeded {
+                            set.put_object(
+                                bucket,
+                                object,
+                                &mut PutObjReader::from_vec(vec![b'0'; size]),
+                                &ObjectOptions {
+                                    versioned,
+                                    write_completion: WriteCompletion::TailDrained,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .unwrap_or_else(|err| panic!("{case}: seed version should commit on every drive: {err}"));
+                        }
+                        wait_for_tmp_workspace_to_drain(&dirs, "seed PUT must leave no staging").await;
+                        let before = per_drive_object_state(&dirs, bucket, object).await;
+
+                        let tasks = rename_fanout_barrier::observe_tasks(object);
+                        let _fault = rename_fault_injection::fail_rename_on(object, &[0, 1]);
+                        let err = set
+                            .put_object(
+                                bucket,
+                                object,
+                                &mut PutObjReader::from_vec(vec![b'1'; size]),
+                                &ObjectOptions {
+                                    versioned,
+                                    write_completion,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .expect_err("two renamed drives cannot satisfy write quorum three");
+                        assert!(
+                            matches!(err, Error::ErasureWriteQuorum | Error::InsufficientWriteQuorum(_, _)),
+                            "{case}: original quorum error expected: {err}"
+                        );
+                        assert_eq!(tasks.running(), 0, "{case}: rename and undo tasks must be reaped before return");
+                        // An incomplete rollback retains staging for recovery, so a
+                        // drained workspace shows the rollback completed.
+                        wait_for_tmp_workspace_to_drain(&dirs, "a completed rollback must release staging").await;
+                        let after = per_drive_object_state(&dirs, bucket, object).await;
+                        assert_eq!(after, before, "{case}: no drive may keep the failed PUT's version or data");
+                    }
+                }
+            }
+        })
+        .await;
     }
 
     #[tokio::test]

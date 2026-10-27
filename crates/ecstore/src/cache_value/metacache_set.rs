@@ -25,7 +25,7 @@ use std::{
     future::Future,
     io::ErrorKind,
     pin::Pin,
-    sync::{Arc, OnceLock, atomic::AtomicBool},
+    sync::{Arc, OnceLock},
     task::{Context, Poll},
     time::Duration,
 };
@@ -43,11 +43,6 @@ const EVENT_METACACHE_LISTING: &str = "metacache_listing";
 pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = Result<(), DiskError>> + Send>> + Send + 'static>;
 pub type PartialFn =
     Box<dyn Fn(MetaCacheEntries, &[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
-pub(crate) type PartialResultFn = Box<
-    dyn Fn(MetaCacheEntries, &[Option<DiskError>]) -> Pin<Box<dyn Future<Output = disk::error::Result<()>> + Send>>
-        + Send
-        + 'static,
->;
 type FinishedFn = Box<dyn Fn(&[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 
 #[derive(Clone, Default)]
@@ -60,6 +55,7 @@ impl FallbackClaimTracker {
         self.claimed.lock().await.insert(disk.endpoint().to_string());
     }
 
+    #[cfg(test)]
     pub(crate) async fn claimed_keys(&self) -> HashSet<String> {
         self.claimed.lock().await.clone()
     }
@@ -198,6 +194,8 @@ pub(crate) enum TestReaderBehavior {
         stopped: Arc<tokio::sync::Notify>,
     },
     IgnoreCancel,
+    /// Entries followed by a terminator trailer saying the producer stopped at its limit.
+    LimitReached(Vec<MetaCacheEntry>),
     ProducerError(DiskError),
     PrimaryErrorThenFallback(DiskError),
     PartialThenTimeout(Vec<MetaCacheEntry>),
@@ -236,8 +234,6 @@ pub struct ListPathRawOptions {
     pub skip_walkdir_total_timeout: bool,
     pub walkdir_timeout: Option<Duration>,
     pub walkdir_stall_timeout: Option<Duration>,
-    /// Shared terminal state for bounded producer walks.
-    pub producer_limit_reached: Option<Arc<AtomicBool>>,
     pub agreed: Option<AgreedFn>,
     pub partial: Option<PartialFn>,
     pub finished: Option<FinishedFn>,
@@ -248,7 +244,7 @@ pub struct ListPathRawOptions {
     #[cfg(test)]
     pub(crate) peek_timeout: Option<Duration>,
     #[cfg(test)]
-    pub(crate) test_disk_io_context_observed: Option<Arc<AtomicBool>>,
+    pub(crate) test_disk_io_context_observed: Option<Arc<std::sync::atomic::AtomicBool>>,
     // pub agreed: Option<Arc<dyn Fn(MetaCacheEntry) + Send + Sync>>,
     // pub partial: Option<Arc<dyn Fn(MetaCacheEntries, &[Option<Error>]) + Send + Sync>>,
     // pub finished: Option<Arc<dyn Fn(&[Option<Error>]) + Send + Sync>>,
@@ -273,7 +269,6 @@ impl Clone for ListPathRawOptions {
             skip_walkdir_total_timeout: self.skip_walkdir_total_timeout,
             walkdir_timeout: self.walkdir_timeout,
             walkdir_stall_timeout: self.walkdir_stall_timeout,
-            producer_limit_reached: self.producer_limit_reached.clone(),
             #[cfg(test)]
             test_reader_behaviors: self.test_reader_behaviors.clone(),
             #[cfg(test)]
@@ -301,44 +296,51 @@ fn walk_dir_options(opts: &ListPathRawOptions) -> WalkDirOptions {
         skip_total_timeout: opts.skip_walkdir_total_timeout,
         timeout_ms: opts.walkdir_timeout.map(duration_millis),
         stall_timeout_ms: opts.walkdir_stall_timeout.map(duration_millis),
-        producer_limit_reached: opts.producer_limit_reached.clone(),
         ..Default::default()
     }
+}
+
+/// How a merged raw listing stream ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListPathRawOutcome {
+    /// At least one producer stopped at its per-disk limit instead of at the
+    /// end of its namespace, so the closed stream is not proof of exhaustion.
+    /// Carried in-band by the metacache stream trailer, so remote producers
+    /// report it as well.
+    pub limit_reached: bool,
 }
 
 pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> disk::error::Result<()> {
     let rx = rx.child_token();
     let _cancel_guard = rx.clone().drop_guard();
-    list_path_raw_inner(rx, opts, None, None).await
+    list_path_raw_inner(rx, opts, None).await.map(|_| ())
+}
+
+/// Like [`list_path_raw`], but reports how the merged stream ended.
+pub(crate) async fn list_path_raw_with_outcome(
+    rx: CancellationToken,
+    opts: ListPathRawOptions,
+) -> disk::error::Result<ListPathRawOutcome> {
+    let rx = rx.child_token();
+    let _cancel_guard = rx.clone().drop_guard();
+    list_path_raw_inner(rx, opts, None).await
 }
 
 pub(crate) async fn list_path_raw_with_claim_tracker(
     rx: CancellationToken,
     opts: ListPathRawOptions,
     claim_tracker: FallbackClaimTracker,
-) -> disk::error::Result<()> {
+) -> disk::error::Result<ListPathRawOutcome> {
     let rx = rx.child_token();
     let _cancel_guard = rx.clone().drop_guard();
-    list_path_raw_inner(rx, opts, Some(claim_tracker), None).await
-}
-
-pub(crate) async fn list_path_raw_with_partial_result(
-    rx: CancellationToken,
-    opts: ListPathRawOptions,
-    claim_tracker: FallbackClaimTracker,
-    partial_result: PartialResultFn,
-) -> disk::error::Result<()> {
-    let rx = rx.child_token();
-    let _cancel_guard = rx.clone().drop_guard();
-    list_path_raw_inner(rx, opts, Some(claim_tracker), Some(partial_result)).await
+    list_path_raw_inner(rx, opts, Some(claim_tracker)).await
 }
 
 async fn list_path_raw_inner(
     rx: CancellationToken,
     opts: ListPathRawOptions,
     fallback_claim_tracker: Option<FallbackClaimTracker>,
-    partial_result: Option<PartialResultFn>,
-) -> disk::error::Result<()> {
+) -> disk::error::Result<ListPathRawOutcome> {
     if opts.disks.is_empty() {
         return Err(DiskError::ErasureReadQuorum);
     }
@@ -391,6 +393,14 @@ async fn list_path_raw_inner(
                         let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
                         out.write(&entries).await.expect("test entries should be written");
                         out.close().await.expect("test entries should close");
+                        return Ok(());
+                    }
+                    TestReaderBehavior::LimitReached(entries) => {
+                        let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                        out.write(&entries).await.expect("test entries should be written");
+                        out.close_with_limit_reached(true)
+                            .await
+                            .expect("test entries should close at the limit");
                         return Ok(());
                     }
                     TestReaderBehavior::Stall => {
@@ -527,6 +537,16 @@ async fn list_path_raw_inner(
                             let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
                             out.write(&entries).await.expect("test fallback entries should be written");
                             out.close().await.expect("test fallback entries should close");
+                            need_fallback = false;
+                            last_err = None;
+                            continue;
+                        }
+                        TestReaderBehavior::LimitReached(entries) => {
+                            let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                            out.write(&entries).await.expect("test fallback entries should be written");
+                            out.close_with_limit_reached(true)
+                                .await
+                                .expect("test fallback entries should close at the limit");
                             need_fallback = false;
                             last_err = None;
                             continue;
@@ -699,6 +719,9 @@ async fn list_path_raw_inner(
         }
         let mut pending_entries: Vec<Option<MetaCacheEntry>> = vec![None; readers.len()];
         let mut peek_outcomes: Vec<Option<PeekOutcome>> = std::iter::repeat_with(|| None).take(readers.len()).collect();
+        // Sticky across rounds: once any reader's trailer says its producer
+        // stopped at the per-disk limit, the merged stream may hide more keys.
+        let mut limit_reached = false;
 
         loop {
             let mut current = MetaCacheEntry::default();
@@ -710,7 +733,7 @@ async fn list_path_raw_inner(
             // );
 
             if revjob_rx.is_cancelled() {
-                return Ok(());
+                return Ok(ListPathRawOutcome { limit_reached });
             }
 
             let mut top_entries: Vec<Option<MetaCacheEntry>> = vec![None; readers.len()];
@@ -760,6 +783,7 @@ async fn list_path_raw_inner(
                                     continue;
                                 }
                                 // eof
+                                limit_reached |= r.limit_reached() == Some(true);
                                 at_eof += 1;
                                 // warn!("list_path_raw: peek eof, disk: {}", i);
                                 continue;
@@ -833,7 +857,7 @@ async fn list_path_raw_inner(
                             *r = MetacacheReader::new(detached_rd);
                             continue;
                         }
-                        PeekOutcome::Cancelled => return Ok(()),
+                        PeekOutcome::Cancelled => return Ok(ListPathRawOutcome { limit_reached }),
                     }
                 };
 
@@ -892,7 +916,7 @@ async fn list_path_raw_inner(
                 if let Some(finished_fn) = opts.finished.as_ref() {
                     tokio::select! {
                         biased;
-                        _ = revjob_rx.cancelled() => return Ok(()),
+                        _ = revjob_rx.cancelled() => return Ok(ListPathRawOutcome { limit_reached }),
                         _ = finished_fn(&errs) => {}
                     }
                 }
@@ -949,7 +973,7 @@ async fn list_path_raw_inner(
                 {
                     tokio::select! {
                         biased;
-                        _ = revjob_rx.cancelled() => return Ok(()),
+                        _ = revjob_rx.cancelled() => return Ok(ListPathRawOutcome { limit_reached }),
                         _ = finished_fn(&errs) => {}
                     }
                 }
@@ -969,7 +993,7 @@ async fn list_path_raw_inner(
                     // warn!("list_path_raw: agreed_fn start, current: {:?}", &current.name);
                     tokio::select! {
                         biased;
-                        _ = revjob_rx.cancelled() => return Ok(()),
+                        _ = revjob_rx.cancelled() => return Ok(ListPathRawOutcome { limit_reached }),
                         result = agreed_fn(current) => result?
                     }
                     // warn!("list_path_raw: agreed_fn done");
@@ -990,61 +1014,58 @@ async fn list_path_raw_inner(
                 }
             }
 
-            if let Some(partial_fn) = partial_result.as_ref() {
+            if let Some(partial_fn) = opts.partial.as_ref() {
                 tokio::select! {
                     biased;
-                    _ = revjob_rx.cancelled() => return Ok(()),
-                    result = partial_fn(MetaCacheEntries(top_entries), &errs) => result?,
-                }
-            } else if let Some(partial_fn) = opts.partial.as_ref() {
-                tokio::select! {
-                    biased;
-                    _ = revjob_rx.cancelled() => return Ok(()),
+                    _ = revjob_rx.cancelled() => return Ok(ListPathRawOutcome { limit_reached }),
                     _ = partial_fn(MetaCacheEntries(top_entries), &errs) => {}
                 }
             }
         }
-        Ok(())
+        Ok(ListPathRawOutcome { limit_reached })
     });
 
     let merge_started = std::time::Instant::now();
     let Some(revjob) = revjobs.join_next().await else {
         return Err(DiskError::Unexpected);
     };
-    if let Err(err) = revjob.map_err(std::io::Error::other)? {
-        rustfs_io_metrics::record_stage_duration("metacache_merge_failed", merge_started.elapsed().as_secs_f64() * 1000.0);
-        if is_missing_path_error(&err) {
-            debug!(
-                event = EVENT_METACACHE_LISTING,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_METACACHE,
-                bucket = %log_bucket,
-                path = %log_path,
-                state = "merge_job_missing_path",
-                error = ?err,
-                "Metacache merge job missing path skipped"
-            );
-        } else {
-            error!(
-                event = EVENT_METACACHE_LISTING,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_METACACHE,
-                bucket = %log_bucket,
-                path = %log_path,
-                state = "merge_job_failed",
-                error = ?err,
-                "Metacache merge job failed"
-            );
-        }
-        cancel_rx.cancel();
-        jobs.abort_all();
+    let outcome = match revjob.map_err(std::io::Error::other)? {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            rustfs_io_metrics::record_stage_duration("metacache_merge_failed", merge_started.elapsed().as_secs_f64() * 1000.0);
+            if is_missing_path_error(&err) {
+                debug!(
+                    event = EVENT_METACACHE_LISTING,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_METACACHE,
+                    bucket = %log_bucket,
+                    path = %log_path,
+                    state = "merge_job_missing_path",
+                    error = ?err,
+                    "Metacache merge job missing path skipped"
+                );
+            } else {
+                error!(
+                    event = EVENT_METACACHE_LISTING,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_METACACHE,
+                    bucket = %log_bucket,
+                    path = %log_path,
+                    state = "merge_job_failed",
+                    error = ?err,
+                    "Metacache merge job failed"
+                );
+            }
+            cancel_rx.cancel();
+            jobs.abort_all();
 
-        return Err(err);
-    }
+            return Err(err);
+        }
+    };
     if rx.is_cancelled() {
         cancel_rx.cancel();
         jobs.abort_all();
-        return Ok(());
+        return Ok(outcome);
     }
     rustfs_io_metrics::record_stage_duration("metacache_merge", merge_started.elapsed().as_secs_f64() * 1000.0);
 
@@ -1113,7 +1134,7 @@ async fn list_path_raw_inner(
     }
 
     // warn!("list_path_raw: done");
-    Ok(())
+    Ok(outcome)
 }
 
 #[inline]
@@ -1132,6 +1153,7 @@ mod tests {
     use rustfs_filemeta::MetacacheWriter;
     use rustfs_filemeta::{FileInfo, FileMeta, MetadataResolutionParams};
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
     use time::OffsetDateTime;
     use uuid::Uuid;
 
@@ -1250,6 +1272,59 @@ mod tests {
             wrapper.background_io_admissions_for_tests() > 0,
             "the LocalDiskWrapper walk should acquire background admission inside its JoinSet producer"
         );
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_reports_limit_reached_from_any_reader_trailer() {
+        let first = fallback_test_entry();
+        let second = MetaCacheEntry {
+            name: "bucket/object-2".to_string(),
+            ..fallback_test_entry()
+        };
+        // One bounded producer, one that ends naturally, one legacy empty
+        // stream without any trailer.
+        let outcome = list_path_raw_inner(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None],
+                min_disks: 1,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::LimitReached(vec![first.clone()]),
+                    TestReaderBehavior::Entries(vec![first, second]),
+                    TestReaderBehavior::Eof,
+                ],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("listing should complete");
+
+        assert!(
+            outcome.limit_reached,
+            "a reader whose trailer reports a limit stop must mark the merged stream as possibly incomplete"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_reports_natural_end_when_no_reader_trailer_says_limit() {
+        let outcome = list_path_raw_inner(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None],
+                min_disks: 1,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::Entries(vec![fallback_test_entry()]),
+                    TestReaderBehavior::Eof,
+                ],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("listing should complete");
+
+        assert!(!outcome.limit_reached, "natural and legacy stream ends must not claim a limit stop");
     }
 
     #[tokio::test]
@@ -1736,39 +1811,6 @@ mod tests {
             result.expect_err("agreed resolution must not silently omit the key"),
             DiskError::ErasureReadQuorum
         );
-    }
-
-    #[tokio::test]
-    async fn list_path_raw_propagates_partial_callback_failure() {
-        let first = MetaCacheEntry {
-            name: "bucket/object-a".to_string(),
-            metadata: vec![1],
-            ..Default::default()
-        };
-        let second = MetaCacheEntry {
-            name: "bucket/object-b".to_string(),
-            metadata: vec![2],
-            ..Default::default()
-        };
-
-        let err = list_path_raw_with_partial_result(
-            CancellationToken::new(),
-            ListPathRawOptions {
-                disks: vec![None, None],
-                min_disks: 2,
-                test_reader_behaviors: vec![
-                    TestReaderBehavior::Entries(vec![first]),
-                    TestReaderBehavior::Entries(vec![second]),
-                ],
-                ..Default::default()
-            },
-            FallbackClaimTracker::default(),
-            Box::new(move |_, _| Box::pin(async { Err(DiskError::ErasureReadQuorum) })),
-        )
-        .await
-        .expect_err("a resolution failure after reader advancement must fail the listing");
-
-        assert_eq!(err, DiskError::ErasureReadQuorum);
     }
 
     #[tokio::test]

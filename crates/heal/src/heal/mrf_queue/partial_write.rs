@@ -69,6 +69,11 @@ impl PartialWriteKey {
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum ResponsibilityState {
     Active {},
+    SourceAndCurrentGenerationUnknown {
+        since_ms: u64,
+        next_probe_at_ms: u64,
+        probe_attempts: u32,
+    },
     HeldUnverifiedLegacy {
         bucket_incarnation_id: Uuid,
         since_ms: u64,
@@ -102,6 +107,7 @@ impl ResponsibilityState {
     fn estimated_bytes(&self) -> usize {
         match self {
             Self::Active {} => 0,
+            Self::SourceAndCurrentGenerationUnknown { .. } => 2 * std::mem::size_of::<u64>() + std::mem::size_of::<u32>(),
             Self::HeldUnverifiedLegacy { .. } => std::mem::size_of::<Uuid>() + std::mem::size_of::<u64>(),
             Self::LegacyGenerationUnknown { .. } => std::mem::size_of::<Uuid>() + std::mem::size_of::<u64>(),
             Self::BucketIncarnationChanged { .. } => 2 * std::mem::size_of::<Uuid>() + std::mem::size_of::<u64>(),
@@ -116,7 +122,7 @@ impl ResponsibilityState {
 
     pub(super) fn bucket_incarnation_id(&self) -> Option<Uuid> {
         match self {
-            Self::Active {} => None,
+            Self::Active {} | Self::SourceAndCurrentGenerationUnknown { .. } => None,
             Self::HeldUnverifiedLegacy {
                 bucket_incarnation_id, ..
             }
@@ -158,6 +164,7 @@ impl ResponsibilityCheckpoint {
         }
         match &self.state {
             ResponsibilityState::Active {} => true,
+            ResponsibilityState::SourceAndCurrentGenerationUnknown { .. } => self.source_bucket_incarnation_id.is_none(),
             ResponsibilityState::HeldUnverifiedLegacy {
                 bucket_incarnation_id, ..
             } => !bucket_incarnation_id.is_nil() && self.source_bucket_incarnation_id == Some(*bucket_incarnation_id),
@@ -210,11 +217,16 @@ struct Responsibility {
     consecutive_unverified_attempts: u32,
     last_identity_probe_result: Option<&'static str>,
     last_identity_probe_at_ms: Option<u64>,
+    first_unresolved_at_ms: Option<u64>,
 }
 
 impl Responsibility {
     fn generation_unobserved(&self) -> bool {
-        self.source_bucket_incarnation_id.is_none() && matches!(self.state, ResponsibilityState::Active {})
+        self.source_bucket_incarnation_id.is_none()
+            && matches!(
+                self.state,
+                ResponsibilityState::Active {} | ResponsibilityState::SourceAndCurrentGenerationUnknown { .. }
+            )
     }
 
     fn is_parked(&self) -> bool {
@@ -251,6 +263,12 @@ pub(super) struct PartialWriteLifecycleSummary {
     pub oldest_operator_accepted_at_ms: Option<u64>,
 }
 
+pub(super) struct PendingLifecycleTransition {
+    pub intent: MrfIntent,
+    pub record: ResponsibilityCheckpoint,
+    pub next_attempt: Instant,
+}
+
 /// Durable storage responsibilities have no guaranteed rediscovery producer.
 /// Admission, task failure and retry exhaustion cannot release their records.
 #[derive(Default)]
@@ -261,6 +279,8 @@ pub(super) struct PartialWrites {
     identity_probe_order: VecDeque<PartialWriteKey>,
     identity_probe_index: HashSet<PartialWriteKey>,
     retirement_checks: HashMap<(Arc<str>, Uuid), (Instant, bool)>,
+    unresolved_generation_candidate: Option<PartialWriteKey>,
+    pub(super) pending_lifecycle_transition: Option<PendingLifecycleTransition>,
     bytes: usize,
 }
 
@@ -356,6 +376,7 @@ impl PartialWrites {
                 consecutive_unverified_attempts: 0,
                 last_identity_probe_result: None,
                 last_identity_probe_at_ms: None,
+                first_unresolved_at_ms: None,
             },
         );
         self.bytes = next_bytes;
@@ -479,7 +500,8 @@ impl PartialWrites {
                             .map_or(*since_ms, |oldest| oldest.min(*since_ms)),
                     );
                 }
-                ResponsibilityState::LegacyGenerationUnknown { .. } => summary.legacy_generation_unknown_count += 1,
+                ResponsibilityState::LegacyGenerationUnknown { .. }
+                | ResponsibilityState::SourceAndCurrentGenerationUnknown { .. } => summary.legacy_generation_unknown_count += 1,
                 ResponsibilityState::BucketIncarnationChanged { .. } => summary.bucket_incarnation_changed_count += 1,
                 ResponsibilityState::OperatorAcceptedUnverified { accepted_at_ms, .. } => {
                     summary.operator_accepted_count += 1;
@@ -525,6 +547,17 @@ impl PartialWrites {
         entry.source_bucket_incarnation_id = record.source_bucket_incarnation_id;
         entry.last_operator_acceptance = record.last_operator_acceptance.clone();
         entry.state = record.state.clone();
+        if let ResponsibilityState::SourceAndCurrentGenerationUnknown {
+            next_probe_at_ms,
+            probe_attempts,
+            ..
+        } = &entry.state
+        {
+            let delay = Duration::from_millis(next_probe_at_ms.saturating_sub(unix_now_ms()))
+                .clamp(MRF_RETIREMENT_PROOF_RECHECK_INTERVAL, MAX_UNVERIFIED_RETRY_BACKOFF);
+            entry.next_attempt = Instant::now() + delay;
+            entry.consecutive_unverified_attempts = *probe_attempts;
+        }
         self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
         if entry.is_parked() {
             entry.retry_queued = false;
@@ -616,6 +649,9 @@ impl PartialWrites {
                 return Err("a different operator disposition already exists");
             }
             ResponsibilityState::Active {} => return Err("responsibility is not held as unverified legacy"),
+            ResponsibilityState::SourceAndCurrentGenerationUnknown { .. } => {
+                return Err("current bucket incarnation is unresolved");
+            }
         };
         if current_incarnation != expected_bucket_incarnation_id {
             return Err("bucket incarnation changed; refresh the responsibility listing");
@@ -743,6 +779,9 @@ impl PartialWrites {
             let (status, bucket_incarnation_id, held_since_ms) = match &entry.state {
                 ResponsibilityState::Active {} if entry.generation_unobserved() => ("legacy_generation_unobserved", None, None),
                 ResponsibilityState::Active {} => continue,
+                ResponsibilityState::SourceAndCurrentGenerationUnknown { since_ms, .. } => {
+                    ("source_and_current_generation_unknown", None, Some(*since_ms))
+                }
                 ResponsibilityState::HeldUnverifiedLegacy {
                     bucket_incarnation_id,
                     since_ms,
@@ -851,14 +890,52 @@ impl PartialWrites {
             entry.retry_queued = false;
         } else if source_bucket_incarnation_id.is_none() {
             let old_cost = Self::entry_cost(entry);
+            let detected_at_ms = match entry.state {
+                ResponsibilityState::SourceAndCurrentGenerationUnknown { since_ms, .. }
+                | ResponsibilityState::LegacyGenerationUnknown {
+                    detected_at_ms: since_ms,
+                    ..
+                } => since_ms,
+                _ => unix_now_ms(),
+            };
             entry.state = ResponsibilityState::LegacyGenerationUnknown {
                 observed_bucket_incarnation_id,
-                detected_at_ms: unix_now_ms(),
+                detected_at_ms,
             };
             self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
             entry.retry_queued = false;
         }
         Ok((previous, previous_acceptance))
+    }
+
+    pub(super) fn take_unresolved_generation_candidate(&mut self) -> Option<PendingLifecycleTransition> {
+        let key = self.unresolved_generation_candidate.take()?;
+        let entry = self.entries.get(&key)?;
+        if !entry.persisted
+            || entry.source_bucket_incarnation_id.is_some()
+            || !matches!(entry.state, ResponsibilityState::Active {})
+        {
+            return None;
+        }
+        let since_ms = entry.first_unresolved_at_ms?;
+        let next_probe_at_ms = unix_now_ms().saturating_add(
+            u64::try_from(entry.next_attempt.saturating_duration_since(Instant::now()).as_millis()).unwrap_or(u64::MAX),
+        );
+        Some(PendingLifecycleTransition {
+            intent: entry.intent.clone(),
+            record: ResponsibilityCheckpoint {
+                intent_digest: super::intent_digest(&entry.intent)?,
+                responsibility_id: entry.responsibility_id,
+                source_bucket_incarnation_id: None,
+                last_operator_acceptance: entry.last_operator_acceptance.clone(),
+                state: ResponsibilityState::SourceAndCurrentGenerationUnknown {
+                    since_ms,
+                    next_probe_at_ms,
+                    probe_attempts: entry.consecutive_unverified_attempts,
+                },
+            },
+            next_attempt: Instant::now(),
+        })
     }
 
     pub(super) fn mark_persisted(&mut self) {
@@ -934,6 +1011,7 @@ impl PartialWrites {
     }
 
     async fn probe_unknown_generation(&mut self, manager: &HealManager, config: &MrfConsumerConfig) -> bool {
+        self.unresolved_generation_candidate = None;
         if config.replay_batch == 0 {
             return false;
         }
@@ -952,34 +1030,60 @@ impl PartialWrites {
                 continue;
             }
             self.identity_probe_index.insert(key.clone());
-            self.identity_probe_order.push_back(key);
+            self.identity_probe_order.push_back(key.clone());
             if !entry.persisted || entry.next_attempt > now {
                 continue;
             }
             // Advance before awaiting so cancellation cannot cause a tight
-            // retry loop. Restart begins with the same conservative delay.
-            entry.defer_unverified_attempt(now, config.admission_backoff.max(MRF_RETIREMENT_PROOF_RECHECK_INTERVAL));
+            // retry loop. V2 checkpoints also retain this pacing on restart.
+            entry.defer_unverified_attempt(
+                now,
+                config
+                    .admission_backoff
+                    .clamp(MRF_RETIREMENT_PROOF_RECHECK_INTERVAL, MAX_UNVERIFIED_RETRY_BACKOFF),
+            );
+            let (lifecycle_changed, detected_at_ms) = match &mut entry.state {
+                ResponsibilityState::SourceAndCurrentGenerationUnknown {
+                    since_ms,
+                    next_probe_at_ms,
+                    probe_attempts,
+                } => {
+                    *next_probe_at_ms = unix_now_ms().saturating_add(
+                        u64::try_from(entry.next_attempt.saturating_duration_since(now).as_millis()).unwrap_or(u64::MAX),
+                    );
+                    *probe_attempts = entry.consecutive_unverified_attempts;
+                    (true, *since_ms)
+                }
+                _ => (false, unix_now_ms()),
+            };
             let result = tokio::time::timeout(
                 MRF_IDENTITY_PROBE_TIMEOUT,
                 manager.mrf_bucket_incarnation_id(entry.intent.bucket.as_ref()),
             )
             .await;
-            entry.last_identity_probe_at_ms = Some(unix_now_ms());
+            let observed_at_ms = unix_now_ms();
+            entry.last_identity_probe_at_ms = Some(observed_at_ms);
             match result {
                 Ok(Ok(Some(observed_bucket_incarnation_id))) => {
                     let old_cost = Self::entry_cost(entry);
                     entry.state = ResponsibilityState::LegacyGenerationUnknown {
                         observed_bucket_incarnation_id,
-                        detected_at_ms: unix_now_ms(),
+                        detected_at_ms,
                     };
                     entry.last_identity_probe_result = Some("known");
                     self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
                     return true;
                 }
-                Ok(Ok(None)) => entry.last_identity_probe_result = Some("unresolved"),
+                Ok(Ok(None)) => {
+                    entry.last_identity_probe_result = Some("unresolved");
+                    if config.lifecycle_v2_writer_enabled && matches!(entry.state, ResponsibilityState::Active {}) {
+                        entry.first_unresolved_at_ms.get_or_insert(observed_at_ms);
+                        self.unresolved_generation_candidate = Some(key);
+                    }
+                }
                 Ok(Err(_)) | Err(_) => entry.last_identity_probe_result = Some("unavailable"),
             }
-            return false;
+            return lifecycle_changed;
         }
         false
     }
@@ -2127,8 +2231,14 @@ mod tests {
         let records = writes.checkpoint_records(super::super::intent_digest);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].intent_digest, records[1].intent_digest);
-        let lifecycle = super::super::encode_mrf_lifecycle_checkpoint(owner, sequence, records, lifecycle_limit)
-            .expect("same-key generations need distinct lifecycle records");
+        let lifecycle = super::super::encode_mrf_lifecycle_checkpoint(
+            crate::heal::mrf_queue::MRF_LIFECYCLE_FORMAT_VERSION,
+            owner,
+            sequence,
+            records,
+            lifecycle_limit,
+        )
+        .expect("same-key generations need distinct lifecycle records");
         super::super::snapshot::publish_committed_snapshot_with_companion(
             &disks,
             owner,
@@ -2152,6 +2262,7 @@ mod tests {
             config,
             checkpoint_owner: Uuid::new_v4(),
             next_checkpoint_sequence: replay.next_checkpoint_sequence,
+            lifecycle_format_version: replay.lifecycle_format_version,
             new_since_flush: 0,
             dirty: false,
             journal_on_disk: replay.journal_on_disk,
@@ -2288,6 +2399,7 @@ mod tests {
         let lifecycle_limit = config.journal_max_bytes.saturating_mul(4);
         let owner = Uuid::new_v4();
         let lifecycle = super::super::encode_mrf_lifecycle_checkpoint(
+            crate::heal::mrf_queue::MRF_LIFECYCLE_FORMAT_VERSION,
             owner,
             7,
             writes.checkpoint_records(super::super::intent_digest),
@@ -2314,6 +2426,7 @@ mod tests {
             config,
             checkpoint_owner: Uuid::new_v4(),
             next_checkpoint_sequence: replay.next_checkpoint_sequence,
+            lifecycle_format_version: replay.lifecycle_format_version,
             new_since_flush: 0,
             dirty: false,
             journal_on_disk: replay.journal_on_disk,
@@ -2424,6 +2537,7 @@ mod tests {
             config,
             checkpoint_owner: Uuid::new_v4(),
             next_checkpoint_sequence: 1,
+            lifecycle_format_version: crate::heal::mrf_queue::MRF_LIFECYCLE_FORMAT_VERSION,
             new_since_flush: 0,
             dirty: false,
             journal_on_disk: true,
@@ -2501,6 +2615,7 @@ mod tests {
             config,
             checkpoint_owner: Uuid::new_v4(),
             next_checkpoint_sequence: 1,
+            lifecycle_format_version: crate::heal::mrf_queue::MRF_LIFECYCLE_FORMAT_VERSION,
             new_since_flush: 0,
             dirty: false,
             journal_on_disk: true,

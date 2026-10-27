@@ -64,7 +64,19 @@ A single local path (`rustfs D:\rustfs\data`) is a single-node single-drive depl
 
 An empty `RUSTFS_STORAGE_CLASS_STANDARD` or `RUSTFS_STORAGE_CLASS_RRS` restores the automatic policy and overrides a persisted value (`standard_policy` / `rrs_policy`). `MINIO_`-prefixed spellings of these keys, of `ERASURE_SET_DRIVE_COUNT`, and of `VOLUMES` are mapped onto the `RUSTFS_` names when the `RUSTFS_` name is unset (`apply_external_env_compat` in `crates/utils/src/envs.rs`); when both are set the `RUSTFS_` value wins and the conflict is reported at startup.
 
-Heal knobs (`RUSTFS_HEAL_*`) and their defaults are documented once, in [scanner-runtime-controls.md](scanner-runtime-controls.md#heal-runtime-controls); the deep bitrot cycle is the admin config key `heal.bitrot_cycle` (environment `RUSTFS_SCANNER_BITROT_CYCLE_SECS`), not a `RUSTFS_HEAL_*` variable. Data-movement knobs: `RUSTFS_REBALANCE_MAX_ATTEMPTS` (default `DEFAULT_REBALANCE_MAX_ATTEMPTS` = 3, `crates/ecstore/src/services/rebalance/mod.rs`), `RUSTFS_DECOMMISSION_BUCKET_CONCURRENCY` (default cap 4) and `RUSTFS_DECOMMISSION_ENTRY_CONCURRENCY` (default cap 8, hard cap 64) in `crates/ecstore/src/core/pools.rs`, and `RUSTFS_LIST_OBJECTS_QUORUM` (default `optimal`; `disk`, `reduced`, `optimal`, `auto`, anything else `strict`, per `normalize_list_quorum` in `crates/ecstore/src/store/list_objects.rs`). None of them relaxes object quorum, object locks, or version checks.
+Heal knobs (`RUSTFS_HEAL_*`) and their defaults are documented once, in [scanner-runtime-controls.md](scanner-runtime-controls.md#heal-runtime-controls); the deep bitrot cycle is the admin config key `heal.bitrot_cycle` (environment `RUSTFS_SCANNER_BITROT_CYCLE_SECS`), not a `RUSTFS_HEAL_*` variable. Data-movement knobs: `RUSTFS_REBALANCE_MAX_ATTEMPTS` (default `DEFAULT_REBALANCE_MAX_ATTEMPTS` = 3, `crates/ecstore/src/services/rebalance/mod.rs`), `RUSTFS_DECOMMISSION_BUCKET_CONCURRENCY` (default cap 4) and `RUSTFS_DECOMMISSION_ENTRY_CONCURRENCY` (default cap 8, hard cap 64) in `crates/ecstore/src/core/pools.rs`, and `RUSTFS_LIST_OBJECTS_QUORUM` (default `strict`, which reads every online drive of the set; `disk`, `reduced`, `optimal` and `auto` read a sample, and anything else means `strict`, per `normalize_list_quorum` in `crates/ecstore/src/store/list_objects.rs`). `optimal` reads about half of the drives, so a deleted object can briefly reappear in a listing while the sampled drives still hold a stale copy; a GET or HEAD of that key still returns 404. None of them relaxes object quorum, object locks, or version checks.
+
+### 3.1 Retired listing index: upgrade and rollback
+
+ListObjects uses the disk walker; the experimental `RUSTFS_LIST_OBJECTS_INDEX_*` provider is retired. New writers no longer update its namespace mutation journal. An older node can therefore mistake a persistent index snapshot for a current one and omit newly written keys. Deployments that never used persistent index snapshots need no additional rollout step.
+
+For deployments that used persistent snapshots:
+
+1. Before replacing any binary, first restart every old node with `RUSTFS_LIST_OBJECTS_INDEX_MODE` unset. Verify the running configuration on every node and finish this configuration rollout while all nodes still use the old binary.
+2. Keep the provider disabled throughout the binary upgrade and any mixed-version operation. Removing the setting only from new nodes does not protect old readers.
+3. On rollback, keep the provider disabled until every writer again runs a version that updates the old journal. Before re-enabling it, set `RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_GENERATION` to a fresh shared value on the old nodes. The generation mismatch forces the old provider to rebuild its snapshots from the live namespace; do not reuse snapshots produced before the unjournaled writes.
+
+This is a deployment prerequisite, not automatic mixed-version cache invalidation. Do not delete mutation journals or object metadata to force a rebuild.
 
 ## 4. Storage classes, parity, capacity, quorum
 

@@ -728,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn test_index_round_trip_with_negative_compressed_deltas_and_large_offsets() -> io::Result<()> {
+    fn test_index_round_trip_with_negative_compressed_deltas_and_maximum_totals() -> io::Result<()> {
         let mut source = Index::new();
         source.est_block_uncomp = 1 << 20;
         // Compressed blocks much smaller than est_block_uncomp / 2 (512 KiB)
@@ -737,8 +737,9 @@ mod tests {
         source.add(200, 1 << 20)?;
         source.add(300, 2 << 20)?;
         source.add(450, (3 << 20) + 12345)?;
-        source.total_uncompressed = 1i64 << 56;
-        source.total_compressed = 1i64 << 55;
+        // ZigZag + LEB128 needs all 10 bytes for the largest valid signed value.
+        source.total_uncompressed = i64::MAX;
+        source.total_compressed = i64::MAX;
 
         let encoded = source.clone().into_vec();
         let mut decoded = Index::new();
