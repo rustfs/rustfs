@@ -27980,6 +27980,167 @@ mod tests {
         );
     }
 
+    /// One version commits, then every in-place attempt to copy the next one
+    /// times out on the target namespace lock. The entry is deferred, not
+    /// failed, with both source versions retained; the resumed entry finds the
+    /// committed version and moves both with their exact bytes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_defers_target_lookup_lock_timeout_and_retries_without_losing_source() {
+        use tokio::io::AsyncReadExt as _;
+
+        let fixture = NullVersionDecommission::new(NullVersionTop::NewerVersion).await;
+        let object = fixture.object;
+        let injected = Arc::new(AtomicUsize::new(0));
+        let attempted = Arc::new(AtomicUsize::new(0));
+        let fault = DecommissionTestFaultGuard::install_with_error(
+            Arc::new({
+                let injected = Arc::clone(&injected);
+                let attempted = Arc::clone(&attempted);
+                move |stage, _, faulted, _, success| {
+                    let target = stage == "before_target_commit" && faulted == object && success;
+                    let should_inject = target && attempted.fetch_add(1, Ordering::SeqCst) > 0;
+                    if should_inject {
+                        injected.fetch_add(1, Ordering::SeqCst);
+                    }
+                    should_inject
+                }
+            }),
+            Some(Arc::new(|_, bucket, object| {
+                data_movement::data_movement_stage_error_for_test(
+                    "decommission_object",
+                    "prepare_put_object",
+                    bucket,
+                    object,
+                    Error::Lock(rustfs_lock::LockError::timeout(
+                        format!("{bucket}/{object}@latest"),
+                        std::time::Duration::from_secs(5),
+                    )),
+                )
+            })),
+        );
+        let (outcome, _) = fixture.run_entry().await;
+        assert_eq!(injected.load(Ordering::SeqCst), DECOMMISSION_VERSION_COPY_ATTEMPTS);
+        fixture.assert_source_retained().await;
+        assert_eq!(
+            fixture
+                .target_versions()
+                .await
+                .expect("the first version was copied")
+                .versions
+                .len(),
+            1,
+            "one version must commit before the next version times out"
+        );
+        assert!(
+            matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_timeout_deferral(err)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            fixture.store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("active decommission")
+                .items_decommission_failed,
+            0,
+            "a deferred entry must not be counted as a permanent failure"
+        );
+        drop(fault);
+        let (outcome, _) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        fixture.assert_moved().await;
+        let mut reader = fixture.store.pools[1]
+            .get_object_reader(
+                fixture.bucket,
+                fixture.object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(fixture.seeded.versions[0].version_id.expect("newer version").to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the newer version must remain readable");
+        let mut actual = Vec::new();
+        reader.stream.read_to_end(&mut actual).await.expect("read the newer version");
+        assert_eq!(actual, b"written after versioning was enabled");
+    }
+
+    /// A namespace lock still held on the target key, as by a copy whose node
+    /// was killed mid-write, makes target selection fail with a typed
+    /// object-lock timeout. A real held lock, not an injected error, must defer
+    /// the entry rather than fail it; once the lock is released selection
+    /// recovers and the resumed entry moves both versions.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_target_selection_returns_timeout_for_a_held_object_lock() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
+            let fixture = NullVersionDecommission::new(NullVersionTop::NewerVersion).await;
+            let target_set = fixture.store.pools[1].get_disks_by_key(fixture.object);
+            let lock = target_set
+                .new_ns_lock(fixture.bucket, fixture.object)
+                .await
+                .expect("target lock");
+            let guard = lock
+                .get_write_lock(std::time::Duration::from_secs(30))
+                .await
+                .expect("hold target lock");
+            let opts = ObjectOptions {
+                data_movement: true,
+                src_pool_idx: 0,
+                version_id: Some(uuid::Uuid::nil().to_string()),
+                ..Default::default()
+            };
+            let select = || {
+                fixture
+                    .store
+                    .select_data_movement_pool_idx(fixture.bucket, fixture.object, 1, &opts, false)
+            };
+            let result = tokio::time::timeout(get_lock_acquire_timeout() + std::time::Duration::from_secs(15), select())
+                .await
+                .expect("target selection must terminate");
+            match result {
+                Err(Error::Lock(rustfs_lock::LockError::Timeout { resource, .. })) => {
+                    assert!(resource.contains(fixture.bucket) && resource.contains(fixture.object), "{resource}");
+                }
+                other => panic!("expected an object lock timeout, got {other:?}"),
+            }
+
+            let (outcome, _) = fixture.run_entry().await;
+            assert!(
+                matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_timeout_deferral(err)),
+                "{outcome:?}"
+            );
+            assert_eq!(
+                fixture.store.pool_meta.read().await.pools[0]
+                    .decommission
+                    .as_ref()
+                    .expect("active decommission")
+                    .items_decommission_failed,
+                0,
+                "a held target lock must not be counted as a permanent failure"
+            );
+            fixture.assert_source_retained().await;
+            assert!(
+                fixture.target_versions().await.is_none(),
+                "no version may commit while the target lock is held"
+            );
+
+            drop(guard);
+            assert_eq!(
+                select()
+                    .await
+                    .expect("target selection must recover once the lock is released"),
+                1
+            );
+            let (outcome, _) = fixture.run_entry().await;
+            assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+            fixture.assert_moved().await;
+        })
+        .await;
+    }
+
     #[test]
     fn decommission_object_attempt_metric_keeps_the_peak() {
         let mut attempts = 0;
