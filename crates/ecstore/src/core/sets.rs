@@ -19,7 +19,6 @@ use crate::layout::set_heal::{formats_to_drives_info, new_heal_format_sets};
 use crate::multipart_listing::paginate_multipart_listing;
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
-    list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
     multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo},
     object::{DeleteAccounting, DeletedObject, ObjectIO as _, ObjectOperations as _, ObjectToDelete},
     range::HTTPRangeSpec,
@@ -60,15 +59,9 @@ use std::{
 use tokio::sync::RwLock;
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::time::Duration;
-use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use tracing::{error, info};
 use uuid::Uuid;
-
-type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
-type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
-type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
-type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 const LIST_MULTIPART_SETS_CONCURRENCY: usize = 4;
 
@@ -322,6 +315,17 @@ impl Sets {
     #[allow(dead_code)] // Consumed starting Slice 3 (lock-namespace isolation).
     pub(crate) fn instance_ctx(&self) -> &Arc<InstanceContext> {
         &self.ctx
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn stop_endpoint_monitor_for_test(&self) {
+        if let Some(exit_signal) = &self.exit_signal {
+            let _ = exit_signal.send(());
+            // Wait for an in-flight reconnect pass as well as its receiver to exit.
+            while exit_signal.receiver_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        }
     }
 
     /// Keep simulated peers' metadata ownership separate while sharing disks and lock clients.
@@ -879,67 +883,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for Sets {
         self.get_disks_by_key(object)
             .restore_transitioned_object(bucket, object, opts)
             .await
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::storage_api_contracts::list::ListOperations for Sets {
-    type Error = Error;
-    type ListObjectsV2Info = ListObjectsV2Info;
-    type ListObjectVersionsInfo = ListObjectVersionsInfo;
-    type ObjectInfoOrErr = ObjectInfoOrErr;
-    type WalkOptions = WalkOptions;
-    type WalkCancellation = CancellationToken;
-    type WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>;
-
-    #[tracing::instrument(level = "trace", skip(self))]
-    async fn list_objects_v2(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        continuation_token: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-        fetch_owner: bool,
-        start_after: Option<String>,
-        incl_deleted: bool,
-    ) -> Result<ListObjectsV2Info> {
-        self.inner_list_objects_v2(
-            bucket,
-            prefix,
-            continuation_token,
-            delimiter,
-            max_keys,
-            fetch_owner,
-            start_after,
-            incl_deleted,
-        )
-        .await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn list_object_versions(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        marker: Option<String>,
-        version_marker: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-    ) -> Result<ListObjectVersionsInfo> {
-        self.inner_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
-            .await
-    }
-
-    async fn walk(
-        self: Arc<Self>,
-        rx: CancellationToken,
-        bucket: &str,
-        prefix: &str,
-        result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
-        opts: WalkOptions,
-    ) -> Result<()> {
-        self.walk_internal(rx, bucket, prefix, result, opts).await
     }
 }
 
@@ -1515,9 +1458,7 @@ mod tests {
     use crate::layout::endpoint::Endpoint;
     use crate::layout::endpoints::SetupType;
     use crate::storage_api_contracts::heal::HealOperations as _;
-    use crate::storage_api_contracts::list::ListOperations as _;
     use crate::storage_api_contracts::multipart::MultipartOperations as _;
-    use rustfs_lock::client::local::LocalClient;
     use serial_test::serial;
 
     struct SetupTypeGuard {
@@ -2095,100 +2036,6 @@ mod tests {
             .expect("second delimiter page should list across every set");
         assert!(!second.is_truncated);
         assert_eq!(second.common_prefixes, expected_prefixes[1..]);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    #[serial]
-    async fn sets_list_objects_v2_lists_objects_within_the_pool() {
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
-        let format = FormatV3::new(1, 2);
-        let mut endpoints = Vec::new();
-        let mut disks = Vec::new();
-
-        for disk_idx in 0..2 {
-            let dir = tempfile::tempdir().expect("tempdir should be created");
-            let mut endpoint =
-                Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
-            endpoint.set_pool_index(0);
-            endpoint.set_set_index(0);
-            endpoint.set_disk_index(disk_idx);
-
-            let disk = new_disk(
-                &endpoint,
-                &DiskOption {
-                    cleanup: false,
-                    health_check: false,
-                },
-            )
-            .await
-            .expect("disk should be created");
-
-            let mut disk_format = format.clone();
-            disk_format.erasure.this = format.erasure.sets[0][disk_idx];
-            save_format_file(&Some(disk.clone()), &Some(disk_format))
-                .await
-                .expect("format should be saved");
-
-            std::mem::forget(dir);
-            endpoints.push(endpoint);
-            disks.push(Some(disk));
-        }
-
-        let set_disks = SetDisks::new(
-            "test-owner".to_string(),
-            Arc::new(RwLock::new(disks)),
-            2,
-            1,
-            0,
-            0,
-            endpoints.clone(),
-            format.clone(),
-            vec![Arc::new(LocalClient::new()), Arc::new(LocalClient::new())],
-        )
-        .await;
-
-        let sets = Arc::new(Sets {
-            id: format.id,
-            disk_set: vec![set_disks],
-            pool_idx: 0,
-            endpoints: PoolEndpoints {
-                legacy: false,
-                set_count: 1,
-                drives_per_set: 2,
-                endpoints: Endpoints::from(endpoints),
-                cmd_line: String::new(),
-                platform: String::new(),
-            },
-            format,
-            parity_count: 1,
-            set_count: 1,
-            set_drive_count: 2,
-            default_parity_count: 1,
-            distribution_algo: DistributionAlgoVersion::V1,
-            exit_signal: None,
-            ctx: bootstrap_ctx(),
-        });
-
-        let bucket = format!("bucket-{}", Uuid::new_v4().simple());
-        let object = format!("object-{}", Uuid::new_v4().simple());
-
-        sets.make_bucket(&bucket, &MakeBucketOptions::default())
-            .await
-            .expect("bucket should be created");
-
-        let mut reader = PutObjReader::from_vec(b"hello".to_vec());
-        sets.put_object(&bucket, &object, &mut reader, &ObjectOptions::default())
-            .await
-            .expect("object should be written");
-
-        let result = sets
-            .clone()
-            .list_objects_v2(&bucket, "", None, None, 1000, false, None, false)
-            .await
-            .expect("pool-level listing should succeed");
-
-        assert_eq!(result.objects.len(), 1);
-        assert_eq!(result.objects[0].name, object);
     }
 
     #[tokio::test]

@@ -188,6 +188,106 @@ impl crate::storage_api::owner::ObjectIO for MutableCycleStateStore {
     }
 }
 
+/// Fails the first `failures` cycle state reads like a lock timeout, then serves `state`.
+#[derive(Debug)]
+struct FlakyCycleStateStore {
+    state: Vec<u8>,
+    failures: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::storage_api::owner::ObjectIO for FlakyCycleStateStore {
+    type Error = EcstoreError;
+    type RangeSpec = crate::storage_api::owner::HTTPRangeSpec;
+    type HeaderMap = http::HeaderMap;
+    type ObjectOptions = crate::ScannerObjectOptions;
+    type ObjectInfo = crate::ScannerObjectInfo;
+    type GetObjectReader = crate::ScannerGetObjectReader;
+    type PutObjectReader = crate::ScannerPutObjReader;
+
+    async fn get_object_reader(
+        &self,
+        bucket: &str,
+        object: &str,
+        _range: Option<Self::RangeSpec>,
+        _h: Self::HeaderMap,
+        _opts: &Self::ObjectOptions,
+    ) -> Result<Self::GetObjectReader, Self::Error> {
+        if bucket != RUSTFS_META_BUCKET || object != DATA_USAGE_BLOOM_NAME_PATH.as_str() {
+            return Err(EcstoreError::FileNotFound);
+        }
+        if self
+            .failures
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+            .is_ok()
+        {
+            return Err(EcstoreError::other("lock acquisition timeout for the cycle state after 5s"));
+        }
+        Ok(crate::ScannerGetObjectReader {
+            stream: Box::new(Cursor::new(self.state.clone())),
+            object_info: crate::ScannerObjectInfo {
+                etag: Some("cycle-state".to_string()),
+                ..Default::default()
+            },
+            buffered_body: None,
+            body_source: Default::default(),
+        })
+    }
+
+    async fn put_object(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _data: &mut Self::PutObjectReader,
+        _opts: &Self::ObjectOptions,
+    ) -> Result<Self::ObjectInfo, Self::Error> {
+        Err(EcstoreError::other("cycle state test store is read-only"))
+    }
+}
+
+fn spawn_flaky_fence_watcher(failures: usize) -> tokio::task::JoinHandle<Result<(), ScannerError>> {
+    let store = Arc::new(FlakyCycleStateStore {
+        state: crate::scanner::encode_scanner_cycle_fence_for_test(7, 9),
+        failures: AtomicUsize::new(failures),
+    });
+    tokio::spawn(async move {
+        let cache = Mutex::new(None);
+        let refresh = AsyncMutex::new(());
+        watch_remote_scanner_request_fence_with_cache(
+            7,
+            9,
+            store,
+            Duration::from_millis(5),
+            &cache,
+            &refresh,
+            Duration::from_millis(1),
+        )
+        .await
+    })
+}
+
+#[tokio::test]
+async fn fence_watcher_retries_transient_cycle_state_read_failures() {
+    let watcher = spawn_flaky_fence_watcher(3);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !watcher.is_finished(),
+        "a few unreadable polls must not stop a walk whose fence still matches"
+    );
+    watcher.abort();
+}
+
+#[tokio::test]
+async fn fence_watcher_stops_when_cycle_state_stays_unreadable() {
+    let err = tokio::time::timeout(Duration::from_secs(2), spawn_flaky_fence_watcher(usize::MAX))
+        .await
+        .expect("fence watcher should give up on a state it can never read")
+        .expect("fence watcher task should not panic")
+        .expect_err("an unreadable fence must eventually stop the walk");
+    assert!(matches!(err, ScannerError::CycleStateUnavailable(_)), "unexpected error: {err}");
+    assert!(err.to_string().contains("failed to read persisted scanner cycle state"));
+}
+
 fn test_usage(bucket: &str, objects: usize) -> DataUsageEntryInfo {
     let entry = crate::DataUsageEntry {
         objects,

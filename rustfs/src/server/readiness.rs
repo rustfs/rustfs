@@ -80,11 +80,12 @@ const METRIC_RUNTIME_READINESS_DEGRADED_TOTAL: &str = "rustfs_runtime_readiness_
 const METRIC_POOL_METADATA_CHECK_TIMEOUT_TOTAL: &str = "rustfs_pool_metadata_check_timeouts_total";
 
 pub use crate::shared_types::{
-    DependencyReadiness, DependencyReadinessReport, ReadinessDegradedReason, StorageReadinessDetails, UnavailableReadinessDrive,
+    DependencyReadiness, DependencyReadinessReport, MissingReadinessDrive, ReadinessDegradedReason, StorageReadinessDetails,
+    UnavailableReadinessDrive,
 };
 
 /// ReadinessGateLayer ensures that the system components (IAM, Storage)
-/// are fully initialized before allowing any request to proceed.
+/// are fully initialized before allowing S3 data-plane requests to proceed.
 #[derive(Clone)]
 pub struct ReadinessGateLayer {
     readiness: Arc<GlobalReadiness>,
@@ -217,10 +218,13 @@ where
         Box::pin(async move {
             let path = req.uri().path();
             debug!("ReadinessGateService: Received request for path: {}", path);
-            if readiness_gate_blocks_path(path, &readiness) {
+            // Control services must reach the authenticated gRPC router while
+            // their storage owners are still initializing.
+            let grpc_request = crate::server::hybrid::is_grpc_request(&req);
+            if !grpc_request && readiness_gate_blocks_path(path, &readiness) {
                 return Ok(service_not_ready_response(readiness.current_stage()));
             }
-            if !is_probe_path(path) && readiness.is_ready() {
+            if !grpc_request && !is_probe_path(path) && readiness.is_ready() {
                 mark_get_metadata_read_version_coalescing_service_ready();
             }
             let resp = inner.call(req).await?;
@@ -939,8 +943,9 @@ pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
         let pool_metadata_status = store.pool_meta_write_status().await;
         storage = apply_node_pool_metadata_timeout_policy(pool_metadata_write_readiness(pool_metadata_status), Instant::now());
         match node_storage_snapshot(store.as_ref(), &lock_observation.online_hosts).await {
-            Ok((info, unavailable_drives)) => {
+            Ok((info, unavailable_drives, missing_drives)) => {
                 details.unavailable_drives = unavailable_drives;
+                details.missing_drives = missing_drives;
                 details.read_quorum_ready = storage_read_ready_from_runtime_state(&info);
                 details.write_quorum_ready = storage_ready_from_runtime_state(&info);
             }
@@ -970,7 +975,7 @@ pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
 async fn node_storage_snapshot<S>(
     store: &S,
     online_hosts: &HashSet<String>,
-) -> Result<(StorageInfo, Vec<UnavailableReadinessDrive>), StorageError>
+) -> Result<(StorageInfo, Vec<UnavailableReadinessDrive>, Vec<MissingReadinessDrive>), StorageError>
 where
     S: StorageAdminApi<BackendInfo = BackendInfo, Disk = DiskStore, Error = StorageError>,
 {
@@ -980,8 +985,9 @@ where
             ..Default::default()
         };
         let mut unavailable_drives = Vec::new();
+        let mut missing_drives = Vec::new();
         if configured_readiness_topology(&info).is_none() {
-            return Ok((info, unavailable_drives));
+            return Ok((info, unavailable_drives, missing_drives));
         }
 
         // Inventory and runtime health are local snapshots. Reuse the lock probe's
@@ -989,12 +995,20 @@ where
         // Do not perform disk-info RPCs or filesystem probes in node readiness.
         for (pool_idx, &set_count) in info.backend.total_sets.iter().enumerate() {
             for set_idx in 0..set_count {
-                for disk in store
-                    .disk_set_inventory(DiskSetSelector::new(pool_idx, set_idx))
-                    .await?
-                    .into_iter()
-                    .flatten()
-                {
+                let inventory = store.disk_set_inventory(DiskSetSelector::new(pool_idx, set_idx)).await?;
+                for disk_idx in 0..info.backend.drives_per_set[pool_idx] {
+                    if inventory.get(disk_idx).is_none_or(Option::is_none) {
+                        missing_drives.push(MissingReadinessDrive {
+                            pool_index: pool_idx,
+                            set_index: set_idx,
+                            disk_index: disk_idx,
+                        });
+                    }
+                }
+                // Missing-slot diagnostics do not normalize the inventory:
+                // preserve every Some entry, including duplicates and extras,
+                // for the existing quorum validation and unavailable reasons.
+                for disk in inventory.into_iter().flatten() {
                     let (snapshot, unavailable) =
                         node_disk_snapshot(disk_endpoint_snapshot(&disk), disk.runtime_state().as_str(), online_hosts);
                     if let Some(unavailable) = unavailable {
@@ -1004,7 +1018,7 @@ where
                 }
             }
         }
-        Ok((info, unavailable_drives))
+        Ok((info, unavailable_drives, missing_drives))
     })
     .await
     .map_err(|_| StorageError::Timeout)?
@@ -1407,11 +1421,12 @@ mod tests {
             let write_quorum = data + usize::from(data == parity);
             for survivors in (0..=drive_count).rev().chain(std::iter::once(drive_count)) {
                 let online_hosts = (0..survivors).map(|idx| format!("node-{idx}:9000")).collect();
-                let (info, unavailable_drives) = node_storage_snapshot(&store, &online_hosts)
+                let (info, unavailable_drives, missing_drives) = node_storage_snapshot(&store, &online_hosts)
                     .await
                     .expect("read local runtime inventory");
                 assert_eq!(info.disks.len(), drive_count, "offline members retain their topology slots");
                 assert_eq!(unavailable_drives.len(), drive_count - survivors);
+                assert!(missing_drives.is_empty(), "inventoried offline drives are not missing slots");
                 assert!(
                     unavailable_drives
                         .iter()
@@ -1429,6 +1444,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn node_storage_snapshot_reports_none_and_short_inventory_slots_without_changing_quorum() {
+        let mut store = runtime_inventory(&[(1, 4, 2)]).await;
+        let selector = DiskSetSelector::new(0, 0);
+        let full_inventory = store.disks.get(&selector).expect("configured set").clone();
+        let online_hosts = (0..4).map(|idx| format!("node-{idx}:9000")).collect();
+        for explicit_none in [true, false] {
+            let mut partial = full_inventory[..3].to_vec();
+            if explicit_none {
+                partial.push(None);
+            }
+            store.disks.insert(selector, partial);
+            let (info, unavailable, missing) = node_storage_snapshot(&store, &online_hosts)
+                .await
+                .expect("inspect configured slot domain");
+            assert_eq!(info.disks.len(), 3, "missing diagnostics must not invent a disk health state");
+            assert!(unavailable.is_empty(), "missing slots have no observed reachability or runtime state");
+            assert_eq!(
+                missing,
+                vec![MissingReadinessDrive {
+                    pool_index: 0,
+                    set_index: 0,
+                    disk_index: 3
+                }]
+            );
+            assert!(storage_read_ready_from_runtime_state(&info), "three online disks retain read quorum");
+            assert!(storage_ready_from_runtime_state(&info), "three online disks retain write quorum");
+        }
+        store.disks.insert(selector, full_inventory);
+        let (info, unavailable, missing) = node_storage_snapshot(&store, &online_hosts)
+            .await
+            .expect("fully restored inventory");
+        assert_eq!(info.disks.len(), 4);
+        assert!(unavailable.is_empty());
+        assert!(missing.is_empty());
+        assert!(storage_read_ready_from_runtime_state(&info));
+        assert!(storage_ready_from_runtime_state(&info));
+    }
+
+    #[tokio::test]
+    async fn node_storage_snapshot_retains_extra_and_duplicate_inventory_entries() {
+        let mut store = runtime_inventory(&[(1, 4, 2)]).await;
+        let selector = DiskSetSelector::new(0, 0);
+        let duplicate = store.disks[&selector][0].clone();
+        let invalid_endpoint = Endpoint {
+            url: url::Url::parse("http://extra:9000/unassigned").expect("extra endpoint"),
+            is_local: false,
+            pool_idx: -1,
+            set_idx: 0,
+            disk_idx: 5,
+        };
+        let extra = new_disk(&invalid_endpoint, &DiskOption::default())
+            .await
+            .expect("extra runtime disk handle");
+        store
+            .disks
+            .get_mut(&selector)
+            .expect("configured set")
+            .extend([duplicate, Some(extra)]);
+        let mut online_hosts: HashSet<_> = (0..4).map(|idx| format!("node-{idx}:9000")).collect();
+        online_hosts.insert("extra:9000".to_owned());
+        let (info, unavailable, missing) = node_storage_snapshot(&store, &online_hosts)
+            .await
+            .expect("inspect unnormalized inventory");
+        assert_eq!(info.disks.len(), 6, "diagnostics must preserve all Some entries");
+        assert_eq!(
+            info.disks[4].endpoint, info.disks[0].endpoint,
+            "duplicate entries reach the existing quorum validator"
+        );
+        assert_eq!(info.disks[4].disk_index, info.disks[0].disk_index);
+        assert_eq!(info.disks[5].pool_index, -1, "invalid extra entries must not vanish");
+        assert!(unavailable.is_empty());
+        assert!(missing.is_empty());
+        assert!(storage_read_ready_from_runtime_state(&info));
+        assert!(storage_ready_from_runtime_state(&info));
     }
 
     #[test]
@@ -1491,21 +1583,21 @@ mod tests {
     async fn node_storage_snapshot_requires_each_configured_set_and_distinct_drives() {
         let mut store = runtime_inventory(&[(2, 4, 2), (1, 8, 2)]).await;
         let online_hosts = (0..8).map(|idx| format!("node-{idx}:9000")).collect();
-        let (info, _) = node_storage_snapshot(&store, &online_hosts)
+        let (info, _, _) = node_storage_snapshot(&store, &online_hosts)
             .await
             .expect("healthy mixed layout");
         assert!(storage_ready_from_runtime_state(&info));
 
         let selector = DiskSetSelector::new(0, 1);
         let original = store.disks.remove(&selector).expect("second configured set");
-        let (info, _) = node_storage_snapshot(&store, &online_hosts)
+        let (info, _, _) = node_storage_snapshot(&store, &online_hosts)
             .await
             .expect("missing set snapshot");
         assert!(!storage_read_ready_from_runtime_state(&info));
         assert!(!storage_ready_from_runtime_state(&info));
 
         store.disks.insert(selector, vec![original[0].clone(); 4]);
-        let (info, _) = node_storage_snapshot(&store, &online_hosts)
+        let (info, _, _) = node_storage_snapshot(&store, &online_hosts)
             .await
             .expect("duplicate drive snapshot");
         assert!(!storage_read_ready_from_runtime_state(&info));
@@ -1909,6 +2001,68 @@ mod tests {
 
         readiness.mark_stage(rustfs_common::SystemStage::FullReady);
         assert!(!readiness_gate_blocks_path("/bucket/object", &readiness));
+    }
+
+    #[tokio::test]
+    async fn grpc_bootstrap_follows_protocol_routing_without_opening_rest() {
+        let readiness = Arc::new(GlobalReadiness::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let inner = tower::service_fn(move |_: HttpRequest<Full<Bytes>>| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::new()))) }
+        });
+        let mut service = ReadinessGateLayer::new(readiness).layer(inner);
+        for path in [
+            "/node_service.HealControlService/HealControl",
+            "/node_service.ScannerControlService/ScannerScopedDirtyUsageAck",
+            "/node_service.TierMutationControlService/PrepareTierMutation",
+        ] {
+            let response = service
+                .call(
+                    HttpRequest::builder()
+                        .method(http::Method::POST)
+                        .version(http::Version::HTTP_2)
+                        .uri(path)
+                        .header(http::header::CONTENT_TYPE, "application/grpc")
+                        .body(Full::new(Bytes::new()))
+                        .expect("control request"),
+                )
+                .await
+                .expect("control routing");
+            assert_eq!(response.status(), StatusCode::OK, "gRPC bootstrap must reach the authenticated router");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        for (version, content_type, path) in [
+            (
+                http::Version::HTTP_11,
+                Some("application/grpc"),
+                "/node_service.HealControlService/HealControl",
+            ),
+            (
+                http::Version::HTTP_2,
+                Some("application/json"),
+                "/node_service.ScannerControlService/ScannerScopedDirtyUsageAck",
+            ),
+            (http::Version::HTTP_2, None, "/bucket/object"),
+        ] {
+            let mut request = HttpRequest::builder().version(version).uri(path);
+            if let Some(content_type) = content_type {
+                request = request.header(http::header::CONTENT_TYPE, content_type);
+            }
+            let response = service
+                .call(request.body(Full::new(Bytes::new())).expect("REST request"))
+                .await
+                .expect("REST readiness response");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[http::header::RETRY_AFTER], "5");
+            assert_eq!(response.headers()[READINESS_PENDING_HEADER], "storage_quorum");
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "REST requests must remain outside their handlers"
+        );
     }
 
     #[tokio::test]
@@ -2487,6 +2641,7 @@ mod tests {
                 write_quorum_ready: false,
                 pool_metadata_write_ready: true,
                 unavailable_drives: Vec::new(),
+                missing_drives: Vec::new(),
             },
             true,
             true,
@@ -2514,6 +2669,7 @@ mod tests {
                 write_quorum_ready: false,
                 pool_metadata_write_ready: false,
                 unavailable_drives: Vec::new(),
+                missing_drives: Vec::new(),
             },
             false,
             true,

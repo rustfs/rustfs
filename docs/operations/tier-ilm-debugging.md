@@ -54,6 +54,12 @@ One background recovery page completes at most 10,000 logical objects across at 
 
 The structured `lifecycle_worker_state` recovery event reports `duration_ms`, `scanned_entries`, `buckets_scanned`, queue counts, truncation, and continuation markers. Coordinator states include `free_version_recovery_leader_acquired`, `free_version_recovery_leader_lost`, and `free_version_recovery_leader_acquire_failed`; normal follower contention is quiet. `rustfs_internal_stage_duration_ms{stage="lifecycle_free_version_recovery"}` records successful page duration; `stage="lifecycle_free_version_recovery_failed"` records failures. When comparing cluster load, include lock acquisition/refresh RPCs and the leader's cleanup backlog as well as namespace traversal work.
 
+## Tier-delete journal recovery scheduling
+
+Tier-delete journal recovery starts immediately and remains enabled independently of the free-version discovery switch. A complete, successful scan that finds both the dispatch-manifest and journal queues empty backs off with jitter, from 60 seconds to at most five minutes. Local recovery notifications wake the loop immediately and reset the idle delay. Durable work without a local notification, including work written by another node, is discovered by the bounded periodic scan; process restart starts a fresh scan immediately.
+
+Recovery passes that observe retained entries, failed pages, continuation markers, or exhausted budgets keep the original 60-second retry cadence. Foreground dispatch still queues committed work directly; the idle wait before the next scan of unnotified new durable work can grow from 60 seconds to five minutes. In-flight recovery, listing and processing time are additional; this cap bounds idle delay rather than end-to-end cleanup latency. This scheduling does not change dispatch ownership, exact-version validation, or remote-delete authorization. An empty-queue backoff therefore reduces background listing traffic while preserving durable crash recovery; it is independent of diagnosing multipart session errors.
+
 ## Metadata key conventions
 
 Internal metadata is stored under both `x-rustfs-internal-<suffix>` and `x-minio-internal-<suffix>` for MinIO interoperability. `get_bytes` prefers the RustFS key and falls back to the MinIO key.

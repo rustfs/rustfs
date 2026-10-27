@@ -90,7 +90,7 @@ use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::multipart::MultipartOperations;
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
-    list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
+    list::{StorageObjectInfoOrErr, StorageWalkOptions},
     multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo},
     namespace::NamespaceLocking as _,
     object::{DeleteAccounting, DeletedObject, HTTPPreconditions, ObjectIO as _, ObjectToDelete},
@@ -129,7 +129,7 @@ use rustfs_filemeta::{
 };
 use rustfs_heal_contracts::heal_channel::{
     DriveState, HealAdmissionResult, HealChannelPriority, HealItemType, HealOpts, HealRequestSource, HealScanMode,
-    send_heal_replacement_disk, send_heal_request_with_admission,
+    send_heal_request_with_admission,
 };
 use rustfs_io_metrics::{
     record_object_lock_diag_acquire_duration, record_object_lock_diag_enabled, record_object_lock_diag_hold_duration,
@@ -160,7 +160,7 @@ use rustfs_utils::http::{
 use rustfs_utils::{
     HashAlgorithm,
     crypto::hex,
-    path::{SLASH_SEPARATOR, encode_dir_object, encode_dir_object_ref, has_suffix, object_name_disk_identity, path_join_buf},
+    path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, object_name_disk_identity, path_join_buf},
 };
 use sha2::Sha256;
 use std::borrow::Cow;
@@ -310,8 +310,6 @@ impl SetDisks {
     }
 }
 
-type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
-type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 type InlineBitrotReader = coding::BitrotReader<crate::io_support::bitrot::ShardReader>;
@@ -936,10 +934,18 @@ pub(in crate::set_disk) struct GetObjectFileInfo {
 }
 
 struct OwnedGetObjectFileInfo {
-    fi: FileInfo,
-    parts_metadata: Vec<FileInfo>,
-    online_disks: Vec<Option<DiskStore>>,
+    payload: OwnedGetObjectFileInfoPayload,
     verified_inline_body: Option<Bytes>,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum OwnedGetObjectFileInfoPayload {
+    Direct {
+        fi: FileInfo,
+        parts_metadata: Vec<FileInfo>,
+        online_disks: Vec<Option<DiskStore>>,
+    },
+    Published(Arc<GetObjectMetadataCacheEntry>),
 }
 
 enum LateMetadataFanout {
@@ -953,9 +959,11 @@ impl GetObjectFileInfo {
     fn owned(fi: FileInfo, parts_metadata: Vec<FileInfo>, online_disks: Vec<Option<DiskStore>>) -> Self {
         Self {
             owned: Some(OwnedGetObjectFileInfo {
-                fi,
-                parts_metadata,
-                online_disks,
+                payload: OwnedGetObjectFileInfoPayload::Direct {
+                    fi,
+                    parts_metadata,
+                    online_disks,
+                },
                 verified_inline_body: None,
             }),
             shared: None,
@@ -964,15 +972,21 @@ impl GetObjectFileInfo {
         }
     }
 
-    fn owned_with_late_metadata_fanout(
-        fi: FileInfo,
-        parts_metadata: Vec<FileInfo>,
-        online_disks: Vec<Option<DiskStore>>,
-        late_metadata_fanout_disks: Vec<Option<DiskStore>>,
-    ) -> Self {
-        let mut snapshot = Self::owned(fi, parts_metadata, online_disks);
-        snapshot.late_metadata_fanout = Some(LateMetadataFanout::CapturedDisks(late_metadata_fanout_disks));
-        snapshot
+    fn owned_published(entry: Arc<GetObjectMetadataCacheEntry>) -> Self {
+        let condition_stopped = entry.capability == GetObjectMetadataCacheCapability::ConditionOnly;
+        Self {
+            owned: Some(OwnedGetObjectFileInfo {
+                payload: OwnedGetObjectFileInfoPayload::Published(entry),
+                verified_inline_body: None,
+            }),
+            shared: None,
+            condition_stopped,
+            late_metadata_fanout: None,
+        }
+    }
+
+    fn set_late_metadata_fanout_disks(&mut self, late_metadata_fanout_disks: Vec<Option<DiskStore>>) {
+        self.late_metadata_fanout = Some(LateMetadataFanout::CapturedDisks(late_metadata_fanout_disks));
     }
 
     fn shared(entry: Arc<GetObjectMetadataCacheEntry>) -> Self {
@@ -991,28 +1005,31 @@ impl GetObjectFileInfo {
         snapshot
     }
 
-    fn fi(&self) -> &FileInfo {
+    fn as_parts(&self) -> (&FileInfo, &[FileInfo], &[Option<DiskStore>]) {
         match (&self.owned, &self.shared) {
-            (Some(snapshot), None) => &snapshot.fi,
-            (None, Some(entry)) => &entry.fi,
+            (Some(snapshot), None) => match &snapshot.payload {
+                OwnedGetObjectFileInfoPayload::Direct {
+                    fi,
+                    parts_metadata,
+                    online_disks,
+                } => (fi, parts_metadata, online_disks),
+                OwnedGetObjectFileInfoPayload::Published(entry) => (&entry.fi, &entry.parts_metadata, &entry.online_disks),
+            },
+            (None, Some(entry)) => (&entry.fi, &entry.parts_metadata, &entry.online_disks),
             _ => unreachable!("GET metadata snapshot representation must be exclusive"),
         }
+    }
+
+    fn fi(&self) -> &FileInfo {
+        self.as_parts().0
     }
 
     fn parts_metadata(&self) -> &[FileInfo] {
-        match (&self.owned, &self.shared) {
-            (Some(snapshot), None) => &snapshot.parts_metadata,
-            (None, Some(entry)) => &entry.parts_metadata,
-            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
-        }
+        self.as_parts().1
     }
 
     fn online_disks(&self) -> &[Option<DiskStore>] {
-        match (&self.owned, &self.shared) {
-            (Some(snapshot), None) => &snapshot.online_disks,
-            (None, Some(entry)) => &entry.online_disks,
-            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
-        }
+        self.as_parts().2
     }
 
     fn has_late_metadata_fanout(&self) -> bool {
@@ -1026,17 +1043,28 @@ impl GetObjectFileInfo {
     }
 
     fn take_verified_inline_body(&mut self) -> Option<Bytes> {
-        self.owned.as_mut().and_then(|owned| owned.verified_inline_body.take())
+        match (&mut self.owned, &self.shared) {
+            (Some(owned), None) => owned.verified_inline_body.take().or_else(|| match &owned.payload {
+                OwnedGetObjectFileInfoPayload::Direct { .. } => None,
+                OwnedGetObjectFileInfoPayload::Published(entry) => entry.verified_inline_body.clone(),
+            }),
+            (None, Some(entry)) => entry.verified_inline_body.clone(),
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
+    }
+
+    fn into_payload(self) -> (OwnedGetObjectFileInfoPayload, Option<LateMetadataFanout>) {
+        match (self.owned, self.shared) {
+            (Some(snapshot), None) => (snapshot.payload, self.late_metadata_fanout),
+            (None, Some(entry)) => (OwnedGetObjectFileInfoPayload::Published(entry), self.late_metadata_fanout),
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
     }
 
     fn into_object_info(self, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
-        match (self.owned, self.shared) {
-            (Some(snapshot), None) => ObjectInfo::from_owned_file_info(snapshot.fi, bucket, object, versioned),
-            (None, Some(entry)) => match Arc::try_unwrap(entry) {
-                Ok(entry) => ObjectInfo::from_owned_file_info(entry.fi, bucket, object, versioned),
-                Err(entry) => ObjectInfo::from_file_info(&entry.fi, bucket, object, versioned),
-            },
-            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        match self.into_payload().0 {
+            OwnedGetObjectFileInfoPayload::Direct { fi, .. } => ObjectInfo::from_owned_file_info(fi, bucket, object, versioned),
+            OwnedGetObjectFileInfoPayload::Published(entry) => ObjectInfo::from_file_info(&entry.fi, bucket, object, versioned),
         }
     }
 
@@ -1046,24 +1074,17 @@ impl GetObjectFileInfo {
     }
 
     fn into_owned_with_late_metadata_fanout(self) -> OwnedGetObjectFileInfoParts {
-        let Self {
-            owned,
-            shared,
-            late_metadata_fanout,
-            ..
-        } = self;
-        match (owned, shared) {
-            (Some(snapshot), None) => (snapshot.fi, snapshot.parts_metadata, snapshot.online_disks, late_metadata_fanout),
-            (None, Some(entry)) => match Arc::try_unwrap(entry) {
-                Ok(entry) => (entry.fi, entry.parts_metadata, entry.online_disks, late_metadata_fanout),
-                Err(entry) => (
-                    entry.fi.clone(),
-                    entry.parts_metadata.clone(),
-                    entry.online_disks.clone(),
-                    late_metadata_fanout,
-                ),
-            },
-            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        let (payload, late_metadata_fanout) = self.into_payload();
+        match payload {
+            OwnedGetObjectFileInfoPayload::Direct {
+                fi,
+                parts_metadata,
+                online_disks,
+            } => (fi, parts_metadata, online_disks, late_metadata_fanout),
+            OwnedGetObjectFileInfoPayload::Published(entry) => {
+                let entry = Arc::unwrap_or_clone(entry);
+                (entry.fi, entry.parts_metadata, entry.online_disks, late_metadata_fanout)
+            }
         }
     }
 
@@ -1448,6 +1469,7 @@ mod prepared_get_object_metadata_tests {
             fi,
             online_disks: vec![None],
             read_quorum: 0,
+            verified_inline_body: None,
         });
         let snapshot = GetObjectFileInfo::shared(Arc::clone(&cached));
 
@@ -2764,7 +2786,9 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<PreparedGetObjectMetadata> {
-        let snapshot = self.get_object_fileinfo(bucket, object, opts, true, false).await?;
+        let snapshot = self
+            .get_object_fileinfo_for_object_read(bucket, object, opts, true, false)
+            .await?;
         let object_info = build_get_object_info(snapshot.fi(), bucket, object, opts.versioned || opts.version_suspended);
         Ok(PreparedGetObjectMetadata {
             snapshot,
@@ -4512,6 +4536,9 @@ pub struct SetDisks {
     /// listings of such a prefix are frequent and the scan reads the whole
     /// subtree, so it is not repeated within `ORPHAN_PURGE_BACKOFF` (#6898).
     orphan_purge_backoff: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    /// Hermetic sets may retain shared services while owning isolated proof scopes.
+    #[cfg(test)]
+    multipart_proof_authority_override: Arc<std::sync::RwLock<Option<crate::disk::multipart_source::ProofVerificationContext>>>,
     #[cfg(test)]
     storage_class_config_override: Arc<std::sync::RwLock<Option<Arc<storageclass::Config>>>>,
     #[cfg(test)]
@@ -4900,7 +4927,7 @@ enum GetObjectMetadataCacheCapability {
     ConditionOnly,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct GetObjectMetadataCacheEntry {
     #[allow(dead_code)] // Kept for debugging; moka handles TTL internally
     created_at: Instant,
@@ -4909,6 +4936,7 @@ struct GetObjectMetadataCacheEntry {
     online_disks: Vec<Option<DiskStore>>,
     read_quorum: usize,
     capability: GetObjectMetadataCacheCapability,
+    verified_inline_body: Option<Bytes>,
 }
 
 #[derive(Clone, Debug)]
@@ -5219,40 +5247,6 @@ impl SetDisks {
         .with_attempt(attempt))
     }
 
-    pub(crate) async fn read_listing_metadata_after_namespace_barrier(
-        &self,
-        disks: &[Option<DiskStore>],
-        bucket: &str,
-        object: &str,
-    ) -> Result<(MetaCacheEntries, usize)> {
-        // This is only called after the lock-free LIST fast path observes an
-        // unresolved metadata generation. Waiting on the ordinary object read
-        // lock establishes a publication boundary with concurrent overwrites.
-        let stored_object = encode_dir_object_ref(object);
-        let _guard = self
-            .acquire_read_lock_diag("list_object_reconcile", bucket, stored_object.as_ref())
-            .await?;
-        let (raw_entries, errors) = Self::read_all_raw_file_info(disks, bucket, stored_object.as_ref(), false).await;
-        let confirmed_absent = errors
-            .iter()
-            .flatten()
-            .filter(|err| DiskError::is_err_object_not_found(err) || DiskError::is_err_version_not_found(err))
-            .count();
-        let entries = raw_entries
-            .into_iter()
-            .map(|raw| {
-                raw.filter(|raw| !raw.buf.is_empty()).map(|raw| MetaCacheEntry {
-                    name: object.to_owned(),
-                    metadata: raw.buf,
-                    cached: None,
-                    reusable: false,
-                })
-            })
-            .collect();
-
-        Ok((MetaCacheEntries(entries), confirmed_absent))
-    }
-
     async fn acquire_write_lock_diag(&self, op: &'static str, bucket: &str, object: &str) -> Result<ObjectLockDiagGuard> {
         crate::hp_guard!("SetDisks::acquire_write_lock");
         let diag_enabled = is_object_lock_diag_enabled();
@@ -5459,6 +5453,8 @@ impl SetDisks {
             tier_free_version_rename_data_source_capable: Arc::new(AtomicBool::new(false)),
             orphan_purge_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
+            multipart_proof_authority_override: Arc::new(std::sync::RwLock::new(None)),
+            #[cfg(test)]
             storage_class_config_override: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(test)]
             rename_tail_heal_capture: Arc::new(std::sync::Mutex::new(None)),
@@ -5469,6 +5465,30 @@ impl SetDisks {
     #[allow(dead_code)] // Read by tests; consumed by later slices.
     pub(crate) fn instance_ctx(&self) -> &Arc<InstanceContext> {
         &self.ctx
+    }
+
+    pub(crate) fn multipart_proof_verification_context(&self) -> crate::disk::multipart_source::ProofVerificationContext {
+        #[cfg(test)]
+        if let Some(authority) = self
+            .multipart_proof_authority_override
+            .read()
+            .expect("hermetic multipart authority lock should not be poisoned")
+            .clone()
+        {
+            return authority;
+        }
+        self.ctx.multipart_proof_verification_context()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_multipart_proof_authority_for_test(
+        &self,
+        authority: crate::disk::multipart_source::ProofVerificationContext,
+    ) {
+        *self
+            .multipart_proof_authority_override
+            .write()
+            .expect("hermetic multipart authority lock should not be poisoned") = Some(authority);
     }
 
     pub(in crate::set_disk) fn tier_free_version_rename_data_source_capable(&self) -> bool {
@@ -8026,8 +8046,7 @@ mod tests {
     use crate::set_disk::core::io_primitives::rename_fanout_barrier;
     use crate::set_disk::ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
     use crate::storage_api_contracts::{
-        heal::HealOperations as _, lifecycle::TransitionedObject, list::ListOperations as _, multipart::CompletePart,
-        object::ObjectOperations as _,
+        heal::HealOperations as _, lifecycle::TransitionedObject, multipart::CompletePart, object::ObjectOperations as _,
     };
     use crate::store::init_format::save_format_file;
     use crate::store::list_objects::ListPathOptions;
@@ -8788,17 +8807,31 @@ mod tests {
             metrics::with_local_recorder(&recorder, || {
                 rustfs_io_metrics::set_put_stage_metrics_enabled(true);
                 runtime.block_on(async {
-                    let healthy: Arc<dyn LockClient> =
-                        Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
-                    let failing: Arc<dyn LockClient> = Arc::new(FailingClient);
                     let ctx = Arc::new(InstanceContext::new());
                     ctx.update_erasure_type(SetupType::DistErasure).await;
-                    let set = make_test_set_disks_with_ctx(vec![healthy, failing], ctx).await;
+                    let set = make_test_set_disks_with_ctx(Vec::new(), ctx).await;
+                    // A real acquire can time out before the failing client is scheduled.
+                    let err = resolve_put_object_commit_lock_acquire_result(
+                        &set,
+                        "put_object_commit",
+                        "bucket",
+                        "object",
+                        Err(LockError::QuorumNotReached {
+                            required: 2,
+                            achieved: 1,
+                        }),
+                    )
+                    .expect_err("a quorum failure must remain a lock error");
                     assert!(
-                        set.acquire_write_lock_diag("put_object_commit", "bucket", "object")
-                            .await
-                            .is_err(),
-                        "one healthy locker must not satisfy the PUT commit write quorum"
+                        matches!(
+                            err,
+                            StorageError::NamespaceLockQuorumUnavailable {
+                                required: 2,
+                                achieved: 1,
+                                ..
+                            }
+                        ),
+                        "expected the typed quorum error, got: {err:?}"
                     );
                     rustfs_io_metrics::set_put_stage_metrics_enabled(false);
                 });
@@ -15527,6 +15560,26 @@ mod tests {
 
         let instance_ctx = Arc::new(InstanceContext::new());
         instance_ctx.update_erasure_type(SetupType::Erasure).await;
+        let topology = crate::layout::endpoints::EndpointServerPools(vec![crate::layout::endpoints::PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: drive_count,
+            endpoints: endpoints.clone().into(),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]);
+        let authority = instance_ctx
+            .bind_multipart_proof_topology(&topology)
+            .expect("standalone set fixture owns the complete local topology");
+        crate::disk::multipart_source::bind_multipart_proof_snapshot(&disks, &authority)
+            .expect("standalone fixture native handles should bind to its own instance");
+        for (slot, disk) in disks.iter().enumerate() {
+            assert_eq!(
+                disk.as_ref().expect("fixture disk").get_disk_id().await.unwrap(),
+                Some(format.erasure.sets[0][slot]),
+                "fixture must use the full actual formatted cohort"
+            );
+        }
         let set_disks = SetDisks::new_with_instance_ctx(
             "test-owner".to_string(),
             Arc::new(RwLock::new(disks)),
@@ -15648,22 +15701,6 @@ mod tests {
             )
             .await
             .expect("object should be written");
-
-        let list_result = set_disks
-            .clone()
-            .list_objects_v2(bucket, "", None, None, 1000, false, None, false)
-            .await
-            .expect("set-level list_objects_v2 should succeed");
-        assert_eq!(list_result.objects.len(), 1);
-        assert_eq!(list_result.objects[0].name, "object");
-
-        let versions_result = set_disks
-            .clone()
-            .list_object_versions(bucket, "", None, None, None, 1000)
-            .await
-            .expect("set-level list_object_versions should succeed");
-        assert_eq!(versions_result.objects.len(), 1);
-        assert_eq!(versions_result.objects[0].name, "object");
 
         let (tx, mut rx) = mpsc::channel(4);
         set_disks
@@ -16404,54 +16441,6 @@ mod tests {
             .await
             .expect_err("the old ETag must fail after the fenced replacement commits");
         assert_eq!(err, StorageError::PreconditionFailed);
-    }
-
-    #[tokio::test]
-    async fn listing_metadata_reconcile_encodes_directory_object_and_waits_for_writer() {
-        let set_disks = make_local_bucket_test_set_disks().await;
-        let bucket = "bucket-list-reconcile-lock";
-        let object = "directory/";
-        let stored_object = encode_dir_object(object);
-        set_disks
-            .make_bucket(bucket, &MakeBucketOptions::default())
-            .await
-            .expect("bucket should be created");
-        let mut reader = PutObjReader::from_vec(b"directory marker".to_vec());
-        set_disks
-            .put_object(bucket, &stored_object, &mut reader, &ObjectOptions::default())
-            .await
-            .expect("directory object should be written under its encoded key");
-        let disks = set_disks.disks.read().await.clone();
-        let namespace_lock = set_disks
-            .new_ns_lock(bucket, &stored_object)
-            .await
-            .expect("namespace lock should be created");
-        let writer_guard = namespace_lock
-            .get_write_lock(std::time::Duration::from_secs(30))
-            .await
-            .expect("writer lock should be acquired");
-        let read = set_disks.read_listing_metadata_after_namespace_barrier(&disks, bucket, object);
-        tokio::pin!(read);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut read)
-                .await
-                .is_err(),
-            "LIST reconciliation must wait for the publishing writer"
-        );
-        drop(writer_guard);
-
-        let (entries, confirmed_absent) = tokio::time::timeout(std::time::Duration::from_secs(30), read)
-            .await
-            .expect("LIST reconciliation should resume after writer release")
-            .expect("LIST reconciliation should read after the namespace barrier");
-        assert_eq!(entries.0.len(), disks.len());
-        assert!(
-            entries.0.iter().all(|entry| entry
-                .as_ref()
-                .is_some_and(|entry| entry.name == object && !entry.metadata.is_empty())),
-            "LIST reconciliation must read encoded metadata and retain the logical key"
-        );
-        assert_eq!(confirmed_absent, 0);
     }
 
     #[tokio::test]

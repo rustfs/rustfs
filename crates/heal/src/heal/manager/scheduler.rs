@@ -582,7 +582,7 @@ impl HealManager {
                                     return;
                                 }
                                 let admission_decision =
-                                    Self::admit_request_to_queue(&mut queue, retry_request.clone(), &retry_config, "retry");
+                                    Self::admit_request_to_queue(&mut queue, retry_request.clone(), &retry_config, "retry", true);
                                 let admission = admission_decision.result;
                                 let should_notify = matches!(admission, HealAdmissionResult::Accepted)
                                     && retry_config.event_driven_scheduler_enable;

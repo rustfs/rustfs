@@ -528,7 +528,7 @@ async fn scanner_heal_topology_decommission_kill_before_source_cleanup_resumes_w
     run.movement_barrier.disarm()?;
     let restarted_pid = run.restart_killed_node(SEED_POOL).await?;
     let label = "after the killed leader resumed decommission";
-    let outcome = settle_decommission(&run, &manifest, label, DECOMMISSION_RESUME_COMPLETE_TIMEOUT).await;
+    let outcome = settle_decommission(&run, &manifest, label, MOVEMENT_COMPLETE_TIMEOUT).await;
     let strict_nodes = assert_process_durability_strict(&run.node_log_paths());
     record(
         &run,

@@ -38,8 +38,8 @@ name: e2e-nightly
 on:
   workflow_dispatch:
   schedule:
-    # 04:00 UTC nightly — staggered clear of fuzz/e2e-s3tests (02:00),
-    # stale (01:30) and performance-ab (06:00).
+    # 04:00 UTC nightly — staggered clear of fuzz/e2e-s3tests (02:00)
+    # and stale (01:30).
     - cron: "29 4 * * *"
 
 # Only alert-on-failure needs more than read access; it declares its own

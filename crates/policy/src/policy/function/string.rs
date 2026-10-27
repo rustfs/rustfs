@@ -73,6 +73,20 @@ impl StringFunc {
     }
 }
 
+/// Replaces every `${...}` reference to a common condition key that has a
+/// non-empty value in the request, not only the first such key.
+fn substitute_common_keys(mut c: String, values: &HashMap<String, Vec<String>>) -> String {
+    for key in KeyName::COMMON_KEYS {
+        if let Some(v) = values.get(key.name()).and_then(|x| x.first())
+            && !v.is_empty()
+        {
+            c = c.replace(&key.var_name(), v);
+        }
+    }
+
+    c
+}
+
 impl FuncKeyValue<StringFuncValue> {
     async fn eval(
         &self,
@@ -110,17 +124,7 @@ impl FuncKeyValue<StringFuncValue> {
         let fvalues = resolved_values
             .into_iter()
             .flatten()
-            .map(|resolved_c| {
-                let mut c = Cow::from(resolved_c);
-                for key in KeyName::COMMON_KEYS {
-                    match values.get(key.name()).and_then(|x| x.first()) {
-                        Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
-                        _ => continue,
-                    };
-                }
-
-                c
-            })
+            .map(|resolved_c| Cow::from(substitute_common_keys(resolved_c, values)))
             .map(|x| if ignore_case { Cow::Owned(x.to_lowercase()) } else { x })
             .collect::<Set<_>>();
 
@@ -159,17 +163,7 @@ impl FuncKeyValue<StringFuncValue> {
                 let matched = resolved_values
                     .into_iter()
                     .flatten()
-                    .map(|resolved_c| {
-                        let mut c = Cow::from(resolved_c);
-                        for key in KeyName::COMMON_KEYS {
-                            match values.get(key.name()).and_then(|x| x.first()) {
-                                Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
-                                _ => continue,
-                            };
-                        }
-
-                        c
-                    })
+                    .map(|resolved_c| substitute_common_keys(resolved_c, values))
                     .any(|x| wildcard::is_match(x, v));
 
                 // Unqualified evaluation reports the plain aggregate match and lets the
@@ -386,6 +380,44 @@ mod tests {
             false,
             false,
             vec![("groups", vec!["RustFS.ConsoleAdmin"])]
+        ));
+    }
+
+    // Real requests always carry earlier common keys such as `signatureversion`
+    // and `SourceIp`; substitution must still reach later keys like `jwt:*`.
+    #[test]
+    fn test_condition_values_substitute_variables_after_other_common_keys() {
+        let request = || {
+            vec![
+                ("signatureversion", vec!["AWS4-HMAC-SHA256"]),
+                ("SourceIp", vec!["192.0.2.10"]),
+                ("preferred_username", vec!["alice"]),
+                ("prefix", vec!["alice/photos/"]),
+            ]
+        };
+
+        assert!(test_eval_like(
+            new_fkv("s3:prefix", vec!["${jwt:preferred_username}/*"]),
+            false,
+            false,
+            request()
+        ));
+        assert!(test_eval(
+            new_fkv("s3:prefix", vec!["${jwt:preferred_username}/photos/"]),
+            false,
+            false,
+            false,
+            request()
+        ));
+        assert!(!test_eval_like(
+            new_fkv("s3:prefix", vec!["${jwt:preferred_username}/*"]),
+            false,
+            false,
+            vec![
+                ("signatureversion", vec!["AWS4-HMAC-SHA256"]),
+                ("preferred_username", vec!["bob"]),
+                ("prefix", vec!["alice/photos/"]),
+            ]
         ));
     }
 

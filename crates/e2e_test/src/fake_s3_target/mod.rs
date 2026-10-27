@@ -487,36 +487,43 @@ impl JournaledHeaders {
 struct ControlState {
     scripts: HashMap<Operation, VecDeque<FaultAction>>,
     keyed_scripts: HashMap<(Operation, String), VecDeque<FaultAction>>,
-    held_get: Option<HeldGetObject>,
+    held_get: Option<HeldObject>,
+    held_delete: Option<HeldObject>,
     requests: VecDeque<RequestRecord>,
     next_sequence: u64,
 }
 
 #[derive(Clone)]
-struct HeldGetObject {
+struct HeldObject {
     bucket: String,
     key: String,
     entered: watch::Sender<usize>,
     released: watch::Receiver<bool>,
 }
 
-/// Holds every GET of one object, including retries, until this guard is dropped.
-#[must_use = "dropping the guard releases the held GET requests"]
-pub struct GetObjectGate {
+/// Holds every matching operation, including retries, until this guard is dropped.
+#[must_use = "dropping the guard releases the held requests"]
+pub struct ObjectGate {
     control: Arc<Mutex<ControlState>>,
+    operation: Operation,
     entered: watch::Receiver<usize>,
     released: watch::Sender<bool>,
 }
 
-impl GetObjectGate {
+impl ObjectGate {
     pub async fn wait_until_entered(&mut self) -> Result<(), watch::error::RecvError> {
         self.entered.wait_for(|count| *count > 0).await.map(|_| ())
     }
 }
 
-impl Drop for GetObjectGate {
+impl Drop for ObjectGate {
     fn drop(&mut self) {
-        lock(&self.control).held_get = None;
+        let mut state = lock(&self.control);
+        match self.operation {
+            Operation::GetObject => state.held_get = None,
+            Operation::DeleteObject => state.held_delete = None,
+            _ => unreachable!("only GET and DELETE have object gates"),
+        }
         self.released.send_replace(true);
     }
 }
@@ -1108,24 +1115,40 @@ impl FakeS3Target {
     }
 
     /// Hold one exact bucket/key before any GET response can reach the client.
-    /// The fixture supports one live gate; request and connection deadlines still apply.
-    pub fn hold_get_object(&self, bucket: &str, key: &str) -> GetObjectGate {
+    /// The fixture supports one live GET gate; request and connection deadlines still apply.
+    pub fn hold_get_object(&self, bucket: &str, key: &str) -> ObjectGate {
+        self.hold_object_operation(Operation::GetObject, bucket, key)
+    }
+
+    /// Hold one exact bucket/key before DELETE changes any stored version.
+    /// The fixture supports one live DELETE gate; request deadlines still apply.
+    pub fn hold_delete_object(&self, bucket: &str, key: &str) -> ObjectGate {
+        self.hold_object_operation(Operation::DeleteObject, bucket, key)
+    }
+
+    fn hold_object_operation(&self, operation: Operation, bucket: &str, key: &str) -> ObjectGate {
         assert!(
             bucket.len() <= MAX_RETAINED_IDENTIFIER_BYTES && key.len() <= MAX_RETAINED_IDENTIFIER_BYTES,
-            "held GET identifiers exceed the fixture limit"
+            "held object identifiers exceed the fixture limit"
         );
         let mut state = lock(&self.control);
-        assert!(state.held_get.is_none(), "fake target already holds a GET gate");
+        let slot = match operation {
+            Operation::GetObject => &mut state.held_get,
+            Operation::DeleteObject => &mut state.held_delete,
+            _ => unreachable!("only GET and DELETE have object gates"),
+        };
+        assert!(slot.is_none(), "fake target already holds a {operation:?} gate");
         let (entered, entered_rx) = watch::channel(0);
         let (released, released_rx) = watch::channel(false);
-        state.held_get = Some(HeldGetObject {
+        *slot = Some(HeldObject {
             bucket: bucket.to_string(),
             key: key.to_string(),
             entered,
             released: released_rx,
         });
-        GetObjectGate {
+        ObjectGate {
             control: Arc::clone(&self.control),
+            operation,
             entered: entered_rx,
             released,
         }
@@ -2795,6 +2818,15 @@ impl S3 for FakeBackend {
         apply_non_body_fault(fault.as_ref(), &self.control).await?;
         let headers = req.headers;
         let input = req.input;
+        let held_delete = lock(&self.control)
+            .held_delete
+            .as_ref()
+            .filter(|held| held.bucket == input.bucket && held.key == input.key)
+            .cloned();
+        if let Some(mut held) = held_delete {
+            held.entered.send_modify(|count| *count += 1);
+            let _ = held.released.wait_for(|released| *released).await;
+        }
         let mut state = lock(&self.store);
         let Some(versioned) = state.buckets.get(&input.bucket).map(|bucket| bucket.versioned) else {
             return Err(s3s::s3_error!(NoSuchBucket, "bucket does not exist"));
@@ -3433,6 +3465,68 @@ mod tests {
         assert_ne!(held_response.version_id, unrelated_response.version_id);
         assert_eq!(get_bytes(&client, bucket, "held", None).await?, Bytes::from_static(b"payload"));
         assert_eq!(target.count_requests(Operation::GetObject, "held"), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_object_gate_retains_exact_version_until_release() -> Result<(), BoxError> {
+        let target = FakeS3Target::start().await?;
+        let bucket = "delete-gated-target";
+        target.create_bucket(bucket);
+        for key in ["held", "unrelated"] {
+            target.put_seed_object(bucket, key, Bytes::from_static(b"payload"), &SeedMetadata::default());
+        }
+        let versions = target.stored_versions(bucket, "held");
+        let mut gate = target.hold_delete_object(bucket, "held");
+        let client = client(&target);
+        let held_client = client.clone();
+        let version = versions[0].0.clone();
+        let mut requests = tokio::task::JoinSet::new();
+        requests.spawn(async move {
+            held_client
+                .delete_object()
+                .bucket(bucket)
+                .key("held")
+                .version_id(version)
+                .send()
+                .await
+        });
+        timeout(Duration::from_secs(2), gate.wait_until_entered()).await??;
+        assert_eq!(
+            target.stored_versions(bucket, "held"),
+            versions,
+            "the gate must precede the storage mutation"
+        );
+        assert!(requests.try_join_next().is_none());
+        let held = target
+            .requests()
+            .into_iter()
+            .find(|record| record.operation == Operation::DeleteObject && record.key.as_deref() == Some("held"))
+            .expect("the held DELETE must be journaled");
+        assert_eq!(held.version_id.as_deref(), Some(versions[0].0.as_str()));
+        assert_eq!(held.prepared_response, None);
+        client
+            .delete_object()
+            .bucket(bucket)
+            .key("unrelated")
+            .version_id(&target.stored_versions(bucket, "unrelated")[0].0)
+            .send()
+            .await?;
+        assert!(target.stored_versions(bucket, "unrelated").is_empty());
+        assert_eq!(target.stored_versions(bucket, "held"), versions);
+        drop(gate);
+        timeout(Duration::from_secs(2), requests.join_next())
+            .await?
+            .expect("held DELETE task")??;
+        assert!(target.stored_versions(bucket, "held").is_empty());
+        let released = target
+            .requests()
+            .into_iter()
+            .find(|record| record.sequence == held.sequence)
+            .and_then(|record| record.prepared_response)
+            .expect("released DELETE response");
+        assert_eq!(released.status, 204);
+        assert_eq!(released.version_id.as_deref(), Some(versions[0].0.as_str()));
         Ok(())
     }
 

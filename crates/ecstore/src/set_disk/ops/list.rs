@@ -12,19 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `ListOperations` for `SetDisks` and the borrow-based prefix-maintenance
-//! service unit.
+//! Set-scoped listing (`SetDisks::walk`) and the borrow-based
+//! prefix-maintenance service unit (`SetDisks::delete_all`).
 //!
-//! P3 of the SetDisks God-Object split (tracking backlog#815, issue #819).
-//! Consolidates the `ListOperations` storage-api contract impl (relocated from
-//! `set_disk/mod.rs`) with the `SetDisks::delete_all` borrow service unit
-//! (relocated from `set_disk/list.rs`). Method bodies are moved verbatim and
-//! runtime behavior is unchanged.
+//! Paginated listings are an `ECStore` concern: they merge every set of every
+//! pool, so `SetDisks` deliberately does not implement the `ListOperations`
+//! storage-api contract.
 
 use super::super::ctx::SetDisksCtx;
 use super::super::{
-    Arc, CancellationToken, DeleteOptions, DiskError, DiskStore, Error, ListObjectVersionsInfo, ListObjectsV2Info,
-    OBJECT_OP_IGNORED_ERRS, ObjectInfoOrErr, Result, Sender, SetDisks, WalkOptions, debug, join_all, reduce_write_quorum_errs,
+    Arc, CancellationToken, DeleteOptions, DiskError, DiskStore, OBJECT_OP_IGNORED_ERRS, ObjectInfoOrErr, Result, Sender,
+    SetDisks, WalkOptions, debug, join_all, reduce_write_quorum_errs,
 };
 use crate::disk::DiskAPI;
 
@@ -139,56 +137,14 @@ impl<'a> ListOperations<'a> {
     }
 }
 
-#[async_trait::async_trait]
-impl crate::storage_api_contracts::list::ListOperations for SetDisks {
-    type Error = Error;
-    type ListObjectsV2Info = ListObjectsV2Info;
-    type ListObjectVersionsInfo = ListObjectVersionsInfo;
-    type ObjectInfoOrErr = ObjectInfoOrErr;
-    type WalkOptions = WalkOptions;
-    type WalkCancellation = CancellationToken;
-    type WalkResultSender = Sender<ObjectInfoOrErr>;
-
-    #[tracing::instrument(level = "trace", skip(self))]
-    async fn list_objects_v2(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        continuation_token: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-        fetch_owner: bool,
-        start_after: Option<String>,
-        incl_deleted: bool,
-    ) -> Result<ListObjectsV2Info> {
-        self.inner_list_objects_v2(
-            bucket,
-            prefix,
-            continuation_token,
-            delimiter,
-            max_keys,
-            fetch_owner,
-            start_after,
-            incl_deleted,
-        )
-        .await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn list_object_versions(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        marker: Option<String>,
-        version_marker: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-    ) -> Result<ListObjectVersionsInfo> {
-        self.inner_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
-            .await
-    }
-
-    async fn walk(
+impl SetDisks {
+    /// Streams every object under `prefix` of this erasure set into `result`.
+    ///
+    /// Paginated listings (`ListObjectsV2`, `ListObjectVersions`) exist only on
+    /// `ECStore`, which merges all sets of all pools; a single set cannot answer
+    /// them on its own. Set-scoped callers (prefix deletes, tier reference
+    /// proofs, pool-local maintenance) walk the set instead.
+    pub async fn walk(
         self: Arc<Self>,
         rx: CancellationToken,
         bucket: &str,

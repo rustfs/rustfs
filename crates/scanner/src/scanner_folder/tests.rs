@@ -33,6 +33,7 @@ mod incremental_enumeration;
 mod listing_completion;
 mod metadata_visits;
 mod node_admission;
+mod usage_updates;
 
 /// Reset the process-global alert cooldown map; test-only.
 fn reset_alert_cooldowns() {
@@ -355,7 +356,6 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         root: temp_dir.to_string_lossy().to_string(),
         old_cache: DataUsageCache::default(),
         new_cache: DataUsageCache::default(),
-        update_cache: DataUsageCache::default(),
         data_usage_scanner_debug: false,
         heal_object_select: 0,
         scan_mode: HealScanMode::Normal,
@@ -369,11 +369,10 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         node_admission: None,
         disks: Vec::new(),
         disks_quorum: 0,
-        updates: None,
+        usage_updates: None,
         checkpoint_tx: None,
         checkpoint_ancestors: Vec::new(),
         checkpoint_depth: 0,
-        last_update: SystemTime::UNIX_EPOCH,
         checkpoint_objects: 0,
         object_metadata_visits: metrics::Counter::noop(),
         last_checkpoint_objects: 0,
@@ -394,9 +393,6 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         resume_failed_paths: Vec::new(),
         coverage_gap: false,
         raw_enumeration_progress: Vec::new(),
-        pending_heal_sync_deferred: false,
-        pending_heal_batch_dirty: false,
-        pending_heal_sync_count: 0,
         pending_size_reconciliation_keys: HashSet::new(),
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,
@@ -714,7 +710,6 @@ async fn malformed_size_reconciliation_replays_after_restart() {
     scanner.finish_size_reconciliation_batch();
 
     assert_eq!(scanner.new_cache.info.size_reconciliation.len(), 1);
-    assert_eq!(scanner.update_cache.info.size_reconciliation.len(), 1);
     assert_eq!(scanner.new_cache.info.size_reconciliation[&entry.key].attempts, 2);
 
     let encoded = rmp_serde::to_vec_named(&scanner.new_cache.info).expect("size ledger should encode");
@@ -728,7 +723,6 @@ async fn malformed_size_reconciliation_replays_after_restart() {
     scanner.apply_size_reconciliation(&resolved);
     scanner.finish_size_reconciliation_batch();
     assert!(scanner.new_cache.info.size_reconciliation.is_empty());
-    assert!(scanner.update_cache.info.size_reconciliation.is_empty());
 }
 
 #[tokio::test]
@@ -1536,7 +1530,6 @@ async fn mrf_ownership_legacy_notices_preserve_pending_entries() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.heal_object_select = 1;
 
     let version = Uuid::new_v4().to_string();
@@ -1683,7 +1676,6 @@ async fn test_pending_heal_prune_expires_stale_entries() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
 
     let mut stale = pending_heal(PendingScannerHealKind::Object, "bucket", Some("stale"), None, 1, 1);
     stale.first_seen = FolderScanner::now_secs().saturating_sub(MAX_PENDING_SCANNER_HEAL_AGE_SECS + 1);
@@ -1694,7 +1686,6 @@ async fn test_pending_heal_prune_expires_stale_entries() {
 
     assert_eq!(scanner.new_cache.info.pending_heals.len(), 1);
     assert_eq!(scanner.new_cache.info.pending_heals[0].object.as_deref(), Some("fresh"));
-    assert_eq!(scanner.update_cache.info.pending_heals, scanner.new_cache.info.pending_heals);
     assert!(scanner.pending_heals_changed);
 }
 
@@ -1703,7 +1694,6 @@ async fn test_pending_heal_update_keeps_stale_entry_until_retry_prune() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
 
     let mut stale = pending_heal(PendingScannerHealKind::Object, "bucket", Some("object"), None, 1, 1);
     stale.first_seen = FolderScanner::now_secs().saturating_sub(MAX_PENDING_SCANNER_HEAL_AGE_SECS + 1);
@@ -1721,7 +1711,6 @@ async fn test_pending_heal_update_keeps_stale_entry_until_retry_prune() {
     assert_eq!(scanner.new_cache.info.pending_heals.len(), 1);
     assert_eq!(scanner.new_cache.info.pending_heals[0].attempts, 1);
     assert_eq!(scanner.new_cache.info.pending_heals[0].object.as_deref(), Some("object"));
-    assert_eq!(scanner.update_cache.info.pending_heals, scanner.new_cache.info.pending_heals);
 }
 
 #[tokio::test]
@@ -1729,7 +1718,6 @@ async fn test_pending_heal_queue_full_deduplicates_object_entry() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
 
     scanner.update_pending_scanner_heal_after_admission(
         PendingScannerHealKind::Object,
@@ -1755,7 +1743,6 @@ async fn test_pending_heal_queue_full_deduplicates_object_entry() {
     assert_eq!(pending.attempts, 1);
     assert_eq!(pending.last_admission_result, "dropped");
     assert_eq!(pending.last_admission_reason, "queue_full");
-    assert_eq!(scanner.update_cache.info.pending_heals, scanner.new_cache.info.pending_heals);
     assert!(scanner.pending_heals_changed);
 }
 
@@ -1881,7 +1868,6 @@ async fn test_scan_folder_keeps_old_cache_bounded_by_loaded_entries() {
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.is_erasure_mode = true;
     for directory in 0..16 {
         for object in 0..32 {
@@ -2301,7 +2287,6 @@ async fn test_scan_folder_skips_unreadable_child_directory() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
 
     let folder = CachedFolder {
         name: "bucket".to_string(),
@@ -2329,7 +2314,6 @@ async fn test_scan_folder_treats_child_removed_before_open_as_empty() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
 
     let folder = CachedFolder {
         name: "bucket/gone".to_string(),
@@ -2362,7 +2346,6 @@ async fn scan_folder_charges_each_enumerated_entry_to_the_disk_budget() {
     scanner.sleeper = SCANNER_SLEEPER.for_disk(&temp_dir);
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
 
     let folder = CachedFolder {
         name: "bucket".to_string(),
@@ -2489,7 +2472,6 @@ async fn test_scan_folder_missing_bucket_root_still_reports_not_found() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
 
     let folder = CachedFolder {
         name: "bucket".to_string(),
@@ -2634,7 +2616,6 @@ async fn test_scan_folder_xl_meta_named_directory_uses_namespace_descent() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.is_erasure_mode = true;
 
     let parent = CancellationToken::new();
@@ -2694,7 +2675,6 @@ async fn scan_corrupt_metadata_with_captured_logs(logs: &CapturedLogs) {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.is_erasure_mode = true;
 
     let parent = CancellationToken::new();
@@ -2845,7 +2825,6 @@ async fn test_scan_folder_missing_xl_meta_stops_erasure_data_dir_descent() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.is_erasure_mode = true;
     scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest).for_disk_with_budget_for_tests(
         &temp_dir,
@@ -2938,8 +2917,9 @@ async fn test_scan_folder_uuid_namespace_part_name_directory_is_not_data_dir() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.is_erasure_mode = true;
+    let (sender, _receiver) = mpsc::channel(1);
+    scanner.usage_updates = Some(ScannerUsageUpdates::new(sender, "bucket".to_string()));
     let namespace_hash = hash_path(&format!("bucket/{namespace_name}"));
     scanner.old_cache.replace_hashed(
         &namespace_hash,
@@ -2974,7 +2954,13 @@ async fn test_scan_folder_uuid_namespace_part_name_directory_is_not_data_dir() {
     assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
     assert!(scanner.new_cache.info.failed_objects.is_empty());
     assert!(
-        scanner.update_cache.find(&namespace_hash.key()).is_some(),
+        scanner
+            .usage_updates
+            .as_ref()
+            .expect("requested progress")
+            .cache
+            .find(&namespace_hash.key())
+            .is_some(),
         "an existing UUID namespace must retain its cached subtree"
     );
 }
@@ -2995,7 +2981,6 @@ async fn test_scan_folder_non_erasure_metadata_keeps_namespace_descent() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.is_erasure_mode = false;
 
     let parent = CancellationToken::new();
@@ -3036,7 +3021,6 @@ async fn scoped_root_scan_reuses_clean_top_level_entries_and_rescans_dirty_entri
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.old_cache.replace("bucket", "", DataUsageEntry::default());
     scanner.old_cache.replace(
         "bucket/clean",
@@ -3095,7 +3079,6 @@ async fn scan_hot_cold_segment_fixture(scoped: bool) -> (DataUsageEntry, Vec<Str
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     if scoped {
         scanner.old_cache.replace("bucket", "", DataUsageEntry::default());
         scanner.old_cache.replace(
@@ -3181,7 +3164,6 @@ async fn scoped_root_scan_preserves_erasure_health_walks() {
     scanner.is_erasure_mode = true;
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.old_cache.replace("bucket", "", DataUsageEntry::default());
     scanner.old_cache.replace(
         "bucket/clean",
@@ -3225,11 +3207,9 @@ async fn test_scan_folder_compacted_parent_sends_partial_update() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
-    scanner.last_update = SystemTime::UNIX_EPOCH;
 
     let (tx, mut rx) = mpsc::channel(1);
-    scanner.updates = Some(tx);
+    scanner.usage_updates = Some(ScannerUsageUpdates::new(tx, "bucket".to_string()));
 
     let folder = CachedFolder {
         name: "bucket".to_string(),
@@ -4230,7 +4210,6 @@ async fn test_scan_folder_ignores_symlinked_child_directory() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
 
     let folder = CachedFolder {
         name: "bucket".to_string(),

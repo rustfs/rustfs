@@ -230,7 +230,7 @@ impl InlineData {
         Self::find_in_slice(&self.0, key)
     }
 
-    pub(crate) fn find_in_slice(raw: &[u8], key: &str) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn find_slice_in_raw<'a>(raw: &'a [u8], key: &str) -> Result<Option<&'a [u8]>> {
         if raw.is_empty() || raw[0] == 0 || raw[0] > INLINE_DATA_VER {
             return Ok(None);
         }
@@ -243,11 +243,15 @@ impl InlineData {
             fields_len -= 1;
             let (field, value) = Self::read_entry_slice(buf, &mut cur, false)?;
             if field == key {
-                return Ok(Some(value.to_vec()));
+                return Ok(Some(value));
             }
         }
 
         Ok(None)
+    }
+
+    pub(crate) fn find_in_slice(raw: &[u8], key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(Self::find_slice_in_raw(raw, key)?.map(<[u8]>::to_vec))
     }
 
     pub fn validate(&self) -> Result<()> {

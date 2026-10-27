@@ -58,6 +58,8 @@ their issue closes.
 | `run.ps1` | dev-tool | Windows counterpart of `run.sh` | — |
 | `probe.sh` | dev-tool | Probe-style e2e run | `make probe-e2e` |
 | `run_scanner_validation_harness.sh` | dev-tool | Scanner validation harness | `docs/operations/scanner-benchmark-runbook.md` |
+| `scanner_memory_acceptance.py` | dev-tool | Owned S3 scanner-memory and scanner-off burst acceptance phases | [Memory acceptance](../docs/testing/scanner-memory-acceptance.md) |
+| `test_scanner_memory_acceptance.py` | dev-tool | Dataset, ownership, telemetry and acceptance-oracle tests | Python unittest; same guide |
 | `check_test_wiring.py` | dev-tool | Validates test wiring and assembles one or more measured Scanner/Heal release descriptors into a single release evidence bundle | `.config/scanner-heal-required-tests.json`; `check_test_wiring.py --self-test` |
 | `run_scanner_heal_evidence_case.sh` | dev-tool | Runs one Scanner/Heal release-evidence registry case and checks the produced receipt/oracle | `.config/scanner-heal-required-tests.json`; `check_test_wiring.py --check-scanner-heal` |
 | `run_scanner_heal_authority_evidence.py` | dev-tool | Assembles measured Scanner/Heal G01 root/quota authority release descriptors from operator-collected authority artifacts | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_authority_evidence.sh` |
@@ -100,7 +102,7 @@ their issue closes.
 | Entry | Status | Purpose | Wiring / docs |
 |---|---|---|---|
 | `run_hotpath_warp_ab.sh` | dev-tool | Linux warp A/B rig for the hotpath series (quick local A/B) | `docs/operations/hotpath-warp-ab-runbook.md` |
-| `run_hotpath_warp_abba.sh` | ci-gate | Formal ABBA warp runner (baseline/candidate interleaved, `--rounds >= 3`); the runner performance-ab.yml executes | performance-ab.yml (scheduled); `docs/operations/hotpath-warp-ab-runbook.md` |
+| `run_hotpath_warp_abba.sh` | dev-tool | Formal ABBA warp runner (baseline/candidate interleaved, `--rounds >= 3`) | `docs/operations/hotpath-warp-ab-runbook.md` |
 | `hotpath_warp_ab_gate.sh` | dev-tool | Relative-budget gate evaluated over the warp A/B results | used by `run_hotpath_warp_ab.sh`; hotpath runbook |
 | `run_internode_grpc_ab_bench.sh` | dev-tool | One-click A/B driver for the internode gRPC optimization stages | `docs/operations/internode-grpc-benchmark-runbook.md` |
 | `run_internode_transport_baseline.sh` | dev-tool | Internode transport baseline runner | internode runbook; `crates/io-metrics/README.md` |
@@ -189,7 +191,6 @@ referenced only by other scripts in this same archived set. Reasons:
 | `prepare_gt1g_get_test_objects.sh` | >1 GiB GET investigation one-shot fixture prep |
 | `run_gt1g_multipart_put_server_path_focus.sh` | >1 GiB PUT investigation one-shot focus run |
 | `run_get_metrics_gate_smoke.sh` | One-shot GET metrics-gate smoke |
-| `run_listobjects_verified_bench.sh` | One-shot verified list-objects bench |
 | `run_object_batch_bench_abc.sh` | One-shot capacity/object profile A/B/C controller |
 | `run_object_data_cache_bench.sh` | One-shot GET bench for the object-data-cache rollout gate |
 | `setup-test-binaries.sh` | One-shot Docker-build test binary fixture |

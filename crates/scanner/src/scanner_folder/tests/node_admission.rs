@@ -387,7 +387,6 @@ async fn scanner_node_admission_compacted_heal_child_preserves_deferral() {
     }
     scanner.old_cache.info.name = bucket.to_string();
     scanner.new_cache.info.name = bucket.to_string();
-    scanner.update_cache.info.name = bucket.to_string();
     scanner.old_cache.replace(
         &format!("{bucket}/{object}"),
         "bucket/prefix",

@@ -36,7 +36,7 @@ pub(crate) async fn get_notification_system() -> S3Result<Arc<rustfs_notify::Not
     Ok(system)
 }
 
-pub(crate) async fn load_notification_config_snapshot() -> S3Result<(Arc<rustfs_notify::NotificationSystem>, Config)> {
+pub(crate) async fn load_notification_mutation_snapshot() -> S3Result<(Arc<rustfs_notify::NotificationSystem>, Config)> {
     let system = get_notification_system().await?;
     let config = system.config_snapshot().await;
     Ok((system, config))

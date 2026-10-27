@@ -497,7 +497,14 @@ async fn successful_result_has_signed_bounded_private_offline_export() {
 
 #[test]
 fn production_cli_measures_and_signs_exact_binary_provenance() {
-    let temp = tempfile::tempdir().expect("CLI tempdir");
+    // This provenance probe keeps the production deadline while isolating its
+    // tiny real-I/O fixture from shared CI storage latency when Linux permits it.
+    let temp = if cfg!(target_os = "linux") && Path::new("/dev/shm").is_dir() {
+        tempfile::tempdir_in("/dev/shm")
+    } else {
+        tempfile::tempdir()
+    }
+    .expect("isolated CLI fixture");
     let state = temp.path().join("state");
     let scratch = temp.path().join("scratch");
     let output = temp.path().join("drive.zip");
@@ -517,7 +524,12 @@ fn production_cli_measures_and_signs_exact_binary_provenance() {
     .output()
     .expect("run production rustfs binary");
 
-    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert!(fs::read_dir(&scratch).expect("scratch directory").next().is_none());
     #[cfg(unix)]
     assert_eq!(fs::metadata(&output).expect("output metadata").permissions().mode(), 0o100600);

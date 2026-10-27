@@ -473,7 +473,6 @@ mod decommission_lock_order_tests {
         let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         ctx.update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
             .await;
-        *ctx.local_disk_map().write().await = other_store.ctx.local_disk_map().read().await.clone();
         let endpoints = other_store
             .ctx
             .endpoints()
@@ -482,9 +481,43 @@ mod decommission_lock_order_tests {
         if let Some(deployment_id) = other_store.ctx.deployment_id() {
             ctx.set_deployment_id(deployment_id);
         }
+        let authority = ctx
+            .bind_multipart_proof_topology(&endpoints)
+            .expect("lease-loss fixture must own its complete native proof topology");
+        let mut local_disk_map = HashMap::new();
         for pool in &mut pools {
-            Arc::make_mut(pool).set_instance_ctx_for_test(Arc::clone(&ctx));
+            let pool = Arc::make_mut(pool);
+            pool.set_instance_ctx_for_test(Arc::clone(&ctx));
+            for set in &mut pool.disk_set {
+                let set = Arc::make_mut(set);
+                let source_disks = set.disks.read().await.clone();
+                let mut disks = Vec::with_capacity(set.set_endpoints.len());
+                for (slot, endpoint) in set.set_endpoints.iter().enumerate() {
+                    // The logical node clone shares durable contents, never a
+                    // native handle already owned by another instance scope.
+                    let disk = crate::disk::new_disk(
+                        endpoint,
+                        &crate::disk::DiskOption {
+                            cleanup: false,
+                            health_check: false,
+                        },
+                    )
+                    .await
+                    .expect("open the lease-loss node's independently owned native handle");
+                    assert!(!Arc::ptr_eq(&disk, source_disks[slot].as_ref().expect("source fixture disk")));
+                    assert_eq!(
+                        crate::disk::DiskAPI::get_disk_id(disk.as_ref()).await.unwrap(),
+                        Some(pool.format.erasure.sets[set.set_index][slot])
+                    );
+                    local_disk_map.insert(endpoint.to_string(), Some(disk.clone()));
+                    disks.push(Some(disk));
+                }
+                crate::disk::multipart_source::bind_multipart_proof_snapshot(&disks, &authority)
+                    .expect("lease-loss native handles must bind only to this fixture instance");
+                set.disks = Arc::new(tokio::sync::RwLock::new(disks));
+            }
         }
+        *ctx.local_disk_map().write().await = local_disk_map;
         let store = Arc::new(crate::store::ECStore {
             id: uuid::Uuid::new_v4(),
             disk_map: other_store.disk_map.clone(),
@@ -6886,7 +6919,6 @@ mod decommission_lock_order_tests {
         };
         owner.apply_to(&mut abort_opts);
         let barrier = MultipartCommitBarrier::install(&bucket, object, MultipartCommitPause::AbortAfterDelete);
-        tokio::time::pause();
         let abort = tokio::spawn({
             let abort_store = Arc::clone(&lossy_store);
             let abort_bucket = bucket.clone();
@@ -6906,6 +6938,9 @@ mod decommission_lock_order_tests {
             }
         });
         barrier.wait_until_paused().await;
+        // Native cleanup performs real filesystem I/O. Pause time only after
+        // durable deletion, when the abort is blocked before its release save.
+        tokio::time::pause();
         tokio::task::yield_now().await;
         refresh_calls.arm();
         tokio::time::advance(Duration::from_secs(11)).await;
