@@ -4487,8 +4487,7 @@ mod tests {
             .build()
             .expect("test runtime");
         runtime.block_on(async {
-            // The listener holds a real local TCP endpoint but never starts a
-            // TLS handshake or receives an RPC.
+            // Keep the address unique to this isolated subprocess.
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("local listener");
             let address = listener.local_addr().expect("listener address");
             let target = format!("https://{address}");
@@ -4502,6 +4501,9 @@ mod tests {
                     target.clone(),
                 )
             };
+            // Block the real channel cache read so the acquisition deadline
+            // wins independently of OS-specific connection or TLS errors.
+            let cache_read_blocker = rustfs_common::block_connection_cache_reads_for_test().await;
             let public_error = match make_client().get_client().await {
                 Ok(_) => panic!("a stalled connection must exceed the channel deadline"),
                 Err(error) => error,
@@ -4537,6 +4539,7 @@ mod tests {
                 scanner_peer_transport_error_message_is_retryable(&lease_error.to_string()),
                 scanner_peer_transport_error_message_is_retryable(&public_error.to_string())
             );
+            drop(cache_read_blocker);
             drop(listener);
         });
     }
