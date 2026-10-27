@@ -548,10 +548,17 @@ impl AbortDeletePermit {
 pub(super) struct MultipartDeleteOwner {
     owner: Option<Arc<dyn Send + Sync>>,
     source_key: Option<PathBuf>,
+    admission_validated: bool,
 }
 impl MultipartDeleteOwner {
     pub(super) fn namespace_owner(&self) -> Option<Arc<dyn Send + Sync>> {
         self.owner.clone()
+    }
+    pub(super) fn mark_validated(&mut self) {
+        self.admission_validated = true;
+    }
+    pub(super) fn is_validated(&self) -> bool {
+        self.admission_validated
     }
     pub(super) fn chain(self, owner: Option<Arc<dyn Send + Sync>>) -> Self {
         let owner = match (self.owner, owner) {
@@ -562,6 +569,7 @@ impl MultipartDeleteOwner {
         Self {
             owner,
             source_key: self.source_key,
+            admission_validated: self.admission_validated,
         }
     }
 }
@@ -582,7 +590,11 @@ impl LocalDisk {
     ) -> Result<MultipartDeleteOwner> {
         let source_key = self.multipart_delete_owner_key(volume, path)?;
         let owner = self.multipart_source_owner(volume, path, true, true, owner).await?;
-        Ok(MultipartDeleteOwner { owner, source_key })
+        Ok(MultipartDeleteOwner {
+            owner,
+            source_key,
+            admission_validated: false,
+        })
     }
     pub(super) fn validate_multipart_delete_owner(
         &self,
