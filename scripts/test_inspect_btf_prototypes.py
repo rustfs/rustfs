@@ -285,35 +285,64 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.stdout, b"")
 
 
-def bounded_native_dump(path):
+def bounded_reference_command(command, timeout=30):
     """Bound both pipe bytes and child lifetime, including a silent child."""
     process = subprocess.Popen(
-        ["bpftool", "btf", "dump", "file", str(path), "format", "raw"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
-    output = bytearray()
-    deadline = time.monotonic() + 30
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    limits = {"stdout": reader.MAX_JSON_BYTES, "stderr": 64 * 1024}
+    deadline = time.monotonic() + timeout
     try:
         with selectors.DefaultSelector() as selector:
-            selector.register(process.stdout, selectors.EVENT_READ)
-            while True:
+            selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+            selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+            while selector.get_map():
                 remaining = deadline - time.monotonic()
-                if remaining <= 0 or not selector.select(remaining):
+                ready = selector.select(max(0, remaining))
+                if remaining <= 0 or not ready:
                     raise ValueError("native_reference_timeout")
-                chunk = os.read(process.stdout.fileno(), 64 * 1024)
-                if not chunk:
-                    break
-                output.extend(chunk)
-                if len(output) > reader.MAX_JSON_BYTES:
-                    raise ValueError("native_reference_output_exceeded_its_bound")
-        if process.wait(timeout=max(0.01, deadline - time.monotonic())) != 0:
-            raise ValueError("native_reference_failed")
-        return bytes(output)
+                for key, _ in ready:
+                    chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    buffers[key.data].extend(chunk)
+                    if len(buffers[key.data]) > limits[key.data]:
+                        raise ValueError("native_reference_" + key.data + "_exceeded_its_bound")
+        code = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+        if code != 0:
+            raise ValueError("native_reference_failed returncode=" + str(code))
+        if buffers["stderr"]:
+            print("Native reference diagnostics: " + repr(bytes(buffers["stderr"])), file=sys.stderr)
+        return bytes(buffers["stdout"])
+    except (ValueError, subprocess.TimeoutExpired) as error:
+        raise ValueError(str(error) + "; captured_stderr=" + repr(bytes(buffers["stderr"]))) from error
     finally:
         process.stdout.close()
+        process.stderr.close()
         if process.poll() is None:
             process.kill()
             process.wait()
+
+
+class NativeCaptureTests(unittest.TestCase):
+    def test_native_stderr_and_exact_failure_status_are_retained(self):
+        command = [sys.executable, "-c", "import sys; sys.stderr.write('reference marker'); sys.exit(7)"]
+        with self.assertRaisesRegex(ValueError, "returncode=7.*reference marker"):
+            bounded_reference_command(command)
+
+    def test_native_success_returns_complete_stdout(self):
+        self.assertEqual(bounded_reference_command([sys.executable, "-c", "print('complete')"]), b"complete\n")
+
+    def test_native_output_overflow_is_refused(self):
+        command = [sys.executable, "-c", "import os; os.write(1, b'x' * (1024 * 1024 + 1))"]
+        with self.assertRaisesRegex(ValueError, "stdout_exceeded_its_bound"):
+            bounded_reference_command(command)
+
+    def test_silent_native_child_cannot_outlive_the_deadline(self):
+        with self.assertRaisesRegex(ValueError, "native_reference_timeout"):
+            bounded_reference_command([sys.executable, "-c", "import threading; threading.Event().wait()"], timeout=0.1)
 
 
 def native_reference(path):
@@ -323,7 +352,8 @@ def native_reference(path):
         raw = source.read(64 * 1024 + 1)
     if len(raw) > 64 * 1024:
         raise ValueError("native_reference_requires_the_small_compiler_fixture")
-    native = bounded_native_dump(path)
+    native = bounded_reference_command(
+        [os.environ.get("BPFTOOL", "bpftool"), "btf", "dump", "file", str(path), "format", "raw"])
     records, current = {}, None
     for line in native.decode("utf-8").splitlines():
         match = re.fullmatch(r"\[(\d+)\] (\w+) '(.*)'(?: (.*))?", line)
