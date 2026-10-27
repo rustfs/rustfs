@@ -544,3 +544,161 @@ async fn scanner_node_admission_progresses_during_continuous_heal_queue() {
     assert!(heal_completions.load(Ordering::Relaxed) > 0, "Heal must also advance during the walk");
     assert_eq!(gate.snapshot().active, 0);
 }
+
+#[tokio::test]
+#[serial]
+async fn scanner_node_admission_usage_updates_preserve_totals_across_mid_walk_handoff() {
+    let (mut scanner, root) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    scanner.old_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest);
+    scanner.skip_heal.store(true, Ordering::SeqCst);
+    for (object, version_id) in [("existing/0000", Uuid::from_u128(1)), ("new/0000", Uuid::from_u128(2))] {
+        write_test_object_metadata_bytes(
+            &root,
+            "bucket",
+            object,
+            &metadata_for_object_version("bucket", object, Some(version_id)),
+        )
+        .await;
+    }
+    scanner.old_cache.replace("bucket", "", DataUsageEntry::default());
+    scanner
+        .old_cache
+        .replace("bucket/existing", "bucket", DataUsageEntry::default());
+    scanner.old_cache.replace(
+        "bucket/existing/0000",
+        "bucket/existing",
+        DataUsageEntry {
+            objects: 1,
+            size: 99,
+            ..Default::default()
+        },
+    );
+    let gate = owner(true);
+    let visits = Arc::new(ShrinkOnMetadata {
+        owner: gate.clone(),
+        visited: AtomicU64::new(0),
+    });
+    scanner.node_admission = Some(gate.clone());
+    scanner.object_metadata_visits = metrics::Counter::from_arc(visits.clone());
+    let (sender, mut receiver) = mpsc::channel(1);
+    scanner.usage_updates = Some(ScannerUsageUpdates::new(sender, "bucket".to_string()));
+    let (node_tx, mut node_rx) = mpsc::channel::<crate::workload_admission::ScannerNodeRequest>(1);
+    let cancel = CancellationToken::new();
+    let mut progress = Vec::new();
+    let mut handoffs = 0;
+    let result = {
+        let mut entry = DataUsageEntry::default();
+        let scan = crate::workload_admission::with_scanner_node_requests(
+            Some(node_tx),
+            scanner.scan_folder(
+                cancel.clone(),
+                CachedFolder {
+                    name: "bucket".to_string(),
+                    parent: None,
+                    object_heal_prob_div: 1,
+                },
+                &mut entry,
+            ),
+        );
+        tokio::pin!(scan);
+        let coordinate = async {
+            loop {
+                tokio::select! {
+                    result = &mut scan => break result,
+                    Some(update) = receiver.recv() => progress.push(update),
+                    Some(request) = node_rx.recv() => {
+                        handoffs += 1;
+                        assert!(Arc::ptr_eq(&request.owner, &gate), "handoff must use the real shared owner");
+                        assert_eq!(visits.visited.load(Ordering::SeqCst), 1, "the next object cannot start before admission");
+                        assert_eq!(gate.snapshot().active, 0, "the prior object returned its node unit");
+                        let permit = request.owner.acquire();
+                        tokio::pin!(permit);
+                        assert!(futures::poll!(&mut permit).is_pending(), "the actual closed gate must defer the walk");
+                        // This direct fixture owns no cache lease. The production
+                        // coordinator releases/revalidates its lease at this handoff.
+                        gate.update(
+                            &mut FeedbackController::new(),
+                            Some(FeedbackObservation {
+                                generation: 2,
+                                max_concurrency: 1,
+                                pressure: ResourcePressure::Unknown,
+                                completed_units: None,
+                            }),
+                        );
+                        request.respond.send(permit.await).unwrap_or_else(|_| panic!("original walk still waits"));
+                    }
+                }
+            }
+        };
+        tokio::pin!(coordinate);
+        let bounded = tokio::time::timeout(Duration::from_secs(2), &mut coordinate).await;
+        if bounded.is_err() {
+            cancel.cancel();
+            let _ = coordinate.await;
+        }
+        bounded
+    };
+    result
+        .expect("the same admitted walk must finish within its original bound")
+        .expect("real directory and metadata scan succeeds");
+    assert_eq!(handoffs, 1, "the first metadata visit must exercise a real mid-walk deferral");
+    assert_eq!(
+        visits.visited.load(Ordering::SeqCst),
+        2,
+        "resumption cannot replay the first metadata visit"
+    );
+    assert_eq!(gate.snapshot().active, 0);
+    assert!(gate.try_acquire().is_some(), "the handoff must not leak a queue entry or node unit");
+    let totals = scanner
+        .new_cache
+        .checked_flatten_complete_scope("bucket")
+        .expect("complete root after the original walk resumes");
+    assert_eq!((totals.objects, totals.size, totals.versions), (2, 2, 2));
+    assert_eq!(
+        scanner
+            .old_cache
+            .find("bucket/existing/0000")
+            .expect("retained baseline")
+            .size,
+        99,
+        "progress and resumption cannot mutate the old cache"
+    );
+    while let Ok(update) = receiver.try_recv() {
+        progress.push(update);
+    }
+    let first = progress.first().expect("the bounded sender emits actual partial progress");
+    assert_eq!((first.objects, first.size, first.versions), (1, 1, 1));
+    for update in &progress {
+        assert!(update.objects <= totals.objects && update.size <= totals.size && update.versions <= totals.versions);
+    }
+    let updates = scanner
+        .usage_updates
+        .as_mut()
+        .expect("requested progress owner survives resumption");
+    let observed = updates.cache.checked_flatten("bucket").expect("connected progress cache");
+    assert_eq!(
+        (observed.objects, observed.size, observed.versions),
+        (totals.objects, totals.size, totals.versions)
+    );
+    // Use the existing usage-update fixture's due-time mechanism; totals still
+    // come solely from the real walk and the production send_update method.
+    updates.last_update = SystemTime::UNIX_EPOCH;
+    scanner.send_update().await;
+    let update = receiver
+        .try_recv()
+        .expect("resumed aggregate reaches the actual bounded receiver");
+    assert_eq!(
+        (update.objects, update.size, update.versions),
+        (totals.objects, totals.size, totals.versions)
+    );
+    scanner.send_update().await;
+    assert!(
+        receiver.try_recv().is_err(),
+        "resumption must retain the original one-minute update throttle"
+    );
+}
