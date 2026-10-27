@@ -5752,6 +5752,19 @@ impl SetDisks {
             return Ok(());
         }
 
+        // A metadata update that misses write quorum is not rolled back, so
+        // refuse it before writing when the target disks cannot reach quorum
+        // even if every write succeeds; otherwise the change a caller reports
+        // as failed would be served and spread by heal.
+        let write_quorum = fi.write_quorum(self.default_write_quorum());
+        let reachable = disks
+            .iter()
+            .map(|disk| disk.is_none().then_some(DiskError::DiskNotFound))
+            .collect::<Vec<_>>();
+        if let Some(err) = reduce_write_quorum_errs(&reachable, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+            return Err(err);
+        }
+
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
         let mut futures = Vec::with_capacity(disks.len());
@@ -5781,7 +5794,7 @@ impl SetDisks {
             }
         }
 
-        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, fi.write_quorum(self.default_write_quorum())) {
+        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
             return Err(err);
         }
 
@@ -9440,7 +9453,7 @@ mod tests {
             "lifecycle-inline-data-get-fanout-bucket",
             "lifecycle-inline-data-get-object",
             GET_OBJECT_PATH_LEGACY_DUPLEX,
-            None,
+            false,
         );
     }
 
@@ -9451,7 +9464,7 @@ mod tests {
             "lifecycle-bounded-inline-data-get-fanout-bucket",
             "lifecycle-bounded-inline-data-get-object",
             GET_OBJECT_PATH_LEGACY_DUPLEX,
-            Some("true"),
+            true,
         );
     }
 
@@ -9462,7 +9475,7 @@ mod tests {
             RUSTFS_META_BUCKET,
             "buckets/.usage-cache/lifecycle-inline-data-get-object",
             GET_OBJECT_PATH_INTERNAL_META,
-            None,
+            false,
         );
     }
 
@@ -9563,7 +9576,7 @@ mod tests {
         bucket: &'static str,
         object_prefix: &str,
         expected_path: &'static str,
-        bounded_fanout_env: Option<&'static str>,
+        bounded_fanout: bool,
     ) {
         const DISKS: usize = 4;
         let object = object_with_initial_data_shards(bucket, object_prefix, 2, 3);
@@ -9583,16 +9596,26 @@ mod tests {
                     [
                         ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
                         ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
-                        ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", bounded_fanout_env),
+                        (
+                            "RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT",
+                            Some(if bounded_fanout { "true" } else { "false" }),
+                        ),
                     ],
                     async {
-                        let barrier_disk = if bounded_fanout_env.is_some() {
-                            bounded_spare_disk_index(bucket, &object, 2, 2)
-                        } else {
-                            3
-                        };
+                        let barrier_disk = bounded_spare_disk_index(bucket, &object, 2, 2);
                         let barrier =
                             rename_fanout_barrier::arm(&object, barrier_disk, rename_fanout_barrier::PHASE_READ_VERSION);
+                        // Keep one initial bounded read pending so its hedge is scheduled;
+                        // eager fanout needs all quorum reads parked until the spare starts.
+                        let quorum_disks = if bounded_fanout {
+                            vec![bounded_metadata_fanout_order(bucket, &object, DISKS, 2)[0]]
+                        } else {
+                            (0..DISKS).filter(|&index| index != barrier_disk).collect()
+                        };
+                        let quorum_barriers = quorum_disks
+                            .into_iter()
+                            .map(|index| rename_fanout_barrier::arm(&object, index, rename_fanout_barrier::PHASE_READ_VERSION))
+                            .collect::<Vec<_>>();
                         let disks_for_read = disks.clone();
                         let object_for_read = object.clone();
                         let mut read = tokio::spawn(async move {
@@ -9614,6 +9637,9 @@ mod tests {
                         tokio::time::timeout(BARRIER_PAUSE_GUARD, barrier.wait_until_paused())
                             .await
                             .expect("metadata fanout should pause the spare metadata task");
+                        for quorum_barrier in &quorum_barriers {
+                            quorum_barrier.release();
+                        }
                         let (parts_metadata, errs, diagnostics) = tokio::time::timeout(BARRIER_PAUSE_GUARD, &mut read)
                             .await
                             .expect("verified inline quorum should abort the paused eager fanout")

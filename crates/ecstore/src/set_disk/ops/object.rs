@@ -9320,8 +9320,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         };
 
         let src_version_id = src_opts.version_id.as_deref().unwrap_or_default();
-        let (online_disks, mut fi, _) =
-            Self::select_valid_fileinfo(&disks, &metas, &errs, src_version_id, read_quorum, write_quorum)
+        let (online_disks, mut fi) =
+            Self::select_fileinfo_for_read(src_bucket, &disks, &metas, &errs, src_version_id, read_quorum, write_quorum)
                 .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
 
         if fi.deleted {
@@ -11182,8 +11182,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![bucket, object]))?;
 
         let version_id = opts.version_id.as_deref().unwrap_or_default();
-        let (online_disks, mut fi, _) = Self::select_valid_fileinfo(&disks, &metas, &errs, version_id, read_quorum, write_quorum)
-            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+        let (online_disks, mut fi) =
+            Self::select_fileinfo_for_read(bucket, &disks, &metas, &errs, version_id, read_quorum, write_quorum)
+                .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
 
         if fi.deleted {
             return Err(to_object_err(Error::MethodNotAllowed, vec![bucket, object]));

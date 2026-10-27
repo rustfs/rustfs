@@ -665,14 +665,20 @@ impl SetDisks {
         read_quorum
     }
 
-    pub(super) fn select_valid_fileinfo(
+    /// The commit-proof rule kept for internal metadata in the system bucket.
+    /// Pool metadata's PREPARE/COMMIT recovery and identity epochs treat an
+    /// ordinary read as proof that a record committed: when enough copies
+    /// answer to prove write quorum, the latest version must hold it, and a
+    /// degraded read never serves a newer version below write quorum. A split
+    /// write therefore stays unreadable until native recovery resolves it.
+    fn select_committed_fileinfo(
         disks: &[Option<DiskStore>],
         parts_metadata: &[FileInfo],
         errs: &[Option<DiskError>],
         version_id: &str,
         read_quorum: usize,
         write_quorum: usize,
-    ) -> disk::error::Result<(Vec<Option<DiskStore>>, FileInfo, usize)> {
+    ) -> disk::error::Result<(Vec<Option<DiskStore>>, FileInfo)> {
         let selection_quorum =
             Self::latest_fileinfo_selection_quorum(version_id, parts_metadata, errs, read_quorum, write_quorum);
         let (usable_metadata, has_read_error) = Self::usable_fileinfo_count(parts_metadata, errs);
@@ -683,14 +689,71 @@ impl SetDisks {
             && usable_metadata >= write_quorum
             && selection_quorum == read_quorum
         {
-            let (online_disks, fi) = Self::pick_degraded_latest_fileinfo(disks, parts_metadata, errs, read_quorum, write_quorum)?;
-            return Ok((online_disks, fi, read_quorum));
+            return Self::pick_degraded_latest_fileinfo(disks, parts_metadata, errs, read_quorum, write_quorum);
         }
 
         let (online_disks, mod_time, etag) = Self::list_online_disks(disks, parts_metadata, errs, selection_quorum);
         let fi = Self::pick_valid_fileinfo(parts_metadata, mod_time, etag, selection_quorum)?;
 
-        Ok((online_disks, fi, selection_quorum))
+        Ok((online_disks, fi))
+    }
+
+    /// Select the version a read of `bucket` serves: S3 buckets use MinIO's
+    /// read-quorum rule (`select_valid_fileinfo`); the system bucket keeps the
+    /// commit-proof rule (`select_committed_fileinfo`).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn select_fileinfo_for_read(
+        bucket: &str,
+        disks: &[Option<DiskStore>],
+        parts_metadata: &[FileInfo],
+        errs: &[Option<DiskError>],
+        version_id: &str,
+        read_quorum: usize,
+        write_quorum: usize,
+    ) -> disk::error::Result<(Vec<Option<DiskStore>>, FileInfo)> {
+        if crate::bucket::utils::is_meta_bucketname(bucket) {
+            Self::select_committed_fileinfo(disks, parts_metadata, errs, version_id, read_quorum, write_quorum)
+        } else {
+            Self::select_valid_fileinfo(disks, parts_metadata, errs, read_quorum)
+        }
+    }
+
+    /// Select the version an S3 read serves with MinIO's rule (`getObjectFileInfo`
+    /// -> `listOnlineDisks` -> `pickValidFileInfo`): the modification time
+    /// shared by the most copies wins when it reaches `read_quorum`, a tie
+    /// goes to the newer time, and one content identity at that time must
+    /// itself reach `read_quorum`. Heal picks the latest version the same
+    /// way, so a read returns the version heal converges the set to; a write
+    /// that failed after reaching exactly `read_quorum` copies is readable
+    /// instead of failing until heal runs, as listing already shows it.
+    ///
+    /// `read_quorum` follows the parity most copies agree on, which delete
+    /// markers and empty versions can lower below the selected version's own
+    /// data blocks; like MinIO's `getLatestFileInfo`, a version with local
+    /// shards also needs that many copies, or HEAD would report a version
+    /// GET cannot decode.
+    pub(super) fn select_valid_fileinfo(
+        disks: &[Option<DiskStore>],
+        parts_metadata: &[FileInfo],
+        errs: &[Option<DiskError>],
+        read_quorum: usize,
+    ) -> disk::error::Result<(Vec<Option<DiskStore>>, FileInfo)> {
+        let (online_disks, mod_time, etag) = Self::list_online_disks(disks, parts_metadata, errs, read_quorum);
+        let (fi, copies) = Self::find_file_info_in_quorum_counted(parts_metadata, &mod_time, &etag, read_quorum)?;
+        if !fi.deleted && !fi.is_remote() && fi.size > 0 && copies < fi.erasure.data_blocks {
+            // The shortcut counts byte-identical copies only; count every copy
+            // of the content identity before refusing the version.
+            let identity = Self::file_info_quorum_hash(&fi);
+            let copies = parts_metadata
+                .iter()
+                .filter(|meta| file_info_is_valid_for_metadata(meta) && Self::file_info_quorum_hash(meta) == identity)
+                .count();
+            if copies < fi.erasure.data_blocks {
+                return Err(DiskError::ErasureReadQuorum);
+            }
+        }
+
+        Ok((online_disks, fi))
     }
 
     pub(super) fn pick_valid_fileinfo(
@@ -1025,6 +1088,23 @@ impl SetDisks {
         etag: &Option<String>,
         quorum: usize,
     ) -> disk::error::Result<FileInfo> {
+        Self::find_file_info_in_quorum_counted(metas, mod_time, etag, quorum).map(|(fi, _)| fi)
+    }
+
+    /// `find_file_info_in_quorum`, also returning how many copies carry the
+    /// selected content identity.
+    ///
+    /// Two identities can share the top count only in a data = parity set
+    /// split exactly in half at one modification time, such as a metadata
+    /// update that failed after reaching half the drives. The identity held
+    /// by the lowest-index disk wins, so every read and heal picks the same
+    /// side and a retried metadata write can repair the split.
+    fn find_file_info_in_quorum_counted(
+        metas: &[FileInfo],
+        mod_time: &Option<OffsetDateTime>,
+        etag: &Option<String>,
+        quorum: usize,
+    ) -> disk::error::Result<(FileInfo, usize)> {
         if quorum < 1 {
             warn!("find_file_info_in_quorum: quorum < 1");
             return Err(DiskError::ErasureReadQuorum);
@@ -1053,7 +1133,7 @@ impl SetDisks {
             if same_count >= quorum && same_count > total_valid - same_count {
                 let mut fi = first.clone();
                 fi.is_latest = fi.successor_mod_time.is_none();
-                return Ok(fi);
+                return Ok((fi, same_count));
             }
         }
 
@@ -1106,15 +1186,12 @@ impl SetDisks {
             *count_map.entry(hash).or_insert(0) += 1;
         }
 
-        let mut max_val = None;
-        let mut max_count = 0;
-
-        for (&val, &count) in &count_map {
-            if count > max_count {
-                max_val = Some(val);
-                max_count = count;
-            }
-        }
+        let max_count = count_map.values().copied().max().unwrap_or(0);
+        let max_val = meta_hashes
+            .iter()
+            .flatten()
+            .find(|hash| count_map.get(*hash) == Some(&max_count))
+            .copied();
 
         if max_count < quorum {
             warn!(
@@ -1155,17 +1232,24 @@ impl SetDisks {
         if found {
             let mut fi = found_fi.expect("operation should succeed");
 
-            for (val, &count) in &valid_obj_map {
-                if count >= quorum {
-                    fi.successor_mod_time = val.successor_mod_time;
-                    fi.num_versions = val.num_versions;
-                    fi.is_latest = val.successor_mod_time.is_none();
-
-                    break;
-                }
+            // Scan in disk order so that two version-stack shapes with equal
+            // counts resolve the same way on every read.
+            let quorum_props = metas
+                .iter()
+                .zip(meta_hashes.iter())
+                .filter(|(meta, hash)| hash.is_some() && **hash == max_val && file_info_is_valid_for_metadata(meta))
+                .map(|(meta, _)| ObjProps {
+                    successor_mod_time: meta.successor_mod_time,
+                    num_versions: meta.num_versions,
+                })
+                .find(|props| valid_obj_map.get(props).is_some_and(|&count| count >= quorum));
+            if let Some(props) = quorum_props {
+                fi.successor_mod_time = props.successor_mod_time;
+                fi.num_versions = props.num_versions;
+                fi.is_latest = props.successor_mod_time.is_none();
             }
 
-            return Ok(fi);
+            return Ok((fi, max_count));
         }
 
         warn!("find_file_info_in_quorum: fileinfo not found");
