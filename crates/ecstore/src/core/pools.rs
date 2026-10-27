@@ -3720,6 +3720,46 @@ fn is_decommission_copy_quorum_deferral(err: &Error) -> bool {
     data_movement::data_movement_stage_source_as::<DecommissionCopyQuorumFailure>(err).is_some()
 }
 
+/// The storage error of a version copy that kept timing out on a namespace
+/// lock through its in-place retries, kept typed so the entry failure policy
+/// defers it.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct DecommissionCopyLockTimeout(#[source] Error);
+
+fn is_decommission_copy_lock_timeout_error(err: &Error) -> bool {
+    let err = data_movement::data_movement_stage_source(err).unwrap_or(err);
+    matches!(err, Error::Lock(rustfs_lock::LockError::Timeout { .. }))
+}
+
+/// A version copy that timed out acquiring a namespace lock leaves the source
+/// in place; the next attempt copies the version again or finds an equivalent
+/// committed target. The lock is held by another mutation of the key or, when
+/// this node restarted mid-copy, by its previous incarnation until that lock's
+/// lease expires on the peers. Either clears by waiting, so the entry is
+/// deferred instead of being counted as a permanent per-object failure.
+fn decommission_copy_lock_timeout_deferral(stage: &str, bucket: &str, object: &str, err: Error) -> Error {
+    data_movement::data_movement_context_error(
+        format!("decommission {stage} timed out on a namespace lock for {bucket}/{object}: {err}"),
+        DecommissionCopyLockTimeout(err),
+    )
+}
+
+fn is_decommission_copy_lock_timeout_deferral(err: &Error) -> bool {
+    data_movement::data_movement_stage_source_as::<DecommissionCopyLockTimeout>(err).is_some()
+}
+
+/// The deferral of a version copy whose in-place retries ended on `error`, if
+/// that failure belongs to the pools at that moment rather than to the object.
+fn take_decommission_copy_deferral(stage: &str, bucket: &str, object: &str, error: &mut Option<Error>) -> Option<Error> {
+    if let Some(err) = error.take_if(|err| is_decommission_copy_quorum_error(err)) {
+        return Some(decommission_copy_quorum_deferral(stage, bucket, object, err));
+    }
+    error
+        .take_if(|err| is_decommission_copy_lock_timeout_error(err))
+        .map(|err| decommission_copy_lock_timeout_deferral(stage, bucket, object, err))
+}
+
 fn resolve_decommission_entry_reload_result(result: Result<()>, bucket: &str, object_name: &str) -> Result<()> {
     result.map_err(|err| Error::other(format!("decommission reload_pool_meta failed for {bucket}/{object_name}: {err}")))
 }
@@ -5782,11 +5822,14 @@ enum DecommissionEntryOutcome {
 /// entry is done and must not be counted as a failure or escalated. A quorum
 /// failure of the source cleanup is deferred too: the copied source is still
 /// in place and the next attempt cleans it up again. So is a version copy that
-/// lost drive quorum through its in-place retries: the source still holds the
-/// version and the next attempt copies it again. Every other failure stays
-/// terminal.
+/// lost drive quorum or timed out on a namespace lock through its in-place
+/// retries: the source still holds the version and the next attempt copies it
+/// again. Every other failure stays terminal.
 fn resolve_decommission_entry_failure(err: Error) -> Result<DecommissionEntryOutcome> {
-    if is_decommission_source_cleanup_retryable_error(&err) || is_decommission_copy_quorum_deferral(&err) {
+    if is_decommission_source_cleanup_retryable_error(&err)
+        || is_decommission_copy_quorum_deferral(&err)
+        || is_decommission_copy_lock_timeout_deferral(&err)
+    {
         return Ok(DecommissionEntryOutcome::Deferred(err));
     }
     match classify_decommission_capacity_failure(&err) {
@@ -18150,13 +18193,11 @@ impl ECStore {
                     }
                 }
 
-                if failure && let Some(err) = error.take_if(|err| is_decommission_copy_quorum_error(err)) {
-                    return Err(decommission_copy_quorum_deferral(
-                        "delete_marker_copy",
-                        bucket.as_str(),
-                        version.name.as_str(),
-                        err,
-                    ));
+                if failure
+                    && let Some(err) =
+                        take_decommission_copy_deferral("delete_marker_copy", bucket.as_str(), version.name.as_str(), &mut error)
+                {
+                    return Err(err);
                 }
 
                 if ignore {
@@ -18542,14 +18583,14 @@ impl ECStore {
 
             if failure
                 && !source_read_failed
-                && let Some(err) = error.take_if(|err| is_decommission_copy_quorum_error(err))
-            {
-                return Err(decommission_copy_quorum_deferral(
+                && let Some(err) = take_decommission_copy_deferral(
                     DECOMMISSION_STAGE_MIGRATE_OBJECT,
                     bucket.as_str(),
                     version.name.as_str(),
-                    err,
-                ));
+                    &mut error,
+                )
+            {
+                return Err(err);
             }
 
             if ignore {
@@ -28294,6 +28335,61 @@ mod tests {
             std::error::Error::source(failure).and_then(|source| source.downcast_ref::<Error>()),
             Some(Error::ErasureWriteQuorum)
         ));
+    }
+
+    /// A restarted node's previous incarnation keeps its namespace locks on the
+    /// peers until their lease expires, so a resumed copy of a key that was in
+    /// flight at the crash times out acquiring the lock. That copy never
+    /// committed: it is deferred, never counted as a failed object.
+    #[test]
+    fn decommission_copy_lock_timeout_is_deferred_not_failed() {
+        let timeout = || {
+            Error::Lock(rustfs_lock::LockError::timeout(
+                "bucket-a/object-a@latest",
+                std::time::Duration::from_secs(5),
+            ))
+        };
+        let prepare = data_movement::data_movement_stage_error_for_test(
+            "decommission_object",
+            "prepare_put_object",
+            "bucket-a",
+            "object-a",
+            timeout(),
+        );
+        for err in [timeout(), prepare] {
+            assert!(is_decommission_copy_lock_timeout_error(&err), "{err}");
+            assert!(!is_decommission_copy_quorum_error(&err), "{err}");
+            let mut error = Some(err);
+            let deferred = take_decommission_copy_deferral("migrate_object", "bucket-a", "object-a", &mut error)
+                .expect("a lock timeout copy must be deferred");
+            assert!(error.is_none());
+            assert!(is_decommission_copy_lock_timeout_deferral(&deferred));
+            assert!(!is_decommission_copy_quorum_deferral(&deferred));
+            let failure = data_movement::data_movement_stage_source_as::<DecommissionCopyLockTimeout>(&deferred)
+                .expect("the deferred error must keep its lock-timeout origin");
+            assert!(is_decommission_copy_lock_timeout_error(&failure.0));
+            assert!(matches!(
+                resolve_decommission_entry_failure(deferred),
+                Ok(DecommissionEntryOutcome::Deferred(_))
+            ));
+        }
+
+        let mut quorum = Some(Error::ErasureWriteQuorum);
+        let deferred = take_decommission_copy_deferral("migrate_object", "bucket-a", "object-a", &mut quorum)
+            .expect("a lost drive quorum copy stays deferred");
+        assert!(is_decommission_copy_quorum_deferral(&deferred));
+
+        for other in [
+            Error::Lock(rustfs_lock::LockError::internal("lock backend failed")),
+            Error::other("Lock acquisition timeout for resource 'bucket-a/object-a@latest' after 5s"),
+        ] {
+            let mut error = Some(other);
+            assert!(
+                take_decommission_copy_deferral("migrate_object", "bucket-a", "object-a", &mut error).is_none(),
+                "{error:?}"
+            );
+            assert!(error.is_some(), "a per-object failure keeps its error");
+        }
     }
 
     #[test]
