@@ -1150,6 +1150,24 @@ pub(super) async fn send_cache_root_entry(
         .map_err(|err| ScannerError::Other(format!("scanner cache root channel closed: {err}")))
 }
 
+fn log_missing_set_snapshot_metadata(store: &SetDisks, info: &DataUsageCacheInfo, reason: &'static str) {
+    warn!(
+        target: "rustfs::scanner::io",
+        event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_IO,
+        state = "snapshot_metadata_missing",
+        reason,
+        store_pool = store.pool_index,
+        store_set = store.set_index,
+        snapshot_source_pool = info.source.map(|source| source.pool_index),
+        snapshot_source_set = info.source.map(|source| source.set_index),
+        snapshot_cycle = info.next_cycle,
+        snapshot_leader_epoch = info.leader_epoch,
+        "Scanner set snapshot is missing required metadata"
+    );
+}
+
 pub(super) async fn persist_and_publish_cache_snapshot(
     store: Arc<SetDisks>,
     updates: &mpsc::Sender<DataUsageCache>,
@@ -1158,9 +1176,20 @@ pub(super) async fn persist_and_publish_cache_snapshot(
     cache_cycle_floor: &AtomicU64,
     expected_publication_epoch: u64,
 ) -> Option<SystemTime> {
-    let source = cache_snapshot.info.source?;
-    let coverage_digest = cache_snapshot.info.scan_coverage_digest?;
-    let execution_digest = cache_snapshot.info.scan_execution_digest?;
+    let snapshot_cycle = cache_snapshot.info.next_cycle;
+    let snapshot_leader_epoch = cache_snapshot.info.leader_epoch;
+    let Some(source) = cache_snapshot.info.source else {
+        log_missing_set_snapshot_metadata(&store, &cache_snapshot.info, "source");
+        return None;
+    };
+    let Some(coverage_digest) = cache_snapshot.info.scan_coverage_digest else {
+        log_missing_set_snapshot_metadata(&store, &cache_snapshot.info, "coverage_digest");
+        return None;
+    };
+    let Some(execution_digest) = cache_snapshot.info.scan_execution_digest else {
+        log_missing_set_snapshot_metadata(&store, &cache_snapshot.info, "execution_digest");
+        return None;
+    };
     let guard = match acquire_scanner_cache_locks(store.as_ref(), DATA_USAGE_CACHE_NAME, source).await {
         Ok(guard) => guard,
         Err(err) => {
@@ -1169,8 +1198,14 @@ pub(super) async fn persist_and_publish_cache_snapshot(
                 event = EVENT_SCANNER_CACHE_PERSIST_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_IO,
-                cache_name = DATA_USAGE_CACHE_NAME,
                 state = err.state(),
+                store_pool = store.pool_index,
+                store_set = store.set_index,
+                snapshot_source_pool = source.pool_index,
+                snapshot_source_set = source.set_index,
+                snapshot_cycle,
+                snapshot_leader_epoch,
+                cache_name = DATA_USAGE_CACHE_NAME,
                 error = %err,
                 "Scanner cache snapshot lock acquisition failed"
             );
@@ -1187,15 +1222,24 @@ pub(super) async fn persist_and_publish_cache_snapshot(
                 event = EVENT_SCANNER_CACHE_PERSIST_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_IO,
-                cache_name = DATA_USAGE_CACHE_NAME,
                 state = "load_or_revision_lookup_failed",
+                store_pool = store.pool_index,
+                store_set = store.set_index,
+                snapshot_source_pool = source.pool_index,
+                snapshot_source_set = source.set_index,
+                snapshot_cycle,
+                snapshot_leader_epoch,
+                cache_name = DATA_USAGE_CACHE_NAME,
                 error = %err,
                 "Scanner cache snapshot load or revision lookup failed"
             );
             return None;
         }
     };
-    let scan_plan_digest = cache_snapshot.info.scan_plan_digest?;
+    let Some(scan_plan_digest) = cache_snapshot.info.scan_plan_digest else {
+        log_missing_set_snapshot_metadata(&store, &cache_snapshot.info, "plan_digest");
+        return None;
+    };
     if persisted.info.next_cycle > cache_snapshot.info.next_cycle {
         cache_cycle_floor.fetch_max(persisted.info.next_cycle, Ordering::AcqRel);
         warn!(
@@ -1203,10 +1247,16 @@ pub(super) async fn persist_and_publish_cache_snapshot(
             event = EVENT_SCANNER_CACHE_PERSIST_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_IO,
+            state = "stale_cycle_rejected",
+            store_pool = store.pool_index,
+            store_set = store.set_index,
+            snapshot_source_pool = source.pool_index,
+            snapshot_source_set = source.set_index,
+            snapshot_cycle,
+            snapshot_leader_epoch,
             cache_name = DATA_USAGE_CACHE_NAME,
             requested_cycle = cache_snapshot.info.next_cycle,
             persisted_cycle = persisted.info.next_cycle,
-            state = "stale_cycle_rejected",
             "Scanner rejected a set cache cycle regression"
         );
         return None;
@@ -1217,10 +1267,16 @@ pub(super) async fn persist_and_publish_cache_snapshot(
             event = EVENT_SCANNER_CACHE_PERSIST_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_IO,
+            state = "stale_leader_rejected",
+            store_pool = store.pool_index,
+            store_set = store.set_index,
+            snapshot_source_pool = source.pool_index,
+            snapshot_source_set = source.set_index,
+            snapshot_cycle,
+            snapshot_leader_epoch,
             cache_name = DATA_USAGE_CACHE_NAME,
             requested_epoch = cache_snapshot.info.leader_epoch,
             persisted_epoch = persisted.info.leader_epoch,
-            state = "stale_leader_rejected",
             "Scanner rejected a set cache snapshot from an older leader epoch"
         );
         return None;
@@ -1251,6 +1307,12 @@ pub(super) async fn persist_and_publish_cache_snapshot(
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_IO,
                 state = "scan_baseline_revision_changed",
+                store_pool = store.pool_index,
+                store_set = store.set_index,
+                snapshot_source_pool = source.pool_index,
+                snapshot_source_set = source.set_index,
+                snapshot_cycle,
+                snapshot_leader_epoch,
                 cache_name = DATA_USAGE_CACHE_NAME,
                 "Scanner skipped set snapshot without an unchanged baseline revision"
             );
@@ -1262,8 +1324,14 @@ pub(super) async fn persist_and_publish_cache_snapshot(
                 event = EVENT_SCANNER_CACHE_PERSIST_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_IO,
-                cache_name = DATA_USAGE_CACHE_NAME,
                 state = "lock_lost",
+                store_pool = store.pool_index,
+                store_set = store.set_index,
+                snapshot_source_pool = source.pool_index,
+                snapshot_source_set = source.set_index,
+                snapshot_cycle,
+                snapshot_leader_epoch,
+                cache_name = DATA_USAGE_CACHE_NAME,
                 "Scanner cache snapshot save skipped after lock loss"
             );
             return None;
@@ -1279,8 +1347,14 @@ pub(super) async fn persist_and_publish_cache_snapshot(
                 event = EVENT_SCANNER_CACHE_PERSIST_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_IO,
-                cache_name = DATA_USAGE_CACHE_NAME,
                 state = "save_failed",
+                store_pool = store.pool_index,
+                store_set = store.set_index,
+                snapshot_source_pool = source.pool_index,
+                snapshot_source_set = source.set_index,
+                snapshot_cycle,
+                snapshot_leader_epoch,
+                cache_name = DATA_USAGE_CACHE_NAME,
                 error = %e,
                 "Scanner cache snapshot persistence failed"
             );
@@ -1295,8 +1369,14 @@ pub(super) async fn persist_and_publish_cache_snapshot(
             event = EVENT_SCANNER_CACHE_PERSIST_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_IO,
-            cache_name = DATA_USAGE_CACHE_NAME,
             state = "lock_lost_after_save",
+            store_pool = store.pool_index,
+            store_set = store.set_index,
+            snapshot_source_pool = source.pool_index,
+            snapshot_source_set = source.set_index,
+            snapshot_cycle,
+            snapshot_leader_epoch,
+            cache_name = DATA_USAGE_CACHE_NAME,
             "Scanner cache snapshot publish skipped after lock loss"
         );
         return None;
@@ -1313,8 +1393,14 @@ pub(super) async fn persist_and_publish_cache_snapshot(
             event = EVENT_SCANNER_CACHE_PERSIST_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_IO,
-            cache_name = DATA_USAGE_CACHE_NAME,
             state = "publication_epoch_changed_before_publish",
+            store_pool = store.pool_index,
+            store_set = store.set_index,
+            snapshot_source_pool = source.pool_index,
+            snapshot_source_set = source.set_index,
+            snapshot_cycle,
+            snapshot_leader_epoch,
+            cache_name = DATA_USAGE_CACHE_NAME,
             "Scanner cache root publish skipped after movement epoch change"
         );
         return None;
@@ -1328,8 +1414,14 @@ pub(super) async fn persist_and_publish_cache_snapshot(
             event = EVENT_SCANNER_CACHE_PERSIST_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_IO,
-            cache_name = DATA_USAGE_CACHE_NAME,
             state = "publish_failed",
+            store_pool = store.pool_index,
+            store_set = store.set_index,
+            snapshot_source_pool = source.pool_index,
+            snapshot_source_set = source.set_index,
+            snapshot_cycle,
+            snapshot_leader_epoch,
+            cache_name = DATA_USAGE_CACHE_NAME,
             error = %e,
             "Scanner cache snapshot publish failed"
         );
