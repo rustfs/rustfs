@@ -278,8 +278,8 @@ pub(crate) mod tests {
     #[serial_test::serial]
     fn object_lock_diagnostics_join_guard_identity_to_physical_release() {
         use rustfs_lock::{
-            DisabledLockManager, FastObjectLockManager, GlobalLockManager, LocalClient, LockClient, LockManager, LockRequest,
-            LockType, NamespaceLock, ObjectKey,
+            DisabledLockManager, FastObjectLockManager, GlobalLockManager, LocalClient, LockClient, LockRequest, LockType,
+            NamespaceLock, ObjectKey,
         };
 
         temp_env::with_vars([(rustfs_config::ENV_OBJECT_LOCK_DIAG_ENABLE, Some("true"))], || {
