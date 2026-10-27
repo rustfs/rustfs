@@ -100,6 +100,7 @@ when restoring `/rustfs/console` for a custom OEM build.
 ## S3 API environment variables
 
 - `RUSTFS_API_OBJECT_MAX_VERSIONS` caps the number of retained versions for a single object. It defaults to `9223372036854775807`, matching MinIO's practical-unlimited default. Set a positive integer to enforce a lower per-object metadata bound.
+- `RUSTFS_VEEAM_SOSAPI_ENABLE` serves Veeam SOSAPI `system.xml` and `capacity.xml` for an authenticated GET or HEAD of those exact bucket-root keys. It defaults to `true`. Set it to `false` to restore the normal object path, including deletion of a real object previously stored at that key.
 - `MINIO_API_OBJECT_MAX_VERSIONS` is accepted as a compatibility alias when the canonical RustFS variable is not set.
 
 ## Distributed endpoint locality

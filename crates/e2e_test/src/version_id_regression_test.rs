@@ -600,6 +600,142 @@ mod tests {
         info!("✅ PASSED: Veeam backup workflow simulation completed successfully");
     }
 
+    /// Veeam B&R discovers SOSAPI by GET/HEAD of two well-known keys.
+    #[tokio::test]
+    async fn test_veeam_sosapi_system_and_capacity() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::common::local_http_client;
+
+        const SYSTEM_KEY: &str = ".system-d26a9498-cb7c-4a87-a44a-8ae204f5ba6c/system.xml";
+        const CAPACITY_KEY: &str = ".system-d26a9498-cb7c-4a87-a44a-8ae204f5ba6c/capacity.xml";
+
+        init_logging();
+        info!("🧪 TEST: Veeam SOSAPI system.xml and capacity.xml");
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+        let client = create_s3_client(&env);
+        let bucket = "veeam-sosapi";
+        create_bucket(&client, bucket).await?;
+
+        let system = client.get_object().bucket(bucket).key(SYSTEM_KEY).send().await?;
+        let system_etag = system.e_tag().map(str::to_string);
+        let system_len = system.content_length();
+        assert_eq!(system.content_type(), Some("application/xml"));
+        let system_body = system.body.collect().await?.into_bytes();
+        let system_xml = std::str::from_utf8(&system_body)?;
+        assert!(system_xml.contains("<ProtocolVersion>\"1.0\"</ProtocolVersion>"), "{system_xml}");
+        assert!(
+            system_xml.contains("<ModelName>\"RustFS ") && system_xml.contains("\"</ModelName>"),
+            "{system_xml}"
+        );
+        assert!(system_xml.contains("<CapacityInfo>true</CapacityInfo>"));
+        assert!(system_xml.contains("<UploadSessions>false</UploadSessions>"));
+        assert!(system_xml.contains("<IAMSTS>false</IAMSTS>"));
+        assert!(!system_xml.contains("SystemRecommendations"));
+        assert!(!system_xml.contains("APIEndpoints"));
+        assert!(!system_xml.contains("&quot;"));
+
+        let head = client.head_object().bucket(bucket).key(SYSTEM_KEY).send().await?;
+        assert_eq!(head.content_type(), Some("application/xml"));
+        assert_eq!(head.content_length(), system_len);
+        assert_eq!(head.e_tag().map(str::to_string), system_etag);
+        assert!(head.last_modified().is_some());
+
+        let ranged = client
+            .get_object()
+            .bucket(bucket)
+            .key(SYSTEM_KEY)
+            .range("bytes=0-3")
+            .send()
+            .await?;
+        assert_eq!(ranged.content_length(), Some(4));
+        let ranged_header = ranged.content_range().unwrap_or("");
+        assert!(ranged_header.starts_with("bytes 0-3/"), "{ranged_header}");
+        let ranged_body = ranged.body.collect().await?.into_bytes();
+        assert_eq!(&ranged_body[..], &system_body[..4]);
+
+        let capacity = client.get_object().bucket(bucket).key(CAPACITY_KEY).send().await?;
+        assert_eq!(capacity.content_type(), Some("application/xml"));
+        let capacity_body = capacity.body.collect().await?.into_bytes();
+        let capacity_xml = std::str::from_utf8(&capacity_body)?;
+        let capacity_value = xml_u64(capacity_xml, "Capacity")?;
+        let available_value = xml_u64(capacity_xml, "Available")?;
+        let used_value = xml_u64(capacity_xml, "Used")?;
+        assert!(used_value <= capacity_value, "{capacity_xml}");
+        assert!(available_value <= capacity_value.saturating_sub(used_value), "{capacity_xml}");
+
+        let put_err = client
+            .put_object()
+            .bucket(bucket)
+            .key(SYSTEM_KEY)
+            .body(ByteStream::from_static(b"overwrite"))
+            .send()
+            .await
+            .expect_err("SOSAPI put must fail");
+        assert_eq!(put_err.code(), Some("MethodNotAllowed"));
+        let delete_err = client
+            .delete_object()
+            .bucket(bucket)
+            .key(CAPACITY_KEY)
+            .send()
+            .await
+            .expect_err("SOSAPI delete must fail");
+        assert_eq!(delete_err.code(), Some("MethodNotAllowed"));
+
+        let normal_key = "Veeam/Backup/job.dat";
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(normal_key)
+            .body(ByteStream::from_static(b"backup-bytes"))
+            .send()
+            .await?;
+        let normal = client.get_object().bucket(bucket).key(normal_key).send().await?;
+        let normal_body = normal.body.collect().await?.into_bytes();
+        assert_eq!(&normal_body[..], b"backup-bytes");
+
+        let anon = local_http_client()
+            .get(format!("{}/{bucket}/{SYSTEM_KEY}", env.url))
+            .send()
+            .await?;
+        assert_eq!(anon.status(), reqwest::StatusCode::FORBIDDEN);
+        let anon_body = anon.text().await?;
+        assert!(!anon_body.contains("ProtocolVersion"), "{anon_body}");
+
+        let now = time::OffsetDateTime::now_utc();
+        let scope_date = format!("{:04}{:02}{:02}", now.year(), u8::from(now.month()), now.day());
+        let amz_date = format!("{scope_date}T{:02}{:02}{:02}Z", now.hour(), now.minute(), now.second());
+        let bad = local_http_client()
+            .get(format!("{}/{bucket}/{SYSTEM_KEY}", env.url))
+            .header("x-amz-date", &amz_date)
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=bad/{scope_date}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000"
+                ),
+            )
+            .send()
+            .await?;
+        assert_eq!(bad.status(), reqwest::StatusCode::FORBIDDEN);
+        let bad_body = bad.text().await?;
+        assert!(!bad_body.contains("ProtocolVersion"), "{bad_body}");
+
+        info!("✅ PASSED: Veeam SOSAPI system.xml and capacity.xml");
+        Ok(())
+    }
+
+    fn xml_u64(xml: &str, element: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let start = format!("<{element}>");
+        let end = format!("</{element}>");
+        let start_idx = xml.find(&start).ok_or_else(|| format!("missing {element} in {xml}"))? + start.len();
+        let end_idx = xml[start_idx..]
+            .find(&end)
+            .ok_or_else(|| format!("unclosed {element} in {xml}"))?
+            + start_idx;
+        Ok(xml[start_idx..end_idx].parse()?)
+    }
+
     #[tokio::test]
     async fn test_terraform_put_after_delete() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();

@@ -107,7 +107,6 @@ pub(crate) mod data_usage {
         crate::storage::storage_api::ecstore_data_usage::load_admin_data_usage_from_backend_cached(store).await
     }
 
-    #[cfg(test)]
     pub(crate) async fn load_data_usage_from_backend_cached(
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
@@ -679,8 +678,8 @@ pub(crate) mod bucket {
             pub(crate) type QuotaChecker = crate::storage::storage_api::ecstore_bucket::quota::checker::QuotaChecker;
         }
 
-        #[cfg(test)]
         pub(crate) type BucketQuota = crate::storage::storage_api::ecstore_bucket::quota::BucketQuota;
+        pub(crate) type QuotaType = crate::storage::storage_api::ecstore_bucket::quota::QuotaType;
         pub(crate) type QuotaOperation = crate::storage::storage_api::ecstore_bucket::quota::QuotaOperation;
         pub(crate) type QuotaCheckResult = crate::storage::storage_api::ecstore_bucket::quota::QuotaCheckResult;
         pub(crate) type QuotaError = crate::storage::storage_api::ecstore_bucket::quota::QuotaError;
@@ -1239,7 +1238,7 @@ pub(crate) mod object_usecase {
     }
 
     pub(crate) use super::{
-        access, bucket, compression, concurrency, data_usage, deadlock_detector, ecfs, error, head_prefix, helper, io,
+        access, bucket, capacity, compression, concurrency, data_usage, deadlock_detector, ecfs, error, head_prefix, helper, io,
         object_utils, options, request_context, s3_api, set_disk, sse, storage_class, timeout_wrapper,
     };
     pub(crate) use crate::storage::storage_api::{

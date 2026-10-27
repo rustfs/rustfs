@@ -562,6 +562,29 @@ pub(super) fn inject_accept_ranges_header(headers: &mut HeaderMap) {
     headers.insert(http::header::ACCEPT_RANGES, HeaderValue::from_static(ACCEPT_RANGES_BYTES));
 }
 
+/// Reject a mutation of a Veeam SOSAPI key while the feature is enabled.
+///
+/// The store closure runs only after the key matches, so ordinary object
+/// writes pay two string compares. Bucket existence is checked first so a
+/// missing bucket stays `NoSuchBucket`.
+pub(crate) async fn reject_veeam_sosapi_mutation(
+    store: impl FnOnce() -> Option<Arc<ECStore>>,
+    bucket: &str,
+    key: &str,
+) -> S3Result<()> {
+    if !super::veeam_sosapi::mutation_blocked(key) {
+        return Ok(());
+    }
+    let Some(store) = store() else {
+        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+    };
+    validate_bucket_exists(&store, bucket).await?;
+    Err(S3Error::with_message(
+        S3ErrorCode::MethodNotAllowed,
+        "Veeam SOSAPI system objects are read-only",
+    ))
+}
+
 /// Derive the response-header echo pairs for an additional-checksum algorithm
 /// (XXHash3/64/128, SHA-512) from the server-computed content checksum, for
 /// PutObject to echo back (#1256). Returns empty for the five s3s-typed algorithms
@@ -1105,6 +1128,23 @@ pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceH
         ..Default::default()
     };
     check_preconditions(headers, &info)
+}
+
+/// Read preconditions for a generated object. `etag_hex` and `last_modified`
+/// are the virtual response values; this does not load a stored object.
+pub(crate) fn check_generated_read_preconditions(
+    headers: &HeaderMap,
+    etag_hex: &str,
+    last_modified: OffsetDateTime,
+) -> S3Result<()> {
+    check_preconditions(
+        headers,
+        &ObjectInfo {
+            etag: Some(etag_hex.to_owned()),
+            mod_time: Some(last_modified),
+            ..Default::default()
+        },
+    )
 }
 
 /// S3 documents write-side `If-None-Match` only as `*` (create-only).

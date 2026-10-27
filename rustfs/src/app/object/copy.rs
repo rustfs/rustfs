@@ -281,6 +281,7 @@ impl DefaultObjectUsecase {
         // Validate both source and destination keys
         validate_object_key(&src_key, "COPY (source)")?;
         validate_object_key(&key, "COPY (dest)")?;
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
         let replaces_metadata = match metadata_directive.as_ref().map(|directive| directive.as_str()) {
             None | Some(MetadataDirective::COPY) => false,
