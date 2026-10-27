@@ -41,7 +41,7 @@ The `--abba` mode runs five independent scenario cells: `cold-hot`, `fresh-hot`,
 three A1/B1/B2/A2 groups for both baseline/candidate with background work on,
 and candidate-only background off/on. A measured release leg lasts at least 7200
 seconds; the minimum matrix contains 120 legs (240 hours before setup/oracles).
-The existing `performance-ab.yml` supplies the pattern for immutable build
+The hotpath warp ABBA rig (`scripts/run_hotpath_warp_abba.sh`) supplies the pattern for immutable build
 provenance and failure propagation, but its short Warp workload is not this
 scanner gate. No scheduled workflow starts this matrix automatically.
 

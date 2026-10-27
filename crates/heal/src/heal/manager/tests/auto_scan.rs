@@ -258,6 +258,16 @@ impl ScannerFixture {
         assert_eq!(request.id, self.task_id, "scanner must replay the durable UUID");
         assert_eq!(request.heal_endpoints, vec![self.local_targets[0].clone()]);
         assert_eq!(request.source, HealRequestSource::AutoHeal);
+        assert!(
+            self.manager
+                .heal_queue
+                .lock()
+                .await
+                .heap
+                .iter()
+                .any(|item| item.request.id == request.id && item.replacement_targets_frozen),
+            "replayed durable targets cannot expand"
+        );
         assert!(matches!(
             request.heal_type,
             HealType::ErasureSet { set_disk_id, buckets }

@@ -7,7 +7,7 @@
 
 This repository is public. For a public repository, GitHub's standard hosted runners (`ubuntu-latest`, `windows-latest`, `macos-latest`) cost nothing and have no minute cap, whatever plan the organisation is on. GitHub bills only two things: larger hosted runners, which have custom labels and are not used here, and standard runners in private repositories.
 
-Every other label in this repository is capacity RustFS pays for by the hour whether or not a job is running well:
+Every other label in this repository is capacity RustFS pays for. ARC pods and lab machines accrue cost while the machine exists. A Ubicloud label is metered for the minutes a job holds its VM:
 
 | Label | Paid by | What it is | Use it for |
 |---|---|---|---|
@@ -15,7 +15,7 @@ Every other label in this repository is capacity RustFS pays for by the hour whe
 | `windows-latest`, `macos-latest` | nobody | GitHub-hosted standard runners | Windows and macOS targets |
 | `sm-standard-2` | RustFS | ARC pod, Ubuntu 24.04, minimal image: no `gh`, no C toolchain; Docker only on the `dind-` label | only a job that a hosted runner cannot run (see the placement rule) |
 | `sm-standard-4` | RustFS | ARC pod, Ubuntu 24.04, 14 CPUs and 28 GB (the label is not the core count), large disk | workspace-scale Cargo builds |
-| `sm-standard-4-arm` | RustFS | ARC pod, aarch64; reached through the `build.yml` matrix, so `actionlint.yaml` does not list it | native aarch64 release builds |
+| `ubicloud-standard-16-arm` | RustFS | Ubicloud VM, alias of `ubicloud-standard-16-arm-ubuntu-2404`: Ubuntu 24.04 arm64, 16 vCPU, 48 GB, 300 GB disk. Reached through the `build.yml` matrix, so `actionlint.yaml` does not list it | native aarch64 release builds (`linux-aarch64-musl`, `linux-aarch64-gnu`) |
 | `dind-sm-standard-2` | RustFS | ARC pod with Docker-in-Docker | image builds that need `buildx` and a registry push |
 | `smoke-testing`, `pf-testing` | RustFS | long-lived lab machines | the packaged functional chain and performance suites |
 
@@ -40,7 +40,7 @@ A hosted runner is also the only choice for a few things the pods cannot do: `mo
 
 - Every `shared-key` has exactly one writer. `cache-warm.yml` owns `ci-dev`, `ci-feat-rio`, `ci-feat-proto` and `ci-uring`; every other `./.github/actions/setup` call states `cache-save-if` explicitly, and `scripts/security/check_cache_save_if.sh` fails the build when one does not.
 - All readers of a key run on the same image as its writer. Keys that live on hosted runners say so in their name (`ci-uring` is warmed on `ubuntu-latest`; `ci-e2e-distributed-hosted`, `e2e-upgrade-server-hosted`, `e2e-upgrade-tests-hosted`).
-- Moving a job between pools therefore means renaming its key. The new key is empty until a run from `main` (a scheduled run, or a manual dispatch of that workflow from `main`) saves it; until then that lane does a cold build.
+- Moving a job between pools therefore means renaming its key. The new key is empty until a run from `main` (a scheduled run, or a manual dispatch of that workflow from `main`) saves it; until then that lane does a cold build. The `build.yml` aarch64 release legs append `-ubicloud-arm` for this reason. `cache-warm.yml` does not write those keys.
 - `CARGO_BUILD_JOBS` and every other `CARGO*`, `CC*`, `CFLAGS*`, `CXX*`, `CMAKE*` and `RUST*` variable is hashed into the key. `ci.yml` sets `CARGO_BUILD_JOBS` at step level for that reason; promoting it to job level rotates the key for every lane that shares it.
 
 ## Where self-hosted minutes leak
@@ -62,7 +62,7 @@ gh api "repos/rustfs/rustfs/actions/runs/<run_id>/jobs?per_page=100" \
   --jq '.jobs[] | "\(.conclusion)\t\(.labels | join(","))\t\(.started_at)\t\(.completed_at)\t\(.name)"'
 ```
 
-Only rows whose label starts with `sm-`, `dind-`, `smoke-` or `pf-` cost anything. At the October 2026 review, a full pull-request run of `ci.yml` spent about 150 self-hosted minutes, a third of it in jobs that never compiled; treat that as the scale of what a placement mistake costs, not as a current figure.
+Only rows whose label starts with `sm-`, `dind-`, `ubicloud-`, `smoke-` or `pf-` cost anything. At the October 2026 review, a full pull-request run of `ci.yml` spent about 150 self-hosted minutes, a third of it in jobs that never compiled; treat that as the scale of what a placement mistake costs, not as a current figure.
 
 ## Checklist for a new or moved job
 

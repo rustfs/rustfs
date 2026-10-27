@@ -683,14 +683,17 @@ fn create_auto_heal_disk_request(set_disk_id: String, priority: Option<HealChann
     }
 }
 
-fn create_auto_replacement_disk_request(
+/// Build one automatic replacement request for the verified targets of a set.
+pub fn create_auto_replacement_disks_request(
     pool_index: usize,
     set_index: usize,
-    replacement_endpoint: String,
+    mut replacement_endpoints: Vec<String>,
     priority: Option<HealChannelPriority>,
 ) -> HealChannelRequest {
+    replacement_endpoints.sort_unstable();
+    replacement_endpoints.dedup();
     let mut request = create_auto_heal_disk_request(format!("pool_{pool_index}_set_{set_index}"), priority);
-    request.heal_endpoints = vec![replacement_endpoint];
+    request.heal_endpoints = replacement_endpoints;
     request.pool_index = Some(pool_index);
     request.set_index = Some(set_index);
     request
@@ -711,10 +714,10 @@ pub async fn send_heal_replacement_disk(
     replacement_endpoint: String,
     priority: Option<HealChannelPriority>,
 ) -> Result<(), String> {
-    send_heal_request(create_auto_replacement_disk_request(
+    send_heal_request(create_auto_replacement_disks_request(
         pool_index,
         set_index,
-        replacement_endpoint,
+        vec![replacement_endpoint],
         priority,
     ))
     .await
@@ -726,13 +729,34 @@ mod auto_heal_disk_request_tests {
 
     #[test]
     fn replacement_disk_request_carries_its_exact_endpoint() {
-        let request =
-            create_auto_replacement_disk_request(2, 3, "http://node2:9000/drive3".to_string(), Some(HealChannelPriority::Normal));
+        let request = create_auto_replacement_disks_request(
+            2,
+            3,
+            vec!["http://node2:9000/drive3".to_string()],
+            Some(HealChannelPriority::Normal),
+        );
 
         assert_eq!(request.disk.as_deref(), Some("pool_2_set_3"));
         assert_eq!(request.heal_endpoints, ["http://node2:9000/drive3"]);
         assert_eq!(request.pool_index, Some(2));
         assert_eq!(request.set_index, Some(3));
+        assert_eq!(request.source, HealRequestSource::AutoHeal);
+    }
+
+    #[test]
+    fn replacement_disk_request_keeps_every_distinct_target() {
+        let request = create_auto_replacement_disks_request(
+            2,
+            3,
+            vec!["drive-b".to_string(), "drive-a".to_string(), "drive-b".to_string()],
+            Some(HealChannelPriority::Normal),
+        );
+
+        assert_eq!(request.disk.as_deref(), Some("pool_2_set_3"));
+        assert_eq!(request.heal_endpoints, ["drive-a", "drive-b"]);
+        assert_eq!(request.pool_index, Some(2));
+        assert_eq!(request.set_index, Some(3));
+        assert_eq!(request.priority, HealChannelPriority::Normal);
         assert_eq!(request.source, HealRequestSource::AutoHeal);
     }
 

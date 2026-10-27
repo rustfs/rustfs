@@ -755,7 +755,7 @@ async fn list_objects_shared_corpus_versions_delete_markers_and_free_versions() 
 }
 
 #[tokio::test]
-async fn list_objects_shared_corpus_orphan_cleanup_requires_authoritative_evidence() {
+async fn list_objects_shared_corpus_orphan_listing_preserves_inputs() {
     for authoritative in [false, true] {
         let fixture = Fixture::new(
             &format!("list-corpus-orphan-{authoritative}"),
@@ -774,10 +774,9 @@ async fn list_objects_shared_corpus_orphan_cleanup_requires_authoritative_eviden
         let result = fixture.page("ghost/", None, None, 1).await;
         assert!(result.objects.is_empty() && result.prefixes.is_empty() && !result.is_truncated);
         for dir in &fixture.dirs {
-            assert_eq!(
-                dir.path().join(&fixture.bucket).join("ghost").exists(),
-                !authoritative,
-                "unknown metadata must fail closed"
+            assert!(
+                dir.path().join(&fixture.bucket).join("ghost/nested/leaf").exists(),
+                "LIST must preserve orphan input"
             );
             assert!(
                 dir.path()
@@ -785,7 +784,7 @@ async fn list_objects_shared_corpus_orphan_cleanup_requires_authoritative_eviden
                     .join("legal/child")
                     .join(STORAGE_FORMAT_FILE)
                     .exists(),
-                "purge must preserve legal siblings"
+                "LIST must preserve legal siblings"
             );
         }
         fixture.assert_walk("legal/", None, None, 1).await;
@@ -796,7 +795,7 @@ async fn list_objects_shared_corpus_orphan_cleanup_requires_authoritative_eviden
                     .join("legal/child")
                     .join(STORAGE_FORMAT_FILE)
                     .exists(),
-                "an orphan in the same subtree must not cause the legitimate child to be purged"
+                "an orphan in the same subtree must not affect a legitimate child"
             );
         }
         if authoritative {
@@ -811,17 +810,15 @@ async fn list_objects_shared_corpus_orphan_cleanup_requires_authoritative_eviden
                 .bucket_metadata_sys()
                 .expect("authoritative fixture has a metadata system");
             let guard = metadata_sys.write().await;
-            assert!(
-                timeout(Duration::from_millis(100), fixture.page("timed-out/", None, None, 1))
-                    .await
-                    .is_err(),
-                "blocked authoritative evidence must time out before cleanup can classify the prefix as empty"
-            );
+            let result = timeout(Duration::from_secs(2), fixture.page("timed-out/", None, None, 1))
+                .await
+                .expect("LIST must not wait for cleanup authorization");
+            assert!(result.objects.is_empty() && result.prefixes.is_empty() && !result.is_truncated);
             drop(guard);
             for dir in &fixture.dirs {
                 assert!(
                     dir.path().join(&fixture.bucket).join("timed-out").exists(),
-                    "a timed-out evidence check must preserve its orphan input"
+                    "LIST must preserve its orphan input while metadata is locked"
                 );
             }
         }
