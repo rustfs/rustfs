@@ -1,10 +1,67 @@
 use criterion::{Criterion, criterion_group, criterion_main};
+use metrics_util::debugging::DebuggingRecorder;
+use rustfs_io_metrics::{
+    LocalBatchReadDecision, LocalBatchReadMetrics, LocalBatchReadStage, record_local_batch_read_decision,
+    set_get_stage_metrics_enabled,
+};
 use rustfs_io_metrics::{MetricsCollector, PerformanceMetrics, record_get_object_timeout_operation_start};
 use rustfs_io_metrics::{record_s3_op, s3_http_metrics::S3HttpRequestGuard};
 use rustfs_s3_ops::S3Operation;
 use std::hint::black_box;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+fn local_batch_attribution_sample() {
+    let prepare = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
+    record_local_batch_read_decision(LocalBatchReadDecision::Selected, prepare.map(|started| started.elapsed()));
+    if let Some(metrics) = LocalBatchReadMetrics::capture() {
+        metrics.record_batch(4);
+        let execution = Instant::now();
+        metrics.record_stage(LocalBatchReadStage::QueueWait, true, execution.elapsed());
+        for _ in 0..4 {
+            for stage in [
+                LocalBatchReadStage::Metadata,
+                LocalBatchReadStage::Open,
+                LocalBatchReadStage::Read,
+            ] {
+                let started = Instant::now();
+                metrics.record_stage(stage, true, started.elapsed());
+            }
+            metrics.record_shard(true, 32 * 1024, 32 * 1024);
+        }
+        metrics.record_stage(LocalBatchReadStage::Execution, true, execution.elapsed());
+    }
+}
+
+fn bench_local_batch_attribution(c: &mut Criterion) {
+    let mut group = c.benchmark_group("local_batch_attribution_4_shards_debug_recorder");
+    for (name, enabled) in [("disabled", false), ("enabled", true)] {
+        set_get_stage_metrics_enabled(enabled);
+        group.bench_function(name, |b| {
+            b.iter_custom(|iterations| {
+                let mut remaining = iterations;
+                let mut elapsed = Duration::ZERO;
+                while remaining > 0 {
+                    // Bound captured histogram storage independently of Criterion's
+                    // iteration count. Recorder setup/teardown is not measured.
+                    let chunk = remaining.min(128);
+                    let recorder = DebuggingRecorder::new();
+                    metrics::with_local_recorder(&recorder, || {
+                        let started = Instant::now();
+                        for _ in 0..chunk {
+                            local_batch_attribution_sample();
+                        }
+                        elapsed += started.elapsed();
+                    });
+                    remaining -= chunk;
+                }
+                elapsed
+            });
+        });
+    }
+    group.finish();
+    set_get_stage_metrics_enabled(false);
+}
 
 fn bench_record_get_object_timeout_operation_start(c: &mut Criterion) {
     c.bench_function("record_get_object_timeout_operation_start", |b| {
@@ -54,6 +111,7 @@ criterion_group!(
     bench_record_get_object_timeout_operation_start,
     bench_s3_http_outcomes,
     bench_update_concurrent_requests,
-    bench_metrics_collector_record_io_operation
+    bench_metrics_collector_record_io_operation,
+    bench_local_batch_attribution
 );
 criterion_main!(benches);

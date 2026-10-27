@@ -143,6 +143,39 @@ Rules that override the table: a candidate result is actionable only when the `A
 
 ### CPU and memory evidence
 
+#### Local shard batch attribution
+
+The existing GET-stage metric gate also controls local batch attribution. This
+path performs buffered positioned reads, even if O_DIRECT or io_uring is enabled
+for another backend. Keep the gate, exporter, and build features identical
+between compared binaries; calibrate instrumentation overhead separately.
+
+| Metric suffix after `rustfs_io_get_object_local_batch_` | Meaning |
+| --- | --- |
+| `decisions_total` | Reader-setup decisions, labelled by a fixed decision enum; this is not an S3 request counter. |
+| `prepare_seconds` | Eligibility and path preparation, including pre-worker path checks; absent when preparation was skipped. |
+| `stage_seconds` | Queue wait, whole-worker execution, and per-shard metadata/open/read durations, labelled by stage and operation outcome. |
+| `shards` / `shards_total` | Batch size and completed shard outcomes. |
+| `requested_bytes_total` / `read_bytes_total` | Requested bytes and bytes actually returned by positioned reads, split by shard outcome. |
+
+Worker handles are captured before dispatch and remain owned by the worker, so
+completion samples can arrive after the caller stops waiting. A stage that did
+not execute contributes no sample. Queue wait ends when the worker starts;
+execution includes allocation and instrumentation, while read timing excludes
+buffer allocation. These nested and per-shard durations cannot be added to
+request latency, and stage p99 values cannot be summed. Match request-boundary
+samples and successful-request counters to the same workload window when
+normalizing costs. Keep failed requests and partial-shard failures visible.
+Inline GET and HEAD can bypass this reader-setup entry entirely; absence of a
+decision sample does not imply a failed request. The two local duration metrics
+use dedicated 0.1-microsecond-to-10-second histogram boundaries in the OTLP view;
+request-duration histogram boundaries are separate.
+
+For a bounded, four-shard instrumentation microbenchmark, run
+`cargo bench -p rustfs-io-metrics --bench metrics_pipeline -- local_batch_attribution_4_shards_debug_recorder`.
+It performs no disk I/O and uses a debugging recorder, so its result calibrates
+the sampling code rather than production exporter overhead or S3 latency.
+
 Warp output says whether throughput or latency changed; host telemetry says why. Collect it for the whole run and stop the collectors after the script exits.
 
 | Tool | Command | Answers |
