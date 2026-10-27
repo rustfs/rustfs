@@ -3958,6 +3958,28 @@ async fn object_catalog_backup_is_idempotent_and_restorable() {
 }
 
 #[tokio::test]
+async fn object_catalog_backup_rejects_missing_current_metadata() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    let metadata_location = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+    store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .unwrap();
+    store
+        .create_table(test_table_entry(bucket, &namespace, &table, metadata_location))
+        .await
+        .unwrap();
+    let error = store.create_object_catalog_backup(bucket, None).await.unwrap_err();
+    assert_matches!(error, TableCatalogStoreError::NotFound(message) if message.contains("backup object disappeared"));
+}
+
+#[tokio::test]
 async fn configured_table_catalog_store_uses_durable_strong_snapshot() {
     let backend = TestCatalogObjectBackend::default();
     let store = ConfiguredTableCatalogStore::new_for_test(backend.clone(), TableCatalogBackingMode::DurableStrong);
