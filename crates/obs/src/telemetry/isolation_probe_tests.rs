@@ -143,15 +143,17 @@ fn emit_root_event(phase: u64) {
     tracing::info!(target: TARGET, parent: None, expected = 1024_u64, emitted = 64_u64, phase, "diagnostic fixture");
 }
 
-// The initial implementation deliberately models `parent: None` without
-// isolation so the contract below has a reviewable red baseline.
-fn emit_candidate(_dispatch: &Dispatch, phase: u64) {
-    assert!(
-        Context::current().baggage().get("synthetic-secret").is_none(),
-        "ambient baggage must be hidden"
-    );
-    assert!(!Context::current().has_active_span(), "ambient OTEL span must be hidden");
-    emit_root_event(phase);
+// This prototype is synchronous and must use a fresh, span-free dispatcher.
+fn emit_candidate(dispatch: &Dispatch, phase: u64) {
+    let _context_guard = Context::new().attach();
+    dispatcher::with_default(dispatch, || {
+        assert!(
+            Context::current().baggage().get("synthetic-secret").is_none(),
+            "ambient baggage must be hidden"
+        );
+        assert!(!Context::current().has_active_span(), "ambient OTEL span must be hidden");
+        emit_root_event(phase);
+    });
 }
 
 #[test]
