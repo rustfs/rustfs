@@ -10,7 +10,7 @@ use crate::admin::{
         contract::object::ObjectIO as _,
     },
 };
-use crate::storage::storage_api::{StorageObjectOptions, StoragePutObjReader, new_instance_ctx};
+use crate::storage::storage_api::{StorageObjectOptions, StoragePutObjReader};
 use http_body_util::BodyExt as _;
 use rustfs_iam::{
     store::{
@@ -57,7 +57,6 @@ impl Fixture {
         let env = rustfs_test_utils::TestECStoreEnv::builder()
             .base_dir(root.path())
             .disk_count(4)
-            .instance_ctx(new_instance_ctx())
             .build()
             .await;
         assert_eq!(env.disk_paths.len(), 4);
