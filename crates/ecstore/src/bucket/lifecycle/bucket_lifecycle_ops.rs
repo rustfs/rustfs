@@ -15868,6 +15868,116 @@ mod tests {
         assert!(ecstore.is_ok(), "fresh local ECStore boot should succeed, got {ecstore:?}");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn stale_multipart_cleanup_preserves_partial_metadata_without_upload_part_warning() {
+        use tracing::instrument::WithSubscriber as _;
+        #[derive(Clone, Default)]
+        struct CapturedLogs(Arc<StdMutex<Vec<u8>>>);
+        struct LogWriter(Arc<StdMutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+            type Writer = LogWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                LogWriter(self.0.clone())
+            }
+        }
+
+        let (paths, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-partial-{}", Uuid::new_v4().simple());
+        create_test_bucket(&ecstore, &bucket).await;
+        for copies in [1, 2] {
+            let object = format!("partial-{copies}.bin");
+            let initiated = OffsetDateTime::now_utc() - time::Duration::hours(30);
+            let upload = ecstore
+                .new_multipart_upload(
+                    &bucket,
+                    &object,
+                    &ObjectOptions {
+                        mod_time: Some(initiated),
+                        max_parity: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("multipart upload should be created");
+            let decoded = base64_simd::URL_SAFE_NO_PAD
+                .decode_to_vec(upload.upload_id.as_bytes())
+                .unwrap();
+            let decoded = String::from_utf8(decoded).unwrap();
+            let (_, upload_dir) = decoded.split_once('.').expect("deployment-prefixed upload id");
+            let upload_path = format!("{}/{upload_dir}", multipart_sha_dir(&bucket, &object));
+            let physical_paths: Vec<_> = paths
+                .iter()
+                .map(|path| path.join(RUSTFS_META_MULTIPART_BUCKET).join(&upload_path))
+                .collect();
+            let original: Vec<_> = physical_paths
+                .iter()
+                .take(copies)
+                .map(|path| std::fs::read(path.join(STORAGE_FORMAT_FILE)).unwrap())
+                .collect();
+            let info = super::get_file_info(
+                &original[0],
+                RUSTFS_META_MULTIPART_BUCKET,
+                &upload_path,
+                "",
+                super::FileInfoOpts {
+                    data: false,
+                    include_free_versions: false,
+                    include_part_checksums: false,
+                },
+            )
+            .unwrap();
+            assert_eq!((info.erasure.data_blocks, info.erasure.parity_blocks), (2, 2));
+            for path in physical_paths.iter().skip(copies) {
+                fs::remove_dir_all(path).await.expect("remove selected metadata copies");
+            }
+            if copies == 2 {
+                ecstore
+                    .get_multipart_info(&bucket, &object, &upload.upload_id, &ObjectOptions::default())
+                    .await
+                    .expect("two metadata copies must meet read quorum");
+            }
+
+            let logs = CapturedLogs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            cleanup_stale_multipart_uploads_once_at(
+                ecstore.clone(),
+                OffsetDateTime::now_utc(),
+                StdDuration::from_secs(24 * 60 * 60),
+            )
+            .with_subscriber(subscriber)
+            .await;
+
+            for (path, expected) in physical_paths.iter().zip(&original) {
+                assert_eq!(fs::read(path.join(STORAGE_FORMAT_FILE)).await.unwrap(), *expected);
+            }
+            let log_output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                log_output.contains(&upload_path),
+                "missing background diagnostic for {upload_path}: {log_output}"
+            );
+            assert!(log_output.contains("multipart_cleanup_lock_or_recheck_failed"), "{log_output}");
+            assert!(!log_output.contains("op=\"upload_part\""), "unexpected upload-part warning: {log_output}");
+            for path in physical_paths.iter().take(copies) {
+                fs::remove_dir_all(path).await.unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     #[serial]
     async fn stale_multipart_cleanup_uses_default_expiry_without_lifecycle() {
