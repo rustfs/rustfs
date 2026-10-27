@@ -110,7 +110,7 @@ fn mrf_ownership_retry_due_boundaries_and_priority_are_bounded() {
 }
 
 #[tokio::test]
-async fn mrf_ownership_full_hint_table_has_bounded_multicycle_work_and_sync() {
+async fn mrf_ownership_full_hint_table_has_bounded_multicycle_work() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
     let base = 1_700_000_000;
@@ -131,39 +131,23 @@ async fn mrf_ownership_full_hint_table_has_bounded_multicycle_work_and_sync() {
         .enumerate()
         .map(|(index, entry)| (entry.object.clone().expect("object identity"), index))
         .collect();
-    scanner.sync_pending_heals();
-    let initial_syncs = scanner.pending_heal_sync_count;
     let mut requests = 0usize;
-    let mut nonempty_batches = 0;
     for minute in 0..24 * 60 {
         let now = base + minute * 60;
         let candidates = pending_scanner_heal_retry_candidates_at(&scanner.new_cache.info.pending_heals, "bucket", now);
         assert!(candidates.len() <= MAX_PENDING_SCANNER_HEAL_RETRIES_PER_BUCKET);
-        if candidates.is_empty() {
-            continue;
+        for candidate in candidates {
+            assert_eq!(
+                build_pending_scanner_heal_request(&candidate)
+                    .expect("retry request")
+                    .priority,
+                HealChannelPriority::Low
+            );
+            let index = indices[candidate.object.as_ref().expect("object identity")];
+            record_pending_heal_attempt(&mut scanner.new_cache.info.pending_heals[index], now);
+            observe_pending_heal_admission(&mut scanner.new_cache.info.pending_heals[index], HealAdmissionResult::Accepted);
+            requests += 1;
         }
-        nonempty_batches += 1;
-        let before = scanner.pending_heal_sync_count;
-        {
-            let batch = PendingHealSyncBatch::new(&mut scanner);
-            for candidate in candidates {
-                assert_eq!(
-                    build_pending_scanner_heal_request(&candidate)
-                        .expect("retry request")
-                        .priority,
-                    HealChannelPriority::Low
-                );
-                let index = indices[candidate.object.as_ref().expect("object identity")];
-                record_pending_heal_attempt(&mut batch.scanner.new_cache.info.pending_heals[index], now);
-                observe_pending_heal_admission(
-                    &mut batch.scanner.new_cache.info.pending_heals[index],
-                    HealAdmissionResult::Accepted,
-                );
-                batch.scanner.sync_pending_heals();
-                requests += 1;
-            }
-        }
-        assert_eq!(scanner.pending_heal_sync_count, before + 1, "one table clone per changed retry batch");
         assert_eq!(scanner.new_cache.info.pending_heals.len(), MAX_PENDING_SCANNER_HEALS_PER_BUCKET);
     }
     assert!(requests >= MAX_PENDING_SCANNER_HEALS_PER_BUCKET, "every retained hint receives a retry");
@@ -172,12 +156,13 @@ async fn mrf_ownership_full_hint_table_has_bounded_multicycle_work_and_sync() {
         "15min..6h backoff bounds repeated work within 24h"
     );
     assert!(scanner.new_cache.info.pending_heals.iter().all(|entry| entry.attempts >= 2));
-    assert_eq!(scanner.pending_heal_sync_count - initial_syncs, nonempty_batches);
-    assert_eq!(scanner.update_cache.info.pending_heals, scanner.new_cache.info.pending_heals);
+    let restored =
+        DataUsageCache::unmarshal(&scanner.new_cache.marshal_msg().expect("encode retry ledger")).expect("reload retry ledger");
+    assert_eq!(restored.info.pending_heals, scanner.new_cache.info.pending_heals);
 }
 
 #[tokio::test]
-async fn mrf_ownership_cancelled_batch_restores_sync_without_per_item_clones() {
+async fn mrf_ownership_cancelled_retry_retains_canonical_ledger() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
     scanner
@@ -185,34 +170,45 @@ async fn mrf_ownership_cancelled_batch_restores_sync_without_per_item_clones() {
         .info
         .pending_heals
         .push(pending_heal(PendingScannerHealKind::Object, "bucket", Some("object"), None, 1, 1));
-    let before = scanner.pending_heal_sync_count;
     let mut work = Box::pin(async {
-        let batch = PendingHealSyncBatch::new(&mut scanner);
-        record_pending_heal_attempt(&mut batch.scanner.new_cache.info.pending_heals[0], 100);
-        batch.scanner.sync_pending_heals();
-        batch.scanner.sync_pending_heals();
+        record_pending_heal_attempt(&mut scanner.new_cache.info.pending_heals[0], 100);
+        scanner.update_pending_scanner_heal_after_admission(
+            PendingScannerHealKind::Object,
+            "bucket",
+            Some("object"),
+            None,
+            HealScanMode::Normal,
+            HealAdmissionResult::Accepted,
+        );
         std::future::pending::<()>().await;
     });
     assert!(futures::poll!(&mut work).is_pending());
     drop(work);
-    assert!(!scanner.pending_heal_sync_deferred);
-    assert!(!scanner.pending_heal_batch_dirty);
-    assert_eq!(scanner.pending_heal_sync_count, before + 1);
+    assert!(scanner.pending_heals_changed, "cancellation must retain the dirty marker");
     assert_eq!(scanner.new_cache.info.pending_heals[0].attempts, 2);
     assert!(pending_scanner_heal_retry_candidates_at(&scanner.new_cache.info.pending_heals, "bucket", 101).is_empty());
-    assert_eq!(scanner.update_cache.info.pending_heals, scanner.new_cache.info.pending_heals);
+    let restored = DataUsageCache::unmarshal(&scanner.new_cache.marshal_msg().expect("encode cancelled retry"))
+        .expect("reload cancelled retry");
+    assert_eq!(restored.info.pending_heals, scanner.new_cache.info.pending_heals);
+
+    scanner.pending_heals_changed = false;
     let result: std::result::Result<(), &'static str> = async {
-        let batch = PendingHealSyncBatch::new(&mut scanner);
-        record_pending_heal_attempt(&mut batch.scanner.new_cache.info.pending_heals[0], 200);
-        observe_pending_heal_admission(&mut batch.scanner.new_cache.info.pending_heals[0], HealAdmissionResult::Merged);
-        batch.scanner.sync_pending_heals();
-        Err("injected retry batch failure")
+        record_pending_heal_attempt(&mut scanner.new_cache.info.pending_heals[0], 200);
+        scanner.update_pending_scanner_heal_after_admission(
+            PendingScannerHealKind::Object,
+            "bucket",
+            Some("object"),
+            None,
+            HealScanMode::Normal,
+            HealAdmissionResult::Merged,
+        );
+        Err("injected retry failure")
     }
     .await;
     assert!(result.is_err());
-    assert_eq!(scanner.pending_heal_sync_count, before + 2);
-    assert!(!scanner.pending_heal_sync_deferred);
-    assert_eq!(scanner.update_cache.info.pending_heals, scanner.new_cache.info.pending_heals);
+    assert!(scanner.pending_heals_changed, "an error must retain the dirty marker");
+    assert_eq!(scanner.new_cache.info.pending_heals[0].attempts, 3);
+    assert_eq!(scanner.new_cache.info.pending_heals[0].last_admission_result, "merged");
 }
 
 #[derive(Default)]
@@ -436,7 +432,6 @@ async fn mrf_ownership_manager_completion_preserves_scanner_pending() {
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
     let bucket = format!("mrf-ownership-{}", Uuid::new_v4());
     scanner.new_cache.info.name = bucket.clone();
-    scanner.update_cache.info.name = bucket.clone();
     scanner.heal_object_select = 1;
     let storage = Arc::new(NoticeStorage {
         bucket_incarnation_id: Uuid::new_v4(),
@@ -521,12 +516,12 @@ async fn mrf_ownership_manager_completion_preserves_scanner_pending() {
             "the second object call remains blocked without a duplicate execution"
         );
         note_mrf_repaired(&bucket, object, Some(*version.as_bytes()));
-        let syncs_before_retry = scanner.pending_heal_sync_count;
+        scanner.pending_heals_changed = false;
         scanner
             .retry_pending_scanner_heals()
             .await
             .expect("real scanner ledger retry");
-        assert_eq!(scanner.pending_heal_sync_count, syncs_before_retry + 1, "the real retry batch syncs once");
+        assert!(scanner.pending_heals_changed, "the real retry marks its canonical ledger for persistence");
         assert_eq!(
             scanner.new_cache.info.pending_heals.len(),
             index + 1,
