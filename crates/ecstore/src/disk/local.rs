@@ -7762,10 +7762,6 @@ impl LocalDisk {
         // }
 
         let multipart_check = self.multipart_delete_check(delete_path, true)?;
-        if let Some(check) = &multipart_check {
-            self.validate_multipart_delete_admission(check.clone(), namespace_owner.clone())
-                .await?;
-        }
         let err = if let Some(check) = &multipart_check {
             os::rename_all_with_precondition_and_parent_sync(
                 delete_path,
@@ -7842,13 +7838,15 @@ impl LocalDisk {
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
         multipart_staging::reject_native_control_write(&self.root, self.io_root(), volume, path)?;
-        let source_owner = self.acquire_multipart_delete_owner(volume, path, namespace_owner).await?;
+        let mut source_owner = self.acquire_multipart_delete_owner(volume, path, namespace_owner).await?;
         let namespace_owner = source_owner.namespace_owner();
         if volume == RUSTFS_META_MULTIPART_BUCKET
             && let Some(check) = self.multipart_delete_check(&self.io_get_object_path(volume, path)?, opt.recursive)?
+            && (opt.orphan_data_dir || (opt.recursive && opt.immediate))
         {
             self.validate_multipart_delete_admission(check, namespace_owner.clone())
                 .await?;
+            source_owner.mark_validated();
         }
         if pool_meta_native::reject_raw_path(&self.root, volume, path).is_err() {
             let owner = self.pool_meta_cleanup_owner(volume, path, &opt, namespace_owner).await?;
@@ -8066,7 +8064,10 @@ impl LocalDisk {
         let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
         let multipart_check = self.multipart_delete_check(&file_path, opt.recursive)?;
-        if let Some(check) = &multipart_check {
+        if !source_owner.is_validated()
+            && (opt.orphan_data_dir || opt.old_data_dir.is_some() || !opt.recursive)
+            && let Some(check) = &multipart_check
+        {
             self.validate_multipart_delete_admission(check.clone(), namespace_owner.clone())
                 .await?;
         }
@@ -8313,8 +8314,6 @@ impl LocalDisk {
                 // debug!("delete_file remove_dir done {:?}", &delete_path);
             } else if let Err(err) = {
                 if let Some(check) = self.multipart_delete_check(delete_path, false)? {
-                    self.validate_multipart_delete_admission(check.clone(), namespace_owner.clone())
-                        .await?;
                     let path = delete_path.clone();
                     let lease = os::acquire_namespace_mutation_lease_with_owner(delete_path, namespace_owner.clone()).await;
                     os::run_blocking_namespace_operation(lease, move || {
@@ -8327,6 +8326,10 @@ impl LocalDisk {
                 }
             } {
                 // debug!("remove_file err {:?} when {:?}", &err, &delete_path);
+                let err = match err.downcast::<DiskError>() {
+                    Ok(disk_err) => return Err(disk_err),
+                    Err(err) => err,
+                };
                 match err.kind() {
                     ErrorKind::NotFound => (),
                     _ => {
@@ -12016,20 +12019,16 @@ impl DiskAPI for LocalDisk {
             // Publish the immutable generation before preparing the part switch.
             // Rollback retains the old generation; an unreferenced new index is
             // reclaimed with the upload directory if preparation is interrupted.
-            os::rename_all_with_precondition(
+            os::rename_all_with_precondition_and_parent_sync(
                 &source,
                 &destination,
                 &dst_volume_dir,
                 &self.publication_root,
                 source_owner.clone(),
                 admission.as_ref().map(|check| check.precondition()),
+                durability.syncs_commit_metadata(),
             )
             .await?;
-            if durability.syncs_commit_metadata() {
-                os::fsync_dir_with_owner(destination.parent().ok_or(DiskError::FileCorrupt)?, source_owner.clone())
-                    .await
-                    .map_err(to_file_error)?;
-            }
         }
         let retained_owner = source_owner.clone();
         tokio::task::spawn_blocking(move || {
@@ -12157,17 +12156,16 @@ impl DiskAPI for LocalDisk {
                 PartTransactionAction::Commit => (PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META),
                 PartTransactionAction::Rollback => (PART_TRANSACTION_OLD_META, PART_TRANSACTION_NEW_META),
             };
-            if let (Ok(current), Ok(retained), Ok(obsolete)) = (
-                std::fs::read(&current_meta_path),
-                std::fs::read(transaction_path.join(retained_name)),
-                std::fs::read(transaction_path.join(obsolete_name)),
-            ) && current == retained
+            if let Ok(obsolete) = std::fs::read(transaction_path.join(obsolete_name))
                 && let Ok(obsolete) = ObjectPartInfo::unmarshal(&obsolete)
                 && let Some(integrity) = obsolete.integrity
                 && integrity.validate().is_ok()
                 && usize::try_from(integrity.number).ok() == Some(obsolete.number)
                 && current_data_path.file_name().and_then(|name| name.to_str())
                     == Some(format!("part.{}", obsolete.number).as_str())
+                && let (Ok(current), Ok(retained)) =
+                    (std::fs::read(&current_meta_path), std::fs::read(transaction_path.join(retained_name)))
+                && current == retained
                 && ObjectPartInfo::unmarshal(&retained)
                     .ok()
                     .and_then(|part| part.integrity)
@@ -12208,16 +12206,6 @@ impl DiskAPI for LocalDisk {
         let source_owner = self.multipart_source_owner(dst_volume, dst_path, true, false, None).await?;
         multipart_staging::reject_reserved_anchor(dst_path)?;
         let admission = self.multipart_source_admission(dst_volume, dst_path, true, false)?;
-        if let Some(check) = admission.clone() {
-            let retained = source_owner.clone();
-            tokio::task::spawn_blocking(move || {
-                let _owner = retained;
-                check.validate()
-            })
-            .await
-            .map_err(DiskError::from)?
-            .map_err(to_file_error)?;
-        }
         pool_meta_native::reject_raw_path(&self.root, src_volume, src_path)?;
         pool_meta_native::reject_raw_path(&self.root, dst_volume, dst_path)?;
         let src_volume_dir = self.io_get_bucket_path(src_volume)?;
@@ -12253,158 +12241,186 @@ impl DiskAPI for LocalDisk {
         check_path_length(src_file_path.to_string_lossy().as_ref())?;
         check_path_length(dst_file_path.to_string_lossy().as_ref())?;
 
-        if src_is_dir {
-            let meta_op = match lstat_std(&src_file_path).map_err(|e| to_file_error(e).into()) {
-                Ok(meta) => Some(meta),
-                Err(e) => {
-                    return Err(e);
-                }
-            };
-
-            if let Some(meta) = meta_op
-                && !meta.is_dir()
-            {
-                warn!(
-                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                    reason = "src_expected_dir_missing",
-                    path = ?src_file_path,
-                    "Disk local rename rejected"
-                );
-                return Err(DiskError::FileAccessDenied);
-            }
-
-            // Clear any stale destination before the directory rename. An absent
-            // destination is the normal case when renaming a directory to a new
-            // location, so tolerate NotFound instead of aborting the whole rename
-            // (MinIO's RenameFile ignores osIsNotExist here).
-            if let Err(e) = remove_std(&dst_file_path)
-                && e.kind() != ErrorKind::NotFound
-            {
-                return Err(to_file_error(e).into());
-            }
-        } else {
-            let meta = lstat_std(&src_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
-            if meta.is_dir() {
-                warn!(
-                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                    reason = "src_unexpected_dir",
-                    path = ?src_file_path,
-                    "Disk local rename rejected"
-                );
-                return Err(DiskError::FileAccessDenied);
-            }
-        }
-
-        let transaction_publish_meta = if src_is_dir {
+        let dst_meta_path = if src_is_dir {
             None
         } else {
-            let transaction_path = self.io_get_object_path(dst_volume, &crate::disk::part_transaction_path(dst_path))?;
-            let transaction_meta_path = transaction_path.join(PART_TRANSACTION_NEW_META);
-            match fs::read(&transaction_meta_path).await {
-                Ok(expected_meta) => {
-                    if expected_meta.as_slice() != meta.as_ref() {
-                        return Err(DiskError::FileCorrupt);
-                    }
-
-                    let publish_meta_path = transaction_path.join(PART_TRANSACTION_PUBLISH_META);
-                    let source_meta_path = transaction_meta_path.clone();
-                    let publish_path = publish_meta_path.clone();
-                    let retained_owner = source_owner.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let _owner = retained_owner;
-                        remove_file_if_exists(&publish_path)?;
-                        std::fs::hard_link(source_meta_path, &publish_path)
-                    })
-                    .await
-                    .map_err(DiskError::from)?
-                    .map_err(to_file_error)?;
-                    Some(publish_meta_path)
-                }
-                // Old peers know only RenamePart. The new coordinator never
-                // reaches rename unless prepare succeeded, so an absent
-                // transaction directory identifies the rolling-upgrade legacy
-                // path. A present directory without new.meta is corruption.
-                Err(err) if err.kind() == ErrorKind::NotFound => match fs::metadata(&transaction_path).await {
-                    Ok(_) => return Err(DiskError::FileCorrupt),
-                    Err(meta_err) if meta_err.kind() == ErrorKind::NotFound => None,
-                    Err(meta_err) => return Err(to_file_error(meta_err).into()),
-                },
-                Err(err) => return Err(to_file_error(err).into()),
-            }
+            let path = self.io_get_object_path(dst_volume, &format!("{dst_path}.meta"))?;
+            check_path_length(path.to_string_lossy().as_ref())?;
+            Some(path)
+        };
+        let transaction_path = if src_is_dir {
+            None
+        } else {
+            Some(self.io_get_object_path(dst_volume, &crate::disk::part_transaction_path(dst_path))?)
         };
 
         // UploadPart is acknowledged once this rename lands, so the part data and
         // its directory entry must be durable before we return. Relaxed keeps the
         // part payload fdatasync but leaves the directory entry to the page cache.
         let durability = effective_durability(dst_volume);
-        if durability.syncs_data_shards() && !src_is_dir {
-            let src = src_file_path.clone();
-            let retained_owner = source_owner.clone();
-            tokio::task::spawn_blocking(move || {
-                let _owner = retained_owner;
-                os::sync_file(&src)
+        let sync = (durability.syncs_data_shards() && !src_is_dir) || durability.syncs_commit_metadata();
+        let publication_root = self.publication_root.clone();
+        let src_file_for_cleanup = src_file_path.clone();
+        let src_volume_for_cleanup = src_volume_dir.clone();
+        let meta_for_legacy = meta.clone();
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&dst_file_path, source_owner.clone()).await;
+
+        let published_transaction_meta =
+            os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<bool> {
+                if let Some(check) = &admission {
+                    check.validate().map_err(to_file_error)?;
+                }
+                if src_is_dir {
+                    let meta_op = lstat_std(&src_file_path).map_err(to_file_error)?;
+                    if !meta_op.is_dir() {
+                        warn!(
+                            event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            reason = "src_expected_dir_missing",
+                            path = ?src_file_path,
+                            "Disk local rename rejected"
+                        );
+                        return Err(DiskError::FileAccessDenied.into());
+                    }
+
+                    // Clear any stale destination before the directory rename. An absent
+                    // destination is the normal case when renaming a directory to a new
+                    // location, so tolerate NotFound instead of aborting the whole rename
+                    // (MinIO's RenameFile ignores osIsNotExist here).
+                    if let Err(e) = remove_std(&dst_file_path)
+                        && e.kind() != ErrorKind::NotFound
+                    {
+                        return Err(to_file_error(e));
+                    }
+                } else {
+                    let meta_op = lstat_std(&src_file_path).map_err(to_file_error)?;
+                    if meta_op.is_dir() {
+                        warn!(
+                            event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            reason = "src_unexpected_dir",
+                            path = ?src_file_path,
+                            "Disk local rename rejected"
+                        );
+                        return Err(DiskError::FileAccessDenied.into());
+                    }
+                }
+
+                let transaction_publish_meta = if let Some(transaction_path) = transaction_path.as_ref() {
+                    let transaction_meta_path = transaction_path.join(PART_TRANSACTION_NEW_META);
+                    match std::fs::File::open(&transaction_meta_path) {
+                        Ok(mut file) => {
+                            let file_len = file.metadata().map_err(to_file_error)?.len();
+                            if file_len != meta.len() as u64 {
+                                return Err(DiskError::FileCorrupt.into());
+                            }
+                            let mut expected_meta = Vec::with_capacity(meta.len());
+                            std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, file_len), &mut expected_meta)
+                                .map_err(to_file_error)?;
+                            drop(file);
+                            if expected_meta.as_slice() != meta.as_ref() {
+                                return Err(DiskError::FileCorrupt.into());
+                            }
+
+                            let publish_meta_path = transaction_path.join(PART_TRANSACTION_PUBLISH_META);
+                            remove_file_if_exists(&publish_meta_path).map_err(to_file_error)?;
+                            std::fs::hard_link(&transaction_meta_path, &publish_meta_path).map_err(to_file_error)?;
+                            Some(publish_meta_path)
+                        }
+                        // Old peers know only RenamePart. The new coordinator never
+                        // reaches rename unless prepare succeeded, so an absent
+                        // transaction directory identifies the rolling-upgrade legacy
+                        // path. A present directory without new.meta is corruption.
+                        Err(err) if err.kind() == ErrorKind::NotFound => match std::fs::metadata(transaction_path) {
+                            Ok(_) => return Err(DiskError::FileCorrupt.into()),
+                            Err(meta_err) if meta_err.kind() == ErrorKind::NotFound => None,
+                            Err(meta_err) => return Err(to_file_error(meta_err)),
+                        },
+                        Err(err) => return Err(to_file_error(err)),
+                    }
+                } else {
+                    None
+                };
+
+                if durability.syncs_data_shards() && !src_is_dir {
+                    os::sync_file(&src_file_path).map_err(to_file_error)?;
+                }
+
+                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                let precondition = admission.as_ref().map(|check| check.precondition());
+                #[cfg(not(all(any(test, feature = "test-util"), not(windows))))]
+                let precondition: Option<Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>> = None;
+
+                os::rename_all_with_precondition_and_parent_sync_std(
+                    &src_file_path,
+                    &dst_file_path,
+                    &dst_volume_dir,
+                    &publication_root,
+                    precondition.as_deref(),
+                    durability.syncs_commit_metadata() && transaction_publish_meta.is_none(),
+                )
+                .map_err(to_file_error)?;
+
+                let dst_meta = lstat_std(&dst_file_path).map_err(to_file_error)?;
+                if src_is_dir != dst_meta.is_dir() {
+                    warn!(
+                        event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        reason = "dst_type_changed_after_rename",
+                        path = ?dst_file_path,
+                        "Disk local rename rejected"
+                    );
+                    return Err(DiskError::FileAccessDenied.into());
+                }
+
+                if let Some(transaction_publish_meta) = transaction_publish_meta {
+                    let dst_meta_path = dst_meta_path.as_ref().ok_or(DiskError::InvalidPath)?;
+                    os::rename_all_with_precondition_and_parent_sync_std(
+                        &transaction_publish_meta,
+                        dst_meta_path,
+                        &dst_volume_dir,
+                        &publication_root,
+                        precondition.as_deref(),
+                        durability.syncs_commit_metadata(),
+                    )
+                    .map_err(to_file_error)?;
+
+                    for dir in src_file_path.ancestors().skip(1) {
+                        if dir == src_volume_dir.as_path() || !dir.starts_with(&src_volume_dir) || is_root_path(dir) {
+                            break;
+                        }
+                        match std::fs::remove_dir(dir) {
+                            Ok(()) => {}
+                            Err(err) if is_dir_not_empty_error(&err) || is_benign_object_rmdir_error(&err) => break,
+                            Err(err) => {
+                                return Err(Error::other(FileAccessDeniedWithContext {
+                                    path: dir.to_path_buf(),
+                                    source: err,
+                                })
+                                .into());
+                            }
+                        }
+                    }
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             })
             .await
-            .map_err(DiskError::from)?
-            .map_err(to_file_error)?;
-        }
+            .map_err(DiskError::from)?;
 
-        os::rename_all_with_precondition(
-            &src_file_path,
-            &dst_file_path,
-            &dst_volume_dir,
-            &self.publication_root,
-            source_owner.clone(),
-            admission.as_ref().map(|check| check.precondition()),
-        )
-        .await?;
-
-        if durability.syncs_commit_metadata()
-            && let Some(parent) = dst_file_path.parent()
-        {
-            os::fsync_dir_with_owner(parent, source_owner.clone())
-                .await
-                .map_err(to_file_error)?;
-        }
-
-        let dst_meta = lstat_std(&dst_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
-        if src_is_dir != dst_meta.is_dir() {
-            warn!(
-                event = EVENT_DISK_LOCAL_RENAME_REJECTED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                reason = "dst_type_changed_after_rename",
-                path = ?dst_file_path,
-                "Disk local rename rejected"
-            );
-            return Err(DiskError::FileAccessDenied);
-        }
-
-        if let Some(transaction_publish_meta) = transaction_publish_meta {
-            let dst_meta_path = self.io_get_object_path(dst_volume, &format!("{dst_path}.meta"))?;
-            os::rename_all_with_precondition(
-                &transaction_publish_meta,
-                &dst_meta_path,
-                &dst_volume_dir,
-                &self.publication_root,
+        if !published_transaction_meta {
+            self.write_all_meta_with_namespace_owner(
+                dst_volume,
+                &format!("{dst_path}.meta"),
+                &meta_for_legacy,
+                true,
                 source_owner.clone(),
-                admission.as_ref().map(|check| check.precondition()),
             )
             .await?;
-            if durability.syncs_commit_metadata()
-                && let Some(parent) = dst_meta_path.parent()
-            {
-                os::fsync_dir_with_owner(parent, source_owner.clone())
-                    .await
-                    .map_err(to_file_error)?;
-            }
-        } else {
-            self.write_all_meta_with_namespace_owner(dst_volume, &format!("{dst_path}.meta"), &meta, true, source_owner.clone())
-                .await?;
         }
 
         if src_is_dir {
@@ -12418,8 +12434,9 @@ impl DiskAPI for LocalDisk {
                 .await;
         }
 
-        if let Some(parent) = src_file_path.parent() {
-            self.delete_file(&src_volume_dir, &parent.to_path_buf(), false, false).await?;
+        if !published_transaction_meta && let Some(parent) = src_file_for_cleanup.parent() {
+            self.delete_file(&src_volume_for_cleanup, &parent.to_path_buf(), false, false)
+                .await?;
         }
 
         Ok(())
@@ -12895,12 +12912,26 @@ impl DiskAPI for LocalDisk {
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
 
+        let mut cached_owner: Option<(String, Option<Arc<dyn Send + Sync>>)> = None;
         for path in paths.iter() {
             let file_path = self.io_get_object_path(volume, path)?;
 
             check_path_length(file_path.to_string_lossy().as_ref())?;
 
-            let owner = self.multipart_source_owner(volume, path, true, true, None).await?;
+            let owner = if volume == RUSTFS_META_MULTIPART_BUCKET {
+                let scope_key = multipart_staging::upload_scope_root(path, true).to_ascii_lowercase();
+                if let Some((cached_key, cached)) = &cached_owner
+                    && cached_key == &scope_key
+                {
+                    cached.clone()
+                } else {
+                    let acquired = self.multipart_source_owner(volume, path, true, true, None).await?;
+                    cached_owner = Some((scope_key, acquired.clone()));
+                    acquired
+                }
+            } else {
+                self.multipart_source_owner(volume, path, true, true, None).await?
+            };
             self.move_to_trash_with_namespace_owner(&file_path, false, false, owner)
                 .await?;
 
@@ -26502,6 +26533,71 @@ mod test {
             assert_eq!(fs::read(&path).await.expect("new metadata"), b"new");
             fs::remove_file(&path).await.expect("remove fixture");
         }
+    }
+
+    #[tokio::test]
+    async fn rename_part_leaves_metadata_reads_on_foreground_lane() {
+        let dir = tempfile::tempdir().expect("disk root");
+        let endpoint = Endpoint::try_from(dir.path().to_string_lossy().as_ref()).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        ensure_test_volume(&disk, "tmp").await;
+        ensure_test_volume(&disk, "bucket").await;
+
+        disk.write_metadata(
+            "",
+            "bucket",
+            "unrelated/object",
+            test_file_info("unrelated/object", Uuid::new_v4(), Some(Uuid::new_v4()), None),
+        )
+        .await
+        .expect("write unrelated object metadata");
+
+        let payload = Bytes::from_static(b"part payload");
+        let meta = Bytes::from(
+            ObjectPartInfo {
+                number: 1,
+                size: payload.len(),
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("part metadata"),
+        );
+        disk.write_all("tmp", "upload/part.1", payload.clone())
+            .await
+            .expect("stage part");
+        disk.prepare_part_transaction("tmp", "upload/part.1", "bucket", "object/part.1", meta.clone())
+            .await
+            .expect("prepare part transaction");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let queue = Arc::clone(&disk.blocking_queue);
+        let blocker = tokio::spawn(async move {
+            queue
+                .run_fsync_cancellable(move |_| {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.blocking_recv();
+                    Ok(())
+                })
+                .await
+        });
+        started_rx.await.expect("fsync lane blocked");
+
+        let mut rename = std::pin::pin!(disk.rename_part("tmp", "upload/part.1", "bucket", "object/part.1", meta.clone()));
+        assert!(futures::FutureExt::now_or_never(&mut rename).is_none());
+
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            disk.read_version("", "bucket", "unrelated/object", "", &ReadOptions::default()),
+        )
+        .await
+        .expect("read_version on unrelated key must not be blocked by rename_part sync")
+        .expect("unrelated object metadata should be readable");
+        assert_eq!(read.name, "unrelated/object");
+
+        release_tx.send(()).expect("release fsync lane");
+        blocker.await.expect("blocker joined").expect("blocker completed");
+        rename.await.expect("rename_part completed");
     }
 
     #[tokio::test]
