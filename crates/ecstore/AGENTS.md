@@ -12,6 +12,9 @@ Applies to `crates/ecstore/`.
 
 - Be careful with allocations and locking in hot paths.
 - Keep network and disk operations async-friendly; avoid introducing unnecessary blocking.
+- Coalesce related `open`, `read`/`write`, `fsync`, and `close` filesystem steps into a single `blocking_queue` or `run_blocking_namespace_operation` closure per disk rather than chaining multiple `tokio::fs` or `spawn_blocking` dispatches.
+- Pin a parent directory once (`openat2(BENEATH | NO_SYMLINKS)` on Linux) and reuse the pinned guard across sibling metadata reads (`read_optional_in_pinned`, `part.N.meta` loops) instead of re-walking ancestor components per file or re-opening when `source_parent == destination_parent`.
+- After `file.metadata()`, pre-size read buffers (`Vec::with_capacity(len + 1)`) before `read_to_end` to avoid `std::io::read_to_end`'s 32-byte exponential growth (`6–7` `read()` syscalls per small metadata file).
 - Benchmark-sensitive changes should include measurable rationale.
 
 ## Allocation Discipline in Hot Paths
