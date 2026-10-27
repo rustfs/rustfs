@@ -190,8 +190,8 @@ fn terminal_with_outcome(heal_type: &HealType, status: HealTaskStatus) -> Comple
             HealObjectDisposition::VerifiedHealthy
         };
         outcome.record(HealObjectOutcome {
-            payload_integrity_verified: false,
-            resolved_data_dir: None,
+            deep_check_observed: false,
+            quorum_selected_data_dir: None,
             identity: HealObjectIdentity {
                 kind: HealObjectKind::Object,
                 bucket: "bucket".to_string(),
@@ -2047,8 +2047,8 @@ async fn root_recovery_cluster_replay_rejects_successor_and_preserves_completed_
         .insert(bucket.clone(), Some(expected));
     scope.next_bucket_index = 1;
     scope.outcome.record(HealObjectOutcome {
-        payload_integrity_verified: false,
-        resolved_data_dir: None,
+        deep_check_observed: false,
+        quorum_selected_data_dir: None,
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
             bucket: bucket.clone(),

@@ -63,12 +63,12 @@ pub struct HealObjectOutcome {
     pub identity: HealObjectIdentity,
     pub disposition: HealObjectDisposition,
     pub detail: Option<String>,
-    /// Local storage generation observation; absent from wire snapshots.
+    /// Local quorum metadata selection; absent from wire snapshots.
     #[serde(skip)]
-    pub resolved_data_dir: Option<Uuid>,
-    /// Local payload verification proof; absent from wire snapshots.
+    pub quorum_selected_data_dir: Option<Uuid>,
+    /// Local Deep check-path observation; absent from wire snapshots.
     #[serde(skip)]
-    pub payload_integrity_verified: bool,
+    pub deep_check_observed: bool,
 }
 
 impl HealObjectOutcome {
@@ -447,8 +447,8 @@ mod canonical_outcome_tests {
 
     fn item(disposition: HealObjectDisposition) -> HealObjectOutcome {
         HealObjectOutcome {
-            payload_integrity_verified: false,
-            resolved_data_dir: None,
+            deep_check_observed: false,
+            quorum_selected_data_dir: None,
             identity: HealObjectIdentity {
                 kind: HealObjectKind::Object,
                 bucket: "bucket".to_string(),
@@ -503,8 +503,8 @@ mod canonical_outcome_tests {
             ..item(HealObjectDisposition::Unknown).identity
         };
         let mut receipt = HealObjectReceipt {
-            payload_integrity_verified: false,
-            resolved_data_dir: None,
+            deep_check_observed: false,
+            quorum_selected_data_dir: None,
             identity: expected.clone(),
             disposition: HealObjectDisposition::MetadataHealthy,
         };
@@ -749,8 +749,8 @@ mod canonical_outcome_tests {
             ..item(HealObjectDisposition::Unknown).identity
         };
         let mut receipt = HealObjectReceipt {
-            payload_integrity_verified: false,
-            resolved_data_dir: None,
+            deep_check_observed: false,
+            quorum_selected_data_dir: None,
             identity: expected.clone(),
             disposition: HealObjectDisposition::Repaired,
         };

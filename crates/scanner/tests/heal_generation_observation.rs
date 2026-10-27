@@ -95,7 +95,7 @@ async fn put_protected(env: &TestECStoreEnv, bucket: &str, object: &str, fill: u
 }
 
 #[tokio::test]
-async fn overwritten_unversioned_generation_is_not_attributed_to_the_scanned_candidate() {
+async fn overwritten_unversioned_generation_is_only_a_data_dir_observation() {
     let root = tempfile::tempdir().expect("local erasure-set fixture");
     let env = TestECStoreEnv::builder().base_dir(root.path()).build().await;
     let bucket = "scanner-generation";
@@ -173,11 +173,8 @@ async fn overwritten_unversioned_generation_is_not_attributed_to_the_scanned_can
     assert!(!terminal.dry_run);
     let receipt = terminal.object.as_ref().expect("production object receipt");
     assert_eq!((&*receipt.identity.bucket, &*receipt.identity.object), (bucket, object));
-    assert_eq!(receipt.resolved_data_dir, Some(generation_b), "terminal must describe generation B");
-    assert!(
-        receipt.payload_integrity_verified,
-        "real protected Deep scan must prove the executed payload"
-    );
+    assert_eq!(receipt.quorum_selected_data_dir, Some(generation_b), "storage selected generation B");
+    assert!(receipt.deep_check_observed, "the protected Deep check path must be observed");
 
     let status = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -193,10 +190,13 @@ async fn overwritten_unversioned_generation_is_not_attributed_to_the_scanned_can
     assert_eq!(status.integrity_state, "unknown");
     assert_eq!(status.retained_pending_candidates, Some(0));
     assert_eq!(status.terminal_candidates.len(), 1);
-    assert_eq!(status.terminal_candidates[0].scope, "identity_mismatch");
+    assert_eq!(status.terminal_candidates[0].scope, "identity_unknown");
     assert_eq!(status.terminal_candidates[0].count, 1);
-    assert_eq!(recorder.total("rustfs_scanner_heal_candidate_generation_mismatch_total"), 1);
-    assert_eq!(recorder.total("rustfs_scanner_heal_task_deep_payload_verified_observations_total"), 1);
+    assert_eq!(
+        recorder.total("rustfs_scanner_heal_candidate_selected_data_dir_mismatch_observations_total"),
+        1
+    );
+    assert_eq!(recorder.total("rustfs_scanner_heal_task_deep_check_observations_total"), 1);
 
     manager.stop().await.expect("stop production heal manager");
     processor.abort();

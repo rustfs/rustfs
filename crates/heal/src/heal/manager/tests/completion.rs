@@ -22,8 +22,8 @@ async fn canonical_completion_publishes_typed_objects_only_for_terminal_untrunca
     completed.options.scan_mode = HealScanMode::Normal;
     let mut outcome = HealTaskOutcome::default();
     outcome.record(HealObjectOutcome {
-        payload_integrity_verified: false,
-        resolved_data_dir: None,
+        deep_check_observed: false,
+        quorum_selected_data_dir: None,
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
             bucket: "bucket".into(),
@@ -97,7 +97,7 @@ async fn completion_carries_local_generation_but_wire_roundtrip_does_not() {
     let generation = Uuid::new_v4();
     let mut outcome = HealTaskOutcome::default();
     outcome.record(HealObjectOutcome {
-        payload_integrity_verified: true,
+        deep_check_observed: true,
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
             bucket: "bucket".into(),
@@ -109,12 +109,12 @@ async fn completion_carries_local_generation_but_wire_roundtrip_does_not() {
         },
         disposition: HealObjectDisposition::VerifiedHealthy,
         detail: None,
-        resolved_data_dir: Some(generation),
+        quorum_selected_data_dir: Some(generation),
     });
     outcome.finish(None);
     let wire = serde_json::to_value(&outcome).expect("serialize outcome");
-    assert!(wire["objects"][0].get("resolvedDataDir").is_none());
-    assert!(wire["objects"][0].get("payloadIntegrityVerified").is_none());
+    assert!(wire["objects"][0].get("quorumSelectedDataDir").is_none());
+    assert!(wire["objects"][0].get("deepCheckObserved").is_none());
     let restored: HealTaskOutcome = serde_json::from_value(wire).expect("deserialize outcome");
 
     for (observed_outcome, expected_generation, expected_proof) in [(outcome, Some(generation), true), (restored, None, false)] {
@@ -139,13 +139,13 @@ async fn completion_carries_local_generation_but_wire_roundtrip_does_not() {
         .await
         .expect("terminal should be published");
         let receipt = observed.object.as_ref().expect("single typed outcome");
-        assert_eq!(receipt.resolved_data_dir, expected_generation);
-        assert_eq!(receipt.payload_integrity_verified, expected_proof);
+        assert_eq!(receipt.quorum_selected_data_dir, expected_generation);
+        assert_eq!(receipt.deep_check_observed, expected_proof);
     }
 }
 
 #[tokio::test]
-async fn completion_requires_success_and_a_non_nil_generation_for_payload_proof() {
+async fn completion_requires_success_and_a_non_nil_selection_for_deep_observation() {
     let mut receiver = subscribe_heal_completions();
     let completed_heals = Mutex::new(HashMap::new());
     let aliases = Mutex::new(HashMap::new());
@@ -187,8 +187,8 @@ async fn completion_requires_success_and_a_non_nil_generation_for_payload_proof(
             },
             disposition: HealObjectDisposition::VerifiedHealthy,
             detail: None,
-            resolved_data_dir: observed_generation,
-            payload_integrity_verified: true,
+            quorum_selected_data_dir: observed_generation,
+            deep_check_observed: true,
         });
         outcome.execution = execution;
         let mut completed = completed_retention_fixture(SystemTime::now());
@@ -211,12 +211,6 @@ async fn completion_requires_success_and_a_non_nil_generation_for_payload_proof(
         })
         .await
         .expect("terminal should be published");
-        assert!(
-            !observed
-                .object
-                .as_ref()
-                .expect("single typed outcome")
-                .payload_integrity_verified
-        );
+        assert!(!observed.object.as_ref().expect("single typed outcome").deep_check_observed);
     }
 }

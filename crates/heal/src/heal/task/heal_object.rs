@@ -335,8 +335,8 @@ impl HealTask {
                     && !self.options.dry_run
                 {
                     self.outcome.write().await.record(HealObjectOutcome {
-                        payload_integrity_verified: false,
-                        resolved_data_dir: None,
+                        deep_check_observed: false,
+                        quorum_selected_data_dir: None,
                         identity: expected_identity,
                         disposition: HealObjectDisposition::Unknown,
                         detail: (!result.detail.is_empty()).then(|| result.detail.clone()),
@@ -516,8 +516,8 @@ impl HealTask {
                     .all(|drive| drive.state == ok_drive_state);
             if healthy_legacy_without_repair {
                 self.outcome.write().await.record(HealObjectOutcome {
-                    payload_integrity_verified: false,
-                    resolved_data_dir: None,
+                    deep_check_observed: false,
+                    quorum_selected_data_dir: None,
                     identity: expected,
                     disposition: HealObjectDisposition::Unknown,
                     detail: Some(storage_result.item.detail.clone()),

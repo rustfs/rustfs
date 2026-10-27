@@ -686,9 +686,9 @@ impl HealTask {
         if !receipt.verified_for(expected) {
             return false;
         }
-        let resolved_data_dir = receipt.resolved_data_dir.filter(|generation| !generation.is_nil());
-        let payload_integrity_verified = receipt.payload_integrity_verified
-            && resolved_data_dir.is_some()
+        let quorum_selected_data_dir = receipt.quorum_selected_data_dir.filter(|generation| !generation.is_nil());
+        let deep_check_observed = receipt.deep_check_observed
+            && quorum_selected_data_dir.is_some()
             && matches!(
                 receipt.disposition,
                 HealObjectDisposition::Repaired | HealObjectDisposition::VerifiedHealthy
@@ -698,8 +698,8 @@ impl HealTask {
             identity: receipt.identity,
             disposition: receipt.disposition,
             detail: None,
-            resolved_data_dir,
-            payload_integrity_verified,
+            quorum_selected_data_dir,
+            deep_check_observed,
         });
         true
     }
@@ -709,8 +709,8 @@ impl HealTask {
             let mut outcome = self.outcome.write().await;
             outcome.attempt_failed();
             outcome.record(HealObjectOutcome {
-                payload_integrity_verified: false,
-                resolved_data_dir: None,
+                deep_check_observed: false,
+                quorum_selected_data_dir: None,
                 identity,
                 disposition: HealObjectDisposition::Deferred {
                     reason,
@@ -996,8 +996,8 @@ impl HealTask {
             let mut outcome = self.outcome.write().await;
             outcome.attempt_failed();
             outcome.record(HealObjectOutcome {
-                payload_integrity_verified: false,
-                resolved_data_dir: None,
+                deep_check_observed: false,
+                quorum_selected_data_dir: None,
                 identity,
                 disposition: HealObjectDisposition::Deferred {
                     reason: HealDeferredReason::RetiredMarkerProof,
@@ -1159,8 +1159,8 @@ impl HealTask {
                     }
                 };
                 outcome.record(HealObjectOutcome {
-                    payload_integrity_verified: false,
-                    resolved_data_dir: None,
+                    deep_check_observed: false,
+                    quorum_selected_data_dir: None,
                     identity,
                     disposition,
                     detail: result.as_ref().err().map(ToString::to_string),

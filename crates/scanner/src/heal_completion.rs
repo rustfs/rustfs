@@ -173,8 +173,8 @@ struct Observations {
 struct Settlement {
     candidates: u64,
     first_task_observation: bool,
-    generation_mismatch: bool,
-    deep_payload_verified_task: bool,
+    data_dir_observation_mismatch: bool,
+    deep_check_observed_task: bool,
     execution: &'static str,
     disposition: &'static str,
     scope: &'static str,
@@ -205,7 +205,7 @@ impl Settlement {
             Some(HealObjectDisposition::DryRunObserved) => "dry_run",
             Some(HealObjectDisposition::Unknown) | None => "unknown",
         };
-        let generation_comparison = match (candidate.identity.as_ref(), completion.object.as_ref()) {
+        let data_dir_comparison = match (candidate.identity.as_ref(), completion.object.as_ref()) {
             (Some(expected), Some(actual))
                 if expected.kind == actual.identity.kind
                     && expected.bucket == actual.identity.bucket
@@ -214,44 +214,36 @@ impl Settlement {
                 candidate
                     .data_dir
                     .filter(|id| !id.is_nil())
-                    .zip(actual.resolved_data_dir.filter(|id| !id.is_nil()))
+                    .zip(actual.quorum_selected_data_dir.filter(|id| !id.is_nil()))
                     .map(|(left, right)| left == right)
             }
             _ => None,
         };
-        let generation_mismatch = generation_comparison == Some(false);
-        let payload_verified = completion
-            .object
-            .as_ref()
-            .is_some_and(|object| object.payload_integrity_verified);
+        let data_dir_observation_mismatch = data_dir_comparison == Some(false);
+        let deep_check_observed = completion.object.as_ref().is_some_and(|object| object.deep_check_observed);
         let scope = if candidate.dry_run || completion.dry_run {
             "dry_run"
         } else if completion.execution != Some(HealExecutionOutcome::Completed) {
             "execution_incomplete"
-        } else if candidate.mode == HealScanMode::Deep
-            && completion.scan_mode != HealScanMode::Deep
-            && !(payload_verified && generation_comparison == Some(true))
-        {
+        } else if candidate.mode == HealScanMode::Deep && completion.scan_mode != HealScanMode::Deep {
             "insufficient_scan"
         } else {
             match (candidate.identity.as_ref(), completion.object.as_ref()) {
-                (Some(expected), Some(actual)) => {
-                    Self::identity_scope(expected, &actual.identity, candidate.data_dir, actual.resolved_data_dir)
-                }
+                (Some(expected), Some(actual)) => Self::identity_scope(expected, &actual.identity),
                 _ => "identity_unknown",
             }
         };
         let first_task_observation = !recent.counted;
-        let deep_payload_verified_task = first_task_observation
+        let deep_check_observed_task = first_task_observation
             && completion.execution == Some(HealExecutionOutcome::Completed)
             && !completion.dry_run
-            && payload_verified;
+            && deep_check_observed;
         recent.counted = true;
         Self {
             candidates: candidate.count,
             first_task_observation,
-            generation_mismatch,
-            deep_payload_verified_task,
+            data_dir_observation_mismatch,
+            deep_check_observed_task,
             execution,
             disposition,
             scope,
@@ -259,18 +251,11 @@ impl Settlement {
         }
     }
 
-    fn identity_scope(
-        expected: &HealObjectIdentity,
-        actual: &HealObjectIdentity,
-        expected_data_dir: Option<Uuid>,
-        resolved_data_dir: Option<Uuid>,
-    ) -> &'static str {
+    fn identity_scope(expected: &HealObjectIdentity, actual: &HealObjectIdentity) -> &'static str {
         let expected_version = expected.version_id.as_deref().filter(|version| !version.is_empty());
         let actual_version = actual.version_id.as_deref().filter(|version| !version.is_empty());
         let expected_incarnation = expected.bucket_incarnation_id.filter(|id| !id.is_nil());
         let actual_incarnation = actual.bucket_incarnation_id.filter(|id| !id.is_nil());
-        let expected_data_dir = expected_data_dir.filter(|id| !id.is_nil());
-        let resolved_data_dir = resolved_data_dir.filter(|id| !id.is_nil());
         if expected.kind != actual.kind
             || expected.bucket != actual.bucket
             || expected.object != actual.object
@@ -288,9 +273,6 @@ impl Settlement {
                 .set_index
                 .zip(actual.set_index)
                 .is_some_and(|(left, right)| left != right)
-            || expected_data_dir
-                .zip(resolved_data_dir)
-                .is_some_and(|(left, right)| left != right)
         {
             "identity_mismatch"
         } else if expected_version.is_none()
@@ -301,8 +283,6 @@ impl Settlement {
             || actual.pool_index.is_none()
             || expected.set_index.is_none()
             || actual.set_index.is_none()
-            || expected_data_dir.is_none()
-            || resolved_data_dir.is_none()
         {
             "identity_unknown"
         } else {
@@ -318,13 +298,12 @@ impl Settlement {
         if self.first_task_observation {
             counter!("rustfs_scanner_heal_task_terminal_observations_total").increment(1);
         }
-        // This is independent of scope: an insufficient scan can also have
-        // resolved a different object generation.
-        if self.generation_mismatch {
-            counter!("rustfs_scanner_heal_candidate_generation_mismatch_total").increment(self.candidates);
+        // These are two observations, not proof of the identity at completion.
+        if self.data_dir_observation_mismatch {
+            counter!("rustfs_scanner_heal_candidate_selected_data_dir_mismatch_observations_total").increment(self.candidates);
         }
-        if self.deep_payload_verified_task {
-            counter!("rustfs_scanner_heal_task_deep_payload_verified_observations_total").increment(1);
+        if self.deep_check_observed_task {
+            counter!("rustfs_scanner_heal_task_deep_check_observations_total").increment(1);
         }
     }
 }

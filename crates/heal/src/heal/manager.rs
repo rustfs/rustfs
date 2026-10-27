@@ -325,13 +325,13 @@ async fn publish_completed_heal(
             .filter(|outcome| completed.heal_type.is_per_object() && !outcome.objects_truncated && outcome.objects.len() == 1)
             .and_then(|outcome| outcome.objects.front())
             .map(|object| {
-                let resolved_data_dir = object.resolved_data_dir.filter(|generation| !generation.is_nil());
+                let quorum_selected_data_dir = object.quorum_selected_data_dir.filter(|generation| !generation.is_nil());
                 crate::heal::outcome::HealObjectReceipt {
                     identity: object.identity.clone(),
                     disposition: object.disposition.clone(),
-                    resolved_data_dir,
-                    payload_integrity_verified: object.payload_integrity_verified
-                        && resolved_data_dir.is_some()
+                    quorum_selected_data_dir,
+                    deep_check_observed: object.deep_check_observed
+                        && quorum_selected_data_dir.is_some()
                         && !completed.options.dry_run
                         && matches!(completed.status, HealTaskStatus::Completed)
                         && outcome.is_some_and(|outcome| outcome.execution == HealExecutionOutcome::Completed),

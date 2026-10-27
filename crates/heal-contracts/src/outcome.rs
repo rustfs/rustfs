@@ -88,12 +88,12 @@ pub enum HealObjectDisposition {
 pub struct HealObjectReceipt {
     pub identity: HealObjectIdentity,
     pub disposition: HealObjectDisposition,
-    /// Storage-selected data-directory generation, when observed locally.
-    /// This identifies a version of the object, not verified payload contents.
-    pub resolved_data_dir: Option<Uuid>,
-    /// Storage reported authenticated Deep verification of the selected object's shards.
-    /// False means no such proof was retained, not that payload verification failed.
-    pub payload_integrity_verified: bool,
+    /// Data directory selected from quorum metadata during storage execution.
+    /// This does not establish lock ownership or identity at completion.
+    pub quorum_selected_data_dir: Option<Uuid>,
+    /// Storage completed its Deep check path for the selected metadata.
+    /// This does not certify all bytes, final identity, or scanner coverage.
+    pub deep_check_observed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
