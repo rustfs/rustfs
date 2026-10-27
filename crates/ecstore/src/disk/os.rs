@@ -6527,16 +6527,31 @@ pub(crate) fn read_multipart_reclaim_target_metadata(
     read_multipart_metadata(path, base, publication_root, None)
 }
 
-fn read_multipart_metadata_bytes(mut reader: impl std::io::Read, maximum: Option<u64>) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    match maximum {
-        Some(maximum) => {
+fn read_multipart_metadata_bytes(
+    mut reader: impl std::io::Read,
+    size_hint: Option<u64>,
+    maximum: Option<u64>,
+) -> io::Result<Vec<u8>> {
+    if let (Some(len), Some(maximum)) = (size_hint, maximum)
+        && len > maximum
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata exceeds its size limit"));
+    }
+    let cap = size_hint
+        .and_then(|len| usize::try_from(len).ok())
+        .map_or(0, |len| len.saturating_add(1));
+    let mut bytes = Vec::with_capacity(cap);
+    match (size_hint, maximum) {
+        (Some(len), _) => {
+            std::io::Read::read_to_end(&mut reader.take(len), &mut bytes)?;
+        }
+        (None, Some(maximum)) => {
             std::io::Read::read_to_end(&mut reader.take(maximum.saturating_add(1)), &mut bytes)?;
             if bytes.len() as u64 > maximum {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata exceeds its size limit"));
             }
         }
-        None => {
+        (None, None) => {
             std::io::Read::read_to_end(&mut reader, &mut bytes)?;
         }
     }
@@ -6568,10 +6583,11 @@ fn read_multipart_metadata(
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?);
-        if !file.metadata()?.is_file() {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata is not a regular file"));
         }
-        read_multipart_metadata_bytes(&mut file, maximum)
+        read_multipart_metadata_bytes(&mut file, Some(metadata.len()), maximum)
     }
     #[cfg(windows)]
     {
@@ -6602,7 +6618,7 @@ fn read_multipart_metadata(
         if windows_file_attribute_tag(&file)?.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata is not a regular file"));
         }
-        read_multipart_metadata_bytes(file.as_file_mut(), maximum)
+        read_multipart_metadata_bytes(file.as_file_mut(), None, maximum)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -7238,33 +7254,16 @@ pub async fn reliable_mkdir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Pat
 /// This function will not create directories under base_dir.
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> io::Result<()> {
-    if !base_dir.as_ref().to_string_lossy().is_empty() && base_dir.as_ref().starts_with(dir_path.as_ref()) {
+    let dir_path = dir_path.as_ref();
+    let base_dir = base_dir.as_ref();
+    if !base_dir.as_os_str().is_empty() && base_dir.starts_with(dir_path) {
         return Ok(());
     }
 
-    if let Err(e) = super::fs::mkdir(dir_path.as_ref()).await {
-        if e.kind() == io::ErrorKind::AlreadyExists {
-            return Ok(());
-        }
-
-        if e.kind() != io::ErrorKind::NotFound {
-            return Err(e);
-        }
-
-        if let Some(parent) = dir_path.as_ref().parent() {
-            // Fall back to creating the missing parent chain only when the direct mkdir proves it is required.
-            if let Err(parent_err) = super::fs::make_dir_all(parent).await
-                && parent_err.kind() != io::ErrorKind::AlreadyExists
-            {
-                return Err(parent_err);
-            }
-        }
-
-        if let Err(retry_err) = super::fs::mkdir(dir_path.as_ref()).await
-            && retry_err.kind() != io::ErrorKind::AlreadyExists
-        {
-            return Err(retry_err);
-        }
+    if let Err(err) = super::fs::make_dir_all(dir_path).await
+        && err.kind() != io::ErrorKind::AlreadyExists
+    {
+        return Err(err);
     }
 
     Ok(())

@@ -11089,7 +11089,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // shared lock and permit metadata caching can early-stop once write
         // quorum agrees on the object identity.
         let allow_early_stop = !opts.no_lock || opts.metadata_cache_safe;
-        let read = self.get_object_fileinfo(bucket, object, opts, true, allow_early_stop);
+        let read = self.get_object_fileinfo_for_object_read(bucket, object, opts, true, allow_early_stop);
         #[cfg(feature = "diagnostic-read-version-caller")]
         let read = crate::cluster::rpc::runtime_sources::with_read_version_entry(
             rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ObjectInfoRead,
@@ -22843,6 +22843,116 @@ mod put_object_tmp_cleanup_tests {
             set.get_object_info(bucket, object, &ObjectOptions::default()).await.is_err(),
             "failed fresh write must not become visible"
         );
+    }
+
+    /// Per-drive view of an object: every version (including free versions)
+    /// recorded in its xl.meta, and the data directories next to it. A missing
+    /// xl.meta and one without versions both hold no version.
+    async fn per_drive_object_state(
+        dirs: &[TempDir],
+        bucket: &str,
+        object: &str,
+    ) -> Vec<(Vec<(Option<Uuid>, Option<Uuid>, Option<OffsetDateTime>)>, Vec<String>)> {
+        let mut drives = Vec::with_capacity(dirs.len());
+        for dir in dirs {
+            let object_dir = dir.path().join(bucket).join(object);
+            let versions = match tokio::fs::read(object_dir.join(STORAGE_FORMAT_FILE)).await {
+                Ok(encoded) => {
+                    let all = FileMeta::load(&encoded)
+                        .expect("xl.meta should decode")
+                        .get_all_file_info_versions(bucket, object, true)
+                        .expect("xl.meta versions should be readable");
+                    all.versions
+                        .iter()
+                        .chain(all.free_versions.iter())
+                        .map(|version| (version.version_id, version.data_dir, version.mod_time))
+                        .collect()
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(err) => panic!("xl.meta at {object_dir:?} should be readable: {err}"),
+            };
+            let mut data_dirs = Vec::new();
+            if let Ok(mut entries) = tokio::fs::read_dir(&object_dir).await {
+                while let Some(entry) = entries.next_entry().await.expect("object directory entry should be readable") {
+                    if entry
+                        .file_type()
+                        .await
+                        .expect("object entry type should be readable")
+                        .is_dir()
+                    {
+                        data_dirs.push(entry.file_name().to_string_lossy().into_owned());
+                    }
+                }
+            }
+            data_dirs.sort();
+            drives.push((versions, data_dirs));
+        }
+        drives
+    }
+
+    /// Stage F lists any version present on half of the drives, so a PUT that
+    /// misses write quorum must not leave its version behind once its rollback
+    /// completes: no drive may keep the new xl.meta entry or its data directory.
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn failed_put_rollback_leaves_no_new_version_on_any_drive() {
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            for write_completion in [WriteCompletion::Quorum, WriteCompletion::TailDrained] {
+                for size in [4096, TEST_OBJECT_SIZE] {
+                    // (versioned, seed an earlier version first)
+                    for (versioned, seeded) in [(false, false), (false, true), (true, true)] {
+                        let case = format!("{write_completion:?} size={size} versioned={versioned} seeded={seeded}");
+                        let (dirs, disks, set) = hermetic_set_disks(4).await;
+                        let bucket = "put-rollback-no-residue";
+                        let object = "rolled-back-object";
+                        make_completion_test_bucket(&disks, bucket).await;
+                        if seeded {
+                            set.put_object(
+                                bucket,
+                                object,
+                                &mut PutObjReader::from_vec(vec![b'0'; size]),
+                                &ObjectOptions {
+                                    versioned,
+                                    write_completion: WriteCompletion::TailDrained,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .unwrap_or_else(|err| panic!("{case}: seed version should commit on every drive: {err}"));
+                        }
+                        wait_for_tmp_workspace_to_drain(&dirs, "seed PUT must leave no staging").await;
+                        let before = per_drive_object_state(&dirs, bucket, object).await;
+
+                        let tasks = rename_fanout_barrier::observe_tasks(object);
+                        let _fault = rename_fault_injection::fail_rename_on(object, &[0, 1]);
+                        let err = set
+                            .put_object(
+                                bucket,
+                                object,
+                                &mut PutObjReader::from_vec(vec![b'1'; size]),
+                                &ObjectOptions {
+                                    versioned,
+                                    write_completion,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .expect_err("two renamed drives cannot satisfy write quorum three");
+                        assert!(
+                            matches!(err, Error::ErasureWriteQuorum | Error::InsufficientWriteQuorum(_, _)),
+                            "{case}: original quorum error expected: {err}"
+                        );
+                        assert_eq!(tasks.running(), 0, "{case}: rename and undo tasks must be reaped before return");
+                        // An incomplete rollback retains staging for recovery, so a
+                        // drained workspace shows the rollback completed.
+                        wait_for_tmp_workspace_to_drain(&dirs, "a completed rollback must release staging").await;
+                        let after = per_drive_object_state(&dirs, bucket, object).await;
+                        assert_eq!(after, before, "{case}: no drive may keep the failed PUT's version or data");
+                    }
+                }
+            }
+        })
+        .await;
     }
 
     #[tokio::test]

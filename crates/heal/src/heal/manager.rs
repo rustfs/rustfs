@@ -1291,7 +1291,9 @@ impl HealManager {
         request: HealRequest,
         config: &HealConfig,
         context: &'static str,
+        replacement_targets_frozen: bool,
     ) -> HealAdmissionDecision {
+        let replacement_targets_frozen = replacement_targets_frozen || request.retry_attempts != 0;
         let queue_len = queue.len();
         publish_heal_queue_length(queue);
         let queue_capacity = config.queue_size;
@@ -1309,7 +1311,9 @@ impl HealManager {
                 .map(ToOwned::to_owned)
         {
             let mut admission = Self::duplicate_admission_for_request(&request, config);
-            if admission == HealAdmissionResult::Merged && !queue.merge_replacement_targets(&owner_id, &request, true) {
+            if admission == HealAdmissionResult::Merged
+                && !queue.merge_replacement_targets(&owner_id, &request, true, replacement_targets_frozen)
+            {
                 admission = HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning);
             }
             Self::record_admission_metric(request.source, admission, context);
@@ -1475,7 +1479,7 @@ impl HealManager {
         let priority = request.priority;
         let source = request.source;
 
-        match queue.push(request) {
+        match queue.push_with_replacement_scope(request, replacement_targets_frozen) {
             QueuePushOutcome::Accepted => {
                 publish_heal_queue_length(queue);
                 Self::record_admission_metric(source, HealAdmissionResult::Accepted, context);
@@ -2314,10 +2318,11 @@ impl HealManager {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     (anchors.contains_key(&merged_task_id), anchors.contains_key(&request.id))
                 };
-                let covered = if (incoming_recovered || request.replacement_targets_frozen) && request.id != merged_task_id {
+                let incoming_frozen = incoming_recovered || request.retry_attempts != 0;
+                let covered = if incoming_frozen && request.id != merged_task_id {
                     false
                 } else if duplicate_state == "queued" {
-                    queue.merge_replacement_targets(&merged_task_id, &request, !owner_recovered && !incoming_recovered)
+                    queue.merge_replacement_targets(&merged_task_id, &request, !owner_recovered, incoming_frozen)
                 } else {
                     let owner = active_heals
                         .get(&merged_task_id)
@@ -2495,7 +2500,14 @@ impl HealManager {
         let request_id = request.id.clone();
         let request_heal_type = request.heal_type.clone();
         let request_source = request.source;
-        let admission_decision = Self::admit_request_to_queue(&mut queue, request, &config, "submit");
+        let recovered_replacement = request.source == HealRequestSource::AutoHeal
+            && !request.heal_endpoints.is_empty()
+            && self
+                .replacement_recovery_anchors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&request.id);
+        let admission_decision = Self::admit_request_to_queue(&mut queue, request, &config, "submit", recovered_replacement);
         let admission = admission_decision.result;
         if durable_handoff_required && !admission.is_admitted() {
             self.root_recovery

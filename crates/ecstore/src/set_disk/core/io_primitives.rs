@@ -5232,14 +5232,10 @@ impl SetDisks {
         let disks = self.get_disks_internal().await;
         let transaction_path = part_transaction_path(dst_object);
         let transaction_meta_path = format!("{transaction_path}/{PART_TRANSACTION_NEW_META}");
-        let rollback_path = format!("{transaction_path}/{PART_TRANSACTION_ROLLBACK}");
-        let current_meta_path = format!("{dst_object}.meta");
 
         let reads = disks.iter().map(|disk| {
             let disk = disk.clone();
             let transaction_meta_path = transaction_meta_path.clone();
-            let rollback_path = rollback_path.clone();
-            let current_meta_path = current_meta_path.clone();
             async move {
                 let Some(disk) = disk else {
                     return PartTransactionObservation {
@@ -5249,44 +5245,20 @@ impl SetDisks {
                         err: Some(DiskError::DiskNotFound),
                     };
                 };
-                let transaction_meta = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &transaction_meta_path).await {
-                    Ok(meta) => Some(meta),
-                    Err(DiskError::FileNotFound) => None,
-                    Err(err) => {
-                        return PartTransactionObservation {
-                            transaction_meta: None,
-                            current_meta: None,
-                            rollback: false,
-                            err: Some(err),
-                        };
-                    }
-                };
-                let rollback = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &rollback_path).await {
-                    Ok(_) => true,
-                    Err(DiskError::FileNotFound) => false,
-                    Err(err) => {
-                        return PartTransactionObservation {
-                            transaction_meta,
-                            current_meta: None,
-                            rollback: false,
-                            err: Some(err),
-                        };
-                    }
-                };
-                let current_meta = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &current_meta_path).await {
-                    Ok(meta) => Some(meta),
-                    Err(DiskError::FileNotFound | DiskError::DiskNotFound) => None,
-                    Err(_) => None,
+                let (transaction_meta, err) = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &transaction_meta_path).await {
+                    Ok(meta) => (Some(meta), None),
+                    Err(DiskError::FileNotFound) => (None, None),
+                    Err(err) => (None, Some(err)),
                 };
                 PartTransactionObservation {
                     transaction_meta,
-                    current_meta,
-                    rollback,
-                    err: None,
+                    current_meta: None,
+                    rollback: false,
+                    err,
                 }
             }
         });
-        let observations = join_all(reads).await;
+        let mut observations = join_all(reads).await;
         let read_errs = observations
             .iter()
             .map(|observation| observation.err.clone())
@@ -5301,6 +5273,42 @@ impl SetDisks {
             .all(|observation| observation.transaction_meta.is_none())
         {
             return Ok(false);
+        }
+
+        let rollback_path = format!("{transaction_path}/{PART_TRANSACTION_ROLLBACK}");
+        let current_meta_path = format!("{dst_object}.meta");
+        let details = disks.iter().zip(observations.iter_mut()).map(|(disk, observation)| {
+            let disk = disk.clone();
+            let rollback_path = rollback_path.clone();
+            let current_meta_path = current_meta_path.clone();
+            async move {
+                if observation.err.is_some() {
+                    return;
+                }
+                let Some(disk) = disk else {
+                    observation.err = Some(DiskError::DiskNotFound);
+                    return;
+                };
+                match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &rollback_path).await {
+                    Ok(_) => observation.rollback = true,
+                    Err(DiskError::FileNotFound) => {}
+                    Err(err) => {
+                        observation.err = Some(err);
+                        return;
+                    }
+                }
+                if let Ok(meta) = disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &current_meta_path).await {
+                    observation.current_meta = Some(meta);
+                }
+            }
+        });
+        join_all(details).await;
+        let read_errs = observations
+            .iter()
+            .map(|observation| observation.err.clone())
+            .collect::<Vec<_>>();
+        if let Some(err) = reduce_write_quorum_errs(&read_errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+            return Err(err);
         }
 
         let mut current_counts: HashMap<Bytes, usize> = HashMap::new();

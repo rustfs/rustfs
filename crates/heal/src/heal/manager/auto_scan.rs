@@ -682,9 +682,9 @@ impl HealManager {
                                 HealPriority::Low,
                             );
                             let recovery_anchor = recovery.as_ref().map(|(_, _, _, anchor)| anchor.clone());
+                            let recovered_replacement = recovery.is_some();
                             if let Some((task_id, _, _, _)) = recovery {
                                 req.id = task_id;
-                                req.replacement_targets_frozen = true;
                             }
                             req.source = HealRequestSource::AutoHeal;
                             req.heal_endpoints = endpoints.iter().map(ToString::to_string).collect();
@@ -692,7 +692,8 @@ impl HealManager {
                             let endpoint_count = req.heal_endpoints.len();
                             let config = config.read().await;
                             let mut queue = heal_queue.lock().await;
-                            let admission_decision = Self::admit_request_to_queue(&mut queue, req, &config, "auto_scan");
+                            let admission_decision =
+                                Self::admit_request_to_queue(&mut queue, req, &config, "auto_scan", recovered_replacement);
                             let admission = admission_decision.result;
                             let should_notify =
                                 matches!(admission, HealAdmissionResult::Accepted) && config.event_driven_scheduler_enable;

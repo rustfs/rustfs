@@ -446,7 +446,6 @@ fn bench_metacache_resolve(c: &mut Criterion) {
                     requested_versions: 1,
                     bucket: "bucket".to_string(),
                     strict: false,
-                    write_quorum_slack: 0,
                     candidates: Vec::new(),
                 });
                 black_box(resolved);
@@ -463,24 +462,6 @@ fn bench_metacache_resolve(c: &mut Criterion) {
                     requested_versions: 1,
                     bucket: "bucket".to_string(),
                     strict: false,
-                    write_quorum_slack: 0,
-                    candidates: Vec::new(),
-                });
-                black_box(resolved);
-            }
-        });
-    });
-
-    group.bench_function("8_disks_write_quorum/1000_objects", |b| {
-        b.iter(|| {
-            for entries in &sets_8_agree {
-                let resolved = entries.resolve_with_write_quorum(MetadataResolutionParams {
-                    dir_quorum: 4,
-                    obj_quorum: 4,
-                    requested_versions: 1,
-                    bucket: "bucket".to_string(),
-                    strict: true,
-                    write_quorum_slack: 0,
                     candidates: Vec::new(),
                 });
                 black_box(resolved);
@@ -491,13 +472,12 @@ fn bench_metacache_resolve(c: &mut Criterion) {
     group.bench_function("8_disks_disagree_merge/1000_objects", |b| {
         b.iter(|| {
             for entries in &sets_8_disagree {
-                let resolved = entries.resolve_with_write_quorum(MetadataResolutionParams {
+                let resolved = entries.resolve(MetadataResolutionParams {
                     dir_quorum: 4,
                     obj_quorum: 4,
                     requested_versions: 1,
                     bucket: "bucket".to_string(),
                     strict: true,
-                    write_quorum_slack: 0,
                     candidates: Vec::new(),
                 });
                 black_box(resolved);
@@ -508,13 +488,12 @@ fn bench_metacache_resolve(c: &mut Criterion) {
     group.bench_function("8_disks_agree_13_versions/1000_objects", |b| {
         b.iter(|| {
             for entries in &sets_8_agree_13v {
-                let resolved = entries.resolve_with_write_quorum(MetadataResolutionParams {
+                let resolved = entries.resolve(MetadataResolutionParams {
                     dir_quorum: 4,
                     obj_quorum: 4,
                     requested_versions: 1,
                     bucket: "bucket".to_string(),
                     strict: true,
-                    write_quorum_slack: 0,
                     candidates: Vec::new(),
                 });
                 black_box(resolved);
@@ -525,13 +504,12 @@ fn bench_metacache_resolve(c: &mut Criterion) {
     group.bench_function("8_disks_disagree_13_versions/1000_objects", |b| {
         b.iter(|| {
             for entries in &sets_8_disagree_13v {
-                let resolved = entries.resolve_with_write_quorum(MetadataResolutionParams {
+                let resolved = entries.resolve(MetadataResolutionParams {
                     dir_quorum: 4,
                     obj_quorum: 4,
                     requested_versions: 1,
                     bucket: "bucket".to_string(),
                     strict: true,
-                    write_quorum_slack: 0,
                     candidates: Vec::new(),
                 });
                 black_box(resolved);
@@ -596,191 +574,6 @@ fn bench_metacache_resolve(c: &mut Criterion) {
     group.finish();
 }
 
-fn listing_history(versions: usize, cached: bool) -> MetaCacheEntry {
-    let mut metadata = FileMeta::new();
-    for index in 0..versions {
-        let (data, parity) = if index + 1 == versions { (12, 4) } else { (8, 8) };
-        let mut info = FileInfo::new("object", data, parity);
-        info.volume = "bucket".to_owned();
-        info.erasure.index = 1;
-        info.data_dir = Some(Uuid::from_u128(0x1000 + u128::try_from(index).expect("data directory index")));
-        info.versioned = true;
-        info.version_id = Some(Uuid::from_u128(u128::try_from(index + 1).expect("version index")));
-        info.mod_time = Some(
-            OffsetDateTime::from_unix_timestamp(1_700_000_000 + i64::try_from(index).expect("timestamp")).expect("fixture time"),
-        );
-        info.size = 1;
-        info.parts = vec![ObjectPartInfo {
-            number: 1,
-            size: 1,
-            actual_size: 1,
-            ..Default::default()
-        }];
-        info.metadata.insert("etag".to_owned(), format!("etag-{index}"));
-        info.metadata.insert("x-amz-meta-description".to_owned(), "m".repeat(1024));
-        metadata.add_version(info).expect("valid version history");
-    }
-    MetaCacheEntry {
-        name: "object".to_owned(),
-        metadata: metadata.marshal_msg().expect("serialize history"),
-        cached: cached.then_some(metadata),
-        reusable: false,
-    }
-}
-
-#[inline]
-fn owned_agreed_latest_reference(
-    mut entry: MetaCacheEntry,
-    replicas: usize,
-    params: &rustfs_filemeta::MetadataResolutionParams,
-    enforce_write_quorum: bool,
-) -> rustfs_filemeta::MetaCacheEntryResolution {
-    use rustfs_filemeta::MetaCacheEntryResolution::{NeedsSupplement, Rejected, Resolved};
-    if !enforce_write_quorum {
-        return Resolved(entry);
-    }
-    if entry.is_dir() {
-        return if replicas >= params.dir_quorum {
-            Resolved(entry)
-        } else {
-            Rejected
-        };
-    }
-    if replicas < params.obj_quorum {
-        return Rejected;
-    }
-    let metadata = match entry.xl_meta_ref() {
-        Ok(metadata) => metadata,
-        Err(_) if params.obj_quorum <= 1 => return Resolved(entry),
-        Err(_) => return Rejected,
-    };
-    if params.requested_versions == 1
-        && let Some(first) = metadata.versions.first()
-        && !first.header.free_version()
-        && replicas >= first.listing_quorum(params.obj_quorum, params.write_quorum_slack)
-    {
-        return Resolved(entry);
-    }
-    // These fixtures cover the fast prefix, never older-version reconciliation.
-    NeedsSupplement(entry)
-}
-
-fn bench_listing_borrowed_metadata(c: &mut Criterion) {
-    use rustfs_filemeta::{FileMetaVersion, MetaCacheEntries, MetadataResolutionParams};
-    let mut group = c.benchmark_group("listing_borrowed_metadata");
-    group
-        .sample_size(20)
-        .warm_up_time(Duration::from_millis(150))
-        .measurement_time(Duration::from_millis(700));
-    for versions in [2, 16, 256] {
-        for cached in [false, true] {
-            let entry = listing_history(versions, cached);
-            let params = MetadataResolutionParams {
-                dir_quorum: 8,
-                obj_quorum: 8,
-                requested_versions: 1,
-                write_quorum_slack: 8,
-                bucket: "bucket".to_owned(),
-                ..Default::default()
-            };
-            let slots = vec![Some(&entry); 8];
-            let owned = MetaCacheEntries(vec![Some(entry.clone()); 8])
-                .resolve_with_write_quorum(params.clone())
-                .expect("previous committed version");
-            let borrowed =
-                MetaCacheEntries::resolve_borrowed_with_write_quorum(&slots, params.clone()).expect("borrowed previous version");
-            assert_eq!(owned.metadata, borrowed.metadata);
-            let id = format!("{versions}_versions/{}", if cached { "cached" } else { "cold" });
-            group.throughput(Throughput::Bytes(u64::try_from(entry.metadata.len()).expect("metadata size")));
-            // ABBA order permits an explicit baseline-drift check for each fixture.
-            for phase in ["owned_a1", "borrowed_b1", "borrowed_b2", "owned_a2"] {
-                group.bench_function(BenchmarkId::new("replicas", format!("{id}/{phase}")), |b| {
-                    b.iter(|| {
-                        if phase.starts_with("owned") {
-                            black_box(
-                                MetaCacheEntries(vec![Some(black_box(&entry).clone()); 8])
-                                    .resolve_with_write_quorum(params.clone()),
-                            )
-                        } else {
-                            let slots = vec![Some(black_box(&entry)); 8];
-                            black_box(MetaCacheEntries::resolve_borrowed_with_write_quorum(&slots, params.clone()))
-                        }
-                    });
-                });
-            }
-            let mut agreed_metadata = entry
-                .cached
-                .clone()
-                .unwrap_or_else(|| FileMeta::load(&entry.metadata).expect("agreed fixture"));
-            let mut latest = FileMetaVersion::try_from(agreed_metadata.versions[0].meta.as_slice()).expect("latest body");
-            let object = latest.object.as_mut().expect("latest object");
-            object.erasure_m = 8;
-            object.erasure_n = 8;
-            agreed_metadata.versions[0] = latest.try_into().expect("balanced latest header");
-            let agreed = MetaCacheEntry {
-                name: entry.name.clone(),
-                metadata: agreed_metadata.marshal_msg().expect("agreed history"),
-                cached: cached.then_some(agreed_metadata),
-                reusable: false,
-            };
-            for phase in ["owned_a1", "borrowed_b1", "borrowed_b2", "owned_a2"] {
-                group.bench_function(BenchmarkId::new("agreed", format!("{id}/{phase}")), |b| {
-                    b.iter_batched(
-                        || agreed.clone(),
-                        |candidate| {
-                            let resolved = if phase.starts_with("owned") {
-                                owned_agreed_latest_reference(candidate, 8, &params, true)
-                            } else {
-                                rustfs_filemeta::resolve_agreed_entry(candidate, 8, &params, true)
-                            };
-                            let rustfs_filemeta::MetaCacheEntryResolution::Resolved(candidate) = resolved else {
-                                panic!("balanced latest must use agreed fast prefix");
-                            };
-                            black_box(candidate)
-                        },
-                        BatchSize::SmallInput,
-                    );
-                });
-            }
-            let replicas: Vec<_> = (1..=8)
-                .map(|disk| {
-                    let mut metadata = entry
-                        .cached
-                        .clone()
-                        .unwrap_or_else(|| FileMeta::load(&entry.metadata).expect("decode fixture"));
-                    for version in &mut metadata.versions {
-                        let mut payload = FileMetaVersion::try_from(version.meta.as_slice()).expect("version body");
-                        payload.object.as_mut().expect("object body").erasure_index = disk;
-                        version.meta = payload.marshal_msg().expect("per-disk body");
-                    }
-                    MetaCacheEntry {
-                        name: entry.name.clone(),
-                        metadata: metadata.marshal_msg().expect("per-disk metadata"),
-                        cached: cached.then_some(metadata),
-                        reusable: false,
-                    }
-                })
-                .collect();
-            assert!(replicas[0].headers_agree(&replicas, false));
-            for phase in ["owned_a1", "borrowed_b1", "borrowed_b2", "owned_a2"] {
-                group.bench_function(BenchmarkId::new("headers", format!("{id}/{phase}")), |b| {
-                    b.iter(|| {
-                        let agreed = if phase.starts_with("owned") {
-                            replicas
-                                .iter()
-                                .all(|candidate| replicas[0].matches(Some(black_box(candidate)), false).1)
-                        } else {
-                            replicas[0].headers_agree(black_box(&replicas), false)
-                        };
-                        black_box(agreed)
-                    });
-                });
-            }
-        }
-    }
-    group.finish();
-}
-
 criterion_group!(
     benches,
     bench_create_real_xlmeta,
@@ -797,8 +590,7 @@ criterion_group!(
     bench_list_page_to_fileinfo,
     bench_delete_inline_versions,
     bench_metacache_stream_page,
-    bench_metacache_resolve,
-    bench_listing_borrowed_metadata
+    bench_metacache_resolve
 );
 
 criterion_main!(benches);

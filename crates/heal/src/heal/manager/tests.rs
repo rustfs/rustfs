@@ -2577,10 +2577,6 @@ async fn automatic_replacement_frozen_targets_reject_late_disks_but_cover_duplic
             .expect("grace wait keeps the generation replayable")
             .0;
             assert_eq!(owner.retry_attempts, 0, "grace must not consume a failure retry");
-            assert!(owner.replacement_targets_frozen, "zero retries cannot mean the scope is fresh");
-        }
-        if state == "recovered" {
-            owner.replacement_targets_frozen = true;
         }
         match state {
             "active" => {
@@ -2598,6 +2594,22 @@ async fn automatic_replacement_frozen_targets_reject_late_disks_but_cover_duplic
                         error: "target unavailable".to_string(),
                         cancel_token: CancellationToken::new(),
                     },
+                );
+            }
+            "grace" | "recovered" => {
+                let config = manager.config.read().await.clone();
+                let mut queue = manager.heal_queue.lock().await;
+                let context = if state == "grace" { "retry" } else { "auto_scan" };
+                assert_eq!(
+                    HealManager::admit_request_to_queue(&mut queue, owner, &config, context, true).result,
+                    HealAdmissionResult::Accepted
+                );
+                assert!(
+                    queue
+                        .heap
+                        .iter()
+                        .any(|item| item.request.id == owner_id && item.replacement_targets_frozen),
+                    "zero retries cannot mean the scope is fresh"
                 );
             }
             _ => {
@@ -2651,7 +2663,7 @@ async fn automatic_replacement_merge_preserves_options_policy_and_recovery_ident
         "dry_run",
         "bucket_scope",
         "pool_scope",
-        "frozen_incoming",
+        "retried_incoming",
         "recovery_anchor",
         "merge_disabled",
     ] {
@@ -2664,9 +2676,9 @@ async fn automatic_replacement_merge_preserves_options_policy_and_recovery_ident
                 }
             }
             "pool_scope" => incoming.options.pool_index = Some(2),
-            "frozen_incoming" => {
+            "retried_incoming" => {
                 incoming.heal_endpoints = vec!["replacement-a".to_string()];
-                incoming.replacement_targets_frozen = true;
+                incoming.retry_attempts = 1;
             }
             "recovery_anchor" => {
                 incoming.heal_endpoints = vec!["replacement-a".to_string()];
@@ -2712,35 +2724,80 @@ fn automatic_replacement_direct_admission_checks_frozen_targets_before_capacity(
     let owner = automatic_replacement_request(&["replacement-a"]);
     let owner_id = owner.id.clone();
     assert_eq!(queue.push(owner), QueuePushOutcome::Accepted);
-    let admit =
-        |queue: &mut PriorityHealQueue, request| HealManager::admit_request_to_queue(queue, request, &config, "auto_scan").result;
+    let admit = |queue: &mut PriorityHealQueue, request, frozen| {
+        HealManager::admit_request_to_queue(queue, request, &config, "auto_scan", frozen).result
+    };
     assert_eq!(
-        admit(&mut queue, automatic_replacement_request(&["replacement-b"])),
+        admit(&mut queue, automatic_replacement_request(&["replacement-b"]), false),
         HealAdmissionResult::Merged
     );
-    let mut owner = queue.pop_next().expect("merged owner");
-    assert_eq!(owner.id, owner_id);
-    assert_eq!(owner.heal_endpoints, ["replacement-a", "replacement-b"]);
-    owner.replacement_targets_frozen = true;
-    assert_eq!(queue.push(owner), QueuePushOutcome::Accepted);
+    let mut replay = automatic_replacement_request(&["replacement-a"]);
+    replay.id = owner_id.clone();
+    assert_eq!(admit(&mut queue, replay, true), HealAdmissionResult::Merged);
+    assert!(
+        queue
+            .heap
+            .iter()
+            .any(|item| item.request.id == owner_id && item.replacement_targets_frozen)
+    );
     assert_eq!(
-        admit(&mut queue, automatic_replacement_request(&["replacement-c"])),
+        admit(&mut queue, automatic_replacement_request(&["replacement-c"]), false),
         HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
     );
     assert_eq!(
-        admit(&mut queue, automatic_replacement_request(&["replacement-a"])),
+        admit(&mut queue, automatic_replacement_request(&["replacement-a"]), false),
         HealAdmissionResult::Merged
     );
-    let mut other_generation = automatic_replacement_request(&["replacement-a"]);
-    other_generation.replacement_targets_frozen = true;
     assert_eq!(
-        admit(&mut queue, other_generation),
+        admit(&mut queue, automatic_replacement_request(&["replacement-a"]), true),
         HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
     );
     assert_eq!(queue.len(), 1);
     let owner = queue.pop_next().expect("frozen owner retained");
     assert_eq!(owner.id, owner_id);
     assert_eq!(owner.heal_endpoints, ["replacement-a", "replacement-b"]);
+
+    let owner = automatic_replacement_request(&["replacement-a"]);
+    let owner_id = owner.id.clone();
+    assert_eq!(queue.push(owner), QueuePushOutcome::Accepted);
+    let mut conflicting_replay = automatic_replacement_request(&["replacement-b"]);
+    conflicting_replay.id = owner_id.clone();
+    assert_eq!(
+        admit(&mut queue, conflicting_replay, true),
+        HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+    );
+    assert!(
+        queue
+            .heap
+            .iter()
+            .any(|item| item.request.id == owner_id && item.replacement_targets_frozen)
+    );
+    assert_eq!(
+        admit(&mut queue, automatic_replacement_request(&["replacement-c"]), false),
+        HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+    );
+
+    let mut queue = PriorityHealQueue::new();
+    let owner = automatic_replacement_request(&["replacement-a"]);
+    let owner_id = owner.id.clone();
+    assert_eq!(queue.push(owner), QueuePushOutcome::Accepted);
+    let mut incompatible_replay = automatic_replacement_request(&["replacement-a"]);
+    incompatible_replay.id = owner_id.clone();
+    incompatible_replay.options.dry_run = true;
+    assert_eq!(
+        admit(&mut queue, incompatible_replay, true),
+        HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+    );
+    assert!(
+        queue
+            .heap
+            .iter()
+            .any(|item| item.request.id == owner_id && item.replacement_targets_frozen)
+    );
+    assert_eq!(
+        admit(&mut queue, automatic_replacement_request(&["replacement-b"]), false),
+        HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+    );
 }
 
 #[tokio::test]

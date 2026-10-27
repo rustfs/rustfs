@@ -727,7 +727,7 @@ Stale-upload cleanup differs in one crash-recovery detail. RustFS's stale multip
 
 ## Replacement Recovery Completion
 
-One reconnect sweep submits all newly attached blank disks in a set together. Compatible automatic requests can add targets while the owner is still queued and has never executed or recovered a durable generation. Once execution or recovery fixes the target scope, later disks cannot join that generation or receive a merged receipt from it. Blank disks outside the frozen scope remain discoverable for the next automatic scan after the owner finishes.
+One reconnect sweep groups the newly attached blank disks in a set. If another reconnect is still pending, the ready targets are submitted after a one-second window rather than waiting indefinitely; later targets are submitted separately. Compatible automatic requests can add targets while the owner is still queued and has never executed or recovered a durable generation. Once execution or recovery fixes the target scope, later disks cannot join that generation or receive a merged receipt from it. Blank disks outside the frozen scope remain discoverable for the next automatic scan after the owner finishes.
 
 `POST /v3/background-heal/status` is an execution-queue view. `state=idle`, zero queue and active counts, an online disk, a readable object, or acceptance of an admin deep-heal request do not independently prove that a replacement disk contains every erasure shard.
 
