@@ -535,7 +535,7 @@ fn publication_lease_retries_local_channel_deadline_and_stops_on_cancel() {
             error
         }
 
-        // The local endpoint never completes TLS or receives an RPC.
+        // Keep the address unique to this isolated subprocess.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("local listener");
         let address = listener.local_addr().expect("listener address");
         let target = format!("https://{address}");
@@ -549,6 +549,10 @@ fn publication_lease_retries_local_channel_deadline_and_stops_on_cancel() {
         );
         let mut notification = crate::storage_api::EcstoreNotificationSys::new(EndpointServerPools::default()).await;
         notification.peer_clients.push(Some(client));
+
+        // Block the real channel cache read so the acquisition deadline wins
+        // independently of OS-specific connect and TLS error ordering.
+        let cache_read_blocker = rustfs_common::block_connection_cache_reads_for_test().await;
 
         let ctx = CancellationToken::new();
         let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
@@ -627,6 +631,7 @@ fn publication_lease_retries_local_channel_deadline_and_stops_on_cancel() {
         assert!(matches!(result, ScannerPublicationProofWait::Cancelled));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(started_at.elapsed() < scanner_publication_proof_retry_delay(1));
+        drop(cache_read_blocker);
         drop(listener);
     });
 }
