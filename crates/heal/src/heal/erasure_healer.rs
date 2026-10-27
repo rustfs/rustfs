@@ -58,6 +58,8 @@ fn result_object_size_u64(result: &HealResultItem) -> u64 {
 
 const NEW_VERSION_SKIP_GRACE_SECS: u64 = 60;
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
+const DEFAULT_REPLACEMENT_PAGE_OBJECT_CONCURRENCY: usize = 2;
+const REPLACEMENT_OBJECT_MAX_RETRIES: u32 = 2;
 
 fn should_skip_new_version(mod_time_unix_nanos: Option<i128>, started_at_secs: u64) -> bool {
     let Some(mod_time_unix_nanos) = mod_time_unix_nanos else {
@@ -177,7 +179,9 @@ mod mainline_pacing_tests {
             .await
             .expect("existing object owns capacity");
         let provider = Arc::new(TestPressure::new(WorkloadClass::ForegroundRead, 0));
-        let pacer = Arc::new(MainlinePacer::new(provider.clone(), 80, 80, Duration::from_millis(250)).expect("pacer"));
+        let pacer = Arc::new(
+            MainlinePacer::new(provider.clone(), 80, 80, Duration::from_millis(250), HealRequestSource::Admin).expect("pacer"),
+        );
         let cancel = CancellationToken::new();
         let waiting = tokio::spawn({
             let semaphore = semaphore.clone();
@@ -216,7 +220,7 @@ mod mainline_pacing_tests {
             let occupied = semaphore.clone().acquire_owned().await.expect("queue both waiters");
             let provider = Arc::new(TestPressure::new(WorkloadClass::ForegroundRead, 0));
             let pause = Duration::from_millis(250);
-            let pacer = MainlinePacer::new(provider.clone(), 80, 80, pause).expect("pacer");
+            let pacer = MainlinePacer::new(provider.clone(), 80, 80, pause, HealRequestSource::Admin).expect("pacer");
             let cancel = CancellationToken::new();
             let mut first = Box::pin(acquire_page_permit(semaphore.clone(), Some(&pacer), &cancel));
             let mut second = Box::pin(acquire_page_permit(semaphore.clone(), Some(&pacer), &cancel));
@@ -304,9 +308,21 @@ impl ErasureSetHealer {
         }
     }
 
-    fn effective_heal_page_object_concurrency_for_source(source: HealRequestSource, scan_mode: HealScanMode) -> usize {
+    fn effective_heal_page_object_concurrency_for_source(
+        source: HealRequestSource,
+        scan_mode: HealScanMode,
+        replacement: bool,
+    ) -> usize {
         if matches!(source, HealRequestSource::AutoHeal) {
-            1
+            if !replacement || matches!(scan_mode, HealScanMode::Deep) || !Self::page_parallel_enabled() {
+                1
+            } else {
+                rustfs_utils::get_env_usize(
+                    rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY,
+                    DEFAULT_REPLACEMENT_PAGE_OBJECT_CONCURRENCY,
+                )
+                .clamp(1, Semaphore::MAX_PERMITS)
+            }
         } else {
             Self::effective_heal_page_object_concurrency_for_scan_mode(scan_mode)
         }
@@ -1469,7 +1485,16 @@ impl ErasureSetHealer {
         // transient cache id that changes between identical pages.
         let mut previous_page_last: Option<(String, Option<String>)> = None;
         let page_concurrency_limit =
-            Self::effective_heal_page_object_concurrency_for_source(self.source, self.heal_opts.scan_mode);
+            if self.source == HealRequestSource::AutoHeal && self.replacement_task_id.is_some() && self.heal_opts.no_lock {
+                // Versions of the same object must not race without its namespace lock.
+                1
+            } else {
+                Self::effective_heal_page_object_concurrency_for_source(
+                    self.source,
+                    self.heal_opts.scan_mode,
+                    self.replacement_task_id.is_some(),
+                )
+            };
         let in_flight = Arc::new(AtomicUsize::new(0));
         // Per-bucket sample caps for per-object warn! lines: a flapping rebuild
         // disk can fail/skip hundreds of thousands of versions in one sweep, so
@@ -1691,6 +1716,7 @@ impl ErasureSetHealer {
                 let semaphore = semaphore.clone();
                 let target_endpoints = self.target_endpoints.clone();
                 let replacement_commit_evidence_required = self.replacement_task_id.is_some();
+                let retry_replacement = replacement_commit_evidence_required && self.source == HealRequestSource::AutoHeal;
                 let mainline_pacer = self.mainline_pacer.clone();
 
                 let admin_identity = self.admin_identity(bucket, &object_name, version_id.as_deref(), incarnation);
@@ -1700,107 +1726,125 @@ impl ErasureSetHealer {
                     .as_ref()
                     .map(|_| (dedup_key.clone(), object_name.clone(), version_id.clone()));
                 let work = async move {
-                    let permit = acquire_page_permit(semaphore, mainline_pacer.as_deref(), &cancel_token).await;
+                    let mut retries = 0;
+                    let mut admin_identity = admin_identity;
+                    let mut admin_task_id = admin_task_id;
+                    loop {
+                        let permit = acquire_page_permit(semaphore.clone(), mainline_pacer.as_deref(), &cancel_token).await;
 
-                    let _permit = match permit {
-                        Ok(permit) => permit,
-                        Err(err) => return (dedup_key, object_name, version_id, (0, Err(err)), None),
-                    };
+                        let permit = match permit {
+                            Ok(permit) => permit,
+                            Err(err) => return (dedup_key, object_name, version_id, (0, Err(err)), None),
+                        };
 
-                    let _in_flight_guard = PageConcurrencyGuard::new(in_flight, set_label);
+                        let in_flight_guard = PageConcurrencyGuard::new(in_flight.clone(), set_label.clone());
 
-                    if let (Some(identity), Some(task_id)) = (admin_identity, admin_task_id) {
-                        let (result, canonical) =
-                            admin::heal_object(storage.as_ref(), &heal_opts, identity, &task_id, &cancel_token).await;
-                        return (dedup_key, object_name, version_id, result, canonical);
-                    }
+                        if let (Some(identity), Some(task_id)) = (admin_identity.take(), admin_task_id.take()) {
+                            let (result, canonical) =
+                                admin::heal_object(storage.as_ref(), &heal_opts, identity, &task_id, &cancel_token).await;
+                            return (dedup_key, object_name, version_id, result, canonical);
+                        }
 
-                    // Always go through heal_object. Genuine absence flows through
-                    // heal_object -> FileVersionNotFound/FileNotFound ->
-                    // classify_heal_object_error -> Absent, so gone versions are
-                    // recorded as skipped-ok rather than failed. The delete-marker
-                    // vs data path is chosen internally in ops/heal.rs.
-                    let result = if cancel_token.is_cancelled() {
-                        (0, Err(Error::TaskCancelled))
-                    } else {
-                        match storage
-                            .heal_object(&bucket_name, &object_name, version_id.as_deref(), &heal_opts)
-                            .await
-                        {
-                            Ok((result, None)) if target_outcomes_complete(&result, &target_endpoints) => {
-                                let object_size = result_object_size_u64(&result);
-                                if !replacement_commit_evidence_required {
-                                    (object_size, Ok(true))
-                                } else {
-                                    match storage
-                                        .replacement_targets_have_version(
-                                            &bucket_name,
-                                            &object_name,
-                                            version_id.as_deref(),
-                                            &heal_opts,
-                                            &target_endpoints,
-                                        )
-                                        .await
-                                    {
-                                        Ok(true) => (object_size, Ok(true)),
-                                        Ok(false) => (
-                                            object_size,
-                                            Err(Error::transient_skip(format!(
-                                                "Skipped heal for {bucket_name}/{object_name} because replacement target readback did not confirm the committed version"
-                                            ))),
-                                        ),
-                                        Err(err) => (
-                                            object_size,
-                                            Err(Error::transient_skip(format!(
-                                                "Skipped heal for {bucket_name}/{object_name} because replacement target readback failed: {err}"
-                                            ))),
-                                        ),
+                        // Always go through heal_object. Genuine absence flows through
+                        // heal_object -> FileVersionNotFound/FileNotFound ->
+                        // classify_heal_object_error -> Absent, so gone versions are
+                        // recorded as skipped-ok rather than failed. The delete-marker
+                        // vs data path is chosen internally in ops/heal.rs.
+                        let result = if cancel_token.is_cancelled() {
+                            (0, Err(Error::TaskCancelled))
+                        } else {
+                            match storage
+                                .heal_object(&bucket_name, &object_name, version_id.as_deref(), &heal_opts)
+                                .await
+                            {
+                                Ok((result, None)) if target_outcomes_complete(&result, &target_endpoints) => {
+                                    let object_size = result_object_size_u64(&result);
+                                    if !replacement_commit_evidence_required {
+                                        (object_size, Ok(true))
+                                    } else {
+                                        match storage
+                                            .replacement_targets_have_version(
+                                                &bucket_name,
+                                                &object_name,
+                                                version_id.as_deref(),
+                                                &heal_opts,
+                                                &target_endpoints,
+                                            )
+                                            .await
+                                        {
+                                            Ok(true) => (object_size, Ok(true)),
+                                            Ok(false) => (
+                                                object_size,
+                                                Err(Error::transient_skip(format!(
+                                                    "Skipped heal for {bucket_name}/{object_name} because replacement target readback did not confirm the committed version"
+                                                ))),
+                                            ),
+                                            Err(err) => (
+                                                object_size,
+                                                Err(Error::transient_skip(format!(
+                                                    "Skipped heal for {bucket_name}/{object_name} because replacement target readback failed: {err}"
+                                                ))),
+                                            ),
+                                        }
                                     }
                                 }
-                            }
-                            Ok((result, None)) if !target_endpoints.is_empty() => (
-                                result_object_size_u64(&result),
-                                Err(Error::transient_skip(format!(
-                                    "Skipped heal for {bucket_name}/{object_name} because a replacement target was not committed"
-                                ))),
-                            ),
-                            Ok((result, None)) => (result_object_size_u64(&result), Ok(true)),
-                            Ok((result, Some(err))) if is_missing_object_dir_heal_result(&object_name, &err) => {
-                                (result_object_size_u64(&result), Ok(false))
-                            }
-                            Ok((result, Some(err))) => {
-                                let object_size = result_object_size_u64(&result);
-                                match Self::classify_heal_object_error(&err) {
-                                    HealObjectOutcome::Absent => (object_size, Ok(false)),
+                                Ok((result, None)) if !target_endpoints.is_empty() => (
+                                    result_object_size_u64(&result),
+                                    Err(Error::transient_skip(format!(
+                                        "Skipped heal for {bucket_name}/{object_name} because a replacement target was not committed"
+                                    ))),
+                                ),
+                                Ok((result, None)) => (result_object_size_u64(&result), Ok(true)),
+                                Ok((result, Some(err))) if is_missing_object_dir_heal_result(&object_name, &err) => {
+                                    (result_object_size_u64(&result), Ok(false))
+                                }
+                                Ok((result, Some(err))) => {
+                                    let object_size = result_object_size_u64(&result);
+                                    match Self::classify_heal_object_error(&err) {
+                                        HealObjectOutcome::Absent => (object_size, Ok(false)),
+                                        HealObjectOutcome::DanglingDeleteDeferred { retry_not_before } => {
+                                            (object_size, Err(Error::DanglingDeleteDeferred { retry_not_before }))
+                                        }
+                                        HealObjectOutcome::Transient => (
+                                            object_size,
+                                            Err(Error::transient_skip(format!(
+                                                "Skipped heal for {bucket_name}/{object_name} due to transient error: {err}"
+                                            ))),
+                                        ),
+                                        HealObjectOutcome::Failed => (object_size, Err(err)),
+                                    }
+                                }
+                                Err(err) => match Self::classify_heal_object_error(&err) {
+                                    HealObjectOutcome::Absent => (0, Ok(false)),
                                     HealObjectOutcome::DanglingDeleteDeferred { retry_not_before } => {
-                                        (object_size, Err(Error::DanglingDeleteDeferred { retry_not_before }))
+                                        (0, Err(Error::DanglingDeleteDeferred { retry_not_before }))
                                     }
                                     HealObjectOutcome::Transient => (
-                                        object_size,
+                                        0,
                                         Err(Error::transient_skip(format!(
                                             "Skipped heal for {bucket_name}/{object_name} due to transient error: {err}"
                                         ))),
                                     ),
-                                    HealObjectOutcome::Failed => (object_size, Err(err)),
-                                }
+                                    HealObjectOutcome::Failed => (0, Err(err)),
+                                },
                             }
-                            Err(err) => match Self::classify_heal_object_error(&err) {
-                                HealObjectOutcome::Absent => (0, Ok(false)),
-                                HealObjectOutcome::DanglingDeleteDeferred { retry_not_before } => {
-                                    (0, Err(Error::DanglingDeleteDeferred { retry_not_before }))
-                                }
-                                HealObjectOutcome::Transient => (
-                                    0,
-                                    Err(Error::transient_skip(format!(
-                                        "Skipped heal for {bucket_name}/{object_name} due to transient error: {err}"
-                                    ))),
-                                ),
-                                HealObjectOutcome::Failed => (0, Err(err)),
-                            },
-                        }
-                    };
+                        };
 
-                    (dedup_key, object_name, version_id, result, None)
+                        drop(in_flight_guard);
+                        drop(permit);
+                        if retry_replacement
+                            && retries < REPLACEMENT_OBJECT_MAX_RETRIES
+                            && matches!(&result.1, Err(Error::TransientSkip { .. }))
+                        {
+                            retries += 1;
+                            tokio::select! {
+                                _ = cancel_token.cancelled() => return (dedup_key, object_name, version_id, (0, Err(Error::TaskCancelled)), None),
+                                _ = tokio::time::sleep(Duration::from_millis(250 * u64::from(retries))) => {}
+                            }
+                            continue;
+                        }
+                        return (dedup_key, object_name, version_id, result, None);
+                    }
                 };
                 page_tasks.push(async move {
                     if let (Some(execution), Some((key, object, version))) = (execution, failure_identity) {
@@ -2131,11 +2175,79 @@ mod tests {
                     ErasureSetHealer::effective_heal_page_object_concurrency_for_source(
                         HealRequestSource::AutoHeal,
                         HealScanMode::Normal,
+                        false,
                     ),
                     1
                 );
             },
         );
+    }
+
+    #[test]
+    fn automatic_replacement_uses_a_conservative_default_and_respects_serial_controls() {
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_HEAL_PAGE_PARALLEL_ENABLE, Some("true")),
+                (rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, None),
+            ],
+            || {
+                assert_eq!(
+                    ErasureSetHealer::effective_heal_page_object_concurrency_for_source(
+                        HealRequestSource::AutoHeal,
+                        HealScanMode::Normal,
+                        true,
+                    ),
+                    2
+                );
+                assert_eq!(
+                    ErasureSetHealer::effective_heal_page_object_concurrency_for_source(
+                        HealRequestSource::AutoHeal,
+                        HealScanMode::Deep,
+                        true,
+                    ),
+                    1
+                );
+            },
+        );
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_HEAL_PAGE_PARALLEL_ENABLE, Some("false")),
+                (rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("8")),
+            ],
+            || {
+                assert_eq!(
+                    ErasureSetHealer::effective_heal_page_object_concurrency_for_source(
+                        HealRequestSource::AutoHeal,
+                        HealScanMode::Normal,
+                        true,
+                    ),
+                    1
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn automatic_replacement_concurrency_fits_the_semaphore() {
+        let maximum = usize::MAX.to_string();
+        for (value, expected) in [("0", 1), (maximum.as_str(), tokio::sync::Semaphore::MAX_PERMITS)] {
+            temp_env::with_vars(
+                [
+                    (rustfs_config::ENV_HEAL_PAGE_PARALLEL_ENABLE, Some("true")),
+                    (rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some(value)),
+                ],
+                || {
+                    assert_eq!(
+                        ErasureSetHealer::effective_heal_page_object_concurrency_for_source(
+                            HealRequestSource::AutoHeal,
+                            HealScanMode::Normal,
+                            true,
+                        ),
+                        expected
+                    );
+                },
+            );
+        }
     }
 
     #[test]
@@ -2150,6 +2262,7 @@ mod tests {
                     ErasureSetHealer::effective_heal_page_object_concurrency_for_source(
                         HealRequestSource::Admin,
                         HealScanMode::Normal,
+                        false,
                     ),
                     11
                 );
@@ -2522,6 +2635,8 @@ mod resume_loop_tests {
         lifecycle_expired: Mutex<HashSet<String>>,
         /// every heal_object call recorded as (name, version_id)
         heal_calls: Mutex<Vec<(String, Option<String>)>>,
+        heal_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+        heal_started: tokio::sync::Notify,
         list_include_lifecycle_object_info: Mutex<Vec<bool>>,
         replacement_target_identity_sequences: Mutex<VecDeque<Vec<ReplacementTargetIdentity>>>,
         replacement_targets_unready: AtomicBool,
@@ -2708,6 +2823,11 @@ mod resume_loop_tests {
                 .lock()
                 .unwrap()
                 .push((object.to_string(), version_id.map(str::to_string)));
+            self.heal_started.notify_one();
+            let heal_gate = self.heal_gate.lock().unwrap().clone();
+            if let Some(gate) = heal_gate {
+                gate.acquire().await.unwrap().forget();
+            }
             let key = compose_key(object, version_id);
             let outcome = {
                 let mut outcomes = self.outcomes.lock().unwrap();
@@ -3903,6 +4023,287 @@ mod resume_loop_tests {
     }
 
     #[tokio::test]
+    async fn auto_replacement_runs_two_object_repairs_within_the_configured_limit() {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_HEAL_PAGE_PARALLEL_ENABLE, Some("true")),
+                (rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("2")),
+            ],
+            async {
+                let mut env = make_env().await;
+                env.healer.source = HealRequestSource::AutoHeal;
+                env.healer = env
+                    .healer
+                    .with_replacement_targets(vec!["replacement-a".to_string()], Some(env.task_id.clone()));
+                let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                *env.storage.heal_gate.lock().unwrap() = Some(gate.clone());
+                let objects = ["a", "b", "c"];
+                for name in objects {
+                    env.storage
+                        .set_result(name, None, replacement_target_ok_result("replacement-a", name));
+                }
+                env.storage.set_page(
+                    None,
+                    Page {
+                        items: objects.into_iter().map(|name| item(name, None, false)).collect(),
+                        next: None,
+                        truncated: false,
+                    },
+                );
+
+                let observe = async {
+                    let two_started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        loop {
+                            let notified = env.storage.heal_started.notified();
+                            if env.storage.calls().len() >= 2 {
+                                break;
+                            }
+                            notified.await;
+                        }
+                    })
+                    .await
+                    .is_ok();
+                    let started = env.storage.calls().len();
+                    gate.add_permits(objects.len());
+                    assert!(two_started, "automatic replacement should start two repairs before either finishes");
+                    assert_eq!(started, 2, "configured concurrency must bound in-flight repairs");
+                };
+                let ((processed, successful, failed, skipped, result), ()) = tokio::join!(run(&env), observe);
+                result.expect("all replacement objects must be verified");
+                assert_eq!((processed, successful, failed, skipped), (3, 3, 0, 0));
+                assert_eq!(env.storage.calls().len(), 3);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auto_replacement_without_object_locks_stays_serial() {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_HEAL_PAGE_PARALLEL_ENABLE, Some("true")),
+                (rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("2")),
+            ],
+            async {
+                let mut env = make_env().await;
+                env.healer.source = HealRequestSource::AutoHeal;
+                env.healer.heal_opts.no_lock = true;
+                env.healer = env
+                    .healer
+                    .with_replacement_targets(vec!["replacement-a".to_string()], Some(env.task_id.clone()));
+                let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                *env.storage.heal_gate.lock().unwrap() = Some(gate.clone());
+                for version in ["v1", "v2"] {
+                    env.storage
+                        .set_result("object", Some(version), replacement_target_ok_result("replacement-a", "object"));
+                }
+                env.storage.set_page(
+                    None,
+                    Page {
+                        items: vec![item("object", Some("v1"), false), item("object", Some("v2"), false)],
+                        next: None,
+                        truncated: false,
+                    },
+                );
+                let observe = async {
+                    let first_started = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        loop {
+                            let notified = env.storage.heal_started.notified();
+                            if !env.storage.calls().is_empty() {
+                                break;
+                            }
+                            notified.await;
+                        }
+                    })
+                    .await
+                    .is_ok();
+                    let two_started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        loop {
+                            let notified = env.storage.heal_started.notified();
+                            if env.storage.calls().len() >= 2 {
+                                break;
+                            }
+                            notified.await;
+                        }
+                    })
+                    .await
+                    .is_ok();
+                    gate.add_permits(2);
+                    assert!(first_started, "the first object repair must start");
+                    assert!(!two_started, "unlocked object repairs must not overlap");
+                };
+                let ((processed, successful, failed, skipped, result), ()) = tokio::join!(run(&env), observe);
+                result.expect("the serial replacement must finish");
+                assert_eq!((processed, successful, failed, skipped), (2, 2, 0, 0));
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auto_replacement_retries_a_transient_object_before_rewinding_the_scan() {
+        let mut env = make_env().await;
+        env.healer.source = HealRequestSource::AutoHeal;
+        env.healer = env
+            .healer
+            .with_replacement_targets(vec!["replacement-a".to_string()], Some(env.task_id.clone()));
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("object", Some("version"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage
+            .set_outcome("object", Some("version"), HealOutcome::RpcCancelled(1));
+        env.storage
+            .set_result("object", Some("version"), replacement_target_ok_result("replacement-a", "object"));
+
+        let (processed, successful, failed, skipped, result) = run(&env).await;
+        result.expect("the transient repair should succeed during the current pass");
+        assert_eq!((processed, successful, failed, skipped), (1, 1, 0, 0));
+        assert_eq!(env.storage.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn auto_replacement_releases_capacity_during_a_bounded_retry() {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_HEAL_PAGE_PARALLEL_ENABLE, Some("true")),
+                (rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("1")),
+            ],
+            async {
+                let mut env = make_env().await;
+                env.healer.source = HealRequestSource::AutoHeal;
+                env.healer = env
+                    .healer
+                    .with_replacement_targets(vec!["replacement-a".to_string()], Some(env.task_id.clone()));
+                env.storage.set_page(
+                    None,
+                    Page {
+                        items: vec![item("retry", None, false), item("ready", None, false)],
+                        next: None,
+                        truncated: false,
+                    },
+                );
+                env.storage.set_outcome("retry", None, HealOutcome::Transient);
+                env.storage
+                    .set_result("ready", None, replacement_target_ok_result("replacement-a", "ready"));
+
+                let (processed, successful, failed, skipped, result) = run(&env).await;
+                result.expect("a failed object is retained as a transient skip");
+                assert_eq!((processed, successful, failed, skipped), (2, 1, 0, 1));
+                let calls = env.storage.calls();
+                let retries: Vec<_> = calls.iter().enumerate().filter(|(_, call)| call.0 == "retry").collect();
+                let ready = calls.iter().position(|call| call.0 == "ready").expect("ready object ran");
+                assert_eq!(retries.len(), 3, "only two retries are allowed");
+                assert!(ready < retries[1].0, "the backoff must release the only page permit");
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auto_replacement_cancellation_interrupts_object_retry() {
+        let mut env = make_env().await;
+        env.healer.source = HealRequestSource::AutoHeal;
+        env.healer = env
+            .healer
+            .with_replacement_targets(vec!["replacement-a".to_string()], Some(env.task_id.clone()));
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("retry", None, false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage.set_outcome("retry", None, HealOutcome::Transient);
+        let cancel = env.healer.cancel_token.clone();
+        let observe = async {
+            loop {
+                let notified = env.storage.heal_started.notified();
+                if !env.storage.calls().is_empty() {
+                    break;
+                }
+                notified.await;
+            }
+            cancel.cancel();
+        };
+
+        let ((_, successful, _, _, result), ()) = tokio::join!(run(&env), observe);
+        assert!(matches!(result, Err(Error::TaskCancelled)));
+        assert_eq!(successful, 0);
+        assert_eq!(env.storage.calls().len(), 1);
+        assert!(env.checkpoint.get_checkpoint().await.processed_objects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_replacement_cancel_retains_workers_until_inflight_repairs_settle() {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_HEAL_PAGE_PARALLEL_ENABLE, Some("true")),
+                (rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("2")),
+            ],
+            async {
+                let mut env = make_env().await;
+                env.healer.source = HealRequestSource::AutoHeal;
+                let execution = crate::heal::storage::ReplacementExecution::for_test(Vec::new(), Vec::new());
+                env.healer = env
+                    .healer
+                    .with_replacement_targets(vec!["replacement-a".to_string()], Some(env.task_id.clone()))
+                    .with_replacement_execution(Some(execution.clone()));
+                let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                *env.storage.heal_gate.lock().unwrap() = Some(gate.clone());
+                for name in ["a", "b", "c"] {
+                    env.storage
+                        .set_result(name, None, replacement_target_ok_result("replacement-a", name));
+                }
+                env.storage.set_page(
+                    None,
+                    Page {
+                        items: ["a", "b", "c"].into_iter().map(|name| item(name, None, false)).collect(),
+                        next: None,
+                        truncated: false,
+                    },
+                );
+                let cancel = env.healer.cancel_token.clone();
+                let observe = async {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        loop {
+                            let notified = env.storage.heal_started.notified();
+                            if env.storage.calls().len() >= 2 {
+                                break;
+                            }
+                            notified.await;
+                        }
+                    })
+                    .await
+                    .expect("two repairs must start");
+                    cancel.cancel();
+                };
+
+                let ((_, successful, _, _, result), ()) = tokio::join!(run(&env), observe);
+                assert!(matches!(result, Err(Error::TaskCancelled)));
+                assert_eq!(successful, 0);
+                assert_eq!(env.storage.calls().len(), 2, "queued work must not start after cancellation");
+                assert!(env.checkpoint.get_checkpoint().await.processed_objects.is_empty());
+                assert!(Arc::strong_count(&execution) >= 4, "in-flight workers must retain execution ownership");
+                gate.add_permits(2);
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while Arc::strong_count(&execution) > 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("workers must release execution ownership after their storage work settles");
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_resume_after_version_deleted_midheal_no_skip() {
         let env = make_env().await;
         // Simulate a resumed pass: (a,v1) was already processed last time, and
@@ -4316,7 +4717,11 @@ mod resume_loop_tests {
         assert!(!state.completed, "readback errors must leave the replacement task incomplete");
         assert_eq!(state.retry_count, 1, "readback errors must arm the bounded retry path");
         assert!(env.checkpoint.get_checkpoint().await.processed_objects.is_empty());
-        assert_eq!(env.storage.calls(), vec![("object".to_string(), Some("dm-v1".to_string()))]);
+        assert_eq!(
+            env.storage.calls(),
+            vec![("object".to_string(), Some("dm-v1".to_string())); 3],
+            "unverified readback must exhaust only the bounded object retries"
+        );
     }
 
     #[tokio::test]
