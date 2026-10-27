@@ -678,3 +678,219 @@ fn protocol_object_creation_operation_preserves_multipart_staging() {
         }
     });
 }
+
+#[cfg(any(feature = "webdav", feature = "sftp"))]
+#[test]
+#[serial_test::serial]
+fn protocol_session_bucket_listing_revalidates_the_session_key() {
+    use crate::storage_api::protocols::client::S3ErrorCode;
+
+    crate::app::gating_test_env::run_large_stack_test("protocol-session-bucket-listing", || async {
+        let root = Credentials {
+            access_key: "listing-policy-root".into(),
+            secret_key: "listing-policy-root-secret".into(),
+            status: "on".into(),
+            ..Default::default()
+        };
+        let (_temp, context, iam) = protocol_test_context(root).await;
+        let store = context.object_store();
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(context));
+        let backend = crate::init::protocol_storage_client_for_server(slot);
+        for bucket in ["listing-visible", "listing-hidden"] {
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+        }
+        iam.create_user(
+            "listing-parent",
+            &rustfs_madmin::AddOrUpdateUserReq {
+                secret_key: "listing-parent-secret".into(),
+                policy: None,
+                status: rustfs_madmin::AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("create parent user");
+        let mut allow = json!({
+            "Effect":"Allow", "Action":["s3:ListBucket","s3:GetBucketLocation"],
+            "Resource":"arn:aws:s3:::listing-visible",
+            "Condition":{
+                "IpAddress":{"aws:SourceIp":"127.0.0.0/8"},
+                "Bool":{"aws:SecureTransport":"true"},
+                "StringEquals":{"aws:UserAgent":"sftp-listing-test"}
+            }
+        });
+        iam.set_policy(
+            "listing-policy",
+            decode_policy(json!({"Version":"2012-10-17","Statement":[allow.clone()]})).expect("parse listing policy"),
+        )
+        .await
+        .expect("save listing policy");
+        iam.policy_db_set("listing-parent", UserType::Reg, false, "listing-policy")
+            .await
+            .expect("attach listing policy");
+        iam.new_service_account(
+            "listing-parent",
+            None,
+            rustfs_iam::sys::NewServiceAccountOpts {
+                access_key: "listing-service-account".into(),
+                secret_key: "listing-service-account-secret".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create service account");
+        let identity = iam
+            .check_key("listing-service-account")
+            .await
+            .expect("load service account")
+            .0
+            .expect("service account exists");
+        // The identity is captured once, at login, like a protocol session does.
+        let mut session = SessionContext::new(
+            ProtocolPrincipal::new(Arc::new(identity)),
+            Protocol::Sftp,
+            "127.0.0.1".parse().expect("loopback"),
+        );
+        session
+            .request_headers
+            .insert("user-agent", "sftp-listing-test".parse().expect("user agent"));
+        let list = || backend.list_buckets_for_session(&session, &session.request_headers, session.secure_transport);
+
+        let visible: Vec<_> = list()
+            .await
+            .expect("bucket-scoped listing")
+            .buckets
+            .into_iter()
+            .map(|b| b.name.as_str().to_owned())
+            .collect();
+        assert_eq!(visible, ["listing-visible"], "listing is filtered to buckets the principal may list");
+
+        let mut insecure = session.clone();
+        insecure.secure_transport = false;
+        let mut foreign_ip = session.clone();
+        foreign_ip.source_ip = "192.0.2.10".parse().expect("documentation address");
+        let mut missing_header = session.clone();
+        missing_header.request_headers.remove("user-agent");
+        for denied_session in [insecure, foreign_ip, missing_header] {
+            let result = backend
+                .list_buckets_for_session(&denied_session, &denied_session.request_headers, denied_session.secure_transport)
+                .await;
+            assert!(
+                matches!(&result, Err(e) if *e.code() == S3ErrorCode::AccessDenied),
+                "bucket discovery must enforce the session's request conditions: {result:?}"
+            );
+        }
+
+        allow["Resource"] = json!(["arn:aws:s3:::listing-visible", "arn:aws:s3:::listing-hidden"]);
+        iam.set_policy(
+            "listing-policy",
+            decode_policy(json!({"Version":"2012-10-17","Statement":[allow]})).expect("parse parent policy"),
+        )
+        .await
+        .expect("allow the parent to list both buckets");
+        for bucket in ["listing-visible", "listing-hidden"] {
+            let session_policy = decode_policy(json!({
+                "Version":"2012-10-17",
+                "Statement":[{
+                    "Effect":"Allow", "Action":["s3:ListBucket","s3:GetBucketLocation"],
+                    "Resource":format!("arn:aws:s3:::{bucket}")
+                }]
+            }))
+            .expect("parse service-account policy");
+            iam.update_service_account(
+                "listing-service-account",
+                rustfs_iam::sys::UpdateServiceAccountOpts {
+                    session_policy: Some(session_policy),
+                    secret_key: None,
+                    name: None,
+                    description: None,
+                    expiration: None,
+                    status: None,
+                    parent_user: None,
+                    allow_site_replicator_account: false,
+                },
+            )
+            .await
+            .expect("update the service-account policy after login");
+            let visible: Vec<_> = list()
+                .await
+                .expect("listing with the refreshed session policy")
+                .buckets
+                .into_iter()
+                .map(|b| b.name.as_str().to_owned())
+                .collect();
+            assert_eq!(visible, [bucket], "listing must use the current service-account claims");
+        }
+
+        iam.update_service_account(
+            "listing-service-account",
+            rustfs_iam::sys::UpdateServiceAccountOpts {
+                session_policy: None,
+                secret_key: None,
+                name: None,
+                description: None,
+                expiration: None,
+                status: Some("off".into()),
+                parent_user: None,
+                allow_site_replicator_account: false,
+            },
+        )
+        .await
+        .expect("disable service account");
+
+        let after_disable = list().await;
+        assert!(
+            matches!(&after_disable, Err(e) if *e.code() == S3ErrorCode::AccessDenied),
+            "a key disabled after login must stop listing buckets: {after_disable:?}"
+        );
+
+        #[cfg(feature = "webdav")]
+        {
+            let mut webdav_session = session.clone();
+            webdav_session.protocol = Protocol::WebDav;
+            let capacity = backend
+                .session_capacity_view(&webdav_session, &webdav_session.request_headers, webdav_session.secure_transport)
+                .await;
+            assert!(
+                matches!(&capacity, Err(e) if *e.code() == S3ErrorCode::AccessDenied),
+                "quota discovery must revalidate the session key before reading capacity: {capacity:?}"
+            );
+        }
+    });
+}
+
+#[cfg(feature = "webdav")]
+#[test]
+#[serial_test::serial]
+fn protocol_capacity_view_uses_server_context_for_empty_listing() {
+    crate::app::gating_test_env::run_large_stack_test("protocol-capacity-listing-context", || async {
+        let root = Credentials {
+            access_key: "capacity-listing-root".into(),
+            secret_key: "capacity-listing-root-secret".into(),
+            status: "on".into(),
+            ..Default::default()
+        };
+        let (_temp, context, _iam) = protocol_test_context(root.clone()).await;
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(context));
+        let backend = crate::init::protocol_storage_client_for_server(slot);
+        let session = SessionContext::new(
+            ProtocolPrincipal::new(Arc::new(rustfs_policy::auth::UserIdentity {
+                credentials: root,
+                ..Default::default()
+            })),
+            Protocol::WebDav,
+            "127.0.0.1".parse().expect("loopback"),
+        );
+
+        let capacity = backend
+            .session_capacity_view(&session, &session.request_headers, session.secure_transport)
+            .await
+            .expect("capacity discovery uses the server's IAM context")
+            .expect("capacity view is supported");
+        assert!(capacity.buckets.is_empty(), "a server with no user buckets has an empty capacity view");
+    });
+}

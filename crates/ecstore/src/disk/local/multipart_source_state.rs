@@ -106,6 +106,7 @@ impl SourceHead {
 }
 
 pub(super) struct LoadedSource {
+    pub root_missing: bool,
     pub state: Option<SourceState>,
     pub head: Option<SourceHead>,
     pub original: Option<Bytes>,
@@ -224,11 +225,31 @@ pub(super) fn read_optional(path: &Path, base: &Path, root: &os::PublicationRoot
         Err(error) => Err(error.into()),
     }
 }
+pub(super) fn read_optional_in_pinned(
+    pinned: &os::ExistingBaseDirectoryGuard,
+    parent: &Path,
+    name: &str,
+    base: &Path,
+    root: &os::PublicationRoot,
+) -> Result<Option<Bytes>> {
+    match os::read_multipart_source_metadata_in_pinned(pinned, parent, std::ffi::OsStr::new(name), base, root) {
+        Ok(bytes) => Ok(Some(Bytes::from(bytes))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
 /// Canonical source mutations are admitted under SourceRW at the syscall,
 /// not on the earlier async caller that may have timed out.
 pub(super) fn validate_source_mutation(source: &Path, base: &Path, root: &os::PublicationRoot, initial: bool) -> Result<()> {
-    let state = read_optional(&source.join(STATE), base, root)?;
-    let head = read_optional(&source.join(STORAGE_FORMAT_FILE), base, root)?;
+    let pinned = match os::pin_multipart_source_directory(source, base, root) {
+        Ok(pinned) => pinned,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return if initial { Ok(()) } else { Err(DiskError::FileNotFound) };
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let state = read_optional_in_pinned(&pinned, source, STATE, base, root)?;
+    let head = read_optional_in_pinned(&pinned, source, STORAGE_FORMAT_FILE, base, root)?;
     let Some(head) = head else {
         return if initial && state.is_none() {
             Ok(())
@@ -314,6 +335,48 @@ fn target_backup_path(source: &Path, owner: Uuid) -> PathBuf {
     source.join(".mpu-completions").join(owner.to_string()).join("target.xl.meta")
 }
 
+fn terminal_record_path(source: &Path, state: &SourceState) -> Option<PathBuf> {
+    matches!(
+        state.phase,
+        MultipartSourcePhase::LocalTerminalSeal | MultipartSourcePhase::GlobalTerminalCertified
+    )
+    .then(|| {
+        source
+            .join(".mpu-completions")
+            .join(state.backup_owner.to_string())
+            .join(format!("terminal-{}.msgpack", state.revision))
+    })
+}
+
+fn snapshot_for_state(
+    disk_id: Uuid,
+    state: &SourceState,
+    state_raw: &[u8],
+    head_sha256: Option<[u8; 32]>,
+) -> Result<MultipartSourceSnapshot> {
+    let state_sha256 = raw_sha(state_raw);
+    let inventory = raw_sha(&encode(&(
+        Some(state_sha256),
+        head_sha256,
+        state.original_sha256,
+        state.negative_certificate_sha256,
+        state.ready_certificate_sha256,
+    ))?);
+    Ok(MultipartSourceSnapshot {
+        disk_id,
+        physical_slot: state.physical_slot,
+        lineage: state.lineage.clone(),
+        generation: state.generation,
+        revision: state.revision,
+        phase: state.phase,
+        state_sha256,
+        head_sha256,
+        inventory_sha256: inventory,
+        capability_sha256: state.capability_sha256,
+        publication: state.publication.clone(),
+    })
+}
+
 impl SourceStore {
     pub fn validate_certificate_topology(&self, certificate: &MultipartCertificate) -> Result<()> {
         if certificate.disk_ids != self.disk_ids || certificate.disk_ids.get(self.physical_slot) != Some(&self.disk_id) {
@@ -348,31 +411,72 @@ impl SourceStore {
         .map_err(DiskError::from)?
     }
     pub async fn persist(&self, state: &SourceState) -> Result<()> {
+        self.persist_with_source_sync(state, false).await.map(|_| ())
+    }
+    pub(super) async fn persist_with_source_sync(
+        &self,
+        state: &SourceState,
+        sync_source_before: bool,
+    ) -> Result<MultipartSourceSnapshot> {
+        state.validate(self.disk_id, &self.path)?;
+        let raw = encode(state)?;
+        let snapshot = snapshot_for_state(self.disk_id, state, &raw, None)?;
+        let source = self.source.clone();
+        let base = self.base.clone();
+        let root = self.publication_root.clone();
+        let terminal = terminal_record_path(&source, state);
+        os::run_blocking_namespace_operation_with_sync(self.lease.clone(), true, move || {
+            Self::persist_state_std(&source, &base, &root, &raw, terminal.as_deref(), sync_source_before)
+        })
+        .await
+        .map_err(DiskError::from)?;
+        Ok(snapshot)
+    }
+    fn persist_state_std(
+        source: &Path,
+        base: &Path,
+        root: &os::PublicationRoot,
+        raw: &[u8],
+        terminal: Option<&Path>,
+        sync_source_before: bool,
+    ) -> std::io::Result<()> {
+        #[cfg(unix)]
+        let mut pinned = os::pin_multipart_source_directory(source, base, root)?;
+        #[cfg(not(unix))]
+        let _pinned = os::pin_multipart_source_directory(source, base, root)?;
+        if sync_source_before {
+            #[cfg(unix)]
+            {
+                let opened = std::fs::File::from(pinned.pop().ok_or_else(|| IoError::other("empty source directory guard"))?);
+                os::fsync_directory_handle_std(source, Some(&opened))?;
+            }
+            #[cfg(not(unix))]
+            os::fsync_dir_std(source)?;
+        }
+        if let Some(path) = terminal {
+            os::replace_multipart_source_metadata(path, raw, base, root)?;
+        }
+        os::replace_multipart_source_metadata(&source.join(STATE), raw, base, root)
+    }
+    async fn write_owned_backup_and_persist(&self, owner: Uuid, target: bool, bytes: &[u8], state: &SourceState) -> Result<()> {
+        if owner.is_nil() {
+            return Err(DiskError::FileCorrupt);
+        }
         state.validate(self.disk_id, &self.path)?;
         let raw = encode(state)?;
         let source = self.source.clone();
         let base = self.base.clone();
         let root = self.publication_root.clone();
-        let terminal = matches!(
-            state.phase,
-            MultipartSourcePhase::LocalTerminalSeal | MultipartSourcePhase::GlobalTerminalCertified
-        )
-        .then(|| {
-            source
-                .join(".mpu-completions")
-                .join(state.backup_owner.to_string())
-                .join(format!("terminal-{}.msgpack", state.revision))
-        });
-        os::run_blocking_namespace_operation(self.lease.clone(), move || {
-            let _pin = os::pin_multipart_source_directory(&source, &base, &root)?;
-            if let Some(path) = terminal {
-                os::replace_multipart_source_metadata(&path, &raw, &base, &root)?;
-            }
-            os::replace_multipart_source_metadata(&source.join(STATE), &raw, &base, &root)
+        let terminal = terminal_record_path(&source, state);
+        let bytes = bytes.to_vec();
+        os::run_blocking_namespace_operation_with_sync(self.lease.clone(), true, move || {
+            Self::write_owned_backup_std(&source, &base, &root, owner, target, &bytes)?;
+            Self::persist_state_std(&source, &base, &root, &raw, terminal.as_deref(), false)
         })
         .await
         .map_err(DiskError::from)
     }
+    #[cfg(test)]
     pub async fn original(&self, state: &SourceState) -> Result<Bytes> {
         let path = original_path(&self.source, state.backup_owner);
         let base = self.base.clone();
@@ -421,53 +525,64 @@ impl SourceStore {
             restore_from: None,
             abort: None,
         };
-        self.write_owned_backup(state.backup_owner, false, original).await?;
-        self.persist(&state).await?;
+        self.write_owned_backup_and_persist(state.backup_owner, false, original, &state)
+            .await?;
         Ok(state)
     }
+    #[cfg(test)]
     pub async fn write_owned_backup(&self, owner: Uuid, target: bool, bytes: &[u8]) -> Result<()> {
         if owner.is_nil() {
             return Err(DiskError::FileCorrupt);
         }
-        let path = if target {
-            target_backup_path(&self.source, owner)
-        } else {
-            original_path(&self.source, owner)
-        };
         let source = self.source.clone();
         let base = self.base.clone();
         let root = self.publication_root.clone();
         let bytes = bytes.to_vec();
         os::run_blocking_namespace_operation(self.lease.clone(), move || {
-            let _pin = os::pin_multipart_source_directory(&source, &base, &root)?;
-            let parent = path
-                .parent()
-                .ok_or_else(|| std::io::Error::other("source backup has no parent"))?;
-            let _parents = os::mkdir_all_below_existing_base_std(parent, &base, &root)?;
-            let existed = if target {
-                match os::observe_multipart_source_metadata(&path, &base, &root, bytes.len() as u64) {
-                    Ok((length, sha)) if length == bytes.len() as u64 && sha == raw_sha(&bytes) => true,
-                    Ok(_) => {
-                        return Err(IoError::new(std::io::ErrorKind::AlreadyExists, "immutable target backup changed"));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(error) => return Err(error),
-                }
-            } else if let Some(previous) = read_optional(&path, &base, &root).map_err(IoError::other)? {
-                if previous.as_ref() != bytes.as_slice() {
-                    return Err(IoError::new(std::io::ErrorKind::AlreadyExists, "immutable source backup changed"));
-                }
-                true
-            } else {
-                false
-            };
-            if !existed {
-                os::replace_multipart_source_metadata(&path, &bytes, &base, &root)?;
-            }
-            os::sync_multipart_owned_record_parents(&source, parent, existed, &base, &root)
+            Self::write_owned_backup_std(&source, &base, &root, owner, target, &bytes)
         })
         .await
         .map_err(DiskError::from)
+    }
+    fn write_owned_backup_std(
+        source: &Path,
+        base: &Path,
+        root: &os::PublicationRoot,
+        owner: Uuid,
+        target: bool,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        let path = if target {
+            target_backup_path(source, owner)
+        } else {
+            original_path(source, owner)
+        };
+        let _pin = os::pin_multipart_source_directory(source, base, root)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("source backup has no parent"))?;
+        let _parents = os::mkdir_all_below_existing_base_std(parent, base, root)?;
+        let existed = if target {
+            match os::observe_multipart_source_metadata(&path, base, root, bytes.len() as u64) {
+                Ok((length, sha)) if length == bytes.len() as u64 && sha == raw_sha(bytes) => true,
+                Ok(_) => {
+                    return Err(IoError::new(std::io::ErrorKind::AlreadyExists, "immutable target backup changed"));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error),
+            }
+        } else if let Some(previous) = read_optional(&path, base, root).map_err(IoError::other)? {
+            if previous.as_ref() != bytes {
+                return Err(IoError::new(std::io::ErrorKind::AlreadyExists, "immutable source backup changed"));
+            }
+            true
+        } else {
+            false
+        };
+        if !existed {
+            os::replace_multipart_source_metadata(&path, bytes, base, root)?;
+        }
+        os::sync_multipart_owned_record_parents(source, parent, existed, base, root)
     }
     pub async fn replace_head(&self, bytes: &[u8]) -> Result<()> {
         let path = self.source.join(STORAGE_FORMAT_FILE);
@@ -490,7 +605,7 @@ impl SourceStore {
         if encode(actual)? != encode(state)? {
             return Err(DiskError::ConditionalDeleteConflict);
         }
-        let raw = self.original(state).await?;
+        let raw = loaded.original.as_ref().ok_or(DiskError::FileCorrupt)?;
         let allowed = match loaded.head.as_ref() {
             None => {
                 state.phase == MultipartSourcePhase::Recovering
@@ -551,7 +666,7 @@ impl SourceStore {
         if !allowed {
             return Err(DiskError::ConditionalDeleteConflict);
         }
-        let mut info = file_info(&raw, RUSTFS_META_MULTIPART_BUCKET, &self.path, state.lineage.original_version_id)?;
+        let mut info = file_info(raw, RUSTFS_META_MULTIPART_BUCKET, &self.path, state.lineage.original_version_id)?;
         strip_native_controls(&mut info.metadata);
         mark_native_source(&mut info);
         set_source_status(
@@ -649,6 +764,14 @@ impl SourceStore {
         Ok(metadata.map(|_| bytes))
     }
     pub fn target_matches(&self, publication: &PublicationIdentity, raw: &[u8]) -> Result<bool> {
+        Self::target_matches_for_slot(publication, raw, self.physical_slot, self.disk_ids.len())
+    }
+    pub(super) fn target_matches_for_slot(
+        publication: &PublicationIdentity,
+        raw: &[u8],
+        physical_slot: usize,
+        disk_count: usize,
+    ) -> Result<bool> {
         let info = file_info(raw, &publication.lineage.bucket, &publication.lineage.object, publication.version_id)?;
         let slot = publication
             .lineage
@@ -670,8 +793,8 @@ impl SourceStore {
             && info.erasure.parity_blocks == publication.lineage.geometry.parity_blocks
             && info.erasure.block_size == publication.lineage.geometry.block_size
             && info.erasure.distribution == publication.lineage.geometry.distribution
-            && slot == self.physical_slot
-            && publication.lineage.geometry.disks() == self.disk_ids.len())
+            && slot == physical_slot
+            && publication.lineage.geometry.disks() == disk_count)
     }
     pub async fn restore_exact_target(&self, state: &SourceState, owner: Option<Arc<dyn Send + Sync>>) -> Result<()> {
         let publication = state.publication.as_ref().ok_or(DiskError::FileCorrupt)?;
@@ -772,13 +895,32 @@ pub(super) fn load_source(
     physical_slot: usize,
     disk_ids: &[Uuid],
 ) -> Result<LoadedSource> {
-    let state_raw = read_optional(&source.join(STATE), base, root)?;
+    let pinned = match os::pin_multipart_source_directory(source, base, root) {
+        Ok(pinned) => pinned,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LoadedSource {
+                root_missing: true,
+                state: None,
+                head: None,
+                original: None,
+                info: None,
+                snapshot: None,
+                head_matches_state: false,
+                head_matches_activation: false,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let state_raw = read_optional_in_pinned(&pinned, source, STATE, base, root)?;
     let state: Option<SourceState> = state_raw.as_deref().map(decode).transpose()?;
-    if state.is_none() && os::multipart_source_has_native_controls(source, base, root)? {
+    if state.is_none() && os::multipart_source_has_native_controls_in_pinned(source, &pinned)? {
         return Err(DiskError::ConditionalDeleteConflict);
     }
-    let head_path = source.join(STORAGE_FORMAT_FILE);
-    let head = if let Some(state) = state.as_ref() {
+    let head = if let Some(state) = state
+        .as_ref()
+        .filter(|state| state.prepared_length.is_some_and(|len| len > 64 * 1024))
+    {
+        let head_path = source.join(STORAGE_FORMAT_FILE);
         let maximum = state
             .prepared_length
             .unwrap_or(0)
@@ -789,7 +931,8 @@ pub(super) fn load_source(
                 let raw = if is_proxy {
                     None
                 } else {
-                    let raw = read_optional(&head_path, base, root)?.ok_or(DiskError::FileCorrupt)?;
+                    let raw = read_optional_in_pinned(&pinned, source, STORAGE_FORMAT_FILE, base, root)?
+                        .ok_or(DiskError::FileCorrupt)?;
                     if raw_sha(&raw) != sha256 {
                         return Err(DiskError::FileCorrupt);
                     }
@@ -801,10 +944,17 @@ pub(super) fn load_source(
             Err(error) => return Err(error.into()),
         }
     } else {
-        read_optional(&head_path, base, root)?.map(|raw| SourceHead {
-            sha256: raw_sha(&raw),
-            length: raw.len() as u64,
-            raw: Some(raw),
+        read_optional_in_pinned(&pinned, source, STORAGE_FORMAT_FILE, base, root)?.map(|raw| {
+            let sha256 = raw_sha(&raw);
+            let length = raw.len() as u64;
+            let is_proxy = state
+                .as_ref()
+                .is_some_and(|state| Some(sha256) == state.prepared_sha256 && Some(length) == state.prepared_length);
+            SourceHead {
+                sha256,
+                length,
+                raw: (!is_proxy).then_some(raw),
+            }
         })
     };
     let mut original = None;
@@ -870,26 +1020,12 @@ pub(super) fn load_source(
             }
         }
         let head_sha = head.as_ref().map(|head| head.sha256);
-        let inventory = raw_sha(&encode(&(
-            state_raw.as_ref().map(|bytes| raw_sha(bytes)),
-            head_sha,
-            state.original_sha256,
-            state.negative_certificate_sha256,
-            state.ready_certificate_sha256,
-        ))?);
-        snapshot = Some(MultipartSourceSnapshot {
+        snapshot = Some(snapshot_for_state(
             disk_id,
-            physical_slot: state.physical_slot,
-            lineage: state.lineage.clone(),
-            generation: state.generation,
-            revision: state.revision,
-            phase: state.phase,
-            state_sha256: raw_sha(state_raw.as_ref().ok_or(DiskError::FileCorrupt)?),
-            head_sha256: head_sha,
-            inventory_sha256: inventory,
-            capability_sha256: state.capability_sha256,
-            publication: state.publication.clone(),
-        });
+            state,
+            state_raw.as_ref().ok_or(DiskError::FileCorrupt)?,
+            head_sha,
+        )?);
     } else if let Some(observed) = &head {
         let raw = observed.raw().ok_or(DiskError::FileCorrupt)?;
         let current = get_file_info(
@@ -950,6 +1086,7 @@ pub(super) fn load_source(
         head_matches_state = true;
     }
     Ok(LoadedSource {
+        root_missing: false,
         state,
         head,
         original,
@@ -1195,11 +1332,7 @@ impl SourceStore {
         directory: &Path,
         lease: Arc<os::NamespaceMutationLease>,
     ) -> Result<()> {
-        let loaded = self.load().await?;
-        let current = loaded.state.as_ref().ok_or(DiskError::ConditionalDeleteConflict)?;
-        if encode(current)? != encode(state)?
-            || !loaded.head_matches_state
-            || state.lineage != publication.lineage
+        if state.lineage != publication.lineage
             || state.generation != publication.source_generation
             || state.disk_id != self.disk_id
             || state.physical_slot != self.physical_slot
@@ -1436,8 +1569,7 @@ impl LocalDisk {
         };
         // Copy the small source FI to an independent immutable inode. Its
         // canonical inode is never truncated to build the destination proxy.
-        store.write_owned_backup(owner, false, original).await?;
-        store.persist(&state).await?;
+        store.write_owned_backup_and_persist(owner, false, original, &state).await?;
         let prepared_path = store.source.join(format!(".mpu-prepared-{owner}"));
         let context = NativeMultipartPublication {
             store,
@@ -1480,14 +1612,19 @@ impl NativeMultipartPublication {
             length: new_metadata.len() as u64,
         };
         if let Some(previous) = old_metadata {
-            self.store.write_owned_backup(state.backup_owner, true, previous).await?;
             state.previous_target_sha256 = Some(raw_sha(previous));
             state.previous_target_length = Some(previous.len() as u64);
         }
         state.prepared_sha256 = Some(validated.sha256);
         state.prepared_length = Some(validated.length);
         state.advance(MultipartSourcePhase::Prepared)?;
-        self.store.persist(&state).await?;
+        if let Some(previous) = old_metadata {
+            self.store
+                .write_owned_backup_and_persist(state.backup_owner, true, previous, &state)
+                .await?;
+        } else {
+            self.store.persist(&state).await?;
+        }
         *self.state.lock() = state;
         *self.validated_prepared.lock() = Some(validated);
         Ok(())
@@ -1569,31 +1706,28 @@ impl NativeMultipartPublication {
         if current.head.is_some() || encode(current_state)? != encode(&state)? {
             return Err(DiskError::ConditionalDeleteConflict);
         }
-        let target = self
-            .store
-            .read_target(&self.publication)
-            .await?
-            .ok_or(DiskError::ConditionalDeleteConflict)?;
-        {
+        let (expected_sha256, expected_length) = {
             let guard = self.validated_prepared.lock();
             let validated = guard.as_ref().ok_or(DiskError::ConditionalDeleteConflict)?;
             if validated.publication != self.publication
                 || state.prepared_sha256 != Some(validated.sha256)
                 || state.prepared_length != Some(validated.length)
-                || target.len() as u64 != validated.length
-                || raw_sha(&target) != validated.sha256
             {
                 return Err(DiskError::ConditionalDeleteConflict);
             }
-        }
-        self.store.sync_target_with_lease(&self.publication, target_lease).await?;
-        let source = self.store.source.clone();
-        os::run_blocking_namespace_operation(self.store.lease.clone(), move || os::fsync_dir_std(&source)).await?;
+            (validated.sha256, validated.length)
+        };
+        self.store
+            .read_and_sync_target_with_lease(&self.publication, target_lease, move |target| {
+                if target.len() as u64 != expected_length || raw_sha(target) != expected_sha256 {
+                    return Err(DiskError::ConditionalDeleteConflict);
+                }
+                Ok(())
+            })
+            .await?;
         state.advance(MultipartSourcePhase::ConsumedUnsealed)?;
-        self.store.persist(&state).await?;
+        let snapshot = self.store.persist_with_source_sync(&state, true).await?;
         *self.state.lock() = state;
-        let loaded = self.store.load().await?;
-        let snapshot = loaded.snapshot.ok_or(DiskError::FileCorrupt)?;
         let proof = self
             .store
             .issue_proof(MultipartProofKind::Published, self.publication.attempt, None, snapshot)?;
@@ -1628,6 +1762,46 @@ impl SourceStore {
             let _pin = os::pin_multipart_source_directory(&directory, &base, &root)?;
             os::sync_file(&file)?;
             os::fsync_dir_std(&directory)
+        })
+        .await
+        .map_err(DiskError::from)
+    }
+    pub async fn read_and_sync_target(
+        &self,
+        publication: &PublicationIdentity,
+        validate: impl FnOnce(&[u8]) -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        let io = self.target_path(publication)?;
+        let logical = self
+            .root
+            .join(io.strip_prefix(&self.base).map_err(|_| DiskError::InvalidPath)?);
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&logical, Some(self.lease.clone())).await;
+        self.read_and_sync_target_with_lease(publication, lease, validate).await
+    }
+    pub async fn read_and_sync_target_with_lease(
+        &self,
+        publication: &PublicationIdentity,
+        lease: Arc<os::NamespaceMutationLease>,
+        validate: impl FnOnce(&[u8]) -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        let directory = self.target_path(publication)?;
+        let base = self.base.clone();
+        let root = self.publication_root.clone();
+        os::run_blocking_namespace_operation_with_sync(lease, true, move || {
+            os::read_and_sync_multipart_target_metadata(
+                &directory,
+                std::ffi::OsStr::new(STORAGE_FORMAT_FILE),
+                &base,
+                &root,
+                |bytes| validate(bytes).map_err(IoError::other),
+            )
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    IoError::other(DiskError::ConditionalDeleteConflict)
+                } else {
+                    error
+                }
+            })
         })
         .await
         .map_err(DiskError::from)

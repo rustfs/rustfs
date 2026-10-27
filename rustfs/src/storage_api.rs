@@ -147,6 +147,8 @@ pub(crate) mod protocols {
         pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
         #[cfg(test)]
         pub(crate) use rustfs_gateway_types::dto::ListObjectsV2Input;
+        #[cfg(all(test, any(feature = "webdav", feature = "sftp")))]
+        pub(crate) use rustfs_s3_types::S3ErrorCode;
 
         /// WebDAV quota reporting surface (`session_capacity_view`): bucket
         /// quota config, cached usage, and the console's erasure-aware usable

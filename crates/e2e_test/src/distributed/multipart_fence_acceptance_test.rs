@@ -1638,6 +1638,191 @@ async fn late_complete_packets_cannot_publish_after_abort_and_bucket_recreation(
             "refused late packets must not recreate staging"
         );
     }
+    late_part_packets_preserve_retired_and_fresh_uploads().await?;
+    Ok(())
+}
+
+async fn late_part_packets_preserve_retired_and_fresh_uploads() -> TestResult {
+    for (method, settles) in [("PreparePartTransaction", false), ("SettlePartTransaction", true)] {
+        for recreate_bucket in [false, true] {
+            let (cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+            let key = "late-part-transaction";
+            let previous = payload_for("committed-before-late-part", 4096);
+            clients[0]
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from(previous.clone()))
+                .send()
+                .await?;
+            let upload = clients[0].create_multipart_upload().bucket(&bucket).key(key).send().await?;
+            let upload_id = upload.upload_id().ok_or("missing original upload ID")?;
+            clients[0]
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(1)
+                .body(ByteStream::from(vec![0x41; 9 * 1024 * 1024]))
+                .send()
+                .await?;
+            let path = upload_path_scope(&bucket, key, upload_id)?;
+            let hash = sha256_hex(format!("{bucket}/{key}").as_bytes());
+            let roots = cluster
+                .nodes
+                .iter()
+                .flat_map(|node| &node.data_dirs)
+                .map(|root| Path::new(root).join(RUSTFS_META_MULTIPART_BUCKET).join(&path))
+                .collect::<Vec<_>>();
+            assert_eq!(roots.len(), 4);
+            let original = multipart_sources(&cluster, Some(&hash))?;
+            assert_eq!(original.len(), 4);
+            assert!(
+                original.values().all(|source| source
+                    .files
+                    .keys()
+                    .any(|path| path.file_name().and_then(|name| name.to_str()) == Some("part.1"))),
+                "all selected peers originally own the acknowledged part"
+            );
+            let scope = upload_scope(upload_id)?;
+            // Retain only the original attempt; recovery of the same upload
+            // must be able to issue fresh settlement requests through the gate.
+            let pauses = proxies[1..3]
+                .iter()
+                .map(|proxy| proxy.pause_late(&[method], 1, &scope))
+                .collect::<Result<Vec<_>, _>>()?;
+            let replacement = clients[0]
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(1)
+                .body(ByteStream::from(vec![0x62; 8 * 1024 * 1024]));
+            let caller = tokio::spawn(async move { replacement.send().await });
+            wait_for_faults(&pauses, &[method]).await?;
+            let failure = tokio::time::timeout(DEADLINE, caller)
+                .await??
+                .expect_err("two retained peers cannot acknowledge part replacement");
+            assert_unavailable(&failure, "storage_write_quorum", None);
+            assert!(pauses.iter().all(|pause| pause.hits() == 1 && pause.responses() == 0));
+            let expected_actions = if settles { (1, 0) } else { (0, 0) };
+            assert!(
+                pauses.iter().all(|pause| pause.retained_settle_actions() == expected_actions),
+                "settlement capture must be a real Commit, not Rollback"
+            );
+            abort_after_fault(&clients[0], &bucket, key, upload_id, false).await?;
+            assert!(
+                roots.iter().all(|root| !root.exists()),
+                "ordinary Abort physically retires all original roots"
+            );
+            assert!(multipart_sources(&cluster, Some(&hash))?.is_empty());
+            for client in &clients {
+                assert_object_bytes_after_fault(client, &bucket, key, &previous).await?;
+            }
+            let protected = if recreate_bucket {
+                clients[0].delete_object().bucket(&bucket).key(key).send().await?;
+                clients[0].delete_bucket().bucket(&bucket).send().await?;
+                clients[1].create_bucket().bucket(&bucket).send().await?;
+                let fresh = payload_for("recreated-before-late-part", 4096);
+                clients[1]
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .body(ByteStream::from(fresh.clone()))
+                    .send()
+                    .await?;
+                fresh
+            } else {
+                previous
+            };
+            let fresh = clients[2].create_multipart_upload().bucket(&bucket).key(key).send().await?;
+            let fresh_id = fresh.upload_id().ok_or("missing fresh upload ID")?;
+            let fresh_body = payload_for("fresh-active-part", 4096);
+            let fresh_part = clients[2]
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(fresh_id)
+                .part_number(1)
+                .body(ByteStream::from(fresh_body.clone()))
+                .send()
+                .await?;
+            let before = multipart_sources(&cluster, Some(&hash))?;
+            assert_eq!(before.len(), 4, "the new upload exists on every original participant");
+            for pause in &pauses {
+                pause.release();
+            }
+            wait_until(
+                DEADLINE,
+                || async {
+                    Ok(pauses.iter().all(|pause| {
+                        pause.responses() == pause.hits()
+                            && if settles {
+                                pause.successful_mutation_replies() == pause.hits() && pause.refused_mutations() == 0
+                            } else {
+                                pause.refused_mutations() == pause.hits() && pause.successful_mutation_replies() == 0
+                            }
+                    }))
+                },
+                "every original part packet returns its typed authenticated terminal outcome",
+            )
+            .await?;
+            assert!(roots.iter().all(|root| !root.exists()), "late part packets cannot recreate retired roots");
+            assert!(
+                multipart_sources(&cluster, Some(&hash))? == before,
+                "late packets cannot change a fresh upload's shard or control bytes"
+            );
+            for client in &clients {
+                assert_object_bytes_after_fault(client, &bucket, key, &protected).await?;
+                let listed = client
+                    .list_parts()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(fresh_id)
+                    .send()
+                    .await?;
+                assert_eq!(listed.parts().len(), 1);
+                assert_eq!(listed.parts()[0].e_tag(), fresh_part.e_tag());
+                let missing = client
+                    .list_parts()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .send()
+                    .await
+                    .expect_err("old upload remains retired");
+                assert_eq!(missing.raw_response().expect("old upload service response").status().as_u16(), 404);
+                assert_eq!(missing.as_service_error().and_then(|error| error.meta().code()), Some("NoSuchUpload"));
+            }
+            clients[2]
+                .complete_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(fresh_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .parts(
+                            CompletedPart::builder()
+                                .part_number(1)
+                                .e_tag(fresh_part.e_tag().ok_or("missing fresh part ETag")?)
+                                .build(),
+                        )
+                        .build(),
+                )
+                .send()
+                .await?;
+            for client in &clients {
+                assert_object_bytes_after_fault(client, &bucket, key, &fresh_body).await?;
+            }
+            assert!(multipart_sources(&cluster, Some(&hash))?.is_empty());
+            assert_no_uploads_after_fault(&clients, &bucket).await?;
+            eprintln!(
+                "MPU late part: method={method}, recreate_bucket={recreate_bucket}, retired_roots=4, delivered=2, refused={}, successful_replies={}, fresh_sources_unchanged=4, verified_readers=4",
+                pauses.iter().map(RpcPause::refused_mutations).sum::<usize>(),
+                pauses.iter().map(RpcPause::successful_mutation_replies).sum::<usize>()
+            );
+        }
+    }
     Ok(())
 }
 

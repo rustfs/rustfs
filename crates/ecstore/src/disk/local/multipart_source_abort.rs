@@ -6,6 +6,7 @@ use super::{
     LocalDisk,
     multipart_source_state::{
         LoadedSource, SourceHead, SourceState, SourceStore, decode, encode, load_source, raw_sha, read_optional,
+        read_optional_in_pinned,
     },
 };
 use crate::disk::{
@@ -127,20 +128,6 @@ pub(super) fn validate_retired_head(
 }
 
 impl SourceStore {
-    pub async fn root_missing(&self) -> Result<bool> {
-        let source = self.source.clone();
-        let base = self.base.clone();
-        let root = self.publication_root.clone();
-        os::run_blocking_namespace_operation(self.lease.clone(), move || {
-            match os::pin_multipart_source_directory(&source, &base, &root) {
-                Ok(_) => Ok(false),
-                Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
-                Err(error) => Err(error),
-            }
-        })
-        .await
-        .map_err(DiskError::from)
-    }
     fn verify_abort_cohort(&self, certificate: &MultipartAbortCertificate) -> Result<()> {
         certificate.verify_with_authority(&self.authority)?;
         if certificate.disk_ids != self.disk_ids
@@ -265,7 +252,7 @@ impl SourceStore {
         let certificate = self.read_abort_certificate(&loaded).await?;
         Ok(MultipartSourceInspection {
             disk_id: self.disk_id,
-            root_missing: self.root_missing().await?,
+            root_missing: loaded.root_missing,
             abort_round: loaded
                 .state
                 .as_ref()
@@ -561,10 +548,17 @@ impl AbortDeletePermit {
 pub(super) struct MultipartDeleteOwner {
     owner: Option<Arc<dyn Send + Sync>>,
     source_key: Option<PathBuf>,
+    admission_validated: bool,
 }
 impl MultipartDeleteOwner {
     pub(super) fn namespace_owner(&self) -> Option<Arc<dyn Send + Sync>> {
         self.owner.clone()
+    }
+    pub(super) fn mark_validated(&mut self) {
+        self.admission_validated = true;
+    }
+    pub(super) fn is_validated(&self) -> bool {
+        self.admission_validated
     }
     pub(super) fn chain(self, owner: Option<Arc<dyn Send + Sync>>) -> Self {
         let owner = match (self.owner, owner) {
@@ -575,6 +569,7 @@ impl MultipartDeleteOwner {
         Self {
             owner,
             source_key: self.source_key,
+            admission_validated: self.admission_validated,
         }
     }
 }
@@ -595,7 +590,11 @@ impl LocalDisk {
     ) -> Result<MultipartDeleteOwner> {
         let source_key = self.multipart_delete_owner_key(volume, path)?;
         let owner = self.multipart_source_owner(volume, path, true, true, owner).await?;
-        Ok(MultipartDeleteOwner { owner, source_key })
+        Ok(MultipartDeleteOwner {
+            owner,
+            source_key,
+            admission_validated: false,
+        })
     }
     pub(super) fn validate_multipart_delete_owner(
         &self,
@@ -620,12 +619,17 @@ pub(super) struct OrdinaryMultipartDeleteCheck {
 }
 impl OrdinaryMultipartDeleteCheck {
     pub(super) fn validate(&self) -> Result<()> {
-        if let Some(raw) = read_optional(&self.source.join(STATE), &self.base, &self.root)? {
+        let pinned = match os::pin_multipart_source_directory(&self.source, &self.base, &self.root) {
+            Ok(pinned) => pinned,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(raw) = read_optional_in_pinned(&pinned, &self.source, STATE, &self.base, &self.root)? {
             let state: SourceState = decode(&raw)?;
             if state.abort.is_some() || state.phase == MultipartSourcePhase::Aborting {
                 return Err(DiskError::ConditionalDeleteConflict);
             }
-        } else if os::multipart_source_has_native_controls(&self.source, &self.base, &self.root)? {
+        } else if os::multipart_source_has_native_controls_in_pinned(&self.source, &pinned)? {
             return Err(DiskError::ConditionalDeleteConflict);
         }
         Ok(())

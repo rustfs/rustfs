@@ -22,9 +22,7 @@ fn to_filemeta_err(err: Error) -> rustfs_filemeta::Error {
 }
 
 use crate::bucket::lifecycle::bucket_lifecycle_ops::free_version_remote_tuple_matches;
-use crate::bucket::metadata_sys::{
-    get_versioning_config, has_authoritative_never_versioned_state, has_authoritative_never_versioned_state_in,
-};
+use crate::bucket::metadata_sys::{get_versioning_config, has_authoritative_never_versioned_state};
 use crate::bucket::utils::{check_list_objs_args, has_bad_path_component};
 use crate::bucket::versioning::VersioningApi;
 use crate::cache_value::metacache_set::{
@@ -373,49 +371,6 @@ async fn can_skip_hidden_prefix_check(options: &ListPathOptions) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether an empty listing of `prefix` is the proof that lets the caller
-/// reclaim delete residue under it. Any first page that scanned the whole
-/// prefix without finding an object or a sub-prefix qualifies, with or without
-/// a delimiter: that is the shape clients issue when they stat, browse, or
-/// recursively remove a phantom folder. The purge itself re-verifies every
-/// directory on every disk before deleting anything.
-fn should_purge_empty_directory_listing(
-    prefix: &str,
-    marker: Option<&str>,
-    max_keys: i32,
-    incl_deleted: bool,
-    result: &ListObjectsInfo,
-) -> bool {
-    // list_path rejects leading slashes, so an empty result cannot justify cleanup.
-    !prefix.is_empty()
-        && !prefix.starts_with(SLASH_SEPARATOR)
-        && prefix.ends_with(SLASH_SEPARATOR)
-        && marker.is_none()
-        && max_keys > 0
-        && !incl_deleted
-        && !result.is_truncated
-        && result.objects.is_empty()
-        && result.prefixes.is_empty()
-}
-
-fn should_purge_empty_recursive_bucket_listing(
-    prefix: &str,
-    delimiter: Option<&str>,
-    marker: Option<&str>,
-    max_keys: i32,
-    incl_deleted: bool,
-    result: &ListObjectsInfo,
-) -> bool {
-    prefix.is_empty()
-        && delimiter.is_none()
-        && marker.is_none()
-        && max_keys > 0
-        && !incl_deleted
-        && !result.is_truncated
-        && result.objects.is_empty()
-        && result.prefixes.is_empty()
-}
-
 const MARKER_TAG_VERSION: &str = "v2";
 const LEGACY_MARKER_TAG_VERSIONS: &[&str] = &["v1", MARKER_TAG_VERSION];
 const LIST_CACHE_MARKER_PREFIX: &str = "[rustfs_cache:";
@@ -552,18 +507,6 @@ impl ListContinuationV2 {
     }
 }
 
-/// Returns the key part of a marker that may still carry the legacy cursor tag.
-/// The data-usage scanner compares successive version-listing markers through
-/// it so two differently tagged markers for the same key never count as progress.
-// RUSTFS_COMPAT_TODO(listing-cursor-legacy-tag): markers tagged by 1.0.x servers. Remove after every supported
-// direct-upgrade release issues plain key markers; callers can then compare markers directly.
-pub(crate) fn list_marker_key(marker: &str) -> &str {
-    marker
-        .rfind(LIST_CACHE_MARKER_PREFIX)
-        .filter(|start_idx| marker[*start_idx..].ends_with(']'))
-        .map_or(marker, |start_idx| &marker[..start_idx])
-}
-
 fn normalize_list_quorum(value: &str) -> &'static str {
     let value = value.trim();
     if value.eq_ignore_ascii_case("disk") {
@@ -631,8 +574,7 @@ fn versioned_prefix_page_boundary_key<'a>(
 /// old-readable escape until legacy tag parsing can be removed.
 // RUSTFS_COMPAT_TODO(listing-cursor-legacy-tag): Remove after the minimum upgrade source stops issuing tagged cursors.
 fn escape_list_marker(marker: String) -> String {
-    // Both the legacy request parser and scanner cursor comparison recognize
-    // cache-shaped suffixes. One old-readable outer tag protects the literal key.
+    // One old-readable outer tag protects a literal cache-shaped key.
     if marker
         .rfind(LIST_CACHE_MARKER_PREFIX)
         .is_some_and(|start| marker[start..].contains(']'))
@@ -669,9 +611,9 @@ fn build_list_versions_next_marker(objects: &[ObjectInfo], prefixes: &[String]) 
                     .unwrap_or_else(|| "null".to_string()),
             )
         };
-        (Some(escape_list_marker(last.name.clone())), version_marker)
+        (Some(last.name.clone()), version_marker)
     } else if let Some(last_prefix) = prefixes.last() {
-        (Some(escape_list_marker(last_prefix.clone())), None)
+        (Some(last_prefix.clone()), None)
     } else {
         (None, None)
     }
@@ -734,7 +676,7 @@ fn list_objects_paginate(
             && let Some(last_scanned) = last_scanned_key
         {
             is_truncated = true;
-            next_marker = Some(escape_list_marker(last_scanned.to_owned()));
+            next_marker = Some(last_scanned.to_owned());
         } else if should_truncate {
             is_truncated = true;
             if include_version_id {
@@ -802,7 +744,7 @@ where
         pagination.last_scanned_key,
     );
     if is_truncated && let Some(raw_key) = prefix_at_page_boundary {
-        next_marker = Some(escape_list_marker(raw_key));
+        next_marker = Some(raw_key);
         next_version_idmarker = None;
     }
 
@@ -894,10 +836,8 @@ impl ListPathOptions {
     /// Releases up to 1.0.x appended `[rustfs_cache:v2,id:...,src:walker,gen:live]`
     /// to every internal continuation marker and exposed it through the V2
     /// continuation token and the ListObjectVersions `NextKeyMarker`. Current
-    /// servers emit plain keys, but a client that paginates across the upgrade
-    /// still sends the tagged form back as `continuation-token`, `key-marker`
-    /// or `marker`, and the opt-in index provider still carries its `src`/`gen`
-    /// cursor fields in the same tag.
+    /// servers still accept the tagged form in V2 continuation tokens and
+    /// legacy object-list markers. Version-listing key markers are literal keys.
     ///
     /// Newly issued cursors protect cache-shaped literal keys with one legacy
     /// outer tag. Parse only at the listing entry point; parsing the resulting
@@ -953,7 +893,9 @@ impl ECStore {
     ) -> Result<ListObjectsV2Info> {
         let marker = {
             if continuation_token.is_none() {
-                start_after
+                // StartAfter is a literal object key, even if it resembles a
+                // legacy cursor. Protect it from the compatibility parser.
+                start_after.map(escape_list_marker)
             } else {
                 continuation_token.clone()
             }
@@ -1022,39 +964,15 @@ impl ECStore {
         let get_objects =
             ObjectInfo::from_meta_cache_entries_sorted_infos(&page.entries, bucket, prefix, delimiter.clone()).await;
 
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
+        let (objects, prefixes, is_truncated, next_marker, _) =
             list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, false, last_scanned_key.as_deref());
-        let _ = next_version_idmarker;
 
-        let result = ListObjectsInfo {
+        Ok(ListObjectsInfo {
             is_truncated,
             next_marker,
             objects,
             prefixes,
-        };
-
-        let purge_exact_prefix =
-            should_purge_empty_directory_listing(prefix, opts.marker.as_deref(), max_keys, incl_deleted, &result);
-        let purge_empty_bucket = should_purge_empty_recursive_bucket_listing(
-            prefix,
-            delimiter.as_deref(),
-            opts.marker.as_deref(),
-            max_keys,
-            incl_deleted,
-            &result,
-        );
-        if (purge_exact_prefix || purge_empty_bucket)
-            && has_authoritative_never_versioned_state_in(&self.ctx, bucket)
-                .await
-                .unwrap_or(false)
-        {
-            if purge_exact_prefix {
-                self.purge_orphan_dir_object(bucket, prefix).await;
-            } else {
-                self.purge_orphan_dir_objects_in_bucket(bucket).await;
-            }
-        }
-        Ok(result)
+        })
     }
 
     pub async fn inner_list_object_versions(
@@ -1198,7 +1116,7 @@ impl ECStore {
         };
 
         let effective_max_keys = list_versions_scan_limit(max_keys, has_version_marker);
-        let mut opts = ListPathOptions {
+        let opts = ListPathOptions {
             bucket: bucket.to_owned(),
             caller: if include_version_purge {
                 ListObjectsGatherCaller::Lifecycle
@@ -1215,10 +1133,6 @@ impl ECStore {
             include_marker: has_version_marker,
             ..Default::default()
         };
-        // Strip a legacy cursor tag before any name comparison (notably
-        // `forward_past`), see backlog#1047.
-        opts.parse_marker();
-
         let mut page = self
             .list_path(&opts)
             .await
@@ -2416,7 +2330,7 @@ impl SetDisks {
         let has_version_marker = version_marker.is_some();
         let version_marker = version_marker.map(parse_version_marker).transpose()?;
         let effective_max_keys = list_versions_scan_limit(max_keys, has_version_marker);
-        let mut opts = ListPathOptions {
+        let opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             limit: effective_max_keys,
@@ -2427,8 +2341,6 @@ impl SetDisks {
             include_marker: has_version_marker,
             ..Default::default()
         };
-        opts.parse_marker();
-
         let mut page = self
             .list_path_result(&opts)
             .await
@@ -2900,13 +2812,12 @@ mod lifecycle_exact_tests;
 #[cfg(test)]
 mod test {
     use super::{
-        ENV_API_LIST_OBJECTS_QUORUM, GatherResultsState, ListObjectsInfo, ListPathOptions, ListSourceMode, MAX_OBJECT_LIST,
-        RUSTFS_META_BUCKET, VersionMarker, gather_results, list_marker_key, list_merged_entry_channel,
-        list_metadata_resolution_params, list_objects_paginate, list_objects_quorum_from_env, max_keys_plus_one,
-        merge_entry_channels, normalize_list_quorum, observe_scanner_namespace_mutations, parse_version_marker,
-        recursive_walk_list_path_options, reset_scanner_namespace_mutation_generation_for_test,
-        scanner_namespace_mutation_generation, send_or_cancel, should_purge_empty_directory_listing, version_marker_for_entries,
-        walk_result_from_set_errors,
+        ENV_API_LIST_OBJECTS_QUORUM, GatherResultsState, ListPathOptions, ListSourceMode, MAX_OBJECT_LIST, RUSTFS_META_BUCKET,
+        VersionMarker, gather_results, list_merged_entry_channel, list_metadata_resolution_params, list_objects_paginate,
+        list_objects_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
+        observe_scanner_namespace_mutations, parse_version_marker, recursive_walk_list_path_options,
+        reset_scanner_namespace_mutation_generation_for_test, scanner_namespace_mutation_generation, send_or_cancel,
+        version_marker_for_entries, walk_result_from_set_errors,
     };
     use crate::bucket::replication::ReplicationState;
     use crate::cache_value::metacache_set::ListPathRawOutcome;
@@ -4411,7 +4322,10 @@ mod test {
                     list_objects_paginate(vec![plain_object(key), plain_object("zz")], &None, 1, false, include_version_id, None);
                 assert!(truncated);
                 let marker = marker.expect("truncated page needs a cursor");
-                assert_eq!(list_marker_key(&marker), key, "scanner must compare the complete literal key");
+                if include_version_id {
+                    assert_eq!(marker, key, "version markers must be literal keys");
+                    continue;
+                }
                 let mut opts = ListPathOptions {
                     marker: Some(marker),
                     ..Default::default()
@@ -4456,6 +4370,7 @@ mod test {
                 .expect("seed literal object");
         }
         let mut marker = None;
+        let mut v1_marker = None;
         let mut key_marker = None;
         let mut version_marker = None;
         for (index, key) in keys.into_iter().enumerate() {
@@ -4468,6 +4383,16 @@ mod test {
             assert_eq!(page.is_truncated, index + 1 < keys.len());
             marker = page.next_continuation_token;
 
+            // V1 sends the literal NextMarker back as StartAfter.
+            let v1_page = store
+                .clone()
+                .inner_list_objects_v2(bucket, "", None, None, 1, false, v1_marker, false)
+                .await
+                .expect("list next object through the V1 marker path");
+            assert_eq!(v1_page.objects.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(), [key]);
+            assert_eq!(v1_page.is_truncated, index + 1 < keys.len());
+            v1_marker = v1_page.is_truncated.then(|| key.to_owned());
+
             let versions = store
                 .clone()
                 .inner_list_object_versions(bucket, "", key_marker, version_marker, None, 1)
@@ -4475,11 +4400,44 @@ mod test {
                 .expect("list next version");
             assert_eq!(versions.objects.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(), [key]);
             assert_eq!(versions.is_truncated, index + 1 < keys.len());
+            if versions.is_truncated {
+                assert_eq!(versions.next_marker.as_deref(), Some(key), "NextKeyMarker must be the literal key");
+            }
             key_marker = versions.next_marker;
             version_marker = versions.next_version_idmarker;
         }
         assert!(marker.is_none());
+        assert!(v1_marker.is_none());
         assert!(key_marker.is_none());
+
+        let literal = "b[rustfs_cache:v1,return:]";
+        let after_literal = store
+            .clone()
+            .inner_list_objects_v2(bucket, "", None, None, 1, false, Some(literal.to_owned()), false)
+            .await
+            .expect("start after a caller-supplied literal key");
+        assert_eq!(after_literal.objects[0].name, "c[rustfs_cache:v2,id:x]suffix");
+
+        let resumed = store
+            .clone()
+            .inner_list_object_versions(bucket, "", Some(literal.to_owned()), None, None, 1)
+            .await
+            .expect("resume from a caller-supplied literal key marker");
+        assert_eq!(resumed.objects[0].name, "c[rustfs_cache:v2,id:x]suffix");
+
+        let resumed_version = store
+            .clone()
+            .inner_list_object_versions(bucket, "", Some(literal.to_owned()), Some("null".to_owned()), None, 1)
+            .await
+            .expect("resume after the literal key's null version");
+        assert_eq!(resumed_version.objects[0].name, "c[rustfs_cache:v2,id:x]suffix");
+
+        let recursive_delete_page = store.pools[0].disk_set[0]
+            .clone()
+            .inner_list_object_versions_for_recursive_delete(bucket, "", Some(literal.to_owned()), None, 1)
+            .await
+            .expect("resume recursive-delete validation from the literal key");
+        assert_eq!(recursive_delete_page.objects[0].name, "c[rustfs_cache:v2,id:x]suffix");
     }
 
     #[tokio::test]
@@ -4643,6 +4601,32 @@ mod test {
         assert!(is_truncated, "a prefix-filled versioned page with more on disk must be truncated");
         assert_eq!(next_marker.as_deref(), Some("data-0002"));
         assert!(next_version_idmarker.is_none());
+    }
+
+    #[test]
+    fn versioned_delimiter_boundaries_preserve_cache_shaped_raw_keys() {
+        let delimiter = Some("-".to_owned());
+        let raw_key = "data-0002[rustfs_cache:v2,return:]";
+        let (_, _, truncated, marker, version_marker) =
+            list_objects_paginate(vec![folded_prefix_object("data-")], &delimiter, 2, true, true, Some(raw_key));
+        assert!(truncated);
+        assert_eq!(marker.as_deref(), Some(raw_key));
+        assert!(version_marker.is_none());
+
+        let (_, _, truncated, marker, version_marker) = super::list_objects_paginate_versions(
+            vec![folded_prefix_object("data-")],
+            super::VersionedListPagination {
+                delimiter: &delimiter,
+                max_keys: 1,
+                disk_has_more: true,
+                marker: None,
+                last_scanned_key: Some(raw_key),
+                raw_keys: std::iter::once(raw_key),
+            },
+        );
+        assert!(truncated);
+        assert_eq!(marker.as_deref(), Some(raw_key));
+        assert!(version_marker.is_none());
     }
 
     // End-to-end simulation of versioned pagination with `max_keys=1`, where the
@@ -4935,77 +4919,114 @@ mod test {
         assert_eq!(scanner_namespace_mutation_generation(), 2);
     }
 
-    #[test]
-    fn empty_directory_listing_purge_requires_complete_first_page_of_prefix() {
-        let empty = ListObjectsInfo::default();
-        assert!(should_purge_empty_directory_listing("ghost/", None, 1, false, &empty));
-        assert!(should_purge_empty_directory_listing("ghost/", None, 1000, false, &empty));
-        assert!(!should_purge_empty_directory_listing("ghost", None, 1, false, &empty));
-        assert!(!should_purge_empty_directory_listing("ghost/", Some("marker"), 1, false, &empty));
-        assert!(!should_purge_empty_directory_listing("ghost/", None, 0, false, &empty));
-        assert!(!should_purge_empty_directory_listing("ghost/", None, 1, true, &empty));
+    #[tokio::test]
+    async fn listing_preserves_valid_legacy_residue_until_explicit_delete() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
 
-        let mut live = ListObjectsInfo::default();
-        live.objects.push(ObjectInfo::default());
-        assert!(!should_purge_empty_directory_listing("ghost/", None, 1, false, &live));
+        use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
 
-        let mut prefixed = ListObjectsInfo::default();
-        prefixed.prefixes.push("ghost/child/".to_owned());
-        assert!(!should_purge_empty_directory_listing("ghost/", None, 1, false, &prefixed));
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "stage-e-exact-delete-legacy";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created with authoritative metadata");
+        let transaction = uuid::Uuid::new_v4();
+        let mut backups = Vec::new();
+        for object in ["repro/obj-00001.bin", "repro/obj-00002.bin"] {
+            let mut reader = crate::object_api::PutObjReader::from_vec(vec![0x62; 1024 * 1024]);
+            store
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &crate::object_api::ObjectOptions {
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create genuine per-drive metadata and shards");
+            for dir in &dirs {
+                let object_dir = dir.path().join(bucket).join(object);
+                let mut entries = tokio::fs::read_dir(&object_dir).await.expect("read actual object root");
+                let mut marked = 0;
+                while let Some(entry) = entries.next_entry().await.expect("read object entry") {
+                    if uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok() {
+                        tokio::fs::write(
+                            entry
+                                .path()
+                                .join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+                            [],
+                        )
+                        .await
+                        .expect("mark actual data dir as historical delete residue");
+                        marked += 1;
+                    }
+                }
+                assert_eq!(marked, 1, "the real shard must have exactly one data directory");
+                let backup = object_dir.join(transaction.to_string());
+                tokio::fs::create_dir_all(&backup).await.expect("create legacy rollback root");
+                tokio::fs::rename(
+                    object_dir.join(crate::disk::STORAGE_FORMAT_FILE),
+                    backup.join(crate::disk::STORAGE_FORMAT_FILE_BACKUP),
+                )
+                .await
+                .expect("retain the actual valid metadata as a historical backup");
+                let backup = backup.join(crate::disk::STORAGE_FORMAT_FILE_BACKUP);
+                let bytes = tokio::fs::read(&backup).await.expect("read the historical backup");
+                backups.push((backup, bytes));
+            }
+        }
 
-        let truncated = ListObjectsInfo {
-            is_truncated: true,
-            ..Default::default()
-        };
-        assert!(!should_purge_empty_directory_listing("ghost/", None, 1, false, &truncated));
-    }
+        let delimited = store
+            .clone()
+            .list_objects_generic(bucket, "", None, Some("/".to_owned()), 1000, false)
+            .await
+            .expect("delimiter listing should succeed");
+        assert!(delimited.objects.is_empty());
+        assert!(delimited.prefixes.is_empty(), "residue must not appear as a common prefix");
 
-    #[test]
-    fn empty_directory_listing_does_not_purge_rejected_leading_slash_prefixes() {
-        let empty = ListObjectsInfo::default();
-        for prefix in ["/", "//", "/ghost/"] {
+        let result = store
+            .clone()
+            .list_objects_generic(bucket, "", None, None, 1000, false)
+            .await
+            .expect("recursive bucket listing should succeed");
+        assert!(result.objects.is_empty());
+        let exact_prefix = store
+            .clone()
+            .list_objects_generic(bucket, "repro/", None, None, 1000, false)
+            .await
+            .expect("recursive prefix listing should succeed");
+        assert!(exact_prefix.objects.is_empty());
+        for (path, bytes) in backups {
+            assert_eq!(tokio::fs::read(path).await.expect("LIST must preserve backup"), bytes);
+        }
+        for dir in &dirs {
             assert!(
-                !should_purge_empty_directory_listing(prefix, None, 1000, false, &empty),
-                "rejected prefix {prefix:?} must not initiate orphan cleanup"
+                dir.path().join(bucket).join("repro").exists(),
+                "LIST must preserve the historical residue"
             );
         }
-        assert!(should_purge_empty_directory_listing("ghost/", None, 1000, false, &empty));
-    }
-
-    #[test]
-    fn recursive_bucket_orphan_purge_requires_an_empty_complete_root_scan() {
-        let empty = ListObjectsInfo::default();
-        assert!(super::should_purge_empty_recursive_bucket_listing("", None, None, 1, false, &empty));
-        assert!(!super::should_purge_empty_recursive_bucket_listing(
-            "ghost/", None, None, 1, false, &empty
-        ));
-        assert!(!super::should_purge_empty_recursive_bucket_listing("", Some("/"), None, 1, false, &empty));
-        assert!(!super::should_purge_empty_recursive_bucket_listing(
-            "",
-            None,
-            Some("marker"),
-            1,
-            false,
-            &empty
-        ));
-        assert!(!super::should_purge_empty_recursive_bucket_listing("", None, None, 0, false, &empty));
-        assert!(!super::should_purge_empty_recursive_bucket_listing("", None, None, 1, true, &empty));
-
-        let live = ListObjectsInfo {
-            objects: vec![ObjectInfo::default()],
-            ..Default::default()
-        };
-        assert!(!super::should_purge_empty_recursive_bucket_listing("", None, None, 1, false, &live));
-
-        let incomplete = ListObjectsInfo {
-            is_truncated: true,
-            ..Default::default()
-        };
-        assert!(!super::should_purge_empty_recursive_bucket_listing("", None, None, 1, false, &incomplete));
+        for object in ["repro/obj-00001.bin", "repro/obj-00002.bin"] {
+            store
+                .delete_object(bucket, object, crate::object_api::ObjectOptions::default())
+                .await
+                .expect("fresh exact-key DELETE should reclaim eligible legacy residue");
+            for dir in &dirs {
+                assert!(!dir.path().join(bucket).join(object).exists(), "exact DELETE must reclaim the root");
+            }
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("the bucket is empty once the residue is reclaimed");
     }
 
     #[tokio::test]
-    async fn empty_recursive_listing_purges_committed_delete_residue() {
+    async fn empty_recursive_listing_preserves_committed_delete_residue() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
         use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
 
@@ -5048,20 +5069,73 @@ mod test {
         assert!(result.objects.is_empty());
         assert!(result.prefixes.is_empty());
         for dir in &dirs {
+            let residue = dir.path().join(bucket).join("ghost/nested/object").join(data_dir.to_string());
+            assert_eq!(tokio::fs::read(residue.join("part.1")).await.expect("LIST preserves part"), b"stale");
             assert!(
-                !dir.path().join(bucket).join("ghost").exists(),
-                "the empty listing should reclaim its committed delete residue"
+                residue
+                    .join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction))
+                    .exists()
             );
         }
     }
 
-    // #6898: what an abandoned DeleteObjects left on every disk (rollback
-    // backup plus marked data dir) no longer blocks DeleteBucket after an empty
-    // recursive listing of the bucket.
     #[tokio::test]
-    async fn empty_recursive_listing_purges_stranded_delete_rollback_backups() {
+    async fn large_preserved_residue_does_not_create_a_common_prefix() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "large-listing-residue";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        for object in 0..20 {
+            let data_dir = uuid::Uuid::new_v4();
+            let transaction = uuid::Uuid::new_v4();
+            for dir in &dirs {
+                let residue = dir
+                    .path()
+                    .join(bucket)
+                    .join(format!("ghost/{object:02}"))
+                    .join(data_dir.to_string());
+                tokio::fs::create_dir_all(&residue).await.expect("create residue");
+                tokio::fs::write(residue.join("part.1"), b"stale")
+                    .await
+                    .expect("write residue part");
+                tokio::fs::write(
+                    residue.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+                    [],
+                )
+                .await
+                .expect("write residue marker");
+            }
+        }
+
+        let recursive = store
+            .clone()
+            .list_objects_generic(bucket, "", None, None, 1000, false)
+            .await
+            .expect("list recursively");
+        assert!(recursive.objects.is_empty());
+        let delimited = store
+            .list_objects_generic(bucket, "", None, Some("/".to_owned()), 1000, false)
+            .await
+            .expect("list with delimiter");
+        assert!(delimited.objects.is_empty());
+        assert!(delimited.prefixes.is_empty(), "residue must not produce a common prefix");
+        for dir in &dirs {
+            assert!(dir.path().join(bucket).join("ghost/00").exists(), "listing must not remove residue");
+        }
+    }
+
+    // A corrupt historical backup must survive LIST and a failed exact DELETE.
+    #[tokio::test]
+    async fn empty_recursive_listing_preserves_corrupt_delete_rollback_backups() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
         use crate::storage_api_contracts::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+        use crate::storage_api_contracts::object::ObjectOperations as _;
 
         let (dirs, store) = isolated_store_over_temp_disks().await;
         let bucket = "listing-purge-rollback-backup";
@@ -5105,21 +5179,38 @@ mod test {
             .expect("recursive bucket listing should succeed");
         assert!(result.objects.is_empty());
         for dir in &dirs {
-            assert!(
-                !dir.path().join(bucket).join("repro").exists(),
-                "the empty listing should reclaim the stranded delete residue"
+            let backup = dir
+                .path()
+                .join(bucket)
+                .join("repro/obj-00001.bin")
+                .join(transaction.to_string())
+                .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP);
+            assert_eq!(tokio::fs::read(backup).await.expect("LIST preserves backup"), b"rollback metadata");
+        }
+        let err = store
+            .delete_object(bucket, "repro/obj-00001.bin", crate::object_api::ObjectOptions::default())
+            .await
+            .expect_err("corrupt metadata must not be reclaimed");
+        assert!(matches!(err, StorageError::FileCorrupt));
+        assert!(store.delete_bucket(bucket, &DeleteBucketOptions::default()).await.is_err());
+        for dir in &dirs {
+            let backup = dir
+                .path()
+                .join(bucket)
+                .join("repro/obj-00001.bin")
+                .join(transaction.to_string())
+                .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP);
+            assert_eq!(
+                tokio::fs::read(backup).await.expect("failed cleanup preserves backup"),
+                b"rollback metadata"
             );
         }
-        store
-            .delete_bucket(bucket, &DeleteBucketOptions::default())
-            .await
-            .expect("the bucket is empty once the residue is reclaimed");
     }
 
     #[tokio::test]
-    async fn empty_recursive_bucket_listing_purges_orphan_directory_prefixes() {
+    async fn empty_recursive_bucket_listing_preserves_empty_directory_prefixes() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
-        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
 
         let (dirs, store) = isolated_store_over_temp_disks().await;
         let bucket = "recursive-bucket-orphan-purge";
@@ -5145,10 +5236,14 @@ mod test {
         assert!(result.prefixes.is_empty(), "a delimiter-less listing has no CommonPrefixes");
         for dir in &dirs {
             assert!(
-                !dir.path().join(bucket).join("ghost").exists(),
-                "an empty recursive bucket scan should reclaim its metadata-less orphan prefix"
+                dir.path().join(bucket).join("ghost/nested/leaf").exists(),
+                "LIST must preserve empty directories"
             );
         }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("bucket deletion removes empty directories");
 
         let versioned_bucket = "recursive-bucket-versioned-orphan";
         store
@@ -5300,7 +5395,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn empty_delimiter_listing_hides_and_purges_committed_delete_residue() {
+    async fn empty_delimiter_listing_hides_and_preserves_committed_delete_residue() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
         use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
 
@@ -5345,15 +5440,22 @@ mod test {
         assert!(result.objects.is_empty());
         assert!(result.prefixes.is_empty(), "delete residue must not surface as a prefix");
         for dir in &dirs {
+            let residue = dir
+                .path()
+                .join(bucket)
+                .join("metrics/2026/object.parquet")
+                .join(data_dir.to_string());
+            assert_eq!(tokio::fs::read(residue.join("part.1")).await.expect("LIST preserves part"), b"stale");
             assert!(
-                !dir.path().join(bucket).join("metrics").join("2026").exists(),
-                "the empty delimiter listing should reclaim the committed delete residue under it"
+                residue
+                    .join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction))
+                    .exists()
             );
         }
     }
 
     #[tokio::test]
-    async fn empty_delimiter_listing_of_residue_ancestor_hides_and_purges_whole_tree() {
+    async fn empty_delimiter_listing_of_residue_ancestor_hides_and_preserves_whole_tree() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
         use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
 
@@ -5386,9 +5488,7 @@ mod test {
             .expect("committed delete marker should be written");
         }
 
-        // Browsing an ancestor of the deleted key must not show the empty
-        // date folders, and the empty result reclaims the whole residue tree
-        // in one pass instead of one level per listing.
+        // Browsing an ancestor must not expose the deleted key's date folders.
         let result = store
             .clone()
             .list_objects_generic(bucket, "metrics/", None, Some("/".to_owned()), 1000, false)
@@ -5397,15 +5497,22 @@ mod test {
         assert!(result.objects.is_empty());
         assert!(result.prefixes.is_empty(), "ancestors of delete residue must not surface as prefixes");
         for dir in &dirs {
+            let residue = dir
+                .path()
+                .join(bucket)
+                .join("metrics/kubelet/2026/08/28/23/74992556388248657933757.parquet")
+                .join(data_dir.to_string());
+            assert_eq!(tokio::fs::read(residue.join("part.1")).await.expect("LIST preserves part"), b"stale");
             assert!(
-                !dir.path().join(bucket).join("metrics").exists(),
-                "the empty delimiter listing should reclaim the committed delete residue tree under it"
+                residue
+                    .join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction))
+                    .exists()
             );
         }
     }
 
     #[tokio::test]
-    async fn empty_delimiter_listing_of_mixed_residue_ancestor_reclaims_only_committed_subtree() {
+    async fn empty_delimiter_listing_of_mixed_residue_ancestor_preserves_every_subtree() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
         use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
 
@@ -5478,9 +5585,18 @@ mod test {
         assert!(result.prefixes.is_empty(), "residue subtrees may not surface as prefixes");
         for dir in &dirs {
             let metrics = dir.path().join(bucket).join("metrics");
-            assert!(
-                !metrics.join("cpu").exists(),
-                "the committed subtree must be reclaimed even though a sibling subtree is blocked"
+            let committed = metrics.join("cpu/2026/08/28/22/a.parquet").join(committed_dir.to_string());
+            assert_eq!(
+                tokio::fs::read(committed.join("part.1"))
+                    .await
+                    .expect("LIST preserves committed part"),
+                b"stale"
+            );
+            assert_eq!(
+                tokio::fs::read(committed.join(crate::disk::STORAGE_FORMAT_FILE_BACKUP))
+                    .await
+                    .expect("LIST preserves backup"),
+                b"rollback metadata"
             );
             assert!(
                 metrics
@@ -5488,7 +5604,7 @@ mod test {
                     .join(unmarked_dir.to_string())
                     .join("part.1")
                     .exists(),
-                "residue without a committed marker must survive the purge"
+                "residue without a committed marker must survive the listing"
             );
             assert_eq!(
                 tokio::fs::read(
@@ -6406,6 +6522,147 @@ mod test {
     }
 
     #[tokio::test]
+    async fn latest_get_follows_read_quorum_on_torn_writes() {
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::storage_api_contracts::object::ObjectOperations as _;
+
+        // HEAD and GET serve the version with the most copies once it reaches
+        // the object's data blocks, and a tie goes to the newer version, as in
+        // MinIO's getObjectFileInfo and as heal converges the set. GET used to
+        // demand write quorum whenever enough metadata answered, so a 2+2 or
+        // 8+8 split, or a newer side that could still hold write quorum
+        // through an offline drive, listed but answered 503.
+        let opts = ObjectOptions {
+            suppress_read_repair: true,
+            ..Default::default()
+        };
+        for (drives, parity) in [(4_usize, 2_usize), (16, 8), (16, 4)] {
+            let data = drives - parity;
+            let bucket = format!("torn-write-get-{drives}-{parity}");
+            let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks(drives, parity).await;
+            set.make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            // Two committed generations of one key give every drive its own
+            // inline shard of each generation; the cases copy them per drive.
+            let mut generations = Vec::new();
+            for body in [b"old generation".as_slice(), b"new generation".as_slice()] {
+                let info = set
+                    .put_object(
+                        &bucket,
+                        "template",
+                        &mut PutObjReader::from_vec(body.to_vec()),
+                        &ObjectOptions {
+                            no_lock: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("generation PUT should commit on every drive");
+                let mut metadata = Vec::with_capacity(drives);
+                for dir in &dirs {
+                    metadata.push(
+                        tokio::fs::read(dir.path().join(&bucket).join("template").join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("generation metadata should carry the inline shard"),
+                    );
+                }
+                generations.push((body, info.etag.expect("PUT should report an etag"), metadata));
+            }
+            let (new_body, new_etag, new) = generations.pop().expect("new generation");
+            let (old_body, old_etag, old) = generations.pop().expect("old generation");
+
+            // New copies occupy the first drives, so the offline drive always
+            // removes one new copy. Each phase reads its own keys so the GET
+            // metadata cache never answers for the other phase.
+            let mut cases = Vec::new();
+            for offline in [false, true] {
+                for copies in 1..drives {
+                    for overwrite in [false, true] {
+                        let name = format!(
+                            "{}-{}-{copies:02}",
+                            if offline { "offline" } else { "online" },
+                            if overwrite { "overwrite" } else { "new" }
+                        );
+                        for slot in 0..drives {
+                            let bytes = if slot < copies {
+                                &new[slot]
+                            } else if overwrite {
+                                &old[slot]
+                            } else {
+                                continue;
+                            };
+                            let path = dirs[slot].path().join(&bucket).join(&name);
+                            tokio::fs::create_dir_all(&path).await.expect("create object directory");
+                            tokio::fs::write(path.join(STORAGE_FORMAT_FILE), bytes)
+                                .await
+                                .expect("write generation metadata");
+                        }
+                        cases.push((offline, name, copies, overwrite));
+                    }
+                }
+            }
+
+            for offline in [false, true] {
+                let parked = if offline { set.disks.write().await[0].take() } else { None };
+                for (_, name, copies, overwrite) in cases.iter().filter(|case| case.0 == offline) {
+                    let new_copies = copies - usize::from(offline);
+                    let old_copies = if *overwrite { drives - copies } else { 0 };
+                    let expected = if new_copies >= data && new_copies >= old_copies {
+                        Some((&new_etag, new_body))
+                    } else if old_copies >= data {
+                        Some((&old_etag, old_body))
+                    } else {
+                        None
+                    };
+                    let context = format!("{drives} drives EC {data}+{parity}, {name}: {new_copies} new, {old_copies} old");
+                    let head = set.get_object_info(&bucket, name, &opts).await;
+                    let get = set.get_object_reader(&bucket, name, None, HeaderMap::new(), &opts).await;
+                    match (expected, head, get) {
+                        (Some((etag, body)), Ok(info), Ok(mut reader)) => {
+                            assert_eq!(info.etag.as_ref(), Some(etag), "{context}: HEAD");
+                            assert_eq!(reader.object_info.etag.as_ref(), Some(etag), "{context}: GET");
+                            let mut streamed = Vec::new();
+                            reader
+                                .stream
+                                .read_to_end(&mut streamed)
+                                .await
+                                .unwrap_or_else(|err| panic!("{context}: GET body: {err:?}"));
+                            assert_eq!(streamed, body, "{context}: GET body");
+                        }
+                        (Some((etag, _)), head, get) => panic!(
+                            "{context}: expected {etag}, HEAD {:?}, GET {:?}",
+                            head.map(|info| info.etag),
+                            get.map(|reader| reader.object_info.etag)
+                        ),
+                        (None, head, get) => {
+                            for (method, result) in [
+                                ("HEAD", head.map(|info| info.etag)),
+                                ("GET", get.map(|reader| reader.object_info.etag)),
+                            ] {
+                                let err = result.expect_err(&format!("{context}: {method} expected 404 or unavailable"));
+                                assert!(
+                                    matches!(
+                                        err,
+                                        StorageError::ObjectNotFound(..)
+                                            | StorageError::FileNotFound
+                                            | StorageError::ErasureReadQuorum
+                                            | StorageError::InsufficientReadQuorum(..)
+                                    ),
+                                    "{context}: {method} expected 404 or unavailable, got {err:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+                if offline {
+                    set.disks.write().await[0] = parked;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn latest_listing_and_get_agree_on_hermetic_set_states() {
         #[derive(Clone, Copy)]
         enum Generation {
@@ -6478,6 +6735,10 @@ mod test {
             ("e-torn-one", [Some(Generation::New), None, None, None]),
             ("f-stale-one", [None, None, None, Some(Generation::Old)]),
             (
+                "fa-overwrite-two-of-three",
+                [Some(Generation::New), Some(Generation::New), Some(Generation::Old), None],
+            ),
+            (
                 "g-overwrite-torn-one",
                 [
                     Some(Generation::New),
@@ -6521,6 +6782,7 @@ mod test {
             ("b-copied", &new_etag),
             ("c-split", &new_etag),
             ("d-torn-two", &new_etag),
+            ("fa-overwrite-two-of-three", &new_etag),
             ("g-overwrite-torn-one", &old_etag),
         ]
         .into_iter()
@@ -6547,12 +6809,6 @@ mod test {
                         "{name}: GET must serve the version LIST selected"
                     );
                 }
-                // Known divergence: when every drive answers, GET of the latest
-                // version demands write quorum (three of four), so a 2+2 split
-                // answers 503 although LIST shows the newer generation, as
-                // MinIO's listing does. F.0's dangling classification does not
-                // cover a split; a GET change is a separate decision.
-                (Some(_), Err(StorageError::InsufficientReadQuorum(..))) if name == "c-split" => {}
                 (Some(_), Err(err)) => assert!(
                     matches!(
                         err,
@@ -6753,22 +7009,6 @@ mod test {
         assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
         assert_eq!(parsed.pool_idx, Some(3));
         assert_eq!(parsed.set_idx, Some(7));
-    }
-
-    #[test]
-    fn list_marker_key_strips_only_trailing_cache_tag() {
-        assert_eq!(
-            list_marker_key("photos/2026/image.jpg[rustfs_cache:v2,id:list-cache-id,src:walker,gen:live]"),
-            "photos/2026/image.jpg"
-        );
-        assert_eq!(
-            list_marker_key("photos/[rustfs_cache:v2]/image.jpg"),
-            "photos/[rustfs_cache:v2]/image.jpg"
-        );
-        assert_eq!(
-            list_marker_key("photos/image.jpg[rustfs_cache:v2,id:list-cache-id"),
-            "photos/image.jpg[rustfs_cache:v2,id:list-cache-id"
-        );
     }
 
     #[test]
