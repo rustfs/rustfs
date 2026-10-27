@@ -26,7 +26,7 @@ async fn observe_queued<F: Future>(
     mut operation: Pin<&mut F>,
     read_complete: impl Fn() -> bool,
     observation: Duration,
-) -> Result<Option<F::Output>, tokio::time::error::Elapsed> {
+) -> std::result::Result<Option<F::Output>, tokio::time::error::Elapsed> {
     tokio::time::timeout(
         observation,
         std::future::poll_fn(|cx| match operation.as_mut().poll(cx) {
