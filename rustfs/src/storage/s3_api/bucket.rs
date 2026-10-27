@@ -398,7 +398,7 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
     {
         // V2 cursors protect literal cache-shaped keys with an outer tag. V1
         // exposes the key itself, which is sent back as a literal StartAfter.
-        // RUSTFS_COMPAT_TODO(listing-cursor-legacy-tag): remove with V2 tag compatibility.
+        // RUSTFS_COMPAT_TODO(listing-cursor-legacy-tag): Remove after supported upgrade sources stop issuing tagged V2 cursors.
         let unescaped_len = marker
             .strip_suffix("[rustfs_cache:v2,return:]")
             .filter(|key| key.rfind("[rustfs_cache:").is_some_and(|start| key[start..].contains(']')))
