@@ -13702,11 +13702,14 @@ mod test {
                 started_before_execution,
                 "the borrowed write must consume native history before queueing its open"
             );
-            assert!(path.is_file(), "cancelling the borrowed waiter must leave the queued open running");
-            std::fs::remove_file(&path).expect("remove the file published by the cancelled waiter");
+            // The disk blocking queue skips an operation once its waiter is gone
+            // (`run_cancellable` observes the closed result channel), so the open
+            // never runs. The Started record taken before queueing must survive
+            // that cancellation: the proof stays conservatively consumed.
+            assert!(!path.exists(), "a cancelled borrowed write must not run its queued open");
             assert!(
                 history.witness(&bucket, disk_id, Arc::clone(&disk.io_backend)).is_none(),
-                "executor drain and physical removal must not regrant native history"
+                "executor drain must not regrant native history to a cancelled publication"
             );
         });
     }
