@@ -34,6 +34,7 @@ mod auto_scan;
 mod completion;
 mod disposition;
 mod legacy_ambiguity_logging;
+mod queued_representative;
 mod running_mainline;
 
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk, storage_api::status::BucketInfo};
