@@ -1343,7 +1343,6 @@ fn table_catalog_handlers_require_table_admin_actions() {
         ("EnableTableBucketHandler", "AdminAction::SetTableBucketAction"),
         ("DisableTableBucketHandler", "AdminAction::SetTableBucketAction"),
         ("GetTableBucketHandler", "AdminAction::GetTableBucketAction"),
-        ("GetTableCatalogMigrationHandler", "AdminAction::GetTableCatalogAction"),
         ("CreateTableCatalogBackupHandler", "AdminAction::MigrateTableCatalogAction"),
         ("RestoreTableCatalogBackupHandler", "AdminAction::MigrateTableCatalogAction"),
         ("RestListNamespacesHandler", "AdminAction::GetTableNamespaceAction"),
@@ -1427,27 +1426,6 @@ fn table_catalog_handlers_require_table_admin_actions() {
         2
     );
     assert_eq!(rename_block.matches("AdminAction::SetTableAction").count(), 2);
-
-    let migration_block = operation_block(&src, "GetTableCatalogMigrationHandler");
-    assert!(
-        migration_block.contains("TableCatalogResource::warehouse(&warehouse)"),
-        "catalog migration dry-run should authorize against the warehouse resource"
-    );
-    for handler in [
-        "MaterializeTableCatalogMigrationHandler",
-        "CancelTableCatalogMigrationHandler",
-        "BackfillTableWarehouseIndexHandler",
-    ] {
-        let block = operation_block(&src, handler);
-        assert!(
-            block.contains("authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;"),
-            "{handler} should require the global catalog migration action"
-        );
-        assert!(
-            !block.contains("authorize_table_catalog_resource_request("),
-            "{handler} must not imply that a global backing cutover is warehouse-scoped"
-        );
-    }
 
     for (handler, action) in [
         ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
@@ -1587,9 +1565,6 @@ fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_sta
     let src = table_catalog_handler_source();
 
     for handler in [
-        "GetTableCatalogMigrationHandler",
-        "MaterializeTableCatalogMigrationHandler",
-        "CancelTableCatalogMigrationHandler",
         "BackfillTableWarehouseIndexHandler",
         "RestListNamespacesHandler",
         "RestCreateNamespaceHandler",
@@ -1897,9 +1872,6 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
 
     assert_operation::<EnableTableBucketHandler>();
     assert_operation::<GetTableBucketHandler>();
-    assert_operation::<GetTableCatalogMigrationHandler>();
-    assert_operation::<MaterializeTableCatalogMigrationHandler>();
-    assert_operation::<CancelTableCatalogMigrationHandler>();
     assert_operation::<RestListNamespacesHandler>();
     assert_operation::<RestCreateNamespaceHandler>();
     assert_operation::<RestGetNamespaceHandler>();

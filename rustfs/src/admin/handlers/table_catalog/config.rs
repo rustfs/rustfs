@@ -82,67 +82,6 @@ impl Operation for GetTableBucketHandler {
     }
 }
 
-pub struct GetTableCatalogMigrationHandler {}
-
-#[async_trait::async_trait]
-impl Operation for GetTableCatalogMigrationHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let warehouse = warehouse_from_params(&params)?;
-        let resource = TableCatalogResource::warehouse(&warehouse);
-        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableCatalogAction).await?;
-        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let store = table_catalog_object_store_from_extensions(&req.extensions)?;
-        let started = Instant::now();
-        let result = store
-            .plan_durable_strong_backing_migration(&warehouse)
-            .await
-            .map_err(catalog_store_error);
-        record_table_catalog_admin_operation_result("migration", &warehouse, "", "", started, &result);
-        let response = result?;
-        build_json_response(StatusCode::OK, &response)
-    }
-}
-
-pub struct MaterializeTableCatalogMigrationHandler {}
-
-#[async_trait::async_trait]
-impl Operation for MaterializeTableCatalogMigrationHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;
-        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let store = table_catalog_object_store_from_extensions(&req.extensions)?;
-        let started = Instant::now();
-        let result = store
-            .materialize_durable_strong_backing_migration(&warehouse)
-            .await
-            .map_err(catalog_store_error);
-        record_table_catalog_admin_operation_result("migration-materialize", &warehouse, "", "", started, &result);
-        let response = result?;
-        build_json_response(StatusCode::OK, &response)
-    }
-}
-
-pub struct CancelTableCatalogMigrationHandler {}
-
-#[async_trait::async_trait]
-impl Operation for CancelTableCatalogMigrationHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;
-        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let store = table_catalog_object_store_from_extensions(&req.extensions)?;
-        let started = Instant::now();
-        let result = store
-            .cancel_durable_strong_backing_migration(&warehouse)
-            .await
-            .map_err(catalog_store_error);
-        record_table_catalog_admin_operation_result("migration-cancel", &warehouse, "", "", started, &result);
-        let response = result?;
-        build_json_response(StatusCode::OK, &response)
-    }
-}
-
 pub struct CreateTableCatalogBackupHandler {}
 
 #[async_trait::async_trait]
