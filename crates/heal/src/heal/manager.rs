@@ -1576,6 +1576,8 @@ impl HealManager {
             return;
         }
 
+        #[cfg(test)]
+        tests::admin_overlap::pause_alias_publication(alias_id).await;
         self.task_aliases.lock().await.insert(
             alias_id.to_string(),
             HealTaskAlias {
@@ -2176,6 +2178,8 @@ impl HealManager {
             drop(queue);
             drop(active_heals);
             active_lock_hold += active_lock_acquired.elapsed();
+            #[cfg(test)]
+            tests::admin_overlap::pause_force_cancellation(&request.id).await;
             for task_id in &overlapping {
                 match self.cancel_task(task_id).await {
                     Ok(_) => info!(

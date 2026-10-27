@@ -17,6 +17,41 @@ use rustfs_heal_contracts::heal_channel::HealScanMode;
 use std::future::Future;
 use std::task::Poll;
 
+struct AdmissionInterleavingHook {
+    reached: Notify,
+    release: Notify,
+}
+
+static FORCE_CANCELLATION_HOOKS: LazyLock<StdMutex<HashMap<String, Arc<AdmissionInterleavingHook>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+static ALIAS_PUBLICATION_HOOKS: LazyLock<StdMutex<HashMap<String, Arc<AdmissionInterleavingHook>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+pub(in crate::heal::manager) async fn pause_force_cancellation(request_id: &str) {
+    let hook = FORCE_CANCELLATION_HOOKS
+        .lock()
+        .expect("force cancellation hooks")
+        .get(request_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook.reached.notify_one();
+        hook.release.notified().await;
+    }
+}
+
+pub(in crate::heal::manager) async fn pause_alias_publication(request_id: &str) {
+    let hook = ALIAS_PUBLICATION_HOOKS
+        .lock()
+        .expect("alias publication hooks")
+        .get(request_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook.reached.notify_one();
+        hook.release.notified().await;
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum OwnerState {
     Active,
@@ -505,6 +540,203 @@ async fn admin_force_start_rechecks_request_id_after_cancelling_overlaps() {
             "overlapping admin cancellation precedes the conflict recheck"
         );
     }
+}
+
+#[tokio::test]
+async fn force_start_and_alias_same_id_do_not_misroute() {
+    let mut observed = Vec::new();
+    for source in [HealRequestSource::Scanner, HealRequestSource::Internal] {
+        for timing in ["published_before", "pending_before", "during"] {
+            let manager = Arc::new(manager_with_policy(HealOverlapPolicy::Merge));
+            install_owner(&manager, admin_prefix_request("bucket", "scope/child/"), OwnerState::Active).await;
+            let mut original = HealRequest::object("other-bucket".to_string(), "object".to_string(), None);
+            original.id = format!("alias-original-{}-{timing}", source.as_str());
+            original.source = source;
+            original.options.recreate_missing = false;
+            let original_id = original.id.clone();
+            assert_eq!(
+                manager
+                    .submit_heal_request(original.clone())
+                    .await
+                    .expect("queue original owner"),
+                HealAdmissionResult::Accepted
+            );
+
+            let mut replacement = admin_prefix_request("bucket", "scope/");
+            replacement.id = format!("alias-forced-{}-{timing}", source.as_str());
+            replacement.force_start = true;
+            let request_id = replacement.id.clone();
+            let mut duplicate = original;
+            duplicate.id = request_id.clone();
+            let mut alias_submission = Box::pin(manager.submit_heal_request(duplicate));
+            let alias_hook = (timing == "pending_before").then(|| {
+                let hook = Arc::new(AdmissionInterleavingHook {
+                    reached: Notify::new(),
+                    release: Notify::new(),
+                });
+                ALIAS_PUBLICATION_HOOKS
+                    .lock()
+                    .expect("install alias publication hook")
+                    .insert(request_id.clone(), Arc::clone(&hook));
+                hook
+            });
+            let mut alias_result = None;
+            if timing == "published_before" {
+                alias_result = Some(alias_submission.as_mut().await);
+                assert_eq!(
+                    alias_result
+                        .as_ref()
+                        .expect("pre-published alias result")
+                        .as_ref()
+                        .expect("merge the alias"),
+                    &HealAdmissionResult::Merged
+                );
+                assert_eq!(manager.canonical_task_id(&request_id).await, original_id);
+            } else if timing == "pending_before" {
+                let hook = alias_hook.as_ref().expect("pending alias hook");
+                let mut reached = std::pin::pin!(hook.reached.notified());
+                let mut drive_alias = std::pin::pin!(tokio::task::unconstrained(alias_submission.as_mut()));
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    std::future::poll_fn(|cx| {
+                        if reached.as_mut().poll(cx).is_ready() {
+                            return Poll::Ready(());
+                        }
+                        assert!(drive_alias.as_mut().poll(cx).is_pending(), "alias admission ended before publication");
+                        reached.as_mut().poll(cx)
+                    }),
+                )
+                .await
+                .expect("alias admission reached publication before forceStart begins");
+            }
+
+            let hook = Arc::new(AdmissionInterleavingHook {
+                reached: Notify::new(),
+                release: Notify::new(),
+            });
+            FORCE_CANCELLATION_HOOKS
+                .lock()
+                .expect("install force cancellation hook")
+                .insert(request_id.clone(), Arc::clone(&hook));
+            let mut force_submission = Box::pin(manager.submit_heal_request_with_receipt(replacement));
+            let (force_result, reached_force_window) = if timing == "during" {
+                let mut reached = std::pin::pin!(hook.reached.notified());
+                let mut drive_force = std::pin::pin!(tokio::task::unconstrained(force_submission.as_mut()));
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    std::future::poll_fn(|cx| {
+                        if reached.as_mut().poll(cx).is_ready() {
+                            return Poll::Ready(());
+                        }
+                        assert!(drive_force.as_mut().poll(cx).is_pending(), "force admission ended before the test window");
+                        reached.as_mut().poll(cx)
+                    }),
+                )
+                .await
+                .expect("forceStart reached the cancellation window before the alias begins");
+                (None, true)
+            } else {
+                let result = match futures::poll!(tokio::task::unconstrained(force_submission.as_mut())) {
+                    Poll::Ready(result) => Some(result),
+                    Poll::Pending => None,
+                };
+                let reached = futures::poll!(std::pin::pin!(hook.reached.notified())).is_ready();
+                (result, reached)
+            };
+
+            // A correct force admission may wait for alias publication or
+            // reserve its id. Do not wait for either admission while a test
+            // hook is blocking the other.
+            if let Some(hook) = &alias_hook {
+                hook.release.notify_one();
+            }
+            if alias_result.is_none()
+                && let Poll::Ready(result) = futures::poll!(tokio::task::unconstrained(alias_submission.as_mut()))
+            {
+                alias_result = Some(result);
+            }
+            hook.release.notify_one();
+            let (alias_result, force_result) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(
+                    async {
+                        match alias_result {
+                            Some(result) => result,
+                            None => alias_submission.as_mut().await,
+                        }
+                    },
+                    async {
+                        match force_result {
+                            Some(result) => result,
+                            None => force_submission.as_mut().await,
+                        }
+                    },
+                )
+            })
+            .await
+            .expect("both admissions finish after releasing the test gates");
+            FORCE_CANCELLATION_HOOKS
+                .lock()
+                .expect("remove force hook")
+                .remove(&request_id);
+            ALIAS_PUBLICATION_HOOKS.lock().expect("remove alias hook").remove(&request_id);
+            let alias_result = alias_result.expect("alias admission returns a decision");
+            let force_receipt = force_result.expect("force admission returns a decision");
+            let forced_queued = manager
+                .heal_queue
+                .lock()
+                .await
+                .requests()
+                .any(|queued| queued.id == request_id);
+            let canonical = manager.canonical_task_id(&request_id).await;
+            let force_status = manager.get_task_status_for_path("bucket/scope", &request_id).await;
+            let alias_status = manager.get_task_status_for_path("other-bucket/object", &request_id).await;
+            let original_status = manager.get_task_status_for_path("other-bucket/object", &original_id).await;
+            let force_pending = matches!(&force_status, Ok(HealTaskStatus::Pending));
+            let force_missing = matches!(&force_status, Err(Error::TaskNotFound { task_id }) if task_id == &request_id);
+            let force_invalid = matches!(&force_status, Err(Error::InvalidClientToken));
+            let alias_pending = matches!(&alias_status, Ok(HealTaskStatus::Pending));
+            let alias_invalid = matches!(&alias_status, Err(Error::InvalidClientToken));
+            let original_pending = matches!(&original_status, Ok(HealTaskStatus::Pending));
+            let alias_won = alias_result == HealAdmissionResult::Merged
+                && force_receipt.result == HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+                && !forced_queued
+                && canonical == original_id
+                && alias_pending
+                && force_missing;
+            let force_won = force_receipt.result == HealAdmissionResult::Accepted
+                && alias_result == HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+                && forced_queued
+                && canonical == request_id
+                && force_pending
+                && alias_invalid;
+            let valid = force_receipt.task_id == request_id && original_pending && (alias_won || force_won);
+            println!(
+                "alias_force_observed source={} timing={} alias_publication_reached={} reached_force_window={} force={} alias={} forced_queued={} canonical_original={} canonical_force={} force_pending={} force_missing={} force_invalid={} alias_pending={} alias_invalid={} original_pending={} receipt_matches={} valid={}",
+                source.as_str(),
+                timing,
+                alias_hook.is_some(),
+                reached_force_window,
+                force_receipt.result.result_label(),
+                alias_result.result_label(),
+                forced_queued,
+                canonical == original_id,
+                canonical == request_id,
+                force_pending,
+                force_missing,
+                force_invalid,
+                alias_pending,
+                alias_invalid,
+                original_pending,
+                force_receipt.task_id == request_id,
+                valid
+            );
+            observed.push((source, timing, valid));
+        }
+    }
+    assert!(
+        observed.iter().all(|(_, _, valid)| *valid),
+        "each id must have exactly one admitted owner and route to that owner: {observed:?}"
+    );
 }
 
 #[tokio::test]
