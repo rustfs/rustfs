@@ -1024,6 +1024,19 @@ impl GetObjectFileInfo {
         self.as_parts().0
     }
 
+    /// Marks an exact-version selection as the object's latest version after
+    /// the versions above it were skipped as dangling.
+    fn mark_selected_as_latest(&mut self) {
+        if let Some(OwnedGetObjectFileInfo {
+            payload: OwnedGetObjectFileInfoPayload::Direct { fi, .. },
+            ..
+        }) = self.owned.as_mut()
+        {
+            fi.is_latest = true;
+            fi.successor_mod_time = None;
+        }
+    }
+
     fn parts_metadata(&self) -> &[FileInfo] {
         self.as_parts().1
     }
