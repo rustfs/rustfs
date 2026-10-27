@@ -31,14 +31,38 @@ jobs:
         run: python3 -B scripts/test_inspect_btf_prototypes.py
       - name: Install only missing native reference tools
         run: |
+          select_bpftool() {
+            local candidate
+            local candidates=()
+            if command -v bpftool >/dev/null; then
+              candidates+=("$(command -v bpftool)")
+            fi
+            for candidate in /usr/lib/linux-tools-*/bpftool /usr/lib/linux-tools/*/bpftool; do
+              if [[ -x "$candidate" ]]; then
+                candidates+=("$candidate")
+              fi
+            done
+            while IFS= read -r candidate; do
+              if [[ -x "$candidate" ]] && file -Lb "$candidate" | grep -q 'ELF' \
+                && "$candidate" version >/dev/null 2>&1; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done < <(printf '%s\n' "${candidates[@]}" | sort -Vr)
+            return 1
+          }
           packages=()
           command -v clang >/dev/null || packages+=(clang)
           command -v llvm-objcopy >/dev/null || packages+=(llvm)
-          command -v bpftool >/dev/null || packages+=(bpftool)
+          select_bpftool >/dev/null || packages+=(linux-tools-generic)
           if (( ${#packages[@]} )); then
             sudo apt-get update
             sudo apt-get install --no-install-recommends -y "${packages[@]}"
           fi
+          # File parsing needs a working binary, not a host-kernel wrapper.
+          selected_bpftool="$(select_bpftool)"
+          "$selected_bpftool" version
+          printf 'BPFTOOL=%s\n' "$selected_bpftool" >> "$GITHUB_ENV"
       - name: Compare compiled declarations with bpftool
         run: |
           clang -target bpf -O2 -g -c scripts/fixtures/btf_prototypes.c -o "$RUNNER_TEMP/prototypes.o"

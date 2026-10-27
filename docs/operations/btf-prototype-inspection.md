@@ -48,6 +48,11 @@ python3 -B scripts/test_inspect_btf_prototypes.py
 The `BTF prototype reference` workflow additionally compiles a small C fixture,
 extracts its raw `.BTF` section, and independently compares both selected
 declarations and resolved types against `bpftool` output. The object is never
-loaded. That comparison validates the tool's declared-format scope; it does not
+loaded. The workflow selects a concrete `bpftool` executable by availability and
+version before comparing data; it does not depend on the hosted kernel's tools
+wrapper or switch tools after a comparison failure. The native
+[file-dump mode](https://github.com/libbpf/bpftool/blob/main/docs/bpftool-btf.rst)
+accepts ELF or raw BTF files. That comparison validates
+the tool's declared-format scope; it does not
 qualify an original test node's kernel generation, complete observer budget, or
 storage/business performance experiment.
