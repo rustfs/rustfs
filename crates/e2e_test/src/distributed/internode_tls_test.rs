@@ -3,13 +3,14 @@
 
 use super::harness::{DistCluster, DistLayout, TestResult, unique_bucket};
 use crate::tls_gen;
+use aws_sdk_s3::operation::RequestId;
 use aws_sdk_s3::{Client, config::retry::RetryConfig, primitives::ByteStream};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, TryLockError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 
 const MIB: u64 = 1024 * 1024;
@@ -26,6 +27,285 @@ struct ObjectFixture {
     path: PathBuf,
     length: u64,
     reads: Vec<ExpectedRead>,
+}
+
+#[derive(Clone)]
+struct ConcurrentReadStream {
+    stage: &'static str,
+    started_ms: Option<u64>,
+    headers_ms: Option<u64>,
+    body_started_ms: Option<u64>,
+    completed_ms: Option<u64>,
+    received: u64,
+    last_progress_ms: Option<u64>,
+    request_id: Option<uuid::Uuid>,
+    terminal: Option<&'static str>,
+    terminal_ms: Option<u64>,
+}
+
+impl Default for ConcurrentReadStream {
+    fn default() -> Self {
+        Self {
+            stage: "queued",
+            started_ms: None,
+            headers_ms: None,
+            body_started_ms: None,
+            completed_ms: None,
+            received: 0,
+            last_progress_ms: None,
+            request_id: None,
+            terminal: None,
+            terminal_ms: None,
+        }
+    }
+}
+
+struct ConcurrentReadProgress {
+    started: Instant,
+    started_clock: ClockSample,
+    expected: u64,
+    streams: Vec<Mutex<ConcurrentReadStream>>,
+}
+
+#[derive(Clone, Copy)]
+struct ClockSample {
+    unix_ms: Option<u64>,
+    before_ms: Option<u64>,
+    after_ms: Option<u64>,
+}
+
+impl ClockSample {
+    fn capture(started: Instant) -> Self {
+        let before_ms = elapsed_ms(started);
+        Self::capture_after(started, before_ms)
+    }
+
+    fn capture_after(started: Instant, before_ms: Option<u64>) -> Self {
+        let unix_ms = unix_ms_at(SystemTime::now());
+        let after_ms = elapsed_ms(started);
+        Self {
+            unix_ms,
+            before_ms,
+            after_ms,
+        }
+    }
+
+    fn json(self) -> serde_json::Value {
+        serde_json::json!({
+            "unix_ms": self.unix_ms,
+            "monotonic_before_ms": self.before_ms,
+            "monotonic_after_ms": self.after_ms,
+        })
+    }
+}
+
+impl ConcurrentReadProgress {
+    fn new(expected: u64, count: usize) -> Self {
+        let started = Instant::now();
+        Self {
+            started,
+            started_clock: ClockSample::capture(started),
+            expected,
+            streams: (0..count).map(|_| Mutex::new(ConcurrentReadStream::default())).collect(),
+        }
+    }
+
+    fn elapsed_ms(&self) -> Option<u64> {
+        elapsed_ms(self.started)
+    }
+
+    fn start(&self, node: usize) {
+        let mut stream = self.streams[node].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        stream.started_ms = self.elapsed_ms();
+        stream.stage = "waiting_headers";
+    }
+
+    fn response(&self, node: usize, request_id: Option<&str>, has_headers: bool) {
+        let mut stream = self.streams[node].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(request_id) = request_id.and_then(|id| uuid::Uuid::parse_str(id).ok()) {
+            stream.request_id = Some(request_id);
+        }
+        if has_headers {
+            stream.headers_ms = self.elapsed_ms();
+            stream.stage = "headers_received";
+        }
+    }
+
+    fn body(&self, node: usize) {
+        let mut stream = self.streams[node].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        stream.body_started_ms = self.elapsed_ms();
+        stream.stage = "reading_body";
+    }
+
+    fn progress(&self, node: usize, received: u64) {
+        let mut stream = self.streams[node].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        stream.last_progress_ms = self.elapsed_ms();
+        stream.received = received;
+    }
+
+    fn complete(&self, node: usize) {
+        let mut stream = self.streams[node].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        stream.completed_ms = self.elapsed_ms();
+        stream.stage = "complete";
+    }
+
+    fn terminal(&self, node: usize, terminal: &'static str) {
+        let mut stream = self.streams[node].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        stream.terminal = Some(terminal);
+        stream.terminal_ms = self.elapsed_ms();
+    }
+
+    fn failure_snapshot(&self, failed_node: Option<usize>, kind: &'static str) -> serde_json::Value {
+        let streams: Vec<_> = self
+            .streams
+            .iter()
+            .enumerate()
+            .map(|(node, stream)| {
+                // Avoid waiting on another task while retaining the first error.
+                let mut snapshot = None;
+                let mut unavailable = "busy";
+                for _ in 0..8 {
+                    let before_ms = self.elapsed_ms();
+                    match stream.try_lock() {
+                        Ok(guard) => {
+                            let stream = guard.clone();
+                            drop(guard);
+                            snapshot = Some((stream, ClockSample::capture_after(self.started, before_ms)));
+                            break;
+                        }
+                        Err(TryLockError::WouldBlock) => std::hint::spin_loop(),
+                        Err(TryLockError::Poisoned(_)) => {
+                            unavailable = "poisoned";
+                            break;
+                        }
+                    }
+                }
+                let Some((stream, sampled_clock)) = snapshot else {
+                    return serde_json::json!({
+                        "node": node,
+                        "snapshot": unavailable,
+                        "sampled_clock": ClockSample::capture(self.started).json(),
+                        "last_stage": "unknown",
+                        "terminal": "unknown",
+                        "request_id": null,
+                        "received_bytes": null,
+                        "last_progress_ms": null,
+                    });
+                };
+                serde_json::json!({
+                    "node": node,
+                    "snapshot": "available",
+                    "sampled_clock": sampled_clock.json(),
+                    "last_stage": stream.stage,
+                    "request_id": stream.request_id.map(|id| id.to_string()),
+                    "started_ms": stream.started_ms,
+                    "headers_ms": stream.headers_ms,
+                    "body_started_ms": stream.body_started_ms,
+                    "completed_ms": stream.completed_ms,
+                    "received_bytes": stream.received,
+                    "last_progress_ms": stream.last_progress_ms,
+                    "terminal": stream.terminal.unwrap_or("unknown"),
+                    "terminal_ms": stream.terminal_ms,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "kind": kind,
+            "failed_node": failed_node,
+            "elapsed_ms": self.elapsed_ms(),
+            "stage_start_clock_sample": self.started_clock.json(),
+            "clock_scope": "client_unsynchronized",
+            "expected_bytes": self.expected,
+            "streams": streams,
+        })
+    }
+
+    fn report_failure(&self, failed_node: Option<usize>, kind: &'static str) {
+        eprintln!("TLS acceptance: concurrent GET failure: {}", self.failure_snapshot(failed_node, kind));
+    }
+}
+
+fn elapsed_ms(started: Instant) -> Option<u64> {
+    u64::try_from(started.elapsed().as_millis()).ok()
+}
+
+fn unix_ms_at(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+}
+
+fn verify_concurrent_read_failure_snapshot_evidence() {
+    let progress = ConcurrentReadProgress::new(100, 4);
+    progress.start(0);
+    progress.response(0, Some("LEAK-invalid-request-id"), true);
+    progress.body(0);
+    progress.progress(0, 100);
+    progress.complete(0);
+    progress.terminal(0, "success");
+
+    let valid_id = "b8172a15-a428-4b42-9cef-1f4a7b96874e";
+    progress.start(1);
+    progress.response(1, Some(valid_id), true);
+    progress.body(1);
+    progress.progress(1, 41);
+    progress.terminal(1, "failed");
+
+    progress.start(3);
+    let _busy = progress.streams[2].lock().expect("hold one stream during the snapshot");
+    let snapshot = progress.failure_snapshot(Some(1), "read_failed");
+    assert_eq!(snapshot["clock_scope"], "client_unsynchronized");
+    assert_eq!(snapshot["failed_node"], 1);
+    let start_clock = &snapshot["stage_start_clock_sample"];
+    assert!(
+        start_clock["monotonic_before_ms"].as_u64().expect("start sample lower bound")
+            <= start_clock["monotonic_after_ms"].as_u64().expect("start sample upper bound")
+    );
+    assert!(!snapshot.to_string().contains("LEAK-invalid-request-id"));
+
+    let streams = snapshot["streams"].as_array().expect("per-stream snapshots");
+    assert_eq!(streams.len(), 4);
+    for (stream, terminal, expected_bytes) in [(&streams[0], "success", 100), (&streams[1], "failed", 41)] {
+        assert_eq!(stream["snapshot"], "available");
+        assert_eq!(stream["terminal"], terminal);
+        assert_eq!(stream["received_bytes"], expected_bytes);
+        let times = [
+            "started_ms",
+            "headers_ms",
+            "body_started_ms",
+            "last_progress_ms",
+            "terminal_ms",
+        ]
+        .map(|field| stream[field].as_u64().expect("observed stream time"));
+        assert!(times.windows(2).all(|pair| pair[0] <= pair[1]));
+        let clock = &stream["sampled_clock"];
+        let before = clock["monotonic_before_ms"].as_u64().expect("sample lower bound");
+        let after = clock["monotonic_after_ms"].as_u64().expect("sample upper bound");
+        assert!(times[4] <= after && before <= after);
+    }
+    assert_eq!(streams[0]["last_stage"], "complete");
+    assert!(streams[0]["request_id"].is_null());
+    assert!(
+        streams[0]["completed_ms"].as_u64().expect("completion time")
+            <= streams[0]["terminal_ms"].as_u64().expect("terminal time")
+    );
+    assert_eq!(streams[1]["last_stage"], "reading_body");
+    assert!(streams[1]["completed_ms"].is_null());
+    assert_eq!(streams[1]["request_id"], valid_id);
+    assert_eq!(streams[2]["snapshot"], "busy");
+    assert_eq!(streams[2]["last_stage"], "unknown");
+    assert_eq!(streams[2]["terminal"], "unknown");
+    assert!(streams[2]["received_bytes"].is_null());
+    assert!(streams[2]["sampled_clock"]["monotonic_before_ms"].is_number());
+    assert_eq!(streams[3]["last_stage"], "waiting_headers");
+    assert_eq!(streams[3]["terminal"], "unknown");
+    assert!(streams[3]["request_id"].is_null());
+    assert!(streams[3]["last_progress_ms"].is_null());
+
+    let before_epoch = UNIX_EPOCH
+        .checked_sub(Duration::from_millis(1))
+        .expect("represent pre-epoch time");
+    assert!(unix_ms_at(before_epoch).is_none());
 }
 
 fn fixture(directory: &Path, length: u64) -> TestResult<ObjectFixture> {
@@ -85,16 +365,28 @@ async fn verified_get(
     object: &ObjectFixture,
     expected: &ExpectedRead,
     concurrent: bool,
+    progress: Option<&ConcurrentReadProgress>,
 ) -> TestResult<serde_json::Value> {
     let started = Instant::now();
     let mut received = 0u64;
     let mut stage = "response headers";
+    if let Some(progress) = progress {
+        progress.start(node);
+    }
     tokio::time::timeout(READ_TIMEOUT, async {
         let mut request = client.get_object().bucket(bucket).key(&object.key);
         if let Some((start, end)) = expected.range {
             request = request.range(format!("bytes={start}-{end}"));
         }
-        let mut output = request.send().await?;
+        let response = request.send().await;
+        if let Some(progress) = progress {
+            let has_headers = match &response {
+                Ok(_) => true,
+                Err(error) => error.raw_response().is_some(),
+            };
+            progress.response(node, response.request_id(), has_headers);
+        }
+        let mut output = response?;
         assert_eq!(output.content_length(), Some(i64::try_from(expected.length)?));
         if let Some((start, end)) = expected.range {
             assert_eq!(output.content_range(), Some(format!("bytes {start}-{end}/{}", object.length).as_str()));
@@ -102,21 +394,32 @@ async fn verified_get(
             assert_eq!(output.content_range(), None);
         }
         stage = "response body";
+        if let Some(progress) = progress {
+            progress.body(node);
+        }
         let mut digest = Sha256::new();
         while let Some(chunk) = output.body.next().await {
-            let chunk = chunk.inspect_err(|error| {
+            let chunk = chunk.inspect_err(|_| {
                 eprintln!(
-                    "TLS acceptance: GET body failed: node={node}, key={}, range={:?}, concurrent={concurrent}, received={received}/{}, elapsed={:?}, error={error}",
+                    "TLS acceptance: GET body failed: node={node}, key={}, range={:?}, concurrent={concurrent}, received={received}/{}, elapsed={:?}",
                     object.key, expected.range, expected.length, started.elapsed()
                 );
             })?;
             received += u64::try_from(chunk.len())?;
+            if !chunk.is_empty()
+                && let Some(progress) = progress
+            {
+                progress.progress(node, received);
+            }
             assert!(received <= expected.length, "node {node}: GET exceeded the requested length");
             digest.update(&chunk);
         }
         let actual_sha256 = hex_simd::encode_to_string(digest.finalize(), hex_simd::AsciiCase::Lower);
         assert_eq!(received, expected.length, "node {node}: truncated GET {}", object.key);
         assert_eq!(actual_sha256, expected.sha256, "node {node}: corrupt GET {}", object.key);
+        if let Some(progress) = progress {
+            progress.complete(node);
+        }
         eprintln!(
             "TLS acceptance: GET node={node}, key={}, range={:?}, concurrent={concurrent}, bytes={received}, elapsed={:?}",
             object.key, expected.range, started.elapsed()
@@ -143,6 +446,7 @@ async fn verified_get(
 /// tiny objects and count that as a large distributed-read pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn four_node_tls_large_and_range_gets_preserve_bytes() -> TestResult {
+    verify_concurrent_read_failure_snapshot_evidence();
     let mode = std::env::var("RUSTFS_E2E_INTERNODE_HTTP_MODE").unwrap_or_else(|_| "http1".into());
     let protocol = match mode.as_str() {
         "http1" => "http1",
@@ -238,7 +542,7 @@ async fn four_node_tls_large_and_range_gets_preserve_bytes() -> TestResult {
         if length == 32 * 1024 {
             let alternate = dist.client_with_credentials(0, &dist.cluster.access_key, &dist.cluster.secret_key)?;
             let alternate = Client::from_conf(alternate.config().to_builder().retry_config(RetryConfig::disabled()).build());
-            results.push(verified_get(&alternate, 0, &bucket, &object, &object.reads[0], false).await?);
+            results.push(verified_get(&alternate, 0, &bucket, &object, &object.reads[0], false, None).await?);
             let invalid = dist.client_with_credentials(0, "invalid-tls-user", "invalid-tls-secret-password")?;
             let invalid = Client::from_conf(invalid.config().to_builder().retry_config(RetryConfig::disabled()).build());
             let denied = invalid
@@ -250,21 +554,45 @@ async fn four_node_tls_large_and_range_gets_preserve_bytes() -> TestResult {
         }
         for expected in &object.reads {
             for (node, client) in clients.iter().enumerate() {
-                results.push(verified_get(client, node, &bucket, &object, expected, false).await?);
+                results.push(verified_get(client, node, &bucket, &object, expected, false, None).await?);
             }
         }
         // Each reader owns a Tokio task and its cooperative budget. Polling
         // every body and synchronous digest in one parent task can let an
         // always-ready reader starve its siblings and their deadlines.
         let mut readers = JoinSet::new();
+        let progress = Arc::new(ConcurrentReadProgress::new(object.reads[0].length, clients.len()));
+        let mut task_nodes = Vec::with_capacity(clients.len());
         for (node, client) in clients.iter().enumerate() {
             let client = client.clone();
             let bucket = bucket.clone();
             let object = Arc::clone(&object);
-            readers.spawn(async move { verified_get(&client, node, &bucket, &object, &object.reads[0], true).await });
+            let progress = Arc::clone(&progress);
+            let handle = readers.spawn(async move {
+                let result = verified_get(&client, node, &bucket, &object, &object.reads[0], true, Some(&progress)).await;
+                progress.terminal(node, if result.is_ok() { "success" } else { "failed" });
+                (node, result)
+            });
+            task_nodes.push((handle.id(), node));
         }
         while let Some(result) = readers.join_next().await {
-            results.push(result??);
+            match result {
+                Ok((_, Ok(result))) => results.push(result),
+                Ok((node, Err(error))) => {
+                    readers.abort_all();
+                    progress.report_failure(Some(node), "read_failed");
+                    return Err(error);
+                }
+                Err(error) => {
+                    let node = task_nodes.iter().find(|(id, _)| *id == error.id()).map(|(_, node)| *node);
+                    readers.abort_all();
+                    if let Some(node) = node {
+                        progress.terminal(node, if error.is_panic() { "panicked" } else { "cancelled" });
+                    }
+                    progress.report_failure(node, "task_failed");
+                    return Err(error.into());
+                }
+            }
         }
         tokio::fs::remove_file(&object.path).await?;
     }
