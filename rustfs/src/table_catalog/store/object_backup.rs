@@ -81,6 +81,31 @@ where
         TableCatalogObjectMutationFence::from_signals(guards.iter().map(TableCatalogLockGuard::lock_lost_signal))
     }
 
+    async fn capture_backup_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<ObjectCatalogBackupObject> {
+        if !safe_object_key(object) {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "catalog backup object key is invalid: {bucket}/{object}"
+            )));
+        }
+        let value = self
+            .backend
+            .read_object_limited(bucket, object, OBJECT_CATALOG_BACKUP_OBJECT_MAX_SIZE)
+            .await?
+            .ok_or_else(|| TableCatalogStoreError::NotFound(format!("catalog backup object disappeared: {bucket}/{object}")))?;
+        Ok(ObjectCatalogBackupObject {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            size_bytes: value
+                .data
+                .len()
+                .try_into()
+                .map_err(|_| TableCatalogStoreError::Invalid("catalog backup object size exceeds u64".to_string()))?,
+            etag: value.etag,
+            sha256: backup_sha256(&value.data),
+            data: value.data,
+        })
+    }
+
     async fn capture_object_catalog_backup_objects(
         &self,
         table_bucket: &str,
@@ -88,29 +113,28 @@ where
         let prefix = self.paths.table_bucket_root_prefix(table_bucket);
         let mut objects = Vec::new();
         for object in self.backend.list_objects(self.catalog_bucket(), &prefix).await? {
-            if !safe_object_key(&object) {
-                return Err(TableCatalogStoreError::Invalid(format!("catalog backup object key is invalid: {object}")));
-            }
-            let value = self
-                .backend
-                .read_object_limited(self.catalog_bucket(), &object, OBJECT_CATALOG_BACKUP_OBJECT_MAX_SIZE)
-                .await?
-                .ok_or_else(|| TableCatalogStoreError::NotFound(format!("catalog backup object disappeared: {object}")))?;
-            let sha256 = backup_sha256(&value.data);
-            objects.push(ObjectCatalogBackupObject {
-                bucket: self.catalog_bucket().to_string(),
-                object,
-                size_bytes: value
-                    .data
-                    .len()
-                    .try_into()
-                    .map_err(|_| TableCatalogStoreError::Invalid("catalog backup object size exceeds u64".to_string()))?,
-                etag: value.etag,
-                sha256,
-                data: value.data,
-            });
+            objects.push(self.capture_backup_object(self.catalog_bucket(), &object).await?);
         }
-        objects.sort_by(|left, right| left.object.cmp(&right.object));
+        let catalog_objects = objects.clone();
+        for object in catalog_objects {
+            if !object.object.ends_with(TABLE_ENTRY_FILE) {
+                continue;
+            }
+            let entry: TableEntry = serde_json::from_slice(&object.data)
+                .map_err(|error| TableCatalogStoreError::Invalid(format!("table catalog entry is invalid: {error}")))?;
+            if entry.state != TableCatalogEntryState::Active {
+                continue;
+            }
+            let metadata_object = table_catalog_object_key_from_location(&entry.table_bucket, &entry.metadata_location)
+                .ok_or_else(|| TableCatalogStoreError::Invalid("table metadata location is not an object path".to_string()))?;
+            if !objects
+                .iter()
+                .any(|candidate| candidate.bucket == entry.table_bucket && candidate.object == metadata_object)
+            {
+                objects.push(self.capture_backup_object(&entry.table_bucket, &metadata_object).await?);
+            }
+        }
+        objects.sort_by(|left, right| left.bucket.cmp(&right.bucket).then_with(|| left.object.cmp(&right.object)));
         if objects.is_empty() {
             return Err(TableCatalogStoreError::NotFound(format!("table bucket catalog {table_bucket}")));
         }

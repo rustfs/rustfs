@@ -3909,6 +3909,7 @@ async fn object_catalog_backup_is_idempotent_and_restorable() {
     let table = IdentifierSegment::parse("orders").unwrap();
     let metadata_location = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
 
+    backend.seed_object(bucket, &metadata_location, b"{}".to_vec()).await;
     store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
     store
         .create_namespace(test_namespace_entry(bucket, &namespace))
