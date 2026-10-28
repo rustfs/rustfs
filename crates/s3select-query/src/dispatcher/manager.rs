@@ -1810,7 +1810,10 @@ mod tests {
             ("SELECT s.obj0.id, s.obj0.inner.\"Key\" FROM S3Object s", ["id", "Key"].as_slice()),
             ("SELECT obj0.id FROM S3Object", &["id"]),
             ("SELECT s.obj0.id FROM S3Object s ORDER BY s.obj0.id", &["id"]),
-            ("SELECT s.obj0.id, COUNT(*) FROM S3Object s GROUP BY s.obj0.id", &["id", "count(*)"]),
+            (
+                "SELECT s.obj0.id, COUNT(*) FROM S3Object s GROUP BY s.obj0.id",
+                &["s.obj0[id]", "count(*)"],
+            ),
         ] {
             let schema = json_lines_plan_schema(DATA, sql).await;
             assert_eq!(field_names(schema.fields()), expected, "{sql}");
@@ -2949,5 +2952,111 @@ mod tests {
         ));
         assert_eq!(admission.available_permits(), 1);
         assert!(output.next().await.is_none());
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn path_alias_does_not_collide_with_computed_output_name() {
+        let mut input = (*json_snapshot_input()).clone();
+        input.bucket = "s3select-review-name-collision".to_string();
+        input.key = "collision.jsonl".to_string();
+        input.request.expression = "SELECT s.obj.\"lower(s.id)\", LOWER(s.id) FROM S3Object s".to_string();
+        let input = Arc::new(input);
+        let env = snapshot_test_env().await;
+        env.make_bucket(&input.bucket, false).await;
+        env.put_object_bytes(&input.bucket, &input.key, b"{\"id\":\"A\",\"obj\":{\"lower(s.id)\":7}}\n".to_vec())
+            .await;
+        let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
+        let dispatcher = production_dispatcher(Arc::clone(&input));
+        let query = Query::new_with_snapshot(
+            QueryContext {
+                input: Arc::clone(&input),
+            },
+            input.request.expression.clone(),
+            snapshot,
+        );
+        let machine = dispatcher.build_query_state_machine(query).await.expect("production session");
+        let result = dispatcher.build_logical_plan(Arc::clone(&machine)).await;
+        if let Err(error) = &result {
+            panic!(
+                "real production planner rejected a previously valid query: {error}; S3 classification={:?}",
+                error.s3_select_policy_error()
+            );
+        }
+        let plan = result.expect("valid production query").expect("query plan");
+        let Plan::Query(query_plan) = &plan;
+        let schema = query_plan.df_plan.schema();
+        assert_eq!(schema.fields().len(), 2);
+        assert_ne!(schema.field(0).name(), schema.field(1).name());
+        let output = dispatcher
+            .execute_logical_plan(plan, machine)
+            .await
+            .expect("execute production query");
+        let Output::StreamData(stream) = output else {
+            panic!("query must return rows");
+        };
+        let batches: Vec<_> = stream.try_collect().await.expect("read production result");
+        assert_eq!(batches.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
+        let batch = batches.iter().find(|batch| batch.num_rows() == 1).expect("one result row");
+        let key = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .expect("integer key");
+        let lower = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .expect("lowercase string");
+        assert_eq!(key.value(0), 7);
+        assert_eq!(lower.value(0), "a");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn path_alias_does_not_collide_with_computed_sort_name() {
+        let mut input = (*json_snapshot_input()).clone();
+        input.bucket = "s3select-sort-name-collision".to_string();
+        input.key = "collision.jsonl".to_string();
+        input.request.expression = "SELECT s.obj.\"lower(s.id)\" FROM S3Object s ORDER BY LOWER(s.id)".to_string();
+        let input = Arc::new(input);
+        let env = snapshot_test_env().await;
+        env.make_bucket(&input.bucket, false).await;
+        env.put_object_bytes(&input.bucket, &input.key, b"{\"id\":\"A\",\"obj\":{\"lower(s.id)\":7}}\n".to_vec())
+            .await;
+        let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
+        let dispatcher = production_dispatcher(Arc::clone(&input));
+        let query = Query::new_with_snapshot(
+            QueryContext {
+                input: Arc::clone(&input),
+            },
+            input.request.expression.clone(),
+            snapshot,
+        );
+        let machine = dispatcher.build_query_state_machine(query).await.expect("production session");
+        let result = dispatcher.build_logical_plan(Arc::clone(&machine)).await;
+        if let Err(error) = &result {
+            panic!(
+                "real production planner rejected a previously valid query: {error}; S3 classification={:?}",
+                error.s3_select_policy_error()
+            );
+        }
+        let plan = result.expect("valid production query").expect("query plan");
+        let Plan::Query(query_plan) = &plan;
+        let schema = query_plan.df_plan.schema();
+        assert_eq!(schema.fields().len(), 1);
+        let output = dispatcher
+            .execute_logical_plan(plan, machine)
+            .await
+            .expect("execute production query");
+        let Output::StreamData(stream) = output else {
+            panic!("query must return rows");
+        };
+        let batches: Vec<_> = stream.try_collect().await.expect("read production result");
+        assert_eq!(batches.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
+        let batch = batches.iter().find(|batch| batch.num_rows() == 1).expect("one result row");
+        let key = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .expect("integer key");
+        assert_eq!(key.value(0), 7);
     }
 }

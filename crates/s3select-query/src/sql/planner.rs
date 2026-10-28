@@ -160,8 +160,9 @@ pub(crate) fn prepare_s3_select_statement(statement: &mut Statement) -> QueryRes
 /// Names an unaliased path projection after its last key, as AWS does
 /// (`s.obj0.id` -> `id`), instead of DataFusion's `s.obj0[id]`. Names that
 /// could collide with another output name keep DataFusion's name. Wildcard
-/// columns are unknown here, so a wildcard disables aliasing; ORDER BY columns
-/// count because DataFusion adds missing sort columns to the projection.
+/// columns and computed output names are unknown here, so either disables
+/// aliasing; ORDER BY columns count because DataFusion adds missing sort
+/// columns to the projection.
 fn alias_path_projections(select: &mut Select, order_by: Option<&OrderBy>) {
     if select
         .projection
@@ -191,6 +192,9 @@ fn alias_path_projections(select: &mut Select, order_by: Option<&OrderBy>) {
             ident.map(|ident| normalizer.normalize(ident.clone()))
         })
         .collect();
+    if names.iter().any(Option::is_none) {
+        return;
+    }
     let mut counts = HashMap::<String, usize>::new();
     for name in names.iter().flatten() {
         *counts.entry(name.clone()).or_default() += 1;
@@ -730,6 +734,9 @@ mod tests {
             "SELECT s.obj0.id FROM S3Object AS s ORDER BY s.id",
             "SELECT s.obj0.id FROM S3Object AS s ORDER BY upper(id)",
             "SELECT s.obj0.id, (s.id) FROM S3Object AS s",
+            "SELECT s.obj.\"lower(s.id)\", LOWER(s.id) FROM S3Object AS s",
+            "SELECT s.obj.\"count(*)\", COUNT(*) FROM S3Object AS s GROUP BY s.obj.\"count(*)\"",
+            "SELECT s.obj0.id, COUNT(*) FROM S3Object AS s GROUP BY s.obj0.id",
         ] {
             assert_eq!(prepared(sql), sql);
         }
