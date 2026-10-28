@@ -32,21 +32,6 @@ pub(super) fn table_catalog_backing_manifest(
     } else {
         TableCatalogWalStatus::Recoverable
     };
-    let migration_status = if manual_review_required {
-        TableCatalogBackingMigrationStatus::ManualReviewRequired
-    } else if recovery_required {
-        TableCatalogBackingMigrationStatus::RecoveryRequired
-    } else {
-        TableCatalogBackingMigrationStatus::ReadyToSnapshot
-    };
-    let mut blockers = Vec::new();
-    if recovery_required {
-        blockers.push(TableCatalogBackingMigrationBlocker::CommitRecoveryRequired);
-    }
-    if manual_review_required {
-        blockers.push(TableCatalogBackingMigrationBlocker::CommitManualReviewRequired);
-    }
-
     TableCatalogBackingManifest {
         version: TABLE_CATALOG_BACKING_MANIFEST_VERSION,
         current: TableCatalogBackingProfile {
@@ -75,19 +60,6 @@ pub(super) fn table_catalog_backing_manifest(
                 snapshot_version: None,
             },
         },
-        migration: TableCatalogBackingMigrationPlan {
-            source_kind: TableCatalogBackingKind::ObjectBacked,
-            target_kind: TableCatalogBackingKind::DurableStrongSnapshot,
-            status: migration_status,
-            required_steps: vec![
-                TableCatalogBackingMigrationStep::SnapshotCatalogExport,
-                TableCatalogBackingMigrationStep::ReplayCommitLog,
-                TableCatalogBackingMigrationStep::VerifyCurrentPointer,
-                TableCatalogBackingMigrationStep::EnableSingleWriterFencing,
-                TableCatalogBackingMigrationStep::CutOverDurableSnapshotReads,
-            ],
-            blockers,
-        },
         ha: TableCatalogHaPolicy {
             writer_region_model: TableCatalogHaWriterModel::SingleActiveWriterRegion,
             read_replica_strategy: TableCatalogReadReplicaStrategy::ReadOnlyReplicasForListAndLoad,
@@ -101,7 +73,6 @@ pub(super) fn table_catalog_backing_manifest(
             required_scenarios: vec![
                 TableCatalogScaleValidationScenario::ConcurrentCommitCas,
                 TableCatalogScaleValidationScenario::CommitLogRecoveryReplay,
-                TableCatalogScaleValidationScenario::MigrationSnapshotReplay,
                 TableCatalogScaleValidationScenario::ReadReplicaStaleReadGuard,
                 TableCatalogScaleValidationScenario::ClientConformanceMatrix,
             ],

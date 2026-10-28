@@ -21,9 +21,9 @@ mod manifest;
 mod object;
 mod object_backup;
 
-pub(crate) use backup_types::{
-    TableCatalogBackupReport, TableCatalogBackupStatus, TableCatalogRestoreReport, TableCatalogRestoreStatus,
-};
+pub(crate) use backup_types::{TableCatalogBackupReport, TableCatalogRestoreReport};
+#[cfg(test)]
+pub(super) use backup_types::{TableCatalogBackupStatus, TableCatalogRestoreStatus};
 use manifest::table_catalog_backing_manifest;
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]
@@ -1357,38 +1357,6 @@ impl TableCatalogObjectPaths {
         )
     }
 
-    pub fn backing_migration_fence_path(&self, table_bucket: &str) -> String {
-        format!(
-            "{}{}/{}",
-            self.table_bucket_root_prefix(table_bucket),
-            TABLE_CATALOG_MIGRATION_ROOT,
-            TABLE_CATALOG_MIGRATION_FENCE_FILE
-        )
-    }
-
-    pub fn backing_migration_fence_lock_path(&self, table_bucket: &str) -> String {
-        format!(
-            "{}{}/{}",
-            self.table_bucket_root_prefix(table_bucket),
-            TABLE_CATALOG_MIGRATION_ROOT,
-            TABLE_CATALOG_MIGRATION_FENCE_LOCK
-        )
-    }
-
-    pub fn backing_migration_global_fence_path(&self) -> String {
-        format!(
-            "{}/{}/{}",
-            self.catalog_root, TABLE_CATALOG_MIGRATION_ROOT, TABLE_CATALOG_MIGRATION_GLOBAL_FENCE_FILE
-        )
-    }
-
-    pub fn backing_migration_global_fence_lock_path(&self) -> String {
-        format!(
-            "{}/{}/{}",
-            self.catalog_root, TABLE_CATALOG_MIGRATION_ROOT, TABLE_CATALOG_MIGRATION_GLOBAL_FENCE_LOCK
-        )
-    }
-
     pub fn catalog_backup_path(&self, table_bucket: &str, backup_id: &str) -> String {
         format!(
             "{}/{}/{}/{}.json",
@@ -1412,16 +1380,6 @@ impl TableCatalogObjectPaths {
         format!("{}/{}/global-fence.lock", self.catalog_root, TABLE_CATALOG_BACKUP_ROOT)
     }
 
-    pub fn catalog_backup_restore_intent_path(&self, table_bucket: &str) -> String {
-        format!(
-            "{}/{}/{}/{}",
-            self.catalog_root,
-            TABLE_CATALOG_BACKUP_RESTORE_ROOT,
-            table_catalog_path_hash(table_bucket),
-            TABLE_CATALOG_BACKUP_RESTORE_INTENT_FILE
-        )
-    }
-
     fn table_bucket_root_prefix(&self, table_bucket: &str) -> String {
         format!("{}/{}/{}/", self.catalog_root, TABLE_BUCKET_ROOT, table_catalog_path_hash(table_bucket))
     }
@@ -1433,7 +1391,6 @@ where
     B: TableCatalogObjectBackend,
 {
     ObjectBacked(ObjectTableCatalogStore<B>),
-    DurableStrong(ObjectTableCatalogStore<B>),
 }
 
 impl<B> ConfiguredTableCatalogStore<B>
@@ -1443,11 +1400,6 @@ where
     pub(crate) fn from_env(backend: B) -> TableCatalogStoreResult<Self> {
         Ok(match TableCatalogBackingMode::from_env()? {
             TableCatalogBackingMode::ObjectBacked => Self::ObjectBacked(ObjectTableCatalogStore::new(backend)),
-            TableCatalogBackingMode::DurableStrong => {
-                return Err(TableCatalogStoreError::Invalid(
-                    "durable-strong table catalog backing has been retired".to_string(),
-                ));
-            }
         })
     }
 
@@ -1455,25 +1407,7 @@ where
     pub(crate) fn new_for_test(backend: B, mode: TableCatalogBackingMode) -> Self {
         match mode {
             TableCatalogBackingMode::ObjectBacked => Self::ObjectBacked(ObjectTableCatalogStore::new(backend)),
-            TableCatalogBackingMode::DurableStrong => Self::DurableStrong(ObjectTableCatalogStore::new(backend)),
         }
-    }
-
-    #[allow(
-        dead_code,
-        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
-    )]
-    pub(crate) fn backing_mode(&self) -> TableCatalogBackingMode {
-        match self {
-            Self::ObjectBacked(_) => TableCatalogBackingMode::ObjectBacked,
-            Self::DurableStrong(_) => TableCatalogBackingMode::DurableStrong,
-        }
-    }
-
-    fn unsupported_for_durable_strong(operation: &str) -> TableCatalogStoreError {
-        TableCatalogStoreError::Invalid(format!(
-            "{operation} is not supported with {TABLE_CATALOG_BACKING_DURABLE_STRONG} table catalog backing"
-        ))
     }
 
     pub(crate) async fn get_table_catalog_diagnostics_retention(
@@ -1487,9 +1421,6 @@ where
                 .get_table_maintenance_config(table_bucket, namespace, table)
                 .await?
                 .retain_recent_metadata_files),
-            // Durable-strong maintenance configuration is not persisted yet. Zero adds no
-            // count-based retention; reachability still protects references, and this API never deletes.
-            Self::DurableStrong(_) => Ok(0),
         }
     }
 }
@@ -1502,49 +1433,42 @@ where
     async fn get_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<Option<TableBucketEntry>> {
         match self {
             Self::ObjectBacked(store) => store.get_table_bucket(table_bucket).await,
-            Self::DurableStrong(store) => store.get_table_bucket(table_bucket).await,
         }
     }
 
     async fn put_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.put_table_bucket(entry).await,
-            Self::DurableStrong(store) => store.put_table_bucket(entry).await,
         }
     }
 
     async fn ensure_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.ensure_table_bucket(entry).await,
-            Self::DurableStrong(store) => store.ensure_table_bucket(entry).await,
         }
     }
 
     async fn disable_empty_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.disable_empty_table_bucket(entry).await,
-            Self::DurableStrong(store) => store.disable_empty_table_bucket(entry).await,
         }
     }
 
     async fn create_namespace(&self, entry: NamespaceEntry) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.create_namespace(entry).await,
-            Self::DurableStrong(store) => store.create_namespace(entry).await,
         }
     }
 
     async fn list_namespaces(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_namespaces(table_bucket).await,
-            Self::DurableStrong(store) => store.list_namespaces(table_bucket).await,
         }
     }
 
     async fn list_namespaces_under(&self, table_bucket: &str, parent: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_namespaces_under(table_bucket, parent).await,
-            Self::DurableStrong(store) => store.list_namespaces_under(table_bucket, parent).await,
         }
     }
 
@@ -1555,7 +1479,6 @@ where
     ) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_namespace_children(table_bucket, parent).await,
-            Self::DurableStrong(store) => store.list_namespace_children(table_bucket, parent).await,
         }
     }
 
@@ -1568,7 +1491,6 @@ where
     ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_namespace_children_page(table_bucket, parent, cursor, limit).await,
-            Self::DurableStrong(store) => store.list_namespace_children_page(table_bucket, parent, cursor, limit).await,
         }
     }
 
@@ -1580,14 +1502,12 @@ where
     ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_namespaces_page(table_bucket, cursor, limit).await,
-            Self::DurableStrong(store) => store.list_namespaces_page(table_bucket, cursor, limit).await,
         }
     }
 
     async fn get_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Option<NamespaceEntry>> {
         match self {
             Self::ObjectBacked(store) => store.get_namespace(table_bucket, namespace).await,
-            Self::DurableStrong(store) => store.get_namespace(table_bucket, namespace).await,
         }
     }
 
@@ -1599,28 +1519,24 @@ where
     ) -> TableCatalogStoreResult<NamespacePropertiesUpdateResult> {
         match self {
             Self::ObjectBacked(store) => store.update_namespace_properties(table_bucket, namespace, update).await,
-            Self::DurableStrong(store) => store.update_namespace_properties(table_bucket, namespace, update).await,
         }
     }
 
     async fn drop_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.drop_namespace(table_bucket, namespace).await,
-            Self::DurableStrong(store) => store.drop_namespace(table_bucket, namespace).await,
         }
     }
 
     async fn create_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.create_table(entry).await,
-            Self::DurableStrong(store) => store.create_table(entry).await,
         }
     }
 
     async fn register_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.register_table(entry).await,
-            Self::DurableStrong(store) => store.register_table(entry).await,
         }
     }
 
@@ -1631,28 +1547,24 @@ where
     ) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.register_table_with_publication(entry, publication).await,
-            Self::DurableStrong(store) => store.register_table_with_publication(entry, publication).await,
         }
     }
 
     async fn list_tables(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_tables(table_bucket, namespace).await,
-            Self::DurableStrong(store) => store.list_tables(table_bucket, namespace).await,
         }
     }
 
     async fn list_all_tables(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_all_tables(table_bucket).await,
-            Self::DurableStrong(store) => store.list_all_tables(table_bucket).await,
         }
     }
 
     async fn ensure_table_warehouse_location_available(&self, candidate: &TableEntry) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.ensure_table_warehouse_location_available(candidate).await,
-            Self::DurableStrong(store) => store.ensure_table_warehouse_location_available(candidate).await,
         }
     }
 
@@ -1665,14 +1577,12 @@ where
     ) -> TableCatalogStoreResult<TableCatalogListPage<TableEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_tables_page(table_bucket, namespace, cursor, limit).await,
-            Self::DurableStrong(store) => store.list_tables_page(table_bucket, namespace, cursor, limit).await,
         }
     }
 
     async fn load_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<Option<TableEntry>> {
         match self {
             Self::ObjectBacked(store) => store.load_table(table_bucket, namespace, table).await,
-            Self::DurableStrong(store) => store.load_table(table_bucket, namespace, table).await,
         }
     }
 
@@ -1690,11 +1600,6 @@ where
                     .rename_table(table_bucket, source_namespace, source_table, destination_namespace, destination_table)
                     .await
             }
-            Self::DurableStrong(store) => {
-                store
-                    .rename_table(table_bucket, source_namespace, source_table, destination_namespace, destination_table)
-                    .await
-            }
         }
     }
 
@@ -1705,7 +1610,6 @@ where
     ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
         match self {
             Self::ObjectBacked(store) => store.resolve_table_data_plane_resource(table_bucket, object).await,
-            Self::DurableStrong(store) => store.resolve_table_data_plane_resource(table_bucket, object).await,
         }
     }
 
@@ -1716,14 +1620,12 @@ where
     ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
         match self {
             Self::ObjectBacked(store) => store.resolve_table_metadata_data_plane_resource(table_bucket, object).await,
-            Self::DurableStrong(store) => store.resolve_table_metadata_data_plane_resource(table_bucket, object).await,
         }
     }
 
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
         match self {
             Self::ObjectBacked(store) => store.commit_table(request).await,
-            Self::DurableStrong(store) => store.commit_table(request).await,
         }
     }
 
@@ -1734,21 +1636,18 @@ where
     ) -> TableCatalogStoreResult<TableCommitResult> {
         match self {
             Self::ObjectBacked(store) => store.commit_table_with_publication(request, publication).await,
-            Self::DurableStrong(store) => store.commit_table_with_publication(request, publication).await,
         }
     }
 
     async fn drop_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.drop_table(table_bucket, namespace, table).await,
-            Self::DurableStrong(store) => store.drop_table(table_bucket, namespace, table).await,
         }
     }
 
     async fn create_view(&self, entry: ViewEntry) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.create_view(entry).await,
-            Self::DurableStrong(store) => store.create_view(entry).await,
         }
     }
 
@@ -1759,14 +1658,12 @@ where
     ) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.create_view_with_publication(entry, publication).await,
-            Self::DurableStrong(store) => store.create_view_with_publication(entry, publication).await,
         }
     }
 
     async fn list_views(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<ViewEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_views(table_bucket, namespace).await,
-            Self::DurableStrong(store) => store.list_views(table_bucket, namespace).await,
         }
     }
 
@@ -1779,21 +1676,18 @@ where
     ) -> TableCatalogStoreResult<TableCatalogListPage<ViewEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_views_page(table_bucket, namespace, cursor, limit).await,
-            Self::DurableStrong(store) => store.list_views_page(table_bucket, namespace, cursor, limit).await,
         }
     }
 
     async fn load_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<Option<ViewEntry>> {
         match self {
             Self::ObjectBacked(store) => store.load_view(table_bucket, namespace, view).await,
-            Self::DurableStrong(store) => store.load_view(table_bucket, namespace, view).await,
         }
     }
 
     async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult> {
         match self {
             Self::ObjectBacked(store) => store.replace_view(request).await,
-            Self::DurableStrong(store) => store.replace_view(request).await,
         }
     }
 
@@ -1809,18 +1703,12 @@ where
                     .replace_view_with_publication(request, table_bucket_fence_required, publication)
                     .await
             }
-            Self::DurableStrong(store) => {
-                store
-                    .replace_view_with_publication(request, table_bucket_fence_required, publication)
-                    .await
-            }
         }
     }
 
     async fn drop_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.drop_view(table_bucket, namespace, view).await,
-            Self::DurableStrong(store) => store.drop_view(table_bucket, namespace, view).await,
         }
     }
 
@@ -1832,7 +1720,6 @@ where
     ) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
         match self {
             Self::ObjectBacked(store) => store.get_commit_by_id(table_bucket, table_id, commit_id).await,
-            Self::DurableStrong(store) => store.get_commit_by_id(table_bucket, table_id, commit_id).await,
         }
     }
 
@@ -1844,11 +1731,6 @@ where
     ) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
         match self {
             Self::ObjectBacked(store) => {
-                store
-                    .get_commit_by_idempotency_key(table_bucket, table_id, idempotency_key)
-                    .await
-            }
-            Self::DurableStrong(store) => {
                 store
                     .get_commit_by_idempotency_key(table_bucket, table_id, idempotency_key)
                     .await
@@ -1869,7 +1751,6 @@ where
     ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
         match self {
             Self::ObjectBacked(store) => store.get_table_maintenance_config(table_bucket, namespace, table).await,
-            Self::DurableStrong(store) => store.get_table_maintenance_config(table_bucket, namespace, table).await,
         }
     }
 
@@ -1882,11 +1763,6 @@ where
     ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
         match self {
             Self::ObjectBacked(store) => {
-                store
-                    .put_table_maintenance_config(table_bucket, namespace, table, config)
-                    .await
-            }
-            Self::DurableStrong(store) => {
                 store
                     .put_table_maintenance_config(table_bucket, namespace, table, config)
                     .await
@@ -1907,11 +1783,6 @@ where
                     .get_table_metadata_maintenance_report(table_bucket, namespace, table, job_id)
                     .await
             }
-            Self::DurableStrong(store) => {
-                store
-                    .get_table_metadata_maintenance_report(table_bucket, namespace, table, job_id)
-                    .await
-            }
         }
     }
 
@@ -1923,11 +1794,6 @@ where
     ) -> TableCatalogStoreResult<TableMaintenanceSchedulerReport> {
         match self {
             Self::ObjectBacked(store) => {
-                store
-                    .get_table_maintenance_scheduler_report(table_bucket, namespace, table)
-                    .await
-            }
-            Self::DurableStrong(store) => {
                 store
                     .get_table_maintenance_scheduler_report(table_bucket, namespace, table)
                     .await
@@ -1944,11 +1810,6 @@ where
     ) -> TableCatalogStoreResult<TableMaintenanceSchedulerRunResult> {
         match self {
             Self::ObjectBacked(store) => {
-                store
-                    .run_table_maintenance_scheduler_once(table_bucket, namespace, table, scheduler_id)
-                    .await
-            }
-            Self::DurableStrong(store) => {
                 store
                     .run_table_maintenance_scheduler_once(table_bucket, namespace, table, scheduler_id)
                     .await
@@ -1979,18 +1840,6 @@ where
                     )
                     .await
             }
-            Self::DurableStrong(store) => {
-                store
-                    .run_table_maintenance_scheduler_once_with_guard_at(
-                        &entry.table_bucket,
-                        &entry.namespace,
-                        &entry.table,
-                        scheduler_id,
-                        OffsetDateTime::now_utc(),
-                        Some(&guard),
-                    )
-                    .await
-            }
         }
     }
 
@@ -2004,11 +1853,6 @@ where
     ) -> TableCatalogStoreResult<TableMaintenanceQuarantineOperationResult> {
         match self {
             Self::ObjectBacked(store) => {
-                store
-                    .apply_table_maintenance_quarantine_operation(table_bucket, namespace, table, job_id, request)
-                    .await
-            }
-            Self::DurableStrong(store) => {
                 store
                     .apply_table_maintenance_quarantine_operation(table_bucket, namespace, table, job_id, request)
                     .await
@@ -2029,11 +1873,6 @@ where
                     .run_table_metadata_maintenance_worker_once(table_bucket, namespace, table, worker_id)
                     .await
             }
-            Self::DurableStrong(store) => {
-                store
-                    .run_table_metadata_maintenance_worker_once(table_bucket, namespace, table, worker_id)
-                    .await
-            }
         }
     }
 
@@ -2047,17 +1886,6 @@ where
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
         match self {
             Self::ObjectBacked(store) => {
-                store
-                    .run_table_metadata_maintenance_worker_once_conditionally(
-                        table_bucket,
-                        namespace,
-                        table,
-                        worker_id,
-                        condition,
-                    )
-                    .await
-            }
-            Self::DurableStrong(store) => {
                 store
                     .run_table_metadata_maintenance_worker_once_conditionally(
                         table_bucket,
@@ -2086,11 +1914,6 @@ where
                     .heartbeat_table_metadata_maintenance_job(table_bucket, namespace, table, job_id, lease_id, worker_id)
                     .await
             }
-            Self::DurableStrong(store) => {
-                store
-                    .heartbeat_table_metadata_maintenance_job(table_bucket, namespace, table, job_id, lease_id, worker_id)
-                    .await
-            }
         }
     }
 
@@ -2102,7 +1925,6 @@ where
     ) -> TableCatalogStoreResult<TableCatalogExport> {
         match self {
             Self::ObjectBacked(store) => store.export_table_catalog_entry(table_bucket, namespace, table).await,
-            Self::DurableStrong(store) => store.export_table_catalog_entry(table_bucket, namespace, table).await,
         }
     }
 
@@ -2119,11 +1941,6 @@ where
                     .diagnose_table_catalog(table_bucket, namespace, table, retain_recent_metadata_files)
                     .await
             }
-            Self::DurableStrong(store) => {
-                store
-                    .diagnose_table_catalog(table_bucket, namespace, table, retain_recent_metadata_files)
-                    .await
-            }
         }
     }
 
@@ -2135,7 +1952,6 @@ where
     ) -> TableCatalogStoreResult<TableCommitRecoveryReport> {
         match self {
             Self::ObjectBacked(store) => store.recover_table_commits(table_bucket, namespace, table).await,
-            Self::DurableStrong(store) => store.recover_table_commits(table_bucket, namespace, table).await,
         }
     }
 
@@ -2151,7 +1967,6 @@ where
     ) -> TableCatalogStoreResult<Option<ExternalCatalogBridgeEntry>> {
         match self {
             Self::ObjectBacked(store) => store.get_external_catalog_bridge(table_bucket, namespace, table).await,
-            Self::DurableStrong(store) => store.get_external_catalog_bridge(table_bucket, namespace, table).await,
         }
     }
 
@@ -2165,7 +1980,6 @@ where
     ) -> TableCatalogStoreResult<ExternalCatalogBridgeEntry> {
         match self {
             Self::ObjectBacked(store) => store.put_external_catalog_bridge(entry).await,
-            Self::DurableStrong(store) => store.put_external_catalog_bridge(entry).await,
         }
     }
 
@@ -2176,7 +1990,6 @@ where
     ) -> TableCatalogStoreResult<TableCatalogBackupReport> {
         match self {
             Self::ObjectBacked(store) => store.create_object_catalog_backup(table_bucket, expected_snapshot_etag).await,
-            Self::DurableStrong(store) => store.create_object_catalog_backup(table_bucket, expected_snapshot_etag).await,
         }
     }
 
@@ -2189,11 +2002,6 @@ where
     ) -> TableCatalogStoreResult<TableCatalogRestoreReport> {
         match self {
             Self::ObjectBacked(store) => {
-                store
-                    .restore_object_catalog_backup(table_bucket, backup_id, expected_snapshot_etag, allow_replace)
-                    .await
-            }
-            Self::DurableStrong(store) => {
                 store
                     .restore_object_catalog_backup(table_bucket, backup_id, expected_snapshot_etag, allow_replace)
                     .await

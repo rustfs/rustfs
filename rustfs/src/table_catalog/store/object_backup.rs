@@ -141,6 +141,43 @@ where
         Ok(objects)
     }
 
+    async fn validate_catalog_backup_snapshot_graph(
+        &self,
+        table_bucket: &str,
+        objects: &[ObjectCatalogBackupObject],
+    ) -> TableCatalogStoreResult<()> {
+        for object in objects
+            .iter()
+            .filter(|object| object.bucket == RUSTFS_META_BUCKET && object.object.ends_with(TABLE_ENTRY_FILE))
+        {
+            let entry: TableEntry = serde_json::from_slice(&object.data)
+                .map_err(|error| TableCatalogStoreError::Invalid(format!("table catalog entry is invalid: {error}")))?;
+            if entry.state != TableCatalogEntryState::Active {
+                continue;
+            }
+            if entry.table_bucket != table_bucket {
+                return Err(TableCatalogStoreError::Invalid(
+                    "catalog backup contains an entry for another table bucket".to_string(),
+                ));
+            }
+            let metadata_object = table_catalog_object_key_from_location(&entry.table_bucket, &entry.metadata_location)
+                .ok_or_else(|| TableCatalogStoreError::Invalid("table metadata location is not an object path".to_string()))?;
+            let metadata = objects
+                .iter()
+                .find(|candidate| candidate.bucket == entry.table_bucket && candidate.object == metadata_object)
+                .ok_or_else(|| {
+                    TableCatalogStoreError::NotFound(format!(
+                        "catalog backup is missing current metadata object: {}/{}",
+                        entry.table_bucket, metadata_object
+                    ))
+                })?;
+            let metadata = decode_table_metadata_json(&entry.metadata_location, &metadata.data)?;
+            let context = TableSnapshotGraphValidationContext::new(&self.backend, table_bucket, &entry);
+            validate_table_snapshot_changes(&context, None, &metadata).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn create_object_catalog_backup(
         &self,
         table_bucket: &str,
@@ -150,6 +187,8 @@ where
         let mutation_fence = Self::object_backup_mutation_fence(&guards);
         mutation_fence.ensure_held()?;
         let objects = self.capture_object_catalog_backup_objects(table_bucket).await?;
+        mutation_fence.ensure_held()?;
+        self.validate_catalog_backup_snapshot_graph(table_bucket, &objects).await?;
         mutation_fence.ensure_held()?;
         let identity = serde_json::to_vec(
             &objects
@@ -262,6 +301,9 @@ where
                 "catalog backup source watermark does not match".to_string(),
             ));
         }
+        self.validate_catalog_backup_snapshot_graph(table_bucket, &backup.objects)
+            .await?;
+        mutation_fence.ensure_held()?;
         let target_prefix = self.paths.table_bucket_root_prefix(table_bucket);
         let current = self.backend.list_objects(self.catalog_bucket(), &target_prefix).await?;
         let target_paths = backup

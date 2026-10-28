@@ -2426,16 +2426,10 @@ fn table_catalog_store_from_extensions(
 }
 
 fn table_catalog_object_store_from_extensions(extensions: &http::Extensions) -> S3Result<EcStoreObjectTableCatalogStore> {
-    match crate::table_catalog::TableCatalogBackingMode::from_env().map_err(catalog_store_error)? {
-        crate::table_catalog::TableCatalogBackingMode::ObjectBacked => Ok(crate::table_catalog::ObjectTableCatalogStore::new(
-            table_catalog_backend_from_extensions(extensions)?,
-        )),
-        crate::table_catalog::TableCatalogBackingMode::DurableStrong => Err(s3_error!(
-            InvalidRequest,
-            "operation is not supported with {} table catalog backing",
-            crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG
-        )),
-    }
+    crate::table_catalog::TableCatalogBackingMode::from_env().map_err(catalog_store_error)?;
+    Ok(crate::table_catalog::ObjectTableCatalogStore::new(table_catalog_backend_from_extensions(
+        extensions,
+    )?))
 }
 
 async fn table_bucket_enabled_from_extensions(extensions: &http::Extensions, bucket: &str) -> S3Result<bool> {

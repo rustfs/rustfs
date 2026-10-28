@@ -46,14 +46,8 @@ async fn configured_table_metadata_maintenance_response<B>(
 where
     B: crate::table_catalog::TableCatalogObjectBackend + Clone,
 {
-    match store {
-        crate::table_catalog::ConfiguredTableCatalogStore::ObjectBacked(store) => {
-            table_metadata_maintenance_response(store, metadata_backend, bucket, namespace, table, request).await
-        }
-        crate::table_catalog::ConfiguredTableCatalogStore::DurableStrong(store) => {
-            table_metadata_maintenance_response(store, metadata_backend, bucket, namespace, table, request).await
-        }
-    }
+    let crate::table_catalog::ConfiguredTableCatalogStore::ObjectBacked(store) = store;
+    table_metadata_maintenance_response(store, metadata_backend, bucket, namespace, table, request).await
 }
 
 pub struct GetTableMaintenanceConfigHandler {}

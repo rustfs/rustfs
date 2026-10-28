@@ -1317,7 +1317,7 @@ async fn table_commit_publication_forwards_lease_loss_to_storage_mutation_fence(
         ),
         rustfs_lock::ObjectKey::new(
             RUSTFS_META_BUCKET,
-            TableCatalogObjectPaths::default().backing_migration_global_fence_lock_path(),
+            TableCatalogObjectPaths::default().catalog_backup_global_fence_lock_path(),
         ),
         "rest-publication-migration".to_string(),
     );
@@ -2196,7 +2196,7 @@ fn rest_pagination_round_trips_context_bound_tokens() {
     assert_eq!(cursor, None);
     assert_eq!(limit.get(), 2);
     let next_page_token = first_pagination
-        .next_page_token(Some("strong:beta".to_string()))
+        .next_page_token(Some("object:beta".to_string()))
         .expect("page token should encode")
         .expect("page token should be present");
     let second_request = format!("/?pageSize=2&pageToken={next_page_token}")
@@ -2206,7 +2206,7 @@ fn rest_pagination_round_trips_context_bound_tokens() {
     let (cursor, limit) = second_pagination
         .page_request()
         .expect("continuation should remain paginated");
-    assert_eq!(cursor, Some("strong:beta"));
+    assert_eq!(cursor, Some("object:beta"));
     assert_eq!(limit.get(), 2);
     assert!(
         second_pagination
@@ -2223,7 +2223,7 @@ fn rest_pagination_round_trips_context_bound_tokens() {
     let (cursor, limit) = default_size_pagination
         .page_request()
         .expect("continuation should remain paginated");
-    assert_eq!(cursor, Some("strong:beta"));
+    assert_eq!(cursor, Some("object:beta"));
     assert_eq!(limit.get(), REST_DEFAULT_PAGE_SIZE);
 
     for other_context in [
@@ -2312,13 +2312,13 @@ fn rest_pagination_rejects_malformed_token_payloads() {
         encoded_json(serde_json::json!({
             "version": REST_PAGE_TOKEN_VERSION,
             "context": context_fingerprint,
-            "cursor": "strong:alpha",
+            "cursor": "legacy:alpha",
             "unknown": true
         })),
         encoded_json(serde_json::json!({
             "version": REST_PAGE_TOKEN_VERSION + 1,
             "context": context_fingerprint,
-            "cursor": "strong:alpha"
+            "cursor": "legacy:alpha"
         })),
         encoded_json(serde_json::json!({
             "version": REST_PAGE_TOKEN_VERSION,
@@ -6104,7 +6104,7 @@ async fn commit_publication_lock_order_remains_compatible_with_old_maintenance_n
             .await
     });
     metadata_backend.wait_for_lock_attempts(3).await;
-    let migration_lock = crate::table_catalog::TableCatalogObjectPaths::default().backing_migration_fence_lock_path("warehouse");
+    let migration_lock = crate::table_catalog::TableCatalogObjectPaths::default().catalog_backup_fence_lock_path("warehouse");
     assert_eq!(
         metadata_backend.lock_attempts.lock().await.as_slice(),
         &[
@@ -14781,136 +14781,4 @@ async fn legacy_commit_rejects_mismatched_table_uuid_before_commit() {
         .expect("table should still exist");
     assert_eq!(unchanged.metadata_location, current_location);
     assert_eq!(unchanged.generation, current.generation);
-}
-
-#[derive(Clone)]
-struct ColdStrongRegistrationBackend<B> {
-    inner: B,
-    armed: Arc<std::sync::atomic::AtomicBool>,
-    reader_ready: Arc<tokio::sync::Notify>,
-    resume: Arc<tokio::sync::Notify>,
-}
-
-impl<B> ColdStrongRegistrationBackend<B> {
-    async fn pause_after_reader(&self) {
-        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            self.reader_ready.notify_one();
-            self.resume.notified().await;
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl<B: crate::table_catalog::TableCatalogObjectBackend> crate::table_catalog::TableCatalogObjectBackend
-    for ColdStrongRegistrationBackend<B>
-{
-    fn acquires_catalog_migration_read_permit(&self) -> bool {
-        self.inner.acquires_catalog_migration_read_permit()
-    }
-
-    async fn acquire_catalog_migration_read_guards(
-        &self,
-        bucket: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Vec<crate::table_catalog::TableCatalogLockGuard>> {
-        let guards = self.inner.acquire_catalog_migration_read_guards(bucket).await?;
-        self.pause_after_reader().await;
-        Ok(guards)
-    }
-
-    async fn acquire_read_lock(
-        &self,
-        bucket: &str,
-        object: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::TableCatalogLockGuard> {
-        let guard = self.inner.acquire_read_lock(bucket, object).await?;
-        if object == crate::table_catalog::TableCatalogObjectPaths::default().backing_migration_global_fence_lock_path() {
-            self.pause_after_reader().await;
-        }
-        Ok(guard)
-    }
-
-    async fn acquire_write_lock(
-        &self,
-        bucket: &str,
-        object: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::TableCatalogLockGuard> {
-        self.inner.acquire_write_lock(bucket, object).await
-    }
-
-    async fn read_object(
-        &self,
-        bucket: &str,
-        object: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableCatalogObject>> {
-        self.inner.read_object(bucket, object).await
-    }
-
-    async fn read_object_unlocked(
-        &self,
-        bucket: &str,
-        object: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableCatalogObject>> {
-        self.inner.read_object_unlocked(bucket, object).await
-    }
-
-    async fn read_object_limited(
-        &self,
-        bucket: &str,
-        object: &str,
-        max_size: usize,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableCatalogObject>> {
-        self.inner.read_object_limited(bucket, object, max_size).await
-    }
-
-    async fn object_metadata(
-        &self,
-        bucket: &str,
-        object: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableCatalogObjectMetadata>> {
-        self.inner.object_metadata(bucket, object).await
-    }
-
-    async fn object_exists(&self, bucket: &str, object: &str) -> crate::table_catalog::TableCatalogStoreResult<bool> {
-        self.inner.object_exists(bucket, object).await
-    }
-
-    async fn put_object(
-        &self,
-        bucket: &str,
-        object: &str,
-        data: Vec<u8>,
-        precondition: crate::table_catalog::TableCatalogPutPrecondition,
-    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        self.inner.put_object(bucket, object, data, precondition).await
-    }
-
-    async fn put_object_unlocked(
-        &self,
-        bucket: &str,
-        object: &str,
-        data: Vec<u8>,
-        precondition: crate::table_catalog::TableCatalogPutPrecondition,
-        guards: Vec<crate::admin::storage_api::object::WriteCommitGuard>,
-    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        self.inner
-            .put_object_unlocked(bucket, object, data, precondition, guards)
-            .await
-    }
-
-    async fn delete_object(&self, bucket: &str, object: &str) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        self.inner.delete_object(bucket, object).await
-    }
-
-    async fn delete_object_if_match(
-        &self,
-        bucket: &str,
-        object: &str,
-        expected_etag: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        self.inner.delete_object_if_match(bucket, object, expected_etag).await
-    }
-
-    async fn list_objects(&self, bucket: &str, prefix: &str) -> crate::table_catalog::TableCatalogStoreResult<Vec<String>> {
-        self.inner.list_objects(bucket, prefix).await
-    }
 }

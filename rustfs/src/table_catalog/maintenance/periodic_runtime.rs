@@ -178,9 +178,6 @@ async fn run(config: PeriodicMaintenanceConfig, server: Arc<ServerContextSlot>, 
                 TableCatalogBackingMode::ObjectBacked => {
                     ConfiguredTableCatalogStore::ObjectBacked(ObjectTableCatalogStore::new(backend))
                 }
-                TableCatalogBackingMode::DurableStrong => {
-                    ConfiguredTableCatalogStore::DurableStrong(ObjectTableCatalogStore::new(backend))
-                }
             };
             scheduler = Some(PeriodicMaintenanceScheduler::new(store, config.buckets.clone(), config.interval));
         }

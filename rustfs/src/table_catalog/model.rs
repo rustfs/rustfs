@@ -1086,7 +1086,6 @@ pub(crate) struct TableCatalogExport {
 pub(crate) struct TableCatalogBackingManifest {
     pub version: u16,
     pub current: TableCatalogBackingProfile,
-    pub migration: TableCatalogBackingMigrationPlan,
     pub ha: TableCatalogHaPolicy,
     pub scale_validation: TableCatalogScaleValidation,
 }
@@ -1106,42 +1105,24 @@ pub(crate) struct TableCatalogBackingProfile {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableCatalogBackingKind {
     ObjectBacked,
-    // RUSTFS_COMPAT_TODO(table-catalog-backing-manifest-v1-wire-labels): Keep the version 1 wire label for existing clients. Remove after a versioned manifest with an explicit client migration contract replaces it.
-    #[serde(rename = "STRONG_KV_WAL")]
-    DurableStrongSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableCatalogAuthority {
     RustfsSysObject,
-    #[allow(
-        dead_code,
-        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
-    )]
-    LinearizableMetadataKv,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableCatalogConsistencyMode {
     ConditionalObjectCas,
-    #[allow(
-        dead_code,
-        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
-    )]
-    LinearizableCas,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableCatalogDurabilityMode {
     StagedCommitLogBeforePointerUpdate,
-    #[allow(
-        dead_code,
-        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
-    )]
-    WalBeforeStateMachineApply,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1175,132 +1156,6 @@ pub(crate) struct TableCatalogSnapshotState {
     pub snapshot_etag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_version: Option<u16>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct TableCatalogBackingMigrationPlan {
-    pub source_kind: TableCatalogBackingKind,
-    pub target_kind: TableCatalogBackingKind,
-    pub status: TableCatalogBackingMigrationStatus,
-    pub required_steps: Vec<TableCatalogBackingMigrationStep>,
-    pub blockers: Vec<TableCatalogBackingMigrationBlocker>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct TableCatalogBackingMigrationDryRunReport {
-    pub table_bucket: String,
-    pub source_kind: TableCatalogBackingKind,
-    pub target_kind: TableCatalogBackingKind,
-    pub status: TableCatalogBackingMigrationStatus,
-    pub namespace_count: usize,
-    pub table_count: usize,
-    pub view_count: usize,
-    pub commit_log_count: usize,
-    pub idempotency_index_count: usize,
-    pub warehouse_prefix_count: usize,
-    pub warehouse_index_ready: bool,
-    pub object_backed_writes_fenced: bool,
-    pub ready_to_enable_durable_strong: bool,
-    pub blockers: Vec<TableCatalogBackingMigrationBlocker>,
-    pub recommended_actions: Vec<TableCatalogBackingMigrationAction>,
-    pub rollback: TableCatalogBackingRollbackPlan,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct TableCatalogBackingMigrationExecutionReport {
-    pub table_bucket: String,
-    pub source_kind: TableCatalogBackingKind,
-    pub target_kind: TableCatalogBackingKind,
-    pub status: TableCatalogBackingMigrationExecutionStatus,
-    pub namespace_count: usize,
-    pub table_count: usize,
-    pub view_count: usize,
-    pub commit_log_count: usize,
-    pub idempotency_index_count: usize,
-    pub source_fingerprint: String,
-    pub target_snapshot_etag: String,
-    pub object_backed_writes_fenced: bool,
-    pub ready_to_enable_durable_strong: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(crate) enum TableCatalogBackingMigrationExecutionStatus {
-    SnapshotMaterialized,
-    SnapshotAlreadyMaterialized,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct TableCatalogBackingMigrationCancelReport {
-    pub table_bucket: String,
-    pub status: TableCatalogBackingMigrationCancelStatus,
-    pub object_backed_writes_fenced: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(crate) enum TableCatalogBackingMigrationCancelStatus {
-    FenceReleased,
-    NoMigrationFence,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(crate) enum TableCatalogBackingMigrationStatus {
-    ReadyToSnapshot,
-    SnapshotMaterialized,
-    RecoveryRequired,
-    ManualReviewRequired,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(crate) enum TableCatalogBackingMigrationStep {
-    SnapshotCatalogExport,
-    ReplayCommitLog,
-    VerifyCurrentPointer,
-    EnableSingleWriterFencing,
-    // RUSTFS_COMPAT_TODO(table-catalog-backing-manifest-v1-wire-labels): Keep the version 1 wire label for existing clients. Remove after a versioned manifest with an explicit client migration contract replaces it.
-    #[serde(rename = "CUT_OVER_LINEARIZABLE_READS")]
-    CutOverDurableSnapshotReads,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(crate) enum TableCatalogBackingMigrationBlocker {
-    TableRenameRecoveryRequired,
-    CommitRecoveryRequired,
-    CommitManualReviewRequired,
-    WarehouseIndexBackfillRequired,
-    DuplicateWarehousePrefix,
-    DuplicateTableIdentity,
-    TableViewIdentifierCollision,
-    DurableStrongSnapshotChanged,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(crate) enum TableCatalogBackingMigrationAction {
-    RunCatalogRecovery,
-    BackfillWarehouseIndex,
-    ReviewDuplicateWarehousePrefixes,
-    ReviewDuplicateTableIdentities,
-    ReviewTableViewIdentifierCollisions,
-    SnapshotObjectBackedCatalog,
-    EnableDurableStrongBacking,
-    VerifyDurableStrongSnapshot,
-    SnapshotRemainingTableBuckets,
-    ReviewDurableStrongSnapshot,
-    KeepObjectBackedRollbackConfig,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct TableCatalogBackingRollbackPlan {
-    pub backing_config_key: &'static str,
-    pub current_backing_value: &'static str,
-    pub rollback_backing_value: &'static str,
-    pub preserves_object_backed_catalog: bool,
-    pub requires_operator_restart: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1348,7 +1203,6 @@ pub(crate) enum TableCatalogScaleValidationStatus {
 pub(crate) enum TableCatalogScaleValidationScenario {
     ConcurrentCommitCas,
     CommitLogRecoveryReplay,
-    MigrationSnapshotReplay,
     ReadReplicaStaleReadGuard,
     ClientConformanceMatrix,
 }
