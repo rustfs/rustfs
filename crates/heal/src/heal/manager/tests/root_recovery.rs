@@ -106,6 +106,64 @@ fn root_request() -> HealRequest {
     admin_request(HealType::Cluster)
 }
 
+#[tokio::test]
+async fn root_recovery_force_start_rejects_published_alias_id() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk]);
+    {
+        let mut config = manager.config.write().await;
+        config.queue_size = 32;
+        config.overlap_policy = HealOverlapPolicy::Merge;
+    }
+    let original = HealRequest::object("other-bucket".to_string(), "object".to_string(), None);
+    let original_id = original.id.clone();
+    assert_eq!(
+        manager
+            .submit_heal_request(original.clone())
+            .await
+            .expect("queue original owner"),
+        HealAdmissionResult::Accepted
+    );
+
+    let mut forced = admin_prefix_request("bucket", "scope/");
+    forced.force_start = true;
+    let forced_id = forced.id.clone();
+    assert!(Uuid::parse_str(&forced_id).is_ok(), "durable task id must be a UUID");
+    let mut duplicate = original;
+    duplicate.id.clone_from(&forced_id);
+    assert_eq!(
+        manager.submit_heal_request(duplicate).await.expect("publish legacy alias"),
+        HealAdmissionResult::Merged
+    );
+    assert_eq!(manager.canonical_task_id(&forced_id).await, original_id);
+
+    let receipt = manager
+        .submit_heal_request_with_receipt(forced)
+        .await
+        .expect("force start admission decision");
+    let pending = manager.root_recovery.pending().await.expect("read durable intents");
+    let durable_forced = pending.iter().any(|request| request.id == forced_id);
+    let queued_forced = manager
+        .heal_queue
+        .lock()
+        .await
+        .requests()
+        .any(|request| request.id == forced_id);
+    let forced_status = manager.get_task_status_for_path("bucket/scope", &forced_id).await;
+    let alias_status = manager.get_task_status_for_path("other-bucket/object", &forced_id).await;
+    println!(
+        "published_alias_force admission={:?} durable_forced={} queued_forced={} forced_status={:?} alias_status={:?}",
+        receipt.result, durable_forced, queued_forced, forced_status, alias_status
+    );
+
+    assert_eq!(receipt.result, HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning));
+    assert!(!durable_forced, "force start must not persist an already claimed id");
+    assert!(!queued_forced, "force start must not queue an already claimed id");
+    assert_eq!(manager.canonical_task_id(&forced_id).await, original_id);
+    assert!(matches!(forced_status, Err(Error::TaskNotFound { task_id }) if task_id == forced_id));
+    assert!(matches!(alias_status, Ok(HealTaskStatus::Pending)));
+}
+
 fn admin_request(heal_type: HealType) -> HealRequest {
     let mut request = HealRequest::new(heal_type, HealOptions::default(), HealPriority::High);
     request.source = HealRequestSource::Admin;
