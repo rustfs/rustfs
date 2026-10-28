@@ -16,8 +16,8 @@ use super::periodic::PeriodicMaintenanceScheduler;
 use crate::storage_api::startup::services::ServerContextSlot;
 use crate::storage_api::table::check_valid_bucket_name_strict;
 use crate::table_catalog::{
-    ConfiguredTableCatalogStore, EcStoreTableCatalogObjectBackend, ObjectTableCatalogStore, StrongTableCatalogStore,
-    TableCatalogBackingMode, TableCatalogStoreError, TableCatalogStoreResult,
+    ConfiguredTableCatalogStore, EcStoreTableCatalogObjectBackend, ObjectTableCatalogStore, TableCatalogBackingMode,
+    TableCatalogStoreError, TableCatalogStoreResult,
 };
 use std::{collections::BTreeSet, future::Future, sync::Arc, time::Duration};
 use tokio::{task::JoinHandle, time::Instant};

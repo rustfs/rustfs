@@ -3658,7 +3658,7 @@ where
             }
         };
 
-        let mut report = self
+        let report = self
             .plan_table_metadata_maintenance(
                 table_bucket,
                 &namespace_name,
