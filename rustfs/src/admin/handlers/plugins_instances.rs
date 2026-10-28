@@ -17,12 +17,13 @@ use crate::admin::{
     handlers::audit_runtime_config::{remove_audit_target_config, set_audit_target_config},
     handlers::event::{converge_target_mutation_on_cluster, preflight_target_mutation_on_cluster},
     handlers::notify_runtime_access::{
-        load_notification_mutation_snapshot, remove_notification_target_config, set_notification_target_config,
+        get_notification_system, load_notification_mutation_snapshot, remove_notification_target_config,
+        set_notification_target_config,
     },
     handlers::supervise_admin_mutation,
     handlers::target_descriptor::{
         AdminTargetSpec, RuntimeHealthStatus, TargetEndpointSource, TargetInstanceReadModel, admin_target_spec_from_builtin,
-        allowed_target_keys, build_enabled_target_kvs, build_json_response, collect_target_instances,
+        allowed_target_keys, build_enabled_target_kvs, build_json_response, build_validated_target_kvs, collect_target_instances,
         collect_validated_key_values, find_target_instance, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason,
     },
@@ -973,14 +974,7 @@ impl Operation for PutPluginInstanceHandler {
 
         let validated_kvs = if let Some(effective) = effective_instance.as_ref() {
             let candidate = effective_validation_fields(context, resolved.target_spec.subsystem, effective, &body.key_values)?;
-            build_enabled_target_kvs(
-                context.specs,
-                candidate.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-                resolved.target_spec.subsystem,
-                context.default_queue_dir,
-                "plugin instance",
-            )
-            .await?
+            build_validated_target_kvs(&resolved.target_spec, candidate, context.default_queue_dir).await?
         } else {
             build_enabled_target_kvs(
                 context.specs,
@@ -1009,7 +1003,7 @@ impl Operation for PutPluginInstanceHandler {
                 stored_instance_config(&config_snapshot, resolved.target_spec.subsystem, rustfs_config::DEFAULT_DELIMITER)
                     .cloned();
             let expected_generation = if body.expected_config.is_some() { generation } else { None };
-            let system = load_notification_mutation_snapshot().await?.0;
+            let system = get_notification_system().await?;
             let subsystem = resolved.target_spec.subsystem.to_owned();
             let target_name = resolved.target_name.clone();
             supervise_admin_mutation("plugin notification target mutation", async move {
@@ -1593,16 +1587,38 @@ mod tests {
             let candidate =
                 super::effective_validation_fields(context, subsystem, &effective, &requested).expect("merge request");
             assert_eq!(candidate.get(NATS_PASSWORD).map(String::as_str), Some("password"));
-            let error = super::build_enabled_target_kvs(
-                context.specs,
-                candidate.iter().map(|(key, value)| (key.as_str(), value.as_str())),
-                subsystem,
-                context.default_queue_dir,
-                "plugin instance",
-            )
-            .await
-            .expect_err("mixed NATS authentication must fail before connection");
+            let spec = context
+                .specs
+                .iter()
+                .find(|spec| spec.subsystem == subsystem)
+                .expect("NATS descriptor");
+            let error = super::build_validated_target_kvs(spec, candidate, context.default_queue_dir)
+                .await
+                .expect_err("mixed NATS authentication must fail before connection");
             assert!(error.to_string().contains("only one auth method"));
+        }
+    }
+
+    #[test]
+    fn conditional_update_rejects_unknown_and_duplicate_keys() {
+        let context = super::plugin_instance_domain_context(PluginContractDomain::Notify);
+        let subsystem = rustfs_config::notify::NOTIFY_NATS_SUB_SYS;
+        let unknown = [super::KeyValue {
+            key: "unknown".into(),
+            value: "value".into(),
+        }];
+        let duplicate = [
+            super::KeyValue {
+                key: rustfs_config::NATS_SUBJECT.into(),
+                value: "one".into(),
+            },
+            super::KeyValue {
+                key: rustfs_config::NATS_SUBJECT.into(),
+                value: "two".into(),
+            },
+        ];
+        for request in [&unknown[..], &duplicate[..]] {
+            assert!(super::effective_validation_fields(context, subsystem, &KVS::new(), request).is_err());
         }
     }
 

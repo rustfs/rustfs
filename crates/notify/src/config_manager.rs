@@ -68,10 +68,14 @@ fn configs_equal(first: Option<&KVS>, second: Option<&KVS>) -> bool {
     match (first, second) {
         (None, None) => true,
         (Some(first), Some(second)) => {
-            let mut first = first.0.clone();
-            let mut second = second.0.clone();
-            first.sort_by(|a, b| (&a.key, &a.value, a.hidden_if_empty).cmp(&(&b.key, &b.value, b.hidden_if_empty)));
-            second.sort_by(|a, b| (&a.key, &a.value, a.hidden_if_empty).cmp(&(&b.key, &b.value, b.hidden_if_empty)));
+            if first == second {
+                return true;
+            }
+            let mut first: Vec<_> = first.0.iter().collect();
+            let mut second: Vec<_> = second.0.iter().collect();
+            // Lookup uses the first occurrence of a key, so preserve duplicate-key order.
+            first.sort_by(|a, b| a.key.cmp(&b.key));
+            second.sort_by(|a, b| a.key.cmp(&b.key));
             first == second
         }
         _ => false,
@@ -474,6 +478,53 @@ mod tests {
     };
     use crate::rules::RulesMap;
     use crate::{NotificationError, NotificationRuntimeState};
+
+    #[test]
+    fn config_comparison_preserves_duplicates_and_hidden_flags() {
+        use rustfs_config::server_config::{KV, KVS};
+        let field = |key: &str, value: &str, hidden_if_empty: bool| KV {
+            key: key.into(),
+            value: value.into(),
+            hidden_if_empty,
+        };
+        let original = KVS(vec![
+            field("password", "secret", false),
+            field("token", "", true),
+            field("password", "secret", false),
+        ]);
+        let reordered = KVS(vec![
+            field("password", "secret", false),
+            field("password", "secret", false),
+            field("token", "", true),
+        ]);
+        let missing_duplicate = KVS(vec![field("password", "secret", false), field("token", "", true)]);
+        let changed_flag = KVS(vec![
+            field("password", "secret", false),
+            field("password", "secret", false),
+            field("token", "", false),
+        ]);
+        assert!(super::configs_equal(Some(&original), Some(&reordered)));
+        assert!(!super::configs_equal(Some(&original), Some(&missing_duplicate)));
+        assert!(!super::configs_equal(Some(&original), Some(&changed_flag)));
+        assert!(!super::configs_equal(Some(&original), None));
+        let first_value = KVS(vec![
+            field("password", "old", false),
+            field("token", "", true),
+            field("password", "new", false),
+        ]);
+        let reordered_keys = KVS(vec![
+            field("token", "", true),
+            field("password", "old", false),
+            field("password", "new", false),
+        ]);
+        let reordered_duplicates = KVS(vec![
+            field("token", "", true),
+            field("password", "new", false),
+            field("password", "old", false),
+        ]);
+        assert!(super::configs_equal(Some(&first_value), Some(&reordered_keys)));
+        assert!(!super::configs_equal(Some(&first_value), Some(&reordered_duplicates)));
+    }
 
     #[test]
     fn conditional_target_update_rejects_rotation_and_deletion() {

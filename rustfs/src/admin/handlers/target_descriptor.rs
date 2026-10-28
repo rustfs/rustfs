@@ -602,6 +602,15 @@ where
     let kv_map = collect_validated_key_values(key_values, &allowed_keys, target_type, target_label)?;
     let spec = target_spec(specs, target_type)
         .ok_or_else(|| s3_error!(InvalidArgument, "unsupported target type: '{}'", target_type))?;
+    build_validated_target_kvs(spec, kv_map, default_queue_dir).await
+}
+
+/// Validate and build from keys already checked against the target descriptor.
+pub(crate) async fn build_validated_target_kvs(
+    spec: &AdminTargetSpec,
+    kv_map: HashMap<String, String>,
+    default_queue_dir: &str,
+) -> S3Result<KVS> {
     timeout(Duration::from_secs(10), validate_target_request(spec, &kv_map, default_queue_dir))
         .await
         .map_err(|_| s3_error!(InvalidArgument, "target validation timed out after 10s"))??;
