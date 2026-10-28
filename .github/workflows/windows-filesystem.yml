@@ -1,224 +1,209 @@
-# Copyright 2024 RustFS Team
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-name: Windows Filesystem Tests
+name: Scanner Admission Receipt Red Green Preflight
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - "crates/ecstore/src/disk/**"
-      - "crates/ecstore/src/layout/**"
-      - "crates/ecstore/src/store/init_format.rs"
-      - "crates/ecstore/src/set_disk/ops/locking.rs"
-      - "crates/ecstore/src/object_api/write_commit_context.rs"
-      - "crates/ecstore/src/bucket/utils.rs"
-      - "crates/ecstore/Cargo.toml"
-      - "crates/utils/src/dunce.rs"
-      - "crates/utils/src/os/**"
-      - "crates/utils/Cargo.toml"
-      - "crates/utils/src/path.rs"
-      - "rustfs/build.rs"
-      - "rustfs/Cargo.toml"
-      - "rustfs/src/main.rs"
-      - "rustfs/src/server/runtime.rs"
-      - "rustfs/src/startup_*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/actions/setup/**"
-      - ".github/workflows/windows-filesystem.yml"
-  pull_request:
-    branches: [ main ]
-    paths:
-      - "crates/ecstore/src/disk/**"
-      - "crates/ecstore/src/layout/**"
-      - "crates/ecstore/src/store/init_format.rs"
-      - "crates/ecstore/src/set_disk/ops/locking.rs"
-      - "crates/ecstore/src/object_api/write_commit_context.rs"
-      - "crates/ecstore/src/bucket/utils.rs"
-      - "crates/ecstore/Cargo.toml"
-      - "crates/utils/src/dunce.rs"
-      - "crates/utils/src/os/**"
-      - "crates/utils/Cargo.toml"
-      - "crates/utils/src/path.rs"
-      - "rustfs/build.rs"
-      - "rustfs/Cargo.toml"
-      - "rustfs/src/main.rs"
-      - "rustfs/src/server/runtime.rs"
-      - "rustfs/src/startup_*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/actions/setup/**"
-      - ".github/workflows/windows-filesystem.yml"
   workflow_dispatch:
+    inputs:
+      expected_head:
+        description: Full SHA of this workflow commit
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: scanner-admission-receipt-${{ github.ref }}
+  cancel-in-progress: false
 
-env:
-  CARGO_TERM_COLOR: always
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  RUST_BACKTRACE: 1
-
+# Exact local channel, processor, manager, and observer tests only. This does
+# not run the rejected RPC/MRF scenarios or replace full CI/distributed G.
 jobs:
-  rename-safety:
-    name: Rename Safety
-    runs-on: windows-latest
-    timeout-minutes: 60
+  scoped:
+    strategy:
+      fail-fast: false
+      matrix:
+        phase: [red, green]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PHASE: ${{ matrix.phase }}
+      EXPECTED_HEAD: ${{ inputs.expected_head }}
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_BACKTRACE: '0'
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+      NO_PROXY: 127.0.0.1,localhost
     steps:
-      - name: Checkout repository
+      - name: Checkout workflow candidate
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
+          fetch-depth: 10
           persist-credentials: false
 
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: build-x86_64-pc-windows-msvc
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-          install-test-tools: 'false'
-
-      - name: Check production Windows dependencies
-        shell: pwsh
-        run: cargo check -p rustfs-ecstore --lib
-
-      - name: Test guarded rename publication
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib rename_all_ -- --nocapture
-
-      - name: Test multipart parent durability barriers
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib multipart_owned_record_parent_barriers_ -- --nocapture
-
-      - name: Test Windows path conversion
-        shell: pwsh
-        run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"
-
-      - name: Test Windows volume and disk-space probes
-        shell: pwsh
-        run: |
-          # Map a drive letter to the temp drive's administrative share so the
-          # remote-volume probe also covers mapped network drives.
-          $drive = (Split-Path -Qualifier ([System.IO.Path]::GetTempPath())).TrimEnd(':')
-          net use R: "\\localhost\$drive`$" /persistent:no
-          if ($LASTEXITCODE -eq 0) {
-            $env:RUSTFS_TEST_WINDOWS_MAPPED_DRIVE = 'R:'
-          } else {
-            Write-Output "::warning::could not map R: to \\localhost\$drive`$; mapped-drive test will skip"
-          }
-          cargo test -p rustfs-utils --features os --lib os:: -- --nocapture
-          $status = $LASTEXITCODE
-          if ($env:RUSTFS_TEST_WINDOWS_MAPPED_DRIVE) { net use R: /delete /y | Out-Null }
-          exit $status
-
-      - name: Test Windows handle guards
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib windows_ -- --nocapture
-
-      - name: Test endpoint path parsing
-        shell: pwsh
-        run: "cargo test -p rustfs-ecstore --lib layout::endpoint:: -- --nocapture"
-
-      - name: Test startup temporary-directory cleanup
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib cleanup_tmp_on_startup_ -- --nocapture
-
-      - name: Test object key Windows admission
-        shell: pwsh
-        run: "cargo test -p rustfs-ecstore --lib bucket::utils:: -- --nocapture"
-
-      - name: Test Windows file-name rules
-        shell: pwsh
-        run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"
-
-      - name: Test fresh format publication
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib fresh_format_load_initializes_all_disks -- --nocapture
-
-  # The native Windows main thread only gets the 1 MiB PE stack reserve, while
-  # Linux and macOS hand out 8 MiB. Startup runs the whole root future on the
-  # thread that calls `block_on`, so a debug server once overflowed before it
-  # listened on Windows only. Start a real server to keep that covered.
-  startup-smoke:
-    name: Startup Smoke
-    runs-on: windows-latest
-    timeout-minutes: 90
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: build-x86_64-pc-windows-msvc
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-          install-test-tools: 'false'
-
-      - name: Build debug server binary
-        shell: pwsh
-        run: cargo build --locked -p rustfs --bin rustfs
-
-      - name: Print version
-        shell: pwsh
-        run: |
-          & .\target\debug\rustfs.exe --version
-          if ($LASTEXITCODE -ne 0) { throw "rustfs --version exited with $LASTEXITCODE" }
-
-      - name: Start server and wait for readiness
-        shell: pwsh
+      - name: Verify workflow, source, and test snapshots
+        shell: bash
         env:
-          RUSTFS_ACCESS_KEY: rustfsadmin
-          RUSTFS_SECRET_KEY: rustfsadmin
+          LOG_DIR: ${{ runner.temp }}/scanner-admission-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.phase }}
         run: |
-          $volume = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke'
-          $stdout = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke.out.log'
-          $stderr = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke.err.log'
-          New-Item -ItemType Directory -Force -Path $volume | Out-Null
-          $server = Start-Process -FilePath .\target\debug\rustfs.exe `
-            -ArgumentList @('--address', '127.0.0.1:9000', "`"$volume`"") `
-            -RedirectStandardOutput $stdout -RedirectStandardError $stderr `
-            -NoNewWindow -PassThru
-          # Cache the process handle now; otherwise ExitCode reads back empty.
-          $null = $server.Handle
-          $ready = $false
-          try {
-            for ($i = 0; $i -lt 180; $i++) {
-              if ($server.HasExited) { break }
-              try {
-                $response = Invoke-WebRequest -Uri 'http://127.0.0.1:9000/health/ready' -UseBasicParsing -NoProxy -TimeoutSec 2
-                if ($response.StatusCode -eq 200) { $ready = $true; break }
-              } catch {}
-              Start-Sleep -Seconds 1
-            }
-          } finally {
-            if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force }
-            $server.WaitForExit()
-            Write-Host '--- server stdout (tail) ---'
-            Get-Content $stdout -Tail 100 -ErrorAction SilentlyContinue
-            Write-Host '--- server stderr (tail) ---'
-            Get-Content $stderr -Tail 100 -ErrorAction SilentlyContinue
+          set -euo pipefail
+          [[ ! -e "$LOG_DIR" ]]
+          mkdir "$LOG_DIR"
+          red=c05566234d900dc778566737142698020c8412bc
+          green=ce0e805f33b1098ad77da04ead87abd459a00895
+          head=$(git rev-parse HEAD)
+          parent=$(git rev-parse "${head}^")
+          red_tree=$(git rev-parse "${red}^{tree}")
+          green_tree=$(git rev-parse "${green}^{tree}")
+          green_parent=$(git rev-parse "${green}^")
+          red_test=$(git rev-parse "${red}:crates/scanner/src/scanner_folder/tests/observed_admission.rs")
+          green_test=$(git rev-parse "${green}:crates/scanner/src/scanner_folder/tests/observed_admission.rs")
+          source_diff=$(git diff --full-index --binary "$red" "$green" | sha256sum | cut -d' ' -f1)
+          workflow_files=$(git diff --name-only "$green" "$head")
+          printf 'expected_head=%s head=%s parent=%s red=%s red_tree=%s green=%s green_tree=%s green_parent=%s red_test=%s green_test=%s source_diff=%s workflow_files=%s\n' \
+            "$EXPECTED_HEAD" "$head" "$parent" "$red" "$red_tree" "$green" "$green_tree" "$green_parent" "$red_test" "$green_test" "$source_diff" "$workflow_files" | tee "$LOG_DIR/snapshot.txt"
+          [[ "$EXPECTED_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$head" == "$EXPECTED_HEAD" && "$head" == "$GITHUB_SHA" && "$parent" == "$green" ]]
+          [[ "$red_tree" == 77528cf69ec000b73023ec1d43e18a7d011df968 ]]
+          [[ "$green_tree" == 4d44b4eec7d56048e6f11abb7334dfffa8773e93 && "$green_parent" == "$red" ]]
+          [[ "$red_test" == 93eee757adac8a1437e1edb4eadec318d95aff7a && "$red_test" == "$green_test" ]]
+          [[ "$source_diff" == 57c1ef60c8a69671b4c711b261ff0f521566bced145685491774c53874847e85 ]]
+          [[ "$workflow_files" == .github/workflows/windows-filesystem.yml ]]
+          [[ -z "$(git status --porcelain --untracked-files=all)" ]]
+          if [[ "$PHASE" == red ]]; then
+            target="$red"
+            expected_tree="$red_tree"
+          else
+            [[ "$PHASE" == green ]]
+            target="$green"
+            expected_tree="$green_tree"
+          fi
+          git checkout --detach "$target"
+          [[ "$(git rev-parse HEAD)" == "$target" ]]
+          [[ "$(git rev-parse 'HEAD^{tree}')" == "$expected_tree" ]]
+          [[ -z "$(git status --porcelain --untracked-files=all)" ]]
+          printf 'phase=%s selected_source=%s selected_tree=%s\n' "$PHASE" "$target" "$expected_tree" | tee -a "$LOG_DIR/snapshot.txt"
+
+      - name: Setup Rust and build dependencies
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: scanner-admission-receipt-${{ matrix.phase }}
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+          install-test-tools: 'false'
+
+      - name: Run exact red or green unit tests
+        shell: bash
+        env:
+          LOG_DIR: ${{ runner.temp }}/scanner-admission-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.phase }}
+        run: |
+          set -euo pipefail
+          [[ -f "$LOG_DIR/snapshot.txt" ]]
+          rustc --version --verbose | tee "$LOG_DIR/rustc-version.log"
+          cargo --version --verbose | tee "$LOG_DIR/cargo-version.log"
+          rustup show active-toolchain | tee "$LOG_DIR/rustup-version.log"
+          grep -Eq '^stable-' "$LOG_DIR/rustup-version.log"
+          check_disk() {
+            local available
+            df -h . | tee -a "$LOG_DIR/disk.log"
+            available=$(df -Pk . | awk 'NR == 2 {print $4}')
+            [[ "$available" =~ ^[0-9]+$ ]]
+            (( available >= 4194304 ))
           }
-          if (-not $ready) {
-            throw ("rustfs did not report ready on /health/ready (exit code: {0})" -f $server.ExitCode)
+          run_one() {
+            local package="$1" name="$2" short status
+            short="${name##*::}"
+            check_disk
+            printf 'RUSTFS_SCANNER_OBSERVED_ADMISSION_TEST_CHILD=%s cargo test --locked -p %s --lib -- %s --exact --test-threads=1\n' \
+              "$name" "$package" "$name" >"$LOG_DIR/$short.command"
+            set +e
+            timeout --signal=TERM --kill-after=30s 65m env RUSTFS_SCANNER_OBSERVED_ADMISSION_TEST_CHILD="$name" \
+              cargo test --locked -p "$package" --lib -- "$name" --exact --test-threads=1 >"$LOG_DIR/$short.log" 2>&1
+            status=$?
+            set -e
+            printf '%s\n' "$status" >"$LOG_DIR/$short.exit"
+            cat "$LOG_DIR/$short.log"
           }
+          if [[ "$PHASE" == red ]]; then
+            # Each exact cargo invocation is a fresh process, so the fixture's
+            # child mode provides isolation without a nested test harness.
+            tests=(
+              'scanner_folder::tests::observed_admission::scanner_item_drop_after_send_records_unknown_once|RED_SCANNER_DROP_UNKNOWN|484|0|1'
+              'scanner_folder::tests::observed_admission::scanner_item_closed_channels_are_not_uncertain_admission|RED_SCANNER_UNSENT_UNKNOWN|613|1|0'
+            )
+            printf '%s\n' "${tests[@]}" >"$LOG_DIR/selected-red.txt"
+            [[ "${#tests[@]}" -eq 2 ]]
+            for item in "${tests[@]}"; do
+              IFS='|' read -r name marker line left right <<< "$item"
+              short="${name##*::}"
+              run_one rustfs-scanner "$name"
+              python3 - "$LOG_DIR/$short.log" "$LOG_DIR/$short.exit" "$name" "$marker" "$line" "$left" "$right" <<'PYRED'
+          from pathlib import Path
+          import re
+          import sys
+
+          log_path, exit_path, name, marker, line, left, right = sys.argv[1:]
+          text = Path(log_path).read_text(errors='replace')
+          assert Path(exit_path).read_text().strip() == '101', 'cargo did not exit 101'
+          assert text.splitlines().count('running 1 test') == 1, 'expected one actual test'
+          assert text.splitlines().count(f'test {name} ... FAILED') == 1, 'wrong named result'
+          assert len(re.findall(r'^test result: FAILED\. 0 passed; 1 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in ', text, re.M)) == 1, 'wrong test summary'
+          panics = re.findall(r"^thread '([^']+)'(?: \([0-9]+\))? panicked at (.+)$", text, re.M)
+          expected = rf'crates/scanner/src/scanner_folder/tests/observed_admission\.rs:{line}:[0-9]+:'
+          assert len(panics) == 1 and panics[0][0] == name and re.fullmatch(expected, panics[0][1]), panics
+          assert text.count(marker) == 1, 'missing or duplicated assertion marker'
+          values = rf'assertion `left == right` failed: {re.escape(marker)}\s+left: {left}\s+right: {right}'
+          assert re.search(values, text), 'wrong target assertion values'
+          print(f'validated expected failure: {name} {marker} left={left} right={right}')
+          PYRED
+            done
+          else
+            tests=(
+              'rustfs-scanner|scanner_folder::tests::observed_admission::scanner_item_drop_after_send_records_unknown_once'
+              'rustfs-scanner|scanner_folder::tests::observed_admission::scanner_item_closed_channels_are_not_uncertain_admission'
+              'rustfs-scanner|scanner_folder::tests::observed_admission::observed_receipts_survive_node_cancellation_and_fast_terminal'
+              'rustfs-scanner|heal_completion::admission_drop_tests::dropped_admission_is_recorded_in_the_installed_generation'
+              'rustfs-scanner|heal_completion::tests::admission_errors_without_decisions_are_reported_unknown'
+              'rustfs-scanner|heal_completion::tests::observer_status_preserves_loss_expiry_and_rejected_admissions'
+              'rustfs-scanner|heal_completion::tests::explicit_rejections_are_reported_not_admitted'
+              'rustfs-scanner|heal_completion::tests::observer_reinstalls_after_runtime_teardown'
+              'rustfs-scanner|heal_completion::tests::live_observer_associates_early_completion_with_canonical_merged_receipts'
+              'rustfs-heal-contracts|heal_channel::tests::enqueue_callback_runs_once_only_for_an_accepted_command'
+              'rustfs-heal-contracts|heal_channel::tests::observed_receipt_falls_back_only_when_no_observed_command_was_accepted'
+              'rustfs-heal-contracts|heal_channel::tests::lost_observed_reply_never_resends_the_request'
+              'rustfs-heal-contracts|heal_channel::tests::fallback_reports_a_typed_error_if_legacy_channel_is_closed'
+              'rustfs-heal-contracts|heal_channel::tests::observed_receipt_keeps_the_owner_token_from_the_processor'
+            )
+            printf '%s\n' "${tests[@]}" >"$LOG_DIR/selected-green.txt"
+            [[ "${#tests[@]}" -eq 14 ]]
+            for item in "${tests[@]}"; do
+              IFS='|' read -r package name <<< "$item"
+              short="${name##*::}"
+              run_one "$package" "$name"
+              python3 - "$LOG_DIR/$short.log" "$LOG_DIR/$short.exit" "$name" <<'PYGREEN'
+          from pathlib import Path
+          import re
+          import sys
+
+          log_path, exit_path, name = sys.argv[1:]
+          text = Path(log_path).read_text(errors='replace')
+          assert Path(exit_path).read_text().strip() == '0', 'cargo did not exit 0'
+          assert text.splitlines().count('running 1 test') == 1, 'expected one actual test'
+          assert text.splitlines().count(f'test {name} ... ok') == 1, 'wrong named result'
+          assert len(re.findall(r'^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in ', text, re.M)) == 1, 'wrong test summary'
+          print(f'validated pass: {name}')
+          PYGREEN
+            done
+          fi
+
+      - name: Upload snapshots, commands, raw logs, and exit codes
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scanner-admission-${{ matrix.phase }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/scanner-admission-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.phase }}/
+          retention-days: 7
+          if-no-files-found: warn
