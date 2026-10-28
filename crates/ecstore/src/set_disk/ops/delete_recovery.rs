@@ -40,9 +40,35 @@ pub(crate) mod test_hooks {
     use std::sync::{Arc, Mutex};
 
     type Hook = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+    type TransactionLockHook = Arc<dyn Fn(&rustfs_lock::NamespaceLockGuard) + Send + Sync>;
 
     static BEFORE_GC_FINALIZE: Mutex<Vec<(String, String, Hook)>> = Mutex::new(Vec::new());
     static CLEANUP_ATTEMPTS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    static AFTER_TRANSACTION_LOCK: Mutex<Vec<(String, String, TransactionLockHook)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn after_transaction_lock_acquired(bucket: &str, object: &str, hook: TransactionLockHook) {
+        AFTER_TRANSACTION_LOCK
+            .lock()
+            .expect("transaction lock hooks")
+            .push((bucket.to_owned(), object.to_owned(), hook));
+    }
+
+    pub(in crate::set_disk) fn run_after_transaction_lock_acquired(
+        bucket: &str,
+        object: &str,
+        guard: &rustfs_lock::NamespaceLockGuard,
+    ) {
+        let hook = {
+            let mut hooks = AFTER_TRANSACTION_LOCK.lock().expect("transaction lock hooks");
+            hooks
+                .iter()
+                .position(|(hook_bucket, hook_object, _)| hook_bucket == bucket && hook_object == object)
+                .map(|index| hooks.remove(index).2)
+        };
+        if let Some(hook) = hook {
+            hook(guard);
+        }
+    }
 
     pub(super) fn record_cleanup_attempt(bucket: &str, object: &str) {
         CLEANUP_ATTEMPTS
@@ -112,6 +138,7 @@ pub(crate) struct DeleteRecoveryContext<'a> {
     /// Only the locked heal path may repair a live marker-creation source.
     pub repair_marker_source: bool,
     pub namespace_owner: Option<Arc<dyn Send + Sync>>,
+    pub transaction_guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
     pub recovery_ticket: Option<crate::store::delete_recovery_runtime::DeleteRecoveryTicket>,
     pub published_hint: Option<(Uuid, &'a [Result<DeleteRecoveryInspection>])>,
     pub can_commit: &'a (dyn Fn() -> bool + Sync),
@@ -125,6 +152,7 @@ impl<'a> DeleteRecoveryContext<'a> {
             explicit_delete: false,
             repair_marker_source: false,
             namespace_owner: None,
+            transaction_guard: None,
             recovery_ticket: None,
             published_hint: None,
             can_commit,
@@ -373,9 +401,22 @@ impl SetDisks {
         write_quorum: usize,
         mut context: DeleteRecoveryContext<'_>,
     ) -> Result<()> {
-        if context.namespace_owner.is_none() {
-            context.namespace_owner = Some(self.ctx.begin_namespace_commit());
-        }
+        let transaction_guard = match context.transaction_guard.take() {
+            Some(guard) => guard,
+            None => self
+                .acquire_delete_transaction_lock(bucket, object)
+                .await
+                .map_err(DiskError::other)?,
+        };
+        let outer_can_commit = context.can_commit;
+        let can_commit = || outer_can_commit() && !transaction_guard.is_lock_lost();
+        context.can_commit = &can_commit;
+        context.transaction_guard = Some(Arc::clone(&transaction_guard));
+        let owner = context
+            .namespace_owner
+            .take()
+            .unwrap_or_else(|| self.ctx.begin_namespace_commit());
+        context.namespace_owner = Some(Arc::new((owner, Arc::clone(&transaction_guard))));
         let can_commit = context.can_commit;
         let states = inspect(disks, bucket, object, transaction).await;
         let untouched_absence = |state: &Result<DeleteRecoveryInspection>| matches!(state, Ok(state) if state.state == DeleteRecoveryState::Absent && state.current_digest.is_none());
@@ -547,8 +588,25 @@ impl SetDisks {
         &self,
         bucket: &str,
         object: &str,
-        context: DeleteRecoveryContext<'_>,
+        mut context: DeleteRecoveryContext<'_>,
     ) -> Result<DeleteRecoverySummary> {
+        let transaction_guard = match context.transaction_guard.take() {
+            Some(guard) => guard,
+            None => self
+                .acquire_delete_transaction_lock(bucket, object)
+                .await
+                .map_err(DiskError::other)?,
+        };
+        let outer_can_commit = context.can_commit;
+        let can_commit = || outer_can_commit() && !transaction_guard.is_lock_lost();
+        context.can_commit = &can_commit;
+        if !context.dry_run {
+            let owner = context
+                .namespace_owner
+                .take()
+                .unwrap_or_else(|| self.ctx.begin_namespace_commit());
+            context.namespace_owner = Some(Arc::new((owner, Arc::clone(&transaction_guard))));
+        }
         let DeleteRecoveryContext {
             incarnation,
             dry_run,
@@ -558,6 +616,7 @@ impl SetDisks {
             published_hint,
             can_commit,
             recovery_ticket: _,
+            transaction_guard: _,
         } = context;
         let disks = self.disk_inventory().await;
         let complete_inventory = disks.len() == self.set_drive_count && disks.iter().all(Option::is_some);
@@ -1255,6 +1314,135 @@ mod tests {
             report.detail
         );
         assert_eq!(body(&store, bucket, None).await, original);
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_deferred_batch_discards_released_alias_fence_and_preserves_caller_fence() {
+        use crate::bucket::metadata_sys::ObjectLockConfigState;
+        use crate::object_api::{NamespaceLockFence, NamespaceLockSignalTestFence, ObjectLockConfigSnapshot};
+        use crate::storage_api_contracts::object::ObjectToDelete;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for lose_caller in [false, true] {
+            let bucket = if lose_caller {
+                "deferred-batch-lost-caller"
+            } else {
+                "deferred-batch-released-alias"
+            };
+            let (_dirs, store, disks) = fixture(bucket).await;
+            put(&store, bucket, &[27; 4096], false).await;
+            let transaction = applied(&store, &disks, bucket, None, disks.len()).await;
+            let before = join_all(
+                disks
+                    .iter()
+                    .map(|disk| disk.inspect_delete_transaction(bucket, "object", transaction)),
+            )
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .expect("capture pending recovery evidence");
+            let mut set = (*store.pools[0].disk_set[0]).clone();
+            set.lockers = vec![Arc::new(rustfs_lock::LocalClient::with_manager(Arc::new(
+                rustfs_lock::GlobalLockManager::Enabled(Arc::new(rustfs_lock::FastObjectLockManager::new())),
+            )))];
+            set.ctx
+                .update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
+                .await;
+
+            let (caller_fence, caller_lost) = NamespaceLockFence::loss_handle_for_test();
+            let released_alias_lost = Arc::new(AtomicBool::new(false));
+            let signal_fence = Arc::new(Mutex::new(None));
+            let captured_signal_fence = Arc::clone(&signal_fence);
+            let captured_alias_lost = Arc::clone(&released_alias_lost);
+            test_hooks::after_transaction_lock_acquired(
+                bucket,
+                "object",
+                Arc::new(move |guard| {
+                    let signal = guard.lock_lost_signal().expect("distributed alias signal");
+                    let fence = NamespaceLockSignalTestFence::install_with_loss_handle(&signal, Arc::clone(&captured_alias_lost));
+                    // Retain the signal so a later allocation cannot reuse its
+                    // registry identity after the original guard is dropped.
+                    *captured_signal_fence.lock().expect("captured alias fence") = Some((fence, signal));
+                }),
+            );
+            let replay_started = Arc::new(AtomicBool::new(false));
+            let captured_replay_started = Arc::clone(&replay_started);
+            let expired_alias = Arc::clone(&released_alias_lost);
+            test_hooks::after_transaction_lock_acquired(
+                bucket,
+                "object",
+                Arc::new(move |_| {
+                    // Acquiring the same transaction key again proves the first
+                    // lease was released. Only its copied fence becomes stale.
+                    expired_alias.store(true, Ordering::Release);
+                    caller_lost.store(lose_caller, Ordering::Release);
+                    captured_replay_started.store(true, Ordering::Release);
+                }),
+            );
+
+            let (deleted, errors) = set
+                .delete_objects(
+                    bucket,
+                    vec![ObjectToDelete {
+                        object_name: "object".into(),
+                        ..Default::default()
+                    }],
+                    ObjectOptions {
+                        namespace_lock_fence: Some(caller_fence),
+                        object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                            ObjectLockConfigState::ConfirmedAbsent,
+                        ))),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(
+                replay_started.load(Ordering::Acquire),
+                "missing metadata must take the deferred replay path"
+            );
+            assert!(
+                released_alias_lost.load(Ordering::Acquire),
+                "the completed batch alias must be marked lost"
+            );
+            if lose_caller {
+                assert!(errors[0].is_some(), "losing the original caller fence must reject deferred replay");
+                for (disk, original) in disks.iter().zip(before) {
+                    let after = disk
+                        .inspect_delete_transaction(bucket, "object", transaction)
+                        .await
+                        .expect("retained proof");
+                    assert_eq!(
+                        after.fingerprint, original.fingerprint,
+                        "lost caller authority must preserve every prepared journal"
+                    );
+                }
+            } else {
+                assert!(
+                    errors.iter().all(Option::is_none),
+                    "released alias loss must not reject fresh recovery: {errors:?}"
+                );
+                assert!(
+                    !deleted[0].found,
+                    "fresh unversioned recovery commits absence before the idempotent batch retry"
+                );
+                for disk in &disks {
+                    assert!(
+                        discover(disk, bucket, Some("object"))
+                            .await
+                            .expect("final recovery evidence")
+                            .is_empty()
+                    );
+                    assert_eq!(
+                        disk.read_version("", bucket, "object", "", &ReadOptions::default())
+                            .await
+                            .expect_err("replayed delete must remove the source"),
+                        DiskError::FileNotFound
+                    );
+                }
+            }
+            drop(signal_fence);
+        }
     }
 
     #[tokio::test]
