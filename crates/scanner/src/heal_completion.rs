@@ -17,8 +17,8 @@
 
 use metrics::{counter, gauge};
 use rustfs_heal_contracts::{
-    completion::{HealCompletion, MAX_COMPLETION_IDENTITY_BYTES, subscribe_heal_completions},
-    heal_channel::{HealAdmissionReceipt, HealChannelRequest, HealScanMode},
+    completion::{MAX_COMPLETION_IDENTITY_BYTES, ObservedHealCompletion, subscribe_observed_heal_completions},
+    heal_channel::{HealChannelRequest, HealObservationChannelError, HealScanMode, ObservedHealAdmissionReceipt},
     outcome::{HealAbortReason, HealExecutionOutcome, HealObjectDisposition, HealObjectIdentity, HealObjectKind},
 };
 use serde::Serialize;
@@ -125,15 +125,21 @@ impl Candidate {
 }
 
 struct Recent {
-    completion: Arc<HealCompletion>,
+    completion: Arc<ObservedHealCompletion>,
     counted: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ObservationKey {
+    task_id: String,
+    observation_id: rustfs_heal_contracts::completion::HealObservationId,
 }
 
 #[derive(Default)]
 struct Observations {
-    pending: HashMap<String, Candidate>,
-    recent: HashMap<String, Recent>,
-    recent_order: VecDeque<(Instant, String)>,
+    pending: HashMap<ObservationKey, Candidate>,
+    recent: HashMap<ObservationKey, Recent>,
+    recent_order: VecDeque<(Instant, ObservationKey)>,
     // All keys come from fixed execution/disposition/scope/mode labels, never task or object identities.
     terminal_counts: BTreeMap<(&'static str, &'static str, &'static str, &'static str), u64>,
     terminal_tasks: u64,
@@ -240,13 +246,13 @@ impl Observations {
         self.record_unknown(settlement.scope, settlement.candidates);
     }
 
-    fn admit(&mut self, task_id: String, candidate: Candidate) -> Option<Settlement> {
-        if let Some(recent) = self.recent.get_mut(&task_id) {
+    fn admit(&mut self, key: ObservationKey, candidate: Candidate) -> Option<Settlement> {
+        if let Some(recent) = self.recent.get_mut(&key) {
             let settlement = Settlement::new(candidate, recent);
             self.record_settlement(&settlement);
             return Some(settlement);
         }
-        if let Some(pending) = self.pending.get_mut(&task_id) {
+        if let Some(pending) = self.pending.get_mut(&key) {
             pending.count = pending.count.saturating_add(candidate.count);
             if pending.identity != candidate.identity {
                 pending.identity = None;
@@ -256,31 +262,34 @@ impl Observations {
             }
             pending.dry_run |= candidate.dry_run;
         } else if self.pending.len() < MAX_PENDING {
-            self.pending.insert(task_id, candidate);
+            self.pending.insert(key, candidate);
         } else {
             self.record_unknown("pending_full", candidate.count);
         }
         None
     }
 
-    fn complete(&mut self, completion: Arc<HealCompletion>, now: Instant) -> Option<Settlement> {
-        if self.recent.contains_key(&completion.task_id) {
+    fn complete(&mut self, completion: Arc<ObservedHealCompletion>, now: Instant) -> Option<Settlement> {
+        let key = ObservationKey {
+            task_id: completion.task_id.clone(),
+            observation_id: completion.observation_id?,
+        };
+        if self.recent.contains_key(&key) {
             return None;
         }
-        let task_id = completion.task_id.clone();
         let mut recent = Recent {
             completion,
             counted: false,
         };
         let settled = self
             .pending
-            .remove(&task_id)
+            .remove(&key)
             .map(|candidate| Settlement::new(candidate, &mut recent));
         if self.recent.len() == MAX_RECENT {
             self.evict_recent();
         }
-        self.recent_order.push_back((now, task_id.clone()));
-        self.recent.insert(task_id, recent);
+        self.recent_order.push_back((now, key.clone()));
+        self.recent.insert(key, recent);
         if let Some(settlement) = &settled {
             self.record_settlement(settlement);
         }
@@ -341,7 +350,7 @@ impl Observations {
     }
 }
 
-type AdmissionSender = mpsc::Sender<(String, Candidate)>;
+type AdmissionSender = mpsc::Sender<(ObservationKey, Candidate)>;
 
 #[derive(Clone)]
 struct ObserverHandle {
@@ -371,7 +380,7 @@ fn observer_from(registry: &Mutex<Option<ObserverHandle>>) -> ObserverHandle {
     let state = Arc::new(Mutex::new(Observations::default()));
     let handle = {
         let (sender, mut admissions) = mpsc::channel(MAX_PENDING);
-        let mut completions = subscribe_heal_completions();
+        let mut completions = subscribe_observed_heal_completions();
         let observations = state.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -489,11 +498,18 @@ pub(crate) fn prepare(request: &HealChannelRequest) -> Option<Candidate> {
     Candidate::from_request(request)
 }
 
-pub(crate) fn observe(candidate: Option<Candidate>, receipt: Result<&HealAdmissionReceipt, ()>) {
+pub(crate) fn observe(
+    candidate: Option<Candidate>,
+    receipt: Result<&ObservedHealAdmissionReceipt, &HealObservationChannelError>,
+) {
     observe_on(&observer(), candidate, receipt);
 }
 
-fn observe_on(observer: &ObserverHandle, candidate: Option<Candidate>, receipt: Result<&HealAdmissionReceipt, ()>) {
+fn observe_on(
+    observer: &ObserverHandle,
+    candidate: Option<Candidate>,
+    receipt: Result<&ObservedHealAdmissionReceipt, &HealObservationChannelError>,
+) {
     match receipt {
         Ok(receipt) if receipt.result.is_admitted() => {
             let Some(candidate) = candidate else {
@@ -505,11 +521,20 @@ fn observe_on(observer: &ObserverHandle, candidate: Option<Candidate>, receipt: 
                 observer.record_unknown("missing_task_id", 1);
                 return;
             }
-            if observer.sender.try_send((task_id.clone(), candidate)).is_err() {
+            let Some(observation_id) = receipt.observation_id else {
+                observer.record_unknown("owner_generation_unknown", candidate.count);
+                return;
+            };
+            let key = ObservationKey {
+                task_id: task_id.clone(),
+                observation_id,
+            };
+            if observer.sender.try_send((key, candidate)).is_err() {
                 observer.record_unknown("observer_full_or_closed", 1);
             }
         }
-        _ => observer.record_unknown("not_admitted", 1),
+        Ok(_) => observer.record_unknown("not_admitted", 1),
+        Err(_) => observer.record_unknown("admission_unknown", 1),
     }
 }
 

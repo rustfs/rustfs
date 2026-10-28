@@ -15,6 +15,27 @@ use super::disposition::record_task_disposition;
 /// The heal scheduler: queue consumption loop and its skip/metric helpers.
 use super::*;
 
+pub(super) fn current_task_observation_id(
+    active: &HashMap<String, Arc<HealTask>>,
+    task: &Arc<HealTask>,
+) -> Option<rustfs_heal_contracts::completion::HealObservationId> {
+    active
+        .get(&task.id)
+        .filter(|owner| Arc::ptr_eq(owner, task))
+        .and_then(|_| task.observation_id)
+}
+
+pub(super) fn current_retry_observation_id(
+    retrying: &HashMap<String, RetryingHeal>,
+    task_id: &str,
+    cancel_token: &CancellationToken,
+) -> Option<rustfs_heal_contracts::completion::HealObservationId> {
+    retrying
+        .get(task_id)
+        .filter(|owner| &owner.cancel_token == cancel_token)
+        .and_then(|owner| owner.observation_id)
+}
+
 pub(super) fn retry_admission_delay(
     grace_deadline: Option<u64>,
     ordinary_delay: Duration,
@@ -211,7 +232,9 @@ impl HealManager {
                 queue.pop_runnable_with_fairness(|_| true, |_| None).0
             };
 
-            if let Some(mut request) = selected_request {
+            if let Some(queued) = selected_request {
+                let observation_id = queued.observation_id;
+                let mut request = queued.request;
                 request.options.timeout.get_or_insert(config.task_timeout);
                 let task_priority = request.priority;
                 let task_type_label = heal_request_type_label(&request).to_string();
@@ -229,6 +252,7 @@ impl HealManager {
                 let mainline_pacer = running_mainline_pacer(&request, &config, workload_provider);
                 let task = Arc::new(
                     HealTask::from_replacement_recovery_request(request, storage.clone(), replacement_resume_endpoint)
+                        .with_observation_id(observation_id)
                         .with_mainline_pacer(mainline_pacer)
                         .with_admin_recovery(root_recovery.clone()),
                 );
@@ -336,6 +360,9 @@ impl HealManager {
                     tests::pause_completed_retention_before_publish(&task_id, &completed_status).await;
                     let mut active_heals_guard = active_heals_clone.lock().await;
                     let owns_completion = active_heals_guard.contains_key(&task_id);
+                    // The legacy scheduler checks only the ID; observation needs the
+                    // actual task object because IDs can be reused concurrently.
+                    let observation_id = current_task_observation_id(&active_heals_guard, &task);
                     let cancelled_snapshot = if owns_completion {
                         None
                     } else {
@@ -428,6 +455,7 @@ impl HealManager {
                                 request.id.clone(),
                                 RetryingHeal {
                                     request: request.clone(),
+                                    observation_id,
                                     error: error.clone(),
                                     cancel_token: cancel_token.clone(),
                                 },
@@ -446,6 +474,7 @@ impl HealManager {
                             &task_id,
                             completed_status_entry,
                             terminal_completion,
+                            observation_id,
                         )
                         .await;
                     }
@@ -593,8 +622,18 @@ impl HealManager {
                                 if retry_cancel_token.is_cancelled() || !retrying.contains_key(&retry_request_id) {
                                     return;
                                 }
-                                let admission_decision =
-                                    Self::admit_request_to_queue(&mut queue, retry_request.clone(), &retry_config, "retry", true);
+                                // A later retry can reuse the ID. Only the same
+                                // cancellation token proves this is its owner.
+                                let retry_observation_id =
+                                    current_retry_observation_id(&retrying, &retry_request_id, &retry_cancel_token);
+                                let admission_decision = Self::admit_request_to_queue(
+                                    &mut queue,
+                                    retry_request.clone(),
+                                    &retry_config,
+                                    "retry",
+                                    true,
+                                    retry_observation_id,
+                                );
                                 let admission = admission_decision.result;
                                 let should_notify = matches!(admission, HealAdmissionResult::Accepted)
                                     && retry_config.event_driven_scheduler_enable;

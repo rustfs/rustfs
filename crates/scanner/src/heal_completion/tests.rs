@@ -1,5 +1,9 @@
 use super::*;
-use rustfs_heal_contracts::outcome::{HealAbortReason, HealDeferredReason, HealFailureClass, HealObjectReceipt};
+use rustfs_heal_contracts::{
+    completion::{HealCompletion, publish_observed_heal_completion},
+    heal_channel::HealAdmissionReceipt,
+    outcome::{HealAbortReason, HealDeferredReason, HealFailureClass, HealObjectReceipt},
+};
 use uuid::Uuid;
 
 fn request() -> HealChannelRequest {
@@ -19,24 +23,38 @@ fn candidate() -> Candidate {
     Candidate::from_request(&request()).expect("bounded candidate")
 }
 
-fn completion(task: &str, disposition: HealObjectDisposition) -> Arc<HealCompletion> {
-    Arc::new(HealCompletion {
-        task_id: task.into(),
-        scan_mode: HealScanMode::Deep,
-        dry_run: false,
-        execution: Some(HealExecutionOutcome::Completed),
-        object: Some(HealObjectReceipt {
-            identity: candidate().identity.expect("exact object identity"),
-            disposition,
+fn key(task_id: &str) -> ObservationKey {
+    ObservationKey {
+        task_id: task_id.into(),
+        observation_id: 1,
+    }
+}
+
+fn completion(task: &str, disposition: HealObjectDisposition) -> Arc<ObservedHealCompletion> {
+    Arc::new(ObservedHealCompletion {
+        observation_id: Some(1),
+        completion: Arc::new(HealCompletion {
+            task_id: task.into(),
+            scan_mode: HealScanMode::Deep,
+            dry_run: false,
+            execution: Some(HealExecutionOutcome::Completed),
+            object: Some(HealObjectReceipt {
+                identity: candidate().identity.expect("exact object identity"),
+                disposition,
+            }),
         }),
     })
+}
+
+fn publish_terminal(observed: Arc<ObservedHealCompletion>) {
+    publish_observed_heal_completion((*observed.completion).clone(), observed.observation_id);
 }
 
 #[test]
 fn merged_candidates_close_only_on_the_canonical_task_once() {
     let mut observations = Observations::default();
-    assert!(observations.admit("owner".into(), candidate()).is_none());
-    assert!(observations.admit("owner".into(), candidate()).is_none());
+    assert!(observations.admit(key("owner"), candidate()).is_none());
+    assert!(observations.admit(key("owner"), candidate()).is_none());
     assert_eq!(observations.pending.len(), 1);
     assert!(
         observations
@@ -57,7 +75,7 @@ fn merged_candidates_close_only_on_the_canonical_task_once() {
         "duplicate completion is ignored"
     );
     let merged_late = observations
-        .admit("owner".into(), candidate())
+        .admit(key("owner"), candidate())
         .expect("terminal before merged admission is retained");
     assert!(!merged_late.first_task_observation);
     assert_eq!(merged_late.candidates, 1);
@@ -71,12 +89,147 @@ fn terminal_before_admission_is_observed_without_claiming_coverage() {
             .complete(completion("fast", HealObjectDisposition::Repaired), Instant::now())
             .is_none()
     );
-    let settled = observations
-        .admit("fast".into(), candidate())
-        .expect("fast terminal retained");
+    let settled = observations.admit(key("fast"), candidate()).expect("fast terminal retained");
     assert_eq!(settled.disposition, "repaired");
     assert_eq!(settled.scope, "content_and_leader_unknown");
     assert!(settled.first_task_observation);
+}
+
+#[test]
+fn status_and_pending_metric_count_each_owner_generation() {
+    #[derive(Default)]
+    struct GaugeValue(Mutex<f64>);
+
+    impl metrics::GaugeFn for GaugeValue {
+        fn increment(&self, value: f64) {
+            *self.0.lock().expect("pending gauge") += value;
+        }
+        fn decrement(&self, value: f64) {
+            *self.0.lock().expect("pending gauge") -= value;
+        }
+        fn set(&self, value: f64) {
+            *self.0.lock().expect("pending gauge") = value;
+        }
+    }
+
+    #[derive(Default)]
+    struct PendingRecorder(Arc<GaugeValue>);
+
+    impl metrics::Recorder for PendingRecorder {
+        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+        fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            if key.name() == "rustfs_scanner_heal_pending_tasks" {
+                metrics::Gauge::from_arc(Arc::clone(&self.0))
+            } else {
+                metrics::Gauge::noop()
+            }
+        }
+        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    let recorder = PendingRecorder::default();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let (sender, _receiver) = mpsc::channel(1);
+    let observer = ObserverHandle {
+        sender,
+        state: Arc::new(Mutex::new(Observations::default())),
+        generation: 1,
+        started_at_unix_secs: None,
+    };
+    let registry = Mutex::new(Some(observer.clone()));
+    let first = key("same-task");
+    let second = ObservationKey {
+        task_id: "same-task".into(),
+        observation_id: 2,
+    };
+    {
+        let mut observations = observer.state.lock().expect("observations");
+        assert!(observations.admit(first.clone(), candidate()).is_none());
+        assert!(observations.admit(first, candidate()).is_none());
+        assert!(observations.admit(second, candidate()).is_none());
+        observations.maintain(Instant::now());
+    }
+    let status = observation_status_from(&registry);
+    assert_eq!(status.retained_pending_tasks, Some(2));
+    assert_eq!(status.retained_pending_candidates, Some(3));
+    assert_eq!(*recorder.0.0.lock().expect("pending gauge"), 2.0);
+    let json = serde_json::to_value(&status).expect("serialize observation status");
+    assert_eq!(json["retained_pending_tasks"], 2);
+    assert_eq!(json["retained_pending_candidates"], 3);
+
+    {
+        let mut observations = observer.state.lock().expect("observations");
+        let settlement = observations
+            .complete(completion("same-task", HealObjectDisposition::VerifiedHealthy), Instant::now())
+            .expect("the first generation settles its two candidates");
+        assert_eq!(settlement.candidates, 2);
+        observations.maintain(Instant::now());
+    }
+    let status = observation_status_from(&registry);
+    assert_eq!(status.retained_pending_tasks, Some(1));
+    assert_eq!(status.retained_pending_candidates, Some(1));
+    assert_eq!(*recorder.0.0.lock().expect("pending gauge"), 1.0);
+}
+
+#[test]
+fn reused_task_id_keeps_terminal_observations_on_their_owner_generation() {
+    let mut observations = Observations::default();
+    let old_key = key("owner");
+    assert!(observations.admit(old_key.clone(), candidate()).is_none());
+    assert!(
+        observations
+            .complete(completion("owner", HealObjectDisposition::VerifiedHealthy), Instant::now())
+            .is_some()
+    );
+
+    let new_key = ObservationKey {
+        task_id: "owner".into(),
+        observation_id: 2,
+    };
+    assert!(
+        observations.admit(new_key.clone(), candidate()).is_none(),
+        "the old terminal cannot settle a new owner"
+    );
+    let mut new_terminal = (*completion("owner", HealObjectDisposition::Repaired)).clone();
+    new_terminal.observation_id = Some(2);
+    let settled = observations
+        .complete(Arc::new(new_terminal), Instant::now())
+        .expect("the new owner settles itself");
+    assert_eq!(settled.disposition, "repaired");
+    assert!(observations.pending.is_empty());
+
+    let fast_key = ObservationKey {
+        task_id: "owner".into(),
+        observation_id: 3,
+    };
+    let mut fast_terminal = (*completion("owner", HealObjectDisposition::MetadataHealthy)).clone();
+    fast_terminal.observation_id = Some(3);
+    assert!(observations.complete(Arc::new(fast_terminal), Instant::now()).is_none());
+    assert!(
+        observations.admit(fast_key, candidate()).is_some(),
+        "a fast terminal stays available to its owner"
+    );
+}
+
+#[test]
+fn removed_owner_remains_pending_then_expires_unknown_after_id_reuse() {
+    let mut observations = Observations::default();
+    let old = key("removed-owner");
+    assert!(observations.admit(old.clone(), candidate()).is_none());
+    let mut new_terminal = (*completion("removed-owner", HealObjectDisposition::VerifiedHealthy)).clone();
+    new_terminal.observation_id = Some(2);
+    assert!(observations.complete(Arc::new(new_terminal), Instant::now()).is_none());
+    assert!(observations.pending.contains_key(&old));
+    observations.maintain(Instant::now() + PENDING_TTL);
+    assert!(!observations.pending.contains_key(&old));
+    assert_eq!(observations.unknown_counts.get("expired"), Some(&1));
 }
 
 #[test]
@@ -103,7 +256,12 @@ fn unversioned_overwrite_and_unknown_leader_never_certify_payload() {
     let mut observed = candidate();
     observed.identity.as_mut().expect("identity").version_id = None;
     let mut terminal = (*completion("same-name", HealObjectDisposition::VerifiedHealthy)).clone();
-    terminal.object.as_mut().expect("receipt").identity.version_id = None;
+    Arc::make_mut(&mut terminal.completion)
+        .object
+        .as_mut()
+        .expect("receipt")
+        .identity
+        .version_id = None;
     let mut recent = Recent {
         completion: Arc::new(terminal),
         counted: false,
@@ -120,7 +278,7 @@ fn unversioned_overwrite_and_unknown_leader_never_certify_payload() {
 fn normal_metadata_and_unproven_repairs_do_not_satisfy_deep_candidates() {
     for disposition in [HealObjectDisposition::MetadataHealthy, HealObjectDisposition::Repaired] {
         let mut terminal = (*completion("normal", disposition)).clone();
-        terminal.scan_mode = HealScanMode::Normal;
+        Arc::make_mut(&mut terminal.completion).scan_mode = HealScanMode::Normal;
         let mut recent = Recent {
             completion: Arc::new(terminal),
             counted: false,
@@ -153,7 +311,7 @@ fn command_success_does_not_hide_deferred_failed_cancelled_or_dry_run_objects() 
         assert_eq!(settled.scope, "content_and_leader_unknown");
     }
     let mut terminal = (*completion("cancelled", HealObjectDisposition::VerifiedHealthy)).clone();
-    terminal.execution = Some(HealExecutionOutcome::Aborted(HealAbortReason::Cancelled));
+    Arc::make_mut(&mut terminal.completion).execution = Some(HealExecutionOutcome::Aborted(HealAbortReason::Cancelled));
     let mut recent = Recent {
         completion: Arc::new(terminal),
         counted: false,
@@ -161,7 +319,7 @@ fn command_success_does_not_hide_deferred_failed_cancelled_or_dry_run_objects() 
     assert_eq!(Settlement::new(candidate(), &mut recent).scope, "execution_incomplete");
     assert_eq!(Settlement::new(candidate(), &mut recent).execution, "aborted_cancelled");
     let mut errors = (*completion("errors", HealObjectDisposition::Repaired)).clone();
-    errors.execution = Some(HealExecutionOutcome::CompletedWithErrors);
+    Arc::make_mut(&mut errors.completion).execution = Some(HealExecutionOutcome::CompletedWithErrors);
     let mut recent = Recent {
         completion: Arc::new(errors),
         counted: false,
@@ -174,7 +332,7 @@ fn command_success_does_not_hide_deferred_failed_cancelled_or_dry_run_objects() 
 #[test]
 fn missing_or_truncated_object_result_remains_unknown() {
     let mut terminal = (*completion("truncated", HealObjectDisposition::VerifiedHealthy)).clone();
-    terminal.object = None;
+    Arc::make_mut(&mut terminal.completion).object = None;
     let mut recent = Recent {
         completion: Arc::new(terminal),
         counted: false,
@@ -186,10 +344,10 @@ fn missing_or_truncated_object_result_remains_unknown() {
 fn overflow_loss_expiry_and_restart_are_bounded_and_do_not_restore_pending() {
     let mut observations = Observations::default();
     for index in 0..=MAX_PENDING {
-        observations.admit(format!("pending-{index}"), candidate());
+        observations.admit(key(&format!("pending-{index}")), candidate());
     }
     assert_eq!(observations.pending.len(), MAX_PENDING);
-    assert!(!observations.pending.contains_key(&format!("pending-{MAX_PENDING}")));
+    assert!(!observations.pending.contains_key(&key(&format!("pending-{MAX_PENDING}"))));
     observations.lost();
     assert!(observations.pending.is_empty());
     assert!(
@@ -197,7 +355,7 @@ fn overflow_loss_expiry_and_restart_are_bounded_and_do_not_restore_pending() {
             .complete(completion("pending-0", HealObjectDisposition::VerifiedHealthy), Instant::now())
             .is_none()
     );
-    observations.admit("expires".into(), candidate());
+    observations.admit(key("expires"), candidate());
     observations.maintain(Instant::now() + PENDING_TTL);
     assert!(observations.pending.is_empty());
     assert!(observations.recent.is_empty());
@@ -220,8 +378,8 @@ fn terminal_history_eviction_loses_evidence_without_inventing_a_completion() {
     }
     assert_eq!(observations.recent.len(), MAX_RECENT);
     assert_eq!(observations.recent_order.len(), MAX_RECENT);
-    assert!(observations.admit("terminal-0".into(), candidate()).is_none());
-    assert!(observations.pending.contains_key("terminal-0"));
+    assert!(observations.admit(key("terminal-0"), candidate()).is_none());
+    assert!(observations.pending.contains_key(&key("terminal-0")));
 }
 
 #[test]
@@ -258,7 +416,7 @@ fn observer_reinstalls_after_runtime_teardown() {
         assert!(observation_status_from(&registry).unknown_candidates.is_empty());
         replacement
             .sender
-            .try_send(("new-runtime".into(), candidate()))
+            .try_send((key("new-runtime"), candidate()))
             .expect("replacement observer admits work");
     });
 }
@@ -294,10 +452,10 @@ fn observer_status_preserves_loss_expiry_and_rejected_admissions() {
     {
         let mut state = observer.state.lock().expect("observations");
         for index in 0..=MAX_PENDING {
-            let _ = state.admit(format!("pending-{index}"), candidate());
+            let _ = state.admit(key(&format!("pending-{index}")), candidate());
         }
         state.lagged(3);
-        let _ = state.admit("expired".into(), candidate());
+        let _ = state.admit(key("expired"), candidate());
         state.maintain(Instant::now() + PENDING_TTL);
     }
     let status = observation_status_from(&registry);
@@ -313,20 +471,37 @@ fn observer_status_preserves_loss_expiry_and_rejected_admissions() {
     assert_eq!(unknown["completion_lost"], u64::try_from(MAX_PENDING).expect("bounded pending count"));
     assert_eq!(unknown["expired"], 1);
 
-    let admitted = HealAdmissionReceipt {
-        result: HealAdmissionResult::Accepted,
-        task_id: "canonical".into(),
+    let admitted = ObservedHealAdmissionReceipt {
+        receipt: HealAdmissionReceipt {
+            result: HealAdmissionResult::Accepted,
+            task_id: "canonical".into(),
+        },
+        observation_id: Some(1),
     };
+    observe_on(
+        &observer,
+        Some(candidate()),
+        Ok(&ObservedHealAdmissionReceipt {
+            receipt: HealAdmissionReceipt {
+                result: HealAdmissionResult::Merged,
+                task_id: "unproven-owner".into(),
+            },
+            observation_id: None,
+        }),
+    );
     observe_on(&observer, None, Ok(&admitted));
     observe_on(
         &observer,
         Some(candidate()),
-        Ok(&HealAdmissionReceipt {
-            result: HealAdmissionResult::Accepted,
-            task_id: String::new(),
+        Ok(&ObservedHealAdmissionReceipt {
+            receipt: HealAdmissionReceipt {
+                result: HealAdmissionResult::Accepted,
+                task_id: String::new(),
+            },
+            observation_id: Some(1),
         }),
     );
-    observe_on(&observer, Some(candidate()), Err(()));
+    observe_on(&observer, Some(candidate()), Err(&HealObservationChannelError::NotInitialized));
     observe_on(&observer, Some(candidate()), Ok(&admitted));
     assert_eq!(observation_status_from(&registry).queued_admissions, Some(1));
     observe_on(&observer, Some(candidate()), Ok(&admitted));
@@ -341,14 +516,98 @@ fn observer_status_preserves_loss_expiry_and_rejected_admissions() {
         .map(|row| (row.reason, row.count))
         .collect::<BTreeMap<_, _>>();
     assert_eq!(unknown["identity_too_large"], 1);
+    assert_eq!(unknown["owner_generation_unknown"], 1);
     assert_eq!(unknown["missing_task_id"], 1);
-    assert_eq!(unknown["not_admitted"], 1);
+    assert_eq!(unknown["admission_unknown"], 1);
     assert_eq!(unknown["observer_full_or_closed"], 2);
+}
+
+#[test]
+fn explicit_rejections_are_reported_not_admitted() {
+    use rustfs_heal_contracts::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
+
+    let recorder = CompletionRecorder::default();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let (sender, _receiver) = mpsc::channel(1);
+    let observer = ObserverHandle {
+        sender,
+        state: Arc::new(Mutex::new(Observations::default())),
+        generation: 1,
+        started_at_unix_secs: None,
+    };
+    let registry = Mutex::new(Some(observer.clone()));
+    for result in [
+        HealAdmissionResult::Full,
+        HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull),
+    ] {
+        let receipt = ObservedHealAdmissionReceipt {
+            receipt: HealAdmissionReceipt {
+                result,
+                task_id: String::new(),
+            },
+            observation_id: None,
+        };
+        observe_on(&observer, Some(candidate()), Ok(&receipt));
+    }
+    let status = observation_status_from(&registry);
+    assert_eq!(status.integrity_state, "unknown");
+    assert_eq!(status.retained_pending_candidates, Some(0));
+    assert_eq!(status.unknown_candidates.iter().map(|row| row.count).sum::<u64>(), 2);
+    assert!(
+        status
+            .unknown_candidates
+            .iter()
+            .any(|row| row.reason == "not_admitted" && row.count == 2)
+    );
+    assert_eq!(recorder.reason_total("not_admitted"), 2);
+    assert_eq!(recorder.reason_total("admission_unknown"), 0);
+    assert_eq!(recorder.total("rustfs_scanner_heal_candidate_unknown_total"), 2);
+}
+
+#[tokio::test]
+async fn admission_errors_without_decisions_are_reported_unknown() {
+    let recorder = CompletionRecorder::default();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let (sender, _receiver) = mpsc::channel(1);
+    let observer = ObserverHandle {
+        sender,
+        state: Arc::new(Mutex::new(Observations::default())),
+        generation: 1,
+        started_at_unix_secs: None,
+    };
+    let registry = Mutex::new(Some(observer.clone()));
+    let (sender, observed_reply) = tokio::sync::oneshot::channel::<()>();
+    drop(sender);
+    let (sender, legacy_reply) = tokio::sync::oneshot::channel::<()>();
+    drop(sender);
+    for error in [
+        HealObservationChannelError::NotInitialized,
+        HealObservationChannelError::LegacyCommandClosed,
+        HealObservationChannelError::ObservedResponseClosed(observed_reply.await.expect_err("reply was dropped")),
+        HealObservationChannelError::LegacyResponseClosed(legacy_reply.await.expect_err("reply was dropped")),
+        HealObservationChannelError::AdmissionFailed("unconfirmed processor error".into()),
+    ] {
+        observe_on(&observer, Some(candidate()), Err(&error));
+    }
+
+    let status = observation_status_from(&registry);
+    assert_eq!(status.integrity_state, "unknown");
+    assert_eq!(status.retained_pending_candidates, Some(0));
+    assert_eq!(status.unknown_candidates.iter().map(|row| row.count).sum::<u64>(), 5);
+    assert!(
+        status
+            .unknown_candidates
+            .iter()
+            .any(|row| row.reason == "admission_unknown" && row.count == 5)
+    );
+    assert_eq!(recorder.reason_total("admission_unknown"), 5);
+    assert_eq!(recorder.reason_total("not_admitted"), 0);
+    assert_eq!(recorder.total("rustfs_scanner_heal_candidate_unknown_total"), 5);
 }
 
 #[tokio::test]
 async fn observer_status_tracks_canonical_terminals_without_a_metrics_recorder() {
-    use rustfs_heal_contracts::{completion::publish_heal_completion, heal_channel::HealAdmissionResult};
+    use rustfs_heal_contracts::heal_channel::HealAdmissionResult;
 
     let recorder = metrics::NoopRecorder;
     let _recorder = metrics::set_default_local_recorder(&recorder);
@@ -361,19 +620,23 @@ async fn observer_status_tracks_canonical_terminals_without_a_metrics_recorder()
         (canonical.clone(), HealAdmissionResult::Merged),
         (deferred.clone(), HealAdmissionResult::Accepted),
     ] {
-        observe_on(&observer, Some(candidate()), Ok(&HealAdmissionReceipt { result, task_id }));
+        observe_on(
+            &observer,
+            Some(candidate()),
+            Ok(&ObservedHealAdmissionReceipt {
+                receipt: HealAdmissionReceipt { result, task_id },
+                observation_id: Some(1),
+            }),
+        );
     }
-    publish_heal_completion((*completion(&canonical, HealObjectDisposition::VerifiedHealthy)).clone());
-    publish_heal_completion(
-        (*completion(
-            &deferred,
-            HealObjectDisposition::Deferred {
-                reason: HealDeferredReason::Deadline,
-                retry_not_before: None,
-            },
-        ))
-        .clone(),
-    );
+    publish_terminal(completion(&canonical, HealObjectDisposition::VerifiedHealthy));
+    publish_terminal(completion(
+        &deferred,
+        HealObjectDisposition::Deferred {
+            reason: HealDeferredReason::Deadline,
+            retry_not_before: None,
+        },
+    ));
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let status = observation_status_from(&registry);
@@ -447,6 +710,19 @@ impl CompletionRecorder {
             .sum()
     }
 
+    fn reason_total(&self, reason: &str) -> u64 {
+        self.0
+            .lock()
+            .expect("completion recorder")
+            .iter()
+            .filter(|(key, _)| {
+                key.name() == "rustfs_scanner_heal_candidate_unknown_total"
+                    && key.labels().any(|label| label.key() == "reason" && label.value() == reason)
+            })
+            .map(|(_, value)| value.load(std::sync::atomic::Ordering::Relaxed))
+            .sum()
+    }
+
     async fn wait_for_terminals(&self, expected: u64) {
         tokio::time::timeout(Duration::from_secs(2), async {
             while self.total("rustfs_scanner_heal_candidate_terminal_total") < expected {
@@ -462,7 +738,7 @@ impl CompletionRecorder {
 // current-thread runtime keeps its spawned observer under this local recorder.
 #[tokio::test]
 async fn live_observer_associates_early_completion_with_canonical_merged_receipts() {
-    use rustfs_heal_contracts::{completion::publish_heal_completion, heal_channel::HealAdmissionResult};
+    use rustfs_heal_contracts::heal_channel::HealAdmissionResult;
 
     let recorder = CompletionRecorder::default();
     let _recorder = metrics::set_default_local_recorder(&recorder);
@@ -476,20 +752,26 @@ async fn live_observer_associates_early_completion_with_canonical_merged_receipt
     observe_on(
         &sender,
         Some(candidate()),
-        Ok(&HealAdmissionReceipt {
-            result: HealAdmissionResult::Accepted,
-            task_id: sentinel_id.clone(),
+        Ok(&ObservedHealAdmissionReceipt {
+            receipt: HealAdmissionReceipt {
+                result: HealAdmissionResult::Accepted,
+                task_id: sentinel_id.clone(),
+            },
+            observation_id: Some(1),
         }),
     );
-    publish_heal_completion((*completion(&canonical_id, HealObjectDisposition::VerifiedHealthy)).clone());
+    publish_terminal(completion(&canonical_id, HealObjectDisposition::VerifiedHealthy));
     // FIFO on the real broadcast channel makes this terminal an acknowledgement
     // that the earlier unmatched completion was consumed before its admission.
-    publish_heal_completion((*completion(&sentinel_id, HealObjectDisposition::MetadataHealthy)).clone());
+    publish_terminal(completion(&sentinel_id, HealObjectDisposition::MetadataHealthy));
     recorder.wait_for_terminals(1).await;
 
-    let merged = HealAdmissionReceipt {
-        result: HealAdmissionResult::Merged,
-        task_id: canonical_id,
+    let merged = ObservedHealAdmissionReceipt {
+        receipt: HealAdmissionReceipt {
+            result: HealAdmissionResult::Merged,
+            task_id: canonical_id,
+        },
+        observation_id: Some(1),
     };
     observe_on(&sender, Candidate::from_request(&source_request), Ok(&merged));
     recorder.wait_for_terminals(2).await;

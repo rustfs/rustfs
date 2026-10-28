@@ -271,6 +271,39 @@ pub struct HealAdmissionReceipt {
     pub task_id: String,
 }
 
+/// Optional process-local observation metadata for a canonical receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedHealAdmissionReceipt {
+    pub receipt: HealAdmissionReceipt,
+    /// Process-local owner identity; absent for remote or unproven owners.
+    pub observation_id: Option<crate::completion::HealObservationId>,
+}
+
+/// Errors from process-local observed admission and its channel initialization.
+#[derive(Debug, thiserror::Error)]
+pub enum HealObservationChannelError {
+    #[error("Heal channel sender already initialized")]
+    AlreadyInitialized,
+    #[error("Heal channel not initialized")]
+    NotInitialized,
+    #[error("Heal receipt command channel closed")]
+    LegacyCommandClosed,
+    #[error("Failed to receive heal admission response: {0}")]
+    LegacyResponseClosed(#[source] oneshot::error::RecvError),
+    #[error("Failed to receive observed heal admission response: {0}")]
+    ObservedResponseClosed(#[source] oneshot::error::RecvError),
+    #[error("{0}")]
+    AdmissionFailed(String),
+}
+
+impl std::ops::Deref for ObservedHealAdmissionReceipt {
+    type Target = HealAdmissionReceipt;
+
+    fn deref(&self) -> &Self::Target {
+        &self.receipt
+    }
+}
+
 impl HealAdmissionResult {
     pub fn result_label(self) -> &'static str {
         match self {
@@ -447,9 +480,19 @@ pub struct HealReceiptCommand {
 /// Canonical-receipt command receiver.
 pub type HealReceiptReceiver = mpsc::UnboundedReceiver<HealReceiptCommand>;
 
+/// Process-local admission command carrying an observed receipt.
+#[derive(Debug)]
+pub struct ObservedHealReceiptCommand {
+    pub request: HealChannelRequest,
+    pub response_tx: oneshot::Sender<Result<ObservedHealAdmissionReceipt, HealObservationChannelError>>,
+}
+
+pub type ObservedHealReceiptReceiver = mpsc::UnboundedReceiver<ObservedHealReceiptCommand>;
+
 struct HealChannelSenders {
     command: HealChannelSender,
     receipt: mpsc::UnboundedSender<HealReceiptCommand>,
+    observed: Option<mpsc::UnboundedSender<ObservedHealReceiptCommand>>,
 }
 
 /// Global heal channel sender
@@ -469,12 +512,31 @@ pub fn init_heal_channel() -> Result<HealChannelReceiver, &'static str> {
 
 /// Initialize the legacy command and canonical-receipt channels atomically.
 pub fn init_heal_channels() -> Result<(HealChannelReceiver, HealReceiptReceiver), &'static str> {
+    let (command_receiver, receipt_receiver, _) =
+        init_heal_channels_inner(false).map_err(|_| "Heal channel sender already initialized")?;
+    Ok((command_receiver, receipt_receiver))
+}
+
+/// Initialize an additional local observation channel while preserving the legacy channels.
+pub fn init_heal_channels_with_observations()
+-> Result<(HealChannelReceiver, HealReceiptReceiver, ObservedHealReceiptReceiver), HealObservationChannelError> {
+    init_heal_channels_inner(true)
+}
+
+fn init_heal_channels_inner(
+    with_observations: bool,
+) -> Result<(HealChannelReceiver, HealReceiptReceiver, ObservedHealReceiptReceiver), HealObservationChannelError> {
     let (command, command_receiver) = mpsc::unbounded_channel();
     let (receipt, receipt_receiver) = mpsc::unbounded_channel();
+    let (observed, observed_receiver) = mpsc::unbounded_channel();
     GLOBAL_HEAL_CHANNEL_SENDERS
-        .set(HealChannelSenders { command, receipt })
-        .map_err(|_| "Heal channel sender already initialized")?;
-    Ok((command_receiver, receipt_receiver))
+        .set(HealChannelSenders {
+            command,
+            receipt,
+            observed: with_observations.then_some(observed),
+        })
+        .map_err(|_| HealObservationChannelError::AlreadyInitialized)?;
+    Ok((command_receiver, receipt_receiver, observed_receiver))
 }
 
 /// Get global heal channel sender
@@ -515,10 +577,17 @@ pub fn subscribe_heal_responses() -> broadcast::Receiver<HealChannelResponse> {
 
 /// Send heal start request and wait for structured admission feedback.
 pub async fn send_heal_request_with_receipt(request: HealChannelRequest) -> Result<HealAdmissionReceipt, String> {
-    let (response_tx, response_rx) = oneshot::channel();
     let senders = GLOBAL_HEAL_CHANNEL_SENDERS
         .get()
         .ok_or_else(|| "Heal channel not initialized".to_string())?;
+    send_heal_request_with_receipt_on(senders, request).await
+}
+
+async fn send_heal_request_with_receipt_on(
+    senders: &HealChannelSenders,
+    request: HealChannelRequest,
+) -> Result<HealAdmissionReceipt, String> {
+    let (response_tx, response_rx) = oneshot::channel();
     senders
         .receipt
         .send(HealReceiptCommand { request, response_tx })
@@ -526,6 +595,46 @@ pub async fn send_heal_request_with_receipt(request: HealChannelRequest) -> Resu
     response_rx
         .await
         .map_err(|e| format!("Failed to receive heal admission response: {e}"))?
+}
+
+/// A missing or closed observation channel falls back only before a command is accepted.
+pub async fn send_heal_request_with_observation(
+    request: HealChannelRequest,
+) -> Result<ObservedHealAdmissionReceipt, HealObservationChannelError> {
+    let senders = GLOBAL_HEAL_CHANNEL_SENDERS
+        .get()
+        .ok_or(HealObservationChannelError::NotInitialized)?;
+    send_heal_request_with_observation_on(senders, request).await
+}
+
+async fn send_heal_request_with_observation_on(
+    senders: &HealChannelSenders,
+    mut request: HealChannelRequest,
+) -> Result<ObservedHealAdmissionReceipt, HealObservationChannelError> {
+    if let Some(observed) = &senders.observed {
+        let (response_tx, response_rx) = oneshot::channel();
+        match observed.send(ObservedHealReceiptCommand { request, response_tx }) {
+            Ok(()) => {
+                return response_rx
+                    .await
+                    .map_err(HealObservationChannelError::ObservedResponseClosed)?;
+            }
+            Err(error) => request = error.0.request,
+        }
+    }
+    let (response_tx, response_rx) = oneshot::channel();
+    senders
+        .receipt
+        .send(HealReceiptCommand { request, response_tx })
+        .map_err(|_| HealObservationChannelError::LegacyCommandClosed)?;
+    let receipt = response_rx
+        .await
+        .map_err(HealObservationChannelError::LegacyResponseClosed)?
+        .map_err(HealObservationChannelError::AdmissionFailed)?;
+    Ok(ObservedHealAdmissionReceipt {
+        receipt,
+        observation_id: None,
+    })
 }
 
 /// Send heal start request and wait for structured admission feedback.
@@ -774,6 +883,109 @@ mod auto_heal_disk_request_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn observed_receipt_falls_back_only_when_no_observed_command_was_accepted() {
+        for closed in [false, true] {
+            let (command, _command_rx) = mpsc::unbounded_channel();
+            let (receipt, mut receipt_rx) = mpsc::unbounded_channel();
+            let observed = if closed {
+                let (sender, receiver) = mpsc::unbounded_channel();
+                drop(receiver);
+                Some(sender)
+            } else {
+                None
+            };
+            let senders = HealChannelSenders {
+                command,
+                receipt,
+                observed,
+            };
+            let request = HealChannelRequest::new();
+            let task = tokio::spawn(async move { send_heal_request_with_observation_on(&senders, request).await });
+            let command = receipt_rx.recv().await.expect("legacy receipt command");
+            command
+                .response_tx
+                .send(Ok(HealAdmissionReceipt {
+                    result: HealAdmissionResult::Accepted,
+                    task_id: "owner".into(),
+                }))
+                .expect("caller waiting");
+            let received = task.await.expect("sender task").expect("legacy admission");
+            assert_eq!(received.task_id, "owner");
+            assert_eq!(received.observation_id, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_observed_reply_never_resends_the_request() {
+        let (command, _command_rx) = mpsc::unbounded_channel();
+        let (receipt, mut receipt_rx) = mpsc::unbounded_channel();
+        let keep_receipt_open = receipt.clone();
+        let (observed, mut observed_rx) = mpsc::unbounded_channel();
+        let senders = HealChannelSenders {
+            command,
+            receipt,
+            observed: Some(observed),
+        };
+        let task = tokio::spawn(async move { send_heal_request_with_observation_on(&senders, HealChannelRequest::new()).await });
+        let command = observed_rx.recv().await.expect("accepted observed command");
+        drop(command.response_tx);
+        let error = task
+            .await
+            .expect("sender task")
+            .expect_err("lost response must remain an error");
+        assert!(matches!(&error, HealObservationChannelError::ObservedResponseClosed(_)));
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(matches!(receipt_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        drop(keep_receipt_open);
+    }
+
+    #[tokio::test]
+    async fn fallback_reports_a_typed_error_if_legacy_channel_is_closed() {
+        let (command, _command_rx) = mpsc::unbounded_channel();
+        let (receipt, receipt_rx) = mpsc::unbounded_channel();
+        drop(receipt_rx);
+        let senders = HealChannelSenders {
+            command,
+            receipt,
+            observed: None,
+        };
+        let error = send_heal_request_with_observation_on(&senders, HealChannelRequest::new())
+            .await
+            .expect_err("closed legacy channel must not accept work");
+        assert!(matches!(error, HealObservationChannelError::LegacyCommandClosed));
+    }
+
+    #[tokio::test]
+    async fn observed_receipt_keeps_the_owner_token_from_the_processor() {
+        let (command, _command_rx) = mpsc::unbounded_channel();
+        let (receipt, mut receipt_rx) = mpsc::unbounded_channel();
+        let keep_receipt_open = receipt.clone();
+        let (observed, mut observed_rx) = mpsc::unbounded_channel();
+        let senders = HealChannelSenders {
+            command,
+            receipt,
+            observed: Some(observed),
+        };
+        let task = tokio::spawn(async move { send_heal_request_with_observation_on(&senders, HealChannelRequest::new()).await });
+        let command = observed_rx.recv().await.expect("observed command");
+        command
+            .response_tx
+            .send(Ok(ObservedHealAdmissionReceipt {
+                receipt: HealAdmissionReceipt {
+                    result: HealAdmissionResult::Merged,
+                    task_id: "owner".into(),
+                },
+                observation_id: Some(37),
+            }))
+            .expect("caller waiting");
+        let received = task.await.expect("sender task").expect("observed admission");
+        assert_eq!(received.task_id, "owner");
+        assert_eq!(received.observation_id, Some(37));
+        assert!(matches!(receipt_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        drop(keep_receipt_open);
+    }
 
     #[test]
     fn heal_request_source_labels_are_stable() {

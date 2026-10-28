@@ -693,7 +693,7 @@ impl HealManager {
                             let config = config.read().await;
                             let mut queue = heal_queue.lock().await;
                             let admission_decision =
-                                Self::admit_request_to_queue(&mut queue, req, &config, "auto_scan", recovered_replacement);
+                                Self::admit_request_to_queue(&mut queue, req, &config, "auto_scan", recovered_replacement, rustfs_heal_contracts::completion::new_heal_observation_id());
                             let admission = admission_decision.result;
                             let should_notify =
                                 matches!(admission, HealAdmissionResult::Accepted) && config.event_driven_scheduler_enable;

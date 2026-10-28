@@ -280,12 +280,12 @@ pub async fn init_heal_manager_with_workload_provider(
             .is_some_and(|hook| hook.fail_channel_init.load(Ordering::SeqCst));
         #[cfg(not(test))]
         let force_channel_failure = false;
-        let channel_receiver = if force_channel_failure {
-            Err("forced heal channel initialization failure")
-        } else {
-            rustfs_heal_contracts::heal_channel::init_heal_channels()
-        };
-        let (receiver, receipt_receiver) = match channel_receiver {
+        if force_channel_failure {
+            stop_initializing_manager(&heal_manager).await?;
+            return Err(Error::Config("forced heal channel initialization failure".to_string()));
+        }
+        let channel_receiver = rustfs_heal_contracts::heal_channel::init_heal_channels_with_observations();
+        let (receiver, receipt_receiver, observed_receiver) = match channel_receiver {
             Ok(receivers) => receivers,
             Err(err) => {
                 stop_initializing_manager(&heal_manager).await?;
@@ -302,7 +302,10 @@ pub async fn init_heal_manager_with_workload_provider(
 
         tokio::spawn(async move {
             let mut processor = channel_processor.lock().await;
-            if let Err(e) = processor.start_with_receipts(receiver, receipt_receiver).await {
+            if let Err(e) = processor
+                .start_with_observed_receipts(receiver, receipt_receiver, observed_receiver)
+                .await
+            {
                 error!(
                     target: "rustfs::heal",
                     event = EVENT_HEAL_RUNTIME_STATE,

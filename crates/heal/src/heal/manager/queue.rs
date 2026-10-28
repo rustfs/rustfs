@@ -22,6 +22,8 @@ use super::*;
 pub(super) struct DedupKeyEntry {
     pub(super) refcount: usize,
     pub(super) representative_request_id: String,
+    representative_sequence: u64,
+    representative_observation_id: Option<rustfs_heal_contracts::completion::HealObservationId>,
 }
 
 /// Priority queue wrapper for heal requests
@@ -70,8 +72,23 @@ pub(super) struct PriorityQueueItem {
     pub(super) sequence: u64,
     pub(super) dedup_key: String,
     pub(super) request: HealRequest,
+    observation_id: Option<rustfs_heal_contracts::completion::HealObservationId>,
     /// Execution or durable recovery fixed these targets; grace waits can have zero retries.
     pub(super) replacement_targets_frozen: bool,
+}
+
+/// The in-process identity moves with the queue item, including forced duplicates.
+pub(super) struct QueuedHeal {
+    pub(super) request: HealRequest,
+    pub(super) observation_id: Option<rustfs_heal_contracts::completion::HealObservationId>,
+}
+
+impl std::ops::Deref for QueuedHeal {
+    type Target = HealRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
 }
 
 impl Eq for PriorityQueueItem {}
@@ -283,6 +300,7 @@ pub(super) struct HealTaskAlias {
 #[derive(Debug, Clone)]
 pub(super) struct RetryingHeal {
     pub(super) request: HealRequest,
+    pub(super) observation_id: Option<rustfs_heal_contracts::completion::HealObservationId>,
     pub(super) error: String,
     pub(super) cancel_token: CancellationToken,
 }
@@ -307,7 +325,7 @@ impl PriorityHealQueue {
     #[cfg(test)]
     pub(super) fn pop_next(&mut self) -> Option<HealRequest> {
         self.heap.pop().map(|item| {
-            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key, item.sequence);
             self.remove_best_effort_count(item.request.source);
             item.request
         })
@@ -318,10 +336,15 @@ impl PriorityHealQueue {
     }
 
     pub(super) fn push(&mut self, request: HealRequest) -> QueuePushOutcome {
-        self.push_with_replacement_scope(request, false)
+        self.push_with_replacement_scope(request, false, rustfs_heal_contracts::completion::new_heal_observation_id())
     }
 
-    pub(super) fn push_with_replacement_scope(&mut self, request: HealRequest, frozen: bool) -> QueuePushOutcome {
+    pub(super) fn push_with_replacement_scope(
+        &mut self,
+        request: HealRequest,
+        frozen: bool,
+        observation_id: Option<rustfs_heal_contracts::completion::HealObservationId>,
+    ) -> QueuePushOutcome {
         let key = Self::make_dedup_key(&request);
 
         // Check for duplicates unless the caller explicitly forces admission.
@@ -332,20 +355,24 @@ impl PriorityHealQueue {
         // also reserves the dedup key for later non-forced duplicates. The first
         // request that opens the key becomes the named representative for merge
         // receipts (taken before `request` moves into the heap).
+        self.sequence += 1;
+        let sequence = self.sequence;
         self.dedup_keys
             .entry(key.clone())
             .or_insert_with(|| DedupKeyEntry {
                 refcount: 0,
                 representative_request_id: request.id.clone(),
+                representative_sequence: sequence,
+                representative_observation_id: observation_id,
             })
             .refcount += 1;
-        self.sequence += 1;
         let source = request.source;
         self.heap.push(PriorityQueueItem {
             priority: request.priority,
             sequence: self.sequence,
             dedup_key: key,
             request,
+            observation_id,
             replacement_targets_frozen: frozen,
         });
         if is_best_effort_source(source) {
@@ -371,7 +398,12 @@ impl PriorityHealQueue {
         self.can_displace_lower_priority_where(priority, |_| true)
     }
 
-    pub(super) fn push_displacing_lower_priority_where<F>(&mut self, request: HealRequest, can_displace: F) -> Option<HealRequest>
+    pub(super) fn push_displacing_lower_priority_where<F>(
+        &mut self,
+        request: HealRequest,
+        can_displace: F,
+        observation_id: Option<rustfs_heal_contracts::completion::HealObservationId>,
+    ) -> Option<HealRequest>
     where
         F: Fn(&HealRequest) -> bool,
     {
@@ -402,7 +434,7 @@ impl PriorityHealQueue {
         self.heap = retained;
 
         let displaced = displaced.map(|item| {
-            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key, item.sequence);
             self.remove_best_effort_count(item.request.source);
             self.refresh_dedup_representative(&item.dedup_key);
             item.request
@@ -413,7 +445,7 @@ impl PriorityHealQueue {
             // into `debug_assert_eq!` — in release builds (`debug_assertions` off) the whole
             // macro, including its argument expression, is compiled out, which would silently
             // drop the new high-priority request after having already evicted a queued item.
-            let outcome = self.push(request);
+            let outcome = self.push_with_replacement_scope(request, false, observation_id);
             debug_assert_eq!(outcome, QueuePushOutcome::Accepted);
         }
 
@@ -422,7 +454,7 @@ impl PriorityHealQueue {
 
     #[cfg(test)]
     pub(super) fn push_displacing_lower_priority(&mut self, request: HealRequest) -> Option<HealRequest> {
-        self.push_displacing_lower_priority_where(request, |_| true)
+        self.push_displacing_lower_priority_where(request, |_| true, rustfs_heal_contracts::completion::new_heal_observation_id())
     }
 
     /// Get statistics about queue contents by priority
@@ -447,13 +479,13 @@ impl PriorityHealQueue {
     #[cfg(test)]
     pub(super) fn pop(&mut self) -> Option<HealRequest> {
         self.heap.pop().map(|item| {
-            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key, item.sequence);
             self.remove_best_effort_count(item.request.source);
             item.request
         })
     }
 
-    pub(super) fn pop_runnable_with_skips<F, G>(&mut self, can_run: F, skip_label: G) -> (Option<HealRequest>, Vec<String>)
+    pub(super) fn pop_runnable_with_skips<F, G>(&mut self, can_run: F, skip_label: G) -> (Option<QueuedHeal>, Vec<String>)
     where
         F: Fn(&HealRequest) -> bool,
         G: Fn(&HealRequest) -> Option<String>,
@@ -477,15 +509,18 @@ impl PriorityHealQueue {
 
         (
             selected.map(|item| {
-                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key, item.sequence);
                 self.remove_best_effort_count(item.request.source);
-                item.request
+                QueuedHeal {
+                    request: item.request,
+                    observation_id: item.observation_id,
+                }
             }),
             skipped,
         )
     }
 
-    pub(super) fn pop_runnable_with_fairness<F, G>(&mut self, can_run: F, skip_label: G) -> (Option<HealRequest>, Vec<String>)
+    pub(super) fn pop_runnable_with_fairness<F, G>(&mut self, can_run: F, skip_label: G) -> (Option<QueuedHeal>, Vec<String>)
     where
         F: Fn(&HealRequest) -> bool,
         G: Fn(&HealRequest) -> Option<String>,
@@ -555,10 +590,13 @@ impl PriorityHealQueue {
 
         let chosen = chosen.map(|item| {
             let request = item.request;
-            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key, item.sequence);
             self.remove_best_effort_count(request.source);
             self.record_dispatch(&request);
-            request
+            QueuedHeal {
+                request,
+                observation_id: item.observation_id,
+            }
         });
         (chosen, skipped)
     }
@@ -667,12 +705,15 @@ impl PriorityHealQueue {
         }
     }
 
-    pub(super) fn decrement_or_remove_dedup_key(dedup_keys: &mut HashMap<String, DedupKeyEntry>, key: &str) {
+    pub(super) fn decrement_or_remove_dedup_key(dedup_keys: &mut HashMap<String, DedupKeyEntry>, key: &str, sequence: u64) {
         if let Some(entry) = dedup_keys.get_mut(key) {
             if entry.refcount <= 1 {
                 dedup_keys.remove(key);
             } else {
                 entry.refcount -= 1;
+                if entry.representative_sequence == sequence {
+                    entry.representative_observation_id = None;
+                }
             }
         }
     }
@@ -747,6 +788,23 @@ impl PriorityHealQueue {
         self.dedup_keys.get(key).map(|entry| entry.representative_request_id.as_str())
     }
 
+    pub(super) fn queued_observation_for_dedup_key(
+        &self,
+        key: &str,
+    ) -> Option<rustfs_heal_contracts::completion::HealObservationId> {
+        self.dedup_keys.get(key).and_then(|entry| entry.representative_observation_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn queued_observation_for_request_id(
+        &self,
+        id: &str,
+    ) -> Option<rustfs_heal_contracts::completion::HealObservationId> {
+        let mut matching = self.heap.iter().filter(|item| item.request.id == id);
+        let observation_id = matching.next()?.observation_id;
+        if matching.next().is_some() { None } else { observation_id }
+    }
+
     /// Re-elect the representative for `key` from the queue entries holding
     /// it. Needed after a holder leaves the queue *without* becoming active
     /// (canceled by id, or displaced): the former opener may be the request
@@ -764,10 +822,12 @@ impl PriorityHealQueue {
             .heap
             .iter()
             .find(|item| item.dedup_key == key)
-            .map(|item| item.request.id.clone())
+            .map(|item| (item.request.id.clone(), item.sequence, item.observation_id))
             && let Some(entry) = self.dedup_keys.get_mut(key)
         {
-            entry.representative_request_id = id;
+            entry.representative_request_id = id.0;
+            entry.representative_sequence = id.1;
+            entry.representative_observation_id = id.2;
         }
     }
 
@@ -786,7 +846,7 @@ impl PriorityHealQueue {
         while let Some(item) = self.heap.pop() {
             if removed.is_none() && item.request.id == request_id {
                 let key = item.dedup_key.clone();
-                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key, item.sequence);
                 self.remove_best_effort_count(item.request.source);
                 affected_key = Some(key);
                 removed = Some(item.request);
@@ -812,7 +872,7 @@ impl PriorityHealQueue {
 
         while let Some(item) = self.heap.pop() {
             if should_remove(&item.request) {
-                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key, item.sequence);
                 self.remove_best_effort_count(item.request.source);
                 affected_keys.push(item.dedup_key);
                 removed.push(item.request);

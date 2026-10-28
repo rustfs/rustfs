@@ -37,6 +37,7 @@ async fn install_owner(manager: &HealManager, request: HealRequest, state: Owner
             manager.retrying_heals.lock().await.insert(
                 id.clone(),
                 RetryingHeal {
+                    observation_id: None,
                     request,
                     error: "recoverable fixture error".to_string(),
                     cancel_token: CancellationToken::new(),

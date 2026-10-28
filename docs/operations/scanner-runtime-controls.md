@@ -623,7 +623,7 @@ typed terminal result:
 
 | Metric | Meaning |
 |---|---|
-| `rustfs_scanner_heal_pending_tasks` | Canonical tasks awaiting a terminal observation. |
+| `rustfs_scanner_heal_pending_tasks` | Pending task ID and owner-generation pairs awaiting a terminal observation. |
 | `rustfs_scanner_heal_pending_oldest_seconds` | Age of the oldest retained pending candidate; refreshed every five seconds. |
 | `rustfs_scanner_heal_candidate_terminal_total` | Associated candidates, labeled by object `disposition`, expected `scan_mode`, and unresolved `scope`. |
 | `rustfs_scanner_heal_task_terminal_observations_total` | Associated task observations, deduplicated within the bounded recent history. This is not an execution count. |
@@ -640,16 +640,25 @@ verified-byte or full-bucket coverage counter is advanced here.
 The scanner status response also exposes `heal_observation` without requiring
 a metrics exporter. Reading status does not start an observer. `state` is
 `not_started`, `active`, or `stopped`; unavailable pending counts are null.
-`retained_pending_tasks` counts canonical IDs in the existing bounded map,
-while `retained_pending_candidates` counts their associated discoveries.
+`retained_pending_tasks` counts distinct canonical task ID and process-local
+owner-generation pairs in the bounded map. Different generations of the same
+task ID count separately. `retained_pending_candidates` counts their associated
+discoveries. The JSON field names are unchanged. The pending-tasks metric uses
+the same pair count when periodically refreshed, so it can lag the status.
 `queued_admissions` samples the local admission channel and is not an atomic
 cluster backlog. `terminal_task_observations_total` keeps the same bounded
 deduplication semantics as the exporter counter.
 
 `terminal_candidates` preserves execution, object disposition, scan mode, and
 unresolved scope. `unknown_candidates` includes admission rejection, overflow,
-loss, expiry, and missing terminal proof. These categories overlap: a completed
-task with a repaired or verified-healthy object can still have unknown scanner
+loss, expiry, and missing terminal proof. The `not_admitted` reason covers an
+explicit `Full` or `Dropped` decision. The `admission_unknown` reason means no
+decision was received because of a channel or processor error. A lost reply
+does not establish whether work was admitted; a failure known to occur before
+enqueue separately rules out submission. Both reasons remain part of the
+unknown total. Monitoring that filters by reason must include the new
+`admission_unknown` label to retain those errors. These categories overlap: a
+completed task with a repaired or verified-healthy object can still have unknown scanner
 integrity. `integrity_state` therefore remains `unknown`, including when retained
 pending is zero. `lost_completion_notifications` counts skipped messages, not
 objects. Counts belong to the named local observer `generation`; runtime

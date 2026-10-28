@@ -448,6 +448,7 @@ async fn root_recovery_retry_cancellation_preserves_previous_attempt_outcome() {
     manager.retrying_heals.lock().await.insert(
         request.id.clone(),
         RetryingHeal {
+            observation_id: None,
             request: request.clone(),
             error: "retryable".to_string(),
             cancel_token: CancellationToken::new(),
@@ -2151,6 +2152,30 @@ async fn root_recovery_cluster_rejects_inventory_without_checkpoint_headroom() {
             .expect("original admission survives")
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn root_recovery_replayed_queue_owner_gets_a_fresh_in_process_observation_identity() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = root_request();
+    let first = manager
+        .submit_heal_request_with_observation_and_alias(request.clone(), false)
+        .await
+        .expect("persisted admission");
+    assert_eq!(first.result, HealAdmissionResult::Accepted);
+    assert!(first.observation_id.is_some());
+    drop(manager);
+
+    let replayed = recovery_manager(vec![disk]);
+    replayed.replay_root_heals().await.expect("replay persisted root");
+    let recovered_id = replayed
+        .heal_queue
+        .lock()
+        .await
+        .queued_observation_for_request_id(&request.id);
+    assert!(recovered_id.is_some());
+    assert_ne!(recovered_id, first.observation_id);
 }
 
 #[tokio::test]

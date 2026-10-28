@@ -29,7 +29,7 @@ use rustfs_concurrency::workload::{ForegroundPressure, foreground_pressure};
 #[cfg(test)]
 use rustfs_concurrency::{AdmissionState, WorkloadClass};
 use rustfs_heal_contracts::heal_channel::{
-    HealAdmissionDropReason, HealAdmissionReceipt, HealAdmissionResult, HealRequestSource,
+    HealAdmissionDropReason, HealAdmissionReceipt, HealAdmissionResult, HealRequestSource, ObservedHealAdmissionReceipt,
 };
 use rustfs_madmin::heal_commands::HealResultItem;
 #[cfg(test)]
@@ -297,6 +297,7 @@ async fn publish_completed_heal(
     task_id: &str,
     completed: CompletedHealStatus,
     terminal: bool,
+    observation_id: Option<rustfs_heal_contracts::completion::HealObservationId>,
 ) {
     let completed = Arc::new(completed);
     completed.retained_bytes();
@@ -328,13 +329,16 @@ async fn publish_completed_heal(
                 identity: object.identity.clone(),
                 disposition: object.disposition.clone(),
             });
-        rustfs_heal_contracts::completion::publish_heal_completion(rustfs_heal_contracts::completion::HealCompletion {
-            task_id: task_id.to_owned(),
-            scan_mode: completed.options.scan_mode,
-            dry_run: completed.options.dry_run,
-            execution: outcome.map(|outcome| outcome.execution),
-            object,
-        });
+        rustfs_heal_contracts::completion::publish_observed_heal_completion(
+            rustfs_heal_contracts::completion::HealCompletion {
+                task_id: task_id.to_owned(),
+                scan_mode: completed.options.scan_mode,
+                dry_run: completed.options.dry_run,
+                execution: outcome.map(|outcome| outcome.execution),
+                object,
+            },
+            observation_id,
+        );
     }
 }
 
@@ -1292,6 +1296,7 @@ impl HealManager {
         config: &HealConfig,
         context: &'static str,
         replacement_targets_frozen: bool,
+        observation_id: Option<rustfs_heal_contracts::completion::HealObservationId>,
     ) -> HealAdmissionDecision {
         let replacement_targets_frozen = replacement_targets_frozen || request.retry_attempts != 0;
         let queue_len = queue.len();
@@ -1328,7 +1333,7 @@ impl HealManager {
                 let priority = request.priority;
                 let source = request.source;
                 if let Some(displaced) =
-                    queue.push_displacing_lower_priority_where(request, Self::queued_request_can_be_displaced)
+                    queue.push_displacing_lower_priority_where(request, Self::queued_request_can_be_displaced, observation_id)
                 {
                     publish_heal_queue_length(queue);
                     Self::record_admission_metric(source, HealAdmissionResult::Accepted, context);
@@ -1479,7 +1484,7 @@ impl HealManager {
         let priority = request.priority;
         let source = request.source;
 
-        match queue.push_with_replacement_scope(request, replacement_targets_frozen) {
+        match queue.push_with_replacement_scope(request, replacement_targets_frozen, observation_id) {
             QueuePushOutcome::Accepted => {
                 publish_heal_queue_length(queue);
                 Self::record_admission_metric(source, HealAdmissionResult::Accepted, context);
@@ -1951,6 +1956,17 @@ impl HealManager {
         request: HealRequest,
         preserve_alias: bool,
     ) -> Result<HealAdmissionReceipt> {
+        Ok(self
+            .submit_heal_request_with_observation_and_alias(request, preserve_alias)
+            .await?
+            .receipt)
+    }
+
+    pub(crate) async fn submit_heal_request_with_observation_and_alias(
+        &self,
+        request: HealRequest,
+        preserve_alias: bool,
+    ) -> Result<ObservedHealAdmissionReceipt> {
         self.submit_heal_request_with_receipt_alias_and_mrf_notice(request, preserve_alias, true, None)
             .await
     }
@@ -1991,8 +2007,10 @@ impl HealManager {
         mrf_notice_target: MrfRepairNoticeTarget,
     ) -> Result<HealAdmissionReceipt> {
         let preserve_alias = !mrf_notice_target.kind.is_durable();
-        self.submit_heal_request_with_receipt_alias_and_mrf_notice(request, preserve_alias, true, Some(mrf_notice_target))
-            .await
+        Ok(self
+            .submit_heal_request_with_receipt_alias_and_mrf_notice(request, preserve_alias, true, Some(mrf_notice_target))
+            .await?
+            .receipt)
     }
 
     #[cfg(test)]
@@ -2058,7 +2076,7 @@ impl HealManager {
         preserve_alias: bool,
         accept_same_request_id_replay: bool,
         mrf_notice_target: Option<MrfRepairNoticeTarget>,
-    ) -> Result<HealAdmissionReceipt> {
+    ) -> Result<ObservedHealAdmissionReceipt> {
         let admission_start = Instant::now();
         if request.id.is_empty() {
             request.id = uuid::Uuid::new_v4().to_string();
@@ -2121,17 +2139,19 @@ impl HealManager {
 
         let request_id_admission = active_heals
             .get(&request.id)
-            .map(|task| (request_matches_task(&request, task), "active"))
+            .map(|task| (request_matches_task(&request, task), "active", task.observation_id))
             .or_else(|| {
+                // ID uniqueness across queue keys is not indexed. Avoid a
+                // second heap scan; a same-ID queued receipt is unproven.
                 queue
                     .requests()
                     .find(|queued| queued.id == request.id)
-                    .map(|queued| (request_matches_request(&request, queued), "queued"))
+                    .map(|queued| (request_matches_request(&request, queued), "queued", None))
             })
             .or_else(|| {
                 retrying_heals
                     .get(&request.id)
-                    .map(|retrying| (request_matches_request(&request, &retrying.request), "retrying"))
+                    .map(|retrying| (request_matches_request(&request, &retrying.request), "retrying", retrying.observation_id))
             })
             // A durable-only owner must be resumed by recovery, not overwritten
             // with a new execution budget by a replay before recovery completes.
@@ -2139,9 +2159,9 @@ impl HealManager {
                 durable_owners
                     .iter()
                     .find(|owner| owner.id == request.id)
-                    .map(|_| (false, "durable"))
+                    .map(|_| (false, "durable", None))
             });
-        if let Some((matches_existing, duplicate_state)) = request_id_admission {
+        if let Some((matches_existing, duplicate_state, observation_id)) = request_id_admission {
             let admission = if matches_existing {
                 if accept_same_request_id_replay {
                     HealAdmissionResult::Accepted
@@ -2183,9 +2203,12 @@ impl HealManager {
                 reason = admission.reason_label(),
                 "Heal queue admission reused an existing request id"
             );
-            return Ok(HealAdmissionReceipt {
-                result: admission,
-                task_id: request.id,
+            return Ok(ObservedHealAdmissionReceipt {
+                receipt: HealAdmissionReceipt {
+                    result: admission,
+                    task_id: request.id,
+                },
+                observation_id,
             });
         }
 
@@ -2284,15 +2307,23 @@ impl HealManager {
 
         let duplicate = (!request.force_start && rejection.is_none()).then(|| {
             active_heal_for_dedup_key(&active_heals, &dedup_key)
-                .map(|(task_id, _)| (task_id, "active"))
+                .map(|(task_id, _)| {
+                    let observation_id = active_heals.get(&task_id).and_then(|task| task.observation_id);
+                    (task_id, "active", observation_id)
+                })
                 .or_else(|| {
                     queue
                         .queued_request_id_for_dedup_key(&dedup_key)
-                        .map(|queued_id| (queued_id.to_string(), "queued"))
+                        .map(|queued_id| (queued_id.to_string(), "queued", queue.queued_observation_for_dedup_key(&dedup_key)))
                 })
-                .or_else(|| retrying_heal_for_dedup_key(&retrying_heals, &dedup_key).map(|(task_id, _)| (task_id, "retrying")))
+                .or_else(|| {
+                    retrying_heal_for_dedup_key(&retrying_heals, &dedup_key).map(|(task_id, _)| {
+                        let observation_id = retrying_heals.get(&task_id).and_then(|retry| retry.observation_id);
+                        (task_id, "retrying", observation_id)
+                    })
+                })
         });
-        if let Some((merged_task_id, duplicate_state)) = duplicate.flatten() {
+        if let Some((merged_task_id, duplicate_state, observation_id)) = duplicate.flatten() {
             // HS-06: under the minio_error overlap policy an exact duplicate
             // admin start reports the typed AlreadyRunning rejection instead
             // of the silent merge (MinIO's ErrHealAlreadyRunning).
@@ -2400,9 +2431,12 @@ impl HealManager {
                 HealAdmissionResult::Accepted | HealAdmissionResult::Full => {}
             }
 
-            return Ok(HealAdmissionReceipt {
-                result: admission,
-                task_id: merged_task_id,
+            return Ok(ObservedHealAdmissionReceipt {
+                receipt: HealAdmissionReceipt {
+                    result: admission,
+                    task_id: merged_task_id,
+                },
+                observation_id,
             });
         }
 
@@ -2433,9 +2467,12 @@ impl HealManager {
                 result = "overlap_rejected",
                 "Admin heal start rejected by overlap policy"
             );
-            return Ok(HealAdmissionReceipt {
-                result: HealAdmissionResult::Dropped(reason),
-                task_id: overlap_task_id,
+            return Ok(ObservedHealAdmissionReceipt {
+                receipt: HealAdmissionReceipt {
+                    result: HealAdmissionResult::Dropped(reason),
+                    task_id: overlap_task_id,
+                },
+                observation_id: None,
             });
         }
 
@@ -2477,9 +2514,12 @@ impl HealManager {
                     result = "dropped_by_disposition",
                     "Heal queue admission answered from the disposition memory"
                 );
-                return Ok(HealAdmissionReceipt {
-                    result: admission,
-                    task_id: recorded_task_id,
+                return Ok(ObservedHealAdmissionReceipt {
+                    receipt: HealAdmissionReceipt {
+                        result: admission,
+                        task_id: recorded_task_id,
+                    },
+                    observation_id: None,
                 });
             }
         }
@@ -2507,17 +2547,24 @@ impl HealManager {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .contains_key(&request.id);
-        let admission_decision = Self::admit_request_to_queue(&mut queue, request, &config, "submit", recovered_replacement);
+        let mut observation_id = rustfs_heal_contracts::completion::new_heal_observation_id();
+        let admission_decision =
+            Self::admit_request_to_queue(&mut queue, request, &config, "submit", recovered_replacement, observation_id);
         let admission = admission_decision.result;
         if durable_handoff_required && !admission.is_admitted() {
             self.root_recovery
                 .remove(&request_id, &request_heal_type, request_source)
                 .await?;
         }
-        if admission == HealAdmissionResult::Merged
-            && let Some(queued_id) = queue.queued_request_id_for_dedup_key(&dedup_key)
-        {
-            task_id = queued_id.to_owned();
+        if admission == HealAdmissionResult::Merged {
+            observation_id = None;
+            if let Some(queued_id) = queue.queued_request_id_for_dedup_key(&dedup_key) {
+                task_id = queued_id.to_owned();
+                observation_id = queue.queued_observation_for_dedup_key(&dedup_key);
+            }
+        }
+        if !admission.is_admitted() {
+            observation_id = None;
         }
         let should_notify = matches!(admission, HealAdmissionResult::Accepted) && config.event_driven_scheduler_enable;
         let displaced_task_id = admission_decision.displaced_task_id().map(ToOwned::to_owned);
@@ -2563,9 +2610,12 @@ impl HealManager {
             lock_timing,
         });
 
-        Ok(HealAdmissionReceipt {
-            result: admission,
-            task_id,
+        Ok(ObservedHealAdmissionReceipt {
+            receipt: HealAdmissionReceipt {
+                result: admission,
+                task_id,
+            },
+            observation_id,
         })
     }
 
@@ -2887,7 +2937,15 @@ impl HealManager {
                     .await?;
                 self.root_recovery.remove(&task.id, &task.heal_type, task.source).await?;
                 task.cancel().await?;
-                publish_completed_heal(&self.completed_heals, &self.task_aliases, &canonical_task_id, completed, true).await;
+                publish_completed_heal(
+                    &self.completed_heals,
+                    &self.task_aliases,
+                    &canonical_task_id,
+                    completed,
+                    true,
+                    task.observation_id,
+                )
+                .await;
                 active_heals.remove(&canonical_task_id);
                 publish_active_heal_count(&active_heals);
                 info!(
@@ -2998,7 +3056,15 @@ impl HealManager {
                         .await?;
                     self.root_recovery.remove(&task.id, &task.heal_type, task.source).await?;
                     task.cancel().await?;
-                    publish_completed_heal(&self.completed_heals, &self.task_aliases, task_id, completed, true).await;
+                    publish_completed_heal(
+                        &self.completed_heals,
+                        &self.task_aliases,
+                        task_id,
+                        completed,
+                        true,
+                        task.observation_id,
+                    )
+                    .await;
                 }
                 active_heals.remove(task_id);
                 cancelled += 1;

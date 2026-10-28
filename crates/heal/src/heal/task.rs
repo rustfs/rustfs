@@ -413,6 +413,8 @@ pub struct HealResultWindow {
 pub struct HealTask {
     /// Task ID
     pub id: String,
+    /// Process-local diagnostic identity; never persisted or part of a request.
+    pub(crate) observation_id: Option<rustfs_heal_contracts::completion::HealObservationId>,
     /// Heal type
     pub heal_type: HealType,
     pub bucket_incarnation_id: Option<Uuid>,
@@ -494,6 +496,7 @@ impl HealTask {
     pub fn from_request(request: HealRequest, storage: Arc<dyn HealStorageAPI>) -> Self {
         Self {
             id: request.id,
+            observation_id: None,
             heal_type: request.heal_type,
             bucket_incarnation_id: request.bucket_incarnation_id,
             expected_mrf_bucket_incarnation_id: request.expected_mrf_bucket_incarnation_id,
@@ -527,6 +530,14 @@ impl HealTask {
             storage,
             mainline_pacer: None,
         }
+    }
+
+    pub(crate) fn with_observation_id(
+        mut self,
+        observation_id: Option<rustfs_heal_contracts::completion::HealObservationId>,
+    ) -> Self {
+        self.observation_id = observation_id;
+        self
     }
 
     pub fn retry_request(&self) -> HealRequest {

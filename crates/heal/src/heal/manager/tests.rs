@@ -935,6 +935,7 @@ async fn heal_start_retry_scheduler_carries_explicit_budget_and_identity() {
 
 #[tokio::test]
 async fn heal_start_retry_scheduler_carries_explicit_budget_across_retries() {
+    let mut terminals = rustfs_heal_contracts::completion::subscribe_observed_heal_completions();
     let manager = HealManager::new_without_root_recovery_for_test(
         Arc::new(MockStorage),
         Some(HealConfig {
@@ -948,10 +949,11 @@ async fn heal_start_retry_scheduler_carries_explicit_budget_across_retries() {
     request.options.timeout = Some(Duration::from_secs(60));
     let task_id = request.id.clone();
     let created_at = request.created_at;
-    manager
-        .submit_heal_request(request)
+    let receipt = manager
+        .submit_heal_request_with_observation_and_alias(request, false)
         .await
         .expect("admit explicit-budget task");
+    let observation_id = receipt.observation_id.expect("accepted owner has an observation identity");
 
     let mut previous_remaining = Duration::from_secs(60);
     for expected_attempt in 1..=3 {
@@ -967,7 +969,9 @@ async fn heal_start_retry_scheduler_carries_explicit_budget_across_retries() {
         .await
         .expect("recoverable executor failure should enter retry backoff");
 
-        let retry = manager.retrying_heals.lock().await[&task_id].request.clone();
+        let retry_owner = manager.retrying_heals.lock().await[&task_id].clone();
+        assert_eq!(retry_owner.observation_id, Some(observation_id));
+        let retry = retry_owner.request;
         assert_eq!(retry.id, task_id);
         assert_eq!(retry.created_at, created_at);
         assert_eq!(retry.source, HealRequestSource::Admin);
@@ -993,6 +997,10 @@ async fn heal_start_retry_scheduler_carries_explicit_budget_across_retries() {
         .await
         .expect("retry backoff should requeue the same task id");
         assert_eq!(manager.operations_snapshot().await.queue_length, 1);
+        assert_eq!(
+            manager.heal_queue.lock().await.queued_observation_for_request_id(&task_id),
+            Some(observation_id)
+        );
     }
 
     process_manager_queue_once(&manager).await;
@@ -1013,6 +1021,17 @@ async fn heal_start_retry_scheduler_carries_explicit_budget_across_retries() {
     );
     assert_eq!(manager.operations_snapshot().await.queue_length, 0);
     assert_eq!(manager.operations_snapshot().await.retrying_tasks, 0);
+    let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let terminal = terminals.recv().await.expect("terminal channel remains open");
+            if terminal.task_id == task_id {
+                break terminal;
+            }
+        }
+    })
+    .await
+    .expect("retry exhaustion emits one terminal");
+    assert_eq!(terminal.observation_id, Some(observation_id));
 }
 
 struct ManagerRecoveryTestHook {
@@ -1207,6 +1226,32 @@ fn test_push_displacing_lower_priority_actually_enqueues_new_request() {
 }
 
 #[test]
+fn queued_observation_tracks_the_holder_sequence_when_ids_repeat() {
+    let mut queue = PriorityHealQueue::new();
+    let first = bucket_request("same-owner-key", HealPriority::Normal, HealRequestSource::Internal);
+    let key = PriorityHealQueue::make_dedup_key(&first);
+    let mut second = first.clone();
+    second.force_start = true;
+    assert_eq!(queue.push_with_replacement_scope(first, false, Some(11)), QueuePushOutcome::Accepted);
+    assert_eq!(queue.push_with_replacement_scope(second, false, Some(12)), QueuePushOutcome::Accepted);
+    assert_eq!(queue.queued_observation_for_dedup_key(&key), Some(11));
+    assert_eq!(
+        queue.queued_observation_for_request_id(&queue.heap.peek().expect("holder").request.id),
+        None
+    );
+
+    let (first, _) = queue.pop_runnable_with_fairness(|_| true, |_| None);
+    assert_eq!(first.expect("first holder").observation_id, Some(11));
+    assert_eq!(
+        queue.queued_observation_for_dedup_key(&key),
+        None,
+        "a departed representative is unproven"
+    );
+    let (second, _) = queue.pop_runnable_with_fairness(|_| true, |_| None);
+    assert_eq!(second.expect("second holder").observation_id, Some(12));
+}
+
+#[test]
 fn queued_request_id_for_dedup_key_tracks_the_representative() {
     let mut queue = PriorityHealQueue::new();
 
@@ -1214,6 +1259,7 @@ fn queued_request_id_for_dedup_key_tracks_the_representative() {
     let first_id = first.id.clone();
     let first_key = PriorityHealQueue::make_dedup_key(&first);
     assert_eq!(queue.push(first), QueuePushOutcome::Accepted);
+    assert!(queue.queued_observation_for_dedup_key(&first_key).is_some());
 
     // A forced duplicate of the same target opens a second entry under
     // the same key; the representative stays the request that opened it.
@@ -1341,6 +1387,7 @@ async fn durable_mrf_anchor_snapshot_follows_live_owners_and_ignores_stale_notic
     manager.retrying_heals.lock().await.insert(
         "retry-merged-active".into(),
         RetryingHeal {
+            observation_id: None,
             request: retry_request,
             error: "retry pending".into(),
             cancel_token: CancellationToken::new(),
@@ -2590,6 +2637,7 @@ async fn automatic_replacement_frozen_targets_reject_late_disks_but_cover_duplic
                 manager.retrying_heals.lock().await.insert(
                     owner_id.clone(),
                     RetryingHeal {
+                        observation_id: None,
                         request: owner,
                         error: "target unavailable".to_string(),
                         cancel_token: CancellationToken::new(),
@@ -2601,7 +2649,7 @@ async fn automatic_replacement_frozen_targets_reject_late_disks_but_cover_duplic
                 let mut queue = manager.heal_queue.lock().await;
                 let context = if state == "grace" { "retry" } else { "auto_scan" };
                 assert_eq!(
-                    HealManager::admit_request_to_queue(&mut queue, owner, &config, context, true).result,
+                    HealManager::admit_request_to_queue(&mut queue, owner, &config, context, true, None).result,
                     HealAdmissionResult::Accepted
                 );
                 assert!(
@@ -2725,7 +2773,7 @@ fn automatic_replacement_direct_admission_checks_frozen_targets_before_capacity(
     let owner_id = owner.id.clone();
     assert_eq!(queue.push(owner), QueuePushOutcome::Accepted);
     let admit = |queue: &mut PriorityHealQueue, request, frozen| {
-        HealManager::admit_request_to_queue(queue, request, &config, "auto_scan", frozen).result
+        HealManager::admit_request_to_queue(queue, request, &config, "auto_scan", frozen, None).result
     };
     assert_eq!(
         admit(&mut queue, automatic_replacement_request(&["replacement-b"]), false),
@@ -3958,6 +4006,7 @@ async fn insert_retrying_request(manager: &HealManager, request: HealRequest) ->
     manager.retrying_heals.lock().await.insert(
         task_id.clone(),
         RetryingHeal {
+            observation_id: None,
             request: request.clone(),
             error: "Lock acquisition timeout".to_string(),
             cancel_token: cancel_token.clone(),
@@ -4510,6 +4559,7 @@ async fn test_operations_snapshot_counts_retry_backoff_as_owned_work() {
     manager.retrying_heals.lock().await.insert(
         task_id,
         RetryingHeal {
+            observation_id: None,
             request,
             error: "transient".to_string(),
             cancel_token: CancellationToken::new(),
@@ -4789,6 +4839,7 @@ async fn test_get_task_report_preserves_retrying_options() {
     manager.retrying_heals.lock().await.insert(
         task_id.clone(),
         RetryingHeal {
+            observation_id: None,
             request,
             error: "transient".to_string(),
             cancel_token: CancellationToken::new(),
