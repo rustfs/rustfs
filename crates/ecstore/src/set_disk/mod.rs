@@ -4245,14 +4245,23 @@ pub(super) struct MultipartWriteQuorumContext<'a> {
     part_number: Option<usize>,
 }
 
+fn record_multipart_write_quorum_failure(
+    stage: &'static str,
+    errs: &[Option<DiskError>],
+    write_quorum: usize,
+) -> crate::disk::error_reduce::WriteQuorumFailureSummary {
+    let summary = build_write_quorum_failure_summary(errs, OBJECT_OP_IGNORED_ERRS, write_quorum);
+    runtime_sources::record_erasure_write_quorum_failure(stage, summary.dominant_error_label);
+    summary
+}
+
 fn log_multipart_write_quorum_failure(
     context: MultipartWriteQuorumContext<'_>,
     errs: &[Option<DiskError>],
     write_quorum: usize,
     returned_error: &DiskError,
 ) {
-    let summary = build_write_quorum_failure_summary(errs, OBJECT_OP_IGNORED_ERRS, write_quorum);
-    runtime_sources::record_erasure_write_quorum_failure(context.stage, summary.dominant_error_label);
+    let summary = record_multipart_write_quorum_failure(context.stage, errs, write_quorum);
     warn!(
         target: "rustfs_ecstore::set_disk",
         event = EVENT_SET_DISK_MULTIPART,
