@@ -143,6 +143,8 @@ pub(crate) mod protocols {
         pub(crate) use crate::storage::storage_api::{StorageObjectOptions, StoragePutObjReader};
         pub(crate) type FS = crate::storage::storage_api::FS;
         pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
+        #[cfg(all(test, any(feature = "webdav", feature = "sftp")))]
+        pub(crate) use s3s::S3ErrorCode;
         #[cfg(test)]
         pub(crate) use s3s::dto::ListObjectsV2Input;
 
