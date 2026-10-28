@@ -623,6 +623,62 @@ fn missing_identity_fields_are_unknown_on_either_side() {
 }
 
 #[test]
+fn nil_version_is_unknown_on_either_side() {
+    for missing_candidate in [true, false] {
+        let mut observed = candidate();
+        let mut terminal = (*completion("nil-version", HealObjectDisposition::VerifiedHealthy)).clone();
+        let expected = observed.identity.as_mut().expect("candidate identity");
+        let actual = &mut Arc::make_mut(&mut terminal.completion)
+            .object
+            .as_mut()
+            .expect("terminal object")
+            .identity;
+        if missing_candidate {
+            expected.version_id = Some(Uuid::nil().to_string());
+        } else {
+            actual.version_id = Some(Uuid::nil().to_string());
+        }
+        let mut recent = Recent {
+            completion: Arc::new(terminal),
+            counted: false,
+        };
+        assert_eq!(
+            Settlement::new(observed, &mut recent).scope,
+            "identity_unknown",
+            "RED_SCANNER_NIL_VERSION candidate={missing_candidate}"
+        );
+    }
+}
+
+#[test]
+fn nil_incarnation_is_unknown_on_either_side() {
+    for missing_candidate in [true, false] {
+        let mut observed = candidate();
+        let mut terminal = (*completion("nil-incarnation", HealObjectDisposition::VerifiedHealthy)).clone();
+        let expected = observed.identity.as_mut().expect("candidate identity");
+        let actual = &mut Arc::make_mut(&mut terminal.completion)
+            .object
+            .as_mut()
+            .expect("terminal object")
+            .identity;
+        if missing_candidate {
+            expected.bucket_incarnation_id = Some(Uuid::nil());
+        } else {
+            actual.bucket_incarnation_id = Some(Uuid::nil());
+        }
+        let mut recent = Recent {
+            completion: Arc::new(terminal),
+            counted: false,
+        };
+        assert_eq!(
+            Settlement::new(observed, &mut recent).scope,
+            "identity_unknown",
+            "RED_SCANNER_NIL_INCARNATION candidate={missing_candidate}"
+        );
+    }
+}
+
+#[test]
 fn equivalent_uuid_version_formats_do_not_claim_identity_mismatch() {
     let version = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").expect("valid fixture version");
     let mut observed = candidate();
