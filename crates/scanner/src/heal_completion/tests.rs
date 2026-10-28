@@ -97,7 +97,7 @@ fn mixed_candidate_semantics_settle_independently_in_either_order() {
                 ("identity_unknown", 1),
                 ("dry_run", 1),
             ] {
-                assert_eq!(observations.unknown_counts.get(scope), Some(&count), "{scope}");
+                assert_eq!(observations.unknown_counts.get(scope), Some(&count), "RED_GROUP_MIXED_SCOPE {scope}");
             }
             assert_eq!(
                 observations
@@ -132,7 +132,11 @@ fn candidate_group_capacity_is_global_and_released_by_completion() {
     assert!(observations.admit(key("owner-a"), duplicate).is_none());
     assert!(observations.admit(key("owner-a"), candidate()).is_none());
     assert!(observations.admit(key("owner-c"), candidate()).is_none());
-    assert_eq!(observations.unknown_counts.get("pending_groups_full"), Some(&2));
+    assert_eq!(
+        observations.unknown_counts.get("pending_groups_full"),
+        Some(&2),
+        "RED_GROUP_GLOBAL_CAPACITY"
+    );
     assert!(!observations.pending.contains_key(&key("owner-c")));
 
     assert!(
@@ -167,7 +171,7 @@ fn candidate_group_expiry_and_notification_loss_are_independent() {
     }
 
     observations.maintain(now + PENDING_TTL);
-    assert_eq!(observations.unknown_counts.get("expired"), Some(&2));
+    assert_eq!(observations.unknown_counts.get("expired"), Some(&2), "RED_GROUP_EXPIRY_WITH_LOSS");
     assert!(observations.pending.contains_key(&key("expiring-owner")));
     assert_eq!(observations.terminal_tasks, 0);
 
@@ -196,7 +200,7 @@ fn candidate_group_expiry_uses_earliest_discovery_not_admission_order() {
     assert!(observations.admit(key("reordered"), later).is_none());
     assert!(observations.admit(key("reordered"), earlier).is_none());
     observations.maintain(now + PENDING_TTL);
-    assert!(!observations.pending.contains_key(&key("reordered")));
+    assert!(!observations.pending.contains_key(&key("reordered")), "RED_GROUP_FIRST_EARLIEST_EXPIRY");
     assert_eq!(observations.unknown_counts.get("expired"), Some(&2));
     assert_eq!(observations.terminal_tasks, 0);
 }
@@ -219,7 +223,11 @@ fn later_candidate_group_also_expires_from_earliest_discovery() {
 
     observations.maintain(now + PENDING_TTL);
     assert!(observations.pending.contains_key(&key("reordered-other-group")));
-    assert_eq!(observations.unknown_counts.get("expired"), Some(&2));
+    assert_eq!(
+        observations.unknown_counts.get("expired"),
+        Some(&2),
+        "RED_GROUP_ADDITIONAL_EARLIEST_EXPIRY"
+    );
     assert_eq!(observations.terminal_tasks, 0);
 }
 
@@ -240,7 +248,7 @@ fn candidate_expiry_is_enforced_when_terminal_arrives_between_ticks() {
             .complete(completion("terminal-expiry", HealObjectDisposition::VerifiedHealthy), now + PENDING_TTL)
             .is_some()
     );
-    assert_eq!(observations.unknown_counts.get("expired"), Some(&1));
+    assert_eq!(observations.unknown_counts.get("expired"), Some(&1), "RED_GROUP_TERMINAL_EXPIRY");
     assert_eq!(observations.terminal_counts.values().sum::<u64>(), 1);
     assert_eq!(observations.terminal_tasks, 1);
     assert!(observations.pending.is_empty());
@@ -262,7 +270,7 @@ fn expired_candidate_is_unknown_even_if_terminal_was_seen_first() {
         old.first_seen = now
             .checked_sub(PENDING_TTL + Duration::from_secs(1))
             .expect("monotonic clock supports the candidate TTL");
-        assert!(observations.admit(key("late-admission"), old).is_none());
+        assert!(observations.admit(key("late-admission"), old).is_none(), "RED_GROUP_EXPIRED_ADMISSION");
         assert_eq!(observations.unknown_counts.get("expired"), Some(&1));
         assert!(!observations.pending.contains_key(&key("late-admission")));
         assert_eq!(observations.terminal_tasks, 0);
@@ -301,7 +309,7 @@ fn grouped_pending_status_counts_candidates_after_partial_expiry() {
 
     observer.state.lock().expect("observations").maintain(now + PENDING_TTL);
     let status = observation_status_from(&registry);
-    assert_eq!(status.retained_pending_tasks, Some(1));
+    assert_eq!(status.retained_pending_tasks, Some(1), "RED_GROUP_STATUS_AFTER_EXPIRY");
     assert_eq!(status.retained_pending_candidates, Some(2));
     assert_eq!(
         status
