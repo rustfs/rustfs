@@ -3101,22 +3101,8 @@ where
         }
 
         let commit_recovery = Self::table_commit_recovery_report_for_entry_locked(state, &table_entry);
-        let snapshot_etag = state
-            .snapshot_etag
-            .clone()
-            .ok_or_else(|| TableCatalogStoreError::Internal("durable strong catalog snapshot has no etag".to_string()))?;
-        let snapshot_version = state
-            .snapshot_version
-            .ok_or_else(|| TableCatalogStoreError::Internal("durable strong catalog snapshot has no version".to_string()))?;
-        let backing_manifest = durable_strong_table_catalog_backing_manifest(
-            Self::snapshot_object_path(),
-            Some(snapshot_etag),
-            Some(snapshot_version),
-            namespace,
-            table,
-            &table_entry,
-            &commit_recovery,
-        );
+        let backing_manifest =
+            table_catalog_backing_manifest(&TableCatalogObjectPaths::default(), namespace, table, &table_entry, &commit_recovery);
 
         Ok((
             TableCatalogExport {

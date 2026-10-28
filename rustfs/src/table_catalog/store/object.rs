@@ -442,6 +442,28 @@ where
         RUSTFS_META_BUCKET
     }
 
+    pub(super) async fn acquire_table_bucket_registry_write_permit(&self) -> TableCatalogStoreResult<TableCatalogLockGuard> {
+        self.backend
+            .acquire_read_lock(self.catalog_bucket(), &self.paths.catalog_backup_global_fence_lock_path())
+            .await
+    }
+
+    pub(super) async fn acquire_object_backed_catalog_write_permit(
+        &self,
+        table_bucket: &str,
+    ) -> TableCatalogStoreResult<TableCatalogLockGuard> {
+        self.backend
+            .acquire_read_lock(self.catalog_bucket(), &self.paths.catalog_backup_fence_lock_path(table_bucket))
+            .await
+    }
+
+    pub(super) async fn ensure_object_backed_catalog_write_permit_after_lock(
+        &self,
+        _table_bucket: &str,
+    ) -> TableCatalogStoreResult<()> {
+        Ok(())
+    }
+
     async fn list_entry_page<T, P, V>(
         &self,
         prefix: &str,
@@ -5298,6 +5320,21 @@ where
         };
         self.plan_table_metadata_maintenance_for_entry_with_scope(&entry, retain_recent_metadata_files, false)
             .await
+    }
+
+    pub(crate) async fn run_table_metadata_maintenance_planning(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        retain_recent_metadata_files: usize,
+        _snapshot_expiration: Option<TableSnapshotExpirationConfig>,
+        _compaction: Option<TableCompactionPlanningConfig>,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let mut report = self
+            .plan_table_metadata_maintenance(table_bucket, namespace, table, retain_recent_metadata_files)
+            .await?;
+        Ok(report)
     }
 
     pub(super) async fn plan_table_metadata_maintenance_for_entry(

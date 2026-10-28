@@ -51,23 +51,7 @@ where
             table_metadata_maintenance_response(store, metadata_backend, bucket, namespace, table, request).await
         }
         crate::table_catalog::ConfiguredTableCatalogStore::DurableStrong(store) => {
-            if request.delete || request.commit_snapshot_expiration || request.commit_compaction {
-                return Err(s3_error!(
-                    InvalidRequest,
-                    "metadata maintenance deletion and snapshot expiration or compaction commits are not supported with durable-strong table catalog backing"
-                ));
-            }
-            store
-                .run_table_metadata_maintenance_planning(
-                    bucket,
-                    &namespace.public_name(),
-                    table,
-                    request.retain_recent_metadata_files,
-                    request.snapshot_expiration,
-                    request.compaction,
-                )
-                .await
-                .map_err(catalog_store_error)
+            table_metadata_maintenance_response(store, metadata_backend, bucket, namespace, table, request).await
         }
     }
 }

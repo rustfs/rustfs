@@ -17,7 +17,7 @@ use super::*;
 use crate::storage_api::table::{WriteCommitGuard, WriteCompletion};
 
 mod backup;
-mod migration;
+mod manifest;
 mod object;
 mod object_backup;
 mod strong;
@@ -25,7 +25,7 @@ mod strong;
 pub(crate) use backup::{TableCatalogBackupReport, TableCatalogRestoreReport};
 #[cfg(test)]
 pub(crate) use backup::{TableCatalogBackupStatus, TableCatalogRestoreStatus};
-use migration::{durable_strong_table_catalog_backing_manifest, table_catalog_backing_manifest};
+use manifest::table_catalog_backing_manifest;
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]
 pub(super) use object::bounded_table_entry_objects_for_data_plane_scan;
@@ -1445,7 +1445,7 @@ where
     B: TableCatalogObjectBackend,
 {
     ObjectBacked(ObjectTableCatalogStore<B>),
-    DurableStrong(StrongTableCatalogStore<B>),
+    DurableStrong(ObjectTableCatalogStore<B>),
 }
 
 impl<B> ConfiguredTableCatalogStore<B>
@@ -1456,7 +1456,9 @@ where
         Ok(match TableCatalogBackingMode::from_env()? {
             TableCatalogBackingMode::ObjectBacked => Self::ObjectBacked(ObjectTableCatalogStore::new(backend)),
             TableCatalogBackingMode::DurableStrong => {
-                Self::DurableStrong(StrongTableCatalogStore::new_requiring_snapshot(backend))
+                return Err(TableCatalogStoreError::Invalid(
+                    "durable-strong table catalog backing has been retired".to_string(),
+                ));
             }
         })
     }
@@ -1465,7 +1467,7 @@ where
     pub(crate) fn new_for_test(backend: B, mode: TableCatalogBackingMode) -> Self {
         match mode {
             TableCatalogBackingMode::ObjectBacked => Self::ObjectBacked(ObjectTableCatalogStore::new(backend)),
-            TableCatalogBackingMode::DurableStrong => Self::DurableStrong(StrongTableCatalogStore::new(backend)),
+            TableCatalogBackingMode::DurableStrong => Self::DurableStrong(ObjectTableCatalogStore::new(backend)),
         }
     }
 
@@ -1991,11 +1993,12 @@ where
             }
             Self::DurableStrong(store) => {
                 store
-                    .run_table_maintenance_scheduler_once_with_guard(
+                    .run_table_maintenance_scheduler_once_with_guard_at(
                         &entry.table_bucket,
                         &entry.namespace,
                         &entry.table,
                         scheduler_id,
+                        OffsetDateTime::now_utc(),
                         Some(&guard),
                     )
                     .await
@@ -2144,7 +2147,7 @@ where
     ) -> TableCatalogStoreResult<TableCommitRecoveryReport> {
         match self {
             Self::ObjectBacked(store) => store.recover_table_commits(table_bucket, namespace, table).await,
-            Self::DurableStrong(store) => store.plan_table_commit_recovery(table_bucket, namespace, table).await,
+            Self::DurableStrong(store) => store.recover_table_commits(table_bucket, namespace, table).await,
         }
     }
 
@@ -2160,7 +2163,7 @@ where
     ) -> TableCatalogStoreResult<Option<ExternalCatalogBridgeEntry>> {
         match self {
             Self::ObjectBacked(store) => store.get_external_catalog_bridge(table_bucket, namespace, table).await,
-            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("external catalog bridge")),
+            Self::DurableStrong(store) => store.get_external_catalog_bridge(table_bucket, namespace, table).await,
         }
     }
 
@@ -2174,7 +2177,7 @@ where
     ) -> TableCatalogStoreResult<ExternalCatalogBridgeEntry> {
         match self {
             Self::ObjectBacked(store) => store.put_external_catalog_bridge(entry).await,
-            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("external catalog bridge")),
+            Self::DurableStrong(store) => store.put_external_catalog_bridge(entry).await,
         }
     }
 
@@ -2185,11 +2188,7 @@ where
     ) -> TableCatalogStoreResult<TableCatalogBackupReport> {
         match self {
             Self::ObjectBacked(store) => store.create_object_catalog_backup(table_bucket, expected_snapshot_etag).await,
-            Self::DurableStrong(store) => {
-                store
-                    .create_durable_catalog_backup(table_bucket, expected_snapshot_etag)
-                    .await
-            }
+            Self::DurableStrong(store) => store.create_object_catalog_backup(table_bucket, expected_snapshot_etag).await,
         }
     }
 
@@ -2208,7 +2207,7 @@ where
             }
             Self::DurableStrong(store) => {
                 store
-                    .restore_durable_catalog_backup(table_bucket, backup_id, expected_snapshot_etag, allow_replace)
+                    .restore_object_catalog_backup(table_bucket, backup_id, expected_snapshot_etag, allow_replace)
                     .await
             }
         }
