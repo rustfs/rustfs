@@ -29,6 +29,132 @@ fn object_request(source: HealRequestSource, priority: HealPriority, force_start
     request
 }
 
+fn scoped_object_request(
+    source: HealRequestSource,
+    version_id: &str,
+    pool_index: Option<usize>,
+    set_index: Option<usize>,
+    force_start: bool,
+) -> HealRequest {
+    let mut request = object_request(source, HealPriority::Low, force_start);
+    let HealType::Object { version_id: version, .. } = &mut request.heal_type else {
+        unreachable!("object_request always constructs an object heal")
+    };
+    *version = Some(version_id.to_owned());
+    request.options.pool_index = pool_index;
+    request.options.set_index = set_index;
+    request.options.recreate_missing = source != HealRequestSource::Scanner;
+    request
+}
+
+#[tokio::test]
+async fn scanner_receipt_tracks_scoped_read_repair_forced_holders() {
+    let manager = HealManager::new_without_root_recovery_for_test(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            queue_size: 16,
+            low_priority_merge_enable: true,
+            ..HealConfig::default()
+        }),
+    );
+    let version = "00000000-0000-4000-8000-000000000001";
+    let original = scoped_object_request(HealRequestSource::ReadRepair, version, Some(0), Some(1), false);
+    let original_id = original.id.clone();
+    let key = PriorityHealQueue::make_dedup_key(&original);
+    let admitted = manager
+        .submit_heal_request_with_receipt(original)
+        .await
+        .expect("admit read-repair owner");
+    assert_eq!(admitted.result, HealAdmissionResult::Accepted);
+    assert_eq!(admitted.task_id, original_id);
+
+    let receipt = manager
+        .submit_heal_request_with_receipt(scoped_object_request(HealRequestSource::Scanner, version, Some(0), Some(1), false))
+        .await
+        .expect("scanner merges into the scoped read-repair owner");
+    assert_eq!(receipt.result, HealAdmissionResult::Merged);
+    assert_eq!(receipt.task_id, original_id);
+
+    let first_forced = scoped_object_request(HealRequestSource::Internal, version, Some(0), Some(1), true);
+    let first_forced_id = first_forced.id.clone();
+    let second_forced = scoped_object_request(HealRequestSource::Internal, version, Some(0), Some(1), true);
+    let second_forced_id = second_forced.id.clone();
+    {
+        let mut queue = manager.heal_queue.lock().await;
+        assert_eq!(queue.push(first_forced), QueuePushOutcome::Accepted);
+        assert_eq!(queue.push(second_forced), QueuePushOutcome::Accepted);
+        let (selected, skipped) = queue.pop_runnable_with_skips(|_| true, |_| None);
+        assert!(skipped.is_empty());
+        assert_eq!(selected.expect("read-repair owner should leave first").id, original_id);
+        assert_eq!(queue.queued_request_id_for_dedup_key(&key), Some(original_id.as_str()));
+    }
+
+    let receipt = manager
+        .submit_heal_request_with_receipt(scoped_object_request(HealRequestSource::Scanner, version, Some(0), Some(1), false))
+        .await
+        .expect("scanner merges into the remaining owner");
+    assert_eq!(receipt.result, HealAdmissionResult::Merged);
+    assert_eq!(receipt.task_id, first_forced_id);
+
+    {
+        let mut queue = manager.heal_queue.lock().await;
+        let (selected, _) = queue.pop_runnable_with_skips(|request| request.id == first_forced_id, |_| None);
+        assert_eq!(selected.expect("first forced holder should leave").id, first_forced_id);
+        assert!(queue.contains_request_id(&second_forced_id));
+    }
+    let receipt = manager
+        .submit_heal_request_with_receipt(scoped_object_request(HealRequestSource::Scanner, version, Some(0), Some(1), false))
+        .await
+        .expect("scanner merges into the last queued holder");
+    assert_eq!(receipt.result, HealAdmissionResult::Merged);
+    assert_eq!(receipt.task_id, second_forced_id);
+}
+
+#[tokio::test]
+async fn scanner_receipt_does_not_merge_read_repair_with_a_different_scope_or_version() {
+    let version = "00000000-0000-4000-8000-000000000001";
+    let other_version = "00000000-0000-4000-8000-000000000002";
+    for (candidate_version, pool, set) in [
+        (version, None, None),
+        (version, Some(1), Some(1)),
+        (version, Some(0), Some(2)),
+        (other_version, Some(0), Some(1)),
+    ] {
+        let manager = HealManager::new_without_root_recovery_for_test(
+            Arc::new(MockStorage),
+            Some(HealConfig {
+                queue_size: 16,
+                low_priority_merge_enable: true,
+                ..HealConfig::default()
+            }),
+        );
+        let original = scoped_object_request(HealRequestSource::ReadRepair, version, Some(0), Some(1), false);
+        let original_id = original.id.clone();
+        let initial = manager
+            .submit_heal_request_with_receipt(original)
+            .await
+            .expect("admit read-repair owner");
+        assert_eq!(initial.result, HealAdmissionResult::Accepted);
+        assert_eq!(initial.task_id, original_id);
+
+        let candidate = scoped_object_request(HealRequestSource::Scanner, candidate_version, pool, set, false);
+        let candidate_id = candidate.id.clone();
+        let receipt = manager
+            .submit_heal_request_with_receipt(candidate)
+            .await
+            .expect("admit scanner with a distinct scope or version");
+        assert_eq!(
+            receipt.result,
+            HealAdmissionResult::Accepted,
+            "version={candidate_version}, pool={pool:?}, set={set:?}"
+        );
+        assert_eq!(receipt.task_id, candidate_id);
+        let queue = manager.heal_queue.lock().await;
+        assert!(queue.contains_request_id(&original_id));
+        assert!(queue.contains_request_id(&candidate_id));
+    }
+}
+
 async fn scanner_receipt_tracks_queued_owner(use_fairness: bool) {
     let manager = HealManager::new_without_root_recovery_for_test(
         Arc::new(MockStorage),
