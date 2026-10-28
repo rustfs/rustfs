@@ -23,12 +23,12 @@ use crate::admin::{
     handlers::target_descriptor::{
         AdminTargetSpec, RuntimeHealthStatus, TargetEndpointSource, TargetInstanceReadModel, admin_target_spec_from_builtin,
         allowed_target_keys, build_enabled_target_kvs, build_json_response, collect_target_instances,
-        collect_validated_key_values, find_target_instance, target_has_environment_default, target_module_disabled_reason,
+        collect_validated_key_values, find_target_instance, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason,
     },
     handlers::target_read::{
-        collect_audit_runtime_statuses, collect_notification_runtime_statuses, load_server_config_from_store,
-        load_target_read_snapshot,
+        collect_audit_runtime_statuses, collect_notification_instance_runtime_statuses, collect_notification_runtime_statuses,
+        load_server_config_from_store, load_target_read_snapshot,
     },
     plugin_contract::{
         PluginContractDomain, PluginInstanceDetail, PluginInstanceDiagnostic, PluginInstanceDiagnosticCode,
@@ -747,7 +747,7 @@ pub(super) fn config_revision(instance_id: &str, generation: &str) -> String {
     hasher.update(generation.as_bytes());
     hasher.update(b"\0");
     hasher.update(instance_id.as_bytes());
-    hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+    faster_hex::hex_string(&hasher.finalize())
 }
 
 fn validate_expected_config(
@@ -772,13 +772,20 @@ fn validate_expected_config(
     )?
     .filter(|instance| instance.source == TargetEndpointSource::Config)
     .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "expected_config requires an existing config-managed target"))?;
+    if instance.has_env_default {
+        return Err(s3::error(
+            S3ErrorCode::InvalidRequest,
+            "notification target inherits environment configuration and cannot be edited",
+        ));
+    }
     if !instance.enabled {
         return Err(s3::error(
             S3ErrorCode::InvalidRequest,
             "disabled targets cannot be edited with expected_config",
         ));
     }
-    if &map_instance(instance.clone()).config != expected {
+    if &map_instance_config(instance.config.clone(), secret_fields_for_instance(context.domain, &instance.subsystem)) != expected
+    {
         return Err(s3::error(
             S3ErrorCode::InvalidRequest,
             "target configuration changed since it was read; refresh and retry",
@@ -861,7 +868,7 @@ impl Operation for GetPluginInstanceHandler {
                 }
             };
             let ((config, generation), runtime) = tokio::try_join!(read_config, async {
-                Ok::<_, s3s::S3Error>(plugin_instance_runtime_statuses(context).await)
+                Ok::<_, s3s::S3Error>(collect_notification_instance_runtime_statuses(context.specs, instance_id).await)
             })?;
             let instance = find_target_instance(context.specs, context.route_prefix, &config, runtime, instance_id)?;
             (instance, generation.map(|value| value.to_string()))
@@ -922,22 +929,6 @@ impl Operation for PutPluginInstanceHandler {
             "plugin instance",
         )? {
             return Err(s3_error!(InvalidRequest, "{reason}"));
-        }
-
-        if body.expected_config.is_some()
-            && context.domain == PluginContractDomain::Notify
-            && target_has_environment_default(
-                context.specs,
-                context.route_prefix,
-                &config_snapshot,
-                resolved.target_spec.subsystem,
-                &resolved.target_name,
-            )?
-        {
-            return Err(s3::error(
-                S3ErrorCode::InvalidRequest,
-                "notification target inherits environment configuration and cannot be edited",
-            ));
         }
 
         if body.expected_revision.is_some() && body.expected_config.is_none() {
@@ -1337,6 +1328,7 @@ mod tests {
             health_state: "offline".to_string(),
             health_reason: "not_loaded_in_runtime".to_string(),
             runtime_present: false,
+            has_env_default: false,
             source: TargetEndpointSource::Config,
             enabled: true,
             config: enabled_kvs("on"),
@@ -1361,6 +1353,7 @@ mod tests {
             health_state: "online".to_string(),
             health_reason: "reachable".to_string(),
             runtime_present: true,
+            has_env_default: false,
             source: TargetEndpointSource::Config,
             enabled: true,
             config: KVS(vec![
@@ -1509,21 +1502,23 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn notify_environment_default_blocks_edit_and_create() {
+    fn conditional_edit_rejects_inherited_environment_defaults() {
         temp_env::with_vars(
             [(rustfs_config::notify::ENV_NOTIFY_WEBHOOK_ENDPOINT, Some("https://example.com/hook"))],
             || {
                 let context = super::plugin_instance_domain_context(PluginContractDomain::Notify);
-                assert!(
-                    super::target_has_environment_default(
-                        context.specs,
-                        context.route_prefix,
-                        &Config::new(),
-                        NOTIFY_WEBHOOK_SUB_SYS,
-                        "primary"
-                    )
-                    .expect("check default env")
-                );
+                let mut config = Config::new();
+                let mut target = KVS::new();
+                target.insert(ENABLE_KEY.into(), "on".into());
+                config
+                    .0
+                    .entry(NOTIFY_WEBHOOK_SUB_SYS.into())
+                    .or_default()
+                    .insert("Primary".into(), target);
+                let id = canonical_target_instance_id("builtin:webhook", TargetDomain::Notify, "primary");
+                let error = super::validate_expected_config(context, &config, &id, &HashMap::new())
+                    .expect_err("inherited environment defaults must prevent edits");
+                assert!(error.to_string().contains("inherits environment configuration"));
             },
         );
     }
@@ -1966,6 +1961,7 @@ mod tests {
             health_state: "offline".to_string(),
             health_reason: "not_loaded_in_runtime".to_string(),
             runtime_present: false,
+            has_env_default: false,
             source: TargetEndpointSource::Config,
             enabled: true,
             config: enabled_kvs("on"),
@@ -1992,6 +1988,7 @@ mod tests {
             health_state: "offline".to_string(),
             health_reason: "unreachable".to_string(),
             runtime_present: true,
+            has_env_default: false,
             source: TargetEndpointSource::Runtime,
             enabled: true,
             config: KVS::new(),
@@ -2018,6 +2015,7 @@ mod tests {
             health_state: "disabled".to_string(),
             health_reason: "disabled".to_string(),
             runtime_present: false,
+            has_env_default: false,
             source: TargetEndpointSource::Mixed,
             enabled: false,
             config: enabled_kvs("off"),
@@ -2061,6 +2059,7 @@ mod tests {
             health_state: "offline".to_string(),
             health_reason: "not_loaded_in_runtime".to_string(),
             runtime_present: false,
+            has_env_default: false,
             source: TargetEndpointSource::Config,
             enabled: true,
             config: enabled_kvs("on"),

@@ -105,6 +105,7 @@ pub(crate) struct TargetInstanceReadModel {
     pub health_state: String,
     pub health_reason: String,
     pub runtime_present: bool,
+    pub has_env_default: bool,
     pub source: TargetEndpointSource,
     pub enabled: bool,
     pub config: KVS,
@@ -279,34 +280,6 @@ pub(crate) fn target_mutation_block_reason(
     })
 }
 
-/// A default environment override participates in every instance's effective config.
-pub(crate) fn target_has_environment_default(
-    specs: &[AdminTargetSpec],
-    route_prefix: &str,
-    config: &Config,
-    target_type: &str,
-    target_name: &str,
-) -> S3Result<bool> {
-    let spec = target_spec(specs, target_type).ok_or_else(|| s3_error!(InvalidArgument, "unsupported target type"))?;
-    let mut probe = Config::new();
-    if let Some(section) = config.0.get(target_type) {
-        probe.0.insert(target_type.to_owned(), section.clone());
-    }
-    let section = probe.0.entry(target_type.to_owned()).or_default();
-    if !section.keys().any(|name| name.eq_ignore_ascii_case(target_name)) {
-        let mut kvs = KVS::new();
-        kvs.insert(ENABLE_KEY.to_owned(), EnableState::On.to_string());
-        section.insert(target_name.to_owned(), kvs);
-    }
-    Ok(normalized_target_instances(std::slice::from_ref(spec), route_prefix, &probe)?
-        .iter()
-        .any(|instance| {
-            instance.subsystem == target_type
-                && instance.instance_id.eq_ignore_ascii_case(target_name)
-                && instance.source_hints.has_env_default
-        }))
-}
-
 pub(crate) fn target_module_disabled_reason(module_name: &str, env_key: &str, enabled: bool, action: &str) -> Option<String> {
     (!enabled).then(|| {
         format!(
@@ -419,6 +392,31 @@ pub(crate) fn merge_target_endpoints(
     Ok(endpoints)
 }
 
+fn runtime_target_plugin_id(specs: &[AdminTargetSpec], service: &str) -> &'static str {
+    target_spec_by_service(specs, service)
+        .map(|spec| builtin_target_manifest(spec.service).plugin_id)
+        .unwrap_or("custom:target")
+}
+
+pub(crate) async fn collect_instance_runtime_statuses<E>(
+    targets: Vec<SharedTarget<E>>,
+    specs: &[AdminTargetSpec],
+    domain: TargetDomain,
+    instance_id: &str,
+) -> HashMap<EndpointKey, RuntimeHealthStatus>
+where
+    E: rustfs_targets::PluginEvent,
+{
+    let targets = targets
+        .into_iter()
+        .filter(|target| {
+            let id = target.id();
+            canonical_target_instance_id(runtime_target_plugin_id(specs, &id.name), domain, &id.id) == instance_id
+        })
+        .collect();
+    collect_runtime_statuses(targets).await
+}
+
 pub(crate) fn canonical_target_instance_id(plugin_id: &str, domain: TargetDomain, instance_id: &str) -> String {
     format!("{plugin_id}:{}:{}", canonical_domain_label(domain), instance_id.to_lowercase())
 }
@@ -472,6 +470,7 @@ pub(crate) fn collect_target_instances(
             health_state: health.state,
             health_reason: health.reason,
             runtime_present,
+            has_env_default: instance.source_hints.has_env_default,
             source,
             enabled: instance.enabled,
             config: instance.effective_config,
@@ -483,9 +482,10 @@ pub(crate) fn collect_target_instances(
             continue;
         }
 
-        let (plugin_id, subsystem): (String, String) = target_spec_by_service(specs, &service)
-            .map(|spec| (builtin_target_manifest(spec.service).plugin_id.to_string(), spec.subsystem.to_string()))
-            .unwrap_or_else(|| ("custom:target".to_string(), format!("{}_{}", canonical_domain_label(domain), service)));
+        let plugin_id = runtime_target_plugin_id(specs, &service).to_owned();
+        let subsystem = target_spec_by_service(specs, &service)
+            .map(|spec| spec.subsystem.to_string())
+            .unwrap_or_else(|| format!("{}_{}", canonical_domain_label(domain), service));
         instances.push(TargetInstanceReadModel {
             canonical_id: canonical_target_instance_id(&plugin_id, domain, &account_id),
             plugin_id,
@@ -497,6 +497,7 @@ pub(crate) fn collect_target_instances(
             health_state: status.state,
             health_reason: status.reason,
             runtime_present: true,
+            has_env_default: false,
             source: TargetEndpointSource::Runtime,
             enabled: true,
             config: KVS::new(),
@@ -1008,5 +1009,59 @@ mod webhook_request_tests {
         validate_webhook_request(&config)
             .await
             .expect("a public HTTPS webhook should pass outbound preflight");
+    }
+}
+
+#[cfg(test)]
+mod instance_runtime_status_tests {
+    use super::{admin_target_spec_from_builtin, collect_instance_runtime_statuses};
+    use rustfs_targets::{
+        SharedTarget, TargetDomain, catalog::builtin::builtin_notify_target_admin_descriptors, testkit::MockTarget,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn instance_health_only_probes_matching_canonical_targets() {
+        let specs: Vec<_> = builtin_notify_target_admin_descriptors()
+            .iter()
+            .map(admin_target_spec_from_builtin)
+            .collect();
+        let wanted = MockTarget::new("Primary", "webhook");
+        let unrelated = MockTarget::new("Primary", "nats").with_health_gate(Arc::new(Notify::new()));
+        let unrelated_started = unrelated.health_started();
+        let targets: Vec<SharedTarget<rustfs_notify::Event>> = vec![Arc::new(wanted), Arc::new(unrelated)];
+        let statuses = tokio::time::timeout(
+            Duration::from_secs(1),
+            collect_instance_runtime_statuses(targets, &specs, TargetDomain::Notify, "builtin:webhook:notify:primary"),
+        )
+        .await
+        .expect("unrelated blocked health must not delay instance detail");
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses.contains_key(&("Primary".into(), "webhook".into())));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), unrelated_started.notified())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn instance_health_preserves_unknown_runtime_identity_collisions() {
+        let specs: Vec<_> = builtin_notify_target_admin_descriptors()
+            .iter()
+            .map(admin_target_spec_from_builtin)
+            .collect();
+        let targets: Vec<SharedTarget<rustfs_notify::Event>> = vec![
+            Arc::new(MockTarget::new("Primary", "custom-one")),
+            Arc::new(MockTarget::new("PRIMARY", "custom-two")),
+            Arc::new(MockTarget::new("Primary", "webhook")),
+        ];
+        let statuses =
+            collect_instance_runtime_statuses(targets, &specs, TargetDomain::Notify, "custom:target:notify:primary").await;
+        assert_eq!(statuses.len(), 2);
+        assert!(statuses.contains_key(&("Primary".into(), "custom-one".into())));
+        assert!(statuses.contains_key(&("PRIMARY".into(), "custom-two".into())));
     }
 }
