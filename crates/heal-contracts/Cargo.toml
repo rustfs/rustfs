@@ -31,7 +31,7 @@ workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
-uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
+uuid = { workspace = true, features = ["v4", "serde", "fast-rng", "macro-diagnostics"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }

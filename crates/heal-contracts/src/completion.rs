@@ -33,7 +33,7 @@ pub type HealObservationId = u64;
 /// Allocate one identity per accepted owner. Exhaustion is reported as unknown.
 pub fn new_heal_observation_id() -> Option<HealObservationId> {
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+    NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
         .ok()
 }
 
