@@ -726,11 +726,14 @@ pub(super) fn merge_conditional_target_update(
     let mut result = original.clone();
     for key in changed_keys {
         if key == rustfs_config::ENABLE_KEY {
-            return Err(s3_error!(InvalidRequest, "target enable state cannot be changed using expected_config"));
+            return Err(s3::error(
+                S3ErrorCode::InvalidRequest,
+                "target enable state cannot be changed using expected_config",
+            ));
         }
         let value = validated
             .lookup(key)
-            .ok_or_else(|| s3_error!(InvalidArgument, "missing validated target field"))?;
+            .ok_or_else(|| s3::error(S3ErrorCode::InvalidArgument, "missing validated target field"))?;
         if expected.get(key) != Some(&value) {
             result.insert(key.clone(), value);
         }
@@ -754,7 +757,10 @@ fn validate_expected_config(
     expected: &HashMap<String, String>,
 ) -> S3Result<TargetInstanceReadModel> {
     if context.domain != PluginContractDomain::Notify {
-        return Err(s3_error!(InvalidArgument, "expected_config is only supported for notification targets"));
+        return Err(s3::error(
+            S3ErrorCode::InvalidArgument,
+            "expected_config is only supported for notification targets",
+        ));
     }
     let resolved = resolve_plugin_instance_target(instance_id)?;
     let instance = find_target_instance(
@@ -765,14 +771,17 @@ fn validate_expected_config(
         instance_id,
     )?
     .filter(|instance| instance.source == TargetEndpointSource::Config)
-    .ok_or_else(|| s3_error!(InvalidRequest, "expected_config requires an existing config-managed target"))?;
+    .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "expected_config requires an existing config-managed target"))?;
     if !instance.enabled {
-        return Err(s3_error!(InvalidRequest, "disabled targets cannot be edited with expected_config"));
+        return Err(s3::error(
+            S3ErrorCode::InvalidRequest,
+            "disabled targets cannot be edited with expected_config",
+        ));
     }
     if &map_instance(instance.clone()).config != expected {
-        return Err(s3_error!(
-            InvalidRequest,
-            "target configuration changed since it was read; refresh and retry"
+        return Err(s3::error(
+            S3ErrorCode::InvalidRequest,
+            "target configuration changed since it was read; refresh and retry",
         ));
     }
     Ok(instance)
@@ -847,7 +856,7 @@ impl Operation for GetPluginInstanceHandler {
                 match current_object_store_handle_for_context(app_context.as_deref()) {
                     Some(store) => read_admin_server_config_with_generation(store)
                         .await
-                        .map_err(|_| s3_error!(InternalError, "failed to read server config")),
+                        .map_err(|_| s3::error(S3ErrorCode::InternalError, "failed to read server config")),
                     None => Ok((Config::new(), None)),
                 }
             };
@@ -859,10 +868,11 @@ impl Operation for GetPluginInstanceHandler {
         } else {
             (find_plugin_instance(instance_id).await?, None)
         };
-        let instance = instance.ok_or_else(|| s3_error!(NoSuchKey, "plugin instance not found"))?;
+        let instance = instance.ok_or_else(|| s3::error(S3ErrorCode::NoSuchKey, "plugin instance not found"))?;
         let mut detail = plugin_instance_detail(instance);
         detail.config_revision = generation.map(|value| config_revision(instance_id, &value));
-        let data = serde_json::to_vec(&detail).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
+        let data = serde_json::to_vec(&detail)
+            .map_err(|e| s3::error(S3ErrorCode::InternalError, format!("failed to serialize response: {}", e)))?;
         Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
     }
 }
@@ -896,10 +906,10 @@ impl Operation for PutPluginInstanceHandler {
 
         let (config_snapshot, generation) = if context.domain == PluginContractDomain::Notify {
             let store = current_object_store_handle_for_context(app_context.as_deref())
-                .ok_or_else(|| s3_error!(InternalError, "server storage not initialized"))?;
+                .ok_or_else(|| s3::error(S3ErrorCode::InternalError, "server storage not initialized"))?;
             let snapshot = read_admin_server_config_snapshot(store)
                 .await
-                .map_err(|_| s3_error!(InternalError, "failed to read server config"))?;
+                .map_err(|_| s3::error(S3ErrorCode::InternalError, "failed to read server config"))?;
             (snapshot.config.clone(), snapshot.generation().map(|value| value.to_string()))
         } else {
             (plugin_instance_mutation_config_snapshot(context).await?, None)
@@ -924,23 +934,23 @@ impl Operation for PutPluginInstanceHandler {
                 &resolved.target_name,
             )?
         {
-            return Err(s3_error!(
-                InvalidRequest,
-                "notification target inherits environment configuration and cannot be edited"
+            return Err(s3::error(
+                S3ErrorCode::InvalidRequest,
+                "notification target inherits environment configuration and cannot be edited",
             ));
         }
 
         if body.expected_revision.is_some() && body.expected_config.is_none() {
-            return Err(s3_error!(InvalidArgument, "expected_revision requires expected_config"));
+            return Err(s3::error(S3ErrorCode::InvalidArgument, "expected_revision requires expected_config"));
         }
         let effective_instance = if let Some(expected) = body.expected_config.as_ref() {
             let revision = generation
                 .as_ref()
-                .ok_or_else(|| s3_error!(InvalidRequest, "target configuration revision unavailable"))?;
+                .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "target configuration revision unavailable"))?;
             if body.expected_revision.as_deref() != Some(config_revision(instance_id, revision).as_str()) {
-                return Err(s3_error!(
-                    InvalidRequest,
-                    "target configuration changed since it was read; refresh and retry"
+                return Err(s3::error(
+                    S3ErrorCode::InvalidRequest,
+                    "target configuration changed since it was read; refresh and retry",
                 ));
             }
             Some(validate_expected_config(context, &config_snapshot, instance_id, expected)?.config)
@@ -993,7 +1003,9 @@ impl Operation for PutPluginInstanceHandler {
 
         let kvs = if let Some(expected_config) = body.expected_config.as_ref() {
             let original = stored_instance_config(&config_snapshot, resolved.target_spec.subsystem, &resolved.target_name)
-                .ok_or_else(|| s3_error!(InvalidRequest, "expected_config requires an existing config-managed target"))?;
+                .ok_or_else(|| {
+                    s3::error(S3ErrorCode::InvalidRequest, "expected_config requires an existing config-managed target")
+                })?;
             merge_conditional_target_update(original, expected_config, &changed_keys, &validated_kvs)?
         } else {
             validated_kvs
@@ -1022,9 +1034,9 @@ impl Operation for PutPluginInstanceHandler {
                     )
                     .await;
                 if matches!(local, Err(rustfs_notify::NotificationError::ConfigurationConflict)) {
-                    return Err(s3_error!(
-                        InvalidRequest,
-                        "target configuration changed during validation; retry the request"
+                    return Err(s3::error(
+                        S3ErrorCode::InvalidRequest,
+                        "target configuration changed during validation; retry the request",
                     ));
                 }
                 converge_target_mutation_on_cluster(app_context.as_deref(), &subsystem, local).await
