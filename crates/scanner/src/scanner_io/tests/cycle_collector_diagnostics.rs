@@ -441,25 +441,102 @@ fn collector_cycle_with_node_admission_preserves_cache_and_reports_outcomes() {
     const TEST: &str = "scanner_io::tests::cycle_collector_diagnostics::collector_cycle_with_node_admission_preserves_cache_and_reports_outcomes";
     const CHILD: &str = "RUSTFS_TEST_ADMITTED_COLLECTOR_CHILD";
     if std::env::var(CHILD).ok().as_deref() != Some(TEST) {
+        struct ChildReaper(std::process::Child);
+
+        impl Drop for ChildReaper {
+            fn drop(&mut self) {
+                if !matches!(self.0.try_wait(), Ok(Some(_))) && self.0.kill().is_ok() {
+                    let _ = self.0.wait();
+                }
+            }
+        }
+
         // The production admission owner is process-global and cannot be reset.
-        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        // Snapshot only non-RustFS settings so concurrent environment tests cannot
+        // change the child fixture's scanner or storage configuration.
+        let child_env = std::env::vars_os().filter(|(name, _)| {
+            let name = name.to_string_lossy().to_ascii_uppercase();
+            !name.starts_with("RUSTFS_") && !name.starts_with("MINIO_")
+        });
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
             .args(["--exact", TEST, "--nocapture", "--color", "never"])
+            .env_clear()
+            .envs(child_env)
             .env(CHILD, TEST)
             .env("RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES", "1")
             .env("RUSTFS_SCANNER_IDLE_MODE", "false")
             .env("RUSTFS_SCANNER_DISK_IO_BUDGET_IOPS", "off")
             .env("RUSTFS_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC", "off")
             .env("RUSTFS_LOCK_ACQUIRE_TIMEOUT", "30")
-            .output()
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .expect("start the isolated collector cycle");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut child = ChildReaper(child);
+        let mut child_stdout = child.0.stdout.take().expect("child stdout pipe");
+        let mut child_stderr = child.0.stderr.take().expect("child stderr pipe");
+        // Drain both pipes while the child runs so neither can block its exit.
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let error = std::io::Read::read_to_end(&mut child_stdout, &mut bytes).err();
+            (bytes, error)
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let error = std::io::Read::read_to_end(&mut child_stderr, &mut bytes).err();
+            (bytes, error)
+        });
+        let started = std::time::Instant::now();
+        let mut timed_out = false;
+        let mut wait_error = None;
+        let status = loop {
+            match child.0.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() < Duration::from_secs(300) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(None) => {
+                    timed_out = true;
+                    if let Err(error) = child.0.kill() {
+                        // The child can exit between the status check and kill.
+                        if let Some(status) = child.0.try_wait().expect("check child after failed kill") {
+                            break status;
+                        }
+                        panic!("failed to terminate the timed-out collector child: {error}");
+                    }
+                    break child.0.wait().expect("reap the timed-out collector child");
+                }
+                Err(error) => {
+                    wait_error = Some(error);
+                    if let Err(error) = child.0.kill() {
+                        if let Some(status) = child.0.try_wait().expect("check child after failed kill") {
+                            break status;
+                        }
+                        panic!("failed to terminate the collector child after a wait error: {error}");
+                    }
+                    break child.0.wait().expect("reap the collector child after a wait error");
+                }
+            }
+        };
+        let (stdout, stdout_error) = stdout_reader.join().expect("join child stdout reader");
+        let (stderr, stderr_error) = stderr_reader.join().expect("join child stderr reader");
+        let stdout = String::from_utf8_lossy(&stdout);
+        let stderr = String::from_utf8_lossy(&stderr);
         assert!(
-            output.status.success()
+            !timed_out
+                && wait_error.is_none()
+                && stdout_error.is_none()
+                && stderr_error.is_none()
+                && status.success()
                 && stdout
                     .lines()
                     .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
-            "the isolated collector cycle must run exactly once: {stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
+            "the isolated collector cycle must finish within 300 seconds and run exactly once \
+             (status={status}, timed_out={timed_out}, wait_error={wait_error:?}, \
+             stdout_error={stdout_error:?}, stderr_error={stderr_error:?}): \
+             {stdout}\n{stderr}"
         );
         return;
     }
