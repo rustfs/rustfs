@@ -202,6 +202,53 @@ fn candidate_group_expiry_uses_earliest_discovery_not_admission_order() {
 }
 
 #[test]
+fn candidate_expiry_is_enforced_when_terminal_arrives_between_ticks() {
+    let mut observations = Observations::default();
+    let now = Instant::now();
+    let mut old = candidate();
+    old.mode = HealScanMode::Normal;
+    old.first_seen = now;
+    let mut fresh = candidate();
+    fresh.first_seen = now + Duration::from_secs(1);
+    assert!(observations.admit(key("terminal-expiry"), old).is_none());
+    assert!(observations.admit(key("terminal-expiry"), fresh).is_none());
+
+    assert!(
+        observations
+            .complete(completion("terminal-expiry", HealObjectDisposition::VerifiedHealthy), now + PENDING_TTL)
+            .is_some()
+    );
+    assert_eq!(observations.unknown_counts.get("expired"), Some(&1));
+    assert_eq!(observations.terminal_counts.values().sum::<u64>(), 1);
+    assert_eq!(observations.terminal_tasks, 1);
+    assert!(observations.pending.is_empty());
+}
+
+#[test]
+fn expired_candidate_is_unknown_even_if_terminal_was_seen_first() {
+    for terminal_first in [true, false] {
+        let mut observations = Observations::default();
+        let now = Instant::now();
+        if terminal_first {
+            assert!(
+                observations
+                    .complete(completion("late-admission", HealObjectDisposition::VerifiedHealthy), now)
+                    .is_none()
+            );
+        }
+        let mut old = candidate();
+        old.first_seen = now
+            .checked_sub(PENDING_TTL + Duration::from_secs(1))
+            .expect("monotonic clock supports the candidate TTL");
+        assert!(observations.admit(key("late-admission"), old).is_none());
+        assert_eq!(observations.unknown_counts.get("expired"), Some(&1));
+        assert!(!observations.pending.contains_key(&key("late-admission")));
+        assert_eq!(observations.terminal_tasks, 0);
+        assert!(observations.terminal_counts.is_empty());
+    }
+}
+
+#[test]
 fn grouped_pending_status_counts_candidates_after_partial_expiry() {
     let (sender, _receiver) = mpsc::channel(1);
     let observer = ObserverHandle {
