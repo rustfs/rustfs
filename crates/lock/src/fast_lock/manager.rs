@@ -661,4 +661,203 @@ mod tests {
 
         manager.shutdown().await;
     }
+
+    fn assert_registered_holder_blocks_writer(manager: &FastObjectLockManager, key: &ObjectKey, guard_id: u64, stage: &str) {
+        assert!(
+            manager.get_shard(key).is_guard_active(guard_id),
+            "{stage}: successor guard must remain registered"
+        );
+        assert_eq!(manager.current_lock_counts().0, 1, "{stage}: successor must remain the sole holder");
+        let contender = ObjectLockRequest::new_write(key.clone(), "contender");
+        assert!(
+            !manager.get_shard(key).try_fast_path_only(&contender),
+            "{stage}: successor must block another writer"
+        );
+    }
+
+    fn assert_free_for_new_writer(manager: &FastObjectLockManager, key: &ObjectKey, stage: &str) {
+        assert_eq!(manager.current_lock_counts().0, 0, "{stage}: no holder should remain");
+        let writer = ObjectLockRequest::new_write(key.clone(), "contender");
+        let shard = manager.get_shard(key);
+        assert!(shard.try_fast_path_only(&writer), "{stage}: a new writer must acquire");
+        assert_eq!(manager.current_lock_counts().0, 1, "{stage}: new writer must hold the lock");
+        assert!(
+            shard.release_lock(key, &writer.owner, LockMode::Exclusive),
+            "{stage}: release the new writer"
+        );
+        assert_eq!(manager.current_lock_counts().0, 0, "{stage}: new writer must release the lock");
+    }
+
+    fn assert_no_registered_guards(manager: &FastObjectLockManager) {
+        let active: usize = manager.shards.iter().map(|shard| shard.active_guard_count()).sum();
+        assert_eq!(active, 0, "all guards in the isolated manager must be unregistered");
+    }
+
+    fn assert_successor_release_or_drop(
+        manager: &FastObjectLockManager,
+        key: &ObjectKey,
+        mut successor: FastLockGuard,
+        release_first: bool,
+    ) {
+        let successor_id = successor.guard_id();
+        if release_first {
+            assert!(successor.release(), "successor must release its own physical lock");
+            assert!(successor.is_released(), "successor must report its explicit release");
+            assert!(
+                !manager.get_shard(key).is_guard_active(successor_id),
+                "released successor must no longer be registered"
+            );
+            assert_free_for_new_writer(manager, key, "after successor release and before drop");
+        }
+        drop(successor);
+        assert!(
+            !manager.get_shard(key).is_guard_active(successor_id),
+            "dropped successor must no longer be registered"
+        );
+        assert_free_for_new_writer(manager, key, "after successor drop");
+    }
+
+    async fn stale_exclusive_guard_does_not_release_successor(release_first: bool, release_successor: bool) {
+        let manager = FastObjectLockManager::new();
+        let key = ObjectKey::new("bucket", "force-unlock-exclusive-successor");
+        let mut stale = manager
+            .acquire_write_lock(key.clone(), "same-owner")
+            .await
+            .expect("acquire original exclusive guard");
+        let stale_id = stale.guard_id();
+        assert_eq!(manager.force_unlock(&key), 1);
+        let successor = manager
+            .acquire_write_lock(key.clone(), "same-owner")
+            .await
+            .expect("acquire exclusive successor after force unlock");
+        assert_ne!(stale.guard_id(), successor.guard_id());
+        assert_registered_holder_blocks_writer(&manager, &key, successor.guard_id(), "before stale guard action");
+
+        if release_first {
+            let _ = stale.release();
+            assert_registered_holder_blocks_writer(&manager, &key, successor.guard_id(), "after stale guard release");
+        }
+        drop(stale);
+        assert!(
+            !manager.get_shard(&key).is_guard_active(stale_id),
+            "dropped stale guard must be unregistered"
+        );
+
+        assert_registered_holder_blocks_writer(&manager, &key, successor.guard_id(), "after stale guard drop");
+        assert_successor_release_or_drop(&manager, &key, successor, release_successor);
+        assert_no_registered_guards(&manager);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn force_unlocked_exclusive_guard_drop_preserves_same_owner_successor() {
+        stale_exclusive_guard_does_not_release_successor(false, true).await;
+        stale_exclusive_guard_does_not_release_successor(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn force_unlocked_exclusive_guard_release_preserves_same_owner_successor() {
+        stale_exclusive_guard_does_not_release_successor(true, true).await;
+        stale_exclusive_guard_does_not_release_successor(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn force_unlock_releases_all_shared_guards_of_same_owner() {
+        let manager = FastObjectLockManager::new();
+        let key = ObjectKey::new("bucket", "force-unlock-shared-owners");
+        let first = manager
+            .acquire_read_lock(key.clone(), "same-owner")
+            .await
+            .expect("acquire first shared guard");
+        let second = manager
+            .acquire_read_lock(key.clone(), "same-owner")
+            .await
+            .expect("acquire second shared guard");
+        let first_id = first.guard_id();
+        let second_id = second.guard_id();
+        assert_eq!(manager.current_lock_counts().0, 2);
+
+        assert_eq!(manager.force_unlock(&key), 1, "one distinct owner was force unlocked");
+        assert_eq!(
+            manager.current_lock_counts().0,
+            0,
+            "force unlock must release every shared guard of the owner"
+        );
+        assert_free_for_new_writer(&manager, &key, "after shared force unlock");
+        drop(first);
+        assert!(
+            !manager.get_shard(&key).is_guard_active(first_id),
+            "first dropped stale guard must be unregistered"
+        );
+        drop(second);
+        assert!(
+            !manager.get_shard(&key).is_guard_active(second_id),
+            "second dropped stale guard must be unregistered"
+        );
+        assert_free_for_new_writer(&manager, &key, "after stale shared guards drop");
+        assert_no_registered_guards(&manager);
+        manager.shutdown().await;
+    }
+
+    async fn stale_shared_guards_do_not_release_successor(release_first: bool, release_successor: bool) {
+        let manager = FastObjectLockManager::new();
+        let key = ObjectKey::new("bucket", "force-unlock-shared-successor");
+        let mut first = manager
+            .acquire_read_lock(key.clone(), "same-owner")
+            .await
+            .expect("acquire first shared guard");
+        let mut second = manager
+            .acquire_read_lock(key.clone(), "same-owner")
+            .await
+            .expect("acquire second shared guard");
+        let first_id = first.guard_id();
+        let second_id = second.guard_id();
+        assert_eq!(manager.force_unlock(&key), 1);
+        // Clear both old holders even on the baseline, so the following
+        // assertion isolates stale guard release from force-unlock completeness.
+        let _ = manager.force_unlock(&key);
+        assert_eq!(manager.current_lock_counts().0, 0);
+        let successor = manager
+            .acquire_read_lock(key.clone(), "same-owner")
+            .await
+            .expect("acquire shared successor after force unlock");
+        assert_ne!(first.guard_id(), successor.guard_id());
+        assert_ne!(second.guard_id(), successor.guard_id());
+        assert_registered_holder_blocks_writer(&manager, &key, successor.guard_id(), "before stale shared guard action");
+
+        if release_first {
+            let _ = first.release();
+            assert_registered_holder_blocks_writer(&manager, &key, successor.guard_id(), "after first stale shared release");
+            let _ = second.release();
+            assert_registered_holder_blocks_writer(&manager, &key, successor.guard_id(), "after second stale shared release");
+        }
+        drop(first);
+        assert!(
+            !manager.get_shard(&key).is_guard_active(first_id),
+            "first dropped stale guard must be unregistered"
+        );
+        assert_registered_holder_blocks_writer(&manager, &key, successor.guard_id(), "after first stale shared drop");
+        drop(second);
+        assert!(
+            !manager.get_shard(&key).is_guard_active(second_id),
+            "second dropped stale guard must be unregistered"
+        );
+        assert_registered_holder_blocks_writer(&manager, &key, successor.guard_id(), "after second stale shared drop");
+
+        assert_successor_release_or_drop(&manager, &key, successor, release_successor);
+        assert_no_registered_guards(&manager);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn force_unlocked_shared_guards_drop_preserves_same_owner_successor() {
+        stale_shared_guards_do_not_release_successor(false, true).await;
+        stale_shared_guards_do_not_release_successor(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn force_unlocked_shared_guards_release_preserves_same_owner_successor() {
+        stale_shared_guards_do_not_release_successor(true, true).await;
+        stale_shared_guards_do_not_release_successor(true, false).await;
+    }
 }
