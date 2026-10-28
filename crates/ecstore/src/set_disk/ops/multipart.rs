@@ -44,9 +44,9 @@ use super::super::{
     create_bitrot_writer, debug, disk, error, file_info_is_valid_for_metadata, get_complete_multipart_md5, get_header_map,
     get_str, insert_str, is_err_object_not_found, is_err_version_not_found, is_min_allowed_part_size,
     log_multipart_write_quorum_failure, parts_after_marker, path_join_buf, prepare_complete_multipart_parts,
-    record_compression_total_memory, reduce_read_quorum_errs, reduce_write_quorum_errs, remove_header_map, resolve_write_layout,
-    restore_commit_operation_id_from_metadata, should_persist_encryption_original_size, strip_internal_multipart_metadata,
-    to_object_err, warn,
+    record_compression_total_memory, record_multipart_write_quorum_failure, reduce_read_quorum_errs, reduce_write_quorum_errs,
+    remove_header_map, resolve_write_layout, restore_commit_operation_id_from_metadata, should_persist_encryption_original_size,
+    strip_internal_multipart_metadata, to_object_err, warn,
 };
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
 #[cfg(test)]
@@ -231,6 +231,19 @@ fn admitted_multipart_size(current: u64, candidate: u64, limit: u64) -> Result<u
         return Err(Error::EntityTooLarge(total, limit));
     }
     Ok(total)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MultipartMetadataQuorum {
+    Read,
+    Write,
+    Cleanup,
+}
+
+impl From<bool> for MultipartMetadataQuorum {
+    fn from(write: bool) -> Self {
+        if write { Self::Write } else { Self::Read }
+    }
 }
 
 pub(crate) struct StaleMultipartCleanupGuard {
@@ -1139,7 +1152,7 @@ impl SetDisks {
             }
             let upload_id = runtime_sources::deployment_upload_id(raw_upload_id);
             let file_info = match self
-                .check_multipart_upload_path_exists(bucket, object, &upload_id, &upload_path, false, true)
+                .check_multipart_upload_path_exists(bucket, object, &upload_id, &upload_path, MultipartMetadataQuorum::Read, true)
                 .await
             {
                 Ok((file_info, _)) => file_info,
@@ -1226,7 +1239,7 @@ impl SetDisks {
             .acquire_write_lock_diag("abort_data_movement_multipart", RUSTFS_META_MULTIPART_BUCKET, &upload_path)
             .await?;
         let file_info = match self
-            .check_multipart_upload_path_exists(bucket, object, upload_id, &upload_path, true, true)
+            .check_multipart_upload_path_exists(bucket, object, upload_id, &upload_path, MultipartMetadataQuorum::Write, true)
             .await
         {
             Ok((file_info, _)) => file_info,
@@ -1333,7 +1346,7 @@ impl SetDisks {
         data_movement: bool,
     ) -> Result<(FileInfo, Vec<FileInfo>)> {
         let upload_id_path = Self::validated_multipart_upload_path(bucket, object, upload_id, data_movement)?;
-        self.check_multipart_upload_path_exists(bucket, object, upload_id, &upload_id_path, write, false)
+        self.check_multipart_upload_path_exists(bucket, object, upload_id, &upload_id_path, write.into(), false)
             .await
     }
 
@@ -1373,7 +1386,7 @@ impl SetDisks {
         object: &str,
         upload_id: &str,
         upload_id_path: &str,
-        write: bool,
+        quorum_mode: MultipartMetadataQuorum,
         include_recovery: bool,
     ) -> Result<(FileInfo, Vec<FileInfo>)> {
         // Slow metadata I/O must not hold the topology registry's read lock.
@@ -1489,22 +1502,26 @@ impl SetDisks {
         }
 
         let mut quorum = read_quorum as usize;
-        if write {
+        if quorum_mode != MultipartMetadataQuorum::Read {
             quorum = write_quorum as usize;
 
             if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, quorum) {
-                log_multipart_write_quorum_failure(
-                    MultipartWriteQuorumContext {
-                        stage: MULTIPART_WRITE_QUORUM_UPLOAD_METADATA,
-                        bucket,
-                        object,
-                        upload_id,
-                        part_number: None,
-                    },
-                    &errs,
-                    quorum,
-                    &err,
-                );
+                if quorum_mode == MultipartMetadataQuorum::Write {
+                    log_multipart_write_quorum_failure(
+                        MultipartWriteQuorumContext {
+                            stage: MULTIPART_WRITE_QUORUM_UPLOAD_METADATA,
+                            bucket,
+                            object,
+                            upload_id,
+                            part_number: None,
+                        },
+                        &errs,
+                        quorum,
+                        &err,
+                    );
+                } else {
+                    record_multipart_write_quorum_failure(MULTIPART_WRITE_QUORUM_UPLOAD_METADATA, &errs, quorum);
+                }
                 return Err(map_error(err));
             }
         } else if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, quorum) {
@@ -1523,7 +1540,7 @@ impl SetDisks {
             .acquire_write_lock_diag("stale_multipart_cleanup", RUSTFS_META_MULTIPART_BUCKET, upload_path)
             .await?;
         let (file_info, _) = self
-            .check_multipart_upload_path_exists("", "", "", upload_path, true, true)
+            .check_multipart_upload_path_exists("", "", "", upload_path, MultipartMetadataQuorum::Cleanup, true)
             .await?;
         let write_quorum = file_info.write_quorum(self.default_write_quorum());
         Ok(StaleMultipartCleanupGuard {
@@ -3032,7 +3049,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // its full write quorum and the upload's incarnation/lifecycle fences.
         let upload_id_path = Self::validated_multipart_upload_path(bucket, object, upload_id, opts.data_movement)?;
         let (fi, _) = self
-            .check_multipart_upload_path_exists(bucket, object, upload_id, &upload_id_path, false, true)
+            .check_multipart_upload_path_exists(bucket, object, upload_id, &upload_id_path, MultipartMetadataQuorum::Read, true)
             .await?;
         ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
@@ -3192,7 +3209,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     }
                     SourceRecovery::Missing => {
                         return match self
-                            .check_multipart_upload_path_exists(bucket, object, upload_id, &upload_id_path, false, true)
+                            .check_multipart_upload_path_exists(
+                                bucket,
+                                object,
+                                upload_id,
+                                &upload_id_path,
+                                MultipartMetadataQuorum::Read,
+                                true,
+                            )
                             .await
                         {
                             Ok(_) => Err(Error::ErasureWriteQuorum),
@@ -5617,7 +5641,10 @@ mod tests {
                 .await
                 .expect("abort task should join after completion releases")
                 .expect_err("the committed upload should no longer exist");
-            assert!(matches!(abort_err, StorageError::InvalidUploadID(..)));
+            assert!(
+                matches!(abort_err, StorageError::InvalidUploadID(..)),
+                "the completed upload must be absent after the tail drains, got: {abort_err:?}"
+            );
 
             for (disk_index, disk) in disk_stores.iter().enumerate() {
                 let fi = disk
@@ -9553,10 +9580,12 @@ mod tests {
                                 ).expect("actual completion identity"));
                             }
                         }
-                        if published == 3 && tasks.running() == 1 { break; }
+                        // The fourth native syscall is held by release_rx even if
+                        // its deadline has already retired the async wrapper.
+                        if published == 3 { break; }
                         tokio::task::yield_now().await;
                     }
-                }).await.expect("three real native publication legs must return before the fourth deadline");
+                }).await.expect("three real native publication legs must succeed while the fourth syscall remains paused");
                 after_publication.as_ref().expect("publication barrier").wait_until_paused().await;
                 // Quorum has been validated and the parent released its object
                 // guard. The successful physical tail cannot retain a clone.
@@ -11128,7 +11157,7 @@ mod tests {
             *disk = None;
         }
         let (info, _) = set
-            .check_multipart_upload_path_exists(bucket, object, &upload, &path, false, true)
+            .check_multipart_upload_path_exists(bucket, object, &upload, &path, MultipartMetadataQuorum::Read, true)
             .await
             .expect("four primary plus four recovery copies reach metadata read quorum");
         assert_eq!(info.name, path);
@@ -11149,7 +11178,7 @@ mod tests {
             *disk = None;
         }
         assert!(
-            set.check_multipart_upload_path_exists(bucket, object, &upload, &path, false, true)
+            set.check_multipart_upload_path_exists(bucket, object, &upload, &path, MultipartMetadataQuorum::Read, true)
                 .await
                 .is_err(),
             "two files on each of four disks must not count as eight voters"
@@ -14466,7 +14495,7 @@ mod tests {
                     object,
                     &u_new,
                     &SetDisks::get_upload_id_dir(bucket, object, &u_new),
-                    true,
+                    MultipartMetadataQuorum::Write,
                     true,
                 )
                 .await
@@ -14511,7 +14540,7 @@ mod tests {
                 object,
                 &upload,
                 &SetDisks::get_upload_id_dir(bucket, object, &upload),
-                true,
+                MultipartMetadataQuorum::Write,
                 true,
             )
             .await
@@ -14594,7 +14623,7 @@ mod tests {
                     assert_completion_files_preserved(&disk_stores, RUSTFS_META_MULTIPART_BUCKET, &source_files).await;
                     set_disks
                         .check_multipart_upload_path_exists(
-                            bucket, object, &u_new, &SetDisks::get_upload_id_dir(bucket, object, &u_new), true, true,
+                            bucket, object, &u_new, &SetDisks::get_upload_id_dir(bucket, object, &u_new), MultipartMetadataQuorum::Write, true,
                         )
                         .await
                         .expect("upload authority must survive the post-commit crash");

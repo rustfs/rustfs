@@ -211,7 +211,7 @@ jobs:
 
   prepare:
     if: ${{ (github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id == '' && inputs.validation_package_sha == '' && inputs.validation_case == '' && !inputs.validation_tools_only && !inputs.validation_native_tools && !inputs.validation_shared_tools && !inputs.validation_manager_tools && !inputs.validation_cleanup_retained_evidence && inputs.validation_cleanup_run_id == '') || github.event.workflow_run.event == 'schedule' }}
-    runs-on: smoke-testing
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       manifest: ${{ steps.candidate.outputs.manifest }}
@@ -746,7 +746,7 @@ jobs:
   complete-chain:
     needs: [prepare, upgrade, s3, kms, tier, storage, heal, pool, security, replication, fault-tolerance, table, performance]
     if: ${{ always() && needs.prepare.result != 'skipped' }}
-    runs-on: smoke-testing
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7

@@ -30,7 +30,7 @@ The same thing was missing at every layer: an inventory of what remote targets m
 
 - **Change design.** A default that applies to every target was changed to satisfy one target class. The PR text considered checksums only for objects that already carried one ("object-level `x-amz-checksum-*` forwarding is unaffected") and never asked the inverse question: which target-side rules depend on a checksum being present.
 - **Tests.** The new unit test asserted the fix ("no `x-amz-trailer`"), not the contract ("the target accepted the PUT"). The fake target modeled neither failure mode: it did not store `aws-chunked` verbatim and it did not demand a checksum on locked PUTs. `replication-check` has an ObjectLock phase, but its probe PUT carries no retention headers, so it would have reported OK against the customer's target.
-- **Review.** The compatibility lens (`.agents/skills/adversarial-validation/references/compatibility.md`) listed only inbound and on-disk concerns: `xl.meta`, proto, MinIO fixtures. It contained no line about outbound target behavior, so the lens passed while blind to the class.
+- **Review.** The compatibility review guidance listed only inbound and on-disk concerns: `xl.meta`, proto, MinIO fixtures. It contained no line about outbound target behavior, so the review passed while blind to the class.
 - **Release.** Two new environment escape hatches shipped undocumented. The customer's second question in rustfs#7082 was whether a configuration option exists; it did, and it was unfindable.
 
 ## Corrective actions
@@ -39,7 +39,7 @@ The same thing was missing at every layer: an inventory of what remote targets m
 | --- | --- |
 | Outbound target matrix e2e: every target failure mode times every object shape, with an explicit expectation table. Known-red cells are pinned to an open issue and fail loudly when they start passing. | `crates/e2e_test/src/replication_target_matrix_test.rs` |
 | Fake target gains the three failure modes a real fleet has shown: rejects `aws-chunked` uploads, requires a checksum on Object Lock PUTs (and verifies `Content-MD5`), mints its own version ids. | `crates/e2e_test/src/fake_s3_target/mod.rs` |
-| Compatibility lens gains an outbound target section. | `.agents/skills/adversarial-validation/references/compatibility.md` |
+| Review policy covers outbound target behavior. | `.agents/references/adversarial-validation.md` |
 | `AGENTS.md` names outbound client defaults as high risk and requires the matrix plus documented escape hatches. | `AGENTS.md`, Adversarial Validation |
 | The two escape hatches from rustfs#6895 are documented. | `docs/operations/replication-outbound-transport.md` |
 | Product fix for rustfs#7082: a locked PUT carries `Content-MD5` derived from the source ETag when that ETag is the MD5 of the wire bytes, and an SDK CRC32 checksum otherwise; the two matrix cells flipped to `Completed` in the same change. | `crates/ecstore/src/bucket/bucket_target_sys.rs` (`object_lock_put_integrity_for`), `crates/replication/src/object.rs` (`object_lock_put_integrity`) |

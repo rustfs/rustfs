@@ -57,8 +57,8 @@ use super::storage_api::bucket_usecase::helper::{OperationHelper, spawn_backgrou
 use super::storage_api::bucket_usecase::object_utils::to_s3s_etag;
 use super::storage_api::bucket_usecase::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-    build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
-    rustfs_owner,
+    build_list_objects_output, build_list_objects_v2_output, encode_list_objects_v2_continuation_token,
+    parse_list_object_versions_params, parse_list_objects_v2_params, rustfs_owner,
 };
 use super::storage_api::bucket_usecase::{
     get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
@@ -629,6 +629,14 @@ async fn notify_bucket_metadata_reload(
     scanner_maintenance_change: bool,
 ) {
     notify_bucket_metadata_reload_with_context(bucket, operation, request_context, scanner_maintenance_change, None).await;
+}
+
+pub(crate) async fn notify_table_bucket_metadata_reload(
+    bucket: String,
+    operation: &'static str,
+    app_context: Option<Arc<AppContext>>,
+) {
+    notify_bucket_metadata_reload_with_context(bucket, operation, None, false, app_context).await;
 }
 
 async fn notify_bucket_metadata_reload_with_context(
@@ -1238,7 +1246,7 @@ fn build_list_objects_v2_metadata_output(
     let key_count = metadata_count_to_i32(contents.len() + common_prefixes.len());
     let next_continuation_token = object_infos
         .next_continuation_token
-        .map(|token| base64_simd::STANDARD.encode_to_string(token.as_bytes()));
+        .map(|cursor| encode_list_objects_v2_continuation_token(&cursor));
 
     ListObjectsV2MetadataOutput {
         output: ListObjectsV2Output {

@@ -622,18 +622,6 @@ pub struct FileMetaShallowVersion {
     pub meta: Vec<u8>, // FileMetaVersion.marshal_msg
 }
 
-fn write_quorum_from_erasure(data_blocks: usize, parity_blocks: usize) -> Option<usize> {
-    if data_blocks == 0 {
-        return None;
-    }
-
-    Some(if data_blocks == parity_blocks {
-        data_blocks.saturating_add(1)
-    } else {
-        data_blocks
-    })
-}
-
 impl FileMetaShallowVersion {
     /// Parse version meta with legacy format compatibility.
     /// Use this instead of `FileMetaVersion::default()` + `unmarshal_msg()` to handle old-version xl.meta.
@@ -641,58 +629,9 @@ impl FileMetaShallowVersion {
         FileMetaVersion::try_from(self.meta.as_slice())
     }
 
-    pub fn write_quorum(&self, fallback_quorum: usize) -> usize {
-        write_quorum_from_header_and_meta(&self.header, self.meta.as_slice(), fallback_quorum)
-    }
-
-    /// Quorum for listing this version without accepting an unreadable payload.
-    pub fn listing_quorum(&self, fallback_quorum: usize, unreachable_disks: usize) -> usize {
-        listing_quorum_from_header_and_meta(&self.header, &self.meta, fallback_quorum, unreachable_disks)
-    }
-
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfo> {
         FileMetaVersion::decode_fileinfo_from_slice(self.meta.as_slice(), volume, path, all_parts, true)
     }
-}
-
-#[inline]
-pub(crate) fn write_quorum_from_header_and_meta(header: &FileMetaVersionHeader, meta: &[u8], fallback_quorum: usize) -> usize {
-    let header_quorum = header.write_quorum(fallback_quorum);
-    if header.has_ec() || !matches!(header.version_type, VersionType::Object | VersionType::Legacy) {
-        return header_quorum;
-    }
-
-    FileMetaVersion::try_from(meta)
-        .ok()
-        .and_then(|version| version.erasure_write_quorum())
-        .unwrap_or(header_quorum)
-}
-
-pub(crate) fn listing_quorum_from_header_and_meta(
-    header: &FileMetaVersionHeader,
-    meta: &[u8],
-    fallback_quorum: usize,
-    unreachable_disks: usize,
-) -> usize {
-    let geometry = if header.version_type == VersionType::Object && header.has_ec() {
-        Some((usize::from(header.ec_m), usize::from(header.ec_n)))
-    } else if matches!(header.version_type, VersionType::Object | VersionType::Legacy) {
-        FileMetaVersion::try_from(meta)
-            .ok()
-            .and_then(|version| version.erasure_geometry())
-    } else {
-        None
-    };
-    let Some((data_blocks, parity_blocks)) = geometry else {
-        return fallback_quorum;
-    };
-    let Some(write_quorum) = write_quorum_from_erasure(data_blocks, parity_blocks) else {
-        return fallback_quorum;
-    };
-    write_quorum
-        .saturating_sub(unreachable_disks)
-        .max(data_blocks)
-        .max(fallback_quorum)
 }
 
 impl TryFrom<FileMetaVersion> for FileMetaShallowVersion {
@@ -737,26 +676,6 @@ pub(super) struct V2ObjectSliceSummary {
 }
 
 impl FileMetaVersion {
-    fn erasure_geometry(&self) -> Option<(usize, usize)> {
-        Some(match self.version_type {
-            VersionType::Object | VersionType::Legacy => {
-                if let Some(object) = &self.object {
-                    (object.erasure_m, object.erasure_n)
-                } else if let Some(object) = &self.legacy_object {
-                    (object.erasure.data_blocks, object.erasure.parity_blocks)
-                } else {
-                    return None;
-                }
-            }
-            _ => return None,
-        })
-    }
-
-    fn erasure_write_quorum(&self) -> Option<usize> {
-        let (data_blocks, parity_blocks) = self.erasure_geometry()?;
-        write_quorum_from_erasure(data_blocks, parity_blocks)
-    }
-
     /// Fast borrowed scanner for `V2Obj` slices. Returning `Ok` guarantees
     /// `FileMetaVersion::try_from` would succeed with the identical summary fields;
     /// any non-`V2Obj` or invalid input returns `Err` so callers fall back to `try_from`.
@@ -1773,14 +1692,6 @@ impl FileMetaVersionHeader {
 
     pub fn has_ec(&self) -> bool {
         self.ec_m > 0 && self.ec_n > 0
-    }
-
-    pub fn write_quorum(&self, fallback_quorum: usize) -> usize {
-        if self.version_type != VersionType::Object || !self.has_ec() {
-            return fallback_quorum;
-        }
-
-        write_quorum_from_erasure(usize::from(self.ec_m), usize::from(self.ec_n)).unwrap_or(fallback_quorum)
     }
 
     pub fn matches_not_strict(&self, o: &FileMetaVersionHeader) -> bool {
@@ -4167,15 +4078,49 @@ pub fn merge_file_meta_versions(
         .iter()
         .map(|v| v.iter().map(|ver| (&ver.header, ver.meta.as_slice())).collect())
         .collect();
-    merge_file_meta_borrowed_streams(quorum, strict, requested_versions, false, 0, streams)
+    merge_file_meta_borrowed_streams(quorum, strict, requested_versions, streams)
+}
+
+/// Picks the most common header among the tops that share `latest`'s version
+/// id; a tie keeps the header that sorts first (the newest).
+fn most_common_header_for_version_id<'a>(
+    tops: &[(&'a FileMetaVersionHeader, &'a [u8])],
+    mut latest: (&'a FileMetaVersionHeader, &'a [u8]),
+    strict: bool,
+) -> ((&'a FileMetaVersionHeader, &'a [u8]), usize) {
+    let version_id = latest.0.version_id;
+    let comparable = |header: &FileMetaVersionHeader| {
+        let mut header = header.clone();
+        if !strict {
+            header.signature = [0; 4];
+        }
+        header
+    };
+    let mut counts: HashMap<FileMetaVersionHeader, usize> = HashMap::new();
+    for &top in tops {
+        if top.0.version_id == version_id {
+            *counts.entry(comparable(top.0)).or_insert(0) += 1;
+        }
+    }
+    let mut latest_count = 0;
+    for (header, count) in &counts {
+        if *count < latest_count || (*count == latest_count && latest.0.sorts_before(header)) {
+            continue;
+        }
+        for &top in tops {
+            if comparable(top.0) == *header {
+                latest = top;
+            }
+        }
+        latest_count = *count;
+    }
+    (latest, latest_count)
 }
 
 pub(crate) fn merge_file_meta_borrowed_streams(
     mut quorum: usize,
     mut strict: bool,
     requested_versions: usize,
-    enforce_write_quorum: bool,
-    write_quorum_slack: usize,
     mut streams: Vec<Vec<(&FileMetaVersionHeader, &[u8])>>,
 ) -> Vec<FileMetaShallowVersion> {
     let to_shallow = |(header, meta): (&FileMetaVersionHeader, &[u8])| FileMetaShallowVersion {
@@ -4192,31 +4137,12 @@ pub(crate) fn merge_file_meta_borrowed_streams(
     }
 
     if streams.len() == 1 {
-        if !enforce_write_quorum {
-            return streams[0].iter().copied().map(to_shallow).collect();
-        }
-
-        let required_quorum = streams[0]
-            .first()
-            .map(|&(hdr, meta)| listing_quorum_from_header_and_meta(hdr, meta, quorum, write_quorum_slack))
-            .unwrap_or(quorum);
-        if streams.len() >= required_quorum {
-            return streams[0].iter().copied().map(to_shallow).collect();
-        }
-        return Vec::new();
+        return streams[0].iter().copied().map(to_shallow).collect();
     }
 
     if quorum == 1 {
         strict = true;
     }
-
-    let required_quorum = |(hdr, meta): (&FileMetaVersionHeader, &[u8])| {
-        if enforce_write_quorum {
-            listing_quorum_from_header_and_meta(hdr, meta, quorum, write_quorum_slack)
-        } else {
-            quorum
-        }
-    };
 
     let mut tops: Vec<(&FileMetaVersionHeader, &[u8])> = Vec::with_capacity(streams.len());
 
@@ -4249,7 +4175,7 @@ pub(crate) fn merge_file_meta_borrowed_streams(
         let latest: (&FileMetaVersionHeader, &[u8]);
         if consistent {
             latest = tops[0];
-            if tops.len() >= required_quorum(latest) {
+            if tops.len() >= quorum {
                 merged.push(to_shallow(latest));
                 if !latest.0.free_version() {
                     n_versions += 1;
@@ -4258,6 +4184,7 @@ pub(crate) fn merge_file_meta_borrowed_streams(
         } else {
             let mut latest_ref = tops[0];
             let mut latest_count = 1;
+            let mut settled_by_version_id = false;
             for &ver in &tops[1..] {
                 if ver.0 == latest_ref.0 {
                     latest_count += 1;
@@ -4281,39 +4208,26 @@ pub(crate) fn merge_file_meta_borrowed_streams(
                 }
 
                 if ver.0.version_id == latest_ref.0.version_id {
-                    let mut x: HashMap<FileMetaVersionHeader, usize> = HashMap::new();
-                    for &a in &tops {
-                        if a.0.version_id != ver.0.version_id {
-                            continue;
-                        }
-                        let mut hdr = a.0.clone();
-                        if !strict {
-                            hdr.signature = [0; 4];
-                        }
-                        *x.entry(hdr).or_insert(0) += 1;
-                    }
-                    latest_count = 0;
-                    for (k, v) in x.iter() {
-                        if *v < latest_count || (*v == latest_count && latest_ref.0.sorts_before(k)) {
-                            continue;
-                        }
-                        for &a in &tops {
-                            let mut hdr = a.0.clone();
-                            if !strict {
-                                hdr.signature = [0; 4];
-                            }
-                            if hdr == *k {
-                                latest_ref = a;
-                            }
-                        }
-
-                        latest_count = *v;
-                    }
+                    (latest_ref, latest_count) = most_common_header_for_version_id(&tops, latest_ref, strict);
+                    settled_by_version_id = true;
                     break;
                 }
             }
+            // Readers return their heads in any order. When every older header
+            // sharing the newest header's version id (an interrupted null-version
+            // overwrite) came first, the scan above never compared them, and the
+            // stream trim below would then drop that older committed generation.
+            if !settled_by_version_id
+                && tops.iter().any(|ver| {
+                    ver.0 != latest_ref.0
+                        && ver.0.version_id == latest_ref.0.version_id
+                        && (strict || !ver.0.matches_not_strict(latest_ref.0))
+                })
+            {
+                (latest_ref, latest_count) = most_common_header_for_version_id(&tops, latest_ref, strict);
+            }
             latest = latest_ref;
-            if latest_count >= required_quorum(latest) {
+            if latest_count >= quorum {
                 if !latest.0.free_version() {
                     n_versions += 1;
                 }
@@ -4505,14 +4419,14 @@ fn read_more_sync<R: std::io::Read>(
     }
 
     let extra = read_size - has;
-    if buf.capacity() >= read_size {
-        // Extend the buffer if we have enough space.
-        buf.resize(read_size, 0);
-    } else {
-        buf.extend(vec![0u8; extra]);
+    buf.try_reserve(extra.saturating_add(1)).map_err(Error::other)?;
+    std::io::Read::read_to_end(&mut std::io::Read::take(reader, extra as u64), buf)?;
+    if buf.len() < read_size {
+        return Err(Error::from(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        )));
     }
-
-    reader.read_exact(&mut buf[has..])?;
     Ok(())
 }
 
@@ -4534,8 +4448,8 @@ pub fn read_xl_meta_no_data_sync<R: std::io::Read>(reader: &mut R, size: usize) 
         has_full = false;
     }
 
-    let mut buf = vec![0u8; initial];
-    reader.read_exact(&mut buf)?;
+    let mut buf = Vec::new();
+    read_more_sync(reader, &mut buf, size, initial, false)?;
 
     let (tmp_buf, major, minor) = FileMeta::check_xl2_v1(&buf)?;
 
@@ -5102,39 +5016,6 @@ mod tests {
         wr
     }
 
-    fn encode_legacy_v2_object_body(data_blocks: usize, parity_blocks: usize) -> Vec<u8> {
-        let drive_count = data_blocks + parity_blocks;
-        let payload = LegacyObjectVersionFixture {
-            version_type: LegacyObjectVersionTypeFixture::Object,
-            object: Some(LegacyObjectFixture {
-                version_id: Some(sample_version_id().as_bytes().to_vec()),
-                data_dir: Some(Uuid::from_u128(42).as_bytes().to_vec()),
-                erasure_algorithm: "ReedSolomon".to_string(),
-                erasure_m: data_blocks,
-                erasure_n: parity_blocks,
-                erasure_block_size: 1_048_576,
-                erasure_index: 1,
-                erasure_dist: (1..=drive_count)
-                    .map(|idx| u8::try_from(idx).expect("test drive index should fit u8"))
-                    .collect(),
-                bitrot_checksum_algo: "HighwayHash".to_string(),
-                part_numbers: vec![1],
-                part_etags: vec!["etag-1".to_string()],
-                part_sizes: vec![11],
-                part_actual_sizes: vec![11],
-                part_indices: vec![Vec::new()],
-                size: 11,
-                mod_time: Some(sample_mod_time()),
-                meta_sys: HashMap::new(),
-                meta_user: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
-            }),
-            delete_marker: None,
-            write_version: 3,
-        };
-
-        rmp_serde::to_vec_named(&payload).expect("legacy object payload should marshal")
-    }
-
     #[test]
     fn version_header_unmarshal_v1_uses_legacy_layout_defaults() {
         let expected = sample_header();
@@ -5167,80 +5048,6 @@ mod tests {
         assert_eq!(decoded.flags, expected.flags);
         assert_eq!(decoded.ec_n, 0);
         assert_eq!(decoded.ec_m, 0);
-    }
-
-    #[test]
-    fn shallow_version_write_quorum_uses_legacy_object_payload_when_header_lacks_ec() {
-        let expected = sample_header();
-        let encoded = encode_v2_header(&expected);
-        let mut header = FileMetaVersionHeader::default();
-        header.unmarshal_v(2, &encoded).expect("legacy v2 header should decode");
-
-        let version = FileMetaShallowVersion {
-            header,
-            meta: encode_legacy_v2_object_body(7, 1),
-        };
-
-        assert_eq!(version.header.write_quorum(5), 5);
-        assert_eq!(version.write_quorum(5), 7);
-    }
-
-    #[test]
-    fn listing_quorum_uses_each_versions_data_floor() {
-        for (data, parity, offline, fallback, expected) in
-            [(8, 8, 0, 9, 9), (8, 8, 8, 8, 8), (12, 4, 8, 8, 12), (12, 4, 0, 9, 12)]
-        {
-            let version = FileMetaShallowVersion {
-                header: FileMetaVersionHeader {
-                    version_type: VersionType::Object,
-                    ec_m: data,
-                    ec_n: parity,
-                    ..Default::default()
-                },
-                // Modern headers must not decode the payload to decide quorum.
-                meta: vec![0xff],
-            };
-            assert_eq!(version.listing_quorum(fallback, offline), expected);
-        }
-        let marker = FileMetaShallowVersion {
-            header: FileMetaVersionHeader {
-                version_type: VersionType::Delete,
-                ..Default::default()
-            },
-            meta: Vec::new(),
-        };
-        assert_eq!(marker.listing_quorum(9, 0), 9, "healthy marker needs majority metadata");
-        assert_eq!(marker.listing_quorum(8, 8), 8, "degraded marker retains metadata floor");
-    }
-
-    #[test]
-    fn listing_quorum_preserves_legacy_and_zero_parity_data_floor() {
-        for (data, parity, fallback, expected) in [(12, 4, 8, 12), (8, 8, 8, 8), (4, 0, 2, 4)] {
-            let version = FileMetaShallowVersion {
-                header: FileMetaVersionHeader {
-                    version_type: VersionType::Object,
-                    ..Default::default()
-                },
-                meta: encode_legacy_v2_object_body(data, parity),
-            };
-            assert_eq!(version.listing_quorum(fallback, 8), expected);
-        }
-    }
-
-    #[test]
-    fn shallow_version_write_quorum_uses_zero_parity_object_payload() {
-        let expected = sample_header();
-        let encoded = encode_v2_header(&expected);
-        let mut header = FileMetaVersionHeader::default();
-        header.unmarshal_v(2, &encoded).expect("legacy v2 header should decode");
-
-        let version = FileMetaShallowVersion {
-            header,
-            meta: encode_legacy_v2_object_body(4, 0),
-        };
-
-        assert_eq!(version.header.write_quorum(2), 2);
-        assert_eq!(version.write_quorum(2), 4);
     }
 
     #[test]

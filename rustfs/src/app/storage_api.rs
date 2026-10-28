@@ -70,6 +70,13 @@ pub(crate) mod admin {
 
 pub(crate) mod capacity {
     pub(crate) type DecommissionUnresolvedEntry = crate::storage::storage_api::ecstore_capacity::DecommissionUnresolvedEntry;
+    pub(crate) type PoolAdminDiagnostic = crate::storage::storage_api::ecstore_capacity::PoolAdminDiagnostic;
+    #[cfg(test)]
+    pub(crate) type PoolAvailability = crate::storage::storage_api::ecstore_capacity::PoolAvailability;
+    #[cfg(test)]
+    pub(crate) type PoolCapacityStatus = crate::storage::storage_api::ecstore_capacity::PoolCapacityStatus;
+    #[cfg(test)]
+    pub(crate) type PoolDiagnosticStatus = crate::storage::storage_api::ecstore_capacity::PoolDiagnosticStatus;
     pub(crate) type PoolDecommissionInfo = crate::storage::storage_api::ecstore_capacity::PoolDecommissionInfo;
     pub(crate) type PoolMeta = crate::storage::storage_api::ecstore_capacity::PoolMeta;
     pub(crate) type PoolStatus = crate::storage::storage_api::ecstore_capacity::PoolStatus;
@@ -1138,8 +1145,8 @@ pub(crate) mod s3_api {
     pub(crate) mod bucket {
         pub(crate) use crate::storage::storage_api::s3_api_consumer::bucket::{
             ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-            build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params,
-            parse_list_objects_v2_params,
+            build_list_objects_output, build_list_objects_v2_output, encode_list_objects_v2_continuation_token,
+            parse_list_object_versions_params, parse_list_objects_v2_params,
         };
         pub(crate) use crate::storage::storage_api::s3_api_consumer::common::rustfs_owner;
     }

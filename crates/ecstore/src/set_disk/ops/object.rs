@@ -2999,6 +2999,44 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             let object_size = usize::try_from(fi.size)
                 .map_err(|_| to_object_err(Error::other("inline fast path object size is invalid"), vec![bucket, object]))?;
 
+            if can_try_inline_data_shards_direct(object_size, fi.erasure.block_size)
+                && let Some(body) = verified_inline_body.filter(|body| body.len() == object_size)
+            {
+                if let Some(inline_prepare_stage_start) = inline_prepare_stage_start.take() {
+                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                        GET_OBJECT_PATH_INLINE_DIRECT,
+                        GET_STAGE_INLINE_PREPARE,
+                        object_class.as_str(),
+                        size_bucket,
+                        inline_prepare_stage_start.elapsed().as_secs_f64(),
+                    );
+                }
+                if rustfs_io_metrics::get_stage_metrics_enabled() {
+                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                        GET_OBJECT_PATH_INLINE_DIRECT,
+                        GET_STAGE_READER_SETUP,
+                        object_class.as_str(),
+                        size_bucket,
+                        0.0,
+                    );
+                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                        GET_OBJECT_PATH_INLINE_DIRECT,
+                        GET_STAGE_DECODE,
+                        object_class.as_str(),
+                        size_bucket,
+                        0.0,
+                    );
+                }
+                record_get_object_reader_path_observation(GET_OBJECT_PATH_INLINE_DIRECT, object_class, size_bucket);
+                let reader = GetObjectReader {
+                    stream: Box::new(Cursor::new(body.clone())),
+                    object_info,
+                    buffered_body: Some(body),
+                    body_source: GetObjectBodySource::Unprobed,
+                };
+                return Ok(reader);
+            }
+
             let checksum_info = fi.erasure.get_checksum_info(fi.parts[0].number);
             let checksum_algo =
                 if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
@@ -3012,42 +3050,6 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     disks.get(index).is_some_and(Option::is_some)
                 })
             {
-                if let Some(body) = verified_inline_body.filter(|body| body.len() == object_size) {
-                    if let Some(inline_prepare_stage_start) = inline_prepare_stage_start.take() {
-                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                            GET_OBJECT_PATH_INLINE_DIRECT,
-                            GET_STAGE_INLINE_PREPARE,
-                            object_class.as_str(),
-                            size_bucket,
-                            inline_prepare_stage_start.elapsed().as_secs_f64(),
-                        );
-                    }
-                    if rustfs_io_metrics::get_stage_metrics_enabled() {
-                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                            GET_OBJECT_PATH_INLINE_DIRECT,
-                            GET_STAGE_READER_SETUP,
-                            object_class.as_str(),
-                            size_bucket,
-                            0.0,
-                        );
-                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                            GET_OBJECT_PATH_INLINE_DIRECT,
-                            GET_STAGE_DECODE,
-                            object_class.as_str(),
-                            size_bucket,
-                            0.0,
-                        );
-                    }
-                    record_get_object_reader_path_observation(GET_OBJECT_PATH_INLINE_DIRECT, object_class, size_bucket);
-                    let reader = GetObjectReader {
-                        stream: Box::new(Cursor::new(body.clone())),
-                        object_info,
-                        buffered_body: Some(body),
-                        body_source: GetObjectBodySource::Unprobed,
-                    };
-                    return Ok(reader);
-                }
-
                 let read_length = inline_erasure_shard_file_offset(
                     0,
                     object_size,
@@ -8907,7 +8909,7 @@ impl SetDisks {
         // quorum, failing write quorum on update_object_meta (backlog#872).
         let read_opts = opts.as_read_opts();
         let (mut fi, _, disks) = self
-            .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
+            .get_object_fileinfo_for_metadata_update(bucket, object, &read_opts)
             .await?
             .into_owned();
 
@@ -9362,35 +9364,55 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         };
 
-        let (read_quorum, write_quorum) = match Self::object_quorum_from_meta(&metas, &errs, self.default_parity_count) {
-            Ok((r, w)) => (
-                usize::try_from(r)
-                    .map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![src_bucket, src_object]))?,
-                usize::try_from(w)
-                    .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![src_bucket, src_object]))?,
-            ),
+        let src_version_id = src_opts.version_id.as_deref().unwrap_or_default();
+        let quorum = Self::object_quorum_from_meta(&metas, &errs, self.default_parity_count);
+        let selection = match &quorum {
+            Ok((read_quorum, write_quorum)) => {
+                let read_quorum = usize::try_from(*read_quorum)
+                    .map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![src_bucket, src_object]))?;
+                let write_quorum = usize::try_from(*write_quorum)
+                    .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![src_bucket, src_object]))?;
+                Self::select_fileinfo_for_read(src_bucket, &disks, &metas, &errs, src_version_id, read_quorum, write_quorum)
+                    .map(|(online_disks, fi)| (online_disks, fi, write_quorum))
+            }
+            Err(err) => Err(err.clone()),
+        };
+        let (online_disks, mut fi, write_quorum) = match selection {
+            Ok(selection) => selection,
             Err(mut err) => {
-                if err == DiskError::ErasureReadQuorum
-                    && !src_bucket.starts_with(RUSTFS_META_BUCKET)
-                    && self
-                        .delete_if_dangling(src_bucket, src_object, &metas, &errs, &HashMap::new(), src_opts.clone())
-                        .await
-                        .is_ok()
+                // The merged latest version can be one a failed PUT left below
+                // quorum; resolve it like a latest GET before the dangling
+                // cleanup below can report a key with a committed version absent.
+                if let Some(snapshot) = self
+                    .select_latest_past_dangling_versions(src_bucket, src_object, src_opts, true, &disks, &err)
+                    .await
                 {
-                    if src_opts.version_id.is_some() {
-                        err = DiskError::FileVersionNotFound
-                    } else {
-                        err = DiskError::FileNotFound
+                    // A version-only copy writes the served version's own
+                    // copies, so they and its write quorum replace the latest
+                    // read's.
+                    let (fi, parts_metadata, online_disks) = snapshot.into_owned();
+                    metas = parts_metadata;
+                    let write_quorum = fi.write_quorum(self.default_write_quorum());
+                    (online_disks, fi, write_quorum)
+                } else {
+                    if quorum.is_err()
+                        && err == DiskError::ErasureReadQuorum
+                        && !src_bucket.starts_with(RUSTFS_META_BUCKET)
+                        && self
+                            .delete_if_dangling(src_bucket, src_object, &metas, &errs, &HashMap::new(), src_opts.clone())
+                            .await
+                            .is_ok()
+                    {
+                        if src_opts.version_id.is_some() {
+                            err = DiskError::FileVersionNotFound
+                        } else {
+                            err = DiskError::FileNotFound
+                        }
                     }
+                    return Err(to_object_err(err.into(), vec![src_bucket, src_object]));
                 }
-                return Err(to_object_err(err.into(), vec![src_bucket, src_object]));
             }
         };
-
-        let src_version_id = src_opts.version_id.as_deref().unwrap_or_default();
-        let (online_disks, mut fi, _) =
-            Self::select_valid_fileinfo(&disks, &metas, &errs, src_version_id, read_quorum, write_quorum)
-                .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
 
         if fi.deleted {
             if src_opts.version_id.is_none() {
@@ -9529,6 +9551,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 }
             }
 
+            // A version-only copy writes and then reverts on a quorum miss;
+            // refuse it before writing when the served version's disks cannot
+            // reach its write quorum even if every write succeeds.
+            let reachable = online_disks
+                .iter()
+                .map(|disk| disk.is_none().then_some(DiskError::DiskNotFound))
+                .collect::<Vec<_>>();
+            if let Some(err) = reduce_write_quorum_errs(&reachable, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+                return Err(to_object_err(err.into(), vec![src_bucket, src_object]));
+            }
             Self::write_unique_file_info(&online_disks, "", src_bucket, src_object, &metas, write_quorum)
                 .await
                 .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
@@ -11170,7 +11202,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // shared lock and permit metadata caching can early-stop once write
         // quorum agrees on the object identity.
         let allow_early_stop = !opts.no_lock || opts.metadata_cache_safe;
-        let read = self.get_object_fileinfo(bucket, object, opts, true, allow_early_stop);
+        let read = self.get_object_fileinfo_for_object_read(bucket, object, opts, true, allow_early_stop);
         #[cfg(feature = "diagnostic-read-version-caller")]
         let read = crate::cluster::rpc::runtime_sources::with_read_version_entry(
             rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ObjectInfoRead,
@@ -11228,43 +11260,62 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         };
 
-        let (read_quorum, write_quorum) = match Self::object_quorum_from_meta(&metas, &errs, self.default_parity_count) {
-            Ok((read_quorum, write_quorum)) => (read_quorum, write_quorum),
+        let version_id = opts.version_id.as_deref().unwrap_or_default();
+        let quorum = Self::object_quorum_from_meta(&metas, &errs, self.default_parity_count);
+        let selection = match &quorum {
+            Ok((read_quorum, write_quorum)) => {
+                let read_quorum = usize::try_from(*read_quorum)
+                    .map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]))?;
+                let write_quorum = usize::try_from(*write_quorum)
+                    .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![bucket, object]))?;
+                Self::select_fileinfo_for_read(bucket, &disks, &metas, &errs, version_id, read_quorum, write_quorum)
+            }
+            Err(err) => Err(err.clone()),
+        };
+        let (online_disks, mut fi) = match selection {
+            Ok(selection) => selection,
             Err(mut err) => {
-                // A replication terminal CAS is a validation/write-back
-                // attempt, never a heal operation. In particular,
-                // ValidateOnly must remain zero-write, and a worker whose
-                // outer replication lease is already lost must not delete the
-                // surviving xl.meta copies before the namespace fence below
-                // can reject it. Leave dangling cleanup to heal/scanner.
-                if opts.replication_status_writeback.is_some() {
+                // The merged latest version can be one a failed PUT left below
+                // quorum; resolve it like a latest GET before the dangling
+                // cleanup below can report a key with a committed version absent.
+                // A replication terminal CAS stays side-effect free: the walk
+                // queues heal for the versions it skips, so it does not run.
+                let resolved = if opts.replication_status_writeback.is_none() {
+                    self.select_latest_past_dangling_versions(bucket, object, opts, false, &disks, &err)
+                        .await
+                } else {
+                    None
+                };
+                if let Some(snapshot) = resolved {
+                    let (fi, _, online_disks) = snapshot.into_owned();
+                    (online_disks, fi)
+                } else {
+                    // A replication terminal CAS is a validation/write-back
+                    // attempt, never a heal operation. In particular,
+                    // ValidateOnly must remain zero-write, and a worker whose
+                    // outer replication lease is already lost must not delete
+                    // the surviving xl.meta copies before the namespace fence
+                    // below can reject it. Leave dangling cleanup to
+                    // heal/scanner.
+                    if quorum.is_err()
+                        && opts.replication_status_writeback.is_none()
+                        && err == DiskError::ErasureReadQuorum
+                        && !bucket.starts_with(RUSTFS_META_BUCKET)
+                        && self
+                            .delete_if_dangling(bucket, object, &metas, &errs, &HashMap::new(), opts.clone())
+                            .await
+                            .is_ok()
+                    {
+                        if opts.version_id.is_some() {
+                            err = DiskError::FileVersionNotFound
+                        } else {
+                            err = DiskError::FileNotFound
+                        }
+                    }
                     return Err(to_object_err(err.into(), vec![bucket, object]));
                 }
-                if err == DiskError::ErasureReadQuorum
-                    && !bucket.starts_with(RUSTFS_META_BUCKET)
-                    && self
-                        .delete_if_dangling(bucket, object, &metas, &errs, &HashMap::new(), opts.clone())
-                        .await
-                        .is_ok()
-                {
-                    if opts.version_id.is_some() {
-                        err = DiskError::FileVersionNotFound
-                    } else {
-                        err = DiskError::FileNotFound
-                    }
-                }
-                return Err(to_object_err(err.into(), vec![bucket, object]));
             }
         };
-
-        let read_quorum =
-            usize::try_from(read_quorum).map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]))?;
-        let write_quorum = usize::try_from(write_quorum)
-            .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![bucket, object]))?;
-
-        let version_id = opts.version_id.as_deref().unwrap_or_default();
-        let (online_disks, mut fi, _) = Self::select_valid_fileinfo(&disks, &metas, &errs, version_id, read_quorum, write_quorum)
-            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
 
         if fi.deleted {
             return Err(to_object_err(Error::MethodNotAllowed, vec![bucket, object]));
@@ -16987,6 +17038,7 @@ mod transition_commit_failure_tests {
                     parts_metadata,
                     online_disks,
                     read_quorum: 2,
+                    verified_inline_body: None,
                 }),
             )
             .await;
@@ -23123,6 +23175,116 @@ mod put_object_tmp_cleanup_tests {
             set.get_object_info(bucket, object, &ObjectOptions::default()).await.is_err(),
             "failed fresh write must not become visible"
         );
+    }
+
+    /// Per-drive view of an object: every version (including free versions)
+    /// recorded in its xl.meta, and the data directories next to it. A missing
+    /// xl.meta and one without versions both hold no version.
+    async fn per_drive_object_state(
+        dirs: &[TempDir],
+        bucket: &str,
+        object: &str,
+    ) -> Vec<(Vec<(Option<Uuid>, Option<Uuid>, Option<OffsetDateTime>)>, Vec<String>)> {
+        let mut drives = Vec::with_capacity(dirs.len());
+        for dir in dirs {
+            let object_dir = dir.path().join(bucket).join(object);
+            let versions = match tokio::fs::read(object_dir.join(STORAGE_FORMAT_FILE)).await {
+                Ok(encoded) => {
+                    let all = FileMeta::load(&encoded)
+                        .expect("xl.meta should decode")
+                        .get_all_file_info_versions(bucket, object, true)
+                        .expect("xl.meta versions should be readable");
+                    all.versions
+                        .iter()
+                        .chain(all.free_versions.iter())
+                        .map(|version| (version.version_id, version.data_dir, version.mod_time))
+                        .collect()
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(err) => panic!("xl.meta at {object_dir:?} should be readable: {err}"),
+            };
+            let mut data_dirs = Vec::new();
+            if let Ok(mut entries) = tokio::fs::read_dir(&object_dir).await {
+                while let Some(entry) = entries.next_entry().await.expect("object directory entry should be readable") {
+                    if entry
+                        .file_type()
+                        .await
+                        .expect("object entry type should be readable")
+                        .is_dir()
+                    {
+                        data_dirs.push(entry.file_name().to_string_lossy().into_owned());
+                    }
+                }
+            }
+            data_dirs.sort();
+            drives.push((versions, data_dirs));
+        }
+        drives
+    }
+
+    /// Stage F lists any version present on half of the drives, so a PUT that
+    /// misses write quorum must not leave its version behind once its rollback
+    /// completes: no drive may keep the new xl.meta entry or its data directory.
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn failed_put_rollback_leaves_no_new_version_on_any_drive() {
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            for write_completion in [WriteCompletion::Quorum, WriteCompletion::TailDrained] {
+                for size in [4096, TEST_OBJECT_SIZE] {
+                    // (versioned, seed an earlier version first)
+                    for (versioned, seeded) in [(false, false), (false, true), (true, true)] {
+                        let case = format!("{write_completion:?} size={size} versioned={versioned} seeded={seeded}");
+                        let (dirs, disks, set) = hermetic_set_disks(4).await;
+                        let bucket = "put-rollback-no-residue";
+                        let object = "rolled-back-object";
+                        make_completion_test_bucket(&disks, bucket).await;
+                        if seeded {
+                            set.put_object(
+                                bucket,
+                                object,
+                                &mut PutObjReader::from_vec(vec![b'0'; size]),
+                                &ObjectOptions {
+                                    versioned,
+                                    write_completion: WriteCompletion::TailDrained,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .unwrap_or_else(|err| panic!("{case}: seed version should commit on every drive: {err}"));
+                        }
+                        wait_for_tmp_workspace_to_drain(&dirs, "seed PUT must leave no staging").await;
+                        let before = per_drive_object_state(&dirs, bucket, object).await;
+
+                        let tasks = rename_fanout_barrier::observe_tasks(object);
+                        let _fault = rename_fault_injection::fail_rename_on(object, &[0, 1]);
+                        let err = set
+                            .put_object(
+                                bucket,
+                                object,
+                                &mut PutObjReader::from_vec(vec![b'1'; size]),
+                                &ObjectOptions {
+                                    versioned,
+                                    write_completion,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .expect_err("two renamed drives cannot satisfy write quorum three");
+                        assert!(
+                            matches!(err, Error::ErasureWriteQuorum | Error::InsufficientWriteQuorum(_, _)),
+                            "{case}: original quorum error expected: {err}"
+                        );
+                        assert_eq!(tasks.running(), 0, "{case}: rename and undo tasks must be reaped before return");
+                        // An incomplete rollback retains staging for recovery, so a
+                        // drained workspace shows the rollback completed.
+                        wait_for_tmp_workspace_to_drain(&dirs, "a completed rollback must release staging").await;
+                        let after = per_drive_object_state(&dirs, bucket, object).await;
+                        assert_eq!(after, before, "{case}: no drive may keep the failed PUT's version or data");
+                    }
+                }
+            }
+        })
+        .await;
     }
 
     #[tokio::test]

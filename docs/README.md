@@ -9,6 +9,7 @@ collection:
 ## Operations
 
 - [Retained MRF responsibilities](operations/mrf-responsibilities.md) — unknown bucket identities, bounded probes, and unreadable checkpoint recovery.
+- [Read-only BTF declaration inspection](operations/btf-prototype-inspection.md) — bounded prototypes and scalar member layouts, explicit void handling, and independent native references.
 
 - [Internode HTTP streaming transport](operations/internode-http-transport.md) — protocol selection, pooled connection isolation, and distributed read validation.
 

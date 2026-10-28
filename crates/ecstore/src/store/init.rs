@@ -5090,8 +5090,8 @@ mod tests {
             assert!(Arc::ptr_eq(disk, expected), "endpoint monitor must not replace an offline test handle");
             assert_eq!(disk.runtime_state(), crate::disk::health_state::RuntimeDriveHealthState::Offline);
             assert!(
-                disk.is_online().await,
-                "the valid disk identity must prevent endpoint renewal while the IO health gate remains offline"
+                !disk.is_online().await,
+                "the explicit drive fault must survive renewal despite a valid disk identity"
             );
         }
         OfflineTestDisks { disks }
@@ -12018,7 +12018,9 @@ mod tests {
                     Ok::<(), Error>(())
                 }
             })
-            .buffer_unordered(32)
+            // Pagination, not write throughput, is the oracle. Drain each pair of
+            // durable receipts before preparing the next to bound fixture IO.
+            .buffer_unordered(1)
             .try_collect::<Vec<_>>()
             .await
             .expect("more than one receipt page should persist");

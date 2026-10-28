@@ -73,6 +73,10 @@ pub fn check_path_length(path_name: &str) -> Result<()> {
         return Err(DiskError::FileAccessDenied);
     }
 
+    if path_name.len() <= 255 {
+        return Ok(());
+    }
+
     // Check each path segment length is > 255 on all Unix
     // platforms, look for this value as NAME_MAX in
     // /usr/include/linux/limits.h
@@ -329,6 +333,8 @@ pub(crate) mod prepared_publication_test_hooks {
         PreparedRename,
         Rename,
         Remove,
+        MetadataReadAfterOpen,
+        MetadataReadAfterRead,
         #[cfg(test)]
         Rollback,
         #[cfg(test)]
@@ -453,6 +459,8 @@ pub enum LocalPublicationStage {
     PreparedRename,
     Rename,
     Remove,
+    MetadataReadAfterOpen,
+    MetadataReadAfterRead,
 }
 
 #[cfg(all(feature = "test-util", not(windows)))]
@@ -465,6 +473,8 @@ impl LocalPublicationPause {
             LocalPublicationStage::PreparedRename => prepared_publication_test_hooks::Stage::PreparedRename,
             LocalPublicationStage::Rename => prepared_publication_test_hooks::Stage::Rename,
             LocalPublicationStage::Remove => prepared_publication_test_hooks::Stage::Remove,
+            LocalPublicationStage::MetadataReadAfterOpen => prepared_publication_test_hooks::Stage::MetadataReadAfterOpen,
+            LocalPublicationStage::MetadataReadAfterRead => prepared_publication_test_hooks::Stage::MetadataReadAfterRead,
         };
         let (entered_tx, entered) = oneshot::channel();
         let (release, release_rx) = std::sync::mpsc::channel::<()>();
@@ -3043,17 +3053,6 @@ pub(crate) async fn rename_all_with_lease(
 
 /// A source admission must run before destination preparation can mkdir and
 /// again before the consuming rename, inside the actual owned callback.
-pub(crate) async fn rename_all_with_precondition(
-    source: &Path,
-    destination: &Path,
-    base: &Path,
-    publication_root: &PublicationRoot,
-    owner: Option<Arc<dyn Send + Sync>>,
-    precondition: Option<Arc<dyn Fn() -> io::Result<()> + Send + Sync>>,
-) -> Result<()> {
-    rename_all_with_precondition_and_parent_sync(source, destination, base, publication_root, owner, precondition, false).await
-}
-
 pub(crate) async fn rename_all_with_precondition_and_parent_sync(
     source: &Path,
     destination: &Path,
@@ -3071,43 +3070,61 @@ pub(crate) async fn rename_all_with_precondition_and_parent_sync(
     let base = base.to_path_buf();
     let root = publication_root.clone();
     let lease = acquire_namespace_mutation_lease_with_owner(&destination, owner).await;
-    run_blocking_namespace_operation(lease, move || {
-        if let Some(check) = precondition.as_ref() {
-            check()?;
-        }
-        let preparation = prepare_rename_with_retry(&source, &destination, &base, &root)?;
-        #[cfg(all(test, not(windows)))]
-        prepared_publication_test_hooks::run_rename_destination(&source, &destination);
-        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
-        {
-            prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &source);
-            prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &destination);
-        }
-        if let Some(check) = precondition.as_ref() {
-            check()?;
-        }
-        rename_prepared(&source, &destination, &preparation)?;
-        if sync_parent {
-            let parent = destination
-                .parent()
-                .ok_or_else(|| io::Error::other("source metadata parent is missing"))?;
-            #[cfg(unix)]
-            {
-                let pinned = preparation
-                    .parent_guard
-                    .as_ref()
-                    .and_then(|guard| guard.last())
-                    .ok_or_else(|| io::Error::other("source metadata parent was not pinned"))?;
-                let opened = std::fs::File::from(pinned.try_clone()?);
-                fsync_directory_handle_std(parent, Some(&opened))?;
-            }
-            #[cfg(not(unix))]
-            fsync_dir_std(parent)?;
-        }
-        Ok(())
+    run_blocking_namespace_operation_with_sync(lease, sync_parent, move || {
+        rename_all_with_precondition_and_parent_sync_std(
+            &source,
+            &destination,
+            &base,
+            &root,
+            precondition.as_deref(),
+            sync_parent,
+        )
     })
     .await
     .map_err(|error| to_file_error(error).into())
+}
+
+pub(crate) fn rename_all_with_precondition_and_parent_sync_std(
+    source: &Path,
+    destination: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+    precondition: Option<&(dyn Fn() -> io::Result<()> + Send + Sync)>,
+    sync_parent: bool,
+) -> io::Result<()> {
+    if let Some(check) = precondition {
+        check()?;
+    }
+    let preparation = prepare_rename_with_retry(source, destination, base, publication_root)?;
+    #[cfg(all(test, not(windows)))]
+    prepared_publication_test_hooks::run_rename_destination(source, destination);
+    #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+    {
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, source);
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, destination);
+        if let Some(check) = precondition {
+            check()?;
+        }
+    }
+    rename_prepared(source, destination, &preparation)?;
+    if sync_parent {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| io::Error::other("source metadata parent is missing"))?;
+        #[cfg(unix)]
+        {
+            let pinned = preparation
+                .parent_guard
+                .as_ref()
+                .and_then(|guard| guard.last())
+                .ok_or_else(|| io::Error::other("source metadata parent was not pinned"))?;
+            let opened = std::fs::File::from(pinned.try_clone()?);
+            fsync_directory_handle_std(parent, Some(&opened))?;
+        }
+        #[cfg(not(unix))]
+        fsync_dir_std(parent)?;
+    }
+    Ok(())
 }
 
 /// Publish a conditional repair and sync its directory in one owned executor.
@@ -3182,26 +3199,32 @@ pub(crate) struct DurableFileReceipt {
 
 #[cfg(unix)]
 fn open_anchored_metadata(path: &Path, publication_root: &PublicationRoot) -> io::Result<std::fs::File> {
-    use rustix::fs::{Mode, OFlags, openat};
     #[cfg(target_os = "linux")]
-    let logical_path = publication_root.path().join(publication_root.relative_path(path)?);
-    #[cfg(target_os = "linux")]
-    let path = logical_path.as_path();
-    let parents = open_existing_directory_below_base_std(
-        path.parent().ok_or_else(|| io::Error::other("metadata has no parent"))?,
-        publication_root.path(),
-        publication_root,
-    )?;
-    let directory = parents
-        .last()
-        .ok_or_else(|| io::Error::other("missing metadata directory guard"))?;
-    Ok(openat(
-        directory,
-        path.file_name().ok_or_else(|| io::Error::other("metadata has no name"))?,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?
-    .into())
+    {
+        let parent = path.parent().ok_or_else(|| io::Error::other("metadata has no parent"))?;
+        existing_base_directory_suffix(parent, publication_root.path())
+            .or_else(|_| existing_base_directory_suffix(parent, publication_root.io_path()))?;
+        publication_root.open_readonly(path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use rustix::fs::{Mode, OFlags, openat};
+        let parents = open_existing_directory_below_base_std(
+            path.parent().ok_or_else(|| io::Error::other("metadata has no parent"))?,
+            publication_root.path(),
+            publication_root,
+        )?;
+        let directory = parents
+            .last()
+            .ok_or_else(|| io::Error::other("missing metadata directory guard"))?;
+        Ok(openat(
+            directory,
+            path.file_name().ok_or_else(|| io::Error::other("metadata has no name"))?,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into())
+    }
 }
 
 #[cfg(unix)]
@@ -3367,6 +3390,29 @@ fn open_existing_directory_below_base_std(
 ) -> io::Result<ExistingBaseDirectoryGuard> {
     use rustix::fs::{Mode, OFlags, openat};
     let relative = existing_base_directory_suffix(directory, base)?;
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{ResolveFlags, openat2};
+        use std::os::fd::AsFd;
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let owned_base;
+        let base_fd = if base == publication_root.io_path.as_path() || base == publication_root.path.as_path() {
+            publication_root.directory.as_fd()
+        } else {
+            owned_base = std::os::fd::OwnedFd::from(publication_root.open_directory(base)?);
+            owned_base.as_fd()
+        };
+        let target = if relative.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            relative
+        };
+        match openat2(base_fd, target, flags, Mode::empty(), ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS) {
+            Ok(leaf) => return Ok(vec![leaf]),
+            Err(rustix::io::Errno::NOSYS) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
     #[cfg(target_os = "linux")]
     let base = publication_root.open_directory(base)?.into();
     #[cfg(not(target_os = "linux"))]
@@ -3654,8 +3700,10 @@ pub(crate) fn read_destination_file_with_commit_guard(
         };
         match open_linux_relative(&parent.file, Path::new(name), OFlags::RDONLY, Mode::empty()) {
             Ok(mut file) => {
-                let mut data = Vec::new();
-                std::io::Read::read_to_end(&mut file, &mut data)?;
+                let len = file.metadata()?.len();
+                let cap = usize::try_from(len).map_or(0, |len| len.saturating_add(1));
+                let mut data = Vec::with_capacity(cap);
+                std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, len), &mut data)?;
                 Ok(Some(data))
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -4921,12 +4969,16 @@ impl LinuxCommitDirectories {
         use std::os::unix::fs::MetadataExt;
         // A pinned directory may have been unlinked or replaced. Do not report a
         // successful publication into a detached object tree.
-        for (path, directory) in [
-            (&self.source_path, &self.source),
-            (&self.destination_path, self.prepare_destination()?),
-        ] {
-            let current = self.root.open_directory(path)?.metadata()?;
-            if (current.dev(), current.ino()) != (directory.device, directory.inode) {
+        let current = self.root.open_directory(&self.source_path)?.metadata()?;
+        if (current.dev(), current.ino()) != (self.source.device, self.source.inode) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "commit directory identity changed"));
+        }
+        let destination = self.prepare_destination()?;
+        if self.source_path != self.destination_path
+            || (self.source.device, self.source.inode) != (destination.device, destination.inode)
+        {
+            let current = self.root.open_directory(&self.destination_path)?.metadata()?;
+            if (current.dev(), current.ino()) != (destination.device, destination.inode) {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "commit directory identity changed"));
             }
         }
@@ -5219,12 +5271,20 @@ pub(crate) fn prepare_rename_commit_guard(
         existing_base_directory_suffix(destination_parent, destination_base)?;
         let source = LinuxCommitDirectory::new(publication_root.open_directory(source_parent)?)?;
         let destination = std::sync::OnceLock::new();
-        match publication_root.open_directory(destination_parent) {
-            Ok(directory) => {
-                let _ = destination.set(LinuxCommitDirectory::new(directory)?);
+        if source_parent == destination_parent {
+            let _ = destination.set(LinuxCommitDirectory {
+                file: Arc::clone(&source.file),
+                device: source.device,
+                inode: source.inode,
+            });
+        } else {
+            match publication_root.open_directory(destination_parent) {
+                Ok(directory) => {
+                    let _ = destination.set(LinuxCommitDirectory::new(directory)?);
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
         }
         Ok(RenameCommitGuard {
             directories: Arc::new(LinuxCommitDirectories {
@@ -6084,12 +6144,20 @@ fn existing_base_directory_suffix<'a>(dir_path: &'a Path, base_dir: &Path) -> io
 
 /// Missing state never downgrades surviving native control records to legacy.
 /// Inspect only this pinned upload root; parts and proof trees are not traversed.
+#[cfg(test)]
 pub(crate) fn multipart_source_has_native_controls(source: &Path, base: &Path, root: &PublicationRoot) -> io::Result<bool> {
-    let _pin = match pin_multipart_source_directory(source, base, root) {
+    let pin = match pin_multipart_source_directory(source, base, root) {
         Ok(pin) => pin,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
+    multipart_source_has_native_controls_in_pinned(source, &pin)
+}
+
+pub(crate) fn multipart_source_has_native_controls_in_pinned(
+    source: &Path,
+    _pin: &ExistingBaseDirectoryGuard,
+) -> io::Result<bool> {
     let mut entries = std::fs::read_dir(source)?;
     for _ in 0..READ_DIR_PROBE_RAW_LIMIT {
         let Some(entry) = entries.next() else {
@@ -6212,6 +6280,7 @@ pub(crate) fn replace_multipart_source_metadata(
     publication_root: &PublicationRoot,
 ) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| io::Error::other("MPU record has no parent"))?;
+    #[cfg(not(target_os = "linux"))]
     let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
     let guard = prepare_rename_commit_guard(parent, parent, base, publication_root)?;
     let staged = parent.join(format!(".mpu-record-{}", uuid::Uuid::new_v4()));
@@ -6393,15 +6462,10 @@ pub(crate) fn sync_multipart_owned_record_parents(
         if !directory.starts_with(source) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "native record barrier escaped source"));
         }
-        let pinned = pin_multipart_source_directory(directory, base, publication_root)?;
+        let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;
         #[cfg(unix)]
         {
-            let opened = std::fs::File::from(
-                pinned
-                    .last()
-                    .ok_or_else(|| io::Error::other("empty native directory guard"))?
-                    .try_clone()?,
-            );
+            let opened = std::fs::File::from(pinned.pop().ok_or_else(|| io::Error::other("empty native directory guard"))?);
             fsync_directory_handle_std(directory, Some(&opened))?;
         }
         #[cfg(not(unix))]
@@ -6432,6 +6496,7 @@ pub(crate) fn install_multipart_prepared_head(
     if original_path.parent() != Some(parent) || original_path == canonical_head {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "MPU proxy must be a private sibling"));
     }
+    #[cfg(not(target_os = "linux"))]
     let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
     let guard = prepare_rename_commit_guard(parent, parent, base, publication_root)?;
     rename_prepared_source_std(&prepared, &original_path, canonical_head, base, publication_root, &guard)?;
@@ -6513,6 +6578,16 @@ pub(crate) fn read_multipart_source_metadata(
     read_multipart_metadata(path, base, publication_root, Some(16 * 1024 * 1024))
 }
 
+pub(crate) fn read_multipart_source_metadata_in_pinned(
+    pinned: &ExistingBaseDirectoryGuard,
+    parent: &Path,
+    name: &std::ffi::OsStr,
+    base: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<Vec<u8>> {
+    read_multipart_metadata_in_pinned(pinned, parent, name, base, publication_root, Some(16 * 1024 * 1024))
+}
+
 /// Target FI histories have no source-control size limit. Keep the same
 /// pinned-parent and no-follow checks when inspecting every referenced DD.
 pub(crate) fn read_multipart_reclaim_target_metadata(
@@ -6523,20 +6598,106 @@ pub(crate) fn read_multipart_reclaim_target_metadata(
     read_multipart_metadata(path, base, publication_root, None)
 }
 
-fn read_multipart_metadata_bytes(mut reader: impl std::io::Read, maximum: Option<u64>) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    match maximum {
-        Some(maximum) => {
+fn read_multipart_metadata_bytes(
+    mut reader: impl std::io::Read,
+    size_hint: Option<u64>,
+    maximum: Option<u64>,
+) -> io::Result<Vec<u8>> {
+    if let (Some(len), Some(maximum)) = (size_hint, maximum)
+        && len > maximum
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata exceeds its size limit"));
+    }
+    let cap = size_hint
+        .and_then(|len| usize::try_from(len).ok())
+        .map_or(0, |len| len.saturating_add(1));
+    let mut bytes = Vec::with_capacity(cap);
+    match (size_hint, maximum) {
+        (Some(len), _) => {
+            std::io::Read::read_to_end(&mut reader.take(len), &mut bytes)?;
+        }
+        (None, Some(maximum)) => {
             std::io::Read::read_to_end(&mut reader.take(maximum.saturating_add(1)), &mut bytes)?;
             if bytes.len() as u64 > maximum {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata exceeds its size limit"));
             }
         }
-        None => {
+        (None, None) => {
             std::io::Read::read_to_end(&mut reader, &mut bytes)?;
         }
     }
     Ok(bytes)
+}
+
+fn read_multipart_metadata_in_pinned(
+    pinned: &ExistingBaseDirectoryGuard,
+    parent: &Path,
+    name: &std::ffi::OsStr,
+    base: &Path,
+    publication_root: &PublicationRoot,
+    maximum: Option<u64>,
+) -> io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, openat};
+        let _ = (parent, base, publication_root);
+        let directory = pinned
+            .last()
+            .ok_or_else(|| io::Error::other("missing multipart source directory"))?;
+        let mut file = std::fs::File::from(openat(
+            directory,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata is not a regular file"));
+        }
+        read_multipart_metadata_bytes(&mut file, Some(metadata.len()), maximum)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pinned;
+        read_multipart_metadata(&parent.join(name), base, publication_root, maximum)
+    }
+}
+
+pub(crate) fn read_and_sync_multipart_target_metadata(
+    directory: &Path,
+    name: &std::ffi::OsStr,
+    base: &Path,
+    publication_root: &PublicationRoot,
+    validate: impl FnOnce(&[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, openat};
+        let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;
+        let dir_fd = pinned
+            .last()
+            .ok_or_else(|| io::Error::other("missing multipart target directory"))?;
+        let mut file =
+            std::fs::File::from(openat(dir_fd, name, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?);
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata is not a regular file"));
+        }
+        let bytes = read_multipart_metadata_bytes(&mut file, Some(metadata.len()), None)?;
+        validate(&bytes)?;
+        file.sync_data()?;
+        let opened = std::fs::File::from(pinned.pop().ok_or_else(|| io::Error::other("empty target directory guard"))?);
+        fsync_directory_handle_std(directory, Some(&opened))
+    }
+    #[cfg(not(unix))]
+    {
+        let _pinned = pin_multipart_source_directory(directory, base, publication_root)?;
+        let file = directory.join(name);
+        let bytes = read_multipart_metadata(&file, base, publication_root, None)?;
+        validate(&bytes)?;
+        sync_file(&file)?;
+        fsync_dir_std(directory)
+    }
 }
 
 fn read_multipart_metadata(
@@ -6545,29 +6706,35 @@ fn read_multipart_metadata(
     publication_root: &PublicationRoot,
     maximum: Option<u64>,
 ) -> io::Result<Vec<u8>> {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
-        use rustix::fs::{Mode, OFlags, openat};
         let parent = path
             .parent()
             .ok_or_else(|| io::Error::other("multipart metadata has no parent"))?;
-        let guards = open_existing_directory_below_base_std(parent, base, publication_root)?;
-        let directory = guards
-            .last()
-            .ok_or_else(|| io::Error::other("missing multipart source directory"))?;
         let name = path
             .file_name()
             .ok_or_else(|| io::Error::other("multipart metadata has no name"))?;
-        let mut file = std::fs::File::from(openat(
-            directory,
-            name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?);
-        if !file.metadata()?.is_file() {
+        if name.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "multipart metadata has no name"));
+        }
+        existing_base_directory_suffix(parent, base)?;
+        let mut file = publication_root.open_readonly(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata is not a regular file"));
         }
-        read_multipart_metadata_bytes(&mut file, maximum)
+        read_multipart_metadata_bytes(&mut file, Some(metadata.len()), maximum)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("multipart metadata has no parent"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| io::Error::other("multipart metadata has no name"))?;
+        let guards = open_existing_directory_below_base_std(parent, base, publication_root)?;
+        read_multipart_metadata_in_pinned(&guards, parent, name, base, publication_root, maximum)
     }
     #[cfg(windows)]
     {
@@ -6598,7 +6765,7 @@ fn read_multipart_metadata(
         if windows_file_attribute_tag(&file)?.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata is not a regular file"));
         }
-        read_multipart_metadata_bytes(file.as_file_mut(), maximum)
+        read_multipart_metadata_bytes(file.as_file_mut(), None, maximum)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -7234,33 +7401,16 @@ pub async fn reliable_mkdir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Pat
 /// This function will not create directories under base_dir.
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> io::Result<()> {
-    if !base_dir.as_ref().to_string_lossy().is_empty() && base_dir.as_ref().starts_with(dir_path.as_ref()) {
+    let dir_path = dir_path.as_ref();
+    let base_dir = base_dir.as_ref();
+    if !base_dir.as_os_str().is_empty() && base_dir.starts_with(dir_path) {
         return Ok(());
     }
 
-    if let Err(e) = super::fs::mkdir(dir_path.as_ref()).await {
-        if e.kind() == io::ErrorKind::AlreadyExists {
-            return Ok(());
-        }
-
-        if e.kind() != io::ErrorKind::NotFound {
-            return Err(e);
-        }
-
-        if let Some(parent) = dir_path.as_ref().parent() {
-            // Fall back to creating the missing parent chain only when the direct mkdir proves it is required.
-            if let Err(parent_err) = super::fs::make_dir_all(parent).await
-                && parent_err.kind() != io::ErrorKind::AlreadyExists
-            {
-                return Err(parent_err);
-            }
-        }
-
-        if let Err(retry_err) = super::fs::mkdir(dir_path.as_ref()).await
-            && retry_err.kind() != io::ErrorKind::AlreadyExists
-        {
-            return Err(retry_err);
-        }
+    if let Err(err) = super::fs::make_dir_all(dir_path).await
+        && err.kind() != io::ErrorKind::AlreadyExists
+    {
+        return Err(err);
     }
 
     Ok(())

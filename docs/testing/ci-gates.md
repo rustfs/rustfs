@@ -99,7 +99,6 @@ Scheduled lanes never block a PR. Their workflow-local gate fails the run, sched
 | `fuzz.yml` (nightly) | `nightly-fuzz-corpus` per target | gate; corpus and crash artifacts | yes | `MAX_TOTAL_TIME=<seconds> ./scripts/fuzz/run.sh` |
 | `minio-interop.yml` (nightly) | `minio-interop` | EC + SSE read-parity gate | yes, with `never_ran_grace_until` | pinned Docker fixture steps in the workflow |
 | `on-demand-migration-interop.yml` (nightly) | `minio-source`, `cloud-source` (`aws`, `r2`, `gcs`) | report-only provider interop; one JSON report per provider naming cases, timings and source request counts, plus JUnit and MinIO logs. A cloud provider whose `ODM_INTEROP_*` secrets are absent is skipped with a summary note, not failed | no | start the pinned MinIO container as in the job, export the `RUSTFS_ODM_INTEROP_*` variables, run `python3 scripts/e2e_binary.py build --bins`, then `python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-odm-interop -p e2e_test` |
-| `performance-ab.yml` (nightly) | `warp-ab` | regression-budget gate; A/B summaries and server logs | yes | `bash scripts/run_hotpath_warp_abba.sh --help` |
 | `nightly-gnu.yml` (nightly) | `build`, `kms-vault-lane`, `kms-vault-ha-failover` | build, live Vault, and HA failover gates | yes | commands and pinned Vault images in the workflow |
 | `audit.yml` (nightly) | `cargo-deny`, `workflow-pin-report` | dependency and workflow-pin gates | yes | `cargo deny check`; `scripts/security/check_workflow_pins.sh` |
 | `mint.yml` (weekly) | `mint` | report-only by design; per-suite PASS/FAIL/NA and raw `log.json` | yes | pinned Docker sequence in the workflow |
@@ -111,7 +110,7 @@ Scheduled lanes never block a PR. Their workflow-local gate fails the run, sched
 | `gateway-integration-sync.yml` (weekdays) | `sync` | merges `main` into `gateway/integration` as a `--no-ff` merge commit; a conflicting merge is aborted and opens a `sync/<source>-<date>` pull request listing the conflicting files, which keeps the run green; a rejected push or missing pull request fails it | no | dispatch, optionally with `source_ref` |
 | `scheduled-validation-freshness.yml` (nightly) | `check-freshness` | fails on missing or stale attempts or completed successes | n/a | dispatch |
 
-Manual `workflow_dispatch` runs are debugging evidence and do not open scheduled-failure issues. A manual performance run may explicitly allow a known regression; that override is not a passing baseline.
+Manual `workflow_dispatch` runs are debugging evidence and do not open scheduled-failure issues.
 
 ## Packaged functional acceptance
 

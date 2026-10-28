@@ -46,7 +46,9 @@ use uuid::Uuid;
 
 mod checkpoint_coverage_identity;
 mod collector_lifecycle;
+mod expiry_lock;
 mod listing_window_scope;
+mod node_admission;
 mod partial_bucket_carry;
 mod per_bucket_certification;
 mod scoped_entry_fallback;
@@ -2210,6 +2212,147 @@ fn test_bucket_incarnations(buckets: &[&str]) -> HashMap<String, Uuid> {
             )
         })
         .collect()
+}
+
+#[derive(Clone)]
+struct SetCacheLogWriter(Arc<StdMutex<Vec<u8>>>);
+
+impl std::io::Write for SetCacheLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("set cache log buffer").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+async fn capture_set_cache_logs<F: std::future::Future>(future: F) -> (F::Output, Vec<serde_json::Value>) {
+    use tracing::instrument::WithSubscriber as _;
+
+    let buffer = Arc::new(StdMutex::new(Vec::new()));
+    let writer = Arc::clone(&buffer);
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || SetCacheLogWriter(Arc::clone(&writer)))
+        .finish();
+    // Avoid a cached Never interest when other tests use an unsubscribed dispatcher.
+    let _interest_guard = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let result = future.with_subscriber(subscriber).await;
+    let logs = buffer.lock().expect("set cache log buffer");
+    let events = std::str::from_utf8(&logs)
+        .expect("set cache logs should be UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("set cache log should be JSON"))
+        .collect();
+    (result, events)
+}
+
+fn set_cache_event<'a>(events: &'a [serde_json::Value], state: &str) -> &'a serde_json::Value {
+    let matching = events
+        .iter()
+        .filter(|event| event["fields"]["state"] == state)
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "expected one {state} event: {events:?}");
+    &matching[0]["fields"]
+}
+
+fn assert_set_cache_context(fields: &serde_json::Value, source: Option<(usize, usize)>) {
+    assert_eq!(fields["store_pool"], 0);
+    assert_eq!(fields["store_set"], 0);
+    assert_eq!(fields["snapshot_cycle"], 7);
+    assert_eq!(fields["snapshot_leader_epoch"], 11);
+    if let Some((pool, set)) = source {
+        assert_eq!(fields["snapshot_source_pool"], pool);
+        assert_eq!(fields["snapshot_source_set"], set);
+    } else {
+        assert!(fields.get("snapshot_source_pool").is_none());
+        assert!(fields.get("snapshot_source_set").is_none());
+    }
+}
+
+async fn set_cache_log_fixture() -> (tempfile::TempDir, Arc<ECStore>, DataUsageCache, u64) {
+    let (temp_dir, store) = setup_two_pool_scanner_store().await;
+    let set = Arc::clone(&store.pools[0].disk_set[0]);
+    let epoch = scanner_publication_epoch(Arc::clone(&set)).await.expect("idle set admission");
+    let mut cache = complete_set_usage_cache(&[("photos", 5)], DataUsageScanPlanDigest([1; 32]));
+    cache.info.source = Some(DataUsageCacheSource::new(0, 0));
+    cache.info.scan_execution_digest = Some(DataUsageScanPlanDigest([2; 32]));
+    cache.save(set, DATA_USAGE_CACHE_NAME).await.expect("seed set cache");
+    (temp_dir, store, cache, epoch)
+}
+
+#[tokio::test]
+#[serial]
+async fn set_cache_missing_metadata_logs_receiver_and_snapshot() {
+    let (_temp_dir, store, cache, epoch) = set_cache_log_fixture().await;
+    let set = Arc::clone(&store.pools[0].disk_set[0]);
+    let cycle_floor = AtomicU64::new(cache.info.next_cycle);
+    let (tx, _rx) = mpsc::channel(1);
+
+    for missing in ["source", "coverage_digest", "execution_digest", "plan_digest"] {
+        let mut candidate = cache.clone();
+        match missing {
+            "source" => candidate.info.source = None,
+            "coverage_digest" => candidate.info.scan_coverage_digest = None,
+            "execution_digest" => {
+                candidate.info.source = Some(DataUsageCacheSource::new(1, 2));
+                candidate.info.scan_execution_digest = None;
+            }
+            "plan_digest" => candidate.info.scan_plan_digest = None,
+            _ => unreachable!("fixture only uses the four checked metadata fields"),
+        }
+        let source = candidate.info.source.map(|source| (source.pool_index, source.set_index));
+        let (result, events) = capture_set_cache_logs(persist_and_publish_cache_snapshot(
+            Arc::clone(&set),
+            &tx,
+            candidate,
+            None,
+            &cycle_floor,
+            epoch,
+        ))
+        .await;
+        assert!(result.is_none(), "missing {missing} should retain the existing rejection");
+        let fields = set_cache_event(&events, "snapshot_metadata_missing");
+        assert_eq!(fields["reason"], missing);
+        assert_set_cache_context(fields, source);
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn set_cache_revision_rejection_logs_receiver_and_snapshot() {
+    let (_temp_dir, store, mut cache, epoch) = set_cache_log_fixture().await;
+    let set = Arc::clone(&store.pools[0].disk_set[0]);
+    cache.info.scan_execution_digest = Some(DataUsageScanPlanDigest([3; 32]));
+    let cycle_floor = AtomicU64::new(cache.info.next_cycle);
+    let (tx, mut rx) = mpsc::channel(1);
+    let (result, events) =
+        capture_set_cache_logs(persist_and_publish_cache_snapshot(set, &tx, cache, None, &cycle_floor, epoch)).await;
+    assert!(result.is_none());
+    assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    assert_set_cache_context(set_cache_event(&events, "scan_baseline_revision_changed"), Some((0, 0)));
+}
+
+#[tokio::test]
+#[serial]
+async fn set_cache_send_failure_logs_receiver_and_snapshot_without_changing_return() {
+    let (_temp_dir, store, cache, epoch) = set_cache_log_fixture().await;
+    let set = Arc::clone(&store.pools[0].disk_set[0]);
+    let cycle_floor = AtomicU64::new(cache.info.next_cycle);
+    let (tx, rx) = mpsc::channel(1);
+    drop(rx);
+    let (result, events) =
+        capture_set_cache_logs(persist_and_publish_cache_snapshot(set, &tx, cache, None, &cycle_floor, epoch)).await;
+    assert!(
+        result.is_some(),
+        "the existing return value must not be treated as receiver acknowledgement"
+    );
+    assert_set_cache_context(set_cache_event(&events, "publish_failed"), Some((0, 0)));
 }
 
 #[tokio::test]

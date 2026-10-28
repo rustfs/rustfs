@@ -24,6 +24,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Global counter for guard IDs to prevent double-release
 static GUARD_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+const EVENT_NAMESPACE_LOCK_RELEASE: &str = "namespace_lock_release";
+const LOG_COMPONENT_LOCK: &str = "lock";
+const LOG_SUBSYSTEM_NAMESPACE: &str = "namespace";
 
 /// RAII guard for fast object locks
 ///
@@ -109,6 +112,7 @@ impl FastLockGuard {
                 record_lock_held_release(self.mode);
                 // Unregister the guard after successful release
                 shard.unregister_guard(self.guard_id);
+                self.record_physical_release();
             }
             success
         } else {
@@ -116,6 +120,22 @@ impl FastLockGuard {
             self.released = true;
             false
         }
+    }
+
+    fn record_physical_release(&self) {
+        tracing::trace!(
+            target: "rustfs_lock::namespace_owner",
+            event = EVENT_NAMESPACE_LOCK_RELEASE,
+            component = LOG_COMPONENT_LOCK,
+            subsystem = LOG_SUBSYSTEM_NAMESPACE,
+            state = "released",
+            peer_kind = "local",
+            process_id = std::process::id(),
+            physical_guard_id = self.guard_id,
+            resource = %self.key,
+            owner = %self.owner,
+            "Namespace physical guard release completed"
+        );
     }
 
     /// Check if the lock has been released
@@ -168,6 +188,9 @@ impl Drop for FastLockGuard {
                 }
                 // Always unregister the guard to prevent leaks, regardless of release success
                 shard.unregister_guard(self.guard_id);
+                if success {
+                    self.record_physical_release();
+                }
             } else {
                 // If guard was already released or disabled, just unregister it
                 shard.unregister_guard(self.guard_id);

@@ -18,28 +18,6 @@ use super::*;
 const PENDING_HEAL_RETRY_BASE_SECS: u64 = 15 * 60;
 const PENDING_HEAL_RETRY_CAP_SECS: u64 = 6 * 60 * 60;
 
-pub(super) struct PendingHealSyncBatch<'a> {
-    pub(super) scanner: &'a mut FolderScanner,
-}
-
-impl<'a> PendingHealSyncBatch<'a> {
-    pub(super) fn new(scanner: &'a mut FolderScanner) -> Self {
-        scanner.pending_heal_sync_deferred = true;
-        scanner.pending_heal_batch_dirty = false;
-        Self { scanner }
-    }
-}
-
-impl Drop for PendingHealSyncBatch<'_> {
-    fn drop(&mut self) {
-        self.scanner.pending_heal_sync_deferred = false;
-        if self.scanner.pending_heal_batch_dirty {
-            self.scanner.pending_heal_batch_dirty = false;
-            self.scanner.sync_pending_heals();
-        }
-    }
-}
-
 pub(super) fn record_pending_heal_attempt(entry: &mut PendingScannerHeal, now: u64) {
     entry.last_attempt = now;
     entry.attempts = entry.attempts.saturating_add(1);
@@ -52,19 +30,6 @@ pub(super) fn observe_pending_heal_admission(entry: &mut PendingScannerHeal, res
 }
 
 impl FolderScanner {
-    pub(super) fn sync_pending_heals(&mut self) {
-        self.pending_heals_changed = true;
-        if self.pending_heal_sync_deferred {
-            self.pending_heal_batch_dirty = true;
-            return;
-        }
-        self.update_cache.info.pending_heals = self.new_cache.info.pending_heals.clone();
-        #[cfg(test)]
-        {
-            self.pending_heal_sync_count += 1;
-        }
-    }
-
     pub(super) fn clear_pending_scanner_heal(
         &mut self,
         kind: PendingScannerHealKind,
@@ -78,7 +43,7 @@ impl FolderScanner {
             .pending_heals
             .retain(|entry| !pending_scanner_heal_matches(entry, kind, bucket, object, version_id));
         if self.new_cache.info.pending_heals.len() != before {
-            self.sync_pending_heals();
+            self.pending_heals_changed = true;
         }
     }
 
@@ -100,7 +65,7 @@ impl FolderScanner {
             .find(|entry| pending_scanner_heal_matches(entry, kind, bucket, object, version_id))
         {
             observe_pending_heal_admission(entry, result);
-            self.sync_pending_heals();
+            self.pending_heals_changed = true;
             return;
         }
 
@@ -116,9 +81,8 @@ impl FolderScanner {
             last_admission_result: result.result_label().to_string(),
             last_admission_reason: result.reason_label().to_string(),
         });
-        if self.prune_pending_scanner_heal_capacity() == 0 {
-            self.sync_pending_heals();
-        }
+        self.pending_heals_changed = true;
+        self.prune_pending_scanner_heal_capacity();
     }
 
     /// Preserve the discovery reason when a candidate could not be admitted
@@ -140,7 +104,7 @@ impl FolderScanner {
             .find(|entry| pending_scanner_heal_matches(entry, kind, bucket, object, version_id))
         {
             entry.last_admission_reason = reason.to_string();
-            self.sync_pending_heals();
+            self.pending_heals_changed = true;
         }
     }
 
@@ -169,22 +133,22 @@ impl FolderScanner {
                 state = "pending_heal_expired",
                 "Scanner pending heal ledger expired old entries"
             );
-            self.sync_pending_heals();
+            self.pending_heals_changed = true;
         }
 
         self.prune_pending_scanner_heal_capacity();
     }
 
-    fn prune_pending_scanner_heal_capacity(&mut self) -> usize {
+    fn prune_pending_scanner_heal_capacity(&mut self) {
         let len = self.new_cache.info.pending_heals.len();
         if len <= MAX_PENDING_SCANNER_HEALS_PER_BUCKET {
-            return 0;
+            return;
         }
 
         sort_pending_scanner_heals_for_retry(&mut self.new_cache.info.pending_heals);
         let remove_count = len.saturating_sub(MAX_PENDING_SCANNER_HEALS_PER_BUCKET);
         self.new_cache.info.pending_heals.drain(..remove_count);
-        self.sync_pending_heals();
+        self.pending_heals_changed = true;
         counter!(
             METRIC_SCANNER_PENDING_HEAL_PRUNE_TOTAL,
             "bucket" => self.new_cache.info.name.clone()
@@ -201,7 +165,6 @@ impl FolderScanner {
             state = "pending_heal_pruned",
             "Scanner pending heal ledger pruned oldest entries"
         );
-        remove_count
     }
 
     pub(super) fn update_pending_scanner_heal_after_admission(
@@ -233,20 +196,18 @@ impl FolderScanner {
                     .find(|entry| pending_scanner_heal_matches(entry, kind, bucket, object, version_id))
                 {
                     observe_pending_heal_admission(entry, result);
-                    self.sync_pending_heals();
+                    self.pending_heals_changed = true;
                 }
             }
         }
     }
 
     pub(super) async fn retry_pending_scanner_heals(&mut self) -> Result<(), ScannerError> {
-        let batch = PendingHealSyncBatch::new(self);
-        let scanner = &mut *batch.scanner;
-        if !scanner.should_heal().await {
+        if !self.should_heal().await {
             return Ok(());
         }
 
-        let bucket = scanner.new_cache.info.name.clone();
+        let bucket = self.new_cache.info.name.clone();
         // Legacy notices cannot bind a verified disposition to the current
         // incarnation, kind, set scope and responsibility generation.
         let repaired = rustfs_common::mrf_channel::take_mrf_repaired_events_for(&bucket);
@@ -254,14 +215,14 @@ impl FolderScanner {
             counter!("rustfs_scanner_unverified_repair_notices_total")
                 .increment(u64::try_from(repaired.len()).unwrap_or(u64::MAX));
         }
-        scanner.prune_pending_scanner_heals();
-        for pending in pending_scanner_heal_retry_candidates(&scanner.new_cache.info.pending_heals, &bucket) {
-            if !scanner.should_heal().await {
+        self.prune_pending_scanner_heals();
+        for pending in pending_scanner_heal_retry_candidates(&self.new_cache.info.pending_heals, &bucket) {
+            if !self.should_heal().await {
                 break;
             }
 
             let Some(request) = build_pending_scanner_heal_request(&pending) else {
-                scanner.clear_pending_scanner_heal(pending.kind, &pending.bucket, None, pending.version_id.as_deref());
+                self.clear_pending_scanner_heal(pending.kind, &pending.bucket, None, pending.version_id.as_deref());
                 counter!(
                     METRIC_SCANNER_PENDING_HEAL_MALFORMED_TOTAL,
                     "bucket" => pending.bucket.clone(),
@@ -280,7 +241,7 @@ impl FolderScanner {
                 continue;
             };
 
-            if let Some(entry) = scanner.new_cache.info.pending_heals.iter_mut().find(|entry| {
+            if let Some(entry) = self.new_cache.info.pending_heals.iter_mut().find(|entry| {
                 pending_scanner_heal_matches(
                     entry,
                     pending.kind,
@@ -290,17 +251,16 @@ impl FolderScanner {
                 )
             }) {
                 record_pending_heal_attempt(entry, Self::now_secs());
-                scanner.sync_pending_heals();
+                self.pending_heals_changed = true;
             }
-            scanner
-                .send_required_scanner_heal_request(
-                    pending.kind,
-                    pending.bucket.clone(),
-                    pending.object.clone(),
-                    pending.version_id.clone(),
-                    request,
-                )
-                .await?;
+            self.send_required_scanner_heal_request(
+                pending.kind,
+                pending.bucket.clone(),
+                pending.object.clone(),
+                pending.version_id.clone(),
+                request,
+            )
+            .await?;
         }
 
         Ok(())

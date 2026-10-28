@@ -28,7 +28,6 @@ on:
       - "mint"
       - "minio-interop"
       - "Nightly GNU Build"
-      - "Performance A/B"
       - "Runner Hygiene"
     types: [completed]
 

@@ -494,9 +494,13 @@ impl HealTask {
             ))
             .await?;
         if let Some(error) = storage_result.error {
-            return Err(Error::TaskExecutionFailed {
-                message: format!("Failed to recreate missing object {bucket}/{object}: {error}"),
-            });
+            if error.is_dangling_delete_grace() {
+                // Preserve the existing MRF grace retry ownership.
+                return Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to recreate missing object {bucket}/{object}: {error}"),
+                });
+            }
+            return Err(error);
         }
 
         let object_size = storage_result.item.object_size as u64;
@@ -531,7 +535,7 @@ impl HealTask {
                 }
             } else {
                 Error::TaskExecutionFailed {
-                    message: format!("Missing exact storage proof for durable MRF repair {bucket}/{object}"),
+                    message: format!("{}{bucket}/{object}", crate::error::MRF_MISSING_PROOF_PREFIX),
                 }
             });
         }

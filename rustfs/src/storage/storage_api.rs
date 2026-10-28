@@ -329,8 +329,8 @@ pub(crate) mod s3_api_consumer {
     pub(crate) mod bucket {
         pub(crate) use super::super::super::s3_api::bucket::{
             ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-            build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params,
-            parse_list_objects_v2_params,
+            build_list_objects_output, build_list_objects_v2_output, encode_list_objects_v2_continuation_token,
+            parse_list_object_versions_params, parse_list_objects_v2_params,
         };
 
         pub(crate) mod contract {
@@ -441,9 +441,11 @@ pub(crate) mod ecstore_bucket {
 
 pub(crate) mod ecstore_capacity {
     pub(crate) use rustfs_ecstore::api::capacity::{
-        DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolMeta, PoolStatus, get_total_usable_capacity,
+        DecommissionUnresolvedEntry, PoolAdminDiagnostic, PoolDecommissionInfo, PoolMeta, PoolStatus, get_total_usable_capacity,
         get_total_usable_capacity_free, is_pool_activation_fleet_proof_error, is_reserved_or_invalid_bucket,
     };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::capacity::{PoolAvailability, PoolCapacityStatus, PoolDiagnosticStatus};
 }
 
 pub(crate) mod ecstore_client {
