@@ -3516,13 +3516,21 @@ async fn stale_upload_current_size_with_opts(
         .await
         .ok()?;
 
-    Some(
-        parts
-            .parts
-            .iter()
-            .map(|part| part.actual_size.max(part.size as i64).max(0) as usize)
-            .sum(),
-    )
+    stale_upload_size_from_parts(&parts)
+}
+
+fn stale_upload_size_from_parts(parts: &crate::storage_api_contracts::multipart::ListPartsInfo) -> Option<usize> {
+    if parts.is_truncated {
+        return None;
+    }
+    parts.parts.iter().try_fold(0usize, |total, part| {
+        // ListParts represents a quorum-confirmed missing part with an empty ETag.
+        if part.etag.as_deref().is_none_or(str::is_empty) {
+            return None;
+        }
+        let actual_size = usize::try_from(part.actual_size.max(0)).ok()?;
+        total.checked_add(part.size.max(actual_size))
+    })
 }
 
 async fn stale_upload_lifecycle_due(
@@ -3539,18 +3547,43 @@ async fn stale_upload_lifecycle_due(
     let bucket = metadata.get(RUSTFS_MULTIPART_BUCKET_KEY)?;
     let object = metadata.get(RUSTFS_MULTIPART_OBJECT_KEY)?;
 
-    let lifecycle = match metadata_boundary::get_lifecycle_config(bucket).await {
+    let mut lifecycle = match metadata_boundary::get_lifecycle_config(bucket).await {
         Ok((lifecycle, _)) => lifecycle,
         Err(_) => return None,
     };
 
+    let has_size_filter = |filter: &s3s::dto::LifecycleRuleFilter| {
+        filter.object_size_greater_than.is_some()
+            || filter.object_size_less_than.is_some()
+            || filter
+                .and
+                .as_ref()
+                .is_some_and(|and| and.object_size_greater_than.is_some() || and.object_size_less_than.is_some())
+    };
+    let needs_size = lifecycle
+        .rules
+        .iter()
+        .any(|rule| rule.abort_incomplete_multipart_upload.is_some() && rule.filter.as_ref().is_some_and(has_size_filter));
+    let size = if needs_size {
+        match stale_upload_current_size_with_opts(set, metadata, upload_dir, no_lock).await {
+            Some(size) => size,
+            None => {
+                // An unknown size cannot authorize a size-filtered abort.
+                // Unrelated rules can still be evaluated independently.
+                lifecycle
+                    .rules
+                    .retain(|rule| !rule.filter.as_ref().is_some_and(has_size_filter));
+                0
+            }
+        }
+    } else {
+        0
+    };
     let object_opts = ObjectOpts {
         name: object.clone(),
         user_tags: metadata.get(AMZ_OBJECT_TAGGING).cloned().unwrap_or_default(),
         mod_time: Some(initiated),
-        size: stale_upload_current_size_with_opts(set, metadata, upload_dir, no_lock)
-            .await
-            .unwrap_or_default(),
+        size,
         is_latest: true,
         delete_marker: false,
         user_defined: metadata.clone(),
@@ -15982,7 +16015,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial]
-    async fn stale_multipart_cleanup_skips_part_listing_after_default_expiry() {
+    async fn stale_multipart_cleanup_lists_parts_only_when_size_is_needed() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tracing::instrument::WithSubscriber as _;
         use tracing_subscriber::prelude::*;
@@ -16006,10 +16039,14 @@ mod tests {
         create_test_bucket(&ecstore, &bucket).await;
         set_abort_incomplete_lifecycle(&bucket, "logs/", 0).await;
         let now = OffsetDateTime::now_utc();
-        for (object, age, should_list) in [
-            ("logs/default-expired", time::Duration::hours(30), false),
-            ("logs/lifecycle-only", time::Duration::minutes(5), true),
+        for (object, age, size_filter, should_list) in [
+            ("logs/default-expired", time::Duration::hours(30), false, false),
+            ("logs/lifecycle-only", time::Duration::minutes(5), false, false),
+            ("logs/size-filter", time::Duration::minutes(5), true, true),
         ] {
+            if size_filter {
+                set_abort_incomplete_lifecycle_with_size(&bucket, "logs/", 0, 0).await;
+            }
             let upload = ecstore
                 .new_multipart_upload(
                     &bucket,
@@ -16021,6 +16058,13 @@ mod tests {
                 )
                 .await
                 .expect("create multipart upload");
+            if size_filter {
+                let mut data = PutObjReader::from_vec(vec![1, 2, 3, 4]);
+                ecstore
+                    .put_object_part(&bucket, object, &upload.upload_id, 1, &mut data, &ObjectOptions::default())
+                    .await
+                    .expect("upload a part for size filtering");
+            }
             let calls = Arc::new(AtomicUsize::new(0));
             let subscriber = tracing_subscriber::registry().with(PartListCounter(Arc::clone(&calls)));
             cleanup_stale_multipart_uploads_once_at(ecstore.clone(), now, StdDuration::from_secs(24 * 60 * 60))
@@ -16036,6 +16080,82 @@ mod tests {
                 "upload must be removed: {result:?}"
             );
         }
+    }
+
+    #[test]
+    fn stale_multipart_cleanup_rejects_incomplete_or_overflowing_part_sizes() {
+        use crate::storage_api_contracts::multipart::{ListPartsInfo, PartInfo};
+
+        let part = |size, actual_size, etag: &str| PartInfo {
+            size,
+            actual_size,
+            etag: Some(etag.to_owned()),
+            ..Default::default()
+        };
+        let mut parts = ListPartsInfo {
+            parts: vec![part(4, 6, "valid")],
+            ..Default::default()
+        };
+        assert_eq!(super::stale_upload_size_from_parts(&parts), Some(6));
+        parts.is_truncated = true;
+        assert_eq!(super::stale_upload_size_from_parts(&parts), None);
+        parts.is_truncated = false;
+        parts.parts = vec![part(0, 0, "")];
+        assert_eq!(super::stale_upload_size_from_parts(&parts), None);
+        parts.parts = vec![part(usize::MAX, 0, "valid"), part(1, 1, "valid")];
+        assert_eq!(super::stale_upload_size_from_parts(&parts), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_multipart_cleanup_handles_unknown_size_without_false_abort() {
+        let (_, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-unknown-size-{}", Uuid::new_v4().simple());
+        let object = "logs/object";
+        create_test_bucket(&ecstore, &bucket).await;
+        let size_rule = r#"<Rule><ID>size</ID><Status>Enabled</Status><Filter><ObjectSizeLessThan>5</ObjectSizeLessThan></Filter><AbortIncompleteMultipartUpload><DaysAfterInitiation>0</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule>"#;
+        let independent_rule = r#"<Rule><ID>prefix</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><AbortIncompleteMultipartUpload><DaysAfterInitiation>0</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule>"#;
+        let lifecycle = |rules: &str| format!("<LifecycleConfiguration>{rules}</LifecycleConfiguration>").into_bytes();
+        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle(size_rule))
+            .await
+            .expect("install upper-size lifecycle rule");
+        let metadata = HashMap::from([
+            (super::RUSTFS_MULTIPART_BUCKET_KEY.to_owned(), bucket.clone()),
+            (super::RUSTFS_MULTIPART_OBJECT_KEY.to_owned(), object.to_owned()),
+        ]);
+        let initiated = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let set = &ecstore.pools[0].disk_set[0];
+        let upload = ecstore
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create empty multipart upload");
+        let decoded = base64_simd::URL_SAFE_NO_PAD
+            .decode_to_vec(upload.upload_id.as_bytes())
+            .expect("decode upload ID");
+        let decoded = String::from_utf8(decoded).expect("upload ID must be UTF-8");
+        let (_, upload_dir) = decoded.split_once('.').expect("deployment-prefixed upload ID");
+        assert!(
+            super::stale_upload_lifecycle_due(set, &metadata, initiated, upload_dir, false)
+                .await
+                .is_some(),
+            "a known empty upload must match the upper-size rule"
+        );
+        let missing_upload = format!("{}x{}", Uuid::new_v4(), initiated.unix_timestamp_nanos());
+        assert!(
+            super::stale_upload_lifecycle_due(set, &metadata, initiated, &missing_upload, false)
+                .await
+                .is_none(),
+            "an unreadable size must not match the upper-size rule"
+        );
+        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle(&format!("{size_rule}{independent_rule}")))
+            .await
+            .expect("install size-independent lifecycle rule");
+        assert!(
+            super::stale_upload_lifecycle_due(set, &metadata, initiated, &missing_upload, false)
+                .await
+                .is_some(),
+            "a size-independent rule remains eligible when size is unknown"
+        );
     }
 
     #[tokio::test]
