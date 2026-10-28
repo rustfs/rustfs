@@ -1005,7 +1005,7 @@ fn observer_status_preserves_loss_expiry_and_rejected_admissions() {
     assert_eq!(unknown["identity_too_large"], 1);
     assert_eq!(unknown["owner_generation_unknown"], 1);
     assert_eq!(unknown["missing_task_id"], 1);
-    assert_eq!(unknown["admission_unknown"], 1);
+    assert_eq!(unknown.get("admission_not_sent"), Some(&1), "RED_UNSENT_STATUS_LABEL");
     assert_eq!(unknown["observer_full_or_closed"], 2);
 }
 
@@ -1085,9 +1085,11 @@ async fn admission_errors_without_decisions_are_reported_unknown() {
         status
             .unknown_candidates
             .iter()
-            .any(|row| row.reason == "admission_unknown" && row.count == 5)
+            .any(|row| row.reason == "admission_unknown" && row.count == 3),
+        "RED_ADMISSION_ERROR_CLASSIFICATION"
     );
-    assert_eq!(recorder.reason_total("admission_unknown"), 5);
+    assert_eq!(recorder.reason_total("admission_unknown"), 3);
+    assert_eq!(recorder.reason_total("admission_not_sent"), 2, "RED_UNSENT_METRIC_LABEL");
     assert_eq!(recorder.reason_total("not_admitted"), 0);
     assert_eq!(recorder.total("rustfs_scanner_heal_candidate_unknown_total"), 5);
 }
