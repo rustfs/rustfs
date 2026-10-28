@@ -229,7 +229,7 @@ mod tests {
                     .find(|(name, _)| *name == key)
                     .map(|(_, value)| value.to_string()))
             },
-            || Ok(TableCatalogBackingMode::DurableStrong),
+            || Ok(TableCatalogBackingMode::ObjectBacked),
         )
     }
 
