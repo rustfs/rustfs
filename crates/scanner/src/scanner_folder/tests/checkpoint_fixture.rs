@@ -49,6 +49,7 @@ struct FixtureStore {
     root: std::path::PathBuf,
     _owned_root: Option<tempfile::TempDir>,
     reject_save: AtomicBool,
+    reject_backup_read: AtomicBool,
 }
 
 impl FixtureStore {
@@ -58,6 +59,7 @@ impl FixtureStore {
             root: root.path().to_path_buf(),
             _owned_root: Some(root),
             reject_save: AtomicBool::new(false),
+            reject_backup_read: AtomicBool::new(false),
         })
     }
 
@@ -67,6 +69,7 @@ impl FixtureStore {
             root,
             _owned_root: None,
             reject_save: AtomicBool::new(false),
+            reject_backup_read: AtomicBool::new(false),
         })
     }
 
@@ -101,6 +104,9 @@ impl ObjectIO for FixtureStore {
         _headers: Self::HeaderMap,
         _options: &Self::ObjectOptions,
     ) -> crate::EcstoreResult<Self::GetObjectReader> {
+        if object.ends_with(".bkp") && self.reject_backup_read.load(Ordering::SeqCst) {
+            return Err(crate::EcstoreError::ErasureReadQuorum);
+        }
         let bytes = tokio::fs::read(self.path(object)).await.map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 crate::EcstoreError::FileNotFound
@@ -887,6 +893,282 @@ async fn check_complete_sampling_resumption(resume_mode: HealScanMode) {
         }
     }
     panic!("sampling interruption must recover with the unchanged three-object budget");
+}
+
+#[tokio::test]
+#[serial]
+async fn corrupt_primary_cannot_promote_older_complete_backup_after_partial() {
+    temp_env::async_with_vars([(ENV_DATA_USAGE_UPDATE_DIR_CYCLES, Some("16"))], async {
+        assert_eq!(data_usage_update_dir_cycles(), 16);
+        assert_corrupt_primary_cannot_promote_older_backup().await;
+    })
+    .await;
+}
+
+async fn assert_corrupt_primary_cannot_promote_older_backup() {
+    let (scanner, root) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    for index in 0..9 {
+        write_checkpoint_object(&root, &format!("prefix/{index:04}"), &[(None, 1)]).await;
+    }
+    write_checkpoint_object(&root, "z-good/healthy", &[(None, 1)]).await;
+    let _ordered = super::erasure_probe::OrderedDirectory::new(&root.join("bucket"));
+    let identity = crate::DataUsageScanIdentity {
+        tier_registry_generation: crate::runtime_tier_registry_for_cycle(11, 7).await.generation,
+        ..bound_checkpoint().1
+    };
+    let mut cache = DataUsageCache::default();
+    cache.prepare_bucket_checkpoint("bucket", 11, 7, SOURCE, PLAN, identity);
+    cache.info.skip_healing = true;
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&parent, Default::default());
+    let baseline = scanner
+        .local_disk
+        .clone()
+        .nsscanner_disk(
+            budget.token(),
+            budget,
+            vec![scanner.local_disk.clone()],
+            cache,
+            None,
+            scan_options(HealScanMode::Normal),
+        )
+        .await
+        .expect("scan complete baseline");
+    let ScannerDiskScanOutcome::Complete(baseline) = baseline else {
+        panic!("baseline scan must be complete")
+    };
+    let prefix = hash_path("bucket/prefix");
+    assert!(baseline.is_compacted(&prefix), "fixture needs an older compacted subtree");
+
+    let store = FixtureStore::new();
+    let mut loaded = DataUsageCache::default();
+    let revisions = loaded
+        .load_with_revisions(store.clone(), CACHE_NAME)
+        .await
+        .expect("load initial cache revisions");
+    baseline
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .await
+        .expect("save complete baseline to both copies");
+    let backup = tokio::fs::read(store.root.join("backup"))
+        .await
+        .expect("read baseline backup");
+    assert!(
+        DataUsageCache::unmarshal(&backup)
+            .expect("decode baseline backup")
+            .info
+            .snapshot_complete
+    );
+
+    let sampling_cycles = data_usage_update_dir_cycles();
+    let sampling_cycle = (12..12 + sampling_cycles)
+        .find(|cycle| prefix.mod_(*cycle, sampling_cycles))
+        .expect("one prefix sampling cycle per rotation");
+    let recovery_cycle = (sampling_cycle + 1..sampling_cycle + 1 + sampling_cycles)
+        .find(|cycle| !prefix.mod_(*cycle, sampling_cycles))
+        .expect("another cycle skips the compacted prefix");
+    let mut partial_input = baseline.clone();
+    partial_input.prepare_bucket_checkpoint("bucket", u64::from(sampling_cycle), 7, SOURCE, PLAN, identity);
+    assert!(partial_input.info.scan_progress.is_none());
+    partial_input.info.skip_healing = true;
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(
+        &parent,
+        ScannerCycleBudgetConfig {
+            max_objects: Some(3),
+            ..Default::default()
+        },
+    );
+    let partial = scanner
+        .local_disk
+        .clone()
+        .nsscanner_disk(
+            budget.token(),
+            budget,
+            vec![scanner.local_disk.clone()],
+            partial_input,
+            None,
+            scan_options(HealScanMode::Normal),
+        )
+        .await
+        .expect("scan interrupted by object budget");
+    let ScannerDiskScanOutcome::Partial(partial) = partial else {
+        panic!("the newer sampled scan must stop as partial")
+    };
+    assert!(!partial.info.snapshot_complete);
+    assert!(partial.info.scan_checkpoint.is_some());
+
+    store.reject_backup_read.store(true, Ordering::SeqCst);
+    let revisions = loaded
+        .load_with_revisions(store.clone(), CACHE_NAME)
+        .await
+        .expect("load primary despite unavailable backup revision");
+    partial
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .await
+        .expect("persist newer partial while backup revision is unavailable");
+    store.reject_backup_read.store(false, Ordering::SeqCst);
+    let partial_bytes = tokio::fs::read(store.root.join("main")).await.expect("read newer partial");
+    let persisted_partial = DataUsageCache::unmarshal(&partial_bytes).expect("decode newer partial");
+    assert!(!persisted_partial.info.snapshot_complete);
+    assert_eq!(persisted_partial.info.next_cycle, u64::from(sampling_cycle));
+    assert_eq!(tokio::fs::read(store.root.join("backup")).await.expect("read older backup"), backup);
+
+    let mut latest = DataUsageCache::default();
+    store.reject_backup_read.store(true, Ordering::SeqCst);
+    let revisions = latest
+        .load_with_revisions(store.clone(), CACHE_NAME)
+        .await
+        .expect("reload newer partial before corruption");
+    store.reject_backup_read.store(false, Ordering::SeqCst);
+    let options = crate::scanner_io::DataUsageCacheReuseOptions {
+        require_source: true,
+        tier_registry_generation: Some(identity.tier_registry_generation),
+        checkpoint_identity: Some(identity),
+        checkpoint_plan_digest: None,
+    };
+    let latest_state = crate::scanner_io::current_cache_root_or_prepare_with_generation(
+        &mut latest,
+        "bucket",
+        SOURCE,
+        u64::from(recovery_cycle),
+        7,
+        PLAN,
+        options,
+    );
+    assert!(matches!(latest_state, crate::scanner_io::DataUsageCacheScanState::Prepared { .. }));
+    assert!(latest.info.scan_progress.is_some(), "the persisted partial requires a coverage sweep");
+    latest.info.skip_healing = true;
+    let _fault = super::erasure_probe::OrderedDirectory::fail_open(&root.join("bucket/prefix"), ErrorKind::PermissionDenied);
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&parent, Default::default());
+    let control_logs = CapturedLogs::default();
+    let control = control_logs
+        .capture(
+            tracing::Level::DEBUG,
+            scanner.local_disk.clone().nsscanner_disk(
+                budget.token(),
+                budget,
+                vec![scanner.local_disk.clone()],
+                latest,
+                None,
+                scan_options(HealScanMode::Normal),
+            ),
+        )
+        .await
+        .expect("scan the intact newer partial");
+    let ScannerDiskScanOutcome::Partial(control) = control else {
+        panic!("the intact partial must not complete across the injected directory failure")
+    };
+    assert!(!control.info.snapshot_complete);
+    assert_eq!(
+        control
+            .checked_flatten("bucket/z-good")
+            .expect("healthy sibling scanned")
+            .objects,
+        1
+    );
+    assert!(control_logs.contents().lines().any(|line| {
+        let event: serde_json::Value = serde_json::from_str(line).expect("scanner JSON event");
+        event["fields"]["state"] == "child_scan_failed" && event["fields"]["child_folder"] == "bucket/prefix"
+    }));
+
+    control
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .await
+        .expect("persist the partial that observed the failed subtree");
+    let partial_bytes = tokio::fs::read(store.root.join("main"))
+        .await
+        .expect("read failed-subtree partial");
+    let persisted_partial = DataUsageCache::unmarshal(&partial_bytes).expect("decode failed-subtree partial");
+    assert!(!persisted_partial.info.snapshot_complete);
+    assert!(
+        persisted_partial.info.scan_progress.is_some(),
+        "the failed subtree requires a verification sweep"
+    );
+    assert_eq!(tokio::fs::read(store.root.join("backup")).await.expect("read older backup"), backup);
+
+    let mut corrupt = partial_bytes;
+    corrupt[0] = 0xc1;
+    assert!(DataUsageCache::unmarshal(&corrupt).is_err(), "corrupt primary must not decode");
+    tokio::fs::write(store.root.join("main"), &corrupt)
+        .await
+        .expect("inject corruption into the newer primary");
+    let recovery_logs = CapturedLogs::default();
+    let mut recovered = DataUsageCache::default();
+    let recovery_result = match recovered.load_with_revisions(store.clone(), CACHE_NAME).await {
+        Err(error) => {
+            println!("backup_recovery load_error={error}");
+            None
+        }
+        Ok(_) => {
+            let state = crate::scanner_io::current_cache_root_or_prepare_with_generation(
+                &mut recovered,
+                "bucket",
+                SOURCE,
+                u64::from(recovery_cycle),
+                7,
+                PLAN,
+                options,
+            );
+            assert!(
+                matches!(state, crate::scanner_io::DataUsageCacheScanState::Prepared { .. }),
+                "an older backup must not be adopted as the current bucket root"
+            );
+            recovered.info.skip_healing = true;
+            let parent = CancellationToken::new();
+            let budget = ScannerCycleBudget::new(&parent, Default::default());
+            Some(
+                recovery_logs
+                    .capture(
+                        tracing::Level::DEBUG,
+                        scanner.local_disk.clone().nsscanner_disk(
+                            budget.token(),
+                            budget,
+                            vec![scanner.local_disk.clone()],
+                            recovered,
+                            None,
+                            scan_options(HealScanMode::Normal),
+                        ),
+                    )
+                    .await,
+            )
+        }
+    };
+    let saw_failure = recovery_logs.contents().lines().any(|line| {
+        let event: serde_json::Value = serde_json::from_str(line).expect("scanner JSON event");
+        event["fields"]["state"] == "child_scan_failed" && event["fields"]["child_folder"] == "bucket/prefix"
+    });
+    assert_eq!(
+        tokio::fs::read(store.root.join("main"))
+            .await
+            .expect("retain corrupted primary"),
+        corrupt
+    );
+    assert_eq!(
+        tokio::fs::read(store.root.join("backup"))
+            .await
+            .expect("retain original backup"),
+        backup
+    );
+    match recovery_result {
+        None => println!("backup_recovery load_rejected failed_prefix_observed={saw_failure}"),
+        Some(Err(error)) => println!("backup_recovery scan_error={error} failed_prefix_observed={saw_failure}"),
+        Some(Ok(ScannerDiskScanOutcome::Partial(cache) | ScannerDiskScanOutcome::NamespaceNotFound(cache))) => {
+            println!(
+                "backup_recovery incomplete snapshot_complete={} failed_prefix_observed={saw_failure}",
+                cache.info.snapshot_complete
+            );
+            assert!(!cache.info.snapshot_complete, "an unverified failed subtree must remain incomplete");
+        }
+        Some(Ok(ScannerDiskScanOutcome::Complete(cache))) => panic!(
+            "an older backup must not certify an unverified failed subtree: snapshot_complete={}, failed_prefix_observed={saw_failure}",
+            cache.info.snapshot_complete
+        ),
+    }
 }
 
 #[tokio::test]

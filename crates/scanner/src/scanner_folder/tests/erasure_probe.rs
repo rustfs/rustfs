@@ -15,10 +15,10 @@ enum DirectoryOrder {
 pub(in crate::scanner_folder) type OrderedEntries = VecDeque<std::io::Result<tokio::fs::DirEntry>>;
 static ORDERED_DIRECTORIES: LazyLock<Mutex<HashMap<String, DirectoryOrder>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-struct OrderedDirectory(String);
+pub(super) struct OrderedDirectory(String);
 
 impl OrderedDirectory {
-    fn new(path: &std::path::Path) -> Self {
+    pub(super) fn new(path: &std::path::Path) -> Self {
         let path = path.to_string_lossy().into_owned();
         ORDERED_DIRECTORIES
             .lock()
@@ -34,7 +34,7 @@ impl OrderedDirectory {
             .insert(guard.0.clone(), DirectoryOrder::FailAfter(entries, kind));
         guard
     }
-    fn fail_open(path: &std::path::Path, kind: std::io::ErrorKind) -> Self {
+    pub(super) fn fail_open(path: &std::path::Path, kind: std::io::ErrorKind) -> Self {
         let guard = Self::new(path);
         ORDERED_DIRECTORIES
             .lock()
