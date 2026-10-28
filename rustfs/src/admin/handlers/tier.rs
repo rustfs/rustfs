@@ -15,6 +15,7 @@
 
 use crate::admin::runtime_sources::object_store_from_extensions;
 use crate::admin::storage_api::runtime_sources::TierConfigMgr;
+use crate::admin::storage_api::s3;
 use crate::admin::storage_api::tier::{
     AdminError, ClusterTierDailyStats, DailyAllTierStats, ECStore, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE,
     ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CONFIG, ERR_TIER_INVALID_CREDENTIALS,
@@ -674,12 +675,12 @@ pub struct CheckTierDeletion {}
 impl Operation for CheckTierDeletion {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         if req.credentials.is_none() {
-            return Err(s3_error!(InvalidRequest, "authentication required"));
+            return Err(s3::error(S3ErrorCode::InvalidRequest, "authentication required"));
         }
         authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
         let tier = resolve_tier_name(&req.uri, &params)?;
         let store = object_store_from_extensions(&req.extensions)
-            .ok_or_else(|| s3_error!(InternalError, "object store is not initialized"))?;
+            .ok_or_else(|| s3::error(S3ErrorCode::InternalError, "object store is not initialized"))?;
         let report = TierConfigMgr::deletion_check(&current_tier_config_handle(), store, &tier)
             .await
             .map_err(|error| tier_admin_custom_error_response(&error))?;
@@ -693,12 +694,12 @@ pub struct RetryTierCleanup {}
 impl Operation for RetryTierCleanup {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         if req.credentials.is_none() {
-            return Err(s3_error!(InvalidRequest, "authentication required"));
+            return Err(s3::error(S3ErrorCode::InvalidRequest, "authentication required"));
         }
         authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
         let tier = resolve_tier_name(&req.uri, &params)?;
         let store = object_store_from_extensions(&req.extensions)
-            .ok_or_else(|| s3_error!(InternalError, "object store is not initialized"))?;
+            .ok_or_else(|| s3::error(S3ErrorCode::InternalError, "object store is not initialized"))?;
         let report = retry_tier_free_version_cleanup(store, &tier)
             .await
             .map_err(|error| tier_admin_custom_error_response(&error))?;
@@ -707,7 +708,8 @@ impl Operation for RetryTierCleanup {
 }
 
 fn tier_diagnostic_response<T: serde::Serialize>(status: StatusCode, report: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let data = serde_json::to_vec(report).map_err(|_| s3_error!(InternalError, "failed to encode tier diagnostic"))?;
+    let data =
+        serde_json::to_vec(report).map_err(|_| s3::error(S3ErrorCode::InternalError, "failed to encode tier diagnostic"))?;
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
     headers.insert(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
