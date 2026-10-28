@@ -566,6 +566,98 @@ fn replacement_bucket_version_or_location_cannot_match_an_old_result() {
 }
 
 #[test]
+fn scanner_candidate_without_scope_does_not_claim_identity_mismatch() {
+    let mut scanner_request = request();
+    scanner_request.expected_bucket_incarnation_id = None;
+    scanner_request.pool_index = None;
+    scanner_request.set_index = None;
+    let observed = Candidate::from_request(&scanner_request).expect("scanner candidate");
+    let mut recent = Recent {
+        completion: completion("scanner-scope", HealObjectDisposition::VerifiedHealthy),
+        counted: false,
+    };
+    assert_eq!(
+        Settlement::new(observed, &mut recent).scope,
+        "identity_unknown",
+        "RED_SCANNER_SCOPE_UNKNOWN"
+    );
+}
+
+#[test]
+fn missing_identity_fields_are_unknown_on_either_side() {
+    for missing_candidate in [true, false] {
+        for field in 0..9 {
+            let mut observed = candidate();
+            let mut terminal = (*completion("missing-identity", HealObjectDisposition::VerifiedHealthy)).clone();
+            let expected = observed.identity.as_mut().expect("candidate identity");
+            let actual = &mut Arc::make_mut(&mut terminal.completion)
+                .object
+                .as_mut()
+                .expect("terminal object")
+                .identity;
+            let target = if missing_candidate { expected } else { actual };
+            match field {
+                0 => target.version_id = None,
+                1 => target.version_id = Some(String::new()),
+                2 => target.version_id = Some(Uuid::nil().to_string()),
+                3 => target.bucket_incarnation_id = None,
+                4 => target.bucket_incarnation_id = Some(Uuid::nil()),
+                5 => target.pool_index = None,
+                6 => target.set_index = None,
+                7 => target.bucket.clear(),
+                _ => target.object.clear(),
+            }
+            let mut recent = Recent {
+                completion: Arc::new(terminal),
+                counted: false,
+            };
+            assert_eq!(
+                Settlement::new(observed, &mut recent).scope,
+                "identity_unknown",
+                "RED_SCANNER_MISSING_IDENTITY field={field} candidate={missing_candidate}"
+            );
+        }
+    }
+}
+
+#[test]
+fn known_identity_conflicts_remain_mismatches_with_other_fields_unknown() {
+    for field in 0..7 {
+        let mut observed = candidate();
+        let mut terminal = (*completion("conflicting-identity", HealObjectDisposition::VerifiedHealthy)).clone();
+        let expected = observed.identity.as_mut().expect("candidate identity");
+        let actual = &mut Arc::make_mut(&mut terminal.completion)
+            .object
+            .as_mut()
+            .expect("terminal object")
+            .identity;
+        if field == 4 {
+            expected.version_id = None;
+        } else {
+            expected.bucket_incarnation_id = None;
+        }
+        match field {
+            0 => actual.kind = HealObjectKind::Metadata,
+            1 => actual.bucket = "other-bucket".into(),
+            2 => actual.object = "other-object".into(),
+            3 => actual.version_id = Some(Uuid::from_u128(12).to_string()),
+            4 => actual.bucket_incarnation_id = Some(Uuid::from_u128(23)),
+            5 => actual.pool_index = Some(9),
+            _ => actual.set_index = Some(9),
+        }
+        let mut recent = Recent {
+            completion: Arc::new(terminal),
+            counted: false,
+        };
+        assert_eq!(
+            Settlement::new(observed, &mut recent).scope,
+            "identity_mismatch",
+            "known conflict field={field}"
+        );
+    }
+}
+
+#[test]
 fn unversioned_overwrite_and_unknown_leader_never_certify_payload() {
     let mut observed = candidate();
     observed.identity.as_mut().expect("identity").version_id = None;
