@@ -520,9 +520,7 @@ impl HealTask {
                     error = %err,
                     "Heal cluster pool metadata failed"
                 );
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to heal cluster pool metadata: {err}"),
-                })
+                Err(err)
             }
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
@@ -539,9 +537,7 @@ impl HealTask {
                     error = %err,
                     "Heal cluster pool metadata failed"
                 );
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to heal cluster pool metadata: {err}"),
-                })
+                Err(err)
             }
         }
     }

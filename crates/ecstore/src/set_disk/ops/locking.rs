@@ -44,6 +44,21 @@ impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
+        // Lock the file the disk resolves, not the spelling: on Windows `a\b`
+        // and `a/b` share one xl.meta, so they must share one lock. The key is
+        // folded by the requesting node only; lock servers compare it verbatim.
+        let resource = ObjectKey {
+            bucket: Arc::from(bucket),
+            object: Arc::from(object_name_disk_identity(object).as_ref()),
+            version: None,
+        };
+
+        Ok(self.namespace_lock_for_key(resource).await)
+    }
+}
+
+impl SetDisks {
+    async fn namespace_lock_for_key(&self, resource: ObjectKey) -> NamespaceLockWrapper {
         // Resolved from this set's own instance context (backlog#1052), not the
         // ambient facade: the facade tracks whichever context is currently
         // published process-wide, so a second instance (or, in tests, another
@@ -69,20 +84,33 @@ impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
             NamespaceLock::with_local_manager_shared(self.set_lock_namespace.clone(), self.local_lock_manager.clone())
         };
 
-        // Lock the file the disk resolves, not the spelling: on Windows `a\b`
-        // and `a/b` share one xl.meta, so they must share one lock. The key is
-        // folded by the requesting node only; lock servers compare it verbatim.
-        let resource = ObjectKey {
-            bucket: Arc::from(bucket),
-            object: Arc::from(object_name_disk_identity(object).as_ref()),
-            version: None,
-        };
-
-        Ok(NamespaceLockWrapper::new(set_lock, resource, self.locker_owner.clone()))
+        NamespaceLockWrapper::new(set_lock, resource, self.locker_owner.clone())
     }
-}
 
-impl SetDisks {
+    /// Raw object locks precede this set-local transaction lock. Its versioned
+    /// resource cannot collide with normal namespace keys, which use None.
+    /// Keeping the target set's clients avoids nesting overlapping raw quorums.
+    pub(in crate::set_disk) async fn acquire_delete_transaction_lock(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> Result<Arc<rustfs_lock::NamespaceLockGuard>> {
+        let resource = ObjectKey::with_version(
+            bucket,
+            object_name_disk_identity(object).as_ref(),
+            format!("rustfs:delete-transaction:{}:{}", self.pool_index, self.set_index),
+        );
+        let guard = self
+            .namespace_lock_for_key(resource)
+            .await
+            .get_write_lock(super::super::get_lock_acquire_timeout())
+            .await
+            .map_err(|error| self.map_namespace_lock_error(bucket, object, "delete_transaction", error))?;
+        #[cfg(test)]
+        super::delete_recovery::test_hooks::run_after_transaction_lock_acquired(bucket, object, &guard);
+        Ok(Arc::new(guard))
+    }
+
     #[allow(dead_code, reason = "lock diagnostics formatter with no caller in this port (backlog#1823)")]
     pub(in crate::set_disk) fn format_lock_error(&self, bucket: &str, object: &str, mode: &str, err: &LockResult) -> String {
         match err {
