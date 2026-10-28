@@ -30,6 +30,7 @@ use std::{
 use tokio::sync::{broadcast, mpsc};
 
 const MAX_PENDING: usize = 1024;
+const MAX_PENDING_GROUPS: usize = MAX_PENDING;
 const MAX_RECENT: usize = 1024;
 const PENDING_TTL: Duration = Duration::from_secs(60 * 60);
 const RECENT_TTL: Duration = Duration::from_secs(10 * 60);
@@ -122,6 +123,26 @@ impl Candidate {
             count: 1,
         })
     }
+
+    fn has_same_semantics(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.mode == other.mode && self.dry_run == other.dry_run
+    }
+}
+
+struct Pending {
+    // Keep the common single-group case inline.
+    first: Candidate,
+    others: Vec<Candidate>,
+}
+
+impl Pending {
+    fn iter(&self) -> impl Iterator<Item = &Candidate> {
+        std::iter::once(&self.first).chain(self.others.iter())
+    }
+
+    fn into_candidates(self) -> impl Iterator<Item = Candidate> {
+        std::iter::once(self.first).chain(self.others)
+    }
 }
 
 struct Recent {
@@ -137,7 +158,9 @@ struct ObservationKey {
 
 #[derive(Default)]
 struct Observations {
-    pending: HashMap<ObservationKey, Candidate>,
+    pending: HashMap<ObservationKey, Pending>,
+    // The group bound applies across all observation keys.
+    pending_groups: usize,
     recent: HashMap<ObservationKey, Recent>,
     recent_order: VecDeque<(Instant, ObservationKey)>,
     // All keys come from fixed execution/disposition/scope/mode labels, never task or object identities.
@@ -247,24 +270,41 @@ impl Observations {
     }
 
     fn admit(&mut self, key: ObservationKey, candidate: Candidate) -> Option<Settlement> {
+        if Instant::now().saturating_duration_since(candidate.first_seen) >= PENDING_TTL {
+            self.record_unknown("expired", candidate.count);
+            return None;
+        }
         if let Some(recent) = self.recent.get_mut(&key) {
             let settlement = Settlement::new(candidate, recent);
             self.record_settlement(&settlement);
             return Some(settlement);
         }
         if let Some(pending) = self.pending.get_mut(&key) {
-            pending.count = pending.count.saturating_add(candidate.count);
-            if pending.identity != candidate.identity {
-                pending.identity = None;
+            if pending.first.has_same_semantics(&candidate) {
+                pending.first.count = pending.first.count.saturating_add(candidate.count);
+                pending.first.first_seen = pending.first.first_seen.min(candidate.first_seen);
+            } else if let Some(group) = pending.others.iter_mut().find(|group| group.has_same_semantics(&candidate)) {
+                group.count = group.count.saturating_add(candidate.count);
+                group.first_seen = group.first_seen.min(candidate.first_seen);
+            } else if self.pending_groups < MAX_PENDING_GROUPS {
+                pending.others.push(candidate);
+                self.pending_groups += 1;
+            } else {
+                self.record_unknown("pending_groups_full", candidate.count);
             }
-            if candidate.mode == HealScanMode::Deep {
-                pending.mode = HealScanMode::Deep;
-            }
-            pending.dry_run |= candidate.dry_run;
-        } else if self.pending.len() < MAX_PENDING {
-            self.pending.insert(key, candidate);
-        } else {
+        } else if self.pending.len() >= MAX_PENDING {
             self.record_unknown("pending_full", candidate.count);
+        } else if self.pending_groups >= MAX_PENDING_GROUPS {
+            self.record_unknown("pending_groups_full", candidate.count);
+        } else {
+            self.pending.insert(
+                key,
+                Pending {
+                    first: candidate,
+                    others: Vec::new(),
+                },
+            );
+            self.pending_groups += 1;
         }
         None
     }
@@ -281,18 +321,26 @@ impl Observations {
             completion,
             counted: false,
         };
-        let settled = self
-            .pending
-            .remove(&key)
-            .map(|candidate| Settlement::new(candidate, &mut recent));
+        let mut settled = None;
+        if let Some(pending) = self.pending.remove(&key) {
+            self.pending_groups -= 1 + pending.others.len();
+            for candidate in pending.into_candidates() {
+                if now.saturating_duration_since(candidate.first_seen) >= PENDING_TTL {
+                    self.record_unknown("expired", candidate.count);
+                    continue;
+                }
+                let settlement = Settlement::new(candidate, &mut recent);
+                self.record_settlement(&settlement);
+                if settled.is_none() {
+                    settled = Some(settlement);
+                }
+            }
+        }
         if self.recent.len() == MAX_RECENT {
             self.evict_recent();
         }
         self.recent_order.push_back((now, key.clone()));
         self.recent.insert(key, recent);
-        if let Some(settlement) = &settled {
-            self.record_settlement(settlement);
-        }
         settled
     }
 
@@ -306,7 +354,9 @@ impl Observations {
         let candidates = self
             .pending
             .drain()
-            .fold(0u64, |count, (_, candidate)| count.saturating_add(candidate.count));
+            .flat_map(|(_, pending)| pending.into_candidates())
+            .fold(0u64, |count, candidate| count.saturating_add(candidate.count));
+        self.pending_groups = 0;
         if candidates > 0 {
             self.record_unknown("completion_lost", candidates);
         }
@@ -322,14 +372,32 @@ impl Observations {
 
     fn maintain(&mut self, now: Instant) {
         let mut expired = 0u64;
-        self.pending.retain(|_, candidate| {
-            if now.saturating_duration_since(candidate.first_seen) >= PENDING_TTL {
-                expired = expired.saturating_add(candidate.count);
-                false
-            } else {
-                true
+        let mut expired_groups = 0usize;
+        self.pending.retain(|_, pending| {
+            let previous_len = pending.others.len();
+            pending.others.retain(|candidate| {
+                if now.saturating_duration_since(candidate.first_seen) >= PENDING_TTL {
+                    expired = expired.saturating_add(candidate.count);
+                    expired_groups += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            if now.saturating_duration_since(pending.first.first_seen) >= PENDING_TTL {
+                expired = expired.saturating_add(pending.first.count);
+                expired_groups += 1;
+                if pending.others.is_empty() {
+                    return false;
+                }
+                pending.first = pending.others.remove(0);
             }
+            if pending.others.len() < previous_len {
+                pending.others.shrink_to_fit();
+            }
+            true
         });
+        self.pending_groups -= expired_groups;
         if expired > 0 {
             self.record_unknown("expired", expired);
         }
@@ -343,6 +411,7 @@ impl Observations {
         let oldest = self
             .pending
             .values()
+            .flat_map(Pending::iter)
             .map(|candidate| now.saturating_duration_since(candidate.first_seen))
             .max();
         gauge!("rustfs_scanner_heal_pending_tasks").set(self.pending.len() as f64);
@@ -454,12 +523,14 @@ fn observation_status_from(registry: &Mutex<Option<ObserverHandle>>) -> ScannerH
             observations
                 .pending
                 .values()
+                .flat_map(Pending::iter)
                 .fold(0u64, |count, candidate| count.saturating_add(candidate.count)),
         );
         let now = Instant::now();
         status.oldest_pending_seconds = observations
             .pending
             .values()
+            .flat_map(Pending::iter)
             .map(|candidate| now.saturating_duration_since(candidate.first_seen))
             .max()
             .map(|age| age.as_secs_f64());
