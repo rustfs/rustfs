@@ -158,9 +158,7 @@ requested adversarial/design reviews, and agent-instruction changes that alter
 execution. Ordinary questions, diagnoses, status reports, non-adversarial code
 reviews, and low-risk planning do not trigger it.
 
-For applicable work and substantial PR reviews, read the [risk tiers and review shape](.agents/references/adversarial-validation.md).
-Load only the matching domain probes; ordinary reviews do not become adversarial
-merely because this reference exists.
+For applicable work and substantial PR reviews, follow the [risk tiers and review shape](.agents/references/adversarial-validation.md) and check changed trust boundaries and relevant correctness, security, concurrency, durability, compatibility, performance, and negative regression coverage.
 
 A review has no finding quota; `No findings` is a complete outcome. A request to
 find problems is not evidence that a defect exists. Before reporting a candidate,

@@ -8839,7 +8839,7 @@ impl SetDisks {
         // quorum, failing write quorum on update_object_meta (backlog#872).
         let read_opts = opts.as_read_opts();
         let (mut fi, _, disks) = self
-            .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
+            .get_object_fileinfo_for_metadata_update(bucket, object, &read_opts)
             .await?
             .into_owned();
 
@@ -9294,35 +9294,55 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         };
 
-        let (read_quorum, write_quorum) = match Self::object_quorum_from_meta(&metas, &errs, self.default_parity_count) {
-            Ok((r, w)) => (
-                usize::try_from(r)
-                    .map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![src_bucket, src_object]))?,
-                usize::try_from(w)
-                    .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![src_bucket, src_object]))?,
-            ),
+        let src_version_id = src_opts.version_id.as_deref().unwrap_or_default();
+        let quorum = Self::object_quorum_from_meta(&metas, &errs, self.default_parity_count);
+        let selection = match &quorum {
+            Ok((read_quorum, write_quorum)) => {
+                let read_quorum = usize::try_from(*read_quorum)
+                    .map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![src_bucket, src_object]))?;
+                let write_quorum = usize::try_from(*write_quorum)
+                    .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![src_bucket, src_object]))?;
+                Self::select_fileinfo_for_read(src_bucket, &disks, &metas, &errs, src_version_id, read_quorum, write_quorum)
+                    .map(|(online_disks, fi)| (online_disks, fi, write_quorum))
+            }
+            Err(err) => Err(err.clone()),
+        };
+        let (online_disks, mut fi, write_quorum) = match selection {
+            Ok(selection) => selection,
             Err(mut err) => {
-                if err == DiskError::ErasureReadQuorum
-                    && !src_bucket.starts_with(RUSTFS_META_BUCKET)
-                    && self
-                        .delete_if_dangling(src_bucket, src_object, &metas, &errs, &HashMap::new(), src_opts.clone())
-                        .await
-                        .is_ok()
+                // The merged latest version can be one a failed PUT left below
+                // quorum; resolve it like a latest GET before the dangling
+                // cleanup below can report a key with a committed version absent.
+                if let Some(snapshot) = self
+                    .select_latest_past_dangling_versions(src_bucket, src_object, src_opts, true, &disks, &err)
+                    .await
                 {
-                    if src_opts.version_id.is_some() {
-                        err = DiskError::FileVersionNotFound
-                    } else {
-                        err = DiskError::FileNotFound
+                    // A version-only copy writes the served version's own
+                    // copies, so they and its write quorum replace the latest
+                    // read's.
+                    let (fi, parts_metadata, online_disks) = snapshot.into_owned();
+                    metas = parts_metadata;
+                    let write_quorum = fi.write_quorum(self.default_write_quorum());
+                    (online_disks, fi, write_quorum)
+                } else {
+                    if quorum.is_err()
+                        && err == DiskError::ErasureReadQuorum
+                        && !src_bucket.starts_with(RUSTFS_META_BUCKET)
+                        && self
+                            .delete_if_dangling(src_bucket, src_object, &metas, &errs, &HashMap::new(), src_opts.clone())
+                            .await
+                            .is_ok()
+                    {
+                        if src_opts.version_id.is_some() {
+                            err = DiskError::FileVersionNotFound
+                        } else {
+                            err = DiskError::FileNotFound
+                        }
                     }
+                    return Err(to_object_err(err.into(), vec![src_bucket, src_object]));
                 }
-                return Err(to_object_err(err.into(), vec![src_bucket, src_object]));
             }
         };
-
-        let src_version_id = src_opts.version_id.as_deref().unwrap_or_default();
-        let (online_disks, mut fi) =
-            Self::select_fileinfo_for_read(src_bucket, &disks, &metas, &errs, src_version_id, read_quorum, write_quorum)
-                .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
 
         if fi.deleted {
             if src_opts.version_id.is_none() {
@@ -9461,6 +9481,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 }
             }
 
+            // A version-only copy writes and then reverts on a quorum miss;
+            // refuse it before writing when the served version's disks cannot
+            // reach its write quorum even if every write succeeds.
+            let reachable = online_disks
+                .iter()
+                .map(|disk| disk.is_none().then_some(DiskError::DiskNotFound))
+                .collect::<Vec<_>>();
+            if let Some(err) = reduce_write_quorum_errs(&reachable, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+                return Err(to_object_err(err.into(), vec![src_bucket, src_object]));
+            }
             Self::write_unique_file_info(&online_disks, "", src_bucket, src_object, &metas, write_quorum)
                 .await
                 .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
@@ -11147,44 +11177,62 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         };
 
-        let (read_quorum, write_quorum) = match Self::object_quorum_from_meta(&metas, &errs, self.default_parity_count) {
-            Ok((read_quorum, write_quorum)) => (read_quorum, write_quorum),
+        let version_id = opts.version_id.as_deref().unwrap_or_default();
+        let quorum = Self::object_quorum_from_meta(&metas, &errs, self.default_parity_count);
+        let selection = match &quorum {
+            Ok((read_quorum, write_quorum)) => {
+                let read_quorum = usize::try_from(*read_quorum)
+                    .map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]))?;
+                let write_quorum = usize::try_from(*write_quorum)
+                    .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![bucket, object]))?;
+                Self::select_fileinfo_for_read(bucket, &disks, &metas, &errs, version_id, read_quorum, write_quorum)
+            }
+            Err(err) => Err(err.clone()),
+        };
+        let (online_disks, mut fi) = match selection {
+            Ok(selection) => selection,
             Err(mut err) => {
-                // A replication terminal CAS is a validation/write-back
-                // attempt, never a heal operation. In particular,
-                // ValidateOnly must remain zero-write, and a worker whose
-                // outer replication lease is already lost must not delete the
-                // surviving xl.meta copies before the namespace fence below
-                // can reject it. Leave dangling cleanup to heal/scanner.
-                if opts.replication_status_writeback.is_some() {
+                // The merged latest version can be one a failed PUT left below
+                // quorum; resolve it like a latest GET before the dangling
+                // cleanup below can report a key with a committed version absent.
+                // A replication terminal CAS stays side-effect free: the walk
+                // queues heal for the versions it skips, so it does not run.
+                let resolved = if opts.replication_status_writeback.is_none() {
+                    self.select_latest_past_dangling_versions(bucket, object, opts, false, &disks, &err)
+                        .await
+                } else {
+                    None
+                };
+                if let Some(snapshot) = resolved {
+                    let (fi, _, online_disks) = snapshot.into_owned();
+                    (online_disks, fi)
+                } else {
+                    // A replication terminal CAS is a validation/write-back
+                    // attempt, never a heal operation. In particular,
+                    // ValidateOnly must remain zero-write, and a worker whose
+                    // outer replication lease is already lost must not delete
+                    // the surviving xl.meta copies before the namespace fence
+                    // below can reject it. Leave dangling cleanup to
+                    // heal/scanner.
+                    if quorum.is_err()
+                        && opts.replication_status_writeback.is_none()
+                        && err == DiskError::ErasureReadQuorum
+                        && !bucket.starts_with(RUSTFS_META_BUCKET)
+                        && self
+                            .delete_if_dangling(bucket, object, &metas, &errs, &HashMap::new(), opts.clone())
+                            .await
+                            .is_ok()
+                    {
+                        if opts.version_id.is_some() {
+                            err = DiskError::FileVersionNotFound
+                        } else {
+                            err = DiskError::FileNotFound
+                        }
+                    }
                     return Err(to_object_err(err.into(), vec![bucket, object]));
                 }
-                if err == DiskError::ErasureReadQuorum
-                    && !bucket.starts_with(RUSTFS_META_BUCKET)
-                    && self
-                        .delete_if_dangling(bucket, object, &metas, &errs, &HashMap::new(), opts.clone())
-                        .await
-                        .is_ok()
-                {
-                    if opts.version_id.is_some() {
-                        err = DiskError::FileVersionNotFound
-                    } else {
-                        err = DiskError::FileNotFound
-                    }
-                }
-                return Err(to_object_err(err.into(), vec![bucket, object]));
             }
         };
-
-        let read_quorum =
-            usize::try_from(read_quorum).map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]))?;
-        let write_quorum = usize::try_from(write_quorum)
-            .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![bucket, object]))?;
-
-        let version_id = opts.version_id.as_deref().unwrap_or_default();
-        let (online_disks, mut fi) =
-            Self::select_fileinfo_for_read(bucket, &disks, &metas, &errs, version_id, read_quorum, write_quorum)
-                .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
 
         if fi.deleted {
             return Err(to_object_err(Error::MethodNotAllowed, vec![bucket, object]));
