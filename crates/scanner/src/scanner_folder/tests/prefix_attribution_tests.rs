@@ -47,7 +47,7 @@ async fn run_scan(
     bucket: &str,
     cancelled: bool,
     configured: Option<Arc<super::super::prefix_attribution::Scope>>,
-    recorder: &Recorder,
+    recorder: &impl metrics::Recorder,
 ) -> Result<DataUsageCache, ScannerError> {
     let parent = CancellationToken::new();
     if cancelled {
@@ -77,6 +77,160 @@ async fn run_scan(
             std::future::poll_fn(|cx| metrics::with_local_recorder(recorder, || scan.as_mut().poll(cx))).await
         })
         .await
+}
+
+#[derive(Clone, Debug)]
+struct ExportedCounter {
+    name: String,
+    labels: Vec<(String, String)>,
+    value: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CounterExporter(Arc<Mutex<Vec<ExportedCounter>>>);
+
+impl opentelemetry_sdk::metrics::exporter::PushMetricExporter for CounterExporter {
+    async fn export(
+        &self,
+        resource: &opentelemetry_sdk::metrics::data::ResourceMetrics,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        use opentelemetry_proto::tonic::{
+            collector::metrics::v1::ExportMetricsServiceRequest,
+            common::v1::any_value,
+            metrics::v1::{AggregationTemporality, metric, number_data_point},
+        };
+        use prost::Message;
+
+        // Use the same SDK-to-OTLP conversion as the production HTTP exporter.
+        let encoded = ExportMetricsServiceRequest::from(resource).encode_to_vec();
+        let decoded = ExportMetricsServiceRequest::decode(encoded.as_slice()).expect("decode exported OTLP protobuf");
+        let mut observed = self.0.lock().expect("lock exported counters");
+        observed.clear();
+        for resource in decoded.resource_metrics {
+            for scope in resource.scope_metrics {
+                for metric in scope.metrics {
+                    if !matches!(
+                        metric.name.as_str(),
+                        TOTAL | ATTRIBUTED | SUCCESSES | "rustfs_scanner_zero_export_test_beacon_total"
+                    ) {
+                        continue;
+                    }
+                    let Some(metric::Data::Sum(sum)) = metric.data else {
+                        panic!("counter exported with non-sum type");
+                    };
+                    assert!(sum.is_monotonic);
+                    assert_eq!(
+                        AggregationTemporality::try_from(sum.aggregation_temporality).expect("known counter temporality"),
+                        AggregationTemporality::Cumulative
+                    );
+                    for point in sum.data_points {
+                        assert!(point.start_time_unix_nano > 0);
+                        assert!(point.time_unix_nano >= point.start_time_unix_nano);
+                        assert_eq!(point.flags, 0);
+                        let Some(number_data_point::Value::AsInt(value)) = point.value else {
+                            panic!("counter point has no integer value");
+                        };
+                        let labels = point
+                            .attributes
+                            .into_iter()
+                            .map(|attr| {
+                                let Some(any_value::Value::StringValue(value)) = attr.value.and_then(|value| value.value) else {
+                                    panic!("counter label is not a string");
+                                };
+                                (attr.key, value)
+                            })
+                            .collect();
+                        observed.push(ExportedCounter {
+                            name: metric.name.clone(),
+                            labels,
+                            value: u64::try_from(value).expect("counter value must be nonnegative"),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        Ok(())
+    }
+
+    fn shutdown_with_timeout(&self, _timeout: std::time::Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+        Ok(())
+    }
+
+    fn temporality(&self) -> opentelemetry_sdk::metrics::Temporality {
+        opentelemetry_sdk::metrics::Temporality::Cumulative
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn configured_zero_total_is_exported_without_manufacturing_unconfigured_points() {
+    use opentelemetry_sdk::metrics::PeriodicReader;
+
+    let (scanner, _retained_temp_dir) = build_test_scanner().await;
+    let disk = scanner.local_disk.clone();
+    let disk_label = disk.path().to_string_lossy().into_owned();
+    let plan = test_scope(PLAN).expect("valid scope");
+    for (bucket, scope, configured) in [
+        ("bucket", Some(plan.clone()), true),
+        ("bucket", None, false),
+        ("other-bucket", Some(plan.clone()), false),
+    ] {
+        let exporter = CounterExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone())
+            .with_interval(std::time::Duration::from_secs(3600))
+            .build();
+        let (provider, recorder) = rustfs_obs::Recorder::builder("scanner-zero-export-test")
+            .with_meter_provider(|builder| builder.with_reader(reader))
+            .build();
+        assert!(matches!(
+            run_scan(disk.clone(), bucket, true, scope, &recorder).await,
+            Err(ScannerError::Other(reason)) if reason == "Operation cancelled"
+        ));
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!("rustfs_scanner_zero_export_test_beacon_total").increment(1);
+        });
+        provider.force_flush().expect("export scanner counters");
+        let rows = exporter.0.lock().expect("lock exported counters").clone();
+        assert!(
+            rows.iter()
+                .any(|row| row.name == "rustfs_scanner_zero_export_test_beacon_total" && row.value == 1)
+        );
+        let has_label = |row: &ExportedCounter, key: &str, value: &str| {
+            row.labels.iter().any(|(label, actual)| label == key && actual == value)
+        };
+        let totals: Vec<_> = rows
+            .iter()
+            .filter(|row| row.name == TOTAL && has_label(row, "bucket", bucket) && has_label(row, "disk", &disk_label))
+            .collect();
+        assert_eq!(totals.len(), usize::from(configured), "total presence requires matching diagnostic scope");
+        if configured {
+            assert_eq!(totals[0].value, 0);
+            assert_eq!(totals[0].labels.len(), 2);
+        }
+        for name in [ATTRIBUTED, SUCCESSES] {
+            for class in ["hot", "cold", "other", "ambiguous"] {
+                let points: Vec<_> = rows
+                    .iter()
+                    .filter(|row| {
+                        row.name == name
+                            && has_label(row, "disk", &disk_label)
+                            && has_label(row, "scope", plan.id())
+                            && has_label(row, "class", class)
+                    })
+                    .collect();
+                assert_eq!(points.len(), usize::from(configured), "attributed series presence");
+                if configured {
+                    assert_eq!(points[0].value, 0);
+                    assert_eq!(points[0].labels.len(), 3);
+                }
+            }
+        }
+        provider.shutdown().expect("stop test exporter");
+    }
 }
 
 #[tokio::test]
@@ -274,11 +428,10 @@ async fn encoded_directory_paths_are_not_attributed_to_a_raw_prefix() {
         .await
         .expect("scan encoded metadata paths");
     let rows = recorder.0.lock().expect("recorder");
-    assert_eq!(
-        rows[&attributed(ATTRIBUTED, &disk_label, plan.id(), "ambiguous")].load(Ordering::Relaxed),
-        4
-    );
-    for class in ["hot", "cold", "other"] {
-        assert_eq!(rows[&attributed(ATTRIBUTED, &disk_label, plan.id(), class)].load(Ordering::Relaxed), 0);
+    for name in [ATTRIBUTED, SUCCESSES] {
+        assert_eq!(rows[&attributed(name, &disk_label, plan.id(), "ambiguous")].load(Ordering::Relaxed), 4);
+        for class in ["hot", "cold", "other"] {
+            assert_eq!(rows[&attributed(name, &disk_label, plan.id(), class)].load(Ordering::Relaxed), 0);
+        }
     }
 }

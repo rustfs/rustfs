@@ -3243,6 +3243,10 @@ pub(crate) async fn scan_data_folder_scoped(
     );
     #[cfg(feature = "diagnostic-prefix-attribution")]
     let prefix_attribution = prefix_attribution::configured_for(&bucket_name, &base_path);
+    #[cfg(feature = "diagnostic-prefix-attribution")]
+    if prefix_attribution.is_some() {
+        object_metadata_visits.increment(0);
+    }
     let next_cycle = cache.info.next_cycle;
     let resume_position_on_entry = cache.has_scan_position();
     let had_scan_checkpoint = cache.info.scan_checkpoint.is_some();
