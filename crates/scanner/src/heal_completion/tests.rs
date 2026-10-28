@@ -181,6 +181,24 @@ fn candidate_group_expiry_and_notification_loss_are_independent() {
             .is_none()
     );
     assert_eq!(observations.terminal_tasks, 0);
+    assert!(observations.admit(key("after-loss"), candidate()).is_none());
+    assert!(observations.pending.contains_key(&key("after-loss")));
+}
+
+#[test]
+fn candidate_group_expiry_uses_earliest_discovery_not_admission_order() {
+    let mut observations = Observations::default();
+    let now = Instant::now();
+    let mut later = candidate();
+    later.first_seen = now + Duration::from_secs(1);
+    let mut earlier = candidate();
+    earlier.first_seen = now;
+    assert!(observations.admit(key("reordered"), later).is_none());
+    assert!(observations.admit(key("reordered"), earlier).is_none());
+    observations.maintain(now + PENDING_TTL);
+    assert!(!observations.pending.contains_key(&key("reordered")));
+    assert_eq!(observations.unknown_counts.get("expired"), Some(&2));
+    assert_eq!(observations.terminal_tasks, 0);
 }
 
 #[test]
