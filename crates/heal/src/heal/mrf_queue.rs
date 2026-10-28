@@ -42,6 +42,7 @@ use rustfs_heal_contracts::heal_channel::{HealAdmissionDropReason, HealAdmission
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -409,11 +410,24 @@ impl MrfQueue {
 
 /// Append one encoded record to `out`.
 pub(crate) fn encode_intent(intent: &MrfIntent, out: &mut Vec<u8>) -> bool {
+    let start = out.len();
+    match encode_intent_to_writer(intent, out) {
+        Ok(true) => true,
+        _ => {
+            out.truncate(start);
+            false
+        }
+    }
+}
+
+// A caller supplying a fallible writer must discard its output after an
+// error; only the Vec adapter above can roll back its own partial record.
+fn encode_intent_to_writer(intent: &MrfIntent, out: &mut impl Write) -> io::Result<bool> {
     let Ok(bucket_len) = u32::try_from(intent.bucket.len()) else {
-        return false;
+        return Ok(false);
     };
     let Ok(object_len) = u32::try_from(intent.object.len()) else {
-        return false;
+        return Ok(false);
     };
     let scope = (!matches!(intent.kind, rustfs_common::mrf_channel::MrfKind::MetadataCorruption))
         .then_some(intent.scope)
@@ -422,62 +436,68 @@ pub(crate) fn encode_intent(intent: &MrfIntent, out: &mut Vec<u8>) -> bool {
     let purge = match intent.kind {
         MrfKind::DeleteMarkerPurge => match intent.delete_marker_purge.as_ref().filter(|payload| payload.is_valid()) {
             Some(payload) if version_id.is_some() && scope.is_some() => Some(payload),
-            _ => return false,
+            _ => return Ok(false),
         },
         _ if intent.delete_marker_purge.is_none() => None,
-        _ => return false,
+        _ => return Ok(false),
     };
-    let start = out.len();
-    out.push(MRF_JOURNAL_FORMAT);
-    out.push(if purge.is_some() {
-        MRF_JOURNAL_VERSION_DELETE_MARKER_PURGE
-    } else if scope.is_some() {
-        MRF_JOURNAL_VERSION_SCOPED
-    } else {
-        MRF_JOURNAL_VERSION
-    });
-    out.push(match intent.kind {
-        rustfs_common::mrf_channel::MrfKind::DecodeFailure => 1,
-        rustfs_common::mrf_channel::MrfKind::MetadataCorruption => 2,
-        rustfs_common::mrf_channel::MrfKind::PartialWrite => 3,
-        rustfs_common::mrf_channel::MrfKind::DeleteMarkerPurge => 4,
-    });
-    out.push(intent.attempts);
-    out.extend_from_slice(&intent.enqueued_at_ms.to_le_bytes());
-    match version_id {
-        Some(bytes) => {
-            out.push(1);
-            out.extend_from_slice(&bytes);
-        }
-        None => out.push(0),
-    }
-    if let Some(scope) = scope {
-        out.extend_from_slice(&scope.pool_index.to_le_bytes());
-        out.extend_from_slice(&scope.set_index.to_le_bytes());
-    }
-    out.extend_from_slice(&bucket_len.to_le_bytes());
-    out.extend_from_slice(&object_len.to_le_bytes());
-    out.extend_from_slice(intent.bucket.as_bytes());
-    out.extend_from_slice(intent.object.as_bytes());
-    if let Some(purge) = purge {
-        let Ok(marker_len) = u32::try_from(purge.marker.len()) else {
-            out.truncate(start);
-            return false;
+    let marker_len = match purge {
+        Some(payload) => match u32::try_from(payload.marker.len()) {
+            Ok(length) => Some(length),
+            Err(_) => return Ok(false),
+        },
+        None => None,
+    };
+    let mut crc = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+    {
+        let mut write_record = |bytes: &[u8]| -> io::Result<()> {
+            out.write_all(bytes)?;
+            crc.update(bytes);
+            Ok(())
         };
-        out.extend_from_slice(purge.bucket_incarnation_id.as_bytes());
-        out.extend_from_slice(purge.marker_incarnation_id.as_bytes());
-        out.extend_from_slice(&purge.marker_identity);
-        out.extend_from_slice(&marker_len.to_le_bytes());
-        out.extend_from_slice(&purge.marker);
+        write_record(&[MRF_JOURNAL_FORMAT])?;
+        write_record(&[if purge.is_some() {
+            MRF_JOURNAL_VERSION_DELETE_MARKER_PURGE
+        } else if scope.is_some() {
+            MRF_JOURNAL_VERSION_SCOPED
+        } else {
+            MRF_JOURNAL_VERSION
+        }])?;
+        write_record(&[match intent.kind {
+            rustfs_common::mrf_channel::MrfKind::DecodeFailure => 1,
+            rustfs_common::mrf_channel::MrfKind::MetadataCorruption => 2,
+            rustfs_common::mrf_channel::MrfKind::PartialWrite => 3,
+            rustfs_common::mrf_channel::MrfKind::DeleteMarkerPurge => 4,
+        }])?;
+        write_record(&[intent.attempts])?;
+        write_record(&intent.enqueued_at_ms.to_le_bytes())?;
+        match version_id {
+            Some(bytes) => {
+                write_record(&[1])?;
+                write_record(&bytes)?;
+            }
+            None => write_record(&[0])?,
+        }
+        if let Some(scope) = scope {
+            write_record(&scope.pool_index.to_le_bytes())?;
+            write_record(&scope.set_index.to_le_bytes())?;
+        }
+        write_record(&bucket_len.to_le_bytes())?;
+        write_record(&object_len.to_le_bytes())?;
+        write_record(intent.bucket.as_bytes())?;
+        write_record(intent.object.as_bytes())?;
+        if let Some(purge) = purge {
+            let Some(marker_len) = marker_len else { return Ok(false) };
+            write_record(purge.bucket_incarnation_id.as_bytes())?;
+            write_record(purge.marker_incarnation_id.as_bytes())?;
+            write_record(&purge.marker_identity)?;
+            write_record(&marker_len.to_le_bytes())?;
+            write_record(&purge.marker)?;
+        }
     }
-    let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
-    hasher.update(&out[start..]);
-    let Ok(checksum) = u32::try_from(hasher.finalize()) else {
-        out.truncate(start);
-        return false;
-    };
-    out.extend_from_slice(&checksum.to_le_bytes());
-    true
+    let checksum = u32::try_from(crc.finalize()).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid MRF CRC"))?;
+    out.write_all(&checksum.to_le_bytes())?;
+    Ok(true)
 }
 
 fn decode_one(data: &[u8]) -> Option<(MrfIntent, usize)> {
@@ -745,9 +765,24 @@ fn decode_mrf_lifecycle_checkpoint(data: &[u8], byte_limit: usize) -> Result<Mrf
     Ok(decoded)
 }
 
+struct IntentDigestWriter(sha2::Sha256);
+
+impl Write for IntentDigestWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn intent_digest(intent: &MrfIntent) -> Option<[u8; 32]> {
-    let mut encoded = Vec::new();
-    encode_intent(intent, &mut encoded).then(|| sha2::Sha256::digest(encoded).into())
+    let mut encoded = IntentDigestWriter(sha2::Sha256::new());
+    encode_intent_to_writer(intent, &mut encoded)
+        .ok()?
+        .then(|| encoded.0.finalize().into())
 }
 
 // ---------------------------------------------------------------------------
@@ -2409,7 +2444,7 @@ mod tests {
     use crate::heal::manager::HealConfig;
     use crate::heal::storage::{ECStoreHealStorage, HealStorageAPI};
     use crate::heal::{DiskError, RUSTFS_META_BUCKET};
-    use rustfs_common::mrf_channel::{MrfIntent, MrfKind, MrfVerifiedRepairDisposition, MrfVerifiedRepairEvent};
+    use rustfs_common::mrf_channel::{MrfIntent, MrfKind, MrfScope, MrfVerifiedRepairDisposition, MrfVerifiedRepairEvent};
     use serde_json::{Map, Value, json};
     use serial_test::serial;
     use std::env;
@@ -2537,6 +2572,73 @@ mod tests {
         let mut payload = Vec::new();
         assert!(encode_intent(intent, &mut payload), "fixture intent must encode");
         payload
+    }
+
+    #[test]
+    fn streaming_intent_codec_preserves_existing_wire_bytes_and_digest() {
+        let mut plain = intent("b", "o", 0);
+        plain.version_id = None;
+        let mut scoped = plain.clone();
+        scoped.kind = MrfKind::PartialWrite;
+        scoped.version_id = Some([7; 16]);
+        scoped.scope = Some(MrfScope {
+            pool_index: 2,
+            set_index: 3,
+        });
+        let mut purge = scoped.clone();
+        purge.kind = MrfKind::DeleteMarkerPurge;
+        let incarnation = Uuid::from_u128(1);
+        purge.delete_marker_purge = MrfDeleteMarkerPurge::new(incarnation, incarnation, [9; 32], vec![1, 2]);
+        let cases = [
+            (plain, "010101000068e5cf8b010000000100000001000000626f883931f3"),
+            (
+                scoped,
+                "010203000068e5cf8b010000010707070707070707070707070707070702000000030000000100000001000000626f59661dd0",
+            ),
+            (
+                purge,
+                "010304000068e5cf8b010000010707070707070707070707070707070702000000030000000100000001000000626f00000000000000000000000000000001000000000000000000000000000000010909090909090909090909090909090909090909090909090909090909090909020000000102304b263e",
+            ),
+        ];
+        for (intent, expected_hex) in cases {
+            let encoded = encoded_payload(&intent);
+            let actual_hex: String = encoded.iter().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(actual_hex, expected_hex);
+            let expected_digest: [u8; 32] = sha2::Sha256::digest(&encoded).into();
+            assert_eq!(intent_digest(&intent), Some(expected_digest));
+        }
+    }
+
+    #[test]
+    fn streaming_intent_codec_propagates_writer_failure_and_rejects_invalid_record() {
+        struct PartialFailure(Vec<u8>);
+        impl Write for PartialFailure {
+            fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+                let remaining = 5usize.saturating_sub(self.0.len());
+                if remaining == 0 {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+                let written = remaining.min(input.len());
+                self.0.extend_from_slice(&input[..written]);
+                Ok(written)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let valid = intent("b", "o", 0);
+        let mut partial = PartialFailure(Vec::new());
+        assert_eq!(
+            encode_intent_to_writer(&valid, &mut partial).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(partial.0.len(), 5, "the caller must discard a partially written fallible output");
+        let mut invalid = valid;
+        invalid.kind = MrfKind::DeleteMarkerPurge;
+        let mut bytes = b"prefix".to_vec();
+        assert!(!encode_intent(&invalid, &mut bytes));
+        assert_eq!(bytes, b"prefix");
+        assert_eq!(intent_digest(&invalid), None);
     }
 
     #[test]
