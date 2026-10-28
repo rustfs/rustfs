@@ -150,10 +150,10 @@ setup = 'ecstore-base-stack'
 filter = 'binary(lifecycle_integration_test) | (package(rustfs) & test(/^app::lifecycle_transition_api_test::/))'
 setup = 'lifecycle-large-stack'
 
-# The pool metadata placement regression composes the full erasure-heal
-# startup future and overflows the default Linux test-thread stack.
+# These heal fixtures compose deep real-store recovery futures that can
+# overflow the default Linux test-thread stack.
 [[profile.default.scripts]]
-filter = 'package(rustfs-heal) & test(=replacement_pool_metadata_follows_real_two_set_placement)'
+filter = 'package(rustfs-heal) & (test(=replacement_pool_metadata_follows_real_two_set_placement) | (binary(heal_integration_test) & test(=bucket_removal_recovers_delete_proofs_before_removing_empty_volumes)))'
 setup = 'ecstore-large-stack'
 
 # These real-disk scanner fixtures assert quiet-workload publication and
@@ -448,10 +448,10 @@ setup = 'ecstore-base-stack'
 filter = 'binary(lifecycle_integration_test) | (package(rustfs) & test(/^app::lifecycle_transition_api_test::/))'
 setup = 'lifecycle-large-stack'
 
-# The pool metadata placement regression composes the full erasure-heal
-# startup future and overflows the default Linux test-thread stack.
+# These heal fixtures compose deep real-store recovery futures that can
+# overflow the default Linux test-thread stack.
 [[profile.ci.scripts]]
-filter = 'package(rustfs-heal) & test(=replacement_pool_metadata_follows_real_two_set_placement)'
+filter = 'package(rustfs-heal) & (test(=replacement_pool_metadata_follows_real_two_set_placement) | (binary(heal_integration_test) & test(=bucket_removal_recovers_delete_proofs_before_removing_empty_volumes)))'
 setup = 'ecstore-large-stack'
 
 # These real-disk scanner fixtures assert quiet-workload publication and
