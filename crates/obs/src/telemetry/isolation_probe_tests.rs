@@ -677,4 +677,86 @@ mod async_isolation {
         assert_eq!(json[0]["target"].as_str(), Some("isolation_outer_control"));
         assert_eq!(logs[0].0.target().map(|target| target.as_ref()), Some("isolation_outer_control"));
     }
+
+    #[derive(Clone)]
+    struct ObservedPanicWriter(Arc<AtomicBool>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ObservedPanicWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Write for ObservedPanicWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            self.0.store(true, Ordering::SeqCst);
+            panic!("synthetic writer panic");
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn classify_panic_isolation() -> &'static str {
+        let outer = Sinks::new(true, true);
+        let reached = Arc::new(AtomicBool::new(false));
+        let panic_dispatch = Dispatch::new(tracing_subscriber::registry().with(build_json_log_layer(
+            ObservedPanicWriter(Arc::clone(&reached)),
+            false,
+            FmtSpan::NONE,
+            true,
+        )));
+        let (caught, span_restored, trace_restored, baggage_restored) = dispatcher::with_default(&outer.dispatch, || {
+            let span = parent_span(&outer.dispatch);
+            let _span = span.enter();
+            let _context = fake_ambient_context().attach();
+            let caught = catch_unwind(AssertUnwindSafe(|| emit_candidate(&panic_dispatch, 0))).is_err();
+            let span_restored = tracing::Span::current().id() == span.id();
+            let current = Context::current();
+            let trace_restored = current.span().span_context().trace_id() == TraceId::from(17);
+            let baggage_restored = current.baggage().get("synthetic-secret").is_some();
+            tracing::info!(target: "isolation_outer_control", value = 1_u64, "outer control");
+            (caught, span_restored, trace_restored, baggage_restored)
+        });
+        if !reached.load(Ordering::SeqCst) {
+            return "writer_not_reached";
+        }
+        if !caught {
+            return "writer_panic_not_caught";
+        }
+        if !span_restored {
+            return "tracing_not_restored";
+        }
+        if !trace_restored {
+            return "trace_not_restored";
+        }
+        if !baggage_restored {
+            return "baggage_not_restored";
+        }
+        let json = outer.json_records();
+        let logs = outer.exported_records();
+        if json.len() == 2
+            && json[0]["target"].as_str() == Some(TARGET)
+            && json[1]["target"].as_str() == Some("isolation_outer_control")
+        {
+            return "stale_isolated_json";
+        }
+        if json.len() != 1 || json[0]["target"].as_str() != Some("isolation_outer_control") {
+            return "outer_json_unexpected";
+        }
+        if logs.len() != 1 || logs[0].0.target().map(|target| target.as_ref()) != Some("isolation_outer_control") {
+            return "outer_otel_unexpected";
+        }
+        "clean"
+    }
+
+    #[test]
+    fn classify_panic_writer_isolation_without_raw_output() {
+        let class = catch_unwind(AssertUnwindSafe(classify_panic_isolation)).unwrap_or("diagnostic_internal_panic");
+        println!("\nRUSTFS_PANIC_DIAGNOSTIC={class}");
+        assert!(class == "clean", "isolation diagnostic failed");
+    }
 }
