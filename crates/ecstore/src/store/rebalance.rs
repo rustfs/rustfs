@@ -122,6 +122,51 @@ async fn pause_prepared_pool_read_before_refetch(object: &str) {
         state.refetch_release.notified().await;
     }
 }
+/// Capacity that every online drive of one pool reports to free-space target
+/// selection, per store, until the guard drops.
+#[cfg(test)]
+static POOL_SPACE_FOR_TEST: std::sync::Mutex<Vec<(Uuid, usize, crate::disk::DiskInfo)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) struct PoolSpaceForTest(Uuid);
+
+#[cfg(test)]
+impl PoolSpaceForTest {
+    pub(crate) fn install(store: Uuid, pools: &[(usize, crate::disk::DiskInfo)]) -> Self {
+        POOL_SPACE_FOR_TEST
+            .lock()
+            .expect("pool space override must not be poisoned")
+            .extend(pools.iter().map(|(pool, info)| (store, *pool, info.clone())));
+        Self(store)
+    }
+}
+
+#[cfg(test)]
+impl Drop for PoolSpaceForTest {
+    fn drop(&mut self) {
+        POOL_SPACE_FOR_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(store, _, _)| *store != self.0);
+    }
+}
+
+#[cfg(test)]
+fn pool_space_for_test(
+    store: Uuid,
+    pool: usize,
+    infos: Vec<Option<crate::disk::DiskInfo>>,
+) -> Vec<Option<crate::disk::DiskInfo>> {
+    let overrides = POOL_SPACE_FOR_TEST.lock().expect("pool space override must not be poisoned");
+    let Some((_, _, info)) = overrides
+        .iter()
+        .find(|(override_store, override_pool, _)| *override_store == store && *override_pool == pool)
+    else {
+        return infos;
+    };
+    infos.into_iter().map(|disk| disk.map(|_| info.clone())).collect()
+}
+
 #[cfg(test)]
 use support::resolve_latest_object_info_candidates;
 use support::{
@@ -438,30 +483,7 @@ impl ECStore {
     }
 
     pub(super) async fn get_available_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Option<usize> {
-        // // Return a random one first
-
-        let mut server_pools = self.get_server_pools_available_space(bucket, object, size).await;
-        server_pools.filter_max_used(100 - (100_f64 * DISK_RESERVE_FRACTION) as u64);
-        let total = server_pools.total_available();
-
-        if total == 0 {
-            return None;
-        }
-
-        let mut rng = rand::rng();
-        let random_u64: u64 = rng.random_range(0..total);
-
-        let choose = random_u64 % total;
-        let mut at_total = 0;
-
-        for pool in server_pools.iter() {
-            at_total += pool.available;
-            if at_total > choose && pool.available > 0 {
-                return Some(pool.index);
-            }
-        }
-
-        None
+        self.get_available_pool_idx_preferring(bucket, object, size, None, None).await
     }
 
     pub(super) async fn get_available_pool_idx_excluding(
@@ -471,11 +493,31 @@ impl ECStore {
         size: i64,
         excluded_pool_idx: usize,
     ) -> Option<usize> {
+        self.get_available_pool_idx_preferring(bucket, object, size, Some(excluded_pool_idx), None)
+            .await
+    }
+
+    /// Free-space choice among the pools that can take `size` more bytes,
+    /// weighted by available space. `preferred_pool_idx` is returned whenever
+    /// it passes the same checks, so a full or excluded pool is never forced.
+    pub(super) async fn get_available_pool_idx_preferring(
+        &self,
+        bucket: &str,
+        object: &str,
+        size: i64,
+        excluded_pool_idx: Option<usize>,
+        preferred_pool_idx: Option<usize>,
+    ) -> Option<usize> {
         let mut server_pools = self.get_server_pools_available_space(bucket, object, size).await;
         server_pools.filter_max_used(100 - (100_f64 * DISK_RESERVE_FRACTION) as u64);
 
-        if let Some(pool) = server_pools.0.get_mut(excluded_pool_idx) {
+        if let Some(pool) = excluded_pool_idx.and_then(|idx| server_pools.0.get_mut(idx)) {
             pool.available = 0;
+        }
+        if let Some(pool_idx) = preferred_pool_idx
+            && server_pools.0.get(pool_idx).is_some_and(|pool| pool.available > 0)
+        {
+            return Some(pool_idx);
         }
 
         let total = server_pools.total_available();
@@ -509,6 +551,8 @@ impl ECStore {
 
             let disks = pool.get_disks_by_key(object).disk_inventory().await;
             let disk_infos = get_disk_infos(&disks).await;
+            #[cfg(test)]
+            let disk_infos = pool_space_for_test(self.id, idx, disk_infos);
 
             (idx, pool.set_count, disk_infos)
         }))

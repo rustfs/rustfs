@@ -278,6 +278,10 @@ const MAX_DANGLING_LATEST_VERSIONS: usize = 8;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DanglingRead {
     KeepQuorumError,
+    /// Metadata updates of the latest version keep the quorum error but, like
+    /// object reads, look past newer versions proven dangling
+    /// (`read_latest_past_dangling_versions`).
+    SkipDanglingVersions,
     ReportNotFound,
 }
 
@@ -729,9 +733,10 @@ impl SetDisks {
     }
 
     /// Like `get_object_fileinfo`, but `allow_early_stop=false` forces the full
-    /// quorum fanout. Read-before-write callers (object tagging) must use this:
-    /// the returned online-disk set is the write target, and the early-stop
-    /// subset would fail write quorum (backlog#872 regression fix).
+    /// quorum fanout. Read-before-write callers must use this or
+    /// `get_object_fileinfo_for_metadata_update`: the returned online-disk set
+    /// is the write target, and the early-stop subset would fail write quorum
+    /// (backlog#872 regression fix).
     #[tracing::instrument(level = "debug", skip(self))]
     pub(in crate::set_disk) async fn get_object_fileinfo_gated(
         &self,
@@ -750,6 +755,64 @@ impl SetDisks {
             MetadataReadPurpose::FullLayout,
             DanglingRead::KeepQuorumError,
         )
+        .await
+    }
+
+    /// The full-fanout read behind a metadata update such as object tagging.
+    /// A latest read whose newest versions never committed resolves to the
+    /// version a latest GET serves, while a dangling key keeps the quorum
+    /// error. The returned online disks are the write target.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub(in crate::set_disk) async fn get_object_fileinfo_for_metadata_update(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<GetObjectFileInfo> {
+        self.get_object_fileinfo_gated_inner(
+            bucket,
+            object,
+            opts,
+            false,
+            false,
+            MetadataReadPurpose::FullLayout,
+            DanglingRead::SkipDanglingVersions,
+        )
+        .await
+    }
+
+    /// Recovers a failed latest selection in read-before-write callers that
+    /// read and select metadata themselves (`put_object_metadata` and the
+    /// CopyObject source) the way a latest GET does. `None` keeps the caller's
+    /// error: a failure other than read quorum, an explicit version, the
+    /// system bucket's commit-proof rule, or a walk that finds no readable
+    /// version or cannot read every drive. The selected metadata keeps its
+    /// part checksums because a version-only copy carries them into the new
+    /// version.
+    pub(in crate::set_disk) async fn select_latest_past_dangling_versions(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        read_data: bool,
+        disks: &[Option<DiskStore>],
+        err: &DiskError,
+    ) -> Option<GetObjectFileInfo> {
+        if *err != DiskError::ErasureReadQuorum || opts.version_id.is_some() || crate::bucket::utils::is_meta_bucketname(bucket) {
+            return None;
+        }
+        let opts = ObjectOptions {
+            include_part_checksums: true,
+            ..opts.clone()
+        };
+        Box::pin(self.read_latest_past_dangling_versions(
+            bucket,
+            object,
+            &opts,
+            read_data,
+            MetadataReadPurpose::FullLayout,
+            disks,
+        ))
         .await
     }
 
@@ -978,7 +1041,7 @@ impl SetDisks {
                 Err(err) => {
                     if err == DiskError::ErasureReadQuorum
                         && vid.is_empty()
-                        && dangling_read == DanglingRead::ReportNotFound
+                        && dangling_read != DanglingRead::KeepQuorumError
                         && metadata_fanout_complete
                         && !crate::bucket::utils::is_meta_bucketname(bucket)
                         && let Some(snapshot) =
@@ -9930,6 +9993,7 @@ mod dangling_read_tests {
     use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
     use crate::storage_api_contracts::object::ObjectOperations;
     use http::HeaderMap;
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
@@ -10449,6 +10513,353 @@ mod dangling_read_tests {
             .await
             .expect("with every drive answering the dangling version is skipped");
         assert_ne!(latest.version_id, Some(v2));
+    }
+
+    /// Version one on every drive under a version two that a failed PUT left
+    /// on drives `0..3`, below the read quorum of four.
+    async fn put_committed_below_dangling(set: &SetDisks, bucket: &str, object: &str) -> (Uuid, Uuid) {
+        let v1 = put(set, bucket, object, b"version one", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id");
+        let v2 = put(set, bucket, object, b"version two", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id");
+        drop_version_from(set, bucket, object, v2, 3..DRIVES).await;
+        (v1, v2)
+    }
+
+    /// Each drive's copy of `version_id`, or `None` where the drive lacks it.
+    async fn version_metadata(
+        set: &SetDisks,
+        bucket: &str,
+        object: &str,
+        version_id: Uuid,
+    ) -> Vec<Option<HashMap<String, String>>> {
+        let disks = set.disks.read().await.clone();
+        let mut copies = Vec::with_capacity(disks.len());
+        for disk in &disks {
+            let disk = disk.as_ref().expect("every drive should be online");
+            copies.push(
+                disk.read_version("", bucket, object, &version_id.to_string(), &ReadOptions::default())
+                    .await
+                    .ok()
+                    .map(|fi| fi.metadata),
+            );
+        }
+        copies
+    }
+
+    #[tokio::test]
+    async fn latest_tagging_skips_dangling_versions_above_a_committed_version() {
+        let bucket = "dangling-latest-tagging";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        let (v1, v2) = put_committed_below_dangling(&set, bucket, object).await;
+        let tag_of = |metadata: &Option<HashMap<String, String>>| {
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get(rustfs_utils::http::headers::AMZ_OBJECT_TAGGING).cloned())
+        };
+
+        let tagged = set
+            .put_object_tags(bucket, object, "stage=committed", &ObjectOptions::default())
+            .await
+            .expect("PutObjectTagging must update the version a latest GET serves");
+        assert_eq!(tagged.version_id, Some(v1));
+        for (disk, metadata) in version_metadata(&set, bucket, object, v1).await.iter().enumerate() {
+            assert_eq!(
+                tag_of(metadata).as_deref(),
+                Some("stage=committed"),
+                "drive {disk} must carry the tag on version one"
+            );
+        }
+        for (disk, metadata) in version_metadata(&set, bucket, object, v2).await.iter().enumerate() {
+            assert_eq!(tag_of(metadata), None, "drive {disk} must leave the dangling version untouched");
+        }
+        assert_eq!(*head(&set, bucket, object, None).await.expect("latest HEAD").user_tags, "stage=committed");
+
+        let untagged = set
+            .delete_object_tags(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("DeleteObjectTagging must update the version a latest GET serves");
+        assert_eq!(untagged.version_id, Some(v1));
+        for (disk, metadata) in version_metadata(&set, bucket, object, v1).await.iter().enumerate() {
+            assert_eq!(tag_of(metadata).as_deref(), Some(""), "drive {disk} must clear the tag on version one");
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_metadata_update_skips_dangling_versions_above_a_committed_version() {
+        let bucket = "dangling-latest-metadata";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        let (v1, v2) = put_committed_below_dangling(&set, bucket, object).await;
+
+        let updated = set
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    eval_metadata: Some(HashMap::from([("x-amz-meta-probe".to_string(), "updated".to_string())])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a latest metadata update must target the version a latest GET serves");
+        assert_eq!(updated.version_id, Some(v1));
+        assert!(updated.is_latest, "the updated version is the latest one");
+        for (disk, metadata) in version_metadata(&set, bucket, object, v1).await.iter().enumerate() {
+            let metadata = metadata.as_ref().expect("version one is on every drive");
+            assert_eq!(metadata.get("x-amz-meta-probe").map(String::as_str), Some("updated"), "drive {disk}");
+        }
+        for (disk, metadata) in version_metadata(&set, bucket, object, v2).await.iter().enumerate() {
+            assert!(
+                metadata
+                    .as_ref()
+                    .is_none_or(|metadata| !metadata.contains_key("x-amz-meta-probe")),
+                "drive {disk} must leave the dangling version untouched"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_copy_source_skips_dangling_versions_above_a_committed_version() {
+        let bucket = "dangling-latest-copy";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+
+        // A metadata-only self-copy rewrites the latest version in place.
+        let object = "torn/in-place";
+        let (v1, _) = put_committed_below_dangling(&set, bucket, object).await;
+        let mut source = head(&set, bucket, object, None).await.expect("latest HEAD");
+        assert_eq!(source.version_id, Some(v1));
+        source.metadata_only = true;
+        source.user_defined = Arc::new(HashMap::from([("x-amz-meta-copied".to_string(), "in-place".to_string())]));
+        let copied = set
+            .copy_object(
+                bucket,
+                object,
+                bucket,
+                object,
+                &mut source,
+                &ObjectOptions::default(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("a CopyObject source without a version id must resolve like a latest GET");
+        assert_eq!(copied.version_id, Some(v1));
+        for (disk, metadata) in version_metadata(&set, bucket, object, v1).await.iter().enumerate() {
+            let metadata = metadata.as_ref().expect("version one is on every drive");
+            assert_eq!(metadata.get("x-amz-meta-copied").map(String::as_str), Some("in-place"), "drive {disk}");
+        }
+
+        // A version-only self-copy commits a new version that shares the
+        // served version's data.
+        let object = "torn/new-version";
+        let (_, v2) = put_committed_below_dangling(&set, bucket, object).await;
+        let v3 = Uuid::new_v4();
+        let mut source = head(&set, bucket, object, None).await.expect("latest HEAD");
+        source.version_only = true;
+        let copied = set
+            .copy_object(
+                bucket,
+                object,
+                bucket,
+                object,
+                &mut source,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+                &ObjectOptions {
+                    version_id: Some(v3.to_string()),
+                    versioned: true,
+                    object_lock_config_snapshot: Some(Arc::new(crate::object_api::ObjectLockConfigSnapshot::new(
+                        crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a version-only CopyObject source without a version id must resolve like a latest GET");
+        assert_eq!(copied.version_id, Some(v3));
+        let latest = head(&set, bucket, object, None).await.expect("latest HEAD");
+        assert_eq!(latest.version_id, Some(v3));
+        assert_eq!(get(&set, bucket, object, None).await.expect("latest GET"), b"version one");
+        assert!(
+            version_metadata(&set, bucket, object, v2).await[..3]
+                .iter()
+                .all(Option::is_some),
+            "the copy must not remove the dangling version; heal owns its cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_metadata_update_past_dangling_versions_keeps_write_quorum() {
+        // EC 3+3: read quorum three, write quorum four. Version one reached
+        // three drives, so it is readable but below write quorum; versions two
+        // and three are dangling on two drives each. A latest read serves
+        // version one, and a metadata update of it is refused before writing.
+        let bucket = "dangling-latest-write-quorum";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set_with(bucket, 6, 3).await;
+        let mut versions = Vec::new();
+        for body in [b"version zero".as_slice(), b"version one", b"version two", b"version three"] {
+            versions.push(
+                put(&set, bucket, object, body, true)
+                    .await
+                    .version_id
+                    .expect("versioned PUT should assign a version id"),
+            );
+        }
+        let [_, v1, v2, v3] = versions[..] else {
+            unreachable!("four versions were written");
+        };
+        drop_version_from(&set, bucket, object, v1, 3..6).await;
+        drop_version_from(&set, bucket, object, v2, 2..6).await;
+        drop_version_from(&set, bucket, object, v3, 0..3).await;
+        drop_version_from(&set, bucket, object, v3, 5..6).await;
+
+        let latest = head(&set, bucket, object, None)
+            .await
+            .expect("version one is readable at read quorum");
+        assert_eq!(latest.version_id, Some(v1));
+
+        let is_write_quorum_error =
+            |err: &StorageError| matches!(err, StorageError::ErasureWriteQuorum | StorageError::InsufficientWriteQuorum(_, _));
+        let Err(err) = set
+            .put_object_tags(bucket, object, "stage=refused", &ObjectOptions::default())
+            .await
+        else {
+            panic!("tagging a version below write quorum must be refused");
+        };
+        assert!(is_write_quorum_error(&err), "tagging keeps the write-quorum error: {err:?}");
+        let Err(err) = set
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    eval_metadata: Some(HashMap::from([("x-amz-meta-probe".to_string(), "refused".to_string())])),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("a metadata update of a version below write quorum must be refused");
+        };
+        assert!(is_write_quorum_error(&err), "the metadata update keeps the write-quorum error: {err:?}");
+        let v4 = Uuid::new_v4();
+        let mut source = head(&set, bucket, object, None).await.expect("latest HEAD");
+        source.version_only = true;
+        let Err(err) = set
+            .copy_object(
+                bucket,
+                object,
+                bucket,
+                object,
+                &mut source,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+                &ObjectOptions {
+                    version_id: Some(v4.to_string()),
+                    versioned: true,
+                    object_lock_config_snapshot: Some(Arc::new(crate::object_api::ObjectLockConfigSnapshot::new(
+                        crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("a version-only copy of a version below write quorum must be refused");
+        };
+        assert!(is_write_quorum_error(&err), "the version-only copy keeps the write-quorum error: {err:?}");
+        assert!(
+            version_metadata(&set, bucket, object, v4).await.iter().all(Option::is_none),
+            "a refused version-only copy must not write the new version to any drive"
+        );
+        for (disk, metadata) in version_metadata(&set, bucket, object, v1).await.iter().enumerate() {
+            assert!(
+                metadata.as_ref().is_none_or(|metadata| {
+                    !metadata.contains_key(rustfs_utils::http::headers::AMZ_OBJECT_TAGGING)
+                        && !metadata.contains_key("x-amz-meta-probe")
+                }),
+                "drive {disk} must not be written by a refused update"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_status_writeback_never_walks_past_dangling_versions() {
+        // A replication terminal CAS stays side-effect free: it keeps the
+        // read-quorum error instead of resolving the latest version, so it
+        // neither queues heal for the dangling version nor writes version one.
+        let bucket = "dangling-latest-replication-cas";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        let (v1, _) = put_committed_below_dangling(&set, bucket, object).await;
+
+        let Err(err) = set
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    eval_metadata: Some(HashMap::from([("x-amz-meta-probe".to_string(), "written".to_string())])),
+                    replication_status_writeback: Some(Box::new(crate::object_api::ReplicationStatusWritebackCondition {
+                        mode: crate::object_api::ReplicationStatusWritebackMode::ValidateOnly,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("a replication terminal CAS must not resolve past a dangling version");
+        };
+        assert!(is_read_quorum_error(&err), "the CAS keeps the read-quorum error: {err:?}");
+        for (disk, metadata) in version_metadata(&set, bucket, object, v1).await.iter().enumerate() {
+            let metadata = metadata.as_ref().expect("version one is on every drive");
+            assert!(!metadata.contains_key("x-amz-meta-probe"), "drive {disk} must not be written");
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_metadata_updates_past_dangling_versions_require_every_drive_to_answer() {
+        let bucket = "dangling-latest-update-offline";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        put_committed_below_dangling(&set, bucket, object).await;
+        let offline = set.disks.write().await[5].take().expect("drive five should start online");
+
+        let Err(err) = set
+            .put_object_tags(bucket, object, "stage=uncertain", &ObjectOptions::default())
+            .await
+        else {
+            panic!("tagging must not resolve past a version an offline drive may commit");
+        };
+        assert!(is_read_quorum_error(&err), "tagging keeps the read-quorum error: {err:?}");
+        let Err(err) = set
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    eval_metadata: Some(HashMap::from([("x-amz-meta-probe".to_string(), "uncertain".to_string())])),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("a metadata update must not resolve past a version an offline drive may commit");
+        };
+        assert!(is_read_quorum_error(&err), "the metadata update keeps the read-quorum error: {err:?}");
+        set.disks.write().await[5] = Some(offline);
     }
 
     #[tokio::test]

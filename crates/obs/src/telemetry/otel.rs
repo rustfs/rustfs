@@ -83,6 +83,16 @@ const GET_OBJECT_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
     0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+const LOCAL_BATCH_DURATION_HISTOGRAM_METRICS: &[&str] = &[
+    "rustfs_io_get_object_local_batch_prepare_seconds",
+    "rustfs_io_get_object_local_batch_stage_seconds",
+];
+
+const LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
+    0.0000001, 0.00000025, 0.0000005, 0.000001, 0.0000025, 0.000005, 0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001,
+    0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
 const DEFAULT_OTLP_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const OTEL_EXPORTER_OTLP_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_TIMEOUT";
 const OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT";
@@ -481,21 +491,25 @@ fn build_meter_provider(
 }
 
 fn get_object_duration_histogram_view(instrument: &Instrument) -> Option<Stream> {
-    if !is_get_object_duration_histogram_metric(instrument.name()) {
-        return None;
-    }
+    let boundaries = get_object_duration_histogram_buckets(instrument.name())?;
 
     Stream::builder()
         .with_aggregation(Aggregation::ExplicitBucketHistogram {
-            boundaries: GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.to_vec(),
+            boundaries: boundaries.to_vec(),
             record_min_max: true,
         })
         .build()
         .ok()
 }
 
-fn is_get_object_duration_histogram_metric(name: &str) -> bool {
-    GET_OBJECT_DURATION_HISTOGRAM_METRICS.contains(&name)
+fn get_object_duration_histogram_buckets(name: &str) -> Option<&'static [f64]> {
+    if LOCAL_BATCH_DURATION_HISTOGRAM_METRICS.contains(&name) {
+        Some(LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS)
+    } else if GET_OBJECT_DURATION_HISTOGRAM_METRICS.contains(&name) {
+        Some(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS)
+    } else {
+        None
+    }
 }
 
 /// Build an optional [`SdkLoggerProvider`] for the given log endpoint.
@@ -1098,10 +1112,22 @@ mod tests {
 
     #[test]
     fn test_get_object_duration_histogram_metric_match_is_scoped() {
-        assert!(is_get_object_duration_histogram_metric("rustfs_io_get_object_stage_duration_seconds"));
-        assert!(is_get_object_duration_histogram_metric("rustfs_io_get_object_request_duration_seconds"));
-        assert!(!is_get_object_duration_histogram_metric("rustfs_io_put_object_request_duration_seconds"));
-        assert!(!is_get_object_duration_histogram_metric("rustfs_io_get_object_response_size_bytes"));
+        for name in [
+            "rustfs_io_get_object_stage_duration_seconds",
+            "rustfs_io_get_object_request_duration_seconds",
+        ] {
+            assert_eq!(get_object_duration_histogram_buckets(name), Some(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS));
+        }
+        for name in LOCAL_BATCH_DURATION_HISTOGRAM_METRICS {
+            assert_eq!(get_object_duration_histogram_buckets(name), Some(LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS));
+        }
+        for name in [
+            "rustfs_io_put_object_request_duration_seconds",
+            "rustfs_io_get_object_response_size_bytes",
+            "rustfs_io_get_object_local_batch_shards",
+        ] {
+            assert!(get_object_duration_histogram_buckets(name).is_none());
+        }
     }
 
     #[test]
@@ -1109,6 +1135,17 @@ mod tests {
         assert!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.first(), Some(&0.0001));
         assert_eq!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.last(), Some(&10.0));
+    }
+
+    #[test]
+    fn local_batch_duration_buckets_resolve_sub_microsecond_operations() {
+        assert!(
+            LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        assert_eq!(LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS.first(), Some(&0.0000001));
+        assert_eq!(LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS.last(), Some(&10.0));
     }
 
     #[cfg(all(
