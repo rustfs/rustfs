@@ -108,6 +108,21 @@ class ProcessReceiptTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not active"):
             self.attest()
 
+    def test_adaptive_admission_is_bound_to_actual_process_environment(self):
+        key = "RUSTFS_HEAL_ADAPTIVE_ADMISSION"
+        self.public[key] = "true"
+        raw = self.environment + b"RUSTFS_HEAL_ADAPTIVE_ADMISSION=true\0"
+        (self.pid / "environ").write_bytes(raw)
+        result = self.attest()
+        self.assertEqual(result["environment_sha256"], receipt.fingerprint(self.public))
+        self.assertIn(key, result["environment_keys"])
+        for observed in (self.environment, raw.replace(b"ADMISSION=true", b"ADMISSION=false"),
+                         raw + b"RUSTFS_HEAL_ADAPTIVE_ADMISSION=true\0"):
+            with self.subTest(raw_hash=hashlib.sha256(observed).hexdigest()), self.assertRaises(ValueError):
+                receipt.environment_digest(observed, self.public)
+        with self.assertRaisesRegex(ValueError, "mismatch"):
+            receipt.environment_digest(raw, {**self.public, key: "false"})
+
     def test_wrong_binary_content_is_rejected(self):
         self.binary.write_bytes(b"replaced executable")
         with self.assertRaisesRegex(ValueError, "binary digest"):
