@@ -51,6 +51,225 @@ fn publish_terminal(observed: Arc<ObservedHealCompletion>) {
 }
 
 #[test]
+fn mixed_candidate_semantics_settle_independently_in_either_order() {
+    for terminal_first in [false, true] {
+        for reverse in [false, true] {
+            let mut observations = Observations::default();
+            let owner = key("mixed-candidates");
+            let mut terminal = (*completion("mixed-candidates", HealObjectDisposition::VerifiedHealthy)).clone();
+            Arc::make_mut(&mut terminal.completion).scan_mode = HealScanMode::Normal;
+            let terminal = Arc::new(terminal);
+            if terminal_first {
+                assert!(observations.complete(terminal.clone(), Instant::now()).is_none());
+            }
+
+            let mut normal = candidate();
+            normal.mode = HealScanMode::Normal;
+            let mut same_normal = candidate();
+            same_normal.mode = HealScanMode::Normal;
+            let deep = candidate();
+            let mut different = candidate();
+            different.mode = HealScanMode::Normal;
+            different.identity.as_mut().expect("candidate identity").object = "different".into();
+            let mut unknown = candidate();
+            unknown.mode = HealScanMode::Normal;
+            unknown.identity = None;
+            let mut dry_run = candidate();
+            dry_run.mode = HealScanMode::Normal;
+            dry_run.dry_run = true;
+            let mut candidates = vec![normal, same_normal, deep, different, unknown, dry_run];
+            if reverse {
+                candidates.reverse();
+            }
+            for candidate in candidates {
+                assert_eq!(observations.admit(owner.clone(), candidate).is_some(), terminal_first);
+            }
+            if !terminal_first {
+                assert!(observations.complete(terminal.clone(), Instant::now()).is_some());
+            }
+            assert!(observations.complete(terminal, Instant::now()).is_none());
+            assert_eq!(observations.terminal_tasks, 1);
+            assert_eq!(observations.terminal_counts.values().sum::<u64>(), 6);
+            for (scope, count) in [
+                ("content_and_leader_unknown", 2),
+                ("insufficient_scan", 1),
+                ("identity_mismatch", 1),
+                ("identity_unknown", 1),
+                ("dry_run", 1),
+            ] {
+                assert_eq!(observations.unknown_counts.get(scope), Some(&count), "{scope}");
+            }
+            assert_eq!(
+                observations
+                    .terminal_counts
+                    .get(&("completed", "verified_healthy", "content_and_leader_unknown", "normal")),
+                Some(&2)
+            );
+            assert_eq!(
+                observations
+                    .terminal_counts
+                    .get(&("completed", "verified_healthy", "insufficient_scan", "deep")),
+                Some(&1)
+            );
+        }
+    }
+}
+
+#[test]
+fn candidate_group_capacity_is_global_and_released_by_completion() {
+    let mut observations = Observations::default();
+    let split = MAX_PENDING / 2;
+    for index in 0..MAX_PENDING {
+        let mut observed = candidate();
+        observed.identity.as_mut().expect("candidate identity").object = format!("object-{index}");
+        let owner = if index < split { "owner-a" } else { "owner-b" };
+        assert!(observations.admit(key(owner), observed).is_none());
+    }
+    assert_eq!(observations.pending.len(), 2);
+
+    let mut duplicate = candidate();
+    duplicate.identity.as_mut().expect("candidate identity").object = "object-0".into();
+    assert!(observations.admit(key("owner-a"), duplicate).is_none());
+    assert!(observations.admit(key("owner-a"), candidate()).is_none());
+    assert!(observations.admit(key("owner-c"), candidate()).is_none());
+    assert_eq!(observations.unknown_counts.get("pending_groups_full"), Some(&2));
+    assert!(!observations.pending.contains_key(&key("owner-c")));
+
+    assert!(
+        observations
+            .complete(completion("owner-a", HealObjectDisposition::VerifiedHealthy), Instant::now())
+            .is_some()
+    );
+    assert_eq!(
+        observations.terminal_counts.values().sum::<u64>(),
+        u64::try_from(split + 1).expect("bounded count")
+    );
+    assert!(observations.admit(key("owner-c"), candidate()).is_none());
+    assert!(observations.pending.contains_key(&key("owner-c")));
+    assert_eq!(observations.unknown_counts.get("pending_groups_full"), Some(&2));
+}
+
+#[test]
+fn candidate_group_expiry_and_notification_loss_are_independent() {
+    let mut observations = Observations::default();
+    let now = Instant::now();
+    let mut old = candidate();
+    old.first_seen = now;
+    old.mode = HealScanMode::Normal;
+    let mut old_duplicate = candidate();
+    old_duplicate.first_seen = now;
+    old_duplicate.mode = HealScanMode::Normal;
+    let mut newer = candidate();
+    newer.first_seen = now + Duration::from_secs(1);
+    newer.dry_run = true;
+    for candidate in [old, old_duplicate, newer] {
+        assert!(observations.admit(key("expiring-owner"), candidate).is_none());
+    }
+
+    observations.maintain(now + PENDING_TTL);
+    assert_eq!(observations.unknown_counts.get("expired"), Some(&2));
+    assert!(observations.pending.contains_key(&key("expiring-owner")));
+    assert_eq!(observations.terminal_tasks, 0);
+
+    observations.lagged(3);
+    assert_eq!(observations.lost_notifications, 3);
+    assert_eq!(observations.unknown_counts.get("completion_lost"), Some(&1));
+    assert!(observations.pending.is_empty());
+    assert!(
+        observations
+            .complete(completion("expiring-owner", HealObjectDisposition::VerifiedHealthy), Instant::now())
+            .is_none()
+    );
+    assert_eq!(observations.terminal_tasks, 0);
+}
+
+#[test]
+fn grouped_pending_status_counts_candidates_after_partial_expiry() {
+    let (sender, _receiver) = mpsc::channel(1);
+    let observer = ObserverHandle {
+        sender,
+        state: Arc::new(Mutex::new(Observations::default())),
+        generation: 1,
+        started_at_unix_secs: None,
+    };
+    let registry = Mutex::new(Some(observer.clone()));
+    let now = Instant::now();
+    {
+        let mut observations = observer.state.lock().expect("observations");
+        let mut old = candidate();
+        old.first_seen = now;
+        let mut newer = candidate();
+        newer.first_seen = now + Duration::from_secs(1);
+        newer.mode = HealScanMode::Normal;
+        let mut newer_duplicate = candidate();
+        newer_duplicate.first_seen = now + Duration::from_secs(1);
+        newer_duplicate.mode = HealScanMode::Normal;
+        for candidate in [old, newer, newer_duplicate] {
+            assert!(observations.admit(key("status-owner"), candidate).is_none());
+        }
+    }
+    let status = observation_status_from(&registry);
+    assert_eq!(status.retained_pending_tasks, Some(1));
+    assert_eq!(status.retained_pending_candidates, Some(3));
+
+    observer.state.lock().expect("observations").maintain(now + PENDING_TTL);
+    let status = observation_status_from(&registry);
+    assert_eq!(status.retained_pending_tasks, Some(1));
+    assert_eq!(status.retained_pending_candidates, Some(2));
+    assert_eq!(
+        status
+            .unknown_candidates
+            .iter()
+            .find(|row| row.reason == "expired")
+            .map(|row| row.count),
+        Some(1)
+    );
+
+    observer.state.lock().expect("observations").lagged(1);
+    let status = observation_status_from(&registry);
+    assert_eq!(status.retained_pending_tasks, Some(0));
+    assert_eq!(status.retained_pending_candidates, Some(0));
+    assert_eq!(
+        status
+            .unknown_candidates
+            .iter()
+            .find(|row| row.reason == "completion_lost")
+            .map(|row| row.count),
+        Some(2)
+    );
+}
+
+#[test]
+fn observation_id_keeps_grouped_owner_generations_separate() {
+    let mut observations = Observations::default();
+    let first = key("reused-owner");
+    let second = ObservationKey {
+        task_id: first.task_id.clone(),
+        observation_id: 2,
+    };
+    let mut normal = candidate();
+    normal.mode = HealScanMode::Normal;
+    assert!(observations.admit(first.clone(), normal).is_none());
+    assert!(observations.admit(first.clone(), candidate()).is_none());
+    assert!(observations.admit(second.clone(), candidate()).is_none());
+
+    let first_terminal = completion("reused-owner", HealObjectDisposition::VerifiedHealthy);
+    assert!(observations.complete(first_terminal.clone(), Instant::now()).is_some());
+    assert!(!observations.pending.contains_key(&first));
+    assert!(observations.pending.contains_key(&second));
+    assert_eq!(observations.terminal_tasks, 1);
+    assert!(observations.complete(first_terminal.clone(), Instant::now()).is_none());
+    assert_eq!(observations.terminal_tasks, 1);
+
+    let mut second_terminal = (*first_terminal).clone();
+    second_terminal.observation_id = Some(2);
+    assert!(observations.complete(Arc::new(second_terminal), Instant::now()).is_some());
+    assert!(observations.pending.is_empty());
+    assert_eq!(observations.terminal_tasks, 2);
+    assert_eq!(observations.terminal_counts.values().sum::<u64>(), 3);
+}
+
+#[test]
 fn merged_candidates_close_only_on_the_canonical_task_once() {
     let mut observations = Observations::default();
     assert!(observations.admit(key("owner"), candidate()).is_none());
