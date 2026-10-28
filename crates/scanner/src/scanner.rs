@@ -2096,14 +2096,12 @@ where
                 }
             })
             .await;
-        match lease_result {
-            ScannerPublicationProofWait::Ready(grants) => {
+        match scanner_publication_lease_wait_result(lease_result) {
+            Ok(grants) => {
                 remote_publication_leases = Some((notification_system, grants));
                 None
             }
-            ScannerPublicationProofWait::Rejected(_) | ScannerPublicationProofWait::Cancelled => {
-                Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
-            }
+            Err(reason) => Some(reason),
         }
     } else {
         Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
@@ -3864,6 +3862,17 @@ enum ScannerCyclePublicationPlan {
     ProgressOnly,
     Observational,
     Authoritative,
+}
+
+fn scanner_publication_lease_wait_result<T>(
+    proof: ScannerPublicationProofWait<T, EcstoreError>,
+) -> Result<T, ScannerCycleDeferReason> {
+    match proof {
+        ScannerPublicationProofWait::Ready(grants) => Ok(grants),
+        ScannerPublicationProofWait::Rejected(_) | ScannerPublicationProofWait::Cancelled => {
+            Err(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        }
+    }
 }
 
 impl ScannerCyclePublicationPlan {

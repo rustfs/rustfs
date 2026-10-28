@@ -518,11 +518,15 @@ fn publication_lease_retries_local_channel_deadline_and_stops_on_cancel() {
         async fn channel_deadline_error(
             notification: &crate::storage_api::EcstoreNotificationSys,
             target: &str,
+            observational: bool,
         ) -> EcstoreError {
-            let error = match notification
-                .acquire_scanner_publication_leases(vec![(target.to_owned(), "session".into(), 3)])
-                .await
-            {
+            let targets = vec![(target.to_owned(), "session".into(), 3)];
+            let result = if observational {
+                notification.acquire_observational_scanner_publication_leases(targets).await
+            } else {
+                notification.acquire_scanner_publication_leases(targets).await
+            };
+            let error = match result {
                 Ok(_) => panic!("the stalled channel cannot grant a lease"),
                 Err(error) => error,
             };
@@ -531,6 +535,11 @@ fn publication_lease_retries_local_channel_deadline_and_stops_on_cancel() {
             assert_eq!(info.kind, "peer_request_failed");
             assert_eq!(info.reason, Some("channel_acquisition_timed_out"));
             assert_eq!(info.reported_reason, None);
+            assert!(error.to_string().contains(if observational {
+                "purpose=observational"
+            } else {
+                "purpose=authoritative"
+            }));
             assert!(!scanner_publication_lease_error_is_retryable(&error.to_string()));
             error
         }
@@ -567,13 +576,102 @@ fn publication_lease_retries_local_channel_deadline_and_stops_on_cancel() {
                     if attempt > 0 {
                         return Ok(());
                     }
-                    Err(channel_deadline_error(notification, &target).await)
+                    Err(channel_deadline_error(notification, &target, false).await)
                 }
             })
             .await;
         assert!(matches!(result, ScannerPublicationProofWait::Ready(())));
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(started_at.elapsed() >= scanner_publication_proof_retry_delay(1));
+
+        assert!(budget.deadline().is_none(), "zero cycle duration must leave no runtime deadline");
+        for (plan, expected_observational) in [
+            (ScannerCyclePublicationPlan::Authoritative, false),
+            (ScannerCyclePublicationPlan::Observational, true),
+        ] {
+            let attempts = AtomicUsize::new(0);
+            let returned = AtomicUsize::new(0);
+            let result = tokio::time::timeout(
+                Duration::from_secs(40),
+                plan.await_leases(&ctx, &budget, 705, 55, |observational| {
+                    assert_eq!(observational, expected_observational);
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let target = target.clone();
+                    let notification = &notification;
+                    let returned = &returned;
+                    async move {
+                        let error = channel_deadline_error(notification, &target, observational).await;
+                        returned.fetch_add(1, Ordering::SeqCst);
+                        Err::<(), _>(error)
+                    }
+                }),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                let completed = returned.load(Ordering::SeqCst);
+                assert!(
+                    completed >= 3,
+                    "SCANNER_NO_DEADLINE_ACQUISITION_STALLED: only {completed} typed timeouts returned"
+                );
+                panic!("SCANNER_NO_DEADLINE_TIMEOUT_MUST_DEFER: {completed} typed timeouts returned without deferring");
+            });
+            let ScannerPublicationProofWait::Rejected(error) = &result else {
+                panic!("persistent local channel timeouts must reject this publication attempt");
+            };
+            assert_eq!(
+                crate::storage_api::scan::scanner_publication_lease_failure_info(error).and_then(|info| info.reason),
+                Some("channel_acquisition_timed_out")
+            );
+            assert_eq!(attempts.load(Ordering::SeqCst), 3);
+            assert_eq!(returned.load(Ordering::SeqCst), 3, "each acquisition must return before retry or defer");
+            let reason = scanner_publication_lease_wait_result(result).expect_err("a missing peer lease must defer publication");
+            assert_eq!(reason, ScannerCycleDeferReason::ActivityBaselineUnavailable);
+            assert_eq!(
+                scanner_cycle_pre_commit_outcome(Some(9), &DataUsagePersistOutcome::Deferred(reason)),
+                Some(ScannerCyclePreCommitOutcome::Deferred(reason)),
+                "a missing peer lease cannot become a complete publication"
+            );
+        }
+
+        let timed_ctx = CancellationToken::new();
+        let timed_budget = ScannerCycleBudget::new(
+            &timed_ctx,
+            ScannerCycleBudgetConfig {
+                max_duration: Some(Duration::from_secs(120)),
+                ..Default::default()
+            },
+        );
+        let timed_attempts = AtomicUsize::new(0);
+        let timed_result = ScannerCyclePublicationPlan::Authoritative
+            .await_leases(&timed_ctx, &timed_budget, 706, 56, |_| {
+                let attempt = timed_attempts.fetch_add(1, Ordering::SeqCst);
+                let target = target.clone();
+                let notification = &notification;
+                async move {
+                    if attempt >= 3 {
+                        return Ok(());
+                    }
+                    Err(channel_deadline_error(notification, &target, false).await)
+                }
+            })
+            .await;
+        assert!(matches!(timed_result, ScannerPublicationProofWait::Ready(())));
+        assert_eq!(timed_attempts.load(Ordering::SeqCst), 4, "a runtime budget retains the existing retry policy");
+
+        let legacy_attempts = AtomicUsize::new(0);
+        let legacy_result = ScannerCyclePublicationPlan::Authoritative
+            .await_leases(&ctx, &budget, 707, 57, |_| {
+                let attempt = legacy_attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt >= 4 {
+                        return Ok(());
+                    }
+                    Err(EcstoreError::other("scanner publication lease capacity is exhausted"))
+                }
+            })
+            .await;
+        assert!(matches!(legacy_result, ScannerPublicationProofWait::Ready(())));
+        assert_eq!(legacy_attempts.load(Ordering::SeqCst), 5, "legacy retryable errors keep their retry policy");
 
         for detail in [
             "channel_acquisition_timed_out",
@@ -602,7 +700,7 @@ fn publication_lease_retries_local_channel_deadline_and_stops_on_cancel() {
                 let cancel_ctx = cancel_ctx.clone();
                 async move {
                     assert_eq!(attempt, 0, "cancellation must stop the scheduled retry");
-                    let error = channel_deadline_error(notification, &target).await;
+                    let error = channel_deadline_error(notification, &target, false).await;
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         cancel_ctx.cancel();
@@ -625,7 +723,7 @@ fn publication_lease_retries_local_channel_deadline_and_stops_on_cancel() {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 let target = target.clone();
                 let notification = &notification;
-                async move { Err::<(), _>(channel_deadline_error(notification, &target).await) }
+                async move { Err::<(), _>(channel_deadline_error(notification, &target, true).await) }
             })
             .await;
         assert!(matches!(result, ScannerPublicationProofWait::Cancelled));
