@@ -709,34 +709,60 @@ mod async_isolation {
             FmtSpan::NONE,
             true,
         )));
-        let (caught, span_restored, trace_restored, baggage_restored) = dispatcher::with_default(&outer.dispatch, || {
+        let early_result = dispatcher::with_default(&outer.dispatch, || {
             let span = parent_span(&outer.dispatch);
             let _span = span.enter();
             let _context = fake_ambient_context().attach();
+            let outer_span = span.id();
+            if outer_span.is_none() {
+                return Some("outer_span_missing");
+            }
             let caught = catch_unwind(AssertUnwindSafe(|| emit_candidate(&panic_dispatch, 0))).is_err();
-            let span_restored = tracing::Span::current().id() == span.id();
+            if !reached.load(Ordering::SeqCst) {
+                return Some("writer_not_reached");
+            }
+            if !caught {
+                return Some("writer_panic_not_caught");
+            }
+            let dispatcher_restored = dispatcher::get_default(|current| {
+                current
+                    .downcast_ref::<MemoryWriter>()
+                    .is_some_and(|writer| Arc::ptr_eq(&writer.0, &outer.json.0))
+            });
+            if !dispatcher_restored {
+                return Some("dispatcher_not_restored");
+            }
+            if tracing::Span::current().id() != outer_span {
+                return Some("tracing_not_restored");
+            }
             let current = Context::current();
-            let trace_restored = current.span().span_context().trace_id() == TraceId::from(17);
-            let baggage_restored = current.baggage().get("synthetic-secret").is_some();
+            if current.span().span_context().trace_id() != TraceId::from(17) {
+                return Some("trace_not_restored");
+            }
+            if current.span().span_context().span_id() != SpanId::from(19) {
+                return Some("span_id_not_restored");
+            }
+            if current.baggage().get("synthetic-secret").map(|value| value.as_str()) != Some(FAKE_AUTH) {
+                return Some("baggage_not_restored");
+            }
             tracing::info!(target: "isolation_outer_control", value = 1_u64, "outer control");
-            (caught, span_restored, trace_restored, baggage_restored)
+            None
         });
-        if !reached.load(Ordering::SeqCst) {
-            return "writer_not_reached";
+        if let Some(class) = early_result {
+            return class;
         }
-        if !caught {
-            return "writer_panic_not_caught";
-        }
-        if !span_restored {
-            return "tracing_not_restored";
-        }
-        if !trace_restored {
-            return "trace_not_restored";
-        }
-        if !baggage_restored {
-            return "baggage_not_restored";
-        }
-        let json = outer.json_records();
+        let bytes = match outer.json.0.lock() {
+            Ok(bytes) => bytes.clone(),
+            Err(_) => return "outer_json_unknown",
+        };
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(text) => text,
+            Err(_) => return "outer_json_unknown",
+        };
+        let json: Vec<Value> = match text.lines().map(serde_json::from_str).collect() {
+            Ok(json) => json,
+            Err(_) => return "outer_json_unknown",
+        };
         let logs = outer.exported_records();
         if json.len() == 2
             && json[0]["target"].as_str() == Some(TARGET)
@@ -753,10 +779,33 @@ mod async_isolation {
         "clean"
     }
 
+    type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
+
+    struct RestorePanicHook(Option<PanicHook>);
+
+    impl Drop for RestorePanicHook {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                std::panic::set_hook(previous);
+            }
+        }
+    }
+
     #[test]
     fn classify_panic_writer_isolation_without_raw_output() {
-        let class = catch_unwind(AssertUnwindSafe(classify_panic_isolation)).unwrap_or("diagnostic_internal_panic");
-        println!("\nRUSTFS_PANIC_DIAGNOSTIC={class}");
-        assert!(class == "clean", "isolation diagnostic failed");
+        // This process-global hook is used only by the workflow's single exact test.
+        let hook = RestorePanicHook(Some(std::panic::take_hook()));
+        std::panic::set_hook(Box::new(|_| {
+            let _ = writeln!(std::io::stderr(), "\nRUSTFS_PANIC_HOOK=redacted");
+        }));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let class = catch_unwind(AssertUnwindSafe(classify_panic_isolation)).unwrap_or("diagnostic_internal_panic");
+            println!("\nRUSTFS_PANIC_DIAGNOSTIC={class}");
+            assert!(class == "clean", "isolation diagnostic failed");
+        }));
+        drop(hook);
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 }
