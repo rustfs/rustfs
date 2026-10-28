@@ -18,6 +18,1617 @@ use std::sync::Arc;
 
 const TABLE_CATALOG_TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
+#[tokio::test]
+async fn catalog_backings_fence_direct_commits_with_publication_lock() {
+    let object_backend = TestCatalogObjectBackend::default();
+    let object_store = ObjectTableCatalogStore::new(object_backend.clone());
+    assert_direct_commit_uses_publication_lock(&object_store, &object_backend).await;
+}
+
+#[tokio::test]
+async fn catalog_backings_stop_view_replacement_after_publication_fence_loss() {
+    let object_backend = TestCatalogObjectBackend::default();
+    let object_store = ObjectTableCatalogStore::new(object_backend.clone());
+    assert_view_replacement_rechecks_publication_fence(&object_store, &object_backend).await;
+}
+
+#[tokio::test]
+async fn catalog_backings_fence_direct_table_drop() {
+    let object_backend = TestCatalogObjectBackend::default();
+    let object_store = ObjectTableCatalogStore::new(object_backend.clone());
+    assert_direct_drop_uses_publication_locks(object_store, &object_backend).await;
+}
+
+#[tokio::test]
+async fn catalog_backings_reject_overlapping_registered_warehouse_prefixes() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let parent_table = IdentifierSegment::parse("orders").unwrap();
+    let child_table = IdentifierSegment::parse("orders_child").unwrap();
+    let current = default_table_metadata_file_path(&namespace, &parent_table, "00001.metadata.json");
+    let child_metadata = default_table_metadata_file_path(&namespace, &child_table, "00001.metadata.json");
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &parent_table, current).await;
+    let mut child_entry = test_table_entry(bucket, &namespace, &child_table, child_metadata);
+    child_entry.table_id = "table-id-child".to_string();
+    child_entry.warehouse_location = format!("s3://{bucket}/tables/table-id/child");
+    assert_matches!(store.create_table(child_entry.clone()).await, Err(TableCatalogStoreError::Conflict(_)));
+}
+
+#[tokio::test]
+async fn catalog_backings_reject_empty_resource_ids_and_duplicate_table_ids() {
+    assert_resource_id_registration_contract(&ObjectTableCatalogStore::new(TestCatalogObjectBackend::default())).await;
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_claims_queued_job_and_replays_without_writes() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        let fixture = ConditionalMaintenanceFixture::new(mode, 0).await;
+        let completed = fixture.run("worker-a", 0, fixture.now).await.unwrap();
+        assert_eq!(completed.job.job_id, fixture.queued.job.job_id);
+        assert_eq!(completed.job.status, TableMetadataMaintenanceJobStatus::Successful);
+        assert_eq!(completed.job.attempt, 1);
+        assert_eq!(completed.job.max_retry_attempts, 0);
+        assert_eq!(completed.job.worker_id.as_deref(), Some("worker-a"));
+        assert_eq!(completed.job.scheduler_id, fixture.queued.job.scheduler_id);
+        assert_eq!(completed.job.deleted_metadata_file_count, 1);
+        assert_eq!(completed.cleanup_candidate_locations, fixture.queued.cleanup_candidate_locations);
+        assert_eq!(
+            completed.job.cleanup_watermark_unix_seconds,
+            fixture.queued.job.cleanup_watermark_unix_seconds
+        );
+        assert!(
+            !fixture
+                .backend
+                .object_exists("analytics", &fixture.old_metadata)
+                .await
+                .unwrap()
+        );
+        fixture.assert_report_views(&completed).await;
+        let before = maintenance_test_object_versions(&fixture.backend).await;
+        let replayed = fixture.run("worker-a", 0, fixture.now + Duration::seconds(1)).await.unwrap();
+        assert_eq!(replayed, completed);
+        assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+        assert_eq!(fixture.delete_attempts().await, 1);
+        assert_eq!(
+            completed
+                .audit_events
+                .iter()
+                .filter(|event| event.action == TableMaintenanceAuditAction::WorkerStarted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            completed
+                .audit_events
+                .iter()
+                .filter(|event| event.action == TableMaintenanceAuditAction::WorkerSucceeded)
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_samples_time_after_publication_wait_and_report_reads() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        for expired in [false, true] {
+            let mut fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+            let config = fixture
+                .store
+                .get_table_maintenance_config("analytics", "sales", "orders")
+                .await
+                .unwrap();
+            let deadline = fixture.now;
+            let lease_timeout = Duration::seconds(i64::try_from(config.worker_lease_timeout_seconds).unwrap());
+            fixture.queued.job.scheduled_at = Some(maintenance_timestamp(deadline - lease_timeout));
+            fixture.seed_report(&fixture.queued).await;
+            let fixture = Arc::new(fixture);
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            let publication_path = default_table_bucket_publication_lock_path();
+            let publication_guard = fixture
+                .backend
+                .acquire_write_lock("analytics", &publication_path)
+                .await
+                .unwrap();
+            let attempts = fixture
+                .backend
+                .write_lock_acquisition_count("analytics", &publication_path)
+                .await;
+            let final_read = fixture
+                .backend
+                .pause_next_read(RUSTFS_META_BUCKET, &fixture.report_paths()[2])
+                .await;
+            let clock = Arc::new(std::sync::Mutex::new((deadline - Duration::seconds(2), 0_usize)));
+            let worker_clock = Arc::clone(&clock);
+            let worker_fixture = Arc::clone(&fixture);
+            let worker = tokio::spawn(async move {
+                let condition = TableMaintenanceWorkerCondition {
+                    expected_job_id: worker_fixture.queued.job.job_id.clone(),
+                    expected_attempt: 0,
+                };
+                let clock = move || {
+                    let mut state = worker_clock.lock().unwrap();
+                    state.1 += 1;
+                    state.0
+                };
+                match &worker_fixture.store {
+                    ConfiguredTableCatalogStore::ObjectBacked(store) => {
+                        store
+                            .run_table_metadata_maintenance_worker_once_conditionally_with_clock(
+                                "analytics",
+                                "sales",
+                                "orders",
+                                "worker-a".to_string(),
+                                &condition,
+                                clock,
+                            )
+                            .await
+                    }
+                }
+            });
+            tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, async {
+                while fixture
+                    .backend
+                    .write_lock_acquisition_count("analytics", &publication_path)
+                    .await
+                    == attempts
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("conditional worker must reach publication lock contention");
+            assert!(!worker.is_finished(), "worker must wait for publication ownership");
+            assert_eq!(clock.lock().unwrap().1, 0, "claim time must not precede publication ownership");
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+            let claim_time = if expired {
+                deadline
+            } else {
+                deadline - Duration::nanoseconds(1)
+            };
+            clock.lock().unwrap().0 = claim_time;
+            drop(publication_guard);
+            tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, final_read.wait_started())
+                .await
+                .expect("conditional worker must read its final persisted report");
+            assert_eq!(clock.lock().unwrap().1, 0, "claim time must follow every persisted report read");
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+            final_read.release();
+            let result = tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, worker)
+                .await
+                .expect("conditional worker must finish after publication and report reads")
+                .unwrap();
+            assert_eq!(clock.lock().unwrap().1, 1, "claim validation must sample the clock once");
+            if expired {
+                assert_matches!(result, Err(TableCatalogStoreError::Conflict(reason))
+                    if reason == "maintenance job is not eligible for a conditional claim; inspect its status and persisted attempt budget");
+                assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+                fixture.assert_report_views(&fixture.queued).await;
+                assert_eq!(fixture.queued.job.status, TableMetadataMaintenanceJobStatus::Queued);
+                assert_eq!(fixture.queued.job.attempt, 0);
+                assert_eq!(fixture.delete_attempts().await, 0);
+                assert!(
+                    fixture
+                        .backend
+                        .object_exists("analytics", &fixture.old_metadata)
+                        .await
+                        .unwrap()
+                );
+            } else {
+                let completed = result.expect("a queued lease remains claimable immediately before its deadline");
+                assert_eq!(completed.job.status, TableMetadataMaintenanceJobStatus::Successful);
+                assert_eq!(completed.job.attempt, 1);
+                assert_eq!(completed.job.started_at, Some(maintenance_timestamp(claim_time)));
+                assert_eq!(completed.job.heartbeat_at, Some(maintenance_timestamp(claim_time)));
+                assert_eq!(
+                    completed
+                        .audit_events
+                        .iter()
+                        .filter(|event| event.action == TableMaintenanceAuditAction::WorkerStarted)
+                        .map(|event| event.timestamp.clone())
+                        .collect::<Vec<_>>(),
+                    vec![maintenance_timestamp(claim_time)],
+                );
+                assert_eq!(completed.job.deleted_metadata_file_count, 1);
+                assert_eq!(fixture.delete_attempts().await, 1);
+                assert!(
+                    !fixture
+                        .backend
+                        .object_exists("analytics", &fixture.old_metadata)
+                        .await
+                        .unwrap()
+                );
+                fixture.assert_report_views(&completed).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_retries_failed_job_with_persisted_plan_and_budget() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        let mut fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+        let failed = fixture.fail_first_attempt().await;
+        let before = maintenance_test_object_versions(&fixture.backend).await;
+        assert_eq!(fixture.run("worker-a", 0, fixture.now).await.unwrap(), failed);
+        assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+        let retry_at = OffsetDateTime::parse(
+            failed.job.next_retry_after.as_deref().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert_matches!(
+            fixture.run("worker-b", 1, retry_at - Duration::seconds(1)).await,
+            Err(TableCatalogStoreError::Conflict(_))
+        );
+        assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+        let mut config = fixture
+            .store
+            .get_table_maintenance_config("analytics", "sales", "orders")
+            .await
+            .unwrap();
+        config.max_retry_attempts = 10;
+        fixture
+            .store
+            .put_table_maintenance_config("analytics", "sales", "orders", config)
+            .await
+            .unwrap();
+        fixture.store = ConfiguredTableCatalogStore::new_for_test(fixture.backend.clone(), mode);
+        let completed = fixture.run("worker-b", 1, retry_at).await.unwrap();
+        assert_eq!(completed.job.status, TableMetadataMaintenanceJobStatus::Successful);
+        assert_eq!(completed.job.job_id, failed.job.job_id);
+        assert_eq!(completed.job.attempt, 2);
+        assert_eq!(completed.job.max_retry_attempts, 2);
+        assert_ne!(completed.job.lease_id, failed.job.lease_id);
+        assert_eq!(completed.cleanup_candidate_locations, failed.cleanup_candidate_locations);
+        assert_eq!(completed.deletable_metadata_locations, failed.deletable_metadata_locations);
+        assert_eq!(completed.job.cleanup_watermark_unix_seconds, failed.job.cleanup_watermark_unix_seconds);
+        assert_eq!(fixture.delete_attempts().await, 2);
+        fixture.assert_report_views(&completed).await;
+        let before = maintenance_test_object_versions(&fixture.backend).await;
+        assert_eq!(fixture.run("worker-b", 1, retry_at).await.unwrap(), completed);
+        assert_matches!(fixture.run("worker-a", 0, retry_at).await, Err(TableCatalogStoreError::Conflict(_)));
+        assert_matches!(
+            fixture
+                .store
+                .heartbeat_table_metadata_maintenance_job(
+                    "analytics",
+                    "sales",
+                    "orders",
+                    &failed.job.job_id,
+                    &failed.job.lease_id,
+                    "worker-a",
+                )
+                .await,
+            Err(TableCatalogStoreError::Conflict(_))
+        );
+        assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_does_not_reset_exhausted_budget_after_reload() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        for budget in [0, 1, 2] {
+            let mut fixture = ConditionalMaintenanceFixture::new(mode, budget).await;
+            let mut failed = fixture.fail_first_attempt().await;
+            if budget == 2 {
+                fixture
+                    .backend
+                    .fail_delete_attempt("analytics", &fixture.old_metadata, 2)
+                    .await;
+                let due = OffsetDateTime::parse(
+                    failed.job.next_retry_after.as_deref().unwrap(),
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .unwrap();
+                fixture
+                    .run("worker-b", 1, due)
+                    .await
+                    .expect_err("second delete failure must be surfaced");
+                failed = fixture.report(&failed.job.job_id).await;
+                assert_eq!(failed.job.attempt, 2);
+            }
+            assert_eq!(failed.job.next_retry_after, None);
+            let mut config = fixture
+                .store
+                .get_table_maintenance_config("analytics", "sales", "orders")
+                .await
+                .unwrap();
+            config.max_retry_attempts = 10;
+            fixture
+                .store
+                .put_table_maintenance_config("analytics", "sales", "orders", config)
+                .await
+                .unwrap();
+            fixture.store = ConfiguredTableCatalogStore::new_for_test(fixture.backend.clone(), mode);
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            assert_matches!(
+                fixture
+                    .run("worker-c", failed.job.attempt, fixture.now + Duration::hours(1))
+                    .await,
+                Err(TableCatalogStoreError::Conflict(_))
+            );
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+            assert_eq!(fixture.delete_attempts().await, usize::from(budget.max(1)));
+            fixture.assert_report_views(&failed).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_rejects_unsafe_persisted_states_without_effects() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        for scenario in [
+            "job",
+            "attempt",
+            "expired-queued",
+            "expired-running",
+            "quarantine",
+            "pointer",
+            "generation",
+            "retention",
+            "paused",
+            "disabled",
+            "delete-disabled",
+        ] {
+            let fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+            let mut report = fixture.queued.clone();
+            let mut attempt = 0;
+            match scenario {
+                "job" => report.job.job_id = "different-job".to_string(),
+                "attempt" => attempt = 2,
+                "expired-queued" => report.job.scheduled_at = Some(maintenance_timestamp(fixture.now - Duration::hours(1))),
+                "expired-running" => {
+                    report.job.status = TableMetadataMaintenanceJobStatus::Running;
+                    report.job.attempt = 1;
+                    report.job.worker_id = Some("worker-a".to_string());
+                    report.job.lease_id = "expired-lease".to_string();
+                    report.job.heartbeat_at = Some(maintenance_timestamp(fixture.now - Duration::hours(1)));
+                }
+                "quarantine" => report.job.quarantined_object_count = 1,
+                "pointer" => report.job.current_metadata_location.push_str(".stale"),
+                "generation" => report.job.current_generation += 1,
+                "retention" => report.job.retain_recent_metadata_files += 1,
+                "paused" | "disabled" | "delete-disabled" => {
+                    let mut config = fixture
+                        .store
+                        .get_table_maintenance_config("analytics", "sales", "orders")
+                        .await
+                        .unwrap();
+                    match scenario {
+                        "paused" => config.worker_paused = true,
+                        "disabled" => config.background_enabled = false,
+                        _ => config.delete_enabled = false,
+                    }
+                    fixture
+                        .store
+                        .put_table_maintenance_config("analytics", "sales", "orders", config)
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            fixture.seed_report(&report).await;
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            assert_matches!(
+                fixture.run("worker-a", attempt, fixture.now).await,
+                Err(TableCatalogStoreError::Conflict(_)),
+                "{mode:?}: {scenario}"
+            );
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before, "{mode:?}: {scenario}");
+            assert_eq!(fixture.delete_attempts().await, 0, "{mode:?}: {scenario}");
+            assert_eq!(
+                fixture.store.load_table("analytics", "sales", "orders").await.unwrap(),
+                Some(fixture.entry)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_claim_publication_failures_do_not_repeat_effects() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        for target in 0..3 {
+            for after_write in [false, true] {
+                let fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+                let path = &fixture.report_paths()[target];
+                if after_write {
+                    fixture.backend.fail_after_next_put(RUSTFS_META_BUCKET, path).await;
+                } else {
+                    fixture.backend.fail_next_put(RUSTFS_META_BUCKET, path).await;
+                }
+                fixture
+                    .run("worker-a", 0, fixture.now)
+                    .await
+                    .expect_err("claim publication fault must be surfaced");
+                assert_eq!(fixture.delete_attempts().await, 0);
+                let before = maintenance_test_object_versions(&fixture.backend).await;
+                let replay = fixture.run("worker-a", 0, fixture.now).await;
+                if target == 0 && !after_write {
+                    let completed = replay.expect("unpublished claim can safely retry");
+                    assert_eq!(completed.job.attempt, 1);
+                    assert_eq!(completed.job.status, TableMetadataMaintenanceJobStatus::Successful);
+                    assert_eq!(fixture.delete_attempts().await, 1);
+                    fixture.assert_report_views(&completed).await;
+                } else if target == 2 && after_write {
+                    let running = replay.expect("fully published running claim can be replayed");
+                    assert_eq!(running.job.attempt, 1);
+                    assert_eq!(running.job.status, TableMetadataMaintenanceJobStatus::Running);
+                    assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+                    fixture.assert_report_views(&running).await;
+                } else {
+                    assert_matches!(replay, Err(TableCatalogStoreError::Conflict(_)));
+                    assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+                    assert_eq!(fixture.delete_attempts().await, 0);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_terminal_publication_faults_never_repeat_deletion() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        for target in 0..3 {
+            for after_write in [false, true] {
+                let fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+                let path = fixture.report_paths()[target].clone();
+                let attempt = fixture.backend.put_attempt_count(RUSTFS_META_BUCKET, &path).await + 2;
+                if after_write {
+                    fixture
+                        .backend
+                        .state
+                        .lock()
+                        .await
+                        .fail_after_put_attempts
+                        .entry((RUSTFS_META_BUCKET.to_string(), path))
+                        .or_default()
+                        .insert(attempt);
+                } else {
+                    fixture.backend.fail_put_attempt(RUSTFS_META_BUCKET, &path, attempt).await;
+                }
+                fixture
+                    .run("worker-a", 0, fixture.now)
+                    .await
+                    .expect_err("terminal publication fault must be surfaced");
+                assert_eq!(fixture.delete_attempts().await, 1);
+                assert!(
+                    !fixture
+                        .backend
+                        .object_exists("analytics", &fixture.old_metadata)
+                        .await
+                        .unwrap()
+                );
+                let before = maintenance_test_object_versions(&fixture.backend).await;
+                assert_matches!(fixture.run("worker-b", 0, fixture.now).await, Err(TableCatalogStoreError::Conflict(_)));
+                assert_matches!(fixture.run("worker-a", 1, fixture.now).await, Err(TableCatalogStoreError::Conflict(_)));
+                assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+                let replay = fixture.run("worker-a", 0, fixture.now).await.unwrap();
+                assert_eq!(replay.job.job_id, fixture.queued.job.job_id);
+                assert_eq!(replay.job.attempt, 1);
+                if target == 0 && !after_write {
+                    assert_eq!(replay.job.status, TableMetadataMaintenanceJobStatus::Running);
+                    assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+                } else {
+                    assert_eq!(replay.job.status, TableMetadataMaintenanceJobStatus::Successful);
+                    assert_eq!(replay.job.deleted_metadata_file_count, 1);
+                }
+                fixture.assert_report_views(&replay).await;
+                let repaired = maintenance_test_object_versions(&fixture.backend).await;
+                assert_eq!(fixture.run("worker-a", 0, fixture.now).await.unwrap(), replay);
+                assert_eq!(maintenance_test_object_versions(&fixture.backend).await, repaired);
+                assert_eq!(fixture.delete_attempts().await, 1);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_terminal_repair_requires_exact_running_predecessor() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        for mismatch in ["lease", "attempt", "worker", "candidate", "audit", "terminal"] {
+            let fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+            let paths = fixture.report_paths();
+            let attempt = fixture.backend.put_attempt_count(RUSTFS_META_BUCKET, &paths[1]).await + 2;
+            fixture.backend.fail_put_attempt(RUSTFS_META_BUCKET, &paths[1], attempt).await;
+            fixture
+                .run("worker-a", 0, fixture.now)
+                .await
+                .expect_err("latest terminal write must fail");
+            let object = fixture
+                .backend
+                .read_object(RUSTFS_META_BUCKET, &paths[2])
+                .await
+                .unwrap()
+                .unwrap();
+            let mut running: TableMetadataMaintenanceReport = serde_json::from_slice(&object.data).unwrap();
+            assert_eq!(running.job.status, TableMetadataMaintenanceJobStatus::Running);
+            match mismatch {
+                "lease" => running.job.lease_id = "other-lease".to_string(),
+                "attempt" => running.job.attempt += 1,
+                "worker" => running.job.worker_id = Some("worker-b".to_string()),
+                "candidate" => running.cleanup_candidate_locations.clear(),
+                "audit" => {
+                    running.audit_events.pop();
+                }
+                "terminal" => running.job.status = TableMetadataMaintenanceJobStatus::Failed,
+                _ => unreachable!(),
+            }
+            fixture
+                .backend
+                .seed_object(RUSTFS_META_BUCKET, &paths[2], serde_json::to_vec(&running).unwrap())
+                .await;
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            assert_matches!(
+                fixture.run("worker-a", 0, fixture.now).await,
+                Err(TableCatalogStoreError::Conflict(_)),
+                "{mode:?}: {mismatch}"
+            );
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+            assert_eq!(fixture.delete_attempts().await, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_failed_terminal_publication_can_be_repaired_and_retried() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        let fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+        let latest = fixture.report_paths()[1].clone();
+        let attempt = fixture.backend.put_attempt_count(RUSTFS_META_BUCKET, &latest).await + 2;
+        fixture.backend.fail_put_attempt(RUSTFS_META_BUCKET, &latest, attempt).await;
+        fixture
+            .backend
+            .fail_delete_attempt("analytics", &fixture.old_metadata, 1)
+            .await;
+        fixture
+            .run("worker-a", 0, fixture.now)
+            .await
+            .expect_err("delete and terminal publication faults must surface");
+        let repaired = fixture.run("worker-a", 0, fixture.now).await.unwrap();
+        assert_eq!(repaired.job.status, TableMetadataMaintenanceJobStatus::Failed);
+        assert_eq!(repaired.job.attempt, 1);
+        assert_eq!(fixture.delete_attempts().await, 1);
+        fixture.assert_report_views(&repaired).await;
+        let due = OffsetDateTime::parse(
+            repaired.job.next_retry_after.as_deref().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let completed = fixture.run("worker-b", 1, due).await.unwrap();
+        assert_eq!(completed.job.status, TableMetadataMaintenanceJobStatus::Successful);
+        assert_eq!(completed.job.attempt, 2);
+        assert_eq!(fixture.delete_attempts().await, 2);
+        fixture.assert_report_views(&completed).await;
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_serializes_competing_claims_and_same_worker_replays() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        for same_worker in [false, true] {
+            let fixture = Arc::new(ConditionalMaintenanceFixture::new(mode, 2).await);
+            let second_worker = if same_worker { "worker-a" } else { "worker-b" };
+            let named_path = fixture.report_paths()[0].clone();
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            let puts_before = fixture.backend.put_attempt_count(RUSTFS_META_BUCKET, &named_path).await;
+            let pause = fixture.backend.pause_next_put(RUSTFS_META_BUCKET, &named_path).await;
+            let first_fixture = Arc::clone(&fixture);
+            let first = tokio::spawn(async move { first_fixture.run("worker-a", 0, first_fixture.now).await });
+            let (first, second) = tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, async {
+                pause.wait_started().await;
+                // The first Running write has not committed: both workers must
+                // contend while every durable report still describes Queued.
+                let publication_path = default_table_bucket_publication_lock_path();
+                let attempts = fixture
+                    .backend
+                    .write_lock_acquisition_count("analytics", &publication_path)
+                    .await;
+                let second_fixture = Arc::clone(&fixture);
+                let second = tokio::spawn(async move { second_fixture.run(second_worker, 0, second_fixture.now).await });
+                while fixture
+                    .backend
+                    .write_lock_acquisition_count("analytics", &publication_path)
+                    .await
+                    == attempts
+                {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    fixture
+                        .backend
+                        .write_lock_acquisition_count("analytics", &publication_path)
+                        .await,
+                    attempts + 1,
+                );
+                assert!(!first.is_finished(), "the first claim must remain paused before publication");
+                assert!(!second.is_finished(), "the competing claim must wait for publication ownership");
+                assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+                assert_eq!(fixture.backend.put_attempt_count(RUSTFS_META_BUCKET, &named_path).await, puts_before + 1);
+                assert_eq!(fixture.delete_attempts().await, 0);
+                pause.release();
+                (first.await.unwrap(), second.await.unwrap())
+            })
+            .await
+            .expect("concurrent claims must complete without deadlock");
+            let winner = if same_worker {
+                let first = first.unwrap();
+                assert_eq!(second.unwrap(), first);
+                first
+            } else {
+                match (first, second) {
+                    (Ok(report), Err(TableCatalogStoreError::Conflict(_)))
+                    | (Err(TableCatalogStoreError::Conflict(_)), Ok(report)) => report,
+                    other => panic!("exactly one competing claim must win: {other:?}"),
+                }
+            };
+            assert_eq!(winner.job.attempt, 1);
+            assert_eq!(winner.job.status, TableMetadataMaintenanceJobStatus::Successful);
+            assert_eq!(fixture.delete_attempts().await, 1);
+            fixture.assert_report_views(&winner).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_running_retry_rejects_previous_lease_and_takeover() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        let fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+        let failed = fixture.fail_first_attempt().await;
+        let due = OffsetDateTime::parse(
+            failed.job.next_retry_after.as_deref().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let current = fixture.report_paths()[2].clone();
+        fixture.backend.fail_after_next_put(RUSTFS_META_BUCKET, &current).await;
+        fixture
+            .run("worker-b", 1, due)
+            .await
+            .expect_err("response after complete Running claim is lost");
+        let running = fixture.run("worker-b", 1, due).await.unwrap();
+        assert_eq!(running.job.status, TableMetadataMaintenanceJobStatus::Running);
+        assert_eq!(running.job.attempt, 2);
+        assert_ne!(running.job.lease_id, failed.job.lease_id);
+        let before = maintenance_test_object_versions(&fixture.backend).await;
+        assert_matches!(
+            fixture
+                .store
+                .heartbeat_table_metadata_maintenance_job(
+                    "analytics",
+                    "sales",
+                    "orders",
+                    &failed.job.job_id,
+                    &failed.job.lease_id,
+                    "worker-a",
+                )
+                .await,
+            Err(TableCatalogStoreError::Conflict(_))
+        );
+        assert_matches!(fixture.run("worker-a", 1, due).await, Err(TableCatalogStoreError::Conflict(_)));
+        assert_matches!(fixture.run("worker-c", 2, due).await, Err(TableCatalogStoreError::Conflict(_)));
+        assert_matches!(
+            fixture.run("worker-b", 1, due + Duration::hours(1)).await,
+            Err(TableCatalogStoreError::Conflict(_))
+        );
+        assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+        assert_eq!(fixture.delete_attempts().await, 1);
+        fixture.assert_report_views(&running).await;
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_rejects_invalid_conditions_before_writes() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        for invalid in ["empty-worker", "overflow", "current", "latest", "../job", ""] {
+            let mut fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+            let mut worker = "worker-a";
+            let mut attempt = 0;
+            match invalid {
+                "empty-worker" => worker = " \t ",
+                "overflow" => attempt = u16::MAX,
+                job_id => fixture.queued.job.job_id = job_id.to_string(),
+            }
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            assert_matches!(
+                fixture.run(worker, attempt, fixture.now).await,
+                Err(TableCatalogStoreError::Invalid(_)),
+                "{mode:?}: {invalid}"
+            );
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+            assert_eq!(fixture.delete_attempts().await, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_requires_every_persisted_report_view() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        for missing in 0..3 {
+            let fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+            fixture
+                .backend
+                .state
+                .lock()
+                .await
+                .objects
+                .remove(&(RUSTFS_META_BUCKET.to_string(), fixture.report_paths()[missing].clone()));
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            assert_matches!(fixture.run("worker-a", 0, fixture.now).await, Err(TableCatalogStoreError::Conflict(_)));
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+            assert_eq!(fixture.delete_attempts().await, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_rejects_invalid_failed_retry_state() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        for invalid in [
+            "missing-backoff",
+            "malformed-backoff",
+            "zero-attempt",
+            "invalid-budget",
+            "exhausted",
+        ] {
+            let fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+            let mut failed = fixture.fail_first_attempt().await;
+            match invalid {
+                "missing-backoff" => failed.job.next_retry_after = None,
+                "malformed-backoff" => failed.job.next_retry_after = Some("not-a-timestamp".to_string()),
+                "zero-attempt" => failed.job.attempt = 0,
+                "invalid-budget" => failed.job.max_retry_attempts = 11,
+                "exhausted" => failed.job.attempt = failed.job.max_retry_attempts,
+                _ => unreachable!(),
+            }
+            fixture.seed_report(&failed).await;
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            assert_matches!(
+                fixture
+                    .run("worker-b", failed.job.attempt, fixture.now + Duration::hours(1))
+                    .await,
+                Err(TableCatalogStoreError::Conflict(_)),
+                "{mode:?}: {invalid}"
+            );
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+            assert_eq!(fixture.delete_attempts().await, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn catalog_diagnostics_follows_renamed_and_custom_metadata_directories() {
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    let original_table = IdentifierSegment::parse("original_orders").unwrap();
+    let original_dir = default_table_metadata_dir_path(&namespace, &original_table);
+    for (metadata_dir, use_uri) in [(original_dir.as_str(), false), ("tables/table-id/metadata", true)] {
+        for mode in [TableCatalogBackingMode::ObjectBacked] {
+            let backend = TestCatalogObjectBackend::default();
+            let current = format!("{metadata_dir}/00005.metadata.json");
+            let logged = format!("{metadata_dir}/00004.metadata.json");
+            let pinned = format!("{metadata_dir}/00003.metadata.json");
+            let unreadable = format!("{metadata_dir}/00002.metadata.json");
+            let orphan = format!("{metadata_dir}/00001.metadata.json");
+            let foreign = default_table_metadata_file_path(&namespace, &table, "foreign.metadata.json");
+            let location = if use_uri {
+                format!("s3://{bucket}/{current}")
+            } else {
+                current.clone()
+            };
+            let object_store = ObjectTableCatalogStore::new(backend.clone());
+            seed_table_for_metadata_maintenance(&object_store, bucket, &namespace, &table, location).await;
+            backend
+                .seed_object(
+                    bucket,
+                    &current,
+                    serde_json::to_vec(&serde_json::json!({
+                        "metadata-log": [{"metadata-file": format!("s3://{bucket}/{logged}")}],
+                        "current-snapshot-id": 2,
+                        "refs": {"keep": {"snapshot-id": 1, "type": "tag"}}
+                    }))
+                    .unwrap(),
+                )
+                .await;
+            backend.seed_object(bucket, &logged, b"{}".to_vec()).await;
+            backend
+                .seed_object(bucket, &pinned, br#"{"current-snapshot-id":1}"#.to_vec())
+                .await;
+            backend.seed_object(bucket, &unreadable, b"invalid JSON".to_vec()).await;
+            backend.seed_object(bucket, &orphan, b"{}".to_vec()).await;
+            backend.seed_object(bucket, &foreign, b"{}".to_vec()).await;
+
+            let report = ConfiguredTableCatalogStore::new_for_test(backend, mode)
+                .diagnose_table_catalog(bucket, "sales", "orders", 0)
+                .await
+                .expect("diagnostics should follow the persisted metadata directory");
+            assert_eq!(report.current_metadata_status, TableMetadataPointerStatus::Valid);
+            assert_eq!(report.recovery_status, TableCatalogRecoveryStatus::Healthy);
+            assert_eq!(report.orphan_metadata_candidate_locations, vec![orphan]);
+            assert_eq!(report.catalog.backing_manifest, report.backing_manifest);
+        }
+    }
+}
+
+#[tokio::test]
+async fn catalog_backings_fail_closed_for_inactive_table_bucket_data_plane() {
+    let bucket = "analytics";
+    let object = "tables/table-id/data/file.parquet";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let mut inactive = test_bucket_entry(bucket);
+    inactive.state = TableCatalogEntryState::Deleted;
+
+    let object_store = ObjectTableCatalogStore::new(TestCatalogObjectBackend::default());
+    object_store
+        .put_table_bucket(inactive.clone())
+        .await
+        .expect("inactive object-backed bucket should be seeded");
+    let object_error = table_data_plane_resource_for_object(&object_store, bucket, object)
+        .await
+        .expect_err("inactive object-backed table buckets must fail closed");
+    assert_matches!(
+        object_error,
+        TableCatalogStoreError::Internal(message) if message.contains("inactive object-backed catalog entry")
+    );
+    let object_error = table_metadata_data_plane_resource_for_object(&object_store, bucket, &metadata)
+        .await
+        .expect_err("metadata access must reject an inactive object-backed table bucket");
+    assert_matches!(
+        object_error,
+        TableCatalogStoreError::Internal(message) if message.contains("inactive object-backed catalog entry")
+    );
+}
+
+#[tokio::test]
+async fn catalog_backings_reject_table_view_identifier_collisions() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        let store = ConfiguredTableCatalogStore::new_for_test(TestCatalogObjectBackend::default(), mode);
+        let bucket = format!("collision-{mode:?}").to_ascii_lowercase();
+        let table_first = Namespace::parse("table_first").expect("namespace should parse");
+        let view_first = Namespace::parse("view_first").expect("namespace should parse");
+        let identifier = IdentifierSegment::parse("orders").expect("identifier should parse");
+        store
+            .put_table_bucket(test_bucket_entry(&bucket))
+            .await
+            .expect("table bucket should be created");
+        for namespace in [&table_first, &view_first] {
+            store
+                .create_namespace(test_namespace_entry(&bucket, namespace))
+                .await
+                .expect("namespace should be created");
+        }
+
+        store
+            .create_table(test_table_entry(
+                &bucket,
+                &table_first,
+                &identifier,
+                default_table_metadata_file_path(&table_first, &identifier, "00001.metadata.json"),
+            ))
+            .await
+            .expect("table should be created");
+        let view_error = store
+            .create_view(test_view_entry(
+                &bucket,
+                &table_first,
+                &identifier,
+                default_view_metadata_file_path(&table_first, &identifier, "00001.metadata.json"),
+            ))
+            .await
+            .expect_err("view must not reuse a table identifier");
+        assert_matches!(view_error, TableCatalogStoreError::Conflict(_));
+
+        store
+            .create_view(test_view_entry(
+                &bucket,
+                &view_first,
+                &identifier,
+                default_view_metadata_file_path(&view_first, &identifier, "00001.metadata.json"),
+            ))
+            .await
+            .expect("view should be created");
+        let mut table_entry = test_table_entry(
+            &bucket,
+            &view_first,
+            &identifier,
+            default_table_metadata_file_path(&view_first, &identifier, "00001.metadata.json"),
+        );
+        table_entry.table_id = "table-id-2".to_string();
+        table_entry.table_uuid = "table-uuid-2".to_string();
+        table_entry.warehouse_location = format!("s3://{bucket}/tables/table-id-2");
+        let table_error = store
+            .create_table(table_entry)
+            .await
+            .expect_err("table must not reuse a view identifier");
+        assert_matches!(table_error, TableCatalogStoreError::Conflict(_));
+    }
+}
+
+#[tokio::test]
+async fn catalog_backings_persist_table_format_upgrade_and_replay() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ConfiguredTableCatalogStore::new_for_test(backend.clone(), mode);
+        let bucket = format!("format-upgrade-{mode:?}").to_ascii_lowercase();
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let next_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        store
+            .put_table_bucket(test_bucket_entry(&bucket))
+            .await
+            .expect("table bucket should be created");
+        store
+            .create_namespace(test_namespace_entry(&bucket, &namespace))
+            .await
+            .expect("namespace should be created");
+        let mut entry = test_table_entry(&bucket, &namespace, &table, current_metadata.clone());
+        entry.format_version = 1;
+        store.create_table(entry).await.expect("v1 table should be created");
+        backend
+            .seed_object(
+                &bucket,
+                &next_metadata,
+                serde_json::to_vec(&serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": format!("s3://{bucket}/tables/table-id")
+                }))
+                .expect("target metadata should encode"),
+            )
+            .await;
+        let request = TableCommitRequest {
+            table_bucket: bucket.clone(),
+            namespace: namespace.public_name(),
+            table: table.as_str().to_string(),
+            commit_id: "format-upgrade-commit".to_string(),
+            idempotency_key: Some("format-upgrade-request".to_string()),
+            operation: "upgrade-format-version".to_string(),
+            expected_version_token: "token-v1".to_string(),
+            expected_metadata_location: current_metadata,
+            new_metadata_location: next_metadata,
+            requirements: Vec::new(),
+            writer: Some("iceberg-rest/test".to_string()),
+        };
+
+        let committed = store
+            .commit_table(request.clone())
+            .await
+            .expect("format upgrade should commit");
+        assert_eq!(committed.table.format_version, 2);
+        let replay = store
+            .commit_table(request)
+            .await
+            .expect("exact format upgrade replay should succeed");
+        assert_eq!(replay, committed);
+
+        let restarted = ConfiguredTableCatalogStore::new_for_test(backend, mode);
+        let loaded = restarted
+            .load_table(&bucket, &namespace.public_name(), table.as_str())
+            .await
+            .expect("restarted catalog should load")
+            .expect("upgraded table should persist");
+        assert_eq!(loaded.format_version, 2);
+        assert_eq!(loaded.metadata_location, committed.table.metadata_location);
+    }
+}
+
+#[tokio::test]
+async fn catalog_backings_hide_and_reject_mutation_of_inactive_resources() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ConfiguredTableCatalogStore::new_for_test(backend.clone(), mode);
+        let bucket = format!("inactive-{mode:?}").to_ascii_lowercase();
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let view = IdentifierSegment::parse("summary").expect("view should parse");
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let current_view_metadata = default_view_metadata_file_path(&namespace, &view, "00001.metadata.json");
+        let new_view_metadata = default_view_metadata_file_path(&namespace, &view, "00002.metadata.json");
+        store
+            .put_table_bucket(test_bucket_entry(&bucket))
+            .await
+            .expect("table bucket should be created");
+        store
+            .create_namespace(test_namespace_entry(&bucket, &namespace))
+            .await
+            .expect("namespace should be created");
+        let mut table_entry = test_table_entry(&bucket, &namespace, &table, current_metadata.clone());
+        table_entry.state = TableCatalogEntryState::Deleted;
+        store
+            .create_table(table_entry)
+            .await
+            .expect("inactive table should be retained");
+        let mut view_entry = test_view_entry(&bucket, &namespace, &view, current_view_metadata.clone());
+        view_entry.state = TableCatalogEntryState::Deleted;
+        store.create_view(view_entry).await.expect("inactive view should be retained");
+
+        assert!(
+            store
+                .load_table(&bucket, &namespace.public_name(), table.as_str())
+                .await
+                .expect("table lookup should succeed")
+                .is_none()
+        );
+        assert!(
+            store
+                .load_view(&bucket, &namespace.public_name(), view.as_str())
+                .await
+                .expect("view lookup should succeed")
+                .is_none()
+        );
+        assert!(
+            store
+                .list_tables(&bucket, &namespace.public_name())
+                .await
+                .expect("tables should list")
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_all_tables(&bucket)
+                .await
+                .expect("all tables should list")
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_views(&bucket, &namespace.public_name())
+                .await
+                .expect("views should list")
+                .is_empty()
+        );
+        assert_matches!(
+            store.drop_namespace(&bucket, &namespace.public_name()).await,
+            Err(TableCatalogStoreError::Conflict(_))
+        );
+
+        backend.seed_object(&bucket, &new_metadata, b"{}".to_vec()).await;
+        let commit_error = store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.clone(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-1".to_string(),
+                idempotency_key: Some("request-1".to_string()),
+                operation: "append".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata,
+                new_metadata_location: new_metadata,
+                requirements: Vec::new(),
+                writer: Some("pyiceberg/test".to_string()),
+            })
+            .await
+            .expect_err("inactive table must reject commits");
+        assert_matches!(commit_error, TableCatalogStoreError::NotFound(_));
+
+        let view_error = store
+            .replace_view(ViewCommitRequest {
+                table_bucket: bucket.clone(),
+                namespace: namespace.public_name(),
+                view: view.as_str().to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_view_metadata,
+                new_metadata_location: new_view_metadata,
+            })
+            .await
+            .expect_err("inactive view must reject replacement");
+        assert_matches!(view_error, TableCatalogStoreError::NotFound(_));
+    }
+}
+
+#[tokio::test]
+async fn catalog_backings_reject_metadata_changed_after_validation() {
+    let object_backend = TestCatalogObjectBackend::default();
+    assert_catalog_rejects_metadata_changed_after_validation(
+        &ObjectTableCatalogStore::new(object_backend.clone()),
+        &object_backend,
+        "object-catalog",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn namespace_properties_load_legacy_values_but_reject_oversized_writes() {
+    let backend = TestCatalogObjectBackend::default();
+    let object_store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    object_store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("object-backed bucket should be created");
+
+    let mut oversized = test_namespace_entry(bucket, &namespace);
+    oversized
+        .properties
+        .insert("owner".to_string(), "x".repeat(NAMESPACE_PROPERTY_VALUE_MAX_LEN + 1));
+    assert_matches!(
+        object_store.create_namespace(oversized.clone()).await,
+        Err(TableCatalogStoreError::Invalid(_))
+    );
+
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &object_store.paths.namespace_entry_path(bucket, &namespace),
+            serde_json::to_vec(&oversized).expect("legacy namespace should serialize"),
+        )
+        .await;
+    let legacy = object_store
+        .get_namespace(bucket, "sales")
+        .await
+        .expect("legacy namespace lookup should succeed")
+        .expect("legacy namespace should remain readable");
+    assert_eq!(
+        legacy.properties.get("owner").map(String::len),
+        Some(NAMESPACE_PROPERTY_VALUE_MAX_LEN + 1)
+    );
+}
+
+#[tokio::test]
+async fn catalog_backings_expose_implicit_parents_and_protect_child_namespaces() {
+    let bucket = "analytics";
+    let parent = Namespace::parse("sales").expect("parent namespace should parse");
+    let child = Namespace::parse("sales.daily").expect("child namespace should parse");
+
+    let object_backend = TestCatalogObjectBackend::default();
+    let object_store = ObjectTableCatalogStore::new(object_backend.clone());
+    object_store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("object-backed bucket should be created");
+    object_store
+        .create_namespace(test_namespace_entry(bucket, &child))
+        .await
+        .expect("object-backed child namespace should be created");
+    let implicit_parent = object_store
+        .get_namespace(bucket, &parent.public_name())
+        .await
+        .expect("object-backed parent lookup should succeed")
+        .expect("implicit object-backed parent should exist");
+    assert_eq!(implicit_parent.namespace, parent.public_name());
+    assert!(implicit_parent.properties.is_empty());
+    assert_matches!(
+        object_store.drop_namespace(bucket, &parent.public_name()).await,
+        Err(TableCatalogStoreError::Conflict(_))
+    );
+    assert_matches!(
+        object_store.create_namespace(test_namespace_entry(bucket, &parent)).await,
+        Err(TableCatalogStoreError::Conflict(_))
+    );
+    let mut inactive_parent = test_namespace_entry(bucket, &parent);
+    inactive_parent.state = TableCatalogEntryState::Deleted;
+    object_backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &object_store.paths.namespace_entry_path(bucket, &parent),
+            serde_json::to_vec(&inactive_parent).expect("inactive parent should serialize"),
+        )
+        .await;
+    object_store
+        .create_namespace(test_namespace_entry(bucket, &parent))
+        .await
+        .expect("inactive object-backed parent should be replaceable");
+    assert_eq!(
+        object_store
+            .list_namespaces_under(bucket, &parent.public_name())
+            .await
+            .expect("object-backed descendants should list")
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn catalog_backings_page_direct_namespace_children_with_scoped_cursors() {
+    assert_direct_namespace_child_contract(
+        &ObjectTableCatalogStore::new(TestCatalogObjectBackend::default()),
+        "object-catalog",
+        OBJECT_CATALOG_LIST_CURSOR_PREFIX,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn catalog_backings_keep_implicit_parents_implicit_during_resource_creation() {
+    let bucket = "analytics";
+    let object_store = ObjectTableCatalogStore::new(TestCatalogObjectBackend::default());
+    create_resources_in_implicit_parents(&object_store, bucket).await;
+}
+
+#[tokio::test]
+async fn catalog_backings_reject_resource_creation_in_inactive_namespace() {
+    assert_inactive_namespace_rejects_resource_creation(
+        &ObjectTableCatalogStore::new(TestCatalogObjectBackend::default()),
+        "object-catalog",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn catalog_backings_reject_creation_in_inactive_table_bucket() {
+    assert_inactive_table_bucket_rejects_catalog_creation(
+        &ObjectTableCatalogStore::new(TestCatalogObjectBackend::default()),
+        "object-catalog",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn object_catalog_table_rename_preserves_identity_index_and_reuses_source_tombstone() {
+    let backend = TestCatalogObjectBackend {
+        content_addressed_etags: true,
+        ..Default::default()
+    };
+    let store = ObjectTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let source_namespace = Namespace::parse("sales").expect("source namespace should parse");
+    let destination_namespace = Namespace::parse("curated").expect("destination namespace should parse");
+    let source_table = IdentifierSegment::parse("orders").expect("source table should parse");
+    store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &source_namespace))
+        .await
+        .unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &destination_namespace))
+        .await
+        .unwrap();
+    let source = test_table_entry(
+        bucket,
+        &source_namespace,
+        &source_table,
+        default_table_metadata_file_path(&source_namespace, &source_table, "00001.metadata.json"),
+    );
+    store.create_table(source.clone()).await.unwrap();
+    let bucket_object = store.paths.table_bucket_entry_path(bucket);
+    let bucket_etag_before = store
+        .read_entry::<TableBucketEntry>(RUSTFS_META_BUCKET, &bucket_object)
+        .await
+        .unwrap()
+        .unwrap()
+        .1
+        .expect("table bucket should have an etag");
+
+    store
+        .rename_table(bucket, "sales", "orders", "curated", "orders_v2")
+        .await
+        .expect("object-backed table rename should complete");
+    let bucket_etag_after = store
+        .read_entry::<TableBucketEntry>(RUSTFS_META_BUCKET, &bucket_object)
+        .await
+        .unwrap()
+        .unwrap()
+        .1
+        .expect("table bucket should have an etag");
+    assert_ne!(bucket_etag_after, bucket_etag_before);
+
+    assert!(store.load_table(bucket, "sales", "orders").await.unwrap().is_none());
+    let destination = store
+        .load_table(bucket, "curated", "orders_v2")
+        .await
+        .unwrap()
+        .expect("destination table should exist");
+    let mut expected_destination = source.clone();
+    expected_destination.namespace = "curated".to_string();
+    expected_destination.table = "orders_v2".to_string();
+    assert_ne!(destination.updated_at, source.updated_at);
+    expected_destination.updated_at.clone_from(&destination.updated_at);
+    assert_eq!(destination, expected_destination);
+
+    let source_object = store.paths.table_entry_path(bucket, &source_namespace, &source_table);
+    let source_tombstone = store
+        .read_entry::<TableEntry>(RUSTFS_META_BUCKET, &source_object)
+        .await
+        .unwrap()
+        .expect("source tombstone should remain")
+        .0;
+    assert_eq!(source_tombstone.state, TableCatalogEntryState::Deleted);
+    assert_eq!(source_tombstone.table_id, destination.table_id);
+    assert!(
+        store
+            .get_table_bucket(bucket)
+            .await
+            .unwrap()
+            .expect("table bucket should exist")
+            .active_rename_id
+            .is_none()
+    );
+
+    let destination_index = table_warehouse_index_entry(&destination).unwrap();
+    let index_object = store
+        .paths
+        .warehouse_index_entry_path(bucket, &destination_index.warehouse_object_prefix);
+    let persisted_index = store
+        .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_object)
+        .await
+        .unwrap()
+        .expect("warehouse index should exist")
+        .0;
+    assert_eq!(persisted_index, destination_index);
+    let resource = store
+        .resolve_table_data_plane_resource(bucket, "tables/table-id/data/part.parquet")
+        .await
+        .unwrap()
+        .expect("renamed table should resolve its stable warehouse prefix");
+    assert_eq!(resource.namespace, "curated");
+    assert_eq!(resource.table, "orders_v2");
+    store
+        .backfill_table_warehouse_index(bucket)
+        .await
+        .expect("retained source tombstone should not make the warehouse index ambiguous");
+
+    store
+        .rename_table(bucket, "curated", "orders_v2", "sales", "orders")
+        .await
+        .expect("rename should conditionally replace the retained source tombstone");
+    store
+        .rename_table(bucket, "sales", "orders", "curated", "orders_v2")
+        .await
+        .expect("rename should conditionally replace a destination tombstone");
+
+    let mut replacement = test_table_entry(
+        bucket,
+        &source_namespace,
+        &source_table,
+        default_table_metadata_file_path(&source_namespace, &source_table, "00002.metadata.json"),
+    );
+    replacement.table_id = "replacement-table-id".to_string();
+    replacement.table_uuid = "replacement-table-uuid".to_string();
+    replacement.warehouse_location = "s3://analytics/tables/replacement-table-id".to_string();
+    store
+        .create_table(replacement.clone())
+        .await
+        .expect("create should conditionally replace the source tombstone");
+    assert_eq!(
+        store
+            .load_table(bucket, "sales", "orders")
+            .await
+            .unwrap()
+            .expect("source identifier should be reusable"),
+        replacement
+    );
+}
+
+#[tokio::test]
+async fn object_catalog_table_rename_recovers_after_destination_publish_and_fences_concurrent_mutations() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let source_namespace = Namespace::parse("sales").expect("source namespace should parse");
+    let destination_namespace = Namespace::parse("curated").expect("destination namespace should parse");
+    let source_table = IdentifierSegment::parse("orders").expect("source table should parse");
+    store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &source_namespace))
+        .await
+        .unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &destination_namespace))
+        .await
+        .unwrap();
+    let source = test_table_entry(
+        bucket,
+        &source_namespace,
+        &source_table,
+        default_table_metadata_file_path(&source_namespace, &source_table, "00001.metadata.json"),
+    );
+    store.create_table(source.clone()).await.unwrap();
+
+    let source_object = store.paths.table_entry_path(bucket, &source_namespace, &source_table);
+    let source_tombstone_attempt = backend.put_attempt_count(RUSTFS_META_BUCKET, &source_object).await + 2;
+    let source_tombstone_pause = backend
+        .pause_put_attempt(RUSTFS_META_BUCKET, &source_object, source_tombstone_attempt)
+        .await;
+    let rename_store = store.clone();
+    let rename = tokio::spawn(async move {
+        rename_store
+            .rename_table(bucket, "sales", "orders", "curated", "orders_v2")
+            .await
+    });
+    source_tombstone_pause.wait_started().await;
+
+    let active_rename_id = store
+        .get_table_bucket(bucket)
+        .await
+        .unwrap()
+        .expect("table bucket should exist")
+        .active_rename_id
+        .expect("rename fence should be durable before destination publication");
+    assert_matches!(
+        store.load_table(bucket, "sales", "orders").await,
+        Err(TableCatalogStoreError::Unavailable(_))
+    );
+    assert_matches!(store.list_tables(bucket, "sales").await, Err(TableCatalogStoreError::Unavailable(_)));
+    assert_matches!(
+        store
+            .resolve_table_data_plane_resource(bucket, "tables/table-id/data/part.parquet")
+            .await,
+        Err(TableCatalogStoreError::Unavailable(_))
+    );
+
+    let publication_lock = default_table_bucket_publication_lock_path();
+    let publication_attempts = backend.write_lock_acquisition_count(bucket, &publication_lock).await;
+    let commit_store = store.clone();
+    let commit = tokio::spawn(async move {
+        commit_store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: "sales".to_string(),
+                table: "orders".to_string(),
+                commit_id: "concurrent-commit".to_string(),
+                idempotency_key: None,
+                operation: "append".to_string(),
+                expected_version_token: source.version_token,
+                expected_metadata_location: source.metadata_location,
+                new_metadata_location: "unused.metadata.json".to_string(),
+                requirements: Vec::new(),
+                writer: Some("rename-test".to_string()),
+            })
+            .await
+    });
+    let drop_store = store.clone();
+    let drop_table = tokio::spawn(async move { drop_store.drop_table(bucket, "sales", "orders").await });
+    let create_store = store.clone();
+    let mut replacement = test_table_entry(
+        bucket,
+        &source_namespace,
+        &source_table,
+        default_table_metadata_file_path(&source_namespace, &source_table, "00002.metadata.json"),
+    );
+    replacement.table_id = "replacement-table-id".to_string();
+    replacement.table_uuid = "replacement-table-uuid".to_string();
+    replacement.warehouse_location = "s3://analytics/tables/replacement-table-id".to_string();
+    let create = tokio::spawn(async move { create_store.create_table(replacement).await });
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, async {
+        while backend.write_lock_acquisition_count(bucket, &publication_lock).await < publication_attempts + 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("concurrent mutations should reach the table-bucket publication fence");
+    assert!(!commit.is_finished());
+    assert!(!drop_table.is_finished());
+    assert!(!create.is_finished());
+    commit.abort();
+    drop_table.abort();
+    create.abort();
+
+    rename.abort();
+    source_tombstone_pause.release();
+    let _ = rename.await;
+    let destination_object = store.paths.table_entry_path(
+        bucket,
+        &destination_namespace,
+        &IdentifierSegment::parse("orders_v2").expect("destination table should parse"),
+    );
+    let source_fence = store
+        .read_entry::<TableEntry>(RUSTFS_META_BUCKET, &source_object)
+        .await
+        .unwrap()
+        .expect("source rename fence should be durable")
+        .0;
+    let destination_fence = store
+        .read_entry::<TableEntry>(RUSTFS_META_BUCKET, &destination_object)
+        .await
+        .unwrap()
+        .expect("destination rename fence should be durable")
+        .0;
+    assert_eq!(source_fence.state, TableCatalogEntryState::Renaming);
+    assert_eq!(destination_fence.state, TableCatalogEntryState::Renaming);
+    assert_matches!(
+        store.load_table(bucket, "curated", "orders_v2").await,
+        Err(TableCatalogStoreError::Unavailable(_))
+    );
+    assert_matches!(
+        store.rename_table(bucket, "sales", "orders", "curated", "orders_v2").await,
+        Err(TableCatalogStoreError::TableNotFound(_))
+    );
+
+    assert!(store.load_table(bucket, "sales", "orders").await.unwrap().is_none());
+    let destination = store
+        .load_table(bucket, "curated", "orders_v2")
+        .await
+        .unwrap()
+        .expect("recovery should finish the destination publication");
+    assert_eq!(destination.table_id, "table-id");
+    assert!(
+        store
+            .get_table_bucket(bucket)
+            .await
+            .unwrap()
+            .expect("table bucket should exist")
+            .active_rename_id
+            .is_none()
+    );
+    let intent_object = store.paths.table_rename_intent_path(bucket, &active_rename_id);
+    let intent = store
+        .read_entry::<TableRenameIntent>(RUSTFS_META_BUCKET, &intent_object)
+        .await
+        .unwrap()
+        .expect("completed rename intent should be retained as a recovery record")
+        .0;
+    assert_eq!(intent.state, TableRenameIntentState::Completed);
+}
+
+#[tokio::test]
+async fn disable_empty_table_bucket_supports_both_catalog_backings() {
+    assert_disable_empty_table_bucket(&ObjectTableCatalogStore::new(TestCatalogObjectBackend::default())).await;
+}
+
+#[tokio::test]
+async fn disable_empty_table_bucket_survives_restart_and_blocks_stale_initialization() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ConfiguredTableCatalogStore::new_for_test(backend.clone(), mode);
+        // Cover an interrupted enable that wrote the bucket marker but no entry.
+        store.disable_empty_table_bucket(test_bucket_entry("disabled")).await.unwrap();
+        let restarted = ConfiguredTableCatalogStore::new_for_test(backend, mode);
+        assert_eq!(
+            restarted.get_table_bucket("disabled").await.unwrap().unwrap().state,
+            TableCatalogEntryState::Deleted
+        );
+        assert_matches!(
+            restarted.ensure_table_bucket(test_bucket_entry("disabled")).await,
+            Err(TableCatalogStoreError::NotFound(_))
+        );
+    }
+}
+
+#[tokio::test]
+async fn disable_empty_table_bucket_serializes_with_namespace_creation() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        let store = ConfiguredTableCatalogStore::new_for_test(TestCatalogObjectBackend::default(), mode);
+        let bucket = "disable-race";
+        let namespace = Namespace::parse("sales").unwrap();
+        store.ensure_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        let (create, disable) = tokio::join!(
+            store.create_namespace(test_namespace_entry(bucket, &namespace)),
+            store.disable_empty_table_bucket(test_bucket_entry(bucket)),
+        );
+        assert_ne!(create.is_ok(), disable.is_ok());
+        if disable.is_ok() {
+            assert!(store.list_namespaces(bucket).await.unwrap().is_empty());
+        } else {
+            assert_eq!(
+                store.get_table_bucket(bucket).await.unwrap().unwrap().state,
+                TableCatalogEntryState::Active
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn disable_empty_table_bucket_failure_keeps_active_catalog() {
+    for mode in [TableCatalogBackingMode::ObjectBacked] {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ConfiguredTableCatalogStore::new_for_test(backend.clone(), mode);
+        let bucket = "disable-failure";
+        store.ensure_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        let path = match mode {
+            TableCatalogBackingMode::ObjectBacked => TableCatalogObjectPaths::default().table_bucket_entry_path(bucket),
+        };
+        *backend.fail_put_object_path.lock().await = Some(path);
+        assert!(store.disable_empty_table_bucket(test_bucket_entry(bucket)).await.is_err());
+        let restarted = ConfiguredTableCatalogStore::new_for_test(backend, mode);
+        assert_eq!(
+            restarted.get_table_bucket(bucket).await.unwrap().unwrap().state,
+            TableCatalogEntryState::Active
+        );
+        restarted.disable_empty_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    }
+}
+
 #[test]
 fn table_data_plane_index_miss_scan_rejects_catalogs_above_its_object_limit() {
     let objects = vec![
