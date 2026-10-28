@@ -934,6 +934,12 @@ test-group = 'e2e-inline-boundaries'
 filter = 'package(e2e_test) & test(/^heal_erasure_disk_rebuild_test::/)'
 test-group = 'e2e-cluster-nightly'
 
+# The multi-pool crash fixture seeds three nodes and 36 drives. Reserve this
+# nextest run's workers so other multi-node tests do not starve its deadline.
+[[profile.e2e-full.overrides]]
+filter = 'package(e2e_test) & test(=heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_ec84_shards_across_multi_pool_after_background_target_crash)'
+threads-required = "num-test-threads"
+
 [[profile.e2e-full.overrides]]
 filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::kms_rekey_sweep_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
 test-group = 'e2e-vault'
