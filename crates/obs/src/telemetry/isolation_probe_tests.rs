@@ -279,3 +279,402 @@ fn diagnostic_fixture_is_detached_for_both_sinks_and_restores_context() {
         }
     }
 }
+
+mod async_isolation {
+    use super::*;
+    use std::{
+        collections::HashSet,
+        future::pending,
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        time::Duration,
+    };
+    use tracing::{Instrument, instrument::WithSubscriber};
+    use tracing_subscriber::EnvFilter;
+
+    const PARTICIPANTS: usize = 4;
+    const WAIT: Duration = Duration::from_secs(30);
+
+    fn parent_span(dispatch: &Dispatch) -> tracing::Span {
+        dispatcher::with_default(dispatch, || {
+            tracing::info_span!("http-request", uri = FAKE_URI, authorization = FAKE_AUTH, request_id = "synthetic-id")
+        })
+    }
+
+    fn observe_once(dispatch: &Dispatch, parent: &Option<tracing::span::Id>, phase: u64) {
+        let _context = fake_ambient_context().attach();
+        assert_eq!(&tracing::Span::current().id(), parent);
+        emit_candidate(dispatch, phase);
+        assert_eq!(&tracing::Span::current().id(), parent);
+        assert_eq!(Context::current().span().span_context().trace_id(), TraceId::from(17));
+        assert!(Context::current().baggage().get("synthetic-secret").is_some());
+    }
+
+    fn assert_isolated_events(sinks: &Sinks, expected_phases: &[u64]) {
+        let json = sinks.json_records();
+        let logs = sinks.exported_records();
+        assert_eq!(json.len(), expected_phases.len(), "each event must reach the isolated JSON sink");
+        assert_eq!(logs.len(), expected_phases.len(), "each event must reach the isolated exporter");
+        let json_keys: BTreeSet<&str> = [
+            "timestamp",
+            "level",
+            "target",
+            "filename",
+            "line_number",
+            "threadName",
+            "threadId",
+            "message",
+            "expected",
+            "emitted",
+            "phase",
+        ]
+        .into_iter()
+        .collect();
+        let otel_keys: BTreeSet<&str> = [
+            "code.namespace",
+            "code.filepath",
+            "code.filename",
+            "code.lineno",
+            "expected",
+            "emitted",
+            "phase",
+        ]
+        .into_iter()
+        .collect();
+        let mut json_phases = Vec::new();
+        for entry in &json {
+            let object = entry.as_object().expect("diagnostic JSON must be an object");
+            assert!(object.keys().all(|key| json_keys.contains(key.as_str())), "unexpected JSON field");
+            assert_eq!(entry["target"].as_str(), Some(TARGET));
+            assert_eq!(entry["message"].as_str(), Some("diagnostic fixture"));
+            assert_eq!(entry["expected"].as_u64(), Some(1024));
+            assert_eq!(entry["emitted"].as_u64(), Some(64));
+            json_phases.push(entry["phase"].as_u64().expect("phase is an unsigned number"));
+            assert!(!entry.to_string().contains(FAKE_URI));
+            assert!(!entry.to_string().contains(FAKE_AUTH));
+        }
+        let mut otel_phases = Vec::new();
+        for (log, scope) in &logs {
+            assert_eq!(log.target().map(|target| target.as_ref()), Some(TARGET));
+            assert!(log.trace_context().is_none());
+            assert!(log.attributes_iter().all(|(key, _)| otel_keys.contains(key.as_str())));
+            assert!(matches!(log.body(), Some(AnyValue::String(body)) if body.as_str() == "diagnostic fixture"));
+            assert!(
+                log.attributes_iter()
+                    .any(|(key, value)| key.as_str() == "expected" && value == &AnyValue::Int(1024))
+            );
+            assert!(
+                log.attributes_iter()
+                    .any(|(key, value)| key.as_str() == "emitted" && value == &AnyValue::Int(64))
+            );
+            let phase = log
+                .attributes_iter()
+                .find_map(|(key, value)| match (key.as_str(), value) {
+                    ("phase", AnyValue::Int(phase)) => u64::try_from(*phase).ok(),
+                    _ => None,
+                })
+                .expect("phase is a nonnegative OTEL integer");
+            otel_phases.push(phase);
+            assert_eq!(scope.name(), "");
+            assert!(scope.version().is_none());
+            assert!(scope.schema_url().is_none());
+            assert!(scope.attributes().next().is_none());
+            assert!(!format!("{log:?}").contains(FAKE_URI));
+            assert!(!format!("{log:?}").contains(FAKE_AUTH));
+        }
+        json_phases.sort_unstable();
+        otel_phases.sort_unstable();
+        let mut expected_phases = expected_phases.to_vec();
+        expected_phases.sort_unstable();
+        assert_eq!(json_phases, expected_phases);
+        assert_eq!(otel_phases, expected_phases);
+        let resource = sinks.exporter.resource.lock().expect("capture exporter resource");
+        assert!(resource.as_ref().expect("exporter resource exists").iter().next().is_none());
+    }
+
+    #[test]
+    fn separate_threads_keep_their_contexts_across_async_suspension() {
+        let outer = Sinks::new(true, true);
+        let isolated = Sinks::new(true, true);
+        let barrier = Arc::new(tokio::sync::Barrier::new(PARTICIPANTS));
+        let thread_ids: HashSet<_> = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..PARTICIPANTS {
+                let outer_dispatch = outer.dispatch.clone();
+                let isolated_dispatch = isolated.dispatch.clone();
+                let barrier = Arc::clone(&barrier);
+                handles.push(scope.spawn(move || {
+                    let thread_id = std::thread::current().id();
+                    let span = parent_span(&outer_dispatch);
+                    let span_id = span.id();
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build a test-only runtime");
+                    runtime.block_on(
+                        async move {
+                            for phase in [0_u64, 1] {
+                                tokio::time::timeout(WAIT, barrier.wait())
+                                    .await
+                                    .expect("all threads reach the barrier");
+                                observe_once(&isolated_dispatch, &span_id, phase);
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                        .instrument(span)
+                        .with_subscriber(outer_dispatch),
+                    );
+                    thread_id
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("thread completes"))
+                .collect()
+        });
+        assert_eq!(thread_ids.len(), PARTICIPANTS, "the fixture must use distinct OS threads");
+        assert!(outer.json_records().is_empty());
+        assert!(outer.exported_records().is_empty());
+        assert_isolated_events(&isolated, &[0, 1, 0, 1, 0, 1, 0, 1]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_runtime_reenters_outer_context_after_each_await() {
+        let outer = Sinks::new(true, true);
+        let isolated = Sinks::new(true, true);
+        let barrier = Arc::new(tokio::sync::Barrier::new(PARTICIPANTS));
+        let mut tasks = Vec::new();
+        for _ in 0..PARTICIPANTS {
+            let outer_dispatch = outer.dispatch.clone();
+            let isolated_dispatch = isolated.dispatch.clone();
+            let barrier = Arc::clone(&barrier);
+            let span = parent_span(&outer_dispatch);
+            let span_id = span.id();
+            tasks.push(tokio::spawn(
+                async move {
+                    for phase in [0_u64, 1] {
+                        tokio::time::timeout(WAIT, barrier.wait())
+                            .await
+                            .expect("all tasks reach the barrier");
+                        observe_once(&isolated_dispatch, &span_id, phase);
+                        tokio::task::yield_now().await;
+                    }
+                }
+                .instrument(span)
+                .with_subscriber(outer_dispatch),
+            ));
+        }
+        for task in tasks {
+            tokio::time::timeout(WAIT, task)
+                .await
+                .expect("task finishes")
+                .expect("task succeeds");
+        }
+        assert!(outer.json_records().is_empty());
+        assert!(outer.exported_records().is_empty());
+        assert_isolated_events(&isolated, &[0, 1, 0, 1, 0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn either_isolation_step_alone_leaves_ambient_context() {
+        let outer = Sinks::new(true, true);
+        let separate = Sinks::new(true, true);
+        dispatcher::with_default(&outer.dispatch, || {
+            let span = parent_span(&outer.dispatch);
+            let _span = span.enter();
+            let _context = fake_ambient_context().attach();
+            dispatcher::with_default(&separate.dispatch, || emit_root_event(0));
+            let _empty_context = Context::new().attach();
+            emit_root_event(1);
+        });
+
+        let separate_json = separate.json_records();
+        let separate_logs = separate.exported_records();
+        assert_eq!(separate_json.len(), 1);
+        assert_eq!(separate_logs.len(), 1);
+        assert!(separate_json[0].get("span").is_none());
+        assert_eq!(
+            separate_logs[0]
+                .0
+                .trace_context()
+                .expect("ambient trace still exists")
+                .trace_id,
+            TraceId::from(17)
+        );
+
+        let outer_json = outer.json_records();
+        let outer_logs = outer.exported_records();
+        assert_eq!(outer_json.len(), 1);
+        assert_eq!(outer_logs.len(), 1);
+        assert_eq!(outer_json[0]["span"]["uri"].as_str(), Some(FAKE_URI));
+        assert_eq!(outer_json[0]["span"]["authorization"].as_str(), Some(FAKE_AUTH));
+        assert!(outer_logs[0].0.trace_context().is_none());
+    }
+
+    fn filtered_sinks(filter: &str, sensitive_resource: bool) -> Sinks {
+        let json = MemoryWriter::default();
+        let exporter = MemoryExporter::default();
+        let resource = if sensitive_resource {
+            Resource::builder_empty()
+                .with_attributes([KeyValue::new("synthetic.resource", FAKE_AUTH)])
+                .build()
+        } else {
+            Resource::builder_empty().build()
+        };
+        let provider = SdkLoggerProvider::builder()
+            .with_resource(resource)
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let bridge = OpenTelemetryTracingBridge::builder(&provider)
+            .with_tracing_span_attributes(TracingSpanAttributes::all())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new(filter))
+            .with(build_json_log_layer(json.clone(), false, FmtSpan::NONE, true))
+            .with(bridge);
+        Sinks {
+            dispatch: Dispatch::new(subscriber),
+            json,
+            exporter,
+            _provider: provider,
+        }
+    }
+
+    #[test]
+    fn filters_and_resources_do_not_cross_dispatchers() {
+        let outer = filtered_sinks("info,rustfs_isolation_probe_test=off", true);
+        let isolated = filtered_sinks("off,rustfs_isolation_probe_test=info", false);
+        let disabled = filtered_sinks("off", false);
+        dispatcher::with_default(&outer.dispatch, || {
+            let span = parent_span(&outer.dispatch);
+            let _span = span.enter();
+            let parent_id = span.id();
+            observe_once(&isolated.dispatch, &parent_id, 0);
+            observe_once(&disabled.dispatch, &parent_id, 1);
+            tracing::info!(target: "isolation_outer_control", value = 1_u64, "outer control");
+        });
+        let outer_json = outer.json_records();
+        let outer_logs = outer.exported_records();
+        assert_eq!(outer_json.len(), 1);
+        assert_eq!(outer_logs.len(), 1);
+        assert_eq!(outer_json[0]["target"].as_str(), Some("isolation_outer_control"));
+        assert_eq!(outer_logs[0].0.target().map(|target| target.as_ref()), Some("isolation_outer_control"));
+        assert!(
+            outer
+                .exporter
+                .resource
+                .lock()
+                .expect("capture outer resource")
+                .as_ref()
+                .expect("outer resource exists")
+                .get(&opentelemetry::Key::new("synthetic.resource"))
+                .is_some()
+        );
+        assert_isolated_events(&isolated, &[0]);
+        assert!(disabled.json_records().is_empty());
+        assert!(disabled.exported_records().is_empty());
+    }
+
+    struct CancellationProbe {
+        outer: Dispatch,
+        isolated: Dispatch,
+        drops: Arc<AtomicUsize>,
+        restored: Arc<AtomicBool>,
+    }
+
+    impl Drop for CancellationProbe {
+        fn drop(&mut self) {
+            dispatcher::with_default(&self.outer, || {
+                let span = parent_span(&self.outer);
+                let _span = span.enter();
+                let _context = fake_ambient_context().attach();
+                emit_candidate(&self.isolated, 1);
+                let restored = tracing::Span::current().id() == span.id()
+                    && Context::current().span().span_context().trace_id() == TraceId::from(17)
+                    && Context::current().baggage().get("synthetic-secret").is_some();
+                self.restored.store(restored, Ordering::SeqCst);
+            });
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_drop_emits_in_isolation_and_restores_context() {
+        let outer = Sinks::new(true, true);
+        let isolated = Sinks::new(true, true);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let restored = Arc::new(AtomicBool::new(false));
+        let probe = CancellationProbe {
+            outer: outer.dispatch.clone(),
+            isolated: isolated.dispatch.clone(),
+            drops: Arc::clone(&drops),
+            restored: Arc::clone(&restored),
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _probe = probe;
+            started_tx.send(()).expect("signal that the cancellation fixture is active");
+            pending::<()>().await;
+        });
+        tokio::time::timeout(WAIT, started_rx)
+            .await
+            .expect("task starts")
+            .expect("start signal");
+        task.abort();
+        let error = tokio::time::timeout(WAIT, task)
+            .await
+            .expect("cancelled task finishes")
+            .expect_err("the task must be cancelled");
+        assert!(error.is_cancelled());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(restored.load(Ordering::SeqCst));
+        assert!(outer.json_records().is_empty());
+        assert!(outer.exported_records().is_empty());
+        assert_isolated_events(&isolated, &[1]);
+    }
+
+    #[derive(Clone)]
+    struct PanicWriter;
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for PanicWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Write for PanicWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            panic!("synthetic writer panic");
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn panic_during_sink_write_restores_the_outer_context() {
+        let outer = Sinks::new(true, true);
+        let panic_dispatch =
+            Dispatch::new(tracing_subscriber::registry().with(build_json_log_layer(PanicWriter, false, FmtSpan::NONE, true)));
+        dispatcher::with_default(&outer.dispatch, || {
+            let span = parent_span(&outer.dispatch);
+            let _span = span.enter();
+            let _context = fake_ambient_context().attach();
+            let panic = catch_unwind(AssertUnwindSafe(|| emit_candidate(&panic_dispatch, 0)));
+            assert!(panic.is_err(), "the fixture must panic while writing the isolated event");
+            assert_eq!(tracing::Span::current().id(), span.id());
+            assert_eq!(Context::current().span().span_context().trace_id(), TraceId::from(17));
+            assert!(Context::current().baggage().get("synthetic-secret").is_some());
+            tracing::info!(target: "isolation_outer_control", value = 1_u64, "outer control");
+        });
+        let json = outer.json_records();
+        let logs = outer.exported_records();
+        assert_eq!(json.len(), 1);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(json[0]["target"].as_str(), Some("isolation_outer_control"));
+        assert_eq!(logs[0].0.target().map(|target| target.as_ref()), Some("isolation_outer_control"));
+    }
+}
