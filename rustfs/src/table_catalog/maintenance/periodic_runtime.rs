@@ -173,10 +173,7 @@ async fn run(config: PeriodicMaintenanceConfig, server: Arc<ServerContextSlot>, 
             let Some(context) = server.installed_app_context() else {
                 continue;
             };
-            let backend = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
-                context.object_store(),
-                context.table_catalog_strong_runtime(),
-            );
+            let backend = EcStoreTableCatalogObjectBackend::new(context.object_store());
             let store = match config.backing {
                 TableCatalogBackingMode::ObjectBacked => {
                     ConfiguredTableCatalogStore::ObjectBacked(ObjectTableCatalogStore::new(backend))

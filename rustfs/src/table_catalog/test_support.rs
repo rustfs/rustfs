@@ -410,7 +410,6 @@ pub(crate) fn manifest_avro_bytes_with_entry_sequences(files: &[ManifestEntryWit
 pub(crate) struct TestCatalogObjectBackend {
     pub(crate) state: Arc<tokio::sync::Mutex<TestCatalogObjectState>>,
     pub(crate) locks: TestCatalogObjectLocks,
-    pub(crate) strong_runtime: Option<StrongTableCatalogRuntime>,
     // One-shot, path-keyed injection knobs from the admin handler tests'
     // former TestTableCatalogObjectBackend (backlog#1837 PR2): each fires
     // once for the named object and clears itself, mirroring the original
@@ -955,10 +954,6 @@ impl TestCatalogObjectState {
 
 #[async_trait::async_trait]
 impl TableCatalogObjectBackend for TestCatalogObjectBackend {
-    fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
-        self.strong_runtime.clone()
-    }
-
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
         let mut missing_read_object_path = self.missing_read_object_path.lock().await;
         if missing_read_object_path.as_deref() == Some(object) {

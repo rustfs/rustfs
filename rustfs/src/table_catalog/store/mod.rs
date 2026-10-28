@@ -20,7 +20,6 @@ mod backup_types;
 mod manifest;
 mod object;
 mod object_backup;
-mod strong;
 
 pub(crate) use backup_types::{
     TableCatalogBackupReport, TableCatalogBackupStatus, TableCatalogRestoreReport, TableCatalogRestoreStatus,
@@ -29,7 +28,6 @@ use manifest::table_catalog_backing_manifest;
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]
 pub(super) use object::bounded_table_entry_objects_for_data_plane_scan;
-pub(crate) use strong::{StrongTableCatalogRuntime, StrongTableCatalogStore};
 
 struct PeriodicTableMaintenanceQueueGuard<'a> {
     table_id: &'a str,
@@ -798,10 +796,6 @@ pub(in crate::table_catalog) fn catalog_list_next_continuation(
 
 #[async_trait::async_trait]
 pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
-    fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
-        None
-    }
-
     async fn acquire_catalog_migration_read_guards(
         &self,
         _table_bucket: &str,
@@ -2210,14 +2204,12 @@ where
 
 pub(crate) struct EcStoreTableCatalogObjectBackend<S> {
     store: Arc<S>,
-    strong_runtime: StrongTableCatalogRuntime,
 }
 
 impl<S> Clone for EcStoreTableCatalogObjectBackend<S> {
     fn clone(&self) -> Self {
         Self {
             store: self.store.clone(),
-            strong_runtime: self.strong_runtime.clone(),
         }
     }
 }
@@ -2226,8 +2218,8 @@ impl<S> EcStoreTableCatalogObjectBackend<S>
 where
     S: TableCatalogStorage,
 {
-    pub fn new_with_strong_runtime(store: Arc<S>, strong_runtime: StrongTableCatalogRuntime) -> Self {
-        Self { store, strong_runtime }
+    pub fn new(store: Arc<S>) -> Self {
+        Self { store }
     }
 }
 
@@ -2238,10 +2230,6 @@ impl<S> TableCatalogObjectBackend for EcStoreTableCatalogObjectBackend<S>
 where
     S: TableCatalogStorage,
 {
-    fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
-        Some(self.strong_runtime.clone())
-    }
-
     fn acquires_catalog_migration_read_permit(&self) -> bool {
         true
     }
@@ -2254,10 +2242,10 @@ where
         // migration read permits ahead of its publication lock, matching store mutations.
         let paths = TableCatalogObjectPaths::default();
         let global = self
-            .acquire_read_lock(RUSTFS_META_BUCKET, &paths.backing_migration_global_fence_lock_path())
+            .acquire_read_lock(RUSTFS_META_BUCKET, &paths.catalog_backup_global_fence_lock_path())
             .await?;
         let bucket = self
-            .acquire_read_lock(RUSTFS_META_BUCKET, &paths.backing_migration_fence_lock_path(table_bucket))
+            .acquire_read_lock(RUSTFS_META_BUCKET, &paths.catalog_backup_fence_lock_path(table_bucket))
             .await?;
         Ok(vec![global, bucket])
     }
