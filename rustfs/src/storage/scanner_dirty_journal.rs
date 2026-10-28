@@ -384,6 +384,10 @@ fn decode_owned_replay_record(owner: &str, bytes: &[u8]) -> Option<(JournalState
 
 fn encode_owned_replay_record(owner: &str, state: &JournalState) -> Result<Vec<u8>, serde_json::Error> {
     let mut entries = state.replay_entries();
+    let mut prefix = Vec::with_capacity(owner.len() + 32);
+    prefix.extend_from_slice(b"{\"owner\":");
+    serde_json::to_writer(&mut prefix, owner)?;
+    prefix.extend_from_slice(b",\"replay\":");
     for compact in [false, true] {
         if let Some(entries) = &mut entries {
             if compact {
@@ -391,13 +395,12 @@ fn encode_owned_replay_record(owner: &str, state: &JournalState) -> Result<Vec<u
                     entry.scope = ScannerDurableDirtyUsageReplayScope::WholeBucket;
                 }
             }
-            if let Ok(replay) = rustfs_scanner::encode_durable_dirty_usage_producer_replay_record(entries.clone())
-                && let Ok(replay) = serde_json::from_slice(&replay)
-            {
-                let bytes = serde_json::to_vec(&OwnedReplayRecord {
-                    owner: owner.to_string(),
-                    replay: Some(replay),
-                })?;
+            if let Ok(replay) = rustfs_scanner::encode_durable_dirty_usage_producer_replay_record(entries.clone()) {
+                // This producer already validated and serialized the complete frame.
+                let mut bytes = prefix.clone();
+                bytes.reserve(replay.len() + 1);
+                bytes.extend_from_slice(&replay);
+                bytes.push(b'}');
                 if bytes.len() <= DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES {
                     return Ok(bytes);
                 }
@@ -405,10 +408,8 @@ fn encode_owned_replay_record(owner: &str, state: &JournalState) -> Result<Vec<u
         }
     }
     // Never label a truncated record as complete producer coverage.
-    serde_json::to_vec(&OwnedReplayRecord {
-        owner: owner.to_string(),
-        replay: None,
-    })
+    prefix.extend_from_slice(b"null}");
+    Ok(prefix)
 }
 
 async fn run_durable_dirty_usage_journal(store: Arc<ECStore>, owner: String, shared: Weak<SharedJournal>, changed: Arc<Notify>) {
@@ -575,6 +576,63 @@ mod tests {
         ENV.get_or_init(|| rustfs_test_utils::TestECStoreEnv::builder().build()).await
     }
 
+    fn legacy_owned_encoding(owner: &str, state: &JournalState) -> Vec<u8> {
+        let mut entries = state.replay_entries();
+        for compact in [false, true] {
+            if let Some(entries) = &mut entries {
+                if compact {
+                    for entry in entries.iter_mut() {
+                        entry.scope = ScannerDurableDirtyUsageReplayScope::WholeBucket;
+                    }
+                }
+                if let Ok(replay) = rustfs_scanner::encode_durable_dirty_usage_producer_replay_record(entries.clone())
+                    && let Ok(replay) = serde_json::from_slice(&replay)
+                {
+                    let bytes = serde_json::to_vec(&OwnedReplayRecord {
+                        owner: owner.to_string(),
+                        replay: Some(replay),
+                    })
+                    .expect("legacy typed wrapper");
+                    if bytes.len() <= DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES {
+                        return bytes;
+                    }
+                }
+            }
+        }
+        serde_json::to_vec(&OwnedReplayRecord {
+            owner: owner.to_string(),
+            replay: None,
+        })
+        .expect("legacy unknown marker")
+    }
+
+    #[test]
+    fn owned_encoding_reuses_the_producer_frame_without_changing_wire_bytes() {
+        let mut scoped = JournalState::default();
+        for producer in SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION {
+            scoped.record_mutation("bucket-a".to_string(), "quote\"雪/object", 17, producer);
+        }
+        scoped.record_mutation("bucket-b".to_string(), "object", 9, SegmentInvalidationProducerIdentity::PutObject);
+        let unknown = JournalState {
+            invalidated: true,
+            ..Default::default()
+        };
+        for owner in ["owner", "quote\"slash\\newline\n", "所有者", "\0"] {
+            for state in [&scoped, &unknown, &JournalState::default()] {
+                let expected = legacy_owned_encoding(owner, state);
+                let actual = encode_owned_replay_record(owner, state).expect("complete owned encoding");
+                assert_eq!(actual, expected, "legacy bytes for owner {owner:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn owned_unknown_marker_keeps_the_pinned_legacy_wire_fixture() {
+        let bytes = encode_owned_replay_record("owner", &JournalState::default()).expect("unknown marker");
+        assert_eq!(bytes, br#"{"owner":"owner","replay":null}"#);
+        assert!(decode_owned_replay_record("owner", &bytes).is_none());
+    }
+
     #[test]
     fn journal_owner_is_stable_and_never_defaults_to_a_shared_identity() {
         assert!(durable_dirty_usage_owner("").is_none());
@@ -654,6 +712,7 @@ mod tests {
         }
         assert!(state.scope_bytes <= DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES);
         let bytes = encode_owned_replay_record(&owner, &state).expect("bounded record");
+        assert_eq!(bytes, legacy_owned_encoding(&owner, &state), "legacy compacted bytes");
         assert!(bytes.len() <= DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES);
         let (decoded, _) = decode_owned_replay_record(&owner, &bytes).expect("compacted replay");
         assert_eq!(decoded.buckets.len(), 3);
@@ -673,6 +732,7 @@ mod tests {
         assert!(!state.invalidated);
         assert_eq!(state.buckets.len(), 1024);
         let bytes = encode_owned_replay_record(&owner, &state).expect("unverified marker");
+        assert_eq!(bytes, legacy_owned_encoding(&owner, &state), "legacy unknown marker bytes");
         assert!(bytes.len() <= DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES);
         let record: OwnedReplayRecord = serde_json::from_slice(&bytes).expect("marker");
         assert!(record.replay.is_none());
