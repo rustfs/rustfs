@@ -85,7 +85,9 @@ def histogram_point(point):
     require(all(a < b for a, b in zip(bounds, bounds[1:])), "unordered histogram boundaries")
     require(len(buckets) == len(bounds) + 1, "missing or inconsistent histogram buckets")
     buckets = [uint(value, "bucket count") for value in buckets]
-    count = uint(point.get("count", 0), "histogram count")
+    # Proto3 JSON conversion can omit a default-zero count. Without presence
+    # information, reject it instead of treating a missing observation as zero.
+    count = uint(point.get("count"), "histogram count")
     require(sum(buckets) == count, "histogram count does not match buckets")
     return {**times, "kind": "histogram", "count": count, "bounds": bounds, "buckets": buckets}
 
