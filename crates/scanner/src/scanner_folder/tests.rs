@@ -33,6 +33,7 @@ mod incremental_enumeration;
 mod listing_completion;
 mod metadata_visits;
 mod node_admission;
+mod observed_admission;
 mod usage_updates;
 
 /// Reset the process-global alert cooldown map; test-only.
