@@ -150,6 +150,12 @@ setup = 'ecstore-base-stack'
 filter = 'binary(lifecycle_integration_test) | (package(rustfs) & test(/^app::lifecycle_transition_api_test::/))'
 setup = 'lifecycle-large-stack'
 
+# This conditional GET fixture composes real-store futures that overflowed
+# the default Linux test-thread stack.
+[[profile.default.scripts]]
+filter = 'package(rustfs) & test(=app::object::get::tests::conditional_get_304_uses_metadata_without_decoding_damaged_data)'
+setup = 'ecstore-large-stack'
+
 # These heal fixtures compose deep real-store recovery futures that can
 # overflow the default Linux test-thread stack.
 [[profile.default.scripts]]
@@ -447,6 +453,12 @@ setup = 'ecstore-base-stack'
 [[profile.ci.scripts]]
 filter = 'binary(lifecycle_integration_test) | (package(rustfs) & test(/^app::lifecycle_transition_api_test::/))'
 setup = 'lifecycle-large-stack'
+
+# This conditional GET fixture composes real-store futures that overflowed
+# the default Linux test-thread stack.
+[[profile.ci.scripts]]
+filter = 'package(rustfs) & test(=app::object::get::tests::conditional_get_304_uses_metadata_without_decoding_damaged_data)'
+setup = 'ecstore-large-stack'
 
 # These heal fixtures compose deep real-store recovery futures that can
 # overflow the default Linux test-thread stack.
