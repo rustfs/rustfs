@@ -282,14 +282,22 @@ fn diagnostic_fixture_is_detached_for_both_sinks_and_restores_context() {
 
 mod async_isolation {
     use super::*;
+    use opentelemetry::context::FutureExt;
     use std::{
         collections::HashSet,
-        future::pending,
+        future::{Future, pending, poll_fn},
         panic::{AssertUnwindSafe, catch_unwind},
-        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-        time::Duration,
+        pin::Pin,
+        sync::{
+            Condvar,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        },
+        task::{Context as TaskContext, Poll, Waker},
+        time::{Duration, Instant},
     };
     use tracing::{Instrument, instrument::WithSubscriber};
+    use tracing_opentelemetry::{OpenTelemetryLayer, OpenTelemetrySpanExt};
     use tracing_subscriber::EnvFilter;
 
     const PARTICIPANTS: usize = 4;
@@ -390,6 +398,345 @@ mod async_isolation {
         assert_eq!(otel_phases, expected_phases);
         let resource = sinks.exporter.resource.lock().expect("capture exporter resource");
         assert!(resource.as_ref().expect("exporter resource exists").iter().next().is_none());
+    }
+
+    fn task_context(tag: u64) -> Context {
+        Context::new()
+            .with_remote_span_context(SpanContext::new(
+                TraceId::from(u128::from(tag) + 100),
+                SpanId::from(tag + 200),
+                TraceFlags::SAMPLED,
+                true,
+                TraceState::default(),
+            ))
+            .with_baggage([KeyValue::new("synthetic-secret", format!("synthetic-baggage-{tag}"))])
+    }
+
+    fn assert_otel_context(tag: u64, span_id: SpanId) {
+        let context = Context::current();
+        assert_eq!(context.span().span_context().trace_id(), TraceId::from(u128::from(tag) + 100));
+        assert_eq!(context.span().span_context().span_id(), span_id);
+        let expected = format!("synthetic-baggage-{tag}");
+        assert_eq!(
+            context.baggage().get("synthetic-secret").map(|value| value.as_str()),
+            Some(expected.as_str())
+        );
+    }
+
+    fn assert_task_context(tag: u64, span_id: SpanId, parent: &Option<tracing::span::Id>) {
+        assert_otel_context(tag, span_id);
+        assert_eq!(&tracing::Span::current().id(), parent);
+    }
+
+    struct CheckPollContext<F> {
+        inner: Pin<Box<F>>,
+        tag: u64,
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl<F: Future> Future for CheckPollContext<F> {
+        type Output = F::Output;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            assert_otel_context(this.tag, SpanId::from(this.tag + 200));
+            this.polls.fetch_add(1, Ordering::SeqCst);
+            this.inner.as_mut().poll(cx)
+        }
+    }
+
+    fn traced_sinks() -> Sinks {
+        use opentelemetry::trace::TracerProvider;
+
+        let json = MemoryWriter::default();
+        let exporter = MemoryExporter::default();
+        let logger = SdkLoggerProvider::builder()
+            .with_resource(Resource::builder_empty().build())
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_resource(Resource::builder_empty().build())
+            .build()
+            .tracer("synthetic-test");
+        let bridge = OpenTelemetryTracingBridge::builder(&logger)
+            .with_tracing_span_attributes(TracingSpanAttributes::all())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(build_json_log_layer(json.clone(), false, FmtSpan::NONE, true))
+            .with(OpenTelemetryLayer::new(tracer))
+            .with(bridge);
+        Sinks {
+            dispatch: Dispatch::new(subscriber),
+            json,
+            exporter,
+            _provider: logger,
+        }
+    }
+
+    fn traced_parent(dispatch: &Dispatch, tag: u64) -> (tracing::Span, SpanId) {
+        let span = parent_span(dispatch);
+        span.set_parent(task_context(tag)).expect("set synthetic OTEL parent");
+        let context = span.context();
+        assert_eq!(context.span().span_context().trace_id(), TraceId::from(u128::from(tag) + 100));
+        let span_id = context.span().span_context().span_id();
+        assert_ne!(span_id, SpanId::INVALID);
+        (span, span_id)
+    }
+
+    fn assert_no_task_baggage(sinks: &Sinks) {
+        for entry in sinks.json_records() {
+            assert!(!entry.to_string().contains("synthetic-baggage-"));
+        }
+        for (log, _) in sinks.exported_records() {
+            assert!(!format!("{log:?}").contains("synthetic-baggage-"));
+        }
+    }
+
+    #[derive(Default)]
+    struct GateState {
+        arrived: usize,
+        active: usize,
+        peak: usize,
+        released: bool,
+        timed_out: bool,
+    }
+
+    #[derive(Default)]
+    struct OverlapGate {
+        state: Mutex<GateState>,
+        changed: Condvar,
+    }
+
+    impl OverlapGate {
+        fn rendezvous(&self) {
+            let mut state = self.state.lock().expect("lock overlap gate");
+            if state.released {
+                return;
+            }
+            state.arrived += 1;
+            state.active += 1;
+            state.peak = state.peak.max(state.active);
+            if state.arrived == PARTICIPANTS {
+                state.released = true;
+                self.changed.notify_all();
+            }
+            let start = Instant::now();
+            while !state.released {
+                let remaining = WAIT.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    state.timed_out = true;
+                    state.released = true;
+                    self.changed.notify_all();
+                    break;
+                }
+                state = self.changed.wait_timeout(state, remaining).expect("wait for overlap").0;
+            }
+            state.active -= 1;
+        }
+    }
+
+    #[derive(Clone)]
+    struct GatedWriter {
+        output: MemoryWriter,
+        gate: Arc<OverlapGate>,
+        first_write: bool,
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for GatedWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            let mut writer = self.clone();
+            writer.first_write = true;
+            writer
+        }
+    }
+
+    impl Write for GatedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.first_write {
+                self.first_write = false;
+                self.gate.rendezvous();
+            }
+            self.output.write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn gated_sinks(gate: Arc<OverlapGate>) -> Sinks {
+        let json = MemoryWriter::default();
+        let exporter = MemoryExporter::default();
+        let provider = SdkLoggerProvider::builder()
+            .with_resource(Resource::builder_empty().build())
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let bridge = OpenTelemetryTracingBridge::builder(&provider)
+            .with_tracing_span_attributes(TracingSpanAttributes::all())
+            .build();
+        let writer = GatedWriter {
+            output: json.clone(),
+            gate,
+            first_write: true,
+        };
+        let subscriber = tracing_subscriber::registry()
+            .with(build_json_log_layer(writer, false, FmtSpan::NONE, true))
+            .with(bridge);
+        Sinks {
+            dispatch: Dispatch::new(subscriber),
+            json,
+            exporter,
+            _provider: provider,
+        }
+    }
+
+    #[test]
+    fn isolated_scopes_overlap_with_distinct_per_poll_contexts() {
+        let outer = traced_sinks();
+        let gate = Arc::new(OverlapGate::default());
+        let isolated = gated_sinks(Arc::clone(&gate));
+        let observations = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for index in 0..PARTICIPANTS {
+                let tag = u64::try_from(index).expect("participant index fits u64");
+                let outer_dispatch = outer.dispatch.clone();
+                let isolated_dispatch = isolated.dispatch.clone();
+                handles.push(scope.spawn(move || {
+                    let id = std::thread::current().id();
+                    let (span, span_id) = traced_parent(&outer_dispatch, tag);
+                    let parent = span.id();
+                    let polls = Arc::new(AtomicUsize::new(0));
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build a test-only runtime");
+                    let future = async move {
+                        for phase in [0_u64, 1] {
+                            assert_task_context(tag, span_id, &parent);
+                            emit_candidate(&isolated_dispatch, phase);
+                            assert_task_context(tag, span_id, &parent);
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    .instrument(span);
+                    runtime.block_on(
+                        CheckPollContext {
+                            inner: Box::pin(future),
+                            tag,
+                            polls: Arc::clone(&polls),
+                        }
+                        .with_context(task_context(tag))
+                        .with_subscriber(outer_dispatch),
+                    );
+                    (id, polls.load(Ordering::SeqCst))
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("thread completes"))
+                .collect::<Vec<_>>()
+        });
+        let thread_ids: HashSet<_> = observations.iter().map(|(id, _)| id).collect();
+        assert_eq!(thread_ids.len(), PARTICIPANTS);
+        assert!(observations.iter().all(|(_, polls)| *polls >= 2));
+        let state = gate.state.lock().expect("read overlap result");
+        assert!(!state.timed_out, "each thread must reach the isolated writer");
+        assert_eq!(state.arrived, PARTICIPANTS);
+        assert_eq!(state.peak, PARTICIPANTS, "all isolated scopes must overlap in the writer");
+        assert_eq!(state.active, 0);
+        drop(state);
+        assert!(outer.json_records().is_empty());
+        assert!(outer.exported_records().is_empty());
+        assert_isolated_events(&isolated, &[0, 1, 0, 1, 0, 1, 0, 1]);
+        assert_no_task_baggage(&isolated);
+    }
+
+    fn in_thread_context<T>(dispatch: &Dispatch, tag: u64, poll: impl FnOnce() -> T) -> T {
+        dispatcher::with_default(dispatch, || {
+            let span = parent_span(dispatch);
+            let _span = span.enter();
+            let _context = task_context(tag).attach();
+            let result = poll();
+            assert_task_context(tag, SpanId::from(tag + 200), &span.id());
+            result
+        })
+    }
+
+    #[test]
+    fn pending_future_migrates_and_restores_each_thread_context() {
+        let outer = traced_sinks();
+        let isolated = Sinks::new(true, true);
+        let thread_sinks = Sinks::new(true, true);
+        let (span, span_id) = traced_parent(&outer.dispatch, 7);
+        let parent = span.id();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let isolated_dispatch = isolated.dispatch.clone();
+        let future = async move {
+            assert_task_context(7, span_id, &parent);
+            emit_candidate(&isolated_dispatch, 0);
+            assert_task_context(7, span_id, &parent);
+            let mut yielded = false;
+            poll_fn(|cx| {
+                if yielded {
+                    Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
+            assert_task_context(7, span_id, &parent);
+            emit_candidate(&isolated_dispatch, 1);
+            assert_task_context(7, span_id, &parent);
+        }
+        .instrument(span);
+        let future = CheckPollContext {
+            inner: Box::pin(future),
+            tag: 7,
+            polls: Arc::clone(&polls),
+        }
+        .with_context(task_context(7))
+        .with_subscriber(outer.dispatch.clone());
+        let mut future = Box::pin(future);
+        let (handoff_tx, handoff_rx) = mpsc::sync_channel(1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let first_dispatch = thread_sinks.dispatch.clone();
+            let first = scope.spawn(move || {
+                in_thread_context(&first_dispatch, 91, || {
+                    let mut cx = TaskContext::from_waker(Waker::noop());
+                    assert!(future.as_mut().poll(&mut cx).is_pending());
+                });
+                assert!(handoff_tx.send((future, std::thread::current().id())).is_ok());
+                done_rx.recv_timeout(WAIT).expect("second thread finishes polling");
+            });
+            let second_dispatch = thread_sinks.dispatch.clone();
+            let second = scope.spawn(move || {
+                let (mut future, first_id) = handoff_rx.recv_timeout(WAIT).expect("receive pending future");
+                assert_ne!(
+                    std::thread::current().id(),
+                    first_id,
+                    "the future must migrate to a different live thread"
+                );
+                in_thread_context(&second_dispatch, 92, || {
+                    let mut cx = TaskContext::from_waker(Waker::noop());
+                    assert!(future.as_mut().poll(&mut cx).is_ready());
+                });
+                done_tx.send(()).expect("signal second poll completion");
+            });
+            first.join().expect("first poll completes");
+            second.join().expect("second poll completes");
+        });
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert!(outer.json_records().is_empty());
+        assert!(outer.exported_records().is_empty());
+        assert!(thread_sinks.json_records().is_empty());
+        assert!(thread_sinks.exported_records().is_empty());
+        assert_isolated_events(&isolated, &[0, 1]);
+        assert_no_task_baggage(&isolated);
     }
 
     #[test]
