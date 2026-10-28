@@ -556,7 +556,7 @@ fn observer_from(registry: &Mutex<Option<ObserverHandle>>) -> ObserverHandle {
     }
     let state = Arc::new(Mutex::new(Observations::default()));
     let handle = {
-        let (sender, mut admissions) = mpsc::channel(MAX_PENDING);
+        let (sender, mut admissions) = mpsc::channel::<(String, Candidate)>(MAX_PENDING);
         let mut completions = subscribe_heal_completions();
         let observations = state.clone();
         tokio::spawn(async move {
