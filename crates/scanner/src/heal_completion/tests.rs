@@ -586,7 +586,7 @@ fn scanner_candidate_without_scope_does_not_claim_identity_mismatch() {
 #[test]
 fn missing_identity_fields_are_unknown_on_either_side() {
     for missing_candidate in [true, false] {
-        for field in 0..9 {
+        for field in 0..11 {
             let mut observed = candidate();
             let mut terminal = (*completion("missing-identity", HealObjectDisposition::VerifiedHealthy)).clone();
             let expected = observed.identity.as_mut().expect("candidate identity");
@@ -600,11 +600,13 @@ fn missing_identity_fields_are_unknown_on_either_side() {
                 0 => target.version_id = None,
                 1 => target.version_id = Some(String::new()),
                 2 => target.version_id = Some(Uuid::nil().to_string()),
-                3 => target.bucket_incarnation_id = None,
-                4 => target.bucket_incarnation_id = Some(Uuid::nil()),
-                5 => target.pool_index = None,
-                6 => target.set_index = None,
-                7 => target.bucket.clear(),
+                3 => target.version_id = Some("not-a-uuid".to_owned()),
+                4 => target.version_id = Some("null".to_owned()),
+                5 => target.bucket_incarnation_id = None,
+                6 => target.bucket_incarnation_id = Some(Uuid::nil()),
+                7 => target.pool_index = None,
+                8 => target.set_index = None,
+                9 => target.bucket.clear(),
                 _ => target.object.clear(),
             }
             let mut recent = Recent {
@@ -618,6 +620,29 @@ fn missing_identity_fields_are_unknown_on_either_side() {
             );
         }
     }
+}
+
+#[test]
+fn equivalent_uuid_version_formats_do_not_claim_identity_mismatch() {
+    let version = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").expect("valid fixture version");
+    let mut observed = candidate();
+    observed.identity.as_mut().expect("candidate identity").version_id = Some(version.to_string());
+    let mut terminal = (*completion("version-format", HealObjectDisposition::VerifiedHealthy)).clone();
+    Arc::make_mut(&mut terminal.completion)
+        .object
+        .as_mut()
+        .expect("terminal object")
+        .identity
+        .version_id = Some(version.to_string().to_uppercase());
+    let mut recent = Recent {
+        completion: Arc::new(terminal),
+        counted: false,
+    };
+    assert_eq!(
+        Settlement::new(observed, &mut recent).scope,
+        "content_and_leader_unknown",
+        "RED_SCANNER_EQUIVALENT_VERSION"
+    );
 }
 
 #[test]
