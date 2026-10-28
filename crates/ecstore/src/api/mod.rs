@@ -371,6 +371,15 @@ pub mod compression {
 
 pub mod config {
     pub mod com {
+        /// Preserve empty existing objects so callers can distinguish corruption from absence.
+        pub async fn read_config_preserve_empty_with_metadata_opts(
+            api: std::sync::Arc<crate::store::ECStore>,
+            file: &str,
+            opts: &crate::object_api::ObjectOptions,
+        ) -> crate::error::Result<(Vec<u8>, crate::object_api::ObjectInfo)> {
+            crate::config::com::read_config_preserve_empty_with_metadata_opts(api, file, opts).await
+        }
+
         pub use crate::config::com::{
             COMMA_SEPARATED_LISTS, CONFIG_PREFIX, ENV_CONFIG_RECOVER_ON_CORRUPTION, STORAGE_CLASS_SUB_SYS,
             ServerConfigCorruptError, ServerConfigSaveResult, ServerConfigSnapshot, delete_config, delete_config_no_lock,
