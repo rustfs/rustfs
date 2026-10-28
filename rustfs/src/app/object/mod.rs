@@ -219,6 +219,7 @@ mod restore;
 pub(crate) mod shared;
 #[cfg(test)]
 mod test_support;
+mod veeam_sosapi;
 
 #[cfg(test)]
 pub(crate) use self::delete::*;

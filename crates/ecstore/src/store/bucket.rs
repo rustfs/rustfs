@@ -448,6 +448,14 @@ impl ECStore {
         await_orphan_bucket_recovery(bucket, &publication_guard, &lifecycle_guard, &metadata_guard, &ns_guard, recover).await
     }
 
+    /// Read quota and bucket identity from one authoritative metadata snapshot.
+    pub async fn bucket_quota_and_incarnation_from_disk(
+        &self,
+        bucket: &str,
+    ) -> Result<(Option<crate::bucket::quota::BucketQuota>, Uuid, OffsetDateTime)> {
+        metadata_sys::get_quota_config_and_incarnation_from_disk_in(&self.ctx, bucket).await
+    }
+
     pub async fn get_bucket_metadata(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
         let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
         sys.read().await.get(bucket).await

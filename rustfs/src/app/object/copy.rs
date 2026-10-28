@@ -239,6 +239,7 @@ impl DefaultObjectUsecase {
         // Validate both source and destination keys
         validate_object_key(&src_key, "COPY (source)")?;
         validate_object_key(&key, "COPY (dest)")?;
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
         let replaces_metadata = match metadata_directive.as_ref().map(|directive| directive.as_str()) {
             None | Some(MetadataDirective::COPY) => false,
@@ -1028,6 +1029,26 @@ mod tests {
 
         let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn copy_object_rejects_reserved_catalog_destination_before_store_lookup() {
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: "source-bucket".into(),
+                key: "source-key".into(),
+                version_id: None,
+            })
+            .bucket(format!("missing-{}", Uuid::new_v4()))
+            .key(".rustfs-table/metadata/current.json".to_string())
+            .build()
+            .unwrap();
+        let error = DefaultObjectUsecase::without_context()
+            .execute_copy_object(build_request(input, Method::PUT))
+            .await
+            .expect_err("reserved catalog destination must fail closed without bucket metadata");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(error.message(), Some(crate::table_catalog::RESERVED_CATALOG_OBJECT_MESSAGE));
     }
 
     #[tokio::test]
