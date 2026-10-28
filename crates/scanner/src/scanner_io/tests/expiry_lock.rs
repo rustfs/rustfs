@@ -50,9 +50,11 @@ async fn free_version_cancelled_while_waiting_for_expiry_write_lock_never_queues
     };
     crate::EXPIRY_LOCK_TEST_CONTEXT
         .scope(context, async {
-            let mut object = crate::ScannerObjectInfo::default();
-            object.bucket = "expiry-lock-bucket".to_string();
-            object.name = "free-object".to_string();
+            let object = crate::ScannerObjectInfo {
+                bucket: "expiry-lock-bucket".to_string(),
+                name: "free-object".to_string(),
+                ..Default::default()
+            };
             let cancellation = CancellationToken::new();
             let guard = state.write().await;
             let mut pending = Box::pin(crate::enqueue_runtime_free_version(object.clone(), Some(&cancellation)));

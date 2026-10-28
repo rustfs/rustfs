@@ -1013,10 +1013,10 @@ async fn held_read_cancelled_scan(corrupt: bool) {
         },
     };
     // A failed observation stays failed, but the same healthy read is still joined.
-    if healthy_result.is_none() {
-        if let Some(healthy_future) = healthy.as_mut() {
-            healthy_result = Some(healthy_future.as_mut().await);
-        }
+    if healthy_result.is_none()
+        && let Some(healthy_future) = healthy.as_mut()
+    {
+        healthy_result = Some(healthy_future.as_mut().await);
     }
     drop(healthy);
     // Drop the completed scope before waiting for the native unit's final return.
