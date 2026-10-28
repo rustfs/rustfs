@@ -480,10 +480,11 @@ pub(super) async fn send_scanner_heal_request(
 ) -> Result<HealAdmissionResult, ScannerError> {
     let priority = request.priority;
     let trace_context = scanner_heal_candidate_trace_context(&request);
-    let candidate = crate::heal_completion::prepare(&request);
-    match send_heal_request_with_observation(request).await {
+    let mut candidate = crate::heal_completion::prepare(&request);
+    let result = send_heal_request_with_observation_on_enqueue(request, || candidate.mark_enqueued()).await;
+    match result {
         Ok(receipt) => {
-            crate::heal_completion::observe(candidate, Ok(&receipt));
+            candidate.observe(Ok(&receipt));
             let result = receipt.result;
             record_heal_candidate_admission(candidate_type, priority, result);
             if let Some(trace_context) = trace_context.as_ref() {
@@ -501,7 +502,7 @@ pub(super) async fn send_scanner_heal_request(
             Ok(result)
         }
         Err(err) => {
-            crate::heal_completion::observe(candidate, Err(&err));
+            candidate.observe(Err(&err));
             let err = err.to_string();
             counter!(
                 "rustfs_heal_candidate_enqueue_total",

@@ -657,12 +657,12 @@ deduplication semantics as the exporter counter.
 unresolved scope. `unknown_candidates` includes admission rejection, overflow,
 loss, expiry, and missing terminal proof. The `not_admitted` reason covers an
 explicit `Full` or `Dropped` decision. The `admission_unknown` reason means no
-decision was received because of a channel or processor error. A lost reply
-does not establish whether work was admitted; a failure known to occur before
-enqueue separately rules out submission. Both reasons remain part of the
-unknown total. Monitoring that filters by reason must include the new
-`admission_unknown` label to retain those errors. These categories overlap: a
-completed task with a repaired or verified-healthy object can still have unknown scanner
+decision was received after a command was enqueued, including when the caller
+is dropped while waiting. A lost reply does not establish whether work was
+admitted. The `admission_not_sent` reason means no local command channel
+accepted the request. Both reasons remain part of the unknown total, so
+monitoring filtered by reason should include both labels. These categories
+overlap: a completed task with a repaired or verified-healthy object can still have unknown scanner
 integrity. `integrity_state` therefore remains `unknown`, including when retained
 pending is zero. `lost_completion_notifications` counts skipped messages, not
 objects. Counts belong to the named local observer `generation`; runtime

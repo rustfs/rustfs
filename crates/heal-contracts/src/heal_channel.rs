@@ -607,14 +607,41 @@ pub async fn send_heal_request_with_observation(
     send_heal_request_with_observation_on(senders, request).await
 }
 
+/// Invoke `on_enqueue` once after a local channel accepts the command and before awaiting its reply.
+/// Failed sends never invoke the callback.
+pub async fn send_heal_request_with_observation_on_enqueue<F>(
+    request: HealChannelRequest,
+    on_enqueue: F,
+) -> Result<ObservedHealAdmissionReceipt, HealObservationChannelError>
+where
+    F: FnOnce(),
+{
+    let senders = GLOBAL_HEAL_CHANNEL_SENDERS
+        .get()
+        .ok_or(HealObservationChannelError::NotInitialized)?;
+    send_heal_request_with_observation_on_tracked(senders, request, on_enqueue).await
+}
+
 async fn send_heal_request_with_observation_on(
     senders: &HealChannelSenders,
-    mut request: HealChannelRequest,
+    request: HealChannelRequest,
 ) -> Result<ObservedHealAdmissionReceipt, HealObservationChannelError> {
+    send_heal_request_with_observation_on_tracked(senders, request, || {}).await
+}
+
+async fn send_heal_request_with_observation_on_tracked<F>(
+    senders: &HealChannelSenders,
+    mut request: HealChannelRequest,
+    on_enqueue: F,
+) -> Result<ObservedHealAdmissionReceipt, HealObservationChannelError>
+where
+    F: FnOnce(),
+{
     if let Some(observed) = &senders.observed {
         let (response_tx, response_rx) = oneshot::channel();
         match observed.send(ObservedHealReceiptCommand { request, response_tx }) {
             Ok(()) => {
+                on_enqueue();
                 return response_rx
                     .await
                     .map_err(HealObservationChannelError::ObservedResponseClosed)?;
@@ -627,6 +654,7 @@ async fn send_heal_request_with_observation_on(
         .receipt
         .send(HealReceiptCommand { request, response_tx })
         .map_err(|_| HealObservationChannelError::LegacyCommandClosed)?;
+    on_enqueue();
     let receipt = response_rx
         .await
         .map_err(HealObservationChannelError::LegacyResponseClosed)?
@@ -939,6 +967,73 @@ mod tests {
         assert!(std::error::Error::source(&error).is_some());
         assert!(matches!(receipt_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         drop(keep_receipt_open);
+    }
+
+    #[tokio::test]
+    async fn enqueue_callback_runs_once_only_for_an_accepted_command() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        for use_observed in [true, false] {
+            let (command, _command_rx) = mpsc::unbounded_channel();
+            let (receipt, mut receipt_rx) = mpsc::unbounded_channel();
+            let keep_receipt_open = receipt.clone();
+            let (observed, mut observed_rx) = mpsc::unbounded_channel();
+            if !use_observed {
+                observed_rx.close();
+            }
+            let senders = HealChannelSenders {
+                command,
+                receipt,
+                observed: Some(observed),
+            };
+            let count = Arc::new(AtomicUsize::new(0));
+            let callback_count = count.clone();
+            let task = tokio::spawn(async move {
+                send_heal_request_with_observation_on_tracked(&senders, HealChannelRequest::new(), || {
+                    callback_count.fetch_add(1, Ordering::SeqCst);
+                })
+                .await
+            });
+            if use_observed {
+                let command = observed_rx.recv().await.expect("observed command accepted");
+                drop(command.response_tx);
+                assert!(matches!(
+                    task.await.expect("sender task"),
+                    Err(HealObservationChannelError::ObservedResponseClosed(_))
+                ));
+                assert!(matches!(receipt_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+            } else {
+                let command = receipt_rx.recv().await.expect("legacy command accepted");
+                drop(command.response_tx);
+                assert!(matches!(
+                    task.await.expect("sender task"),
+                    Err(HealObservationChannelError::LegacyResponseClosed(_))
+                ));
+            }
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            drop(keep_receipt_open);
+        }
+
+        let (command, _command_rx) = mpsc::unbounded_channel();
+        let (receipt, receipt_rx) = mpsc::unbounded_channel();
+        let (observed, observed_rx) = mpsc::unbounded_channel();
+        drop(receipt_rx);
+        drop(observed_rx);
+        let senders = HealChannelSenders {
+            command,
+            receipt,
+            observed: Some(observed),
+        };
+        let count = AtomicUsize::new(0);
+        let result = send_heal_request_with_observation_on_tracked(&senders, HealChannelRequest::new(), || {
+            count.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert!(matches!(result, Err(HealObservationChannelError::LegacyCommandClosed)));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

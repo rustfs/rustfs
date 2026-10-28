@@ -52,7 +52,7 @@ use rustfs_filemeta::{
 };
 use rustfs_heal_contracts::heal_channel::{
     HEAL_DELETE_DANGLING, HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest,
-    HealRequestSource, HealScanMode, send_heal_request_with_observation,
+    HealRequestSource, HealScanMode, send_heal_request_with_observation_on_enqueue,
 };
 use rustfs_scanner_metrics::metrics::{
     CloseDiskGuard, IlmAction, Metric, Metrics, ScannerReplicationRepairKind, ScannerSourceWorkUpdate, ScannerWorkSource,

@@ -485,7 +485,8 @@ impl ObserverHandle {
 static OBSERVER: Mutex<Option<ObserverHandle>> = Mutex::new(None);
 
 fn observer_from(registry: &Mutex<Option<ObserverHandle>>) -> ObserverHandle {
-    // Installation takes only the registry lock. Readers release it before taking state; workers take only state.
+    // Installation takes only the registry lock. Drop records under registry then state;
+    // other readers release the registry before taking state, and workers take only state.
     let mut installed = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(handle) = installed.as_ref().filter(|handle| !handle.sender.is_closed()) {
         return handle.clone();
@@ -607,17 +608,56 @@ pub fn scanner_heal_observation_status() -> ScannerHealObservationStatus {
     observation_status_from(&OBSERVER)
 }
 
-/// Capture only the identity actually available at discovery, before dispatch.
-pub(crate) fn prepare(request: &HealChannelRequest) -> Option<Candidate> {
-    let _ = observer();
-    Candidate::from_request(request)
+/// Keeps an unconfirmed admission visible if its caller is dropped while waiting.
+pub(crate) struct AdmissionObservation {
+    observer: ObserverHandle,
+    candidate: Option<Candidate>,
+    enqueued: bool,
+    finished: bool,
 }
 
-pub(crate) fn observe(
-    candidate: Option<Candidate>,
-    receipt: Result<&ObservedHealAdmissionReceipt, &HealObservationChannelError>,
-) {
-    observe_on(&observer(), candidate, receipt);
+impl AdmissionObservation {
+    pub(crate) fn mark_enqueued(&mut self) {
+        self.enqueued = true;
+    }
+
+    pub(crate) fn observe(mut self, receipt: Result<&ObservedHealAdmissionReceipt, &HealObservationChannelError>) {
+        self.finished = true;
+        let observer = observer();
+        if receipt.is_err() {
+            let reason = if self.enqueued {
+                "admission_unknown"
+            } else {
+                "admission_not_sent"
+            };
+            observer.record_unknown(reason, 1);
+        } else {
+            observe_on(&observer, self.candidate.take(), receipt);
+        }
+    }
+}
+
+impl Drop for AdmissionObservation {
+    fn drop(&mut self) {
+        if self.enqueued && !self.finished {
+            record_dropped_admission(&OBSERVER, &self.observer);
+        }
+    }
+}
+
+fn record_dropped_admission(registry: &Mutex<Option<ObserverHandle>>, original: &ObserverHandle) {
+    let installed = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    installed.as_ref().unwrap_or(original).record_unknown("admission_unknown", 1);
+}
+
+/// Capture only the identity actually available at discovery, before dispatch.
+pub(crate) fn prepare(request: &HealChannelRequest) -> AdmissionObservation {
+    AdmissionObservation {
+        observer: observer(),
+        candidate: Candidate::from_request(request),
+        enqueued: false,
+        finished: false,
+    }
 }
 
 fn observe_on(
@@ -649,9 +689,48 @@ fn observe_on(
             }
         }
         Ok(_) => observer.record_unknown("not_admitted", 1),
+        Err(HealObservationChannelError::NotInitialized | HealObservationChannelError::LegacyCommandClosed) => {
+            observer.record_unknown("admission_not_sent", 1);
+        }
         Err(_) => observer.record_unknown("admission_unknown", 1),
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod admission_drop_tests {
+    use super::*;
+
+    #[test]
+    fn dropped_admission_is_recorded_in_the_installed_generation() {
+        let (sender, _original_receiver) = mpsc::channel(1);
+        let original = ObserverHandle {
+            sender,
+            state: Arc::new(Mutex::new(Observations::default())),
+            generation: 1,
+            started_at_unix_secs: None,
+        };
+        let (sender, _replacement_receiver) = mpsc::channel(1);
+        let replacement = ObserverHandle {
+            sender,
+            state: Arc::new(Mutex::new(Observations::default())),
+            generation: 2,
+            started_at_unix_secs: None,
+        };
+        let registry = Mutex::new(Some(replacement));
+        record_dropped_admission(&registry, &original);
+        let original_state = original.state.lock().expect("original observation state");
+        assert!(!original_state.unknown_counts.contains_key("admission_unknown"));
+        drop(original_state);
+        let status = observation_status_from(&registry);
+        assert_eq!(status.generation, Some(2));
+        assert!(
+            status
+                .unknown_candidates
+                .iter()
+                .any(|row| row.reason == "admission_unknown" && row.count == 1)
+        );
+    }
+}
