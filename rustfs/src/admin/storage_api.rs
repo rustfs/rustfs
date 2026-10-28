@@ -1088,6 +1088,7 @@ pub(crate) mod s3 {
 }
 
 pub(crate) mod tier {
+    pub(crate) use super::ecstore_bucket::lifecycle::tier_free_version_recovery::retry_tier_free_version_cleanup;
     pub(crate) use super::{
         AdminError, ClusterTierDailyStats, DailyAllTierStats, ECStore, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE,
         ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CONFIG, ERR_TIER_INVALID_CREDENTIALS,

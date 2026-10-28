@@ -141,6 +141,12 @@ pub mod bucket {
             pub use crate::bucket::lifecycle::rule::{Filter, NoncurrentVersionTransitionOps, TransitionOps};
         }
 
+        pub mod tier_free_version_recovery {
+            pub use crate::bucket::lifecycle::tier_free_version_recovery::{
+                TierCleanupRetryReport, TierCleanupRetryStatus, retry_tier_free_version_cleanup,
+            };
+        }
+
         pub mod tier_delete_journal {
             #[cfg(feature = "test-util")]
             pub use crate::bucket::lifecycle::tier_delete_journal::recover_tier_delete_journal_entries;

@@ -15009,6 +15009,226 @@ mod tests {
         reset_runtime_expiry_state(&ecstore).await;
     }
 
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn tier_cleanup_retry_enqueues_only_target_and_retains_durable_marker() {
+        use crate::bucket::lifecycle::tier_free_version_recovery::{TierCleanupRetryStatus, retry_tier_free_version_cleanup};
+        let (disks, api) = setup_test_env().await;
+        let (_backend, identity) = register_recovery_mock_tier(&api).await;
+        let state = install_unconsumed_runtime_expiry_worker(&api, 4).await;
+        let bucket = format!("tier-retry-{}", Uuid::new_v4());
+        create_test_bucket(&api, &bucket).await;
+        seed_recoverable_free_version(&disks, &bucket, "owned", None, Some(identity)).await;
+        let check = TierConfigMgr::deletion_check(&api.tier_config_mgr(), api.clone(), "WARM")
+            .await
+            .expect("physical free-version must be diagnosed through ECStore");
+        assert!(!check.proof_complete);
+        assert_eq!(
+            check.scan_status,
+            crate::services::tier::tier::TierDeletionScanStatus::StoppedAfterBlocker
+        );
+        assert_eq!(check.reasons.len(), 1);
+        assert_eq!(check.reasons[0].kind, crate::services::tier::tier::TierDeletionReasonKind::CleanupPending);
+        let report = retry_tier_free_version_cleanup(api.clone(), "WARM")
+            .await
+            .expect("retry should enqueue durable cleanup");
+        assert_eq!(report.status, TierCleanupRetryStatus::Accepted);
+        assert_eq!(report.enqueued, 1);
+        assert_eq!(report.failed, 0);
+        let rx = Arc::clone(&state.read().await.tasks_rx[0]);
+        let task = rx.lock().await.try_recv().expect("cleanup was queued").expect("queue item");
+        let task = task
+            .as_any()
+            .downcast_ref::<FreeVersionTask>()
+            .expect("existing free-version worker task");
+        assert_eq!(
+            (&task.0.bucket, task.0.name.as_str(), task.0.transitioned_object.tier.as_str()),
+            (&bucket, "owned", "WARM")
+        );
+        assert_eq!(
+            crate::services::tier::test_util::free_version_count(&disks[0], &bucket, "owned").await,
+            1,
+            "enqueue acceptance must retain ownership until remote cleanup commits"
+        );
+        crate::services::tier::test_util::register_mock_tier(&api.tier_config_mgr(), "OTHER").await;
+        let other = retry_tier_free_version_cleanup(api.clone(), "OTHER")
+            .await
+            .expect("other tier retry should be bounded");
+        assert_eq!(other.enqueued, 0, "retry must not enqueue a different tier's marker");
+        assert!(rx.lock().await.try_recv().is_err());
+        api.tier_config_mgr()
+            .write()
+            .await
+            .remove("OTHER", true)
+            .await
+            .expect("remove other mock tier");
+        reset_runtime_expiry_state(&api).await;
+        let failed = retry_tier_free_version_cleanup(api.clone(), "WARM")
+            .await
+            .expect("queue failure remains retryable");
+        assert_eq!(failed.failed, 1);
+        assert_eq!(failed.enqueued, 0);
+        assert_eq!(crate::services::tier::test_util::free_version_count(&disks[0], &bucket, "owned").await, 1);
+        remove_seeded_free_version(&disks, &bucket, "owned").await;
+        api.tier_config_mgr()
+            .write()
+            .await
+            .remove("WARM", true)
+            .await
+            .expect("remove mock tier");
+        api.delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("remove test bucket");
+        reset_runtime_expiry_state(&api).await;
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn tier_cleanup_retry_strictly_bounds_versions_within_one_key() {
+        use crate::bucket::lifecycle::tier_free_version_recovery::{
+            DEFAULT_FREE_VERSION_RECOVERY_LIMIT, RecoveryWalkTestAction, retry_tier_free_version_cleanup,
+            set_recovery_walk_test_hook,
+        };
+        let (_disks, api) = setup_test_env().await;
+        let (_backend, _) = register_recovery_mock_tier(&api).await;
+        let state = install_unconsumed_runtime_expiry_worker(&api, DEFAULT_FREE_VERSION_RECOVERY_LIMIT + 2).await;
+        let bucket = format!("retry-version-limit-{}", Uuid::new_v4());
+        create_test_bucket(&api, &bucket).await;
+        let selected_bucket = bucket.clone();
+        let hook = set_recovery_walk_test_hook(move |name| {
+            (name == selected_bucket).then(|| {
+                RecoveryWalkTestAction::SendItems(
+                    (0..DEFAULT_FREE_VERSION_RECOVERY_LIMIT + 1)
+                        .map(|_| {
+                            let mut object = ObjectInfo {
+                                bucket: selected_bucket.clone(),
+                                name: "same-key".to_string(),
+                                version_id: Some(Uuid::new_v4()),
+                                ..Default::default()
+                            };
+                            object.transitioned_object.free_version = true;
+                            object.transitioned_object.name = "remote/object".to_string();
+                            object.transitioned_object.tier = "WARM".to_string();
+                            object
+                        })
+                        .collect(),
+                )
+            })
+        });
+        let report = retry_tier_free_version_cleanup(api.clone(), "WARM")
+            .await
+            .expect("bounded retry succeeds");
+        assert_eq!(report.enqueued, DEFAULT_FREE_VERSION_RECOVERY_LIMIT);
+        assert_eq!(report.failed, 0);
+        assert!(report.scan_truncated, "a partial key must remain visibly truncated");
+        let receiver = Arc::clone(&state.read().await.tasks_rx[0]);
+        let mut queued = 0;
+        while receiver.lock().await.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, DEFAULT_FREE_VERSION_RECOVERY_LIMIT);
+        drop(hook);
+        reset_runtime_expiry_state(&api).await;
+        api.tier_config_mgr()
+            .write()
+            .await
+            .remove("WARM", true)
+            .await
+            .expect("remove mock tier");
+        api.delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("remove empty test bucket");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn tier_cleanup_retry_coalesces_by_backend_identity() {
+        use crate::bucket::lifecycle::tier_free_version_recovery::{TierCleanupRetryStatus, retry_tier_free_version_cleanup};
+        let (_disks, api) = setup_test_env().await;
+        let (_backend, _) = register_recovery_mock_tier(&api).await;
+        let state = install_unconsumed_runtime_expiry_worker(&api, 1).await;
+        let lease = TierConfigMgr::acquire_operation_lease(&api.tier_config_mgr(), "WARM")
+            .await
+            .expect("test lease");
+        let name = format!(
+            "tier-cleanup-retry/{}",
+            hex_simd::encode_to_string(lease.backend_identity(), hex_simd::AsciiCase::Lower)
+        );
+        let lock = api
+            .new_ns_lock(crate::disk::RUSTFS_META_BUCKET, &name)
+            .await
+            .expect("retry lock");
+        let mut guard = lock
+            .get_write_lock_quiet(StdDuration::from_secs(1))
+            .await
+            .expect("hold concurrent retry");
+        let report = retry_tier_free_version_cleanup(api.clone(), "WARM")
+            .await
+            .expect("busy retry is observable");
+        assert_eq!(report.status, TierCleanupRetryStatus::Busy);
+        assert_eq!(report.enqueued, 0);
+        assert_eq!(report.scanned, 0);
+        assert!(state.read().await.tasks_rx[0].lock().await.try_recv().is_err());
+        guard.release();
+        drop(lease);
+        api.tier_config_mgr()
+            .write()
+            .await
+            .remove("WARM", true)
+            .await
+            .expect("remove mock tier");
+        reset_runtime_expiry_state(&api).await;
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn tier_cleanup_retry_cancels_walk_without_dropping_cleanup_ownership() {
+        use crate::bucket::lifecycle::tier_free_version_recovery::{
+            RecoveryWalkTestAction, retry_tier_free_version_cleanup_with_cancel, set_recovery_walk_test_hook,
+        };
+        let (disks, api) = setup_test_env().await;
+        let (_backend, identity) = register_recovery_mock_tier(&api).await;
+        let bucket = format!("retry-cancel-{}", Uuid::new_v4());
+        create_test_bucket(&api, &bucket).await;
+        seed_recoverable_free_version(&disks, &bucket, "owned", None, Some(identity)).await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = started.clone();
+        let selected_bucket = bucket.clone();
+        let hook = set_recovery_walk_test_hook(move |name| {
+            (name == selected_bucket).then(|| RecoveryWalkTestAction::WaitForCancellation(notify.clone()))
+        });
+        let cancel = CancellationToken::new();
+        let task_api = api.clone();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move { retry_tier_free_version_cleanup_with_cancel(task_api, "WARM", task_cancel).await });
+        tokio::time::timeout(StdDuration::from_secs(5), started.notified())
+            .await
+            .expect("retry starts a walk");
+        cancel.cancel();
+        let error = tokio::time::timeout(StdDuration::from_secs(2), task)
+            .await
+            .expect("cancelled retry must stop")
+            .expect("retry joins")
+            .expect_err("cancelled scan cannot report acceptance");
+        assert_eq!(error.status_code, http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(crate::services::tier::test_util::free_version_count(&disks[0], &bucket, "owned").await, 1);
+        drop(hook);
+        remove_seeded_free_version(&disks, &bucket, "owned").await;
+        api.tier_config_mgr()
+            .write()
+            .await
+            .remove("WARM", true)
+            .await
+            .expect("remove mock tier");
+        api.delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("remove test bucket");
+    }
+
     #[tokio::test]
     #[serial]
     async fn tier_free_version_recovery_production_entrypoint_enqueues_seeded_item() {
