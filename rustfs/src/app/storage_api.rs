@@ -110,8 +110,9 @@ pub(crate) mod data_usage {
     pub(crate) async fn load_bucket_usage_from_backend_cached(
         store: Arc<crate::storage::storage_api::ECStore>,
         bucket: &str,
+        incarnation: uuid::Uuid,
     ) -> Result<Option<u64>, crate::storage::storage_api::StorageError> {
-        crate::storage::storage_api::ecstore_data_usage::load_bucket_usage_from_backend_cached(store, bucket).await
+        crate::storage::storage_api::ecstore_data_usage::load_bucket_usage_from_backend_cached(store, bucket, incarnation).await
     }
 
     #[cfg(test)]
@@ -1246,7 +1247,7 @@ pub(crate) mod object_usecase {
     }
 
     pub(crate) use super::{
-        access, bucket, capacity, compression, concurrency, data_usage, deadlock_detector, ecfs, error, head_prefix, helper, io,
+        access, bucket, compression, concurrency, data_usage, deadlock_detector, ecfs, error, head_prefix, helper, io,
         object_utils, options, request_context, s3_api, set_disk, sse, storage_class, timeout_wrapper,
     };
     pub(crate) use crate::storage::storage_api::{

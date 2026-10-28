@@ -18,6 +18,7 @@
 //! XML. The objects are not stored: no `xl.meta`, version, or Object Lock
 //! interaction. Mutations of those keys are rejected while the feature is on.
 
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,13 +34,12 @@ use time::OffsetDateTime;
 use tracing::debug;
 
 use super::super::storage_api::object_usecase::ECStore;
-use super::super::storage_api::object_usecase::capacity::{get_total_usable_capacity, get_total_usable_capacity_free};
 use super::super::storage_api::object_usecase::data_usage::load_bucket_usage_from_backend_cached;
+use super::HTTPRangeSpec;
 use super::shared::{LOG_COMPONENT_APP, LOG_SUBSYSTEM_OBJECT};
-use super::{DefaultObjectUsecase, HTTPRangeSpec};
 use crate::app::storage_api::admin_usecase::contract::StorageAdminApi;
-use crate::app::storage_api::object_usecase::bucket::quota::checker::QuotaChecker;
 use crate::app::storage_api::object_usecase::bucket::quota::{BucketQuota, QuotaType};
+use uuid::Uuid;
 
 pub(super) const SYSTEM_KEY: &str = ".system-d26a9498-cb7c-4a87-a44a-8ae204f5ba6c/system.xml";
 pub(super) const CAPACITY_KEY: &str = ".system-d26a9498-cb7c-4a87-a44a-8ae204f5ba6c/capacity.xml";
@@ -88,6 +88,8 @@ pub(super) struct CapacityFigures {
 
 #[derive(Clone)]
 struct CapacityCacheEntry {
+    store_id: Uuid,
+    bucket_incarnation: Uuid,
     bytes: Bytes,
     etag_hex: String,
     generated_at: OffsetDateTime,
@@ -144,18 +146,13 @@ pub(super) fn capacity_figures(inputs: CapacityInputs) -> CapacityFigures {
 
 /// Full generated document. Range and part-number checks happen after read
 /// preconditions so a failing `If-Match` stays 412.
-pub(super) async fn generated(
-    usecase: &DefaultObjectUsecase,
-    store: &Arc<ECStore>,
-    bucket: &str,
-    kind: SosapiKind,
-) -> S3Result<(Bytes, String, OffsetDateTime)> {
+pub(super) async fn generated(store: &Arc<ECStore>, bucket: &str, kind: SosapiKind) -> S3Result<(Bytes, String, OffsetDateTime)> {
     match kind {
         SosapiKind::System => {
             let stable = system_xml_stable();
             Ok((stable.bytes.clone(), stable.etag_hex.clone(), stable.modified_at))
         }
-        SosapiKind::Capacity => cached_or_build_capacity(usecase, store, bucket).await,
+        SosapiKind::Capacity => cached_or_build_capacity(store, bucket).await,
     }
 }
 
@@ -276,46 +273,65 @@ fn capacity_refresh_lock(bucket: &str) -> &'static tokio::sync::Mutex<()> {
     &LOCKS.get_or_init(|| std::array::from_fn(|_| tokio::sync::Mutex::new(())))[(hasher.finish() % 64) as usize]
 }
 
-fn cached_capacity(bucket: &str) -> Option<(Bytes, String, OffsetDateTime)> {
+fn cached_capacity(bucket: &str, store_id: Uuid, incarnation: Uuid) -> Option<(Bytes, String, OffsetDateTime)> {
     let entry = capacity_cache().get(bucket)?;
-    if entry.stored_at.elapsed() >= CAPACITY_XML_CACHE_TTL {
+    if entry.store_id != store_id
+        || entry.bucket_incarnation != incarnation
+        || entry.stored_at.elapsed() >= CAPACITY_XML_CACHE_TTL
+    {
         return None;
     }
     Some((entry.bytes, entry.etag_hex, entry.generated_at))
 }
 
-async fn cached_or_build_capacity(
-    usecase: &DefaultObjectUsecase,
-    store: &Arc<ECStore>,
-    bucket: &str,
-) -> S3Result<(Bytes, String, OffsetDateTime)> {
-    cached_or_load_capacity(bucket, || async {
-        Ok(capacity_figures(load_capacity_inputs(usecase, store, bucket).await?))
+async fn cached_or_build_capacity(store: &Arc<ECStore>, bucket: &str) -> S3Result<(Bytes, String, OffsetDateTime)> {
+    let incarnation = store
+        .bucket_incarnation_id_from_disk(bucket)
+        .await
+        .map_err(|_| capacity_unavailable())?;
+    cached_or_load_capacity(bucket, store.id, incarnation, || async {
+        let inputs = load_capacity_inputs(store, bucket, incarnation).await?;
+        if store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .map_err(|_| capacity_unavailable())?
+            != incarnation
+        {
+            return Err(capacity_unavailable());
+        }
+        Ok(capacity_figures(inputs))
     })
     .await
 }
 
-async fn cached_or_load_capacity<F, Fut>(bucket: &str, load: F) -> S3Result<(Bytes, String, OffsetDateTime)>
+async fn cached_or_load_capacity<F, Fut>(
+    bucket: &str,
+    store_id: Uuid,
+    incarnation: Uuid,
+    load: F,
+) -> S3Result<(Bytes, String, OffsetDateTime)>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = S3Result<CapacityFigures>>,
 {
-    if let Some(hit) = cached_capacity(bucket) {
+    if let Some(hit) = cached_capacity(bucket, store_id, incarnation) {
         return Ok(hit);
     }
     let _refresh = capacity_refresh_lock(bucket).lock().await;
-    if let Some(hit) = cached_capacity(bucket) {
+    if let Some(hit) = cached_capacity(bucket, store_id, incarnation) {
         return Ok(hit);
     }
     let bytes = Bytes::from(capacity_xml(&load().await?));
     let etag_hex = md5_hex(&bytes);
     let generated_at = capacity_cache()
         .get(bucket)
-        .filter(|entry| entry.bytes == bytes)
+        .filter(|entry| entry.store_id == store_id && entry.bucket_incarnation == incarnation && entry.bytes == bytes)
         .map_or_else(OffsetDateTime::now_utc, |entry| entry.generated_at);
     capacity_cache().insert(
         bucket.to_owned(),
         CapacityCacheEntry {
+            store_id,
+            bucket_incarnation: incarnation,
             bytes: bytes.clone(),
             etag_hex: etag_hex.clone(),
             generated_at,
@@ -329,8 +345,15 @@ fn capacity_unavailable() -> S3Error {
     S3Error::with_message(S3ErrorCode::ServiceUnavailable, "Veeam SOSAPI capacity is temporarily unavailable")
 }
 
-async fn load_capacity_inputs(usecase: &DefaultObjectUsecase, store: &Arc<ECStore>, bucket: &str) -> S3Result<CapacityInputs> {
-    let used_bucket = load_bucket_usage_from_backend_cached(Arc::clone(store), bucket)
+async fn load_capacity_inputs(store: &Arc<ECStore>, bucket: &str, incarnation: Uuid) -> S3Result<CapacityInputs> {
+    let (quota, quota_incarnation, _) = store.bucket_quota_and_incarnation_from_disk(bucket).await.map_err(|_| {
+        log_quota_unavailable_once(bucket);
+        capacity_unavailable()
+    })?;
+    if quota_incarnation != incarnation {
+        return Err(capacity_unavailable());
+    }
+    let used_bucket = load_bucket_usage_from_backend_cached(Arc::clone(store), bucket, incarnation)
         .await
         .ok()
         .flatten()
@@ -338,24 +361,13 @@ async fn load_capacity_inputs(usecase: &DefaultObjectUsecase, store: &Arc<ECStor
             log_usage_missing_once(bucket);
             capacity_unavailable()
         })?;
+    let (capacity_cluster, free_cluster) = cached_cluster_capacity(store).await?;
     Ok(CapacityInputs {
         used_bucket,
-        hard_quota: load_hard_quota(usecase, bucket).await?,
-        ..load_cluster_capacity(store).await
+        hard_quota: quota.as_ref().and_then(hard_quota_bytes),
+        capacity_cluster,
+        free_cluster,
     })
-}
-
-async fn load_hard_quota(usecase: &DefaultObjectUsecase, bucket: &str) -> S3Result<Option<u64>> {
-    let metadata = usecase.bucket_metadata_sys().ok_or_else(capacity_unavailable)?;
-    let checker = QuotaChecker::new(metadata);
-    checker
-        .get_quota_config(bucket)
-        .await
-        .map(|quota| hard_quota_bytes(&quota))
-        .map_err(|_| {
-            log_quota_unavailable_once(bucket);
-            capacity_unavailable()
-        })
 }
 
 fn hard_quota_bytes(quota: &BucketQuota) -> Option<u64> {
@@ -364,20 +376,117 @@ fn hard_quota_bytes(quota: &BucketQuota) -> Option<u64> {
     }
 }
 
-async fn load_cluster_capacity(store: &Arc<ECStore>) -> CapacityInputs {
-    let info = StorageAdminApi::storage_info(store.as_ref()).await;
-    let capacity_cluster = usable_u64(get_total_usable_capacity(&info.disks, &info));
-    let free_cluster = usable_u64(get_total_usable_capacity_free(&info.disks, &info));
-    CapacityInputs {
-        used_bucket: 0,
-        hard_quota: None,
-        capacity_cluster,
-        free_cluster,
-    }
+struct ClusterCapacity {
+    store_id: Uuid,
+    total: u64,
+    free: u64,
+    stored_at: Instant,
 }
 
-fn usable_u64(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+async fn cached_cluster_capacity(store: &Arc<ECStore>) -> S3Result<(u64, u64)> {
+    static CACHE: OnceLock<tokio::sync::Mutex<Option<ClusterCapacity>>> = OnceLock::new();
+    cached_cluster_capacity_with(CACHE.get_or_init(|| tokio::sync::Mutex::new(None)), store.id, || async {
+        let info = StorageAdminApi::storage_info(store.as_ref()).await;
+        if !cluster_capacity_observations_are_live(&info) {
+            return Err(capacity_unavailable());
+        }
+        conservative_cluster_capacity(&info).ok_or_else(capacity_unavailable)
+    })
+    .await
+}
+
+fn cluster_capacity_observations_are_live(info: &rustfs_madmin::StorageInfo) -> bool {
+    !info.disks.is_empty()
+        && !info.observations.is_empty()
+        && info
+            .observations
+            .iter()
+            .all(|observation| !observation.cached && observation.status == rustfs_madmin::StorageInfoProbeStatus::Succeeded)
+        && info.disks.iter().all(|disk| {
+            (disk.state.eq_ignore_ascii_case("ok") || disk.state.eq_ignore_ascii_case("online"))
+                && disk.capacity_observation_source.as_deref() == Some("live_probe")
+        })
+}
+
+async fn cached_cluster_capacity_with<F, Fut>(
+    cache: &tokio::sync::Mutex<Option<ClusterCapacity>>,
+    store_id: Uuid,
+    load: F,
+) -> S3Result<(u64, u64)>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = S3Result<(u64, u64)>>,
+{
+    let mut cached = cache.lock().await;
+    if let Some(entry) = cached
+        .as_ref()
+        .filter(|entry| entry.store_id == store_id && entry.stored_at.elapsed() < CAPACITY_XML_CACHE_TTL)
+    {
+        return Ok((entry.total, entry.free));
+    }
+    let (total, free) = load().await?;
+    *cached = Some(ClusterCapacity {
+        store_id,
+        total,
+        free,
+        stored_at: Instant::now(),
+    });
+    Ok((total, free))
+}
+
+/// A set can consume only the space available on each of its shard disks.
+/// This remains an estimate when multiple shard paths share a backing device.
+fn conservative_cluster_capacity(info: &rustfs_madmin::StorageInfo) -> Option<(u64, u64)> {
+    let backend = &info.backend;
+    let pools = backend.drives_per_set.len();
+    if pools == 0
+        || backend.total_sets.len() != pools
+        || backend.standard_sc_data.len() != pools
+        || backend.standard_sc_parities.len() != pools
+    {
+        return None;
+    }
+    let expected = backend
+        .drives_per_set
+        .iter()
+        .zip(&backend.total_sets)
+        .try_fold(0usize, |sum, (&width, &sets)| sum.checked_add(width.checked_mul(sets)?))?;
+    if expected != info.disks.len() {
+        return None;
+    }
+    let mut seen = HashSet::with_capacity(expected);
+    let mut sets: HashMap<(usize, usize), (u64, u64, usize)> = HashMap::new();
+    for disk in &info.disks {
+        let pool = usize::try_from(disk.pool_index).ok()?;
+        let set = usize::try_from(disk.set_index).ok()?;
+        let index = usize::try_from(disk.disk_index).ok()?;
+        let width = *backend.drives_per_set.get(pool)?;
+        if width == 0 || set >= *backend.total_sets.get(pool)? || index >= width || !seen.insert((pool, set, index)) {
+            return None;
+        }
+        let entry = sets.entry((pool, set)).or_insert((u64::MAX, u64::MAX, 0));
+        entry.0 = entry.0.min(disk.total_space);
+        entry.1 = entry.1.min(disk.available_space);
+        entry.2 = entry.2.checked_add(1)?;
+    }
+    let mut total = 0u64;
+    let mut free = 0u64;
+    for ((pool, _), (min_total, min_free, count)) in sets {
+        let width = backend.drives_per_set[pool];
+        let data = backend.standard_sc_data[pool];
+        if count != width
+            || data == 0
+            || data.checked_add(backend.standard_sc_parities[pool]) != Some(width)
+            || min_total == 0
+            || min_free > min_total
+        {
+            return None;
+        }
+        let data = u64::try_from(data).ok()?;
+        total = total.checked_add(min_total.checked_mul(data)?)?;
+        free = free.checked_add(min_free.checked_mul(data)?)?;
+    }
+    Some((total, free))
 }
 
 fn log_usage_missing_once(bucket: &str) {
@@ -522,6 +631,8 @@ mod tests {
     async fn concurrent_capacity_refreshes_share_one_load_and_preserve_modification_time() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let bucket = format!("veeam-cache-{}", super::super::Uuid::new_v4());
+        let store_id = Uuid::new_v4();
+        let incarnation = Uuid::new_v4();
         let calls = AtomicUsize::new(0);
         let figures = || CapacityFigures {
             capacity: 100,
@@ -533,7 +644,10 @@ mod tests {
             tokio::task::yield_now().await;
             Ok(figures())
         };
-        let (first, second) = tokio::join!(cached_or_load_capacity(&bucket, load), cached_or_load_capacity(&bucket, load));
+        let (first, second) = tokio::join!(
+            cached_or_load_capacity(&bucket, store_id, incarnation, load),
+            cached_or_load_capacity(&bucket, store_id, incarnation, load)
+        );
         let first = first.expect("first refresh");
         let second = second.expect("coalesced refresh");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -542,16 +656,30 @@ mod tests {
         let mut expired = capacity_cache().get(&bucket).expect("cached entry");
         expired.stored_at = Instant::now() - CAPACITY_XML_CACHE_TTL;
         capacity_cache().insert(bucket.clone(), expired);
-        let unchanged = cached_or_load_capacity(&bucket, load)
+        let unchanged = cached_or_load_capacity(&bucket, store_id, incarnation, load)
             .await
             .expect("refresh unchanged content");
         assert_eq!(first, unchanged);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let replacement = Uuid::new_v4();
+        let replacement_value = cached_or_load_capacity(&bucket, store_id, replacement, load)
+            .await
+            .expect("new incarnation");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "new incarnation must not hit the old cache");
+        assert_eq!(replacement_value.0, first.0);
+        let different_store = cached_or_load_capacity(&bucket, Uuid::new_v4(), replacement, load)
+            .await
+            .expect("other store");
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "other stores must not share cached values");
+        assert_eq!(different_store.0, first.0);
+        let _ = cached_or_load_capacity(&bucket, store_id, incarnation, load)
+            .await
+            .expect("restore test identity");
 
         let mut expired = capacity_cache().get(&bucket).expect("refreshed entry");
         expired.stored_at = Instant::now() - CAPACITY_XML_CACHE_TTL;
         capacity_cache().insert(bucket.clone(), expired);
-        let changed = cached_or_load_capacity(&bucket, || async {
+        let changed = cached_or_load_capacity(&bucket, store_id, incarnation, || async {
             Ok(CapacityFigures {
                 capacity: 100,
                 used: 30,
@@ -564,14 +692,121 @@ mod tests {
         capacity_cache().invalidate(&bucket);
     }
 
+    #[test]
+    fn cluster_capacity_rejects_missing_or_stale_observations() {
+        let mut info = rustfs_madmin::StorageInfo {
+            disks: vec![rustfs_madmin::Disk {
+                state: "ok".into(),
+                capacity_observation_source: Some("live_probe".into()),
+                ..Default::default()
+            }],
+            observations: vec![rustfs_madmin::StorageInfoObservation {
+                status: rustfs_madmin::StorageInfoProbeStatus::Succeeded,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(cluster_capacity_observations_are_live(&info));
+        info.disks[0].capacity_observation_source = Some("snapshot".into());
+        assert!(!cluster_capacity_observations_are_live(&info));
+        info.disks[0].capacity_observation_source = Some("live_probe".into());
+        info.observations[0].status = rustfs_madmin::StorageInfoProbeStatus::Failed;
+        assert!(!cluster_capacity_observations_are_live(&info));
+        info.observations.clear();
+        assert!(!cluster_capacity_observations_are_live(&info));
+    }
+
+    #[test]
+    fn cluster_capacity_uses_the_smallest_disk_in_each_erasure_set() {
+        let mut info = rustfs_madmin::StorageInfo::default();
+        info.backend.drives_per_set = vec![4];
+        info.backend.total_sets = vec![1];
+        info.backend.standard_sc_data = vec![2];
+        info.backend.standard_sc_parities = vec![2];
+        info.disks = [100, 100, 100, 10]
+            .into_iter()
+            .enumerate()
+            .map(|(index, free)| rustfs_madmin::Disk {
+                pool_index: 0,
+                set_index: 0,
+                disk_index: i32::try_from(index).unwrap(),
+                total_space: 200,
+                available_space: free,
+                ..Default::default()
+            })
+            .collect();
+        assert_eq!(conservative_cluster_capacity(&info), Some((400, 20)));
+        info.disks[3].disk_index = 0;
+        assert_eq!(conservative_cluster_capacity(&info), None, "duplicate drives cannot certify capacity");
+        info.disks.pop();
+        assert_eq!(conservative_cluster_capacity(&info), None, "missing drives cannot certify capacity");
+    }
+
+    #[test]
+    fn cluster_capacity_handles_heterogeneous_pools_and_rejects_overflow() {
+        let mut info = rustfs_madmin::StorageInfo::default();
+        info.backend.drives_per_set = vec![2, 1];
+        info.backend.total_sets = vec![1, 2];
+        info.backend.standard_sc_data = vec![1, 1];
+        info.backend.standard_sc_parities = vec![1, 0];
+        info.disks = [
+            (0, 0, 0, 100, 80),
+            (0, 0, 1, 120, 50),
+            (1, 0, 0, 200, 90),
+            (1, 1, 0, 300, 150),
+        ]
+        .into_iter()
+        .map(|(pool, set, index, total, free)| rustfs_madmin::Disk {
+            pool_index: pool,
+            set_index: set,
+            disk_index: index,
+            total_space: total,
+            available_space: free,
+            ..Default::default()
+        })
+        .collect();
+        assert_eq!(conservative_cluster_capacity(&info), Some((600, 290)));
+        info.disks[2].total_space = u64::MAX;
+        info.disks[3].total_space = u64::MAX;
+        assert_eq!(conservative_cluster_capacity(&info), None);
+    }
+
+    #[tokio::test]
+    async fn cluster_capacity_refresh_is_shared_and_store_scoped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = tokio::sync::Mutex::new(None);
+        let calls = AtomicUsize::new(0);
+        let store = Uuid::new_v4();
+        let load = || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            Ok((100, 80))
+        };
+        let (a, b) = tokio::join!(
+            cached_cluster_capacity_with(&cache, store, load),
+            cached_cluster_capacity_with(&cache, store, load)
+        );
+        assert_eq!((a.unwrap(), b.unwrap()), ((100, 80), (100, 80)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cached_cluster_capacity_with(&cache, Uuid::new_v4(), load).await.unwrap(), (100, 80));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let failed_store = Uuid::new_v4();
+        let failed = cached_cluster_capacity_with(&cache, failed_store, || async { Err(capacity_unavailable()) }).await;
+        assert_eq!(failed.unwrap_err().code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(cached_cluster_capacity_with(&cache, failed_store, load).await.unwrap(), (100, 80));
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "failed probes must not poison the cache");
+    }
+
     #[tokio::test]
     async fn cancelled_or_failed_capacity_refresh_can_be_retried() {
         let bucket = format!("veeam-cancel-{}", super::super::Uuid::new_v4());
         let started = Arc::new(tokio::sync::Notify::new());
+        let store_id = Uuid::new_v4();
+        let incarnation = Uuid::new_v4();
         let task_bucket = bucket.clone();
         let task_started = Arc::clone(&started);
         let task = tokio::spawn(async move {
-            cached_or_load_capacity(&task_bucket, || async {
+            cached_or_load_capacity(&task_bucket, store_id, incarnation, || async {
                 task_started.notify_one();
                 std::future::pending::<()>().await;
                 Ok(CapacityFigures {
@@ -585,11 +820,11 @@ mod tests {
         started.notified().await;
         task.abort();
         assert!(task.await.expect_err("refresh was cancelled").is_cancelled());
-        let failed = cached_or_load_capacity(&bucket, || async { Err(capacity_unavailable()) }).await;
+        let failed = cached_or_load_capacity(&bucket, store_id, incarnation, || async { Err(capacity_unavailable()) }).await;
         assert_eq!(failed.expect_err("failure is returned").code(), &S3ErrorCode::ServiceUnavailable);
         let recovered = tokio::time::timeout(
             Duration::from_secs(1),
-            cached_or_load_capacity(&bucket, || async {
+            cached_or_load_capacity(&bucket, store_id, incarnation, || async {
                 Ok(CapacityFigures {
                     capacity: 1,
                     used: 0,
@@ -649,7 +884,7 @@ mod tests {
             temp_env::async_with_vars([(rustfs_config::ENV_VEEAM_SOSAPI_ENABLE, None::<&str>)], async {
                 use crate::app::runtime_sources::{AppContext, ServerContextSlot};
                 use crate::app::storage_api::s3::{Body, S3ServiceBuilder, SimpleAuth};
-                use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+                use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
                 use crate::app::storage_api::test::contract::list::ListOperations as _;
                 use crate::app::storage_api::test::contract::object::ObjectOperations as _;
                 use http::Method;
@@ -767,7 +1002,13 @@ mod tests {
                     usage_snapshot_complete: true,
                     ..Default::default()
                 };
-                snapshot.buckets_usage.insert(bucket.clone(), rustfs_data_usage::BucketUsageInfo::default());
+                let bucket_incarnation = store.bucket_incarnation_id_from_disk(&bucket).await.expect("bucket incarnation");
+                snapshot.usage_snapshot_converged = Some(true);
+                snapshot.scanner_cycle = Some(1);
+                snapshot.scanner_epoch = Some(1);
+                snapshot.buckets_usage.insert(bucket.clone(), rustfs_data_usage::BucketUsageInfo {
+                    bucket_incarnation: Some(bucket_incarnation.to_string()), ..Default::default()
+                });
                 snapshot.bucket_sizes.insert(bucket.clone(), 0);
                 crate::app::storage_api::test::data_usage::store_data_usage_in_backend(snapshot.clone(), Arc::clone(&store))
                     .await.expect("seed capacity snapshot");
@@ -907,9 +1148,12 @@ mod tests {
                     .expect("set quota on fresh bucket");
                 snapshot.last_update = Some(std::time::SystemTime::now() + Duration::from_secs(2));
                 snapshot.buckets_count = 2;
-                snapshot.buckets_usage.insert(quota_bucket.clone(), rustfs_data_usage::BucketUsageInfo::default());
+                let quota_incarnation = store.bucket_incarnation_id_from_disk(&quota_bucket).await.expect("quota bucket incarnation");
+                snapshot.buckets_usage.insert(quota_bucket.clone(), rustfs_data_usage::BucketUsageInfo {
+                    bucket_incarnation: Some(quota_incarnation.to_string()), ..Default::default()
+                });
                 snapshot.bucket_sizes.insert(quota_bucket.clone(), 0);
-                crate::app::storage_api::test::data_usage::store_data_usage_in_backend(snapshot, Arc::clone(&store))
+                crate::app::storage_api::test::data_usage::store_data_usage_in_backend(snapshot.clone(), Arc::clone(&store))
                     .await.expect("seed quota bucket usage");
                 let quota_response = owner
                     .call(owner_call(
@@ -940,9 +1184,50 @@ mod tests {
                     let response = owner.call(owner_call(
                         method, format!("/{quota_bucket}/{CAPACITY_KEY}"), Vec::new(), Bytes::new()
                     )).await.expect("invalid quota response");
-                    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+                    assert_eq!(response.status(), http::StatusCode::OK, "stale in-memory quota must not override authoritative metadata");
                 }
                 metadata.read().await.set(quota_bucket.clone(), original_quota).await;
+
+                let recycled = format!("veeam-recycled-{}", Uuid::new_v4());
+                store.make_bucket(&recycled, &MakeBucketOptions::default()).await.expect("create recycled bucket");
+                let old_id = store.bucket_incarnation_id_from_disk(&recycled).await.expect("old identity");
+                let (old_metadata, _) = metadata.read().await.get_config(&recycled).await.expect("old cached metadata");
+                snapshot.last_update = Some(std::time::SystemTime::now() + Duration::from_secs(3));
+                snapshot.buckets_count = 3;
+                snapshot.buckets_usage.insert(recycled.clone(), rustfs_data_usage::BucketUsageInfo {
+                    size: 123, bucket_incarnation: Some(old_id.to_string()), ..Default::default()
+                });
+                snapshot.bucket_sizes.insert(recycled.clone(), 123);
+                crate::app::storage_api::test::data_usage::store_data_usage_in_backend(snapshot.clone(), Arc::clone(&store))
+                    .await.expect("seed old incarnation snapshot");
+                let recycled_uri = format!("/{recycled}/{CAPACITY_KEY}");
+                let old = owner.call(owner_call(Method::GET, recycled_uri.clone(), Vec::new(), Bytes::new())).await.expect("old capacity");
+                assert_eq!(old.status(), http::StatusCode::OK);
+                let old_body = BodyExt::collect(old.into_body()).await.expect("old capacity body").to_bytes();
+                assert_eq!(element_text(std::str::from_utf8(&old_body).unwrap(), "Used"), "123");
+                store.delete_bucket(&recycled, &DeleteBucketOptions::default()).await.expect("delete recycled bucket");
+                store.make_bucket(&recycled, &MakeBucketOptions::default()).await.expect("recreate bucket");
+                let new_id = store.bucket_incarnation_id_from_disk(&recycled).await.expect("new identity");
+                assert_ne!(old_id, new_id);
+                let (new_metadata, _) = metadata.read().await.get_config(&recycled).await.expect("new cached metadata");
+                metadata.read().await.set(recycled.clone(), old_metadata).await;
+                // Simulate a stale peer snapshot after the new bucket exists.
+                snapshot.last_update = Some(std::time::SystemTime::now() + Duration::from_secs(4));
+                crate::app::storage_api::test::data_usage::store_data_usage_in_backend(snapshot.clone(), Arc::clone(&store))
+                    .await.expect("seed stale incarnation snapshot");
+                let stale = owner.call(owner_call(Method::GET, recycled_uri.clone(), Vec::new(), Bytes::new())).await.expect("stale capacity");
+                assert_eq!(stale.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+                snapshot.last_update = Some(std::time::SystemTime::now() + Duration::from_secs(5));
+                snapshot.buckets_usage.get_mut(&recycled).unwrap().bucket_incarnation = Some(new_id.to_string());
+                snapshot.buckets_usage.get_mut(&recycled).unwrap().size = 17;
+                snapshot.bucket_sizes.insert(recycled.clone(), 17);
+                crate::app::storage_api::test::data_usage::store_data_usage_in_backend(snapshot, Arc::clone(&store))
+                    .await.expect("seed new incarnation snapshot");
+                let fresh = owner.call(owner_call(Method::GET, recycled_uri, Vec::new(), Bytes::new())).await.expect("new capacity");
+                assert_eq!(fresh.status(), http::StatusCode::OK);
+                let fresh_body = BodyExt::collect(fresh.into_body()).await.expect("new capacity body").to_bytes();
+                assert_eq!(element_text(std::str::from_utf8(&fresh_body).unwrap(), "Used"), "17");
+                metadata.read().await.set(recycled.clone(), new_metadata).await;
 
                 let stored = store
                     .get_object_info(&bucket, SYSTEM_KEY, &super::super::ObjectOptions::default())

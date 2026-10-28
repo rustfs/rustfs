@@ -129,6 +129,41 @@ fn projected_publication_moves_bucket_maps_into_cache() {
     );
 }
 
+#[test]
+fn certified_bucket_usage_rejects_unproven_and_pending_data() {
+    let id = uuid::Uuid::from_u128(7);
+    let mut info = data_usage_info_for_test("known", 1, 42, SystemTime::UNIX_EPOCH);
+    info.usage_snapshot_converged = Some(true);
+    info.scanner_cycle = Some(1);
+    info.scanner_epoch = Some(1);
+    info.buckets_usage.get_mut("known").unwrap().bucket_incarnation = Some(id.to_string());
+    assert_eq!(certified_bucket_usage(&info, "known", id), Some(42));
+    assert_eq!(certified_bucket_usage(&info, "known", uuid::Uuid::from_u128(8)), None);
+    assert_eq!(certified_bucket_usage(&info, "known", uuid::Uuid::nil()), None);
+    let mut legacy = info.clone();
+    legacy.buckets_usage.get_mut("known").unwrap().bucket_incarnation = None;
+    assert_eq!(certified_bucket_usage(&legacy, "known", id), None);
+    legacy.buckets_usage.get_mut("known").unwrap().bucket_incarnation = Some("corrupt".into());
+    assert_eq!(certified_bucket_usage(&legacy, "known", id), None);
+    let mut pending = info.clone();
+    pending.usage_snapshot_converged = Some(false);
+    pending.usage_snapshot_pending_buckets = vec!["other".into()];
+    pending.usage_snapshot_pending_bucket_count = 1;
+    assert_eq!(certified_bucket_usage(&pending, "known", id), Some(42));
+    pending.usage_snapshot_pending_buckets = vec!["known".into()];
+    assert_eq!(certified_bucket_usage(&pending, "known", id), None);
+    pending.usage_snapshot_pending_bucket_count = 0;
+    assert_eq!(certified_bucket_usage(&pending, "known", id), None);
+    pending.usage_snapshot_pending_buckets = vec!["z".into(), "a".into()];
+    pending.usage_snapshot_pending_bucket_count = 2;
+    assert_eq!(certified_bucket_usage(&pending, "known", id), None);
+    let mut observational = info.clone();
+    observational.usage_snapshot_observational = true;
+    assert_eq!(certified_bucket_usage(&observational, "known", id), None);
+    info.usage_snapshot_converged = None;
+    assert_eq!(certified_bucket_usage(&info, "known", id), None);
+}
+
 #[tokio::test]
 #[serial]
 async fn persisted_scalar_projection_shares_cache_refresh_and_invalidation() {
@@ -140,6 +175,13 @@ async fn persisted_scalar_projection_shares_cache_refresh_and_invalidation() {
     info.buckets_usage.insert("empty".to_string(), BucketUsageInfo::default());
     info.bucket_sizes.insert("empty".to_string(), 0);
     info.buckets_count = 2;
+    info.usage_snapshot_converged = Some(true);
+    info.scanner_cycle = Some(1);
+    info.scanner_epoch = Some(1);
+    let incarnation = uuid::Uuid::from_u128(7);
+    for usage in info.buckets_usage.values_mut() {
+        usage.bucket_incarnation = Some(incarnation.to_string());
+    }
     save_config(
         store.clone(),
         DATA_USAGE_OBJ_NAME_PATH.as_str(),
@@ -152,7 +194,7 @@ async fn persisted_scalar_projection_shares_cache_refresh_and_invalidation() {
     for (bucket, expected) in [("known", Some(42)), ("empty", Some(0)), ("missing", None)] {
         assert_eq!(persisted_bucket_usage(store.clone(), bucket).await, expected);
         assert_eq!(
-            load_bucket_usage_from_backend_cached(store.clone(), bucket)
+            load_bucket_usage_from_backend_cached(store.clone(), bucket, incarnation)
                 .await
                 .expect("project bucket usage"),
             expected
@@ -162,6 +204,18 @@ async fn persisted_scalar_projection_shares_cache_refresh_and_invalidation() {
             .expect("owned cached snapshot");
         assert_eq!(expected, owned.buckets_usage.get(bucket).map(|usage| usage.size));
     }
+    assert_eq!(
+        load_bucket_usage_from_backend_cached(store.clone(), "known", uuid::Uuid::from_u128(8))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        load_bucket_usage_from_backend_cached(store.clone(), "known", uuid::Uuid::nil())
+            .await
+            .unwrap(),
+        None
+    );
     info.buckets_usage.get_mut("known").expect("known bucket").size = 84;
     info.bucket_sizes.insert("known".to_string(), 84);
     save_config(

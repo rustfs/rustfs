@@ -1494,14 +1494,45 @@ pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<
 }
 
 /// Read one bucket's persisted usage without cloning the complete snapshot.
-pub async fn load_bucket_usage_from_backend_cached(store: Arc<ECStore>, bucket: &str) -> Result<Option<u64>, Error> {
-    project_data_usage_from_backend_cached(store, |info| {
-        info.buckets_usage
-            .get(bucket)
-            .map(|usage| usage.size)
-            .or_else(|| info.bucket_sizes.get(bucket).copied())
-    })
-    .await
+pub async fn load_bucket_usage_from_backend_cached(
+    store: Arc<ECStore>,
+    bucket: &str,
+    incarnation: uuid::Uuid,
+) -> Result<Option<u64>, Error> {
+    project_data_usage_from_backend_cached(store, |info| certified_bucket_usage(info, bucket, incarnation)).await
+}
+
+fn certified_bucket_usage(info: &DataUsageInfo, bucket: &str, incarnation: uuid::Uuid) -> Option<u64> {
+    if incarnation.is_nil()
+        || !info.is_complete_bucket_usage_snapshot()
+        || info.usage_snapshot_observational
+        || info.scanner_cycle.is_none()
+        || info.scanner_epoch.is_none()
+    {
+        return None;
+    }
+    let pending_count = u64::try_from(info.usage_snapshot_pending_buckets.len()).ok()?;
+    if pending_count != info.usage_snapshot_pending_bucket_count {
+        return None;
+    }
+    match info.usage_snapshot_converged {
+        Some(true) if pending_count == 0 => {}
+        Some(false)
+            if pending_count > 0
+                && info.usage_snapshot_pending_buckets.windows(2).all(|pair| pair[0] < pair[1])
+                && info
+                    .usage_snapshot_pending_buckets
+                    .binary_search_by(|pending| pending.as_str().cmp(bucket))
+                    .is_err() => {}
+        _ => return None,
+    }
+    let usage = info.buckets_usage.get(bucket)?;
+    let certified = usage
+        .bucket_incarnation
+        .as_deref()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .filter(|id| !id.is_nil())?;
+    (certified == incarnation).then_some(usage.size)
 }
 
 // Project under the cache guard so scalar readers never copy the snapshot's
