@@ -79,6 +79,8 @@ pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope", "dep:object", "dep:symboli
 dial9 = ["rustfs-obs/dial9"]
 # Diagnostic-only Rust GlobalAlloc live-byte accounting; adds per-allocation atomic updates.
 diagnostic-allocator-live = []
+# Default-off sampled local batch wall/CPU and request correlation diagnostics.
+diagnostic-local-batch = ["rustfs-ecstore/diagnostic-local-batch", "rustfs-obs/diagnostic-local-batch"]
 # Diagnostic-only S3-operation attribution for internode ReadVersion and list-walker metrics.
 diagnostic-read-version-caller = ["rustfs-ecstore/diagnostic-read-version-caller", "rustfs-io-metrics/diagnostic-read-version-caller", "rustfs-scanner/diagnostic-read-version-caller"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn"]
