@@ -89,6 +89,14 @@ impl CounterRecorder {
     }
 }
 
+fn stack_probe_stage(stage: &str) {
+    use std::io::Write;
+
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "HEAL_ID_REUSE_STACK_STAGE: {stage}");
+    let _ = stderr.flush();
+}
+
 async fn put_protected(env: &TestECStoreEnv, bucket: &str, object: &str, fill: u8, mod_time: OffsetDateTime) {
     let lock = env.ecstore.new_ns_lock(bucket, object).await.expect("fixture namespace lock");
     let guard = WriteCommitGuard::acquire(&lock, Duration::from_secs(30))
@@ -249,16 +257,22 @@ fn assert_observer_resolution(
 
 #[tokio::test]
 async fn overwritten_unversioned_generation_is_not_attributed_to_the_scanned_candidate() {
+    stack_probe_stage("test body entered");
     let root = tempfile::tempdir().expect("local erasure-set fixture");
+    stack_probe_stage("ECStore build started");
     let env = TestECStoreEnv::builder().base_dir(root.path()).build().await;
+    stack_probe_stage("ECStore build finished");
     let bucket = "scanner-generation";
     let object = "overwritten-object";
+    stack_probe_stage("bucket creation started");
     env.make_bucket(bucket, false).await;
 
     // The old timestamp exercises the scanner's real Deep selection without
     // altering the ObjectInfo returned by storage.
     let now = OffsetDateTime::now_utc();
+    stack_probe_stage("generation A write started");
     put_protected(&env, bucket, object, 0x41, now - time::Duration::minutes(4)).await;
+    stack_probe_stage("generation A write finished");
     let discovered = env
         .ecstore
         .get_object_info(bucket, object, &ScannerObjectOptions::default())
@@ -267,7 +281,9 @@ async fn overwritten_unversioned_generation_is_not_attributed_to_the_scanned_can
     assert!(discovered.version_id.is_none_or(|id| id.is_nil()), "fixture must be unversioned");
     let generation_a = discovered.data_dir.filter(|id| !id.is_nil()).expect("generation A");
 
+    stack_probe_stage("generation B write started");
     put_protected(&env, bucket, object, 0x42, now - time::Duration::minutes(3)).await;
+    stack_probe_stage("generation B write finished");
     let current = env
         .ecstore
         .get_object_info(bucket, object, &ScannerObjectOptions::default())
@@ -289,7 +305,9 @@ async fn overwritten_unversioned_generation_is_not_attributed_to_the_scanned_can
             ..Default::default()
         }),
     ));
+    stack_probe_stage("heal manager start started");
     manager.start().await.expect("start production heal manager");
+    stack_probe_stage("heal manager start finished");
     let (commands, receipts) = init_heal_channels().expect("initialize process-local heal channels");
     let processor_manager = manager.clone();
     let processor = tokio::spawn(async move {
@@ -315,17 +333,20 @@ async fn overwritten_unversioned_generation_is_not_attributed_to_the_scanned_can
         heal_bitrot: true,
         debug: false,
     };
+    stack_probe_stage("scanner apply started");
     temp_env::async_with_vars([("RUSTFS_SCANNER_DEEP_VERIFY_COOLDOWN_SECS", Some("0"))], async {
         scanner
             .apply_actions(vec![discovered], None, Default::default(), &[], &mut SizeSummary::default())
             .await;
     })
     .await;
+    stack_probe_stage("scanner apply finished");
 
     let terminal = tokio::time::timeout(Duration::from_secs(30), completions.recv())
         .await
         .expect("manager terminal deadline")
         .expect("manager terminal delivered");
+    stack_probe_stage("initial heal terminal received");
     assert_eq!(terminal.execution, Some(HealExecutionOutcome::Completed));
     assert_eq!(terminal.scan_mode, HealScanMode::Deep);
     assert!(!terminal.dry_run);
@@ -370,6 +391,7 @@ async fn overwritten_unversioned_generation_is_not_attributed_to_the_scanned_can
 
         // The same ID first runs again without an overwrite: equal data_dir
         // still does not mean that this is the earlier execution.
+        stack_probe_stage("same-data owner round started");
         let (same_admission, same_terminal) = run_reused_owner_round(
             &manager,
             &mut scanner,
@@ -381,8 +403,11 @@ async fn overwritten_unversioned_generation_is_not_attributed_to_the_scanned_can
             generation_b,
         )
         .await;
+        stack_probe_stage("same-data owner round finished");
 
+        stack_probe_stage("generation C write started");
         put_protected(&env, bucket, object, 0x43, now - time::Duration::minutes(2)).await;
+        stack_probe_stage("generation C write finished");
         let changed = env
             .ecstore
             .get_object_info(bucket, object, &ScannerObjectOptions::default())
@@ -390,6 +415,7 @@ async fn overwritten_unversioned_generation_is_not_attributed_to_the_scanned_can
             .expect("read generation C from storage");
         let generation_c = changed.data_dir.filter(|id| !id.is_nil()).expect("generation C");
         assert_ne!(generation_b, generation_c);
+        stack_probe_stage("changed-data owner round started");
         let (changed_admission, changed_terminal) = run_reused_owner_round(
             &manager,
             &mut scanner,
@@ -401,6 +427,7 @@ async fn overwritten_unversioned_generation_is_not_attributed_to_the_scanned_can
             generation_c,
         )
         .await;
+        stack_probe_stage("changed-data owner round finished");
 
         let final_status = scanner_heal_observation_status();
         assert_eq!(final_status.state, "active");
