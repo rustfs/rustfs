@@ -280,7 +280,7 @@ pub(in crate::set_disk) fn resolve_read_part_from_responses(
             continue;
         }
 
-        if !parts[part_idx].etag.is_empty() {
+        if !parts[part_idx].etag.is_empty() && parts[part_idx].error.is_none() {
             present_count += 1;
             let part = &parts[part_idx];
             let key = (part.etag.as_str(), part.number, part.size, part.actual_size, part.integrity.as_ref());
@@ -12821,6 +12821,20 @@ mod tests {
             .expect_err("mismatched and transient responses must not be treated as confirmed missing");
 
         assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn resolve_read_part_does_not_count_error_response_with_etag_as_a_vote() {
+        let healthy = read_part_test_part(1, "same-etag");
+        let mut failed = healthy.clone();
+        failed.error = Some("metadata read failed".to_owned());
+        let responses = vec![Some(vec![healthy.clone()]), Some(vec![healthy]), Some(vec![failed])];
+        let err = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 3)
+            .expect_err("an error-bearing response must not supply the third vote");
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+        let part = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
+            .expect("the two healthy matching responses remain a valid quorum");
+        assert!(part.error.is_none());
     }
 
     #[test]
