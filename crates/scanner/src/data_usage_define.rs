@@ -67,11 +67,12 @@ const METRIC_CACHE_SAVE_RETRY_TOTAL: &str = "rustfs_scanner_cache_save_retry_tot
 const METRIC_CACHE_SAVE_PAYLOAD_BYTES_TOTAL: &str = "rustfs_scanner_cache_save_payload_bytes_total";
 const METRIC_CACHE_SAVE_DURATION_SECONDS: &str = "rustfs_scanner_cache_save_duration_seconds";
 const METRIC_CACHE_BACKUP_REVISION_FAILURE_TOTAL: &str = "rustfs_scanner_cache_backup_revision_failure_total";
+const METRIC_CACHE_READ_ORIGIN_TOTAL: &str = "rustfs_scanner_cache_read_origin_total";
 const LOG_COMPONENT_SCANNER: &str = "scanner";
 const LOG_SUBSYSTEM_CACHE: &str = "cache";
 const EVENT_SCANNER_CACHE_LOAD_STATE: &str = "scanner_cache_load_state";
 const EVENT_SCANNER_CACHE_SAVE_STATE: &str = "scanner_cache_save_state";
-static CACHE_SAVE_METRICS_ONCE: Once = Once::new();
+static CACHE_METRICS_ONCE: Once = Once::new();
 
 pub const DATA_USAGE_SCAN_CHECKPOINT_VERSION: u16 = 1;
 pub const DATA_USAGE_RAW_ENUMERATION_CURSOR_VERSION: u16 = 1;
@@ -202,6 +203,54 @@ pub(crate) async fn read_config_revision<S: ScannerObjectIO>(store: Arc<S>, path
 pub(crate) struct DataUsageCacheRevisions {
     main: DataUsageCacheRevision,
     backup: Option<DataUsageCacheRevision>,
+}
+
+/// The observed result of trying the logical primary cache slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DataUsageCachePrimaryRead {
+    Missing,
+    Corrupt,
+}
+
+/// Process-local read provenance, not evidence of freshness or authority.
+/// Legacy objects may come from the old data-usage bucket. Empty may mean
+/// missing or corrupt objects; neither state certifies a complete snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DataUsageCacheReadOrigin {
+    Primary {
+        legacy: bool,
+    },
+    Backup {
+        primary: DataUsageCachePrimaryRead,
+        legacy: bool,
+    },
+    Empty,
+}
+
+impl DataUsageCacheReadOrigin {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Primary { legacy: false } => "primary",
+            Self::Primary { legacy: true } => "legacy_primary",
+            Self::Backup {
+                primary: DataUsageCachePrimaryRead::Missing,
+                legacy: false,
+            } => "backup_primary_missing",
+            Self::Backup {
+                primary: DataUsageCachePrimaryRead::Missing,
+                legacy: true,
+            } => "legacy_backup_primary_missing",
+            Self::Backup {
+                primary: DataUsageCachePrimaryRead::Corrupt,
+                legacy: false,
+            } => "backup_primary_corrupt",
+            Self::Backup {
+                primary: DataUsageCachePrimaryRead::Corrupt,
+                legacy: true,
+            } => "legacy_backup_primary_corrupt",
+            Self::Empty => "empty",
+        }
+    }
 }
 
 pub static DATA_USAGE_BUCKET: LazyLock<String> =
@@ -1271,8 +1320,12 @@ impl DataUsageCache {
         Ok(())
     }
 
-    fn ensure_cache_save_metrics_registered() {
-        CACHE_SAVE_METRICS_ONCE.call_once(|| {
+    fn ensure_cache_metrics_registered() {
+        CACHE_METRICS_ONCE.call_once(|| {
+            describe_counter!(
+                METRIC_CACHE_READ_ORIGIN_TOTAL,
+                "Successful scanner cache loads by observed logical origin; does not prove cache freshness."
+            );
             describe_counter!(
                 METRIC_CACHE_SAVE_ATTEMPT_TOTAL,
                 "Total scanner data usage cache save attempts by result and cache type."

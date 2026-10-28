@@ -70,6 +70,7 @@ struct DataUsageCacheLoadResult {
     cache: DataUsageCache,
     main_revision: DataUsageCacheRevision,
     backup_revision: Option<DataUsageCacheRevision>,
+    origin: DataUsageCacheReadOrigin,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +98,7 @@ impl DataUsageCache {
     /// If the object is not found, a nil error with empty data usage cache is returned.
     pub async fn load<S: ScannerObjectIO>(&mut self, store: Arc<S>, name: &str) -> StorageResult<()> {
         let loaded = Self::load_cache(store, name).await?;
+        Self::record_cache_read_origin(loaded.origin);
         *self = loaded.cache;
         Ok(())
     }
@@ -106,6 +108,17 @@ impl DataUsageCache {
         store: Arc<S>,
         name: &str,
     ) -> StorageResult<DataUsageCacheRevisions> {
+        self.load_with_revisions_and_origin(store, name)
+            .await
+            .map(|(revisions, _)| revisions)
+    }
+
+    /// Origin is an observation of this load, not proof of current coverage.
+    pub(crate) async fn load_with_revisions_and_origin<S: ScannerObjectIO>(
+        &mut self,
+        store: Arc<S>,
+        name: &str,
+    ) -> StorageResult<(DataUsageCacheRevisions, DataUsageCacheReadOrigin)> {
         let backup_name = format!("{name}.bkp");
         let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
         let loaded = Self::load_cache(store.clone(), name).await?;
@@ -131,9 +144,16 @@ impl DataUsageCache {
             },
         };
         let main = loaded.main_revision;
+        let origin = loaded.origin;
+        Self::record_cache_read_origin(origin);
         *self = loaded.cache;
 
-        Ok(DataUsageCacheRevisions { main, backup })
+        Ok((DataUsageCacheRevisions { main, backup }, origin))
+    }
+
+    fn record_cache_read_origin(origin: DataUsageCacheReadOrigin) {
+        Self::ensure_cache_metrics_registered();
+        counter!(METRIC_CACHE_READ_ORIGIN_TOTAL, "origin" => origin.metric_label()).increment(1);
     }
 
     pub(crate) async fn read_revisions<S: ScannerObjectIO>(store: Arc<S>, name: &str) -> StorageResult<DataUsageCacheRevisions> {
@@ -156,10 +176,12 @@ impl DataUsageCache {
                     cache,
                     revision: Some(main_revision),
                 } => {
+                    let legacy = matches!(&main_revision, DataUsageCacheRevision::Missing);
                     return Ok(DataUsageCacheLoadResult {
                         cache: *cache,
                         main_revision,
                         backup_revision: None,
+                        origin: DataUsageCacheReadOrigin::Primary { legacy },
                     });
                 }
                 DataUsageCacheLoadAttempt::Loaded { revision: None, .. } => {
@@ -193,10 +215,17 @@ impl DataUsageCache {
                         let main_revision = main_revision.ok_or_else(|| {
                             Error::other(format!("scanner cache main revision is unavailable while loading backup: {name}"))
                         })?;
+                        let primary = if main_state == DataUsageCacheLoadState::Corrupt {
+                            DataUsageCachePrimaryRead::Corrupt
+                        } else {
+                            DataUsageCachePrimaryRead::Missing
+                        };
+                        let legacy = matches!(&backup_revision, DataUsageCacheRevision::Missing);
                         return Ok(DataUsageCacheLoadResult {
                             cache: *cache,
                             main_revision,
                             backup_revision: Some(backup_revision),
+                            origin: DataUsageCacheReadOrigin::Backup { primary, legacy },
                         });
                     }
                     DataUsageCacheLoadState::Loaded
@@ -220,6 +249,7 @@ impl DataUsageCache {
                         main_revision: main_revision
                             .ok_or_else(|| Error::other(format!("scanner cache missing state has no revision: {name}")))?,
                         backup_revision,
+                        origin: DataUsageCacheReadOrigin::Empty,
                     });
                 }
                 (DataUsageCacheLoadState::Corrupt, DataUsageCacheLoadState::Missing)
@@ -239,6 +269,7 @@ impl DataUsageCache {
                         main_revision: main_revision
                             .ok_or_else(|| Error::other(format!("scanner cache corrupt state has no revision: {name}")))?,
                         backup_revision,
+                        origin: DataUsageCacheReadOrigin::Empty,
                     });
                 }
                 _ => {}
@@ -518,7 +549,7 @@ impl DataUsageCache {
         revision: Option<DataUsageCacheRevision>,
         expected_epoch: Option<u64>,
     ) -> StorageResult<()> {
-        Self::ensure_cache_save_metrics_registered();
+        Self::ensure_cache_metrics_registered();
         let path_type = Self::cache_path_type(path);
         let path = path.to_string();
         let sha256hex = (revision.is_some() && !buf.is_empty())

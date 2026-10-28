@@ -168,8 +168,10 @@ impl AsyncRead for PrefixThenErrorReader {
 #[derive(Debug)]
 struct CacheReadStore {
     main: CacheReadBody,
+    main_missing: bool,
     backup: Option<Vec<u8>>,
     legacy: Option<Vec<u8>>,
+    legacy_backup: Option<Vec<u8>>,
     puts: AtomicUsize,
     #[cfg(feature = "diagnostic-read-version-caller")]
     entry_sources: Mutex<Vec<Option<crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource>>>,
@@ -185,8 +187,10 @@ impl CacheReadStore {
     fn new(main: CacheReadBody, backup: Option<Vec<u8>>) -> Self {
         Self {
             main,
+            main_missing: false,
             backup,
             legacy: None,
+            legacy_backup: None,
             puts: AtomicUsize::new(0),
             #[cfg(feature = "diagnostic-read-version-caller")]
             entry_sources: Mutex::new(Vec::new()),
@@ -239,8 +243,12 @@ impl ObjectIO for CacheReadStore {
             .await
             .push(crate::storage_api::ecstore_diagnostic::current_read_version_entry_source());
         if bucket == DATA_USAGE_BUCKET.as_str() {
-            return self
-                .legacy
+            let legacy = if object.ends_with(".bkp") {
+                &self.legacy_backup
+            } else {
+                &self.legacy
+            };
+            return legacy
                 .clone()
                 .map(|data| Self::reader(CacheReadBody::Bytes(data), "legacy-etag"))
                 .ok_or(Error::FileNotFound);
@@ -252,6 +260,9 @@ impl ObjectIO for CacheReadStore {
         let main_path = path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]);
         let backup_path = format!("{main_path}.bkp");
         if object == main_path {
+            if self.main_missing {
+                return Err(Error::FileNotFound);
+            }
             return Ok(Self::reader(self.main.clone(), "main-etag"));
         }
         if object == backup_path {
@@ -710,6 +721,143 @@ async fn corrupt_primary_cache_loads_valid_backup() {
 
     assert_eq!(loaded.info.name, "recovered");
     assert_eq!(store.puts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cache_read_origin_reports_logical_slot_and_legacy_location() {
+    let mut primary = DataUsageCache::default();
+    primary.info.name = "primary".to_owned();
+    let mut backup = DataUsageCache::default();
+    backup.info.name = "backup".to_owned();
+    backup.info.snapshot_complete = true;
+    let primary_bytes = primary.marshal_msg().expect("serialize primary");
+    let backup_bytes = backup.marshal_msg().expect("serialize backup");
+    let empty_bytes = DataUsageCache::default().marshal_msg().expect("serialize empty cache");
+    let corrupt = b"not-msgpack".to_vec();
+
+    let cases = [
+        (
+            "primary",
+            Some(primary_bytes.clone()),
+            Some(backup_bytes.clone()),
+            None,
+            None,
+            DataUsageCacheReadOrigin::Primary { legacy: false },
+            primary_bytes.clone(),
+        ),
+        (
+            "legacy primary",
+            None,
+            None,
+            Some(primary_bytes.clone()),
+            None,
+            DataUsageCacheReadOrigin::Primary { legacy: true },
+            primary_bytes,
+        ),
+        (
+            "backup after missing",
+            None,
+            Some(backup_bytes.clone()),
+            None,
+            None,
+            DataUsageCacheReadOrigin::Backup {
+                primary: DataUsageCachePrimaryRead::Missing,
+                legacy: false,
+            },
+            backup_bytes.clone(),
+        ),
+        (
+            "legacy backup after missing",
+            None,
+            None,
+            None,
+            Some(backup_bytes.clone()),
+            DataUsageCacheReadOrigin::Backup {
+                primary: DataUsageCachePrimaryRead::Missing,
+                legacy: true,
+            },
+            backup_bytes.clone(),
+        ),
+        (
+            "backup after corrupt",
+            Some(corrupt.clone()),
+            Some(backup_bytes.clone()),
+            None,
+            None,
+            DataUsageCacheReadOrigin::Backup {
+                primary: DataUsageCachePrimaryRead::Corrupt,
+                legacy: false,
+            },
+            backup_bytes.clone(),
+        ),
+        (
+            "legacy backup after corrupt",
+            Some(corrupt.clone()),
+            None,
+            None,
+            Some(backup_bytes.clone()),
+            DataUsageCacheReadOrigin::Backup {
+                primary: DataUsageCachePrimaryRead::Corrupt,
+                legacy: true,
+            },
+            backup_bytes,
+        ),
+        (
+            "missing objects",
+            None,
+            None,
+            None,
+            None,
+            DataUsageCacheReadOrigin::Empty,
+            empty_bytes.clone(),
+        ),
+        (
+            "corrupt primary without backup",
+            Some(corrupt),
+            None,
+            None,
+            None,
+            DataUsageCacheReadOrigin::Empty,
+            empty_bytes,
+        ),
+    ];
+
+    for (name, main, current_backup, legacy_primary, legacy_backup, expected_origin, expected_bytes) in cases {
+        let has_main = main.is_some();
+        let has_backup = current_backup.is_some();
+        let mut fixture = CacheReadStore::new(CacheReadBody::Bytes(main.unwrap_or_default()), current_backup);
+        fixture.main_missing = !has_main;
+        fixture.legacy = legacy_primary;
+        fixture.legacy_backup = legacy_backup;
+        let store = Arc::new(fixture);
+        let mut loaded = DataUsageCache::default();
+        let (revisions, origin) = loaded
+            .load_with_revisions_and_origin(store.clone(), DATA_USAGE_CACHE_NAME)
+            .await
+            .expect("fixture cache load");
+
+        assert_eq!(origin, expected_origin, "origin for {name}");
+        assert_eq!(loaded.marshal_msg().expect("re-encode cache"), expected_bytes, "cache body for {name}");
+        assert_eq!(
+            revisions.main,
+            if has_main {
+                DataUsageCacheRevision::Etag("main-etag".to_owned())
+            } else {
+                DataUsageCacheRevision::Missing
+            },
+            "primary CAS revision for {name}"
+        );
+        assert_eq!(
+            revisions.backup,
+            Some(if has_backup {
+                DataUsageCacheRevision::Etag("backup-etag".to_owned())
+            } else {
+                DataUsageCacheRevision::Missing
+            }),
+            "backup CAS revision for {name}"
+        );
+        assert_eq!(store.puts.load(Ordering::SeqCst), 0, "reading must not write for {name}");
+    }
 }
 
 #[tokio::test]

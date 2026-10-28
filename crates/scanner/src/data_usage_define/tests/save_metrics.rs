@@ -7,17 +7,18 @@ use std::sync::atomic::AtomicU64;
 
 const PAYLOAD_BYTES: &str = "rustfs_scanner_cache_save_payload_bytes_total";
 const ENCODED_BYTES: &str = "rustfs_scanner_cache_serialized_bytes_total";
+const READ_ORIGIN: &str = "rustfs_scanner_cache_read_origin_total";
 
 #[derive(Default)]
-struct SaveRecorder(StdMutex<HashMap<metrics::Key, Arc<AtomicU64>>>);
+struct CacheRecorder(StdMutex<HashMap<metrics::Key, Arc<AtomicU64>>>);
 
-impl metrics::Recorder for SaveRecorder {
+impl metrics::Recorder for CacheRecorder {
     fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
     fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
     fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
 
     fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
-        if ![PAYLOAD_BYTES, ENCODED_BYTES].contains(&key.name()) {
+        if ![PAYLOAD_BYTES, ENCODED_BYTES, READ_ORIGIN].contains(&key.name()) {
             return metrics::Counter::noop();
         }
         metrics::Counter::from_arc(self.0.lock().expect("save recorder").entry(key.clone()).or_default().clone())
@@ -36,7 +37,7 @@ async fn check_save(store: BackupFallbackStore, revisions: Option<DataUsageCache
     let store = Arc::new(store);
     let cache = DataUsageCache::default();
     let encoded = rmp_serde::to_vec(&cache).expect("independent encoded body");
-    let recorder = SaveRecorder::default();
+    let recorder = CacheRecorder::default();
     let save = async {
         match revisions {
             Some(revisions) => {
@@ -83,6 +84,49 @@ async fn check_save(store: BackupFallbackStore, revisions: Option<DataUsageCache
         1 + attempts.into_iter().filter(|count| *count > 0).count(),
         "fixed labels only"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn read_origin_counts_successful_loads_with_fixed_labels() {
+    let bytes = DataUsageCache::default().marshal_msg().expect("serialize backup");
+    let corrupt_primary = CacheReadStore::new(CacheReadBody::Bytes(b"not-msgpack".to_vec()), Some(bytes.clone()));
+    let mut legacy_backup = CacheReadStore::new(CacheReadBody::Bytes(Vec::new()), None);
+    legacy_backup.main_missing = true;
+    legacy_backup.legacy_backup = Some(bytes);
+    let mut empty = CacheReadStore::new(CacheReadBody::Bytes(Vec::new()), None);
+    empty.main_missing = true;
+    let recorder = CacheRecorder::default();
+
+    for (store, with_revisions) in [(corrupt_primary, false), (legacy_backup, true), (empty, true)] {
+        let store = Arc::new(store);
+        let mut loaded = DataUsageCache::default();
+        let read = async {
+            if with_revisions {
+                loaded.load_with_revisions(store, DATA_USAGE_CACHE_NAME).await.map(|_| ())
+            } else {
+                loaded.load(store, DATA_USAGE_CACHE_NAME).await
+            }
+        };
+        let mut read = std::pin::pin!(read);
+        std::future::poll_fn(|cx| metrics::with_local_recorder(&recorder, || read.as_mut().poll(cx)))
+            .await
+            .expect("fixture load");
+    }
+
+    let unavailable = Arc::new(BackupFallbackStore::new(Vec::new(), false));
+    let mut loaded = DataUsageCache::default();
+    let mut failed_read = std::pin::pin!(loaded.load_with_revisions(unavailable, DATA_USAGE_CACHE_NAME));
+    let error = std::future::poll_fn(|cx| metrics::with_local_recorder(&recorder, || failed_read.as_mut().poll(cx)))
+        .await
+        .expect_err("an unreadable primary must not count as a fallback");
+    assert!(matches!(error, Error::ErasureReadQuorum));
+
+    let rows = recorder.0.lock().expect("cache recorder");
+    assert_eq!(rows.len(), 3, "one fixed origin label per successful load");
+    for origin in ["backup_primary_corrupt", "legacy_backup_primary_missing", "empty"] {
+        let key = metrics::Key::from_parts(READ_ORIGIN, vec![metrics::Label::new("origin", origin)]);
+        assert_eq!(rows[&key].load(Ordering::Relaxed), 1, "one observation for {origin}");
+    }
 }
 
 fn revisions(backup: bool) -> DataUsageCacheRevisions {
