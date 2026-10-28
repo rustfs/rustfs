@@ -267,14 +267,14 @@ pub(crate) async fn await_scanner_publication_proof<T, E, F, Fut, Retryable>(
     ctx: &CancellationToken,
     context: ScannerPublicationProofContext,
     mut proof: F,
-    retryable: Retryable,
+    mut retryable: Retryable,
     failure_info: for<'a> fn(&'a E) -> Option<ScannerPublicationLeaseFailureInfo<'a>>,
 ) -> ScannerPublicationProofWait<T, E>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
     E: std::fmt::Display,
-    Retryable: Fn(&E) -> bool,
+    Retryable: FnMut(&E) -> bool,
 {
     let ScannerPublicationProofContext {
         cycle,
@@ -330,7 +330,7 @@ where
                     failure_kind,
                     reason,
                     reported_reason,
-                    "Scanner publication proof failed with a non-retryable cluster state"
+                    "Scanner publication proof was not acquired"
                 );
                 return ScannerPublicationProofWait::Rejected(err);
             }

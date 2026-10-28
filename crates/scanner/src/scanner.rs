@@ -275,6 +275,7 @@ const MAINTENANCE_FEATURE_INSPECTION_RETRY_MAX_INTERVAL: Duration = Duration::fr
 const MAX_MAINTENANCE_FEATURE_INSPECTION_ATTEMPTS: usize = 2;
 const SCANNER_PERSIST_CAS_RETRIES: usize = 2;
 const DATA_USAGE_BACKUP_INTERVAL_CYCLES: u64 = 10;
+const SCANNER_LEASE_NO_DEADLINE_CHANNEL_TIMEOUT_ATTEMPTS: u32 = 3;
 const SCANNER_PUBLICATION_LEASE_FENCE_MAX_ENTRIES: usize = 256;
 const SCANNER_PUBLICATION_LEASE_FENCE_MAX_BYTES: usize = 64 * 1024;
 const SCANNER_CYCLE_STATE_MAGIC: &[u8; 8] = b"RSCYC001";
@@ -2096,14 +2097,12 @@ where
                 }
             })
             .await;
-        match lease_result {
-            ScannerPublicationProofWait::Ready(grants) => {
+        match scanner_publication_lease_wait_result(lease_result) {
+            Ok(grants) => {
                 remote_publication_leases = Some((notification_system, grants));
                 None
             }
-            ScannerPublicationProofWait::Rejected(_) | ScannerPublicationProofWait::Cancelled => {
-                Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
-            }
+            Err(reason) => Some(reason),
         }
     } else {
         Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
@@ -3866,6 +3865,17 @@ enum ScannerCyclePublicationPlan {
     Authoritative,
 }
 
+fn scanner_publication_lease_wait_result<T>(
+    proof: ScannerPublicationProofWait<T, EcstoreError>,
+) -> Result<T, ScannerCycleDeferReason> {
+    match proof {
+        ScannerPublicationProofWait::Ready(grants) => Ok(grants),
+        ScannerPublicationProofWait::Rejected(_) | ScannerPublicationProofWait::Cancelled => {
+            Err(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        }
+    }
+}
+
 impl ScannerCyclePublicationPlan {
     fn for_result(result: &ScannerCycleResult) -> Self {
         match (result.has_usage_update(), result.status) {
@@ -3923,6 +3933,8 @@ impl ScannerCyclePublicationPlan {
         } else {
             "authoritative"
         };
+        let limit_channel_timeouts = self != Self::ProgressOnly && budget.deadline().is_none();
+        let mut channel_timeout_attempts = 0u32;
         debug!(
             target: "rustfs::scanner",
             event = EVENT_SCANNER_CYCLE_STATE,
@@ -3946,10 +3958,21 @@ impl ScannerCyclePublicationPlan {
             },
             || acquire(self.uses_observational_lease()),
             |err| {
-                // The structured reason comes from local acquisition, not a peer report.
-                crate::storage_api::scan::scanner_publication_lease_failure_info(err)
+                if scanner_publication_lease_error_is_retryable(&err.to_string()) {
+                    return true;
+                }
+                // Bound only the new local timeout when the cycle has no deadline.
+                // The notification path attempts partial-grant cleanup before returning.
+                if crate::storage_api::scan::scanner_publication_lease_failure_info(err)
                     .is_some_and(|info| info.reason == Some("channel_acquisition_timed_out"))
-                    || scanner_publication_lease_error_is_retryable(&err.to_string())
+                {
+                    if !limit_channel_timeouts {
+                        return true;
+                    }
+                    channel_timeout_attempts = channel_timeout_attempts.saturating_add(1);
+                    return channel_timeout_attempts < SCANNER_LEASE_NO_DEADLINE_CHANNEL_TIMEOUT_ATTEMPTS;
+                }
+                false
             },
             crate::storage_api::scan::scanner_publication_lease_failure_info,
         );
