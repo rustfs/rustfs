@@ -275,6 +275,11 @@ impl LockClient for LocalClient {
                     {
                         let shard = self.get_shard(&lock_id);
                         let mut guards = shard.write().await;
+                        // The physical guard can be revoked while waiting for
+                        // the lease storage lock. Check at publication time.
+                        if entry.guard.is_released() {
+                            return Ok(LockResponse::failure("Lock was released before acquisition completed", Duration::ZERO));
+                        }
                         guards.insert(lock_id.clone(), entry);
                     }
 
@@ -361,21 +366,29 @@ impl LockClient for LocalClient {
 
     async fn refresh(&self, lock_id: &LockId) -> Result<bool> {
         let shard = self.get_shard(lock_id);
-        let expired_entry = {
+        let (removed_entry, was_expired) = {
             let mut guards = shard.write().await;
             let Some(entry) = guards.get_mut(lock_id) else {
                 return Ok(false);
             };
-            if entry.is_expired() {
-                guards.remove(lock_id)
+            if entry.guard.is_released() {
+                (guards.remove(lock_id), false)
+            } else if entry.is_expired() {
+                (guards.remove(lock_id), true)
             } else {
                 entry.refresh();
-                None
+                if entry.guard.is_released() {
+                    (guards.remove(lock_id), false)
+                } else {
+                    (None, false)
+                }
             }
         };
 
-        if let Some(entry) = expired_entry {
-            Self::release_reclaimed_guards([entry], Some(&lock_id.resource));
+        if let Some(entry) = removed_entry {
+            if was_expired {
+                Self::release_reclaimed_guards([entry], Some(&lock_id.resource));
+            }
             Ok(false)
         } else {
             Ok(true)
@@ -390,7 +403,9 @@ impl LockClient for LocalClient {
         let shard = self.get_shard(lock_id);
         let guards = shard.read().await;
         if let Some(entry) = guards.get(lock_id) {
-            // We have an active guard for this lock
+            if entry.guard.is_released() {
+                return Ok(None);
+            }
             let lock_type = match entry.guard.mode() {
                 crate::LockMode::Shared => LockType::Shared,
                 crate::LockMode::Exclusive => LockType::Exclusive,
@@ -400,7 +415,7 @@ impl LockClient for LocalClient {
             } else {
                 LockStatus::Acquired
             };
-            Ok(Some(LockInfo {
+            let info = LockInfo {
                 id: lock_id.clone(),
                 resource: lock_id.resource.clone(),
                 lock_type,
@@ -412,7 +427,8 @@ impl LockClient for LocalClient {
                 metadata: LockMetadata::default(),
                 priority: LockPriority::Normal,
                 wait_start_time: None,
-            }))
+            };
+            Ok((!entry.guard.is_released()).then_some(info))
         } else {
             Ok(None)
         }
@@ -423,17 +439,22 @@ impl LockClient for LocalClient {
         for shard in self.guard_storage.iter() {
             let guards = shard.read().await;
             leases.reserve(guards.len());
-            leases.extend(guards.iter().map(|(lock_id, entry)| crate::LockLeaseInfo {
-                resource: lock_id.resource.clone(),
-                lock_type: match entry.guard.mode() {
-                    crate::LockMode::Shared => LockType::Shared,
-                    crate::LockMode::Exclusive => LockType::Exclusive,
-                },
-                owner: entry.guard.owner().to_string(),
-                acquired_at: entry.acquired_at,
-                remaining_ttl: entry.deadline.saturating_duration_since(Instant::now()),
-                guard_id: (!entry.guard.is_disabled()).then(|| entry.guard.guard_id()),
-            }));
+            leases.extend(
+                guards
+                    .iter()
+                    .filter(|(_, entry)| !entry.guard.is_released())
+                    .map(|(lock_id, entry)| crate::LockLeaseInfo {
+                        resource: lock_id.resource.clone(),
+                        lock_type: match entry.guard.mode() {
+                            crate::LockMode::Shared => LockType::Shared,
+                            crate::LockMode::Exclusive => LockType::Exclusive,
+                        },
+                        owner: entry.guard.owner().to_string(),
+                        acquired_at: entry.acquired_at,
+                        remaining_ttl: entry.deadline.saturating_duration_since(Instant::now()),
+                        guard_id: (!entry.guard.is_disabled()).then(|| entry.guard.guard_id()),
+                    }),
+            );
         }
         leases
     }
@@ -474,6 +495,77 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("lock guard was not reaped before test deadline");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_before_lease_publication_does_not_report_acquisition() {
+        let fast = Arc::new(crate::FastObjectLockManager::new());
+        let manager = Arc::new(GlobalLockManager::Enabled(fast.clone()));
+        let client = Arc::new(LocalClient::with_manager_and_reaper_interval(manager, Duration::from_secs(60)));
+        client.reaper_started.store(true, Ordering::Release);
+        let resource = crate::ObjectKey::new("bucket", "force-before-lease-publication");
+        let request = request(resource.clone(), "owner", Duration::from_secs(30)).with_acquire_timeout(Duration::from_secs(30));
+
+        // A read guard allows the pre-acquisition scan but blocks publication.
+        let storage_read = client.get_shard(&request.lock_id).read().await;
+        let pending = {
+            let client = client.clone();
+            let request = request.clone();
+            tokio::spawn(async move { client.acquire_lock(&request).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fast.get_lock_info(&resource).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("physical lock should be acquired before lease publication");
+        assert!(!pending.is_finished());
+        assert_eq!(fast.force_unlock(&resource), 1);
+        let successor = fast
+            .acquire_write_lock(resource.clone(), "owner")
+            .await
+            .expect("successor holder");
+        drop(storage_read);
+
+        let response = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("acquire response")
+            .expect("acquire task")
+            .expect("local acquire");
+        assert!(!response.success, "a revoked guard must not be published as acquired");
+        assert!(client.check_status(&request.lock_id).await.expect("lease status").is_none());
+        let other = crate::ObjectLockRequest::new_write(resource.clone(), "other");
+        assert!(!fast.get_shard(&resource).try_fast_path_only(&other), "successor must remain held");
+        drop(successor);
+        fast.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn force_revoked_lease_cannot_be_refreshed_or_reported_held() {
+        let fast = Arc::new(crate::FastObjectLockManager::new());
+        let manager = Arc::new(GlobalLockManager::Enabled(fast.clone()));
+        let client = LocalClient::with_manager_and_reaper_interval(manager, Duration::from_secs(60));
+        client.reaper_started.store(true, Ordering::Release);
+        for lock_type in [LockType::Exclusive, LockType::Shared] {
+            let resource = crate::ObjectKey::new("bucket", format!("force-revoked-{lock_type:?}"));
+            let request = LockRequest::new(resource.clone(), lock_type, "owner").with_ttl(Duration::from_secs(30));
+            assert!(client.acquire_lock(&request).await.expect("initial acquire").success);
+            assert_eq!(fast.force_unlock(&resource), 1);
+            let successor = match lock_type {
+                LockType::Exclusive => fast.acquire_write_lock(resource.clone(), "owner").await,
+                LockType::Shared => fast.acquire_read_lock(resource.clone(), "owner").await,
+            }
+            .expect("successor holder");
+            assert!(client.check_status(&request.lock_id).await.expect("lease status").is_none());
+            assert!(client.list_lock_leases().await.is_empty());
+            assert!(!client.refresh(&request.lock_id).await.expect("lease refresh"));
+            assert!(!client.release(&request.lock_id).await.expect("old lease was removed"));
+            let other = crate::ObjectLockRequest::new_write(resource.clone(), "other");
+            assert!(!fast.get_shard(&resource).try_fast_path_only(&other), "successor must remain held");
+            drop(successor);
+        }
+        fast.shutdown().await;
     }
 
     #[tokio::test]

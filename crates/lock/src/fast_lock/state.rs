@@ -367,6 +367,72 @@ pub struct SharedOwnerEntry {
     pub lock_timeout: Duration,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ReleaseWake {
+    None,
+    Writer,
+    PreferWriter,
+}
+
+#[derive(Debug)]
+enum ReleaseFailure {
+    SharedInconsistent(usize),
+    SharedOwnerMissing(Vec<Arc<str>>),
+    ExclusiveInconsistent(u64),
+    ExclusiveOwnerMismatch(Option<Arc<str>>),
+}
+
+#[derive(Debug)]
+pub(crate) struct ReleaseOutcome {
+    pub(crate) success: bool,
+    wake: ReleaseWake,
+    failure: Option<ReleaseFailure>,
+}
+
+impl ReleaseOutcome {
+    pub(crate) fn finish(self, state: &ObjectLockState, owner: &Arc<str>) -> bool {
+        match self.failure {
+            Some(ReleaseFailure::SharedInconsistent(remaining)) => tracing::warn!(
+                "Atomic state inconsistency during shared lock release: owner={}, remaining_entries={}",
+                owner,
+                remaining
+            ),
+            Some(ReleaseFailure::SharedOwnerMissing(entries)) => tracing::debug!(
+                "Shared lock release failed - owner not found: owner={}, current_entries={:?}",
+                owner,
+                entries
+            ),
+            Some(ReleaseFailure::ExclusiveInconsistent(bits)) => tracing::warn!(
+                "Atomic state inconsistency during exclusive lock release: owner={}, atomic_state={:b}",
+                owner,
+                bits
+            ),
+            Some(ReleaseFailure::ExclusiveOwnerMismatch(actual)) => tracing::debug!(
+                "Exclusive lock release failed - owner mismatch: expected_owner={}, actual_owner={:?}",
+                owner,
+                actual
+            ),
+            None => {}
+        }
+        match self.wake {
+            ReleaseWake::None => {}
+            ReleaseWake::Writer => state.optimized_notify.notify_writer(),
+            ReleaseWake::PreferWriter => {
+                if state
+                    .atomic_state
+                    .writers_waiting(state.atomic_state.state.load(Ordering::Acquire))
+                    > 0
+                {
+                    state.optimized_notify.notify_writer();
+                } else {
+                    state.optimized_notify.notify_readers();
+                }
+            }
+        }
+        self.success
+    }
+}
+
 impl Default for ObjectLockState {
     fn default() -> Self {
         Self::new()
@@ -427,6 +493,10 @@ impl ObjectLockState {
 
     /// Release shared lock
     pub fn release_shared(&self, owner: &Arc<str>) -> bool {
+        self.release_shared_deferred(owner).finish(self, owner)
+    }
+
+    pub(crate) fn release_shared_deferred(&self, owner: &Arc<str>) -> ReleaseOutcome {
         let mut shared = self.shared_owners.write();
         if let Some(pos) = shared.iter().position(|entry| entry.owner.as_ref() == owner.as_ref()) {
             let original_entry = shared[pos].clone();
@@ -437,17 +507,17 @@ impl ObjectLockState {
                 Some(shared.remove(pos))
             };
             if self.atomic_state.release_shared() {
-                if shared.is_empty() {
-                    drop(shared);
-                    self.optimized_notify.notify_writer();
+                ReleaseOutcome {
+                    success: true,
+                    wake: if shared.is_empty() {
+                        ReleaseWake::Writer
+                    } else {
+                        ReleaseWake::None
+                    },
+                    failure: None,
                 }
-                true
             } else {
-                tracing::warn!(
-                    "Atomic state inconsistency during shared lock release: owner={}, remaining_entries={}",
-                    owner,
-                    shared.len()
-                );
+                let remaining = shared.len();
                 // Re-add owner entry to maintain consistency when release failed
                 match removed_entry {
                     Some(entry) => {
@@ -461,53 +531,53 @@ impl ObjectLockState {
                         }
                     }
                 }
-                false
+                ReleaseOutcome {
+                    success: false,
+                    wake: ReleaseWake::None,
+                    failure: Some(ReleaseFailure::SharedInconsistent(remaining)),
+                }
             }
         } else {
-            tracing::debug!(
-                "Shared lock release failed - owner not found: owner={}, current_entries={:?}",
-                owner,
-                shared.iter().map(|s| s.owner.as_ref()).collect::<Vec<_>>()
-            );
-            false
+            ReleaseOutcome {
+                success: false,
+                wake: ReleaseWake::None,
+                failure: Some(ReleaseFailure::SharedOwnerMissing(
+                    shared.iter().map(|entry| entry.owner.clone()).collect(),
+                )),
+            }
         }
     }
 
     /// Release exclusive lock
     pub fn release_exclusive(&self, owner: &Arc<str>) -> bool {
+        self.release_exclusive_deferred(owner).finish(self, owner)
+    }
+
+    pub(crate) fn release_exclusive_deferred(&self, owner: &Arc<str>) -> ReleaseOutcome {
         let mut current = self.current_owner.write();
         if current.as_ref().is_some_and(|info| info.owner.as_ref() == owner.as_ref()) {
             if self.atomic_state.release_exclusive() {
                 *current = None;
-                drop(current);
-                // Notify waiters using optimized system - prefer writers over readers
-                if self
-                    .atomic_state
-                    .writers_waiting(self.atomic_state.state.load(Ordering::Acquire))
-                    > 0
-                {
-                    self.optimized_notify.notify_writer();
-                } else {
-                    self.optimized_notify.notify_readers();
+                ReleaseOutcome {
+                    success: true,
+                    wake: ReleaseWake::PreferWriter,
+                    failure: None,
                 }
-                true
             } else {
                 // Atomic state inconsistency - current owner matches but atomic release failed
-                tracing::warn!(
-                    "Atomic state inconsistency during exclusive lock release: owner={}, atomic_state={:b}",
-                    owner,
-                    self.atomic_state.state.load(Ordering::Acquire)
-                );
-                false
+                ReleaseOutcome {
+                    success: false,
+                    wake: ReleaseWake::None,
+                    failure: Some(ReleaseFailure::ExclusiveInconsistent(self.atomic_state.state.load(Ordering::Acquire))),
+                }
             }
         } else {
             // Owner mismatch
-            tracing::debug!(
-                "Exclusive lock release failed - owner mismatch: expected_owner={}, actual_owner={:?}",
-                owner,
-                current.as_ref().map(|s| s.owner.as_ref())
-            );
-            false
+            ReleaseOutcome {
+                success: false,
+                wake: ReleaseWake::None,
+                failure: Some(ReleaseFailure::ExclusiveOwnerMismatch(current.as_ref().map(|entry| entry.owner.clone()))),
+            }
         }
     }
 

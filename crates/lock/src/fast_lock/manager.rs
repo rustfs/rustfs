@@ -19,7 +19,7 @@ use tracing::warn;
 
 use crate::LockError;
 use crate::fast_lock::{
-    guard::FastLockGuard,
+    guard::{FastLockGuard, GuardToken},
     manager_trait::LockManager,
     metrics::{AggregatedMetrics, GlobalMetrics},
     shard::LockShard,
@@ -96,15 +96,10 @@ impl FastObjectLockManager {
     /// Acquire object lock
     pub async fn acquire_lock(&self, request: ObjectLockRequest) -> Result<FastLockGuard, LockResult> {
         let shard = self.get_shard(&request.key);
-        match shard.acquire_lock(&request).await {
-            Ok(()) => {
-                let guard = FastLockGuard::new(request.key, request.mode, request.owner, shard.clone());
-                // Register guard to prevent premature cleanup
-                shard.register_guard_with_info(guard.guard_id(), guard.key(), guard.mode(), guard.owner());
-                Ok(guard)
-            }
-            Err(err) => Err(err),
-        }
+        let token = GuardToken::new();
+        let guard = FastLockGuard::new(request.key.clone(), request.mode, request.owner.clone(), shard.clone(), token.clone());
+        shard.acquire_tracked(&request, &token).await?;
+        Ok(guard)
     }
 
     /// Acquire shared (read) lock
@@ -208,11 +203,13 @@ impl FastObjectLockManager {
                 let key = request.key.clone();
                 let owner = request.owner.clone();
                 let mode = request.mode;
+                let token = GuardToken::new();
+                let guard = FastLockGuard::new(key.clone(), mode, owner, shard.clone(), token.clone());
 
-                let acquired = if shard.try_fast_path_only(request) {
+                let acquired = if shard.try_fast_path_tracked_only(request, &token) {
                     true
                 } else {
-                    match shard.acquire_lock(request).await {
+                    match shard.acquire_tracked(request, &token).await {
                         Ok(()) => true,
                         Err(err) => {
                             all_failed.push((key.clone(), err));
@@ -222,8 +219,6 @@ impl FastObjectLockManager {
                 };
 
                 if acquired {
-                    let guard = FastLockGuard::new(key.clone(), mode, owner.clone(), shard.clone());
-                    shard.register_guard_with_info(guard.guard_id(), guard.key(), guard.mode(), guard.owner());
                     all_successful.push(key);
                     guards.push(guard);
                 }
@@ -249,10 +244,11 @@ impl FastObjectLockManager {
             let shard = self.shards[*shard_id].clone();
 
             for request in requests {
-                match shard.acquire_lock(request).await {
+                let token = GuardToken::new();
+                let guard =
+                    FastLockGuard::new(request.key.clone(), request.mode, request.owner.clone(), shard.clone(), token.clone());
+                match shard.acquire_tracked(request, &token).await {
                     Ok(()) => {
-                        let guard = FastLockGuard::new(request.key.clone(), request.mode, request.owner.clone(), shard.clone());
-                        shard.register_guard_with_info(guard.guard_id(), guard.key(), guard.mode(), guard.owner());
                         acquired_guards.push(guard);
                     }
                     Err(err) => {
@@ -310,7 +306,8 @@ impl FastObjectLockManager {
         infos
     }
 
-    /// Enumerate held locks with holder counts and stable holder identities.
+    /// Enumerate held locks with holder counts and process-local snapshot IDs.
+    /// Missing IDs include raw holders; equal IDs across snapshots do not prove continuous ownership.
     pub fn list_locks_with_holder_generations(&self) -> Vec<(crate::fast_lock::types::ObjectLockInfo, u32, Option<Vec<u64>>)> {
         let mut infos = Vec::new();
         for shard in &self.shards {
@@ -726,10 +723,13 @@ mod tests {
             .expect("acquire original exclusive guard");
         let stale_id = stale.guard_id();
         assert_eq!(manager.force_unlock(&key), 1);
+        assert!(stale.is_released(), "force unlock must revoke the original guard");
+        assert!(stale.lock_info().is_none(), "a revoked guard must not report its successor");
         let successor = manager
             .acquire_write_lock(key.clone(), "same-owner")
             .await
             .expect("acquire exclusive successor after force unlock");
+        assert!(!successor.is_released());
         assert_ne!(stale.guard_id(), successor.guard_id());
         assert_registered_holder_blocks_writer(&manager, &key, successor.guard_id(), "before stale guard action");
 
@@ -778,6 +778,8 @@ mod tests {
         assert_eq!(manager.current_lock_counts().0, 2);
 
         assert_eq!(manager.force_unlock(&key), 1, "one distinct owner was force unlocked");
+        assert!(first.is_released(), "first shared guard must be revoked");
+        assert!(second.is_released(), "second shared guard must be revoked");
         assert_eq!(
             manager.current_lock_counts().0,
             0,

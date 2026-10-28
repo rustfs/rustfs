@@ -13,30 +13,63 @@
 // limitations under the License.
 
 use parking_lot::RwLock;
+use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::time::timeout;
 
 use crate::fast_lock::{
+    guard::{GuardToken, record_lock_held_acquire, record_lock_held_release},
     metrics::ShardMetrics,
     object_pool::ObjectStatePool,
-    state::ObjectLockState,
+    state::{ObjectLockState, ReleaseOutcome},
     types::{LockMode, LockResult, ObjectKey, ObjectLockRequest},
 };
 
-#[derive(Debug)]
-struct ActiveGuardInfo {
-    key: ObjectKey,
-    mode: LockMode,
-    owner: Arc<str>,
+#[derive(Debug, Default)]
+struct GuardRegistration {
+    tokens: SmallVec<[Arc<GuardToken>; 1]>,
+    weak: Option<Arc<()>>,
+    ambiguous: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct GuardHolderKey {
-    key: ObjectKey,
-    mode: LockMode,
+#[derive(Debug)]
+struct Holder {
     owner: Arc<str>,
+    mode: LockMode,
+    token: Option<Arc<GuardToken>>,
+}
+
+impl Holder {
+    fn is_raw(&self) -> bool {
+        self.token.as_ref().is_none_or(|token| !token.tracked)
+    }
+}
+
+#[derive(Debug)]
+struct ShardObjectState {
+    state: ObjectLockState,
+    holders: parking_lot::Mutex<SmallVec<[Holder; 1]>>,
+}
+
+impl ShardObjectState {
+    fn new(state: ObjectLockState) -> Self {
+        Self {
+            state,
+            holders: parking_lot::Mutex::new(SmallVec::new()),
+        }
+    }
+}
+
+impl Deref for ShardObjectState {
+    type Target = ObjectLockState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
 }
 
 #[cfg(test)]
@@ -46,6 +79,9 @@ enum TestPausePoint {
     BeforeFastWrite,
     FastWriteExisting,
     SlowLookup,
+    TrackedBeforeRegistration,
+    GuardIdAfterLookup,
+    ForceGateContended,
 }
 
 #[cfg(test)]
@@ -69,11 +105,12 @@ fn test_pause(point: TestPausePoint, key: &ObjectKey) {
 
 /// Lock shard to reduce global contention.
 ///
-/// When both are needed, lock `objects` before a state's owner metadata.
+/// Lock order is `objects`, then the holder gate, then owner metadata or the
+/// guard registry. Notifications run after these locks have been released.
 #[derive(Debug)]
 pub struct LockShard {
     /// Object lock states - using parking_lot for better performance
-    objects: RwLock<HashMap<ObjectKey, Arc<ObjectLockState>>>,
+    objects: RwLock<HashMap<ObjectKey, Arc<ShardObjectState>>>,
     /// Object state pool for memory optimization
     object_pool: ObjectStatePool,
     /// Shard-level metrics
@@ -81,7 +118,7 @@ pub struct LockShard {
     /// Shard ID for debugging
     _shard_id: usize,
     /// Active guard IDs to prevent cleanup of locks with live guards
-    active_guards: parking_lot::Mutex<HashMap<u64, Option<ActiveGuardInfo>>>,
+    active_guards: parking_lot::Mutex<HashMap<u64, GuardRegistration>>,
 }
 
 /// Cancellation-safe waiter counter ticket.
@@ -89,13 +126,13 @@ pub struct LockShard {
 /// Ensures waiting counters are decremented even if the waiting future
 /// is cancelled/dropped before the normal post-await path runs.
 struct WaiterCounterGuard {
-    state: Arc<ObjectLockState>,
+    state: Arc<ShardObjectState>,
     mode: LockMode,
     incremented: bool,
 }
 
 impl WaiterCounterGuard {
-    fn new(state: Arc<ObjectLockState>, mode: LockMode) -> Self {
+    fn new(state: Arc<ShardObjectState>, mode: LockMode) -> Self {
         let incremented = match mode {
             LockMode::Shared => state.atomic_state.inc_readers_waiting(),
             LockMode::Exclusive => state.atomic_state.inc_writers_waiting(),
@@ -120,6 +157,39 @@ impl Drop for WaiterCounterGuard {
     }
 }
 
+/// Keeps an all-or-nothing raw batch tied to the exact holders it acquired.
+struct BatchAcquisition<'a> {
+    shard: &'a LockShard,
+    acquired: Vec<(ObjectKey, LockMode, Arc<str>, Arc<GuardToken>)>,
+    rollback: bool,
+}
+
+impl Drop for BatchAcquisition<'_> {
+    fn drop(&mut self) {
+        if !self.rollback {
+            return;
+        }
+
+        let mut cleanup_failures = 0;
+        for (key, mode, owner, token) in &self.acquired {
+            if token.acquired.load(Ordering::Acquire)
+                && !self.shard.release_tracked(key, owner, *mode, token)
+                && token.acquired.load(Ordering::Acquire)
+            {
+                cleanup_failures += 1;
+                tracing::warn!(
+                    "Failed to release lock during batch cleanup in shard: bucket={}, object={}",
+                    key.bucket,
+                    key.object
+                );
+            }
+        }
+        if cleanup_failures > 0 {
+            tracing::error!("Shard batch lock cleanup had {} failures", cleanup_failures);
+        }
+    }
+}
+
 impl LockShard {
     pub fn new(shard_id: usize) -> Self {
         Self {
@@ -133,31 +203,47 @@ impl LockShard {
 
     /// Acquire lock with fast path optimization
     pub async fn acquire_lock(&self, request: &ObjectLockRequest) -> Result<(), LockResult> {
+        self.acquire_lock_inner(request, None).await
+    }
+
+    pub(crate) async fn acquire_tracked(&self, request: &ObjectLockRequest, token: &Arc<GuardToken>) -> Result<(), LockResult> {
+        self.acquire_lock_inner(request, Some(token)).await
+    }
+
+    async fn acquire_lock_inner(&self, request: &ObjectLockRequest, token: Option<&Arc<GuardToken>>) -> Result<(), LockResult> {
         let start_time = Instant::now();
 
         // Try fast path first
-        if let Some(_state) = self.try_fast_path(request) {
+        if let Some(_state) = self.try_fast_path(request, token) {
             self.metrics.record_fast_path_success();
             return Ok(());
         }
 
         // Slow path with waiting
-        self.acquire_lock_slow_path(request, start_time).await
+        self.acquire_lock_slow_path(request, start_time, token).await
     }
 
     /// Try fast path only (without fallback to slow path)
     pub fn try_fast_path_only(&self, request: &ObjectLockRequest) -> bool {
+        self.try_fast_path_only_inner(request, None)
+    }
+
+    pub(crate) fn try_fast_path_tracked_only(&self, request: &ObjectLockRequest, token: &Arc<GuardToken>) -> bool {
+        self.try_fast_path_only_inner(request, Some(token))
+    }
+
+    fn try_fast_path_only_inner(&self, request: &ObjectLockRequest, token: Option<&Arc<GuardToken>>) -> bool {
         // Early check to avoid unnecessary lock contention
         if let Some(state) = self.objects.read().get(&request.key)
             && !state.atomic_state.is_fast_path_available(request.mode)
         {
             return false;
         }
-        self.try_fast_path(request).is_some()
+        self.try_fast_path(request, token).is_some()
     }
 
     /// Try fast path lock acquisition (lock-free when possible)
-    fn try_fast_path(&self, request: &ObjectLockRequest) -> Option<Arc<ObjectLockState>> {
+    fn try_fast_path(&self, request: &ObjectLockRequest, token: Option<&Arc<GuardToken>>) -> Option<Arc<ShardObjectState>> {
         // First try to get existing state without write lock
         {
             let objects = self.objects.read();
@@ -168,10 +254,7 @@ impl LockShard {
                 test_pause(TestPausePoint::FastExisting, &request.key);
 
                 // Try atomic acquisition
-                let success = match request.mode {
-                    LockMode::Shared => state.try_acquire_shared_fast(&request.owner, request.lock_timeout),
-                    LockMode::Exclusive => state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout),
-                };
+                let success = self.try_acquire_holder(&state, request, token);
                 drop(objects);
 
                 if success {
@@ -195,7 +278,7 @@ impl LockShard {
                 #[cfg(test)]
                 test_pause(TestPausePoint::FastWriteExisting, &request.key);
 
-                let acquired = state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout);
+                let acquired = self.try_acquire_holder(&state, request, token);
                 drop(objects);
                 if acquired {
                     return Some(state);
@@ -203,9 +286,9 @@ impl LockShard {
             } else {
                 // Create new state from pool and acquire immediately
                 let state_box = self.object_pool.acquire();
-                let state = Arc::new(*state_box);
-                if state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout) {
-                    objects.insert(request.key.clone(), state.clone());
+                let state = Arc::new(ShardObjectState::new(*state_box));
+                objects.insert(request.key.clone(), state.clone());
+                if self.try_acquire_holder(&state, request, token) {
                     return Some(state);
                 }
             }
@@ -214,8 +297,40 @@ impl LockShard {
         None
     }
 
+    fn try_acquire_holder(&self, state: &ShardObjectState, request: &ObjectLockRequest, token: Option<&Arc<GuardToken>>) -> bool {
+        let mut holders = state.holders.lock();
+        holders.reserve(1);
+        let holder = Holder {
+            owner: request.owner.clone(),
+            mode: request.mode,
+            token: token.cloned(),
+        };
+        let success = match request.mode {
+            LockMode::Shared => state.try_acquire_shared_fast(&request.owner, request.lock_timeout),
+            LockMode::Exclusive => state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout),
+        };
+        if success {
+            holders.push(holder);
+            if let Some(token) = token {
+                token.acquired.store(true, Ordering::Release);
+                if token.tracked {
+                    record_lock_held_acquire(request.mode);
+                    #[cfg(test)]
+                    test_pause(TestPausePoint::TrackedBeforeRegistration, &request.key);
+                    self.register_guard_with_info(token);
+                }
+            }
+        }
+        success
+    }
+
     /// Slow path with async waiting
-    async fn acquire_lock_slow_path(&self, request: &ObjectLockRequest, start_time: Instant) -> Result<(), LockResult> {
+    async fn acquire_lock_slow_path(
+        &self,
+        request: &ObjectLockRequest,
+        start_time: Instant,
+        token: Option<&Arc<GuardToken>>,
+    ) -> Result<(), LockResult> {
         // Use adaptive timeout based on current load and request priority
         let adaptive_timeout = self.calculate_adaptive_timeout(request);
         let deadline = start_time + adaptive_timeout;
@@ -240,7 +355,7 @@ impl LockShard {
                     Some(state) => state.clone(),
                     None => {
                         let state_box = self.object_pool.acquire();
-                        let state = Arc::new(*state_box);
+                        let state = Arc::new(ShardObjectState::new(*state_box));
                         objects.insert(request.key.clone(), state.clone());
                         state
                     }
@@ -249,10 +364,7 @@ impl LockShard {
 
                 #[cfg(test)]
                 test_pause(TestPausePoint::SlowLookup, &request.key);
-                let success = match request.mode {
-                    LockMode::Shared => state.try_acquire_shared_fast(&request.owner, request.lock_timeout),
-                    LockMode::Exclusive => state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout),
-                };
+                let success = self.try_acquire_holder(&state, request, token);
                 drop(objects);
                 (state, success)
             };
@@ -324,71 +436,126 @@ impl LockShard {
         }
     }
 
-    /// Release lock
+    /// Release an owner-matched lock.
+    ///
+    /// This legacy API has no holder identity and cannot distinguish an old
+    /// caller from a new acquisition by the same owner.
     pub fn release_lock(&self, key: &ObjectKey, owner: &Arc<str>, mode: LockMode) -> bool {
-        let should_cleanup;
-        let result;
+        self.release_matching(key, owner, mode, None, None)
+    }
 
-        {
+    pub(crate) fn release_tracked(&self, key: &ObjectKey, owner: &Arc<str>, mode: LockMode, token: &Arc<GuardToken>) -> bool {
+        self.release_matching(key, owner, mode, Some(token), None)
+    }
+
+    fn release_matching(
+        &self,
+        key: &ObjectKey,
+        owner: &Arc<str>,
+        mode: LockMode,
+        token: Option<&Arc<GuardToken>>,
+        weak_guard: Option<(u64, &Arc<()>)>,
+    ) -> bool {
+        let (state, outcome, should_cleanup) = {
             let objects = self.objects.read();
-            if let Some(state) = objects.get(key) {
-                result = match mode {
-                    LockMode::Shared => state.release_shared(owner),
-                    LockMode::Exclusive => state.release_exclusive(owner),
-                };
-
-                if result {
-                    self.metrics.record_release();
-
-                    // Check if cleanup is needed
-                    should_cleanup = !state.is_locked() && !state.atomic_state.has_waiters();
-                } else {
-                    should_cleanup = false;
-                    // Additional diagnostics for release failures
-                    let current_mode = state.current_mode();
-                    let is_locked = state.is_locked();
-                    let has_waiters = state.atomic_state.has_waiters();
-
-                    tracing::debug!(
-                        "Lock release failed in shard: key={}, owner={}, mode={:?}, current_mode={:?}, is_locked={}, has_waiters={}",
-                        key,
-                        owner,
-                        mode,
-                        current_mode,
-                        is_locked,
-                        has_waiters
-                    );
+            let Some(state) = objects.get(key).cloned() else {
+                if let Some((id, weak)) = weak_guard {
+                    let mut guards = self.active_guards.lock();
+                    if guards.get(&id).is_some_and(|entry| {
+                        entry.tokens.is_empty() && entry.weak.as_ref().is_some_and(|entry| Arc::ptr_eq(entry, weak))
+                    }) {
+                        guards.remove(&id);
+                    }
                 }
+                return false;
+            };
+            let mut holders = state.holders.lock();
+            let mut weak_registry = if let Some((id, weak)) = weak_guard {
+                let guards = self.active_guards.lock();
+                if !guards.get(&id).is_some_and(|entry| {
+                    entry.tokens.is_empty()
+                        && !entry.ambiguous
+                        && entry.weak.as_ref().is_some_and(|entry| Arc::ptr_eq(entry, weak))
+                }) {
+                    return false;
+                }
+                Some(guards)
             } else {
-                result = false;
-                should_cleanup = false;
-                tracing::debug!(
-                    "Lock release failed - key not found in shard: key={}, owner={}, mode={:?}",
-                    key,
-                    owner,
-                    mode
-                );
+                None
+            };
+            let matches = |holder: &&Holder| holder.owner == *owner && holder.mode == mode;
+            let position = if let Some(token) = token {
+                holders
+                    .iter()
+                    .position(|holder| matches(&holder) && holder.token.as_ref().is_some_and(|held| Arc::ptr_eq(held, token)))
+            } else if weak_guard.is_some() {
+                // A legacy registration has no holder identity. It may release
+                // a raw holder, but must not impersonate a tracked guard.
+                holders.iter().position(|holder| matches(&holder) && holder.is_raw())
+            } else {
+                holders
+                    .iter()
+                    .position(|holder| matches(&holder) && holder.is_raw())
+                    .or_else(|| holders.iter().position(|holder| matches(&holder)))
+            };
+            let Some(position) = position else {
+                return false;
+            };
+            let outcome = Self::release_physical(&state, owner, mode);
+            let holder = outcome.success.then(|| holders.remove(position));
+            if let (true, Some((id, _)), Some(guards)) = (outcome.success, weak_guard, weak_registry.as_mut()) {
+                guards.remove(&id);
             }
-        }
-
-        // Perform cleanup outside of the read lock
+            drop(weak_registry);
+            if let Some(holder) = holder {
+                self.record_holder_release(&holder);
+                self.metrics.record_release();
+            }
+            let should_cleanup = outcome.success && !state.is_locked() && !state.atomic_state.has_waiters();
+            drop(holders);
+            (state, outcome, should_cleanup)
+        };
+        let result = outcome.finish(&state, owner);
         if should_cleanup {
             self.schedule_cleanup(key.clone());
         }
-
         result
     }
 
-    /// Release lock with guard ID tracking for double-release prevention
+    fn release_physical(state: &ShardObjectState, owner: &Arc<str>, mode: LockMode) -> ReleaseOutcome {
+        match mode {
+            LockMode::Shared => state.release_shared_deferred(owner),
+            LockMode::Exclusive => state.release_exclusive_deferred(owner),
+        }
+    }
+
+    fn record_holder_release(&self, holder: &Holder) {
+        if let Some(token) = &holder.token {
+            token.acquired.store(false, Ordering::Release);
+            if token.tracked {
+                record_lock_held_release(holder.mode);
+                self.unregister_guard_token(token);
+            }
+        }
+    }
+
+    /// Release lock with guard ID tracking for double-release prevention.
+    ///
+    /// Weak registrations contain no holder identity. A call beginning after
+    /// an ID is reused cannot distinguish the previous registration.
     pub fn release_lock_with_guard(&self, key: &ObjectKey, owner: &Arc<str>, mode: LockMode, guard_id: u64) -> bool {
-        // First, try to remove the guard from active set
-        let guard_was_active = {
-            let mut guards = self.active_guards.lock();
-            guards.remove(&guard_id).is_some()
+        let registration = {
+            let guards = self.active_guards.lock();
+            match guards.get(&guard_id) {
+                Some(entry) if entry.weak.is_none() && !entry.ambiguous && entry.tokens.len() == 1 => {
+                    Some(Ok(entry.tokens[0].clone()))
+                }
+                Some(entry) if !entry.ambiguous && entry.tokens.is_empty() => entry.weak.clone().map(Err),
+                _ => None,
+            }
         };
 
-        // If guard was not active, this is a double-release attempt
-        if !guard_was_active {
+        let Some(registration) = registration else {
             tracing::debug!(
                 "Double-release attempt blocked: key={}, owner={}, mode={:?}, guard_id={}",
                 key,
@@ -397,54 +564,48 @@ impl LockShard {
                 guard_id
             );
             return false;
+        };
+
+        #[cfg(test)]
+        test_pause(TestPausePoint::GuardIdAfterLookup, key);
+        match registration {
+            Ok(token) => self.release_tracked(key, owner, mode, &token),
+            Err(weak) => self.release_matching(key, owner, mode, None, Some((guard_id, &weak))),
         }
-
-        // Proceed with normal release
-        let should_cleanup;
-        let result;
-
-        {
-            let objects = self.objects.read();
-            if let Some(state) = objects.get(key) {
-                result = match mode {
-                    LockMode::Shared => state.release_shared(owner),
-                    LockMode::Exclusive => state.release_exclusive(owner),
-                };
-
-                if result {
-                    self.metrics.record_release();
-                    should_cleanup = !state.is_locked() && !state.atomic_state.has_waiters();
-                } else {
-                    should_cleanup = false;
-                }
-            } else {
-                result = false;
-                should_cleanup = false;
-            }
-        }
-
-        if should_cleanup {
-            self.schedule_cleanup(key.clone());
-        }
-
-        result
     }
 
     /// Register a guard to prevent premature cleanup
     pub fn register_guard(&self, guard_id: u64) {
-        self.active_guards.lock().insert(guard_id, None);
+        let mut guards = self.active_guards.lock();
+        let entry = guards.entry(guard_id).or_default();
+        entry.ambiguous = !entry.tokens.is_empty();
+        entry.weak = Some(Arc::new(()));
     }
 
-    pub(crate) fn register_guard_with_info(&self, guard_id: u64, key: &ObjectKey, mode: LockMode, owner: &Arc<str>) {
+    fn register_guard_with_info(&self, token: &Arc<GuardToken>) {
+        if token.id == 0 {
+            return;
+        }
         let mut guards = self.active_guards.lock();
-        guards.insert(
-            guard_id,
-            Some(ActiveGuardInfo {
-                key: key.clone(),
-                mode,
-                owner: owner.clone(),
-            }),
-        );
+        let entry = guards.entry(token.id).or_default();
+        entry.ambiguous |= entry.weak.is_some() || entry.tokens.iter().any(|held| !Arc::ptr_eq(held, token));
+        if !entry.tokens.iter().any(|held| Arc::ptr_eq(held, token)) {
+            entry.tokens.push(token.clone());
+        }
+    }
+
+    pub(crate) fn unregister_guard_token(&self, token: &Arc<GuardToken>) {
+        if token.id == 0 {
+            return;
+        }
+        let mut guards = self.active_guards.lock();
+        let Some(entry) = guards.get_mut(&token.id) else {
+            return;
+        };
+        entry.tokens.retain(|held| !Arc::ptr_eq(held, token));
+        if entry.tokens.is_empty() && entry.weak.is_none() {
+            guards.remove(&token.id);
+        }
     }
 
     /// Unregister a guard (called when guard is dropped)
@@ -528,41 +689,32 @@ impl LockShard {
         // Sort requests by key to prevent deadlocks
         requests.sort_by(|a, b| a.key.cmp(&b.key));
 
-        let mut acquired = Vec::new();
+        let mut batch = BatchAcquisition {
+            shard: self,
+            acquired: Vec::new(),
+            rollback: all_or_nothing,
+        };
         let mut failed = Vec::new();
 
         for request in requests {
-            match self.acquire_lock(&request).await {
-                Ok(()) => acquired.push((request.key.clone(), request.mode, request.owner.clone())),
+            let token = GuardToken::raw_batch();
+            match self.acquire_lock_inner(&request, Some(&token)).await {
+                Ok(()) => batch
+                    .acquired
+                    .push((request.key.clone(), request.mode, request.owner.clone(), token)),
                 Err(err) => {
                     failed.push((request.key, err));
 
                     if all_or_nothing {
-                        // Release all acquired locks using their correct owner and mode
-                        let mut cleanup_failures = 0;
-                        for (key, mode, owner) in &acquired {
-                            if !self.release_lock(key, owner, *mode) {
-                                cleanup_failures += 1;
-                                tracing::warn!(
-                                    "Failed to release lock during batch cleanup in shard: bucket={}, object={}",
-                                    key.bucket,
-                                    key.object
-                                );
-                            }
-                        }
-
-                        if cleanup_failures > 0 {
-                            tracing::error!("Shard batch lock cleanup had {} failures", cleanup_failures);
-                        }
-
                         return Err(failed);
                     }
                 }
             }
         }
 
+        batch.rollback = false;
         if failed.is_empty() {
-            Ok(acquired.into_iter().map(|(key, _, _)| key).collect())
+            Ok(batch.acquired.iter().map(|(key, _, _, _)| key.clone()).collect())
         } else {
             Err(failed)
         }
@@ -619,50 +771,61 @@ impl LockShard {
     }
 
     pub(crate) fn list_locks_with_holder_counts(&self) -> Vec<(crate::fast_lock::types::ObjectLockInfo, u32)> {
+        self.list_lock_snapshot(false)
+            .into_iter()
+            .map(|(info, count, _)| (info, count))
+            .collect()
+    }
+
+    pub(crate) fn list_locks_with_holder_generations(
+        &self,
+    ) -> Vec<(crate::fast_lock::types::ObjectLockInfo, u32, Option<Vec<u64>>)> {
+        self.list_lock_snapshot(true)
+    }
+
+    fn list_lock_snapshot(
+        &self,
+        include_generations: bool,
+    ) -> Vec<(crate::fast_lock::types::ObjectLockInfo, u32, Option<Vec<u64>>)> {
         let objects = self.objects.read();
         let mut infos = Vec::new();
         for (key, state) in objects.iter() {
+            let holders = state.holders.lock();
             let Some(mode) = state.current_mode() else {
                 continue;
             };
             let priority = *state.priority.read();
+            let mut add = |owner: Arc<str>, acquired_at: SystemTime, lock_timeout: Duration, count: u32| {
+                let expires_at = acquired_at
+                    .checked_add(lock_timeout)
+                    .unwrap_or_else(|| acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
+                let generations = if include_generations {
+                    Self::holder_generations(&holders, &owner, mode, count)
+                } else {
+                    None
+                };
+                infos.push((
+                    crate::fast_lock::types::ObjectLockInfo {
+                        key: key.clone(),
+                        mode,
+                        owner,
+                        acquired_at,
+                        expires_at,
+                        priority,
+                    },
+                    count,
+                    generations,
+                ));
+            };
             match mode {
                 LockMode::Exclusive => {
                     if let Some(info) = state.current_owner.read().clone() {
-                        let expires_at = info
-                            .acquired_at
-                            .checked_add(info.lock_timeout)
-                            .unwrap_or_else(|| info.acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
-                        infos.push((
-                            crate::fast_lock::types::ObjectLockInfo {
-                                key: key.clone(),
-                                mode,
-                                owner: info.owner,
-                                acquired_at: info.acquired_at,
-                                expires_at,
-                                priority,
-                            },
-                            1,
-                        ));
+                        add(info.owner, info.acquired_at, info.lock_timeout, 1);
                     }
                 }
                 LockMode::Shared => {
                     for entry in state.shared_owners.read().iter() {
-                        let expires_at = entry
-                            .acquired_at
-                            .checked_add(entry.lock_timeout)
-                            .unwrap_or_else(|| entry.acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
-                        infos.push((
-                            crate::fast_lock::types::ObjectLockInfo {
-                                key: key.clone(),
-                                mode,
-                                owner: entry.owner.clone(),
-                                acquired_at: entry.acquired_at,
-                                expires_at,
-                                priority,
-                            },
-                            entry.count,
-                        ));
+                        add(entry.owner.clone(), entry.acquired_at, entry.lock_timeout, entry.count);
                     }
                 }
             }
@@ -670,48 +833,20 @@ impl LockShard {
         infos
     }
 
-    pub(crate) fn list_locks_with_holder_generations(
-        &self,
-    ) -> Vec<(crate::fast_lock::types::ObjectLockInfo, u32, Option<Vec<u64>>)> {
-        // Snapshot lock state before guard registrations. Acquires register after
-        // mutating state, while releases unregister before mutating state, so a
-        // concurrent transition can only make the cohort mismatch and fall back.
-        let infos = self.list_locks_with_holder_counts();
-        let guards = self.active_guards.lock();
-        let mut guard_ids_by_holder: HashMap<GuardHolderKey, Vec<u64>> = HashMap::with_capacity(guards.len());
-        for (&guard_id, guard) in guards
+    fn holder_generations(holders: &[Holder], owner: &Arc<str>, mode: LockMode, count: u32) -> Option<Vec<u64>> {
+        let mut ids: Vec<_> = holders
             .iter()
-            .filter_map(|(guard_id, guard)| guard.as_ref().map(|guard| (guard_id, guard)))
-        {
-            let key = GuardHolderKey {
-                key: guard.key.clone(),
-                mode: guard.mode,
-                owner: guard.owner.clone(),
-            };
-            guard_ids_by_holder
-                .entry(key)
-                .and_modify(|guard_ids| guard_ids.push(guard_id))
-                .or_insert_with(|| vec![guard_id]);
+            .filter(|holder| holder.owner == *owner && holder.mode == mode)
+            .map(|holder| holder.token.as_ref().and_then(|token| (token.id != 0).then_some(token.id)))
+            .collect::<Option<_>>()?;
+        if u32::try_from(ids.len()).ok() != Some(count) {
+            return None;
         }
-        drop(guards);
-        for guard_ids in guard_ids_by_holder.values_mut() {
-            guard_ids.sort_unstable();
+        ids.sort_unstable();
+        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return None;
         }
-
-        infos
-            .into_iter()
-            .map(|(info, holder_count)| {
-                let key = GuardHolderKey {
-                    key: info.key.clone(),
-                    mode: info.mode,
-                    owner: info.owner.clone(),
-                };
-                let generation = guard_ids_by_holder
-                    .remove(&key)
-                    .filter(|guard_ids| u32::try_from(guard_ids.len()).ok() == Some(holder_count));
-                (info, holder_count, generation)
-            })
-            .collect()
+        Some(ids)
     }
 
     /// Force-release every holder of a lock on `key`, regardless of owner.
@@ -719,28 +854,46 @@ impl LockShard {
     /// Returns the number of owners that were released. Used by the admin
     /// force-unlock path to clear a stuck resource.
     pub fn force_release_all(&self, key: &ObjectKey) -> usize {
-        let owners_modes: Vec<(Arc<str>, LockMode)> = {
+        let (state, outcomes, owners) = {
             let objects = self.objects.read();
-            let Some(state) = objects.get(key) else {
+            let Some(state) = objects.get(key).cloned() else {
                 return 0;
             };
-            let mut pairs = Vec::new();
-            if let Some(info) = state.current_owner.read().clone() {
-                pairs.push((info.owner, LockMode::Exclusive));
+            #[cfg(test)]
+            let mut holders = match state.holders.try_lock() {
+                Some(holders) => holders,
+                None => {
+                    test_pause(TestPausePoint::ForceGateContended, key);
+                    state.holders.lock()
+                }
+            };
+            #[cfg(not(test))]
+            let mut holders = state.holders.lock();
+            let mut outcomes = Vec::with_capacity(holders.len());
+            let mut owners: Vec<Arc<str>> = Vec::new();
+            let mut index = 0;
+            while index < holders.len() {
+                let owner = holders[index].owner.clone();
+                let outcome = Self::release_physical(&state, &owner, holders[index].mode);
+                if outcome.success {
+                    let holder = holders.remove(index);
+                    self.record_holder_release(&holder);
+                    self.metrics.record_release();
+                    if !owners.contains(&owner) {
+                        owners.push(owner.clone());
+                    }
+                } else {
+                    index += 1;
+                }
+                outcomes.push((owner, outcome));
             }
-            for entry in state.shared_owners.read().iter() {
-                pairs.push((entry.owner.clone(), LockMode::Shared));
-            }
-            pairs
+            drop(holders);
+            (state, outcomes, owners)
         };
-
-        let mut released = 0;
-        for (owner, mode) in owners_modes {
-            if self.release_lock(key, &owner, mode) {
-                released += 1;
-            }
+        for (owner, outcome) in outcomes {
+            outcome.finish(&state, &owner);
         }
-        released
+        owners.len()
     }
 
     /// Get current load factor of the shard
@@ -831,7 +984,7 @@ impl LockShard {
 
         let mut objects = self.objects.write();
         objects.retain(|_key, state| {
-            if !state.is_locked() && !state.atomic_state.has_waiters() {
+            if !state.is_locked() && !state.atomic_state.has_waiters() && state.holders.lock().is_empty() {
                 let last_access_secs = state.atomic_state.last_accessed();
                 let last_access_millis = last_access_secs * 1000; // Convert to millis
                 let idle_time = now_millis.saturating_sub(last_access_millis);
@@ -887,7 +1040,7 @@ impl LockShard {
             }
             processed += 1;
 
-            if !state.is_locked() && !state.atomic_state.has_waiters() {
+            if !state.is_locked() && !state.atomic_state.has_waiters() && state.holders.lock().is_empty() {
                 let last_access_millis = state.atomic_state.last_accessed() * 1000;
                 let idle_time = now_millis.saturating_sub(last_access_millis);
 
@@ -909,7 +1062,7 @@ impl LockShard {
             if let Some(state) = objects.remove(&key)
                 && let Ok(state) = Arc::try_unwrap(state)
             {
-                self.object_pool.release(Box::new(state));
+                self.object_pool.release(Box::new(state.state));
             }
         }
 
@@ -966,11 +1119,15 @@ mod tests {
     }
 
     fn test_manager() -> Arc<FastObjectLockManager> {
+        test_manager_with_shards(4)
+    }
+
+    fn test_manager_with_shards(shard_count: usize) -> Arc<FastObjectLockManager> {
         // Construct outside a runtime so no background cleanup races the test.
         Arc::new(
-            std::thread::spawn(|| {
+            std::thread::spawn(move || {
                 FastObjectLockManager::with_config(crate::fast_lock::types::LockConfig {
-                    shard_count: 4,
+                    shard_count,
                     ..Default::default()
                 })
             })
@@ -1061,6 +1218,543 @@ mod tests {
             drop(successor);
         }
         manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_waits_for_tracked_holder_and_registration_commit() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "force-during-commit");
+        drop(manager.acquire_write_lock(key.clone(), "seed").await.expect("seed"));
+        let shard = manager.get_shard(&key).clone();
+        let state = shard.objects.read().get(&key).cloned().expect("existing state");
+        let (entered, resume) = install_pause(TestPausePoint::TrackedBeforeRegistration, &key);
+        let pending = start_acquisition(&manager, ObjectLockRequest::new_write(key.clone(), "owner"));
+        entered.recv_timeout(Duration::from_secs(5)).expect("tracked acquisition");
+        assert!(state.holders.try_lock().is_none(), "physical holder and registration must share a gate");
+
+        let (force_contended, resume_force) = install_pause(TestPausePoint::ForceGateContended, &key);
+        let force = {
+            let manager = manager.clone();
+            let key = key.clone();
+            tokio::task::spawn_blocking(move || manager.force_unlock(&key))
+        };
+        force_contended
+            .recv_timeout(Duration::from_secs(5))
+            .expect("force encountered the holder gate");
+        resume_force.send(()).expect("resume force");
+        resume.send(()).expect("resume acquisition");
+        let stale = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("acquisition completed")
+            .expect("acquisition task")
+            .expect("initial acquisition");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), force)
+                .await
+                .expect("force completed")
+                .expect("force task"),
+            1
+        );
+        assert!(!shard.is_guard_active(stale.guard_id()));
+
+        let successor = manager.acquire_write_lock(key.clone(), "owner").await.expect("successor");
+        let entries = manager.list_locks_with_holder_generations();
+        let (_, count, generations) = entries
+            .iter()
+            .find(|(info, _, _)| info.key == key)
+            .expect("successor snapshot");
+        assert_eq!(*count, 1);
+        assert_eq!(generations.as_ref(), Some(&vec![successor.guard_id()]));
+        drop(stale);
+        let contender = ObjectLockRequest::new_write(key, "other").with_acquire_timeout(Duration::from_millis(100));
+        assert!(manager.acquire_lock(contender).await.is_err());
+        drop(successor);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_numeric_release_does_not_release_reacquired_holder() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "stale-numeric-release");
+        let owner: Arc<str> = Arc::from("owner");
+        let stale = manager
+            .acquire_write_lock(key.clone(), owner.clone())
+            .await
+            .expect("initial holder");
+        let shard = manager.get_shard(&key).clone();
+        let (entered, resume) = install_pause(TestPausePoint::GuardIdAfterLookup, &key);
+        let release = {
+            let key = key.clone();
+            let owner = owner.clone();
+            let id = stale.guard_id();
+            tokio::task::spawn_blocking(move || shard.release_lock_with_guard(&key, &owner, LockMode::Exclusive, id))
+        };
+        entered.recv_timeout(Duration::from_secs(5)).expect("numeric release lookup");
+        assert_eq!(manager.force_unlock(&key), 1);
+        let successor = manager.acquire_write_lock(key.clone(), owner).await.expect("successor");
+        resume.send(()).expect("resume numeric release");
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), release)
+                .await
+                .expect("numeric release completed")
+                .expect("release task"),
+            "an invalidated numeric release must not release the successor"
+        );
+        drop(stale);
+        let contender = ObjectLockRequest::new_write(key, "other").with_acquire_timeout(Duration::from_millis(100));
+        assert!(manager.acquire_lock(contender).await.is_err());
+        drop(successor);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_flight_weak_numeric_release_does_not_release_successor() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "in-flight-weak-release");
+        let owner: Arc<str> = Arc::from("owner");
+        let stale = manager
+            .acquire_write_lock(key.clone(), owner.clone())
+            .await
+            .expect("initial holder");
+        let shard = manager.get_shard(&key).clone();
+        shard.unregister_guard(stale.guard_id());
+        shard.register_guard(stale.guard_id());
+        let (entered, resume) = install_pause(TestPausePoint::GuardIdAfterLookup, &key);
+        let release = {
+            let shard = shard.clone();
+            let key = key.clone();
+            let owner = owner.clone();
+            let id = stale.guard_id();
+            tokio::task::spawn_blocking(move || shard.release_lock_with_guard(&key, &owner, LockMode::Exclusive, id))
+        };
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("weak numeric release lookup");
+        drop(stale);
+        let successor = manager.acquire_write_lock(key.clone(), owner).await.expect("successor");
+        resume.send(()).expect("resume weak numeric release");
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), release)
+                .await
+                .expect("numeric release completed")
+                .expect("release task"),
+            "an in-flight weak release must not release the successor"
+        );
+        let contender = ObjectLockRequest::new_write(key, "other").with_acquire_timeout(Duration::from_millis(100));
+        assert!(manager.acquire_lock(contender).await.is_err());
+        drop(successor);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_flight_weak_release_preserves_replacement_tracked_registration() {
+        let manager = test_manager_with_shards(1);
+        let key = ObjectKey::new("bucket", "weak-id-replacement");
+        let owner: Arc<str> = Arc::from("owner");
+        let shard = manager.get_shard(&key).clone();
+        let id = 42;
+        shard.register_guard(id);
+        let (entered, resume) = install_pause(TestPausePoint::GuardIdAfterLookup, &key);
+        let release = {
+            let shard = shard.clone();
+            let key = key.clone();
+            let owner = owner.clone();
+            tokio::task::spawn_blocking(move || shard.release_lock_with_guard(&key, &owner, LockMode::Exclusive, id))
+        };
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("weak numeric release lookup");
+        shard.unregister_guard(id);
+        let token = Arc::new(GuardToken {
+            id,
+            acquired: std::sync::atomic::AtomicBool::new(false),
+            tracked: true,
+        });
+        let successor = FastLockGuard::new(key.clone(), LockMode::Exclusive, owner.clone(), shard.clone(), token.clone());
+        shard
+            .acquire_tracked(&ObjectLockRequest::new_write(key.clone(), owner), &token)
+            .await
+            .expect("replacement tracked holder");
+        resume.send(()).expect("resume weak numeric release");
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), release)
+                .await
+                .expect("numeric release completed")
+                .expect("release task")
+        );
+        assert!(shard.is_guard_active(id), "replacement tracked registration must remain");
+        let contender = ObjectLockRequest::new_write(key, "other").with_acquire_timeout(Duration::from_millis(100));
+        assert!(manager.acquire_lock(contender).await.is_err());
+        drop(successor);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_flight_weak_release_preserves_reregistered_raw_holder() {
+        let manager = test_manager_with_shards(1);
+        let key = ObjectKey::new("bucket", "weak-raw-replacement");
+        let owner: Arc<str> = Arc::from("owner");
+        let shard = manager.get_shard(&key).clone();
+        let request = ObjectLockRequest::new_write(key.clone(), owner.clone());
+        let id = u64::MAX;
+        shard.acquire_lock(&request).await.expect("original raw holder");
+        shard.register_guard(id);
+        let (entered, resume) = install_pause(TestPausePoint::GuardIdAfterLookup, &key);
+        let release = {
+            let shard = shard.clone();
+            let key = key.clone();
+            let owner = owner.clone();
+            tokio::task::spawn_blocking(move || shard.release_lock_with_guard(&key, &owner, LockMode::Exclusive, id))
+        };
+        entered.recv_timeout(Duration::from_secs(5)).expect("old weak lookup");
+        assert!(shard.release_lock(&key, &owner, LockMode::Exclusive));
+        shard.unregister_guard(id);
+        shard.acquire_lock(&request).await.expect("replacement raw holder");
+        shard.register_guard(id);
+        resume.send(()).expect("resume old weak release");
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), release)
+                .await
+                .expect("release completed")
+                .expect("release task")
+        );
+        assert!(shard.is_guard_active(id));
+        assert!(!shard.try_fast_path_only(&ObjectLockRequest::new_write(key.clone(), "other")));
+        assert!(shard.release_lock_with_guard(&key, &owner, LockMode::Exclusive, id));
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tracked_revocation_preserves_a_replacement_weak_registration() {
+        let manager = test_manager_with_shards(1);
+        let key = ObjectKey::new("bucket", "weak-registration-after-tracked");
+        let owner: Arc<str> = Arc::from("owner");
+        let tracked = manager
+            .acquire_write_lock(key.clone(), owner.clone())
+            .await
+            .expect("tracked holder");
+        let id = tracked.guard_id();
+        let shard = manager.get_shard(&key).clone();
+        shard.unregister_guard(id);
+        shard.register_guard(id);
+        assert_eq!(manager.force_unlock(&key), 1);
+        assert!(tracked.is_released());
+        assert!(shard.is_guard_active(id), "tracked cleanup must not erase the weak registration");
+        shard
+            .acquire_lock(&ObjectLockRequest::new_write(key.clone(), owner.clone()))
+            .await
+            .expect("raw successor");
+        drop(tracked);
+        assert!(shard.release_lock_with_guard(&key, &owner, LockMode::Exclusive, id));
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn raw_and_weak_release_prefer_raw_shared_holder() {
+        let manager = test_manager_with_shards(1);
+        for weak in [false, true] {
+            for batch in [false, true] {
+                let key = ObjectKey::new("bucket", format!("mixed-shared-{weak}-{batch}"));
+                let owner: Arc<str> = Arc::from("owner");
+                let tracked = manager
+                    .acquire_read_lock(key.clone(), owner.clone())
+                    .await
+                    .expect("tracked holder");
+                let shard = manager.get_shard(&key).clone();
+                let request = ObjectLockRequest::new_read(key.clone(), owner.clone());
+                if batch {
+                    assert_eq!(
+                        shard.acquire_locks_batch(vec![request], true).await.expect("raw batch"),
+                        vec![key.clone()]
+                    );
+                } else {
+                    shard.acquire_lock(&request).await.expect("raw holder");
+                }
+                if weak {
+                    shard.register_guard(u64::MAX);
+                    assert!(shard.release_lock_with_guard(&key, &owner, LockMode::Shared, u64::MAX));
+                } else {
+                    assert!(shard.release_lock(&key, &owner, LockMode::Shared));
+                }
+                assert!(!tracked.is_released());
+                assert!(shard.is_guard_active(tracked.guard_id()));
+                assert!(!shard.try_fast_path_only(&ObjectLockRequest::new_write(key.clone(), "other")));
+                drop(tracked);
+                let request = ObjectLockRequest::new_write(key.clone(), "other");
+                assert!(shard.try_fast_path_only(&request));
+                assert!(shard.release_lock(&key, &request.owner, LockMode::Exclusive));
+            }
+        }
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn releasing_one_token_preserves_a_different_token_with_the_same_numeric_id() {
+        let manager = test_manager_with_shards(1);
+        for force in [false, true] {
+            let first_key = ObjectKey::new("bucket", format!("first-collision-{force}"));
+            let second_key = ObjectKey::new("bucket", format!("second-collision-{force}"));
+            let owner: Arc<str> = Arc::from("owner");
+            let first = manager
+                .acquire_write_lock(first_key.clone(), owner.clone())
+                .await
+                .expect("first holder");
+            let shard = manager.get_shard(&first_key).clone();
+            let token = Arc::new(GuardToken {
+                id: first.guard_id(),
+                acquired: std::sync::atomic::AtomicBool::new(false),
+                tracked: true,
+            });
+            let second = FastLockGuard::new(second_key.clone(), LockMode::Exclusive, owner.clone(), shard.clone(), token.clone());
+            shard
+                .acquire_tracked(&ObjectLockRequest::new_write(second_key.clone(), owner.clone()), &token)
+                .await
+                .expect("second holder");
+            if force {
+                assert_eq!(manager.force_unlock(&first_key), 1);
+                drop(first);
+            } else {
+                drop(first);
+            }
+            assert!(shard.is_guard_active(token.id), "different live token registration must survive");
+            assert!(
+                !shard.release_lock_with_guard(&second_key, &owner, LockMode::Exclusive, token.id),
+                "a numeric ID that collided must remain ambiguous"
+            );
+            assert!(!second.is_released());
+            drop(second);
+            let contender = ObjectLockRequest::new_write(second_key, "other").with_acquire_timeout(Duration::from_millis(100));
+            drop(manager.acquire_lock(contender).await.expect("second holder released"));
+        }
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_batch_failure_rolls_back_a_previously_acquired_lock() {
+        let manager = test_manager_with_shards(1);
+        let first = ObjectKey::new("bucket", "a-first");
+        let blocked = ObjectKey::new("bucket", "z-blocked");
+        let blocker = manager.acquire_write_lock(blocked.clone(), "blocker").await.expect("blocker");
+        let (entered, resume) = install_pause(TestPausePoint::SlowLookup, &blocked);
+        let requests = vec![
+            ObjectLockRequest::new_write(first.clone(), "raw"),
+            ObjectLockRequest::new_write(blocked, "raw").with_acquire_timeout(Duration::from_millis(100)),
+        ];
+        let batch = {
+            let shard = manager.get_shard(&first).clone();
+            tokio::spawn(async move { shard.acquire_locks_batch(requests, true).await })
+        };
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second batch lock reached slow path");
+        let first_info = manager.get_lock_info(&first).expect("first raw batch lock is held");
+        assert_eq!(first_info.owner.as_ref(), "raw");
+        assert!(!batch.is_finished());
+        resume.send(()).expect("resume blocked batch request");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), batch)
+                .await
+                .expect("batch completed")
+                .expect("batch task")
+                .is_err()
+        );
+        let request = ObjectLockRequest::new_write(first, "other").with_acquire_timeout(Duration::from_millis(100));
+        drop(
+            manager
+                .acquire_lock(request)
+                .await
+                .expect("failed batch released its first lock"),
+        );
+        drop(blocker);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_raw_batch_does_not_release_a_reacquired_holder() {
+        let manager = test_manager_with_shards(1);
+        let first = ObjectKey::new("bucket", "a-batch-replaced");
+        let blocked = ObjectKey::new("bucket", "z-batch-blocked");
+        let owner: Arc<str> = Arc::from("raw");
+        let blocker = manager.acquire_write_lock(blocked.clone(), "blocker").await.expect("blocker");
+        let shard = manager.get_shard(&first).clone();
+        let (entered, resume) = install_pause(TestPausePoint::SlowLookup, &blocked);
+        let requests = vec![
+            ObjectLockRequest::new_write(first.clone(), owner.clone()),
+            ObjectLockRequest::new_write(blocked, owner.clone()).with_acquire_timeout(Duration::from_millis(100)),
+        ];
+        let batch = {
+            let shard = shard.clone();
+            tokio::spawn(async move { shard.acquire_locks_batch(requests, true).await })
+        };
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("batch reached blocked key");
+        assert_eq!(manager.force_unlock(&first), 1);
+        shard
+            .acquire_lock(&ObjectLockRequest::new_write(first.clone(), owner.clone()))
+            .await
+            .expect("raw successor");
+        resume.send(()).expect("resume batch");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), batch)
+                .await
+                .expect("batch completed")
+                .expect("batch task")
+                .is_err()
+        );
+        assert!(!shard.try_fast_path_only(&ObjectLockRequest::new_write(first.clone(), "other")));
+        assert!(shard.release_lock(&first, &owner, LockMode::Exclusive));
+        drop(blocker);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_raw_batch_releases_its_holders_and_waiter() {
+        let manager = test_manager_with_shards(1);
+        let first = ObjectKey::new("bucket", "a-cancel-batch");
+        let blocked = ObjectKey::new("bucket", "z-cancel-batch");
+        let blocker = manager.acquire_write_lock(blocked.clone(), "blocker").await.expect("blocker");
+        let shard = manager.get_shard(&first).clone();
+        let (entered, resume) = install_pause(TestPausePoint::SlowLookup, &blocked);
+        let requests = vec![
+            ObjectLockRequest::new_write(first.clone(), "raw"),
+            ObjectLockRequest::new_write(blocked.clone(), "raw").with_acquire_timeout(Duration::from_secs(30)),
+        ];
+        let batch = {
+            let shard = shard.clone();
+            tokio::spawn(async move { shard.acquire_locks_batch(requests, true).await })
+        };
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("batch reached blocked key");
+        let state = shard.objects.read().get(&blocked).cloned().expect("blocked state");
+        resume.send(()).expect("resume batch");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.atomic_state.writers_waiting_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("batch waiter registered");
+        batch.abort();
+        assert!(batch.await.expect_err("batch cancelled").is_cancelled());
+        assert_eq!(state.atomic_state.writers_waiting_count(), 0);
+        let contender = ObjectLockRequest::new_write(first.clone(), "other");
+        assert!(shard.try_fast_path_only(&contender));
+        assert!(shard.release_lock(&first, &contender.owner, LockMode::Exclusive));
+        drop(blocker);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pooled_state_does_not_revive_a_forced_guard() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "pooled-guard");
+        let stale = manager
+            .acquire_write_lock(key.clone(), "owner")
+            .await
+            .expect("initial acquisition");
+        assert_eq!(manager.force_unlock(&key), 1);
+        let shard = manager.get_shard(&key);
+
+        let initial_millis = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis();
+        while SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() == initial_millis {
+            std::thread::yield_now();
+        }
+        assert_eq!(shard.cleanup_expired_batch(10, 0), 1);
+        let hits = shard.pool_stats().0;
+        let successor = manager.acquire_write_lock(key.clone(), "owner").await.expect("successor");
+        assert_eq!(shard.pool_stats().0, hits + 1);
+        drop(stale);
+        let contender = ObjectLockRequest::new_write(key, "other").with_acquire_timeout(Duration::from_millis(100));
+        assert!(manager.acquire_lock(contender).await.is_err());
+        drop(successor);
+        manager.shutdown().await;
+    }
+
+    struct ReentrantWake {
+        shard: Arc<LockShard>,
+        key: ObjectKey,
+        woke: std::sync::mpsc::Sender<usize>,
+    }
+
+    impl std::task::Wake for ReentrantWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let _ = self.woke.send(self.shard.force_release_all(&self.key));
+        }
+    }
+
+    async fn check_reentrant_wake(force: bool) -> bool {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", if force { "force-wake" } else { "drop-wake" });
+        let guard = manager.acquire_write_lock(key.clone(), "owner").await.expect("writer");
+        let shard = manager.get_shard(&key).clone();
+        let state = shard.objects.read().get(&key).cloned().expect("writer state");
+        let (woke_tx, woke_rx) = std::sync::mpsc::channel();
+        let waker = Waker::from(Arc::new(ReentrantWake {
+            shard,
+            key: key.clone(),
+            woke: woke_tx,
+        }));
+        let mut context = Context::from_waker(&waker);
+        let mut waiter = Box::pin(state.optimized_notify.wait_for_read());
+        if !matches!(waiter.as_mut().poll(&mut context), Poll::Pending) {
+            return false;
+        }
+
+        let task = {
+            let manager = manager.clone();
+            tokio::task::spawn_blocking(move || {
+                if force {
+                    let released = manager.force_unlock(&key);
+                    drop(guard);
+                    released
+                } else {
+                    drop(guard);
+                    1
+                }
+            })
+        };
+        let completed = matches!(tokio::time::timeout(Duration::from_secs(2), task).await, Ok(Ok(1)));
+        let callback = woke_rx.try_recv().ok() == Some(0);
+        drop(waiter);
+        if completed {
+            manager.shutdown().await;
+        }
+        completed && callback
+    }
+
+    #[test]
+    fn release_wakes_can_reenter_the_shard() {
+        const CHILD_ENV: &str = "RUSTFS_TEST_REENTRANT_LOCK_WAKE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "fast_lock::shard::tests::release_wakes_can_reenter_the_shard",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("isolated wake test");
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let passed = runtime.block_on(async { check_reentrant_wake(false).await && check_reentrant_wake(true).await });
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        assert!(passed, "waker must be able to reenter after the physical release");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

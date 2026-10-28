@@ -20,13 +20,44 @@ use rustfs_io_metrics::{
     record_read_lock_held_acquire, record_read_lock_held_release, record_write_lock_held_acquire, record_write_lock_held_release,
 };
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Global counter for guard IDs to prevent double-release
+/// Global counter for guard IDs; zero is reserved for an unavailable ID.
 static GUARD_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 const EVENT_NAMESPACE_LOCK_RELEASE: &str = "namespace_lock_release";
 const LOG_COMPONENT_LOCK: &str = "lock";
 const LOG_SUBSYSTEM_NAMESPACE: &str = "namespace";
+
+#[derive(Debug)]
+pub(crate) struct GuardToken {
+    pub(crate) id: u64,
+    pub(crate) acquired: AtomicBool,
+    pub(crate) tracked: bool,
+}
+
+impl GuardToken {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            id: next_guard_id(&GUARD_ID_COUNTER),
+            acquired: AtomicBool::new(false),
+            tracked: true,
+        })
+    }
+
+    pub(crate) fn raw_batch() -> Arc<Self> {
+        Arc::new(Self {
+            id: 0,
+            acquired: AtomicBool::new(false),
+            tracked: false,
+        })
+    }
+}
+
+fn next_guard_id(counter: &AtomicU64) -> u64 {
+    counter
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .unwrap_or(0)
+}
 
 /// RAII guard for fast object locks
 ///
@@ -41,12 +72,11 @@ pub struct FastLockGuard {
     disabled: bool, // True when locks are disabled globally
     /// Unique ID for this guard instance to prevent double-release
     guard_id: u64,
+    token: Option<Arc<GuardToken>>,
 }
 
 impl FastLockGuard {
-    pub(crate) fn new(key: ObjectKey, mode: LockMode, owner: Arc<str>, shard: Arc<LockShard>) -> Self {
-        let guard_id = GUARD_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-        record_lock_held_acquire(mode);
+    pub(crate) fn new(key: ObjectKey, mode: LockMode, owner: Arc<str>, shard: Arc<LockShard>, token: Arc<GuardToken>) -> Self {
         Self {
             key,
             mode,
@@ -54,13 +84,14 @@ impl FastLockGuard {
             shard: Some(shard),
             released: false,
             disabled: false,
-            guard_id,
+            guard_id: token.id,
+            token: Some(token),
         }
     }
 
     /// Create a disabled guard (when locks are globally disabled)
     pub(crate) fn new_disabled(key: ObjectKey, mode: LockMode, owner: Arc<str>) -> Self {
-        let guard_id = GUARD_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let guard_id = next_guard_id(&GUARD_ID_COUNTER);
         Self {
             key,
             mode,
@@ -69,6 +100,7 @@ impl FastLockGuard {
             released: false,
             disabled: true,
             guard_id,
+            token: None,
         }
     }
 
@@ -105,13 +137,13 @@ impl FastLockGuard {
             return true;
         }
 
-        if let Some(shard) = &self.shard {
-            let success = shard.release_lock_with_guard(&self.key, &self.owner, self.mode, self.guard_id);
+        if let (Some(shard), Some(token)) = (&self.shard, &self.token) {
+            if !token.acquired.load(Ordering::Acquire) {
+                return false;
+            }
+            let success = shard.release_tracked(&self.key, &self.owner, self.mode, token);
             if success {
                 self.released = true;
-                record_lock_held_release(self.mode);
-                // Unregister the guard after successful release
-                shard.unregister_guard(self.guard_id);
                 self.record_physical_release();
             }
             success
@@ -138,9 +170,15 @@ impl FastLockGuard {
         );
     }
 
-    /// Check if the lock has been released
+    /// Check if this guard has been released or locally revoked.
+    ///
+    /// A false result is only a snapshot; it cannot fence a later force unlock.
     pub fn is_released(&self) -> bool {
         self.released
+            || self
+                .token
+                .as_ref()
+                .is_some_and(|token| !token.acquired.load(Ordering::Acquire))
     }
 
     /// Check if this guard represents a disabled lock
@@ -148,14 +186,14 @@ impl FastLockGuard {
         self.disabled
     }
 
-    /// Get the unique guard ID
+    /// Get the process-local guard ID, or zero if the ID space is exhausted.
     pub fn guard_id(&self) -> u64 {
         self.guard_id
     }
 
     /// Get lock information for monitoring
     pub fn lock_info(&self) -> Option<crate::fast_lock::types::ObjectLockInfo> {
-        if self.released || self.disabled {
+        if self.is_released() || self.disabled {
             None
         } else if let Some(shard) = &self.shard {
             shard.get_lock_info(&self.key)
@@ -167,40 +205,31 @@ impl FastLockGuard {
 
 impl Drop for FastLockGuard {
     fn drop(&mut self) {
-        if let Some(shard) = &self.shard {
-            if !self.released && !self.disabled {
-                let success = shard.release_lock_with_guard(&self.key, &self.owner, self.mode, self.guard_id);
-                if !success {
-                    // For high-concurrency scenarios, this is likely due to:
-                    // 1. Lock was already released by another thread
-                    // 2. Lock was cleaned up by background cleanup
-                    // 3. Legitimate double-drop scenario
-                    tracing::debug!(
-                        "Guard release failed (likely already released): key={}, owner={}, mode={:?}, guard_id={}",
-                        self.key,
-                        self.owner,
-                        self.mode,
-                        self.guard_id
-                    );
-                }
-                if success {
-                    record_lock_held_release(self.mode);
-                }
-                // Always unregister the guard to prevent leaks, regardless of release success
-                shard.unregister_guard(self.guard_id);
-                if success {
-                    self.record_physical_release();
-                }
-            } else {
-                // If guard was already released or disabled, just unregister it
-                shard.unregister_guard(self.guard_id);
+        if let (Some(shard), Some(token)) = (&self.shard, &self.token)
+            && !self.released
+            && !self.disabled
+            && token.acquired.load(Ordering::Acquire)
+        {
+            let success = shard.release_tracked(&self.key, &self.owner, self.mode, token);
+            if !success {
+                // A force unlock or owner-only release may have revoked this holder.
+                tracing::debug!(
+                    "Guard release failed (likely already released): key={}, owner={}, mode={:?}, guard_id={}",
+                    self.key,
+                    self.owner,
+                    self.mode,
+                    self.guard_id
+                );
+            }
+            if success {
+                self.record_physical_release();
             }
         }
     }
 }
 
 #[inline(always)]
-fn record_lock_held_acquire(mode: LockMode) {
+pub(crate) fn record_lock_held_acquire(mode: LockMode) {
     match mode {
         LockMode::Shared => record_read_lock_held_acquire(),
         LockMode::Exclusive => record_write_lock_held_acquire(),
@@ -208,7 +237,7 @@ fn record_lock_held_acquire(mode: LockMode) {
 }
 
 #[inline(always)]
-fn record_lock_held_release(mode: LockMode) {
+pub(crate) fn record_lock_held_release(mode: LockMode) {
     match mode {
         LockMode::Shared => record_read_lock_held_release(),
         LockMode::Exclusive => record_write_lock_held_release(),
