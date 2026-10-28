@@ -486,8 +486,14 @@ pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, S
     rustfs_utils::http::metadata_compat::remove_str(metadata, SUFFIX_BUCKET_INCARNATION_ID);
 }
 
-fn should_persist_encryption_original_size(metadata: &HashMap<String, String>) -> bool {
+pub(crate) fn should_persist_encryption_original_size(metadata: &HashMap<String, String>) -> bool {
     metadata.keys().any(|key| is_object_encryption_marker(key))
+}
+
+/// Reject ambiguous part sizes unless the upload records a transformation.
+pub(crate) fn multipart_part_logical_size(stored_size: usize, actual_size: i64, transformed: bool) -> Option<usize> {
+    let actual_size = usize::try_from(actual_size).ok()?;
+    (transformed || actual_size == stored_size).then_some(actual_size)
 }
 
 /// Per-set memoized capacity dirty scope.
