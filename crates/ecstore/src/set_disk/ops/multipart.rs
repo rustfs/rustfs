@@ -858,7 +858,7 @@ fn validate_part_size_observations(
     errs: &[Option<DiskError>],
     object_parts: &[Vec<String>],
     read_quorum: usize,
-) -> disk::error::Result<()> {
+) -> disk::error::Result<Vec<usize>> {
     if errs.iter().any(Option::is_some) {
         return Err(DiskError::ErasureReadQuorum);
     }
@@ -874,7 +874,9 @@ fn validate_part_size_observations(
                 None => (name, 1),
             };
             let parsed = number.parse::<usize>().map_err(|_| DiskError::FileCorrupt)?;
-            if !(1..=MAX_PARTS_COUNT).contains(&parsed) || parsed.to_string() != number {
+            if !(1..=MAX_PARTS_COUNT).contains(&parsed)
+                || !number.as_bytes().first().is_some_and(|digit| (b'1'..=b'9').contains(digit))
+            {
                 return Err(DiskError::FileCorrupt);
             }
             *observed.entry(parsed).or_default() |= flag;
@@ -889,7 +891,9 @@ fn validate_part_size_observations(
     if counts.values().any(|&count| count < read_quorum) {
         return Err(DiskError::ErasureReadQuorum);
     }
-    Ok(())
+    let mut part_numbers: Vec<_> = counts.into_keys().collect();
+    part_numbers.sort_unstable();
+    Ok(part_numbers)
 }
 
 fn reduce_quorum_part_numbers(object_parts: Vec<Vec<String>>, read_quorum: usize) -> Vec<usize> {
@@ -1366,15 +1370,10 @@ impl SetDisks {
             });
         }
 
-        let mut errs = Vec::with_capacity(disks.len());
-        let mut object_parts = Vec::with_capacity(disks.len());
-
-        let (collected_errs, collected_parts) = collect_list_parts_results(futures, read_quorum).await?;
-        errs.extend(collected_errs);
-        object_parts.extend(collected_parts);
+        let (errs, object_parts) = collect_list_parts_results(futures, read_quorum).await?;
 
         if strict_size {
-            validate_part_size_observations(&errs, &object_parts, read_quorum)?;
+            return validate_part_size_observations(&errs, &object_parts, read_quorum);
         }
         if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
             return Err(err);
@@ -7708,7 +7707,18 @@ mod tests {
         let pair = || vec!["part.1".to_string(), "part.1.meta".to_string()];
         let all_online = vec![None; 4];
         assert!(validate_part_size_observations(&all_online, &[vec![], vec![], vec![], vec![]], 2).is_ok());
-        assert!(validate_part_size_observations(&all_online, &[pair(), pair(), vec![], vec![]], 2).is_ok());
+        assert_eq!(
+            validate_part_size_observations(&all_online, &[pair(), pair(), vec![], vec![]], 2),
+            Ok(vec![1])
+        );
+        let unordered = vec!["part.9.meta", "part.1", "part.9", "part.1.meta", "part.1"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            validate_part_size_observations(&all_online, &[unordered.clone(), unordered, vec![], vec![]], 2),
+            Ok(vec![1, 9])
+        );
         assert_eq!(
             validate_part_size_observations(&all_online, &[pair(), vec![], vec![], vec![]], 2),
             Err(DiskError::ErasureReadQuorum)
@@ -7717,7 +7727,7 @@ mod tests {
             validate_part_size_observations(&all_online, &[vec!["part.1.meta".to_string()], pair(), pair(), vec![]], 2),
             Err(DiskError::FileCorrupt)
         );
-        for invalid in ["part.0", "part.10001", "part.01"] {
+        for invalid in ["part.0", "part.10001", "part.01", "part.+1", "part.1x"] {
             let entries = vec![invalid.to_string(), format!("{invalid}.meta")];
             assert_eq!(
                 validate_part_size_observations(&all_online, &[entries.clone(), entries.clone(), entries.clone(), entries], 2),
