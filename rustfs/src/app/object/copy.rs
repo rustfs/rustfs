@@ -1083,6 +1083,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copy_object_rejects_reserved_catalog_destination_before_store_lookup() {
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: "source-bucket".into(),
+                key: "source-key".into(),
+                version_id: None,
+            })
+            .bucket(format!("missing-{}", Uuid::new_v4()))
+            .key(".rustfs-table/metadata/current.json".to_string())
+            .build()
+            .unwrap();
+        let error = DefaultObjectUsecase::without_context()
+            .execute_copy_object(build_request(input, Method::PUT))
+            .await
+            .expect_err("reserved catalog destination must fail closed without bucket metadata");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(error.message(), Some(crate::table_catalog::RESERVED_CATALOG_OBJECT_MESSAGE));
+    }
+
+    #[tokio::test]
     async fn execute_copy_object_rejects_invalid_storage_class() {
         let input = CopyObjectInput::builder()
             .copy_source(CopySource::Bucket {

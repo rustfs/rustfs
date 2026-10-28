@@ -307,17 +307,8 @@ impl DefaultObjectUsecase {
         part_number: Option<usize>,
         range: Option<&HTTPRangeSpec>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        let (full, etag_hex, last_modified) = veeam_sosapi::generated(store, &req.input.bucket, kind).await?;
-        check_generated_read_preconditions(&req.headers, &etag_hex, last_modified)?;
         let representation =
-            veeam_sosapi::representation_from(full, etag_hex, last_modified, part_number, range).map_err(|err| match err {
-                veeam_sosapi::SosapiReadError::InvalidRange => {
-                    S3Error::with_message(S3ErrorCode::InvalidRange, "The requested range is not satisfiable")
-                }
-                veeam_sosapi::SosapiReadError::PartNumber => {
-                    S3Error::with_message(S3ErrorCode::InvalidArgument, "partNumber is not supported for Veeam SOSAPI objects")
-                }
-            })?;
+            veeam_sosapi::read_representation(store, &req.input.bucket, kind, &req.headers, part_number, range).await?;
         let content_type = ContentType::from_str(veeam_sosapi::CONTENT_TYPE)
             .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "invalid SOSAPI content type"))?;
         let content_range = representation.content_range;

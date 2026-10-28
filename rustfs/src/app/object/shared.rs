@@ -1130,23 +1130,6 @@ pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceH
     check_preconditions(headers, &info)
 }
 
-/// Read preconditions for a generated object. `etag_hex` and `last_modified`
-/// are the virtual response values; this does not load a stored object.
-pub(crate) fn check_generated_read_preconditions(
-    headers: &HeaderMap,
-    etag_hex: &str,
-    last_modified: OffsetDateTime,
-) -> S3Result<()> {
-    check_preconditions(
-        headers,
-        &ObjectInfo {
-            etag: Some(etag_hex.to_owned()),
-            mod_time: Some(last_modified),
-            ..Default::default()
-        },
-    )
-}
-
 /// S3 documents write-side `If-None-Match` only as `*` (create-only).
 /// Reject unsupported ETag comparisons with 501 NotImplemented.
 /// Treating it as an ETag comparison would let a write overwrite an existing key
