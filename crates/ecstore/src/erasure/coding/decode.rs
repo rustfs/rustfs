@@ -19,6 +19,7 @@ use crate::diagnostics::get::{
     GET_STAGE_STRIPE_READ_QUORUM, GetObjectFailureReason, classify_io_error, get_stage_timer_if_enabled,
     record_get_object_pipeline_failure, record_get_stage_duration_if_enabled,
 };
+use crate::diagnostics::get_pipeline_sync;
 use crate::disk::disk_store::get_object_disk_read_timeout;
 use crate::disk::error::{Error, is_terminal_read_error};
 use crate::disk::error_reduce::reduce_errs;
@@ -2179,7 +2180,13 @@ where
 
         let write_len = write_left.min(block_slice.len());
         let write_stage_start = get_stage_timer_if_enabled(rustfs_io_metrics::get_stage_metrics_enabled());
+        #[cfg(feature = "diagnostic-get-pipeline")]
+        let diagnostic = crate::diagnostics::get_pipeline::ElapsedMeasurement::emit();
         if let Err(e) = writer.write_all(&block_slice[..write_len]).await {
+            #[cfg(feature = "diagnostic-get-pipeline")]
+            if let Some(diagnostic) = diagnostic {
+                diagnostic.finish(false, 0);
+            }
             if let Some(write_stage_start) = write_stage_start {
                 rustfs_io_metrics::record_get_object_duplex_backpressure_duration(write_stage_start.elapsed().as_secs_f64());
             }
@@ -2207,6 +2214,10 @@ where
                 );
             }
             return Err(e);
+        }
+        #[cfg(feature = "diagnostic-get-pipeline")]
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.finish(true, write_len);
         }
         if let Some(write_stage_start) = write_stage_start {
             rustfs_io_metrics::record_get_object_duplex_backpressure_duration(write_stage_start.elapsed().as_secs_f64());
@@ -2447,11 +2458,17 @@ impl Erasure {
         } else {
             None
         };
-        let decode_result = if require_surplus_source {
-            self.decode_data_with_reconstruction_verification_for_lockstep(shards)
-        } else {
-            self.decode_data_with_reconstruction_verification(shards)
-        };
+        let decode_result = get_pipeline_sync!(
+            Reconstruct,
+            0,
+            result || {
+                if require_surplus_source {
+                    self.decode_data_with_reconstruction_verification_for_lockstep(shards)
+                } else {
+                    self.decode_data_with_reconstruction_verification(shards)
+                }
+            }
+        );
         if let Err(e) = decode_result {
             record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
             let reason = GetObjectFailureReason::DecodeError;
@@ -3209,6 +3226,60 @@ mod tests {
 
         assert_eq!(defaulted.read_costs, vec![ShardReadCost::Unknown; 3]);
         assert!(defaulted.verify_reconstruction);
+    }
+
+    #[cfg(feature = "diagnostic-get-pipeline")]
+    #[tokio::test]
+    async fn diagnostic_emit_preserves_success_error_and_pending_cancellation() {
+        use crate::diagnostics::get_pipeline::{self as diagnostic, Stage};
+        struct Downstream {
+            pending: bool,
+        }
+        impl AsyncWrite for Downstream {
+            fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &[u8]) -> Poll<io::Result<usize>> {
+                if self.pending {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+                }
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let blocks = vec![Some(vec![1, 2, 3, 4])];
+        let sample = diagnostic::test_request();
+        let mut out = Vec::new();
+        let result = diagnostic::in_context(Some(&sample), || {
+            diagnostic::with_captured_context(write_data_blocks(&mut out, &blocks, 1, 0, 4))
+        })
+        .await;
+        assert_eq!(result.expect("emit original bytes"), 4);
+        assert_eq!(out, [1, 2, 3, 4]);
+        assert_eq!(diagnostic::test_total(&sample, Stage::Emit), (1, 4, 0, 1, 0, 0));
+
+        let sample = diagnostic::test_request();
+        let mut downstream = Downstream { pending: false };
+        let error = diagnostic::in_context(Some(&sample), || {
+            diagnostic::with_captured_context(write_data_blocks(&mut downstream, &blocks, 1, 0, 4))
+        })
+        .await
+        .expect_err("closed downstream must remain an error");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(diagnostic::test_total(&sample, Stage::Emit), (1, 0, 0, 1, 1, 0));
+
+        let sample = diagnostic::test_request();
+        let mut downstream = Downstream { pending: true };
+        let future = diagnostic::in_context(Some(&sample), || {
+            diagnostic::with_captured_context(write_data_blocks(&mut downstream, &blocks, 1, 0, 4))
+        });
+        let mut future = Box::pin(future);
+        assert!(futures::poll!(future.as_mut()).is_pending());
+        drop(future);
+        assert_eq!(diagnostic::test_total(&sample, Stage::Emit), (1, 0, 0, 1, 0, 1));
     }
 
     #[tokio::test]

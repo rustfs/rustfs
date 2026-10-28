@@ -79,6 +79,24 @@ const REDACTED_QUERY_VALUE: &str = "redacted";
 type BatchDiagnosticRequest = Option<Arc<str>>;
 #[cfg(not(feature = "diagnostic-local-batch"))]
 type BatchDiagnosticRequest = ();
+#[cfg(feature = "diagnostic-get-pipeline")]
+type PipelineDiagnosticRequest = Option<PipelineRequestOwner>;
+#[cfg(not(feature = "diagnostic-get-pipeline"))]
+type PipelineDiagnosticRequest = ();
+#[cfg(feature = "diagnostic-get-pipeline")]
+struct PipelineRequestOwner(Arc<batch_diagnostic::RequestSample>);
+#[cfg(feature = "diagnostic-get-pipeline")]
+impl PipelineRequestOwner {
+    fn sample(&self) -> &Arc<batch_diagnostic::RequestSample> {
+        &self.0
+    }
+}
+#[cfg(feature = "diagnostic-get-pipeline")]
+impl Drop for PipelineRequestOwner {
+    fn drop(&mut self) {
+        batch_diagnostic::cancel_response(Some(&self.0));
+    }
+}
 const OBJECT_ZIP_DOWNLOADS_PATH: &str = "/v3/object-zip-downloads/";
 const HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 static HTTP_SERVER_ERROR_LOGS: [rustfs_utils::LogThrottle; 100] = [const { rustfs_utils::LogThrottle::new(5_000) }; 100];
@@ -291,10 +309,24 @@ where
         } else {
             req.headers().get(REQUEST_ID_HEADER).cloned()
         };
+        #[cfg(feature = "diagnostic-get-pipeline")]
+        let pipeline_request = (is_s3 && req.method() == Method::GET)
+            .then(|| batch_diagnostic::capture_request(&request_context.request_id))
+            .flatten()
+            .map(PipelineRequestOwner);
+        #[cfg(not(feature = "diagnostic-get-pipeline"))]
+        let pipeline_request = ();
         #[cfg(feature = "diagnostic-local-batch")]
-        let diagnostic_request = is_s3
-            .then(|| batch_diagnostic::request_context(&request_context.request_id))
-            .flatten();
+        let diagnostic_context = || {
+            is_s3
+                .then(|| batch_diagnostic::request_context(&request_context.request_id))
+                .flatten()
+        };
+        #[cfg(feature = "diagnostic-get-pipeline")]
+        let diagnostic_context =
+            || batch_diagnostic::in_context(pipeline_request.as_ref().map(PipelineRequestOwner::sample), diagnostic_context);
+        #[cfg(feature = "diagnostic-local-batch")]
+        let diagnostic_request = diagnostic_context();
         #[cfg(not(feature = "diagnostic-local-batch"))]
         let diagnostic_request = ();
         req.extensions_mut().insert(request_context);
@@ -312,22 +344,23 @@ where
             .flatten();
         let head_request = req.method() == Method::HEAD;
         let mut metrics = is_s3.then(|| s3_http_request_guard(req.method().as_str()));
-        #[cfg(feature = "diagnostic-local-batch")]
-        let inner = batch_diagnostic::in_request_context(diagnostic_request.as_ref(), || match metrics.as_mut() {
-            Some(metrics) => metrics.in_scope(|| self.inner.call(req)),
-            None => self.inner.call(req),
-        });
-        #[cfg(not(feature = "diagnostic-local-batch"))]
-        let inner = match metrics.as_mut() {
+        let call = || match metrics.as_mut() {
             Some(metrics) => metrics.in_scope(|| self.inner.call(req)),
             None => self.inner.call(req),
         };
+        #[cfg(feature = "diagnostic-get-pipeline")]
+        let call = || batch_diagnostic::in_context(pipeline_request.as_ref().map(PipelineRequestOwner::sample), call);
+        #[cfg(feature = "diagnostic-local-batch")]
+        let inner = batch_diagnostic::in_request_context(diagnostic_request.as_ref(), call);
+        #[cfg(not(feature = "diagnostic-local-batch"))]
+        let inner = call();
         if let Some(feedback) = feedback.as_mut() {
             feedback.set_class(foreground_class(metrics.as_ref().and_then(S3HttpRequestGuard::operation)));
         }
         ExternalRequestContextFuture {
             inner,
             diagnostic_request,
+            pipeline_request,
             request_id,
             is_s3,
             metrics,
@@ -378,6 +411,7 @@ pin_project! {
         #[pin]
         inner: F,
         diagnostic_request: BatchDiagnosticRequest,
+        pipeline_request: PipelineDiagnosticRequest,
         request_id: Option<HeaderValue>,
         is_s3: bool,
         metrics: Option<S3HttpRequestGuard>,
@@ -394,22 +428,24 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        #[cfg(feature = "diagnostic-local-batch")]
-        let result = batch_diagnostic::in_request_context(this.diagnostic_request.as_ref(), || match this.metrics.as_mut() {
-            Some(metrics) => metrics.in_scope(|| this.inner.poll(cx)),
-            None => this.inner.poll(cx),
-        });
-        #[cfg(not(feature = "diagnostic-local-batch"))]
-        let result = match this.metrics.as_mut() {
+        let poll = || match this.metrics.as_mut() {
             Some(metrics) => metrics.in_scope(|| this.inner.poll(cx)),
             None => this.inner.poll(cx),
         };
+        #[cfg(feature = "diagnostic-get-pipeline")]
+        let poll = || batch_diagnostic::in_context(this.pipeline_request.as_ref().map(PipelineRequestOwner::sample), poll);
+        #[cfg(feature = "diagnostic-local-batch")]
+        let result = batch_diagnostic::in_request_context(this.diagnostic_request.as_ref(), poll);
+        #[cfg(not(feature = "diagnostic-local-batch"))]
+        let result = poll();
         if let Some(feedback) = this.feedback.as_mut() {
             feedback.set_class(foreground_class(this.metrics.as_ref().and_then(S3HttpRequestGuard::operation)));
         }
         let mut response = match result {
             Poll::Ready(Ok(response)) => response,
             Poll::Ready(Err(error)) => {
+                #[cfg(feature = "diagnostic-get-pipeline")]
+                batch_diagnostic::fail_service(this.pipeline_request.as_ref().map(PipelineRequestOwner::sample));
                 if let Some(metrics) = this.metrics.as_mut() {
                     metrics.service_error();
                 }
@@ -433,18 +469,23 @@ where
             }
         }
 
+        #[cfg(feature = "diagnostic-get-pipeline")]
+        batch_diagnostic::response_ready(this.pipeline_request.as_ref().map(PipelineRequestOwner::sample));
         let status = response.status();
         let suppressed = *this.head_request
             || status.is_informational()
             || status == StatusCode::NO_CONTENT
             || status == StatusCode::NOT_MODIFIED;
         Poll::Ready(Ok(response.map(|body| {
-            ForegroundResponseBody::new(
+            let body = ForegroundResponseBody::new(
                 body,
                 this.feedback.take(),
                 !status.is_client_error() && !status.is_server_error(),
                 suppressed,
-            )
+            );
+            #[cfg(feature = "diagnostic-get-pipeline")]
+            let body = body.with_pipeline_request(this.pipeline_request.take(), suppressed);
+            body
         })))
     }
 }
@@ -478,6 +519,7 @@ pin_project! {
         // Body::is_end_stream only has a shared reference. Empty responses can
         // finish there without being polled; Cell adds no mutex or allocation.
         observation: Cell<Option<ForegroundObservation<'static>>>,
+        pipeline_request: PipelineDiagnosticRequest,
         succeeded: bool,
     }
 }
@@ -493,6 +535,7 @@ impl<B> ForegroundResponseBody<B> {
         let body = Self {
             inner,
             observation: Cell::new(observation),
+            pipeline_request: Default::default(),
             succeeded,
         };
         if suppressed {
@@ -501,7 +544,18 @@ impl<B> ForegroundResponseBody<B> {
         body
     }
 
+    #[cfg(feature = "diagnostic-get-pipeline")]
+    fn with_pipeline_request(mut self, sample: Option<PipelineRequestOwner>, suppressed: bool) -> Self {
+        self.pipeline_request = sample;
+        if suppressed {
+            batch_diagnostic::finish_response(self.pipeline_request.as_ref().map(PipelineRequestOwner::sample), self.succeeded);
+        }
+        self
+    }
+
     fn complete(&self) {
+        #[cfg(feature = "diagnostic-get-pipeline")]
+        batch_diagnostic::finish_response(self.pipeline_request.as_ref().map(PipelineRequestOwner::sample), self.succeeded);
         finish_foreground_observation(
             &self.observation,
             if self.succeeded {
@@ -519,8 +573,22 @@ impl<B: Body> Body for ForegroundResponseBody<B> {
 
     fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let mut this = self.project();
+        #[cfg(feature = "diagnostic-get-pipeline")]
+        let result = batch_diagnostic::response_poll(this.pipeline_request.as_ref().map(PipelineRequestOwner::sample), || {
+            let result = this.inner.as_mut().poll_frame(cx);
+            let bytes = match &result {
+                Poll::Ready(Some(Ok(frame))) => frame.data_ref().map_or(0, bytes::Buf::remaining),
+                _ => 0,
+            };
+            let success = !matches!(&result, Poll::Ready(Some(Err(_))));
+            (result, bytes, success)
+        });
+        #[cfg(not(feature = "diagnostic-get-pipeline"))]
         let result = this.inner.as_mut().poll_frame(cx);
-        if this.observation.get_mut().is_none() {
+        let observed = this.observation.get_mut().is_some();
+        #[cfg(feature = "diagnostic-get-pipeline")]
+        let observed = observed || this.pipeline_request.is_some();
+        if !observed {
             return result;
         }
         let outcome = match &result {
@@ -538,6 +606,11 @@ impl<B: Body> Body for ForegroundResponseBody<B> {
             _ => None,
         };
         if let Some(outcome) = outcome {
+            #[cfg(feature = "diagnostic-get-pipeline")]
+            batch_diagnostic::finish_response(
+                this.pipeline_request.as_ref().map(PipelineRequestOwner::sample),
+                matches!(outcome, CompletionOutcome::Success),
+            );
             finish_foreground_observation(this.observation, outcome);
         }
         result
@@ -2634,6 +2707,177 @@ fn rewrite_double_slash_root(uri: &Uri) -> Option<Uri> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "diagnostic-get-pipeline")]
+    mod diagnostic_pipeline {
+        use super::*;
+        use std::io::Write;
+        use std::sync::Mutex as StdMutex;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct Output(Arc<StdMutex<Vec<u8>>>);
+        struct Writer(Output);
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.0.lock().expect("capture diagnostic JSON").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Output {
+            type Writer = Writer;
+            fn make_writer(&'a self) -> Self::Writer {
+                Writer(self.clone())
+            }
+        }
+        struct ScriptBody {
+            step: u8,
+            error: bool,
+        }
+        impl Body for ScriptBody {
+            type Data = Bytes;
+            type Error = &'static str;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+                let this = self.get_mut();
+                this.step += 1;
+                match this.step {
+                    1 => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    2 => Poll::Ready(Some(Ok(http_body::Frame::data(Bytes::from_static(b"body-bytes"))))),
+                    3 if this.error => Poll::Ready(Some(Err("original-body-error"))),
+                    _ => Poll::Ready(None),
+                }
+            }
+            fn is_end_stream(&self) -> bool {
+                self.step >= 3
+            }
+        }
+
+        #[test]
+        fn canonical_response_completion_error_and_drop_are_preserved() {
+            const CHILD: &str = "RUSTFS_TEST_PIPELINE_HTTP_CHILD";
+            if std::env::var_os(CHILD).is_none() {
+                let status = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+                    .args([
+                        "--exact",
+                        "server::layer::tests::diagnostic_pipeline::canonical_response_completion_error_and_drop_are_preserved",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("RUSTFS_DIAGNOSTIC_GET_STAGE_SAMPLE_EVERY", "1")
+                    .env("RUSTFS_DIAGNOSTIC_LOCAL_BATCH_SAMPLE_EVERY", "0")
+                    .status()
+                    .expect("run isolated diagnostic HTTP contract");
+                assert!(status.success(), "diagnostic HTTP contract failed");
+                return;
+            }
+            for scenario in ["complete", "error", "drop", "service-error", "suppressed", "status-error"] {
+                let output = Output::default();
+                let subscriber = tracing_subscriber::fmt()
+                    .json()
+                    .flatten_event(true)
+                    .with_current_span(false)
+                    .with_span_list(false)
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_writer(output.clone())
+                    .finish();
+                let mut canonical_id = None;
+                tracing::subscriber::with_default(subscriber, || {
+                    let handler = tower::service_fn(move |_: HttpRequest<Full<Bytes>>| async move {
+                        if scenario == "service-error" {
+                            return Err("original-service-error");
+                        }
+                        let mut response = Response::new(ScriptBody {
+                            step: 0,
+                            error: scenario == "error",
+                        });
+                        if scenario == "suppressed" {
+                            *response.status_mut() = StatusCode::NO_CONTENT;
+                        }
+                        if scenario == "status-error" {
+                            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                        }
+                        Ok(response)
+                    });
+                    let mut service = ExternalRequestContextLayer::new(false).layer(handler);
+                    let request = HttpRequest::builder()
+                        .method(Method::GET)
+                        .uri("/private-object?signature=private")
+                        .header(REQUEST_ID_HEADER, "client-controlled")
+                        .body(Full::new(Bytes::new()))
+                        .expect("test request");
+                    let response = futures::executor::block_on(service.call(request));
+                    if scenario == "service-error" {
+                        assert_eq!(response.err(), Some("original-service-error"));
+                    } else {
+                        let response = response.expect("original response");
+                        canonical_id = Some(response.headers()[AMZ_REQUEST_ID].to_str().expect("canonical ID").to_owned());
+                        assert_ne!(canonical_id.as_deref(), Some("client-controlled"));
+                        if matches!(scenario, "drop" | "suppressed") {
+                            drop(response);
+                        } else {
+                            assert!(output.0.lock().expect("summary before EOF").is_empty());
+                            let result = futures::executor::block_on(response.into_body().collect());
+                            if scenario == "error" {
+                                assert_eq!(result.err(), Some("original-body-error"));
+                            } else {
+                                assert_eq!(result.expect("original body bytes").to_bytes(), Bytes::from_static(b"body-bytes"));
+                            }
+                        }
+                    }
+                });
+                let bytes = output.0.lock().expect("recorded diagnostic JSON");
+                let text = std::str::from_utf8(&bytes).expect("UTF-8 diagnostic records");
+                let rows: Vec<serde_json::Value> = text
+                    .lines()
+                    .map(|l| serde_json::from_str(l).expect("diagnostic JSON"))
+                    .collect();
+                assert_eq!(rows.len(), 1, "one final summary for {scenario}: {text}");
+                let row = &rows[0];
+                assert_eq!(row["event"], "get_pipeline_diagnostic");
+                assert!(row["body_end_ns"].is_u64(), "EOF/error/drop must retain its boundary");
+                if scenario != "service-error" {
+                    assert!(row["response_ready_ns"].is_u64());
+                }
+                assert_eq!(
+                    row["result"],
+                    match scenario {
+                        "complete" | "suppressed" => "body_complete",
+                        "error" | "status-error" => "body_error",
+                        "drop" => "cancelled",
+                        _ => "service_error",
+                    }
+                );
+                if let Some(id) = canonical_id {
+                    assert_eq!(row["request_id"], id);
+                }
+                let totals: Vec<serde_json::Value> =
+                    serde_json::from_str(row["stage_totals_json"].as_str().expect("stage schema")).expect("stage totals");
+                if matches!(scenario, "complete" | "error" | "status-error") {
+                    assert_eq!(totals[4]["calls"], 3);
+                    assert_eq!(totals[4]["bytes"], 10);
+                    assert_eq!(totals[4]["failures"], u64::from(scenario == "error"));
+                }
+                for forbidden in [
+                    "private-object",
+                    "signature",
+                    "client-controlled",
+                    "original-body-error",
+                    "original-service-error",
+                ] {
+                    assert!(!text.contains(forbidden), "request and error payload must not enter diagnostic records");
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "diagnostic-local-batch")]
     #[test]
     fn diagnostic_external_request_uses_server_id_not_client_header() {
@@ -2700,6 +2944,7 @@ mod tests {
         let future = ExternalRequestContextFuture {
             inner,
             diagnostic_request: Some(Arc::from("server-owned-test")),
+            pipeline_request: Default::default(),
             request_id: None,
             is_s3: false,
             metrics: None,

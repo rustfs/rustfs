@@ -6,6 +6,7 @@ cd "$repo_root"
 
 checked_files=(
   "crates/ecstore/src/diagnostics/batch_read_diagnostics.rs"
+  "crates/ecstore/src/diagnostics/get_pipeline.rs"
   "rustfs/src/main.rs"
   "rustfs/src/startup_entrypoint.rs"
   "rustfs/src/init.rs"

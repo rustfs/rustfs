@@ -36,7 +36,7 @@ tokio::task_local! {
     static REQUEST_ID: Option<Arc<str>>;
 }
 
-fn parse_rate(value: Option<&str>) -> u64 {
+pub(super) fn parse_rate(value: Option<&str>) -> u64 {
     value
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|rate| (1..=MAX_SAMPLE_EVERY).contains(rate))
@@ -51,7 +51,7 @@ fn recording_enabled() -> bool {
     enabled_rate() != 0 && tracing::enabled!(target: TARGET, Level::TRACE)
 }
 
-fn valid_request_id(id: &str) -> bool {
+pub(super) fn valid_request_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id
@@ -63,6 +63,13 @@ fn valid_request_id(id: &str) -> bool {
 ///
 /// The external S3 boundary must supply its canonical ID, not a client header.
 pub fn request_context(id: &str) -> Option<Arc<str>> {
+    #[cfg(feature = "diagnostic-get-pipeline")]
+    if super::get_pipeline::mode_enabled() {
+        return super::get_pipeline::current().and_then(|sample| {
+            let selected_id = sample.id();
+            (selected_id.as_ref() == id).then_some(selected_id)
+        });
+    }
     (recording_enabled() && valid_request_id(id)).then(|| Arc::from(id))
 }
 
@@ -78,6 +85,8 @@ pub fn current_request_id() -> Option<Arc<str>> {
 
 /// Capture before spawning the legacy producer; task locals are not inherited.
 pub(crate) fn with_captured_request_context<F: std::future::Future>(future: F) -> impl std::future::Future<Output = F::Output> {
+    #[cfg(feature = "diagnostic-get-pipeline")]
+    let future = super::get_pipeline::with_captured_context(future);
     REQUEST_ID.scope(current_request_id(), future)
 }
 
@@ -107,7 +116,7 @@ fn unix_ns() -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn cpu_ns() -> Option<u64> {
+pub(super) fn cpu_ns() -> Option<u64> {
     use rustix::time::{ClockId, DynamicClockId, clock_gettime_dynamic};
     let time = clock_gettime_dynamic(DynamicClockId::Known(ClockId::ThreadCPUTime)).ok()?;
     let seconds = u64::try_from(time.tv_sec).ok()?;
@@ -116,11 +125,11 @@ fn cpu_ns() -> Option<u64> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn cpu_ns() -> Option<u64> {
+pub(super) fn cpu_ns() -> Option<u64> {
     None
 }
 
-fn thread_id() -> Option<i32> {
+pub(super) fn thread_id() -> Option<i32> {
     #[cfg(target_os = "linux")]
     {
         thread_local! { static TID: i32 = rustix::thread::gettid().as_raw_nonzero().get(); }
@@ -150,10 +159,22 @@ pub(crate) struct Sample {
     submitted: Instant,
     submitted_unix_ns: Option<u64>,
     dispatch: Dispatch,
+    #[cfg(feature = "diagnostic-get-pipeline")]
+    pipeline: Option<Arc<super::get_pipeline::RequestSample>>,
 }
 
 impl Sample {
     pub(crate) fn capture() -> Option<Self> {
+        #[cfg(feature = "diagnostic-get-pipeline")]
+        if super::get_pipeline::mode_enabled() {
+            // Request mode uses the external request's one decision. It never
+            // intersects an independent per-batch sampler with that cohort.
+            let pipeline = super::get_pipeline::current()?;
+            let mut sample = Self::capture_with(1, true, &NEXT_BATCH)?;
+            sample.request_id = Some(pipeline.id());
+            sample.pipeline = Some(pipeline);
+            return Some(sample);
+        }
         Self::capture_with(enabled_rate(), tracing::enabled!(target: TARGET, Level::TRACE), &NEXT_BATCH)
     }
 
@@ -171,6 +192,8 @@ impl Sample {
             submitted: Instant::now(),
             submitted_unix_ns: unix_ns(),
             dispatch: tracing::dispatcher::get_default(Clone::clone),
+            #[cfg(feature = "diagnostic-get-pipeline")]
+            pipeline: None,
         })
     }
 
@@ -219,6 +242,10 @@ impl Sample {
     }
 
     fn emit(&self, stage: &'static str, shard: Option<usize>, success: bool, timing: Timing) {
+        #[cfg(feature = "diagnostic-get-pipeline")]
+        if self.pipeline.as_ref().is_some_and(|sample| !sample.allow_batch_event()) {
+            return;
+        }
         tracing::trace!(target: TARGET, parent: None,
             event = EVENT_LOCAL_BATCH_DIAGNOSTIC, component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_LOCAL_BATCH, result = if success { "success" } else { "error" },
@@ -231,6 +258,10 @@ impl Sample {
     }
 
     pub(crate) fn shard_result(&self, shard: usize, requested: usize, read: usize, success: bool) {
+        #[cfg(feature = "diagnostic-get-pipeline")]
+        if self.pipeline.as_ref().is_some_and(|sample| !sample.allow_batch_event()) {
+            return;
+        }
         tracing::trace!(target: TARGET, parent: None,
             event = EVENT_LOCAL_BATCH_DIAGNOSTIC, component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_LOCAL_BATCH, result = if success { "success" } else { "error" },

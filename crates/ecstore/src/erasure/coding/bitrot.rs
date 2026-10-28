@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::diagnostics::get_pipeline_sync;
 use crate::disk::error::Error as DiskError;
 use crate::erasure::codec::buffer_pool::{get_ec_buffer, return_ec_buffer};
 use pin_project_lite::pin_project;
@@ -176,7 +177,7 @@ where
         if let Some(integrity) = &mut self.integrity {
             integrity.verify(data).await?;
         }
-        out.copy_from_slice(data);
+        get_pipeline_sync!(Copy, data.len(), || out.copy_from_slice(data));
         self.last_verify_duration = verify;
         Ok(want)
     }
@@ -254,21 +255,27 @@ fn split_and_verify<'a>(hash_algo: &HashAlgorithm, skip_verify: bool, block: &'a
     if skip_verify {
         return Ok((data, Duration::ZERO));
     }
-    let verify_start = std::time::Instant::now();
-    let actual_hash = hash_algo.hash_encode(data);
-    let verify = verify_start.elapsed();
-    if actual_hash.as_ref() != hash {
-        error!(
-            event = EVENT_BITROT_HASH_MISMATCH,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_ERASURE,
-            state = "failed",
-            data_len = data.len(),
-            "bitrot hash mismatch"
-        );
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::FileCorrupt));
-    }
-    Ok((data, verify))
+    get_pipeline_sync!(
+        Verify,
+        data.len(),
+        result || {
+            let verify_start = std::time::Instant::now();
+            let actual_hash = hash_algo.hash_encode(data);
+            let verify = verify_start.elapsed();
+            if actual_hash.as_ref() != hash {
+                error!(
+                    event = EVENT_BITROT_HASH_MISMATCH,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_ERASURE,
+                    state = "failed",
+                    data_len = data.len(),
+                    "bitrot hash mismatch"
+                );
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::FileCorrupt));
+            }
+            Ok((data, verify))
+        }
+    )
 }
 
 impl<R> BitrotReader<R>
@@ -329,7 +336,7 @@ where
 
         if let Some(block) = self.inner.try_take_block(need) {
             let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &block)?;
-            out.extend_from_slice(data);
+            get_pipeline_sync!(Copy, data.len(), || out.extend_from_slice(data));
             self.last_verify_duration = verify;
             return Ok(want);
         }
@@ -401,7 +408,7 @@ where
             if self.chunks.len() == 1 && self.buf.is_empty() {
                 let block = &self.chunks[0];
                 let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, block)?;
-                out.extend_from_slice(data);
+                get_pipeline_sync!(Copy, data.len(), || out.extend_from_slice(data));
                 self.last_verify_duration = verify;
                 return Ok(want);
             }
@@ -413,43 +420,49 @@ where
                     .chain((!self.buf.is_empty()).then_some(self.buf.as_slice()))
             };
             if !self.skip_verify {
-                let verify_start = std::time::Instant::now();
-                let actual_hash = self
-                    .hash_algo
-                    .hash_encode_slices(block_chunks().scan(hash_size, |skip, chunk| {
-                        let start = (*skip).min(chunk.len());
-                        *skip -= start;
-                        Some(&chunk[start..])
-                    }));
-                let verify = verify_start.elapsed();
-                let mut hash_offset = 0;
-                let mut remaining = hash_size;
-                for chunk in block_chunks() {
-                    let take = remaining.min(chunk.len());
-                    if actual_hash.as_ref()[hash_offset..hash_offset + take] != chunk[..take] {
-                        error!(
-                            event = EVENT_BITROT_HASH_MISMATCH,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_ERASURE,
-                            state = "failed",
-                            data_len = want,
-                            "bitrot hash mismatch"
-                        );
-                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::FileCorrupt));
+                self.last_verify_duration = get_pipeline_sync!(
+                    Verify,
+                    want,
+                    result || {
+                        let verify_start = std::time::Instant::now();
+                        let actual_hash = self
+                            .hash_algo
+                            .hash_encode_slices(block_chunks().scan(hash_size, |skip, chunk| {
+                                let start = (*skip).min(chunk.len());
+                                *skip -= start;
+                                Some(&chunk[start..])
+                            }));
+                        let verify = verify_start.elapsed();
+                        let mut hash_offset = 0;
+                        let mut remaining = hash_size;
+                        for chunk in block_chunks() {
+                            let take = remaining.min(chunk.len());
+                            if actual_hash.as_ref()[hash_offset..hash_offset + take] != chunk[..take] {
+                                error!(
+                                    event = EVENT_BITROT_HASH_MISMATCH,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_ERASURE,
+                                    state = "failed",
+                                    data_len = want,
+                                    "bitrot hash mismatch"
+                                );
+                                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::FileCorrupt));
+                            }
+                            hash_offset += take;
+                            remaining -= take;
+                            if remaining == 0 {
+                                break;
+                            }
+                        }
+                        Ok::<_, std::io::Error>(verify)
                     }
-                    hash_offset += take;
-                    remaining -= take;
-                    if remaining == 0 {
-                        break;
-                    }
-                }
-                self.last_verify_duration = verify;
+                )?;
             }
             let mut skip = hash_size;
             for chunk in block_chunks() {
                 let start = skip.min(chunk.len());
                 skip -= start;
-                out.extend_from_slice(&chunk[start..]);
+                get_pipeline_sync!(Copy, chunk.len() - start, || out.extend_from_slice(&chunk[start..]));
             }
             return Ok(want);
         }
@@ -459,7 +472,7 @@ where
         // `copy_from_slice` into a pre-zeroed buffer).
         self.read_scratch_block(need, want).await?;
         let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
-        out.extend_from_slice(data);
+        get_pipeline_sync!(Copy, data.len(), || out.extend_from_slice(data));
         self.last_verify_duration = verify;
         Ok(want)
     }

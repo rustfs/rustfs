@@ -249,6 +249,11 @@ pub(crate) mod server {
         pub(crate) mod batch_diagnostic {
             #[cfg(test)]
             pub(crate) use crate::storage::storage_api::ecstore_diagnostic::current_request_id;
+            #[cfg(feature = "diagnostic-get-pipeline")]
+            pub(crate) use crate::storage::storage_api::ecstore_diagnostic::{
+                RequestSample, cancel_response, capture_request, fail_service, finish_response, in_context, response_poll,
+                response_ready,
+            };
             pub(crate) use crate::storage::storage_api::ecstore_diagnostic::{in_request_context, request_context};
         }
 

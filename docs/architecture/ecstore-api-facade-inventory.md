@@ -15,7 +15,7 @@ The broad `rustfs_ecstore::api` facade is a compatibility boundary, not an archi
 | `data_usage`, `capacity`, `notification`, `metrics`, `rebalance`, `integrity` | Domain and service facades consumed through owner-local boundaries. | Narrow one group at a time after explicit aliases or wrappers exist. |
 | `set_disk`, `object`, `object_api_utils`, `rio`, `bitrot`, `erasure`, `compression`, `cache`, `store_list` | Low-level object IO, reader, erasure, cache, and migration helper compatibility. | Keep stable while `SetDisks` remains the shared state carrier. |
 | `admin`, `event`, `global` | Admin, event hook, and bootstrap-global compatibility. | `global` is limited to bootstrap writes and lifecycle controls; read-only runtime access goes through `runtime`. |
-| `diagnostic` | Feature-gated read-version attribution and sampled local-batch request context. | Keep explicit exports and default-off gates; consumers use the storage-owner and root-local diagnostic boundaries. |
+| `diagnostic` | Feature-gated read-version attribution, sampled local-batch context and request-coherent GET diagnostics. | Keep explicit exports and default-off gates; consumers use the storage-owner and root-local diagnostic boundaries. |
 
 The S3 client is no longer a facade group: it lives in `crates/s3-client` (`rustfs_s3_client`). Regenerate the group list with:
 

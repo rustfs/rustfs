@@ -8,7 +8,7 @@ collection:
 
 ## Operations
 
-- [Sampled local batch CPU diagnostics](operations/local-batch-cpu-diagnostics.md) — default-off request-correlated allocation and worker wall/CPU diagnosis.
+- [Sampled local batch and GET pipeline diagnostics](operations/local-batch-cpu-diagnostics.md) — default-off request-coherent allocation, verification, copy and response wall/CPU diagnosis.
 
 - [Retained MRF responsibilities](operations/mrf-responsibilities.md) — unknown bucket identities, bounded probes, and unreadable checkpoint recovery.
 - [Read-only BTF declaration inspection](operations/btf-prototype-inspection.md) — bounded prototypes and scalar member layouts, explicit void handling, and independent native references.

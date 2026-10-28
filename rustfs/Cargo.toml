@@ -81,6 +81,8 @@ dial9 = ["rustfs-obs/dial9"]
 diagnostic-allocator-live = []
 # Default-off sampled local batch wall/CPU and request correlation diagnostics.
 diagnostic-local-batch = ["rustfs-ecstore/diagnostic-local-batch", "rustfs-obs/diagnostic-local-batch"]
+# Default-off request-coherent verification, copy and response diagnostics.
+diagnostic-get-pipeline = ["diagnostic-local-batch", "rustfs-ecstore/diagnostic-get-pipeline"]
 # Diagnostic-only S3-operation attribution for internode ReadVersion and list-walker metrics.
 diagnostic-read-version-caller = ["rustfs-ecstore/diagnostic-read-version-caller", "rustfs-io-metrics/diagnostic-read-version-caller", "rustfs-scanner/diagnostic-read-version-caller"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn"]

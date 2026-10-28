@@ -23,6 +23,10 @@ pub mod diagnostic {
     };
     #[cfg(feature = "diagnostic-local-batch")]
     pub use crate::diagnostics::batch_read_diagnostics::{current_request_id, in_request_context, request_context};
+    #[cfg(feature = "diagnostic-get-pipeline")]
+    pub use crate::diagnostics::get_pipeline::{
+        RequestSample, cancel_response, capture_request, fail_service, finish_response, in_context, response_poll, response_ready,
+    };
     #[cfg(feature = "diagnostic-read-version-caller")]
     pub use rustfs_io_metrics::internode_metrics::{ReadVersionContextBoundary, ReadVersionEntrySource};
 }

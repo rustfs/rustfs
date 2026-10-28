@@ -36,6 +36,10 @@ pub(crate) mod ecstore_diagnostic {
     pub(crate) use rustfs_ecstore::api::diagnostic::{
         ReadVersionContextBoundary, ReadVersionEntrySource, with_captured_read_version_context, with_read_version_spawn_context,
     };
+    #[cfg(feature = "diagnostic-get-pipeline")]
+    pub(crate) use rustfs_ecstore::api::diagnostic::{
+        RequestSample, cancel_response, capture_request, fail_service, finish_response, in_context, response_poll, response_ready,
+    };
     #[cfg(all(test, feature = "diagnostic-read-version-caller"))]
     pub(crate) use rustfs_ecstore::api::diagnostic::{current_read_version_entry_source, with_read_version_entry};
     #[cfg(feature = "diagnostic-local-batch")]

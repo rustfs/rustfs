@@ -34,6 +34,8 @@ default = []
 diagnostic-read-version-caller = ["rustfs-io-metrics/diagnostic-read-version-caller"]
 # Sampled wall/CPU diagnostics only; does not change the read backend.
 diagnostic-local-batch = ["rustix/time"]
+# Request-coherent diagnostics; never enables an alternative I/O backend.
+diagnostic-get-pipeline = ["diagnostic-local-batch"]
 gcs = ["dep:google-cloud-storage", "dep:google-cloud-auth"]
 rio-v2 = ["dep:rustfs-rio-v2"]
 hotpath = [
