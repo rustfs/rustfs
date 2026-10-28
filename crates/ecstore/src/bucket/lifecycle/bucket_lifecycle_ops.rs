@@ -3803,7 +3803,8 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
     for candidate in candidates.into_values() {
         let upload_dir = candidate.path.rsplit('/').next().unwrap_or_default().to_string();
         let mut due = stale_upload_default_due(candidate.initiated, default_expiry);
-        if let Some(metadata) = candidate.metadata.as_ref()
+        if now < due
+            && let Some(metadata) = candidate.metadata.as_ref()
             && let Some(lifecycle_due) = stale_upload_lifecycle_due(set, metadata, candidate.initiated, &upload_dir, false).await
             && lifecycle_due < due
         {
@@ -3832,8 +3833,9 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
         let current_metadata = cleanup_guard.file_info().metadata.clone();
         let current_initiated = initiated_from_upload_dir(&upload_dir, cleanup_guard.file_info().mod_time);
         let mut current_due = stale_upload_default_due(current_initiated, default_expiry);
-        if let Some(lifecycle_due) =
-            stale_upload_lifecycle_due(set, &current_metadata, current_initiated, &upload_dir, true).await
+        if now < current_due
+            && let Some(lifecycle_due) =
+                stale_upload_lifecycle_due(set, &current_metadata, current_initiated, &upload_dir, true).await
             && lifecycle_due < current_due
         {
             current_due = lifecycle_due;
@@ -15975,6 +15977,64 @@ mod tests {
             for path in physical_paths.iter().take(copies) {
                 fs::remove_dir_all(path).await.unwrap();
             }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn stale_multipart_cleanup_skips_part_listing_after_default_expiry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::prelude::*;
+
+        struct PartListCounter(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PartListCounter {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::span::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if attrs.metadata().name() == "list_object_parts" {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let (_, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-list-parts-{}", Uuid::new_v4().simple());
+        create_test_bucket(&ecstore, &bucket).await;
+        set_abort_incomplete_lifecycle(&bucket, "logs/", 0).await;
+        let now = OffsetDateTime::now_utc();
+        for (object, age, should_list) in [
+            ("logs/default-expired", time::Duration::hours(30), false),
+            ("logs/lifecycle-only", time::Duration::minutes(5), true),
+        ] {
+            let upload = ecstore
+                .new_multipart_upload(
+                    &bucket,
+                    object,
+                    &ObjectOptions {
+                        mod_time: Some(now - age),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create multipart upload");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let subscriber = tracing_subscriber::registry().with(PartListCounter(Arc::clone(&calls)));
+            cleanup_stale_multipart_uploads_once_at(ecstore.clone(), now, StdDuration::from_secs(24 * 60 * 60))
+                .with_subscriber(subscriber)
+                .await;
+            let listed = calls.load(Ordering::Relaxed);
+            assert_eq!(listed > 0, should_list, "unexpected ListParts calls for {object}: {listed}");
+            let result = ecstore
+                .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+                .await;
+            assert!(
+                matches!(result, Err(ref err) if is_err_invalid_upload_id(err)),
+                "upload must be removed: {result:?}"
+            );
         }
     }
 
