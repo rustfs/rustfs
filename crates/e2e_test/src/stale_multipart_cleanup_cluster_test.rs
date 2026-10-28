@@ -88,7 +88,9 @@ async fn wait_for_cleanup_on_all_nodes(
     Err("stale multipart upload was not cleaned up on all nodes within timeout".into())
 }
 
-fn physical_tree(root: &Path) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>, Box<dyn std::error::Error + Send + Sync>> {
+type PhysicalTree = BTreeMap<PathBuf, Option<Vec<u8>>>;
+
+fn physical_tree(root: &Path) -> Result<PhysicalTree, Box<dyn std::error::Error + Send + Sync>> {
     let mut result = BTreeMap::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {

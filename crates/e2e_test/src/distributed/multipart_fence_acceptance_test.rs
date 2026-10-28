@@ -1310,7 +1310,7 @@ async fn concurrent_capped_parts_respect_limit_on_distinct_nodes(clients: &[Clie
         .send()
         .await?;
     for client in clients {
-        assert_object_bytes_after_fault(client, bucket, key, &vec![byte; 6]).await?;
+        assert_object_bytes_after_fault(client, bucket, key, &[byte; 6]).await?;
     }
     eprintln!("MPU size limit: two coordinators raced; exactly one six-byte part admitted under ten-byte limit");
     Ok(())
