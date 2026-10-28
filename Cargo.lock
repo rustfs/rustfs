@@ -4075,6 +4075,7 @@ dependencies = [
  "rustfs-signer",
  "rustfs-tokio-tar",
  "rustfs-utils",
+ "rustix",
  "rustls",
  "s3s",
  "same-file",
@@ -4095,6 +4096,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "zip",
+ "zeroize",
  "zstd 0.14.3",
 ]
 

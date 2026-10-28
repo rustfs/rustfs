@@ -211,6 +211,8 @@ mod copy;
 mod delete;
 mod extract;
 mod get;
+#[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+pub(crate) mod get_e2e_observation;
 mod head;
 mod internal_put;
 mod on_demand_migration_put;

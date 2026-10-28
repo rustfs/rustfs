@@ -143,7 +143,11 @@ rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", 
 russh = { workspace = true, features = ["serde"] }
 russh-sftp = { workspace = true }
 zip.workspace = true
+zeroize.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 same-file.workspace = true

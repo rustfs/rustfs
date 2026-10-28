@@ -1589,10 +1589,29 @@ impl RustFSTestClusterEnvironment {
     /// Upgrade compatibility tests use this to initialize a cluster with a
     /// pinned previous release before replacing nodes with the workspace build.
     pub async fn start_with_binary(&mut self, binary_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.start_with_binary_and_callback(binary_path, |_| {}).await
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn start_with_pid_callback(
+        &mut self,
+        on_pid: impl FnMut(u32),
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let binary_path = rustfs_binary_path();
+        self.start_with_binary_and_callback(&binary_path, on_pid).await
+    }
+
+    async fn start_with_binary_and_callback(
+        &mut self,
+        binary_path: &Path,
+        mut on_pid: impl FnMut(u32),
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let volumes_arg = self.build_volumes_arg();
 
         for node_idx in 0..self.nodes.len() {
             self.spawn_node(node_idx, binary_path, &volumes_arg)?;
+            let process = self.nodes[node_idx].process.as_ref().ok_or("spawned node has no process")?;
+            on_pid(process.id());
         }
 
         for (i, node) in self.nodes.iter().enumerate() {

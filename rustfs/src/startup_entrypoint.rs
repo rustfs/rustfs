@@ -1980,6 +1980,9 @@ fn print_license_report(report: &crate::connect::LicenseReport) -> Result<()> {
 
 #[instrument(skip(config))]
 async fn run(config: Config) -> Result<()> {
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    crate::app::object::get_e2e_observation::init().await;
+
     // Single-instance startup threads the process bootstrap context through
     // the storage path explicitly (Phase 5 follow-up, backlog#1052); a future
     // multi-instance server constructs its own context here instead.

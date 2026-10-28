@@ -1370,6 +1370,8 @@ struct GetObjectStreamingReader<R> {
     content_range: Option<String>,
     expected: usize,
     emitted: usize,
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    e2e_observation: Option<super::get_e2e_observation::Observation>,
     timeout: Duration,
     timer: Option<Pin<Box<tokio::time::Sleep>>>,
     started: std::time::Instant,
@@ -1401,6 +1403,8 @@ impl<R> GetObjectStreamingReader<R> {
             content_range,
             expected,
             emitted: 0,
+            #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+            e2e_observation: super::get_e2e_observation::Observation::start(request_id, expected),
             timeout,
             timer: None,
             started: std::time::Instant::now(),
@@ -1758,6 +1762,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
 
 impl<R> Drop for GetObjectStreamingReader<R> {
     fn drop(&mut self) {
+        #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+        if let Some(observation) = &mut self.e2e_observation {
+            observation.finish(self.emitted);
+        }
         if self.lifecycle.is_finished() {
             return;
         }
