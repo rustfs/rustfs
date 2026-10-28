@@ -215,7 +215,10 @@ async fn test_stale_multipart_cleanup_removes_incomplete_upload_across_cluster()
     cluster.set_env("RUSTFS_API_STALE_UPLOADS_EXPIRY", "5s");
     cluster.set_env("RUSTFS_API_STALE_UPLOADS_CLEANUP_INTERVAL", "1s");
     cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", "EC:2");
-    cluster.set_env("RUST_LOG", "warn,rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops=debug");
+    cluster.set_env(
+        "RUST_LOG",
+        concat!("warn,rustfs_ecstore", "::bucket::lifecycle::bucket_lifecycle_ops=debug"),
+    );
     let log_dir = std::env::var_os("RUSTFS_E2E_LOG_DIR")
         .map(PathBuf::from)
         .map(|root| root.join(format!("stale-multipart-{}", Uuid::new_v4().simple())))

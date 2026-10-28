@@ -16416,7 +16416,7 @@ mod tests {
             metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, rule(filter))
                 .await
                 .expect("install size filter");
-            metadata_sys::get_lifecycle_config(&bucket)
+            super::metadata_boundary::get_lifecycle_config(&bucket)
                 .await
                 .expect("size filter must be readable during the fault");
             assert!(
@@ -16445,7 +16445,9 @@ mod tests {
             metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, rule(filter))
                 .await
                 .expect("restore size filter");
-            let config = metadata_sys::get_lifecycle_config(&bucket).await.expect("read lifecycle");
+            let config = super::metadata_boundary::get_lifecycle_config(&bucket)
+                .await
+                .expect("read lifecycle");
             let due = super::stale_upload_lifecycle_due(set, &metadata, initiated, upload_dir, false).await;
             assert!(due.is_some(), "restored part must satisfy {filter}; size={size:?}, config={config:?}");
         }
