@@ -36,6 +36,45 @@ const MAX_RECENT: usize = 1024;
 const PENDING_TTL: Duration = Duration::from_secs(60 * 60);
 const RECENT_TTL: Duration = Duration::from_secs(10 * 60);
 
+#[cfg(feature = "test-util")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScannerHealTestAdmission {
+    Pending,
+    Unknown,
+    CachedTerminal { data_dir: Option<Uuid> },
+    Unaccounted,
+}
+
+#[cfg(feature = "test-util")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScannerHealTestEvent {
+    Admission {
+        task_id: String,
+        candidate_data_dir: Option<Uuid>,
+        outcome: ScannerHealTestAdmission,
+    },
+    Terminal {
+        task_id: String,
+        terminal_data_dir: Option<Uuid>,
+        duplicate: bool,
+        settled_candidate_data_dirs: Vec<Option<Uuid>>,
+        remaining_candidate_data_dirs: Vec<Option<Uuid>>,
+    },
+}
+
+#[cfg(feature = "test-util")]
+fn test_events() -> &'static broadcast::Sender<ScannerHealTestEvent> {
+    static EVENTS: std::sync::OnceLock<broadcast::Sender<ScannerHealTestEvent>> = std::sync::OnceLock::new();
+    EVENTS.get_or_init(|| broadcast::channel(64).0)
+}
+
+/// Subscribe to bounded, process-local observer events in test builds.
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub fn subscribe_scanner_heal_test_events() -> broadcast::Receiver<ScannerHealTestEvent> {
+    test_events().subscribe()
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ScannerHealTerminalObservation {
     pub execution: &'static str,
@@ -527,14 +566,79 @@ fn observer_from(registry: &Mutex<Option<ObserverHandle>>) -> ObserverHandle {
                 tokio::select! {
                     candidate = admissions.recv() => match candidate {
                         Some((id, candidate)) => {
-                            let _ = observations.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).admit(id, candidate);
+                            let mut state = observations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            #[cfg(feature = "test-util")]
+                            let probe_id = id.clone();
+                            #[cfg(feature = "test-util")]
+                            let probe_identity = candidate.identity.clone();
+                            #[cfg(feature = "test-util")]
+                            let probe_data_dir = candidate.data_dir;
+                            #[cfg(feature = "test-util")]
+                            let probe_mode = candidate.mode;
+                            #[cfg(feature = "test-util")]
+                            let probe_dry_run = candidate.dry_run;
+                            #[cfg(feature = "test-util")]
+                            let unknown_before: u64 = state.unknown_counts.values().copied().sum();
+                            let _settled = state.admit(id, candidate);
+                            #[cfg(feature = "test-util")]
+                            if test_events().receiver_count() != 0 {
+                                let pending = state.pending.get(&probe_id).is_some_and(|pending| {
+                                    pending.iter().any(|candidate| {
+                                        candidate.identity == probe_identity
+                                            && candidate.data_dir == probe_data_dir
+                                            && candidate.mode == probe_mode
+                                            && candidate.dry_run == probe_dry_run
+                                    })
+                                });
+                                let outcome = if _settled.is_some() {
+                                    ScannerHealTestAdmission::CachedTerminal {
+                                        data_dir: state.recent.get(&probe_id)
+                                            .and_then(|recent| recent.completion.object.as_ref())
+                                            .and_then(|object| object.resolved_data_dir),
+                                    }
+                                } else if pending {
+                                    ScannerHealTestAdmission::Pending
+                                } else if state.unknown_counts.values().copied().sum::<u64>() > unknown_before {
+                                    ScannerHealTestAdmission::Unknown
+                                } else {
+                                    ScannerHealTestAdmission::Unaccounted
+                                };
+                                let _ = test_events().send(ScannerHealTestEvent::Admission {
+                                    task_id: probe_id,
+                                    candidate_data_dir: probe_data_dir,
+                                    outcome,
+                                });
+                            }
                         },
                         None => break,
                     },
                     completion = completions.recv() => match completion {
                         Ok(completion) => {
-                            let _ = observations.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .complete(completion, Instant::now());
+                            let mut state = observations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            #[cfg(feature = "test-util")]
+                            let probe_id = completion.task_id.clone();
+                            #[cfg(feature = "test-util")]
+                            let probe_data_dir = completion.object.as_ref().and_then(|object| object.resolved_data_dir);
+                            #[cfg(feature = "test-util")]
+                            let duplicate = state.recent.contains_key(&probe_id);
+                            #[cfg(feature = "test-util")]
+                            let pending_before: Vec<_> = state.pending.get(&probe_id)
+                                .map(|pending| pending.iter().map(|candidate| candidate.data_dir).collect())
+                                .unwrap_or_default();
+                            let _settled = state.complete(completion, Instant::now());
+                            #[cfg(feature = "test-util")]
+                            if test_events().receiver_count() != 0 {
+                                let remaining_candidate_data_dirs = state.pending.get(&probe_id)
+                                    .map(|pending| pending.iter().map(|candidate| candidate.data_dir).collect())
+                                    .unwrap_or_default();
+                                let _ = test_events().send(ScannerHealTestEvent::Terminal {
+                                    task_id: probe_id,
+                                    terminal_data_dir: probe_data_dir,
+                                    duplicate,
+                                    settled_candidate_data_dirs: if _settled.is_some() { pending_before } else { Vec::new() },
+                                    remaining_candidate_data_dirs,
+                                });
+                            }
                         },
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             observations.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).lagged(skipped);

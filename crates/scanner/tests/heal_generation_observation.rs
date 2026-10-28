@@ -15,6 +15,8 @@
 //! One local process exercises the scanner, heal manager, and real ECStore.
 
 use rustfs_ecstore::api::object::{ShardIntegrityWriteMode, WriteCommitGuard, WriteCompletion};
+#[cfg(feature = "test-util")]
+use rustfs_heal::heal::task::{HealRequest, HealTaskStatus};
 use rustfs_heal::{
     HealChannelProcessor,
     heal::{
@@ -22,11 +24,18 @@ use rustfs_heal::{
         storage::ECStoreHealStorage,
     },
 };
+#[cfg(feature = "test-util")]
+use rustfs_heal_contracts::{
+    completion::HealCompletion,
+    heal_channel::{HealAdmissionResult, HealChannelResponse, HealRequestSource, subscribe_heal_responses},
+};
 use rustfs_heal_contracts::{
     completion::subscribe_heal_completions,
     heal_channel::{HealScanMode, init_heal_channels},
     outcome::HealExecutionOutcome,
 };
+#[cfg(feature = "test-util")]
+use rustfs_scanner::{ScannerHealTestAdmission, ScannerHealTestEvent, ScannerObjectInfo, subscribe_scanner_heal_test_events};
 use rustfs_scanner::{
     ScannerObjectOptions, ScannerPutObjReader, SizeSummary, scanner_folder::ScannerItem, scanner_heal_observation_status,
 };
@@ -38,6 +47,10 @@ use std::{
     time::Duration,
 };
 use time::OffsetDateTime;
+#[cfg(feature = "test-util")]
+use tokio::sync::broadcast;
+#[cfg(feature = "test-util")]
+use uuid::Uuid;
 
 #[derive(Default)]
 struct CounterRecorder(Mutex<HashMap<metrics::Key, Arc<AtomicU64>>>);
@@ -94,6 +107,146 @@ async fn put_protected(env: &TestECStoreEnv, bucket: &str, object: &str, fill: u
         .expect("write protected object to the real erasure set");
 }
 
+#[cfg(feature = "test-util")]
+async fn wait_for_observer_admission(
+    events: &mut broadcast::Receiver<ScannerHealTestEvent>,
+    owner: &str,
+    data_dir: Uuid,
+) -> ScannerHealTestAdmission {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match events.recv().await.expect("observer test event stream") {
+                ScannerHealTestEvent::Admission {
+                    task_id,
+                    candidate_data_dir: Some(observed),
+                    outcome,
+                } if task_id == owner && observed == data_dir => break outcome,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("observer must process the candidate admission")
+}
+
+#[cfg(feature = "test-util")]
+async fn wait_for_observer_terminal(
+    events: &mut broadcast::Receiver<ScannerHealTestEvent>,
+    owner: &str,
+    data_dir: Uuid,
+) -> (bool, Vec<Option<Uuid>>, Vec<Option<Uuid>>) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match events.recv().await.expect("observer test event stream") {
+                ScannerHealTestEvent::Terminal {
+                    task_id,
+                    terminal_data_dir: Some(observed),
+                    duplicate,
+                    settled_candidate_data_dirs,
+                    remaining_candidate_data_dirs,
+                } if task_id == owner && observed == data_dir => {
+                    break (duplicate, settled_candidate_data_dirs, remaining_candidate_data_dirs);
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("observer must process the requested terminal")
+}
+
+#[cfg(feature = "test-util")]
+async fn wait_for_idle(manager: &HealManager) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while manager.get_active_tasks_count().await != 0 || manager.get_queue_length().await != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the previous execution must leave the active queue");
+}
+
+#[cfg(feature = "test-util")]
+async fn run_reused_owner_round(
+    manager: &HealManager,
+    scanner: &mut ScannerItem,
+    admissions: &mut broadcast::Receiver<HealChannelResponse>,
+    completions: &mut broadcast::Receiver<Arc<HealCompletion>>,
+    observer_events: &mut broadcast::Receiver<ScannerHealTestEvent>,
+    owner: &str,
+    candidate: ScannerObjectInfo,
+    data_dir: Uuid,
+) -> (ScannerHealTestAdmission, (bool, Vec<Option<Uuid>>, Vec<Option<Uuid>>)) {
+    manager.set_max_concurrent_heals_for_test(0).await;
+    let mut request = HealRequest::object(scanner.bucket.clone(), scanner.object_path(), None);
+    request.id = owner.to_owned();
+    request.source = HealRequestSource::Scanner;
+    request.options.scan_mode = HealScanMode::Deep;
+    request.options.recreate_missing = false;
+    let receipt = manager
+        .submit_heal_request_with_receipt(request)
+        .await
+        .expect("submit new execution with reused task ID");
+    assert_eq!(receipt.result, HealAdmissionResult::Accepted);
+    assert_eq!(receipt.task_id, owner);
+
+    temp_env::async_with_vars([("RUSTFS_SCANNER_DEEP_VERIFY_COOLDOWN_SECS", Some("0"))], async {
+        scanner
+            .apply_actions(vec![candidate], None, Default::default(), &[], &mut SizeSummary::default())
+            .await;
+    })
+    .await;
+    let response = tokio::time::timeout(Duration::from_secs(30), admissions.recv())
+        .await
+        .expect("scanner admission response deadline")
+        .expect("scanner admission response delivered");
+    assert_eq!(response.request_id, owner, "scanner must merge into the new owner");
+    assert!(response.success);
+    assert_eq!(response.data.as_deref(), Some(&b"admission=merged,reason=none"[..]));
+    assert_eq!(
+        manager.get_task_status(owner).await.expect("new owner status"),
+        HealTaskStatus::Pending,
+        "new owner must remain queued while the observer handles admission"
+    );
+    let admission = wait_for_observer_admission(observer_events, owner, data_dir).await;
+    assert_ne!(admission, ScannerHealTestAdmission::Unaccounted, "observer did not account for admission");
+
+    manager.set_max_concurrent_heals_for_test(1).await;
+    let terminal = tokio::time::timeout(Duration::from_secs(30), completions.recv())
+        .await
+        .expect("new execution terminal deadline")
+        .expect("new terminal delivered");
+    assert_eq!(terminal.task_id, owner);
+    assert_eq!(terminal.execution, Some(HealExecutionOutcome::Completed));
+    assert_eq!(terminal.object.as_ref().expect("new storage receipt").resolved_data_dir, Some(data_dir));
+    let observed_terminal = wait_for_observer_terminal(observer_events, owner, data_dir).await;
+    wait_for_idle(manager).await;
+    (admission, observed_terminal)
+}
+
+#[cfg(feature = "test-util")]
+fn assert_observer_resolution(
+    admission: &ScannerHealTestAdmission,
+    terminal: &(bool, Vec<Option<Uuid>>, Vec<Option<Uuid>>),
+    data_dir: Uuid,
+) {
+    let (duplicate, settled, remaining) = terminal;
+    assert!(
+        remaining.is_empty(),
+        "the owner's candidate must not remain pending after terminal processing"
+    );
+    match admission {
+        ScannerHealTestAdmission::Pending => {
+            assert!(!duplicate, "the new terminal must not be discarded as a duplicate");
+            assert_eq!(settled.as_slice(), &[Some(data_dir)], "only the expected candidate must be settled");
+        }
+        ScannerHealTestAdmission::Unknown => {}
+        ScannerHealTestAdmission::CachedTerminal { .. } | ScannerHealTestAdmission::Unaccounted => {
+            panic!("unexpected admission state after stale-terminal assertion")
+        }
+    }
+}
+
 #[tokio::test]
 async fn overwritten_unversioned_generation_is_not_attributed_to_the_scanned_candidate() {
     let root = tempfile::tempdir().expect("local erasure-set fixture");
@@ -129,6 +282,9 @@ async fn overwritten_unversioned_generation_is_not_attributed_to_the_scanned_can
         Some(HealConfig {
             enable_auto_heal: false,
             mainline_throttle_enable: false,
+            max_concurrent_heals: 1,
+            low_priority_merge_enable: true,
+            event_driven_scheduler_enable: true,
             heal_interval: Duration::from_millis(10),
             ..Default::default()
         }),
@@ -142,6 +298,8 @@ async fn overwritten_unversioned_generation_is_not_attributed_to_the_scanned_can
             .await
     });
     let mut completions = subscribe_heal_completions();
+    #[cfg(feature = "test-util")]
+    let mut observer_events = subscribe_scanner_heal_test_events();
     let recorder = CounterRecorder::default();
     let _recorder = metrics::set_default_local_recorder(&recorder);
     let mut scanner = ScannerItem {
@@ -194,9 +352,72 @@ async fn overwritten_unversioned_generation_is_not_attributed_to_the_scanned_can
     assert_eq!(status.retained_pending_candidates, Some(0));
     assert_eq!(status.terminal_candidates.len(), 1);
     assert_eq!(status.terminal_candidates[0].scope, "identity_mismatch");
+    assert_eq!(status.terminal_candidates[0].scan_mode, HealScanMode::Deep.as_str());
     assert_eq!(status.terminal_candidates[0].count, 1);
     assert_eq!(recorder.total("rustfs_scanner_heal_candidate_generation_mismatch_total"), 1);
     assert_eq!(recorder.total("rustfs_scanner_heal_task_deep_payload_verified_observations_total"), 1);
+
+    #[cfg(feature = "test-util")]
+    {
+        let owner = terminal.task_id.clone();
+        let initial = scanner_heal_observation_status();
+        assert_eq!(initial.state, "active");
+        let observer_generation = initial.generation.expect("observer generation");
+        let lost_notifications = initial.lost_completion_notifications.expect("observer loss counter");
+        let _ = wait_for_observer_terminal(&mut observer_events, &owner, generation_b).await;
+        wait_for_idle(&manager).await;
+        let mut admissions = subscribe_heal_responses();
+
+        // The same ID first runs again without an overwrite: equal data_dir
+        // still does not mean that this is the earlier execution.
+        let (same_admission, same_terminal) = run_reused_owner_round(
+            &manager,
+            &mut scanner,
+            &mut admissions,
+            &mut completions,
+            &mut observer_events,
+            &owner,
+            current,
+            generation_b,
+        )
+        .await;
+
+        put_protected(&env, bucket, object, 0x43, now - time::Duration::minutes(2)).await;
+        let changed = env
+            .ecstore
+            .get_object_info(bucket, object, &ScannerObjectOptions::default())
+            .await
+            .expect("read generation C from storage");
+        let generation_c = changed.data_dir.filter(|id| !id.is_nil()).expect("generation C");
+        assert_ne!(generation_b, generation_c);
+        let (changed_admission, changed_terminal) = run_reused_owner_round(
+            &manager,
+            &mut scanner,
+            &mut admissions,
+            &mut completions,
+            &mut observer_events,
+            &owner,
+            changed,
+            generation_c,
+        )
+        .await;
+
+        let final_status = scanner_heal_observation_status();
+        assert_eq!(final_status.state, "active");
+        assert_eq!(final_status.generation, Some(observer_generation));
+        assert_eq!(final_status.lost_completion_notifications, Some(lost_notifications));
+
+        let same_stale = matches!(&same_admission, ScannerHealTestAdmission::CachedTerminal { .. });
+        let changed_stale = matches!(&changed_admission, ScannerHealTestAdmission::CachedTerminal { .. });
+        assert!(
+            !same_stale && !changed_stale,
+            "HEAL_ID_REUSE_E2E_STALE_TERMINAL: same_data={same_stale} changed_data={changed_stale}"
+        );
+        assert_observer_resolution(&same_admission, &same_terminal, generation_b);
+        assert_observer_resolution(&changed_admission, &changed_terminal, generation_c);
+        assert_eq!(recorder.total("rustfs_scanner_heal_candidate_generation_mismatch_total"), 1);
+        assert_eq!(final_status.integrity_state, "unknown");
+    }
 
     manager.stop().await.expect("stop production heal manager");
     processor.abort();

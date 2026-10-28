@@ -1752,6 +1752,14 @@ impl HealManager {
         Self::new_with_root_recovery(storage, config, None, Arc::new(root_recovery::RootHealRecovery::disabled_for_tests()))
     }
 
+    /// Change the scheduler limit only in an explicitly enabled test build.
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    pub async fn set_max_concurrent_heals_for_test(&self, limit: usize) {
+        self.config.write().await.max_concurrent_heals = limit;
+        self.notify.notify_one();
+    }
+
     #[cfg(any(test, feature = "test-util"))]
     #[doc(hidden)]
     pub fn new_with_workload_provider_without_root_recovery_for_test(

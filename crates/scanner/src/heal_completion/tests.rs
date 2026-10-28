@@ -82,6 +82,50 @@ fn terminal_before_admission_is_observed_without_claiming_coverage() {
 }
 
 #[test]
+fn reused_task_id_does_not_attach_an_old_terminal_to_a_new_execution() {
+    let recorder = CompletionRecorder::default();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let mut observations = Observations::default();
+    assert!(observations.admit("owner".into(), candidate()).is_none());
+    let old_terminal = completion("owner", HealObjectDisposition::VerifiedHealthy);
+    assert!(observations.complete(old_terminal, Instant::now()).is_some());
+
+    let mut new_candidate = candidate();
+    new_candidate.data_dir = Some(Uuid::from_u128(34));
+    let old_terminal_was_reused = observations.admit("owner".into(), new_candidate).is_some();
+    let mut new_terminal = (*completion("owner", HealObjectDisposition::VerifiedHealthy)).clone();
+    new_terminal.object.as_mut().expect("object receipt").resolved_data_dir = Some(Uuid::from_u128(34));
+    let _ = observations.complete(Arc::new(new_terminal), Instant::now());
+
+    assert!(
+        !old_terminal_was_reused,
+        "HEAL_ID_REUSE_UNIT_STALE_TERMINAL: a later execution cannot settle from an earlier terminal"
+    );
+    assert_eq!(
+        recorder.total("rustfs_scanner_heal_candidate_generation_mismatch_total"),
+        0,
+        "both executions verified the generation discovered for their own candidate"
+    );
+}
+
+#[test]
+fn reused_task_id_with_unchanged_data_dir_does_not_reuse_the_old_terminal() {
+    let mut observations = Observations::default();
+    assert!(observations.admit("owner".into(), candidate()).is_none());
+    assert!(
+        observations
+            .complete(completion("owner", HealObjectDisposition::VerifiedHealthy), Instant::now())
+            .is_some()
+    );
+    let old_terminal_was_reused = observations.admit("owner".into(), candidate()).is_some();
+    let _ = observations.complete(completion("owner", HealObjectDisposition::VerifiedHealthy), Instant::now());
+    assert!(
+        !old_terminal_was_reused,
+        "HEAL_ID_REUSE_UNIT_SAME_DATA_STALE_TERMINAL: equal data directories do not identify an execution"
+    );
+}
+
+#[test]
 fn replacement_bucket_version_or_location_cannot_match_an_old_result() {
     for change in 0..4 {
         let mut observed = candidate();

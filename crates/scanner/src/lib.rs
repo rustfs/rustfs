@@ -81,6 +81,9 @@ pub use error::ScannerError;
 pub use heal_completion::{
     ScannerHealObservationStatus, ScannerHealTerminalObservation, ScannerHealUnknownObservation, scanner_heal_observation_status,
 };
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub use heal_completion::{ScannerHealTestAdmission, ScannerHealTestEvent, subscribe_scanner_heal_test_events};
 pub use prefix_usage::{BucketPrefixUsageResponse, bucket_prefix_usage, invalidate_prefix_usage_cache};
 pub use remote_scanner::{
     NS_SCANNER_MAX_REQUEST_BODY_SIZE, RemoteScannerAdmission, RemoteScannerRequest, admit_remote_scanner_request,
