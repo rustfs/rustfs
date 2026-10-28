@@ -1,224 +1,247 @@
-# Copyright 2024 RustFS Team
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-name: Windows Filesystem Tests
+name: Scanner Group Identity Red Preflight
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - "crates/ecstore/src/disk/**"
-      - "crates/ecstore/src/layout/**"
-      - "crates/ecstore/src/store/init_format.rs"
-      - "crates/ecstore/src/set_disk/ops/locking.rs"
-      - "crates/ecstore/src/object_api/write_commit_context.rs"
-      - "crates/ecstore/src/bucket/utils.rs"
-      - "crates/ecstore/Cargo.toml"
-      - "crates/utils/src/dunce.rs"
-      - "crates/utils/src/os/**"
-      - "crates/utils/Cargo.toml"
-      - "crates/utils/src/path.rs"
-      - "rustfs/build.rs"
-      - "rustfs/Cargo.toml"
-      - "rustfs/src/main.rs"
-      - "rustfs/src/server/runtime.rs"
-      - "rustfs/src/startup_*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/actions/setup/**"
-      - ".github/workflows/windows-filesystem.yml"
-  pull_request:
-    branches: [ main ]
-    paths:
-      - "crates/ecstore/src/disk/**"
-      - "crates/ecstore/src/layout/**"
-      - "crates/ecstore/src/store/init_format.rs"
-      - "crates/ecstore/src/set_disk/ops/locking.rs"
-      - "crates/ecstore/src/object_api/write_commit_context.rs"
-      - "crates/ecstore/src/bucket/utils.rs"
-      - "crates/ecstore/Cargo.toml"
-      - "crates/utils/src/dunce.rs"
-      - "crates/utils/src/os/**"
-      - "crates/utils/Cargo.toml"
-      - "crates/utils/src/path.rs"
-      - "rustfs/build.rs"
-      - "rustfs/Cargo.toml"
-      - "rustfs/src/main.rs"
-      - "rustfs/src/server/runtime.rs"
-      - "rustfs/src/startup_*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/actions/setup/**"
-      - ".github/workflows/windows-filesystem.yml"
   workflow_dispatch:
+    inputs:
+      expected_head:
+        description: Full SHA of this workflow commit
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: scanner-group-identity-red-${{ github.ref }}
+  cancel-in-progress: false
 
-env:
-  CARGO_TERM_COLOR: always
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  RUST_BACKTRACE: 1
-
+# Fixed in-memory observation fixtures only. This does not replace full CI,
+# distributed G, or validate previously rejected RPC or MRF scenarios.
 jobs:
-  rename-safety:
-    name: Rename Safety
-    runs-on: windows-latest
-    timeout-minutes: 60
+  scoped:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_BACKTRACE: '0'
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+      NO_PROXY: 127.0.0.1,localhost
     steps:
-      - name: Checkout repository
+      - name: Checkout candidate
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
+          fetch-depth: 10
           persist-credentials: false
 
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: build-x86_64-pc-windows-msvc
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-          install-test-tools: 'false'
-
-      - name: Check production Windows dependencies
-        shell: pwsh
-        run: cargo check -p rustfs-ecstore --lib
-
-      - name: Test guarded rename publication
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib rename_all_ -- --nocapture
-
-      - name: Test multipart parent durability barriers
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib multipart_owned_record_parent_barriers_ -- --nocapture
-
-      - name: Test Windows path conversion
-        shell: pwsh
-        run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"
-
-      - name: Test Windows volume and disk-space probes
-        shell: pwsh
-        run: |
-          # Map a drive letter to the temp drive's administrative share so the
-          # remote-volume probe also covers mapped network drives.
-          $drive = (Split-Path -Qualifier ([System.IO.Path]::GetTempPath())).TrimEnd(':')
-          net use R: "\\localhost\$drive`$" /persistent:no
-          if ($LASTEXITCODE -eq 0) {
-            $env:RUSTFS_TEST_WINDOWS_MAPPED_DRIVE = 'R:'
-          } else {
-            Write-Output "::warning::could not map R: to \\localhost\$drive`$; mapped-drive test will skip"
-          }
-          cargo test -p rustfs-utils --features os --lib os:: -- --nocapture
-          $status = $LASTEXITCODE
-          if ($env:RUSTFS_TEST_WINDOWS_MAPPED_DRIVE) { net use R: /delete /y | Out-Null }
-          exit $status
-
-      - name: Test Windows handle guards
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib windows_ -- --nocapture
-
-      - name: Test endpoint path parsing
-        shell: pwsh
-        run: "cargo test -p rustfs-ecstore --lib layout::endpoint:: -- --nocapture"
-
-      - name: Test startup temporary-directory cleanup
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib cleanup_tmp_on_startup_ -- --nocapture
-
-      - name: Test object key Windows admission
-        shell: pwsh
-        run: "cargo test -p rustfs-ecstore --lib bucket::utils:: -- --nocapture"
-
-      - name: Test Windows file-name rules
-        shell: pwsh
-        run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"
-
-      - name: Test fresh format publication
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib fresh_format_load_initializes_all_disks -- --nocapture
-
-  # The native Windows main thread only gets the 1 MiB PE stack reserve, while
-  # Linux and macOS hand out 8 MiB. Startup runs the whole root future on the
-  # thread that calls `block_on`, so a debug server once overflowed before it
-  # listened on Windows only. Start a real server to keep that covered.
-  startup-smoke:
-    name: Startup Smoke
-    runs-on: windows-latest
-    timeout-minutes: 90
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: build-x86_64-pc-windows-msvc
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-          install-test-tools: 'false'
-
-      - name: Build debug server binary
-        shell: pwsh
-        run: cargo build --locked -p rustfs --bin rustfs
-
-      - name: Print version
-        shell: pwsh
-        run: |
-          & .\target\debug\rustfs.exe --version
-          if ($LASTEXITCODE -ne 0) { throw "rustfs --version exited with $LASTEXITCODE" }
-
-      - name: Start server and wait for readiness
-        shell: pwsh
+      - name: Verify exact source and test snapshot
+        shell: bash
         env:
-          RUSTFS_ACCESS_KEY: rustfsadmin
-          RUSTFS_SECRET_KEY: rustfsadmin
+          EXPECTED_HEAD: ${{ inputs.expected_head }}
+          LOG_DIR: ${{ runner.temp }}/scanner-group-identity-red
         run: |
-          $volume = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke'
-          $stdout = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke.out.log'
-          $stderr = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke.err.log'
-          New-Item -ItemType Directory -Force -Path $volume | Out-Null
-          $server = Start-Process -FilePath .\target\debug\rustfs.exe `
-            -ArgumentList @('--address', '127.0.0.1:9000', "`"$volume`"") `
-            -RedirectStandardOutput $stdout -RedirectStandardError $stderr `
-            -NoNewWindow -PassThru
-          # Cache the process handle now; otherwise ExitCode reads back empty.
-          $null = $server.Handle
-          $ready = $false
-          try {
-            for ($i = 0; $i -lt 180; $i++) {
-              if ($server.HasExited) { break }
-              try {
-                $response = Invoke-WebRequest -Uri 'http://127.0.0.1:9000/health/ready' -UseBasicParsing -NoProxy -TimeoutSec 2
-                if ($response.StatusCode -eq 200) { $ready = $true; break }
-              } catch {}
-              Start-Sleep -Seconds 1
-            }
-          } finally {
-            if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force }
-            $server.WaitForExit()
-            Write-Host '--- server stdout (tail) ---'
-            Get-Content $stdout -Tail 100 -ErrorAction SilentlyContinue
-            Write-Host '--- server stderr (tail) ---'
-            Get-Content $stderr -Tail 100 -ErrorAction SilentlyContinue
+          set -euo pipefail
+          [[ ! -e "$LOG_DIR" ]]
+          mkdir "$LOG_DIR"
+          head=$(git rev-parse HEAD)
+          workflow_parent=$(git rev-parse "${head}^")
+          source=$(git rev-parse '78657f1306b95bf9845ee82ea107ca2caaa18943^{commit}')
+          parent=$(git rev-parse "${source}^")
+          tree=$(git rev-parse "${source}^{tree}")
+          parent_tree=$(git rev-parse "${parent}^{tree}")
+          test_blob=$(git rev-parse "${source}:crates/scanner/src/heal_completion/tests.rs")
+          production_blob=$(git rev-parse "${source}:crates/scanner/src/heal_completion.rs")
+          parent_production_blob=$(git rev-parse "${parent}:crates/scanner/src/heal_completion.rs")
+          source_diff=$(git diff --full-index --binary "$parent" "$source" | sha256sum | cut -d' ' -f1)
+          workflow_diff=$(git diff --full-index --binary "$source" "$head" | sha256sum | cut -d' ' -f1)
+          source_files=$(git diff --name-only "$parent" "$source")
+          workflow_files=$(git diff --name-only "$source" "$head")
+          printf 'expected_head=%s head=%s workflow_parent=%s source=%s parent=%s tree=%s parent_tree=%s test_blob=%s production_blob=%s source_diff=%s workflow_diff=%s\n' \
+            "$EXPECTED_HEAD" "$head" "$workflow_parent" "$source" "$parent" "$tree" "$parent_tree" "$test_blob" "$production_blob" "$source_diff" "$workflow_diff" | tee "$LOG_DIR/snapshot.txt"
+          printf 'source_files=%s workflow_files=%s\n' "$source_files" "$workflow_files" | tee -a "$LOG_DIR/snapshot.txt"
+          [[ "$EXPECTED_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$head" == "$EXPECTED_HEAD" && "$head" == "$GITHUB_SHA" && "$workflow_parent" == "$source" ]]
+          [[ "$source" == 78657f1306b95bf9845ee82ea107ca2caaa18943 ]]
+          [[ "$parent" == 72e7e70f26a53b27cefcc71031e3c5383c1658bd ]]
+          [[ "$tree" == caf7fa17e1ce8a359e79049b82e4e90023f8e36e && "$parent_tree" == 84bd510a5bd5b6628647c26d36ad32c7d1ab69d7 ]]
+          [[ "$test_blob" == d6eaf77762b3cb00a3da6055ce601915055d51b5 ]]
+          [[ "$production_blob" == 0523194e39688915a1bb0a4661f8ed58aa93d58b && "$production_blob" == "$parent_production_blob" ]]
+          [[ "$source_diff" == ddbc0c4170f0c0fcf86dcb84842cf5367400ae0cc4a31064e8b2dad44c0cf35c ]]
+          [[ "$source_files" == crates/scanner/src/heal_completion/tests.rs ]]
+          [[ "$workflow_files" == .github/workflows/windows-filesystem.yml ]]
+          [[ -z "$(git status --porcelain)" ]]
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: scanner-group-identity-red-hosted
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+          install-test-tools: 'false'
+
+      - name: Run five exact expected failures and one passing control
+        shell: bash
+        env:
+          LOG_DIR: ${{ runner.temp }}/scanner-group-identity-red
+        run: |
+          set -euo pipefail
+          [[ -d "$LOG_DIR" && -f "$LOG_DIR/snapshot.txt" ]]
+          rustc --version --verbose | tee "$LOG_DIR/rustc-version.log"
+          cargo --version --verbose | tee "$LOG_DIR/cargo-version.log"
+          toolchain=$(rustup show active-toolchain)
+          printf '%s\n' "$toolchain" | tee "$LOG_DIR/rustup-version.log"
+          [[ "$toolchain" == stable-* ]]
+          tests=(
+            'heal_completion::tests::scanner_candidate_without_scope_does_not_claim_identity_mismatch|RED_SCANNER_SCOPE_UNKNOWN|579'
+            'heal_completion::tests::missing_identity_fields_are_unknown_on_either_side|RED_SCANNER_MISSING_IDENTITY|616'
+            'heal_completion::tests::nil_version_is_unknown_on_either_side|RED_SCANNER_NIL_VERSION|645'
+            'heal_completion::tests::nil_incarnation_is_unknown_on_either_side|RED_SCANNER_NIL_INCARNATION|673'
+            'heal_completion::tests::equivalent_uuid_version_formats_do_not_claim_identity_mismatch|RED_SCANNER_EQUIVALENT_VERSION|697'
+          )
+          control=heal_completion::tests::known_identity_conflicts_remain_mismatches_with_other_fields_unknown
+          printf '%s\n' "${tests[@]}" >"$LOG_DIR/selected-red.txt"
+          printf '%s\n' "$control" >"$LOG_DIR/selected-control.txt"
+          unique_names=$(printf '%s\n' "${tests[@]}" | cut -d'|' -f1 | sort -u | wc -l | tr -d '[:space:]')
+          unique_markers=$(printf '%s\n' "${tests[@]}" | cut -d'|' -f2 | sort -u | wc -l | tr -d '[:space:]')
+          [[ "${#tests[@]}" -eq 5 && "$unique_names" -eq 5 && "$unique_markers" -eq 5 ]]
+          python3 - "$LOG_DIR/selected-red.txt" "$control" <<'PYSEL'
+          from pathlib import Path
+          import re
+          import sys
+
+          source = Path('crates/scanner/src/heal_completion/tests.rs').read_text()
+          lines = source.splitlines()
+          for item in Path(sys.argv[1]).read_text().splitlines():
+              name, marker, line_text = item.split('|')
+              assert name.startswith('heal_completion::tests::'), name
+              symbol = name.rsplit('::', 1)[-1]
+              declarations = list(re.finditer(rf'#\[test\]\s*fn\s+{re.escape(symbol)}\s*\(', source))
+              assert len(declarations) == 1, name
+              assert source.count(marker) == 1, marker
+              line = int(line_text)
+              start = source.count('\n', 0, declarations[0].start()) + 1
+              following = re.search(r'#\[test\]\s*fn\s+', source[declarations[0].end():])
+              end = source.count('\n', 0, declarations[0].end() + following.start()) + 1 if following else len(lines) + 1
+              assert start < line < end, (name, line)
+              assert lines[line - 1].lstrip().startswith(('assert!(', 'assert_eq!(')), (name, line)
+              assert marker in '\n'.join(lines[line - 1:line + 4]), (name, marker, line)
+          control = sys.argv[2].rsplit('::', 1)[-1]
+          assert len(re.findall(rf'#\[test\]\s*fn\s+{re.escape(control)}\s*\(', source)) == 1, control
+          PYSEL
+          validate_control() {
+            local status="$1" log="$2" name="$3"
+            if (( status != 0 )); then return "$status"; fi
+            awk -v name="$name" '
+              $0 == "running 1 test" { runs++ }
+              index($0, "test " name " ...") == 1 {
+                suffix = substr($0, length("test " name " ...") + 1)
+                if (suffix == "" || suffix ~ /^[[:space:]]/) names++
+              }
+              /^test result: ok[.] 1 passed; 0 failed; 0 ignored; [0-9]+ measured; [0-9]+ filtered out; finished in / { passed++ }
+              END {
+                printf "Control markers: running=%d named=%d passed=%d\n", runs, names, passed
+                if (runs != 1 || names != 1 || passed != 1) exit 1
+              }
+            ' "$log"
           }
-          if (-not $ready) {
-            throw ("rustfs did not report ready on /health/ready (exit code: {0})" -f $server.ExitCode)
+          validate_red() {
+            local status="$1" log="$2" name="$3" marker="$4" expected_line="$5"
+            (( status == 101 )) || return 1
+            awk -v name="$name" -v marker="$marker" -v expected_line="$expected_line" '
+              $0 == "running 1 test" { runs++ }
+              index($0, "test " name " ...") == 1 {
+                suffix = substr($0, length("test " name " ...") + 1)
+                if (suffix == "" || suffix ~ /^[[:space:]]/) names++
+              }
+              /^test result: FAILED[.] 0 passed; 1 failed; 0 ignored; [0-9]+ measured; [0-9]+ filtered out; finished in / { failed++ }
+              /^thread .* panicked at / {
+                panics++
+                expected_thread = "thread \047" name "\047"
+                expected_location = "crates/scanner/src/heal_completion/tests.rs:" expected_line ":"
+                tail = substr($0, length(expected_thread) + 1)
+                split_at = index(tail, " panicked at ")
+                thread_id = substr(tail, 1, split_at - 1)
+                location = substr(tail, split_at + length(" panicked at "))
+                column = substr(location, length(expected_location) + 1)
+                target = index($0, expected_thread) == 1 && split_at > 0 && (thread_id == "" || thread_id ~ /^ [(][0-9]+[)]$/) && index(location, expected_location) == 1 && column ~ /^[0-9]+:$/
+                if (target) target_panics++
+              }
+              /RED_SCANNER_/ {
+                rest = $0
+                while (match(rest, /RED_SCANNER_[A-Z_]+/)) {
+                  word = substr(rest, RSTART, RLENGTH)
+                  markers++
+                  if (target && word == marker) target_markers++
+                  rest = substr(rest, RSTART + RLENGTH)
+                }
+              }
+              END {
+                printf "Red markers: running=%d named=%d failed=%d panics=%d target=%d markers=%d matched=%d\n", runs, names, failed, panics, target_panics, markers, target_markers
+                if (runs != 1 || names != 1 || failed != 1 || panics != 1 || target_panics != 1 || markers != 1 || target_markers != 1) exit 1
+              }
+            ' "$log"
           }
+          check_disk() {
+            local available
+            df -h . | tee -a "$LOG_DIR/disk.log"
+            available=$(df -Pk . | awk 'NR == 2 {print $4}')
+            [[ "$available" =~ ^[0-9]+$ ]]
+            if (( available < 4194304 )); then
+              echo 'not_started: insufficient disk' | tee -a "$LOG_DIR/disk.log"
+              return 1
+            fi
+          }
+          run_one() {
+            local name="$1" short status
+            short="${name##*::}"
+            check_disk
+            set +e
+            cargo test --locked -p rustfs-scanner --lib -- "$name" --exact --test-threads=1 >"$LOG_DIR/$short.log" 2>&1
+            status=$?
+            set -e
+            printf '%s\n' "$status" >"$LOG_DIR/$short.exit"
+            cat "$LOG_DIR/$short.log"
+          }
+          matched=0
+          mismatched=0
+          for item in "${tests[@]}"; do
+            IFS='|' read -r name marker line <<< "$item"
+            short="${name##*::}"
+            run_one "$name"
+            status=$(cat "$LOG_DIR/$short.exit")
+            if validate_red "$status" "$LOG_DIR/$short.log" "$name" "$marker" "$line" >"$LOG_DIR/$short.validation"; then
+              matched=$((matched + 1))
+            else
+              mismatched=$((mismatched + 1))
+              if ! grep -Fxq 'running 1 test' "$LOG_DIR/$short.log"; then
+                echo "Stopping: test execution did not start for $name" >&2
+                cat "$LOG_DIR/$short.validation"
+                exit 1
+              fi
+            fi
+            cat "$LOG_DIR/$short.validation"
+          done
+          control_short="${control##*::}"
+          run_one "$control"
+          control_status=$(cat "$LOG_DIR/$control_short.exit")
+          if validate_control "$control_status" "$LOG_DIR/$control_short.log" "$control" >"$LOG_DIR/$control_short.validation"; then
+            control_passed=1
+          else
+            control_passed=0
+          fi
+          cat "$LOG_DIR/$control_short.validation"
+          printf 'expected_red=5 matched=%s mismatched=%s control_passed=%s\n' "$matched" "$mismatched" "$control_passed"
+          [[ "$matched" -eq 5 && "$mismatched" -eq 0 && "$control_passed" -eq 1 ]]
+
+      - name: Upload raw logs, status codes and selection
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scanner-group-identity-red-${{ github.run_id }}
+          path: ${{ runner.temp }}/scanner-group-identity-red/
+          retention-days: 7
+          if-no-files-found: warn
