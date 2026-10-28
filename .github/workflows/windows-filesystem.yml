@@ -1,4 +1,4 @@
-name: Scanner heal ID stack diagnostic
+name: Scanner heal ID 32 MiB stack diagnostic
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: scanner-heal-id-reuse-stack-${{ github.ref }}
+  group: scanner-heal-id-reuse-stack-32m-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -39,8 +39,8 @@ jobs:
           mkdir -p "$output_dir"
           workflow_sha=$(git rev-parse HEAD)
           previous_workflow_sha=$(git rev-parse HEAD^)
-          source_sha=$(git rev-parse HEAD^^)
-          base_sha=$(git rev-parse HEAD^^^)
+          source_sha=$(git rev-parse HEAD^^^)
+          base_sha=$(git rev-parse HEAD^^^^)
           source_tree=$(git rev-parse "${source_sha}^{tree}")
           marker_diff=$(git diff --full-index --binary "$base_sha" "$source_sha" | sha256sum | cut -d' ' -f1)
           marker_files=$(git diff --name-only "$base_sha" "$source_sha")
@@ -49,7 +49,7 @@ jobs:
             "$workflow_sha" "$previous_workflow_sha" "$source_sha" "$base_sha" "$source_tree" "$marker_diff" "$marker_files" "$workflow_files" \
             | tee "$output_dir/source.txt"
           [[ "$workflow_sha" == "$GITHUB_SHA" ]]
-          [[ "$previous_workflow_sha" == 'dce2e710b5a6e7b6385749f898d0cb008b25b067' ]]
+          [[ "$previous_workflow_sha" == '46c3ca41be974ad90aea92ac4037ce2bd36ef410' ]]
           [[ "$source_sha" == '12b3ee9f948be35e54a0cd008aab50009f446ad3' ]]
           [[ "$base_sha" == 'd31b9fe1b8777482a5ad90c46dedb27170c46d74' ]]
           [[ "$source_tree" == '55c91e3a126628e309092353ceff9766c3ea06f7' ]]
@@ -87,13 +87,17 @@ jobs:
           log="$output_dir/test.log"
           test_name='overwritten_unversioned_generation_is_not_attributed_to_the_scanned_candidate'
           if [[ -v RUST_MIN_STACK ]]; then
-            printf 'RUST_MIN_STACK is set; refusing a non-default-stack diagnostic\n' | tee "$output_dir/environment.txt"
+            printf 'RUST_MIN_STACK is set in the parent shell; refusing an uncontrolled comparison\n' | tee "$output_dir/environment.txt"
             exit 1
           fi
-          printf 'RUST_MIN_STACK is unset\nshell_stack_limit_kib=%s\n' "$(ulimit -s)" | tee "$output_dir/environment.txt"
-          printf '%s\n' 'Diagnostic only: the test result is not a repair or full CI verdict.' | tee "$output_dir/scope.txt"
+          printf 'parent_RUST_MIN_STACK=unset\nshell_stack_limit_kib=%s\n' "$(ulimit -s)" | tee "$output_dir/environment.txt"
+          printf '%s\n' 'Diagnostic only: test-thread environment comparison, not production stack, root cause, repair, or full CI evidence.' | tee "$output_dir/scope.txt"
           set +e
-          cargo test --locked -p rustfs-scanner --features test-util --test heal_generation_observation -- --exact "$test_name" --nocapture >"$log" 2>&1
+          RUST_MIN_STACK=33554432 bash -euo pipefail -c '
+            [[ "$RUST_MIN_STACK" == 33554432 ]]
+            printf "test_RUST_MIN_STACK=%s\n" "$RUST_MIN_STACK" > "$1"
+            exec cargo test --locked -p rustfs-scanner --features test-util --test heal_generation_observation -- --exact "$2" --nocapture
+          ' _ "$output_dir/test-environment.txt" "$test_name" >"$log" 2>&1
           test_status=$?
           set -e
           printf '%s\n' "$test_status" | tee "$output_dir/exit-code.txt"
