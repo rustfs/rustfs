@@ -164,6 +164,7 @@ impl DefaultObjectUsecase {
             ..
         } = req.input.clone();
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &object).await?;
         validate_table_catalog_object_mutation(&bucket, &object).await?;
 
         // Typed S3 errors on every RestoreObject failure (backlog#2205): a

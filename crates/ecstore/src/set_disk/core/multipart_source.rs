@@ -338,16 +338,25 @@ fn abort_slot(
     Ok(())
 }
 
-fn abort_certificate_cohort(
+pub(in crate::set_disk) fn abort_certificate_cohort(
     certificate: &MultipartAbortCertificate,
     ids: &[Option<Uuid>],
     authority: &ProofVerificationContext,
 ) -> Result<()> {
     certificate.verify_with_authority(authority)?;
-    if ids.len() != certificate.disk_ids.len()
-        || ids.iter().copied().collect::<Option<Vec<_>>>().as_ref() != Some(&certificate.disk_ids)
-    {
+    if ids.len() != certificate.disk_ids.len() {
         return Err(DiskError::FileCorrupt);
+    }
+    let mut missing = false;
+    for (actual, expected) in ids.iter().zip(&certificate.disk_ids) {
+        match actual {
+            Some(actual) if actual != expected => return Err(DiskError::FileCorrupt),
+            Some(_) => {}
+            None => missing = true,
+        }
+    }
+    if missing {
+        return Err(DiskError::ErasureWriteQuorum);
     }
     Ok(())
 }

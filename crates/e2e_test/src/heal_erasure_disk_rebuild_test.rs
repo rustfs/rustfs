@@ -1725,6 +1725,15 @@ mod tests {
         cluster.set_env("RUSTFS_HEAL_AUTO_HEAL_ENABLE", background_enabled.to_string());
         cluster.set_env("RUSTFS_HEAL_MRF_ENABLE", background_enabled.to_string());
         cluster.set_env("RUSTFS_SCANNER_ENABLED", background_enabled.to_string());
+        let bucket = "heal-restart-during-rebuild";
+        let outage_key_prefix = "cluster/written-while-node-down-";
+        if !background_enabled {
+            // With MRF disabled, an outage PUT still hands its missing shard to a
+            // best-effort repair on the PUT coordinator. That repair retries until
+            // the target rejoins, so suppress it to keep the explicit root heal
+            // the only owner of the outage object.
+            cluster.set_env("RUSTFS_E2E_SUPPRESS_RENAME_TAIL_HEAL_PREFIX", format!("{bucket}/{outage_key_prefix}"));
+        }
         if background_enabled {
             // Only the scanner cadence is accelerated. Keep normal Heal
             // concurrency and every automatic recovery owner enabled.
@@ -1884,7 +1893,7 @@ mod tests {
         let mut replacement_outage_erasure_index = None;
         let mut rejected_outage_keys = Vec::new();
         for attempt in 0..max_outage_write_attempts {
-            let candidate_key = format!("cluster/written-while-node-down-{attempt:04}.bin");
+            let candidate_key = format!("{outage_key_prefix}{attempt:04}.bin");
             let put_result = timeout(
                 Duration::from_secs(30),
                 clients[2]
@@ -2009,25 +2018,6 @@ mod tests {
         }
 
         let heal_body = r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;
-        if !background_enabled {
-            // The PUT path may have admitted a direct Internal object repair while
-            // node 1 was offline. Cancel the isolated bucket path before the target
-            // returns; otherwise it could rebuild the outage object and invalidate
-            // the explicit-root ownership assertion below.
-            let cancel_outage_heal_path = format!("/rustfs/admin/v3/heal/{bucket}?forceStop=true");
-            let (cancel_status, cancel_body) = admin_request(
-                &cluster.nodes[0].url,
-                Method::POST,
-                &cancel_outage_heal_path,
-                Some(heal_body.to_string()),
-                &cluster.access_key,
-                &cluster.secret_key,
-            )
-            .await?;
-            if !cancel_status.is_success() {
-                return Err(format!("cancel outage heal failed: {cancel_status} {cancel_body}").into());
-            }
-        }
 
         // Keep the partial-repair checkpoint stable across readiness and admin
         // requests. Endpoint-blackhole tests must prove their own network stall.
