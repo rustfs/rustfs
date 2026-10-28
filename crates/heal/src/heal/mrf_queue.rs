@@ -2449,7 +2449,6 @@ mod tests {
     use serial_test::serial;
     use std::env;
     use std::fs;
-    use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::sync::Arc as StdArc;
     use std::time::{Duration as StdDuration, Instant};
