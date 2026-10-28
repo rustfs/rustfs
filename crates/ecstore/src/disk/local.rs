@@ -8450,6 +8450,23 @@ impl LocalDisk {
                     return Err(std::io::Error::other("metadata read worker cancelled"));
                 }
                 let _io_permit = io_permit;
+                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                {
+                    let opened = root.open_readonly(&path);
+                    if opened.is_ok() {
+                        os::prepared_publication_test_hooks::run(
+                            os::prepared_publication_test_hooks::Stage::MetadataReadAfterOpen,
+                            &path,
+                        );
+                    }
+                    let result = read_fn(opened);
+                    os::prepared_publication_test_hooks::run(
+                        os::prepared_publication_test_hooks::Stage::MetadataReadAfterRead,
+                        &path,
+                    );
+                    Ok(result)
+                }
+                #[cfg(not(all(any(test, feature = "test-util"), not(windows))))]
                 Ok(read_fn(root.open_readonly(&path)))
             })
             .await
