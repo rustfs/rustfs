@@ -6,6 +6,7 @@ import copy
 import fcntl
 import io
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -140,6 +141,15 @@ def child_released(marker, timeout=1):
         while True:
             try:
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                record = stream.read()
+                if not record.endswith(";ready"):
+                    raise AssertionError("fixture deadline unavailable")
+                try:
+                    expiry = float(record.removesuffix(";ready"))
+                except ValueError as error:
+                    raise AssertionError("fixture deadline unavailable") from error
+                if not math.isfinite(expiry) or time.monotonic() >= expiry:
+                    raise AssertionError("fixture deadline unavailable or expired")
                 return True
             except BlockingIOError:
                 if time.monotonic() >= deadline:
@@ -148,11 +158,11 @@ def child_released(marker, timeout=1):
 
 
 def reap_fixture(marker):
-    if marker.exists() and marker.stat().st_size and not child_released(marker, timeout=0):
-        # The unique file lock proves the original fixture process still owns this PID.
-        os.kill(int(marker.read_text()), signal.SIGKILL)
-        if not child_released(marker, timeout=5):
-            raise AssertionError("fixture child did not release its process-owned lock")
+    # The lock does not keep a PID reserved after the owner exits. Ask the
+    # fixture to exit instead of signaling a potentially reused PID.
+    marker.with_name(marker.name + ".release").touch()
+    if marker.exists() and marker.stat().st_size and not child_released(marker, timeout=5):
+        raise AssertionError("fixture child did not release its process-owned lock")
 
 
 class ScannerAbbaTest(unittest.TestCase):
@@ -259,6 +269,7 @@ class ScannerAbbaTest(unittest.TestCase):
                 with self.assertRaises(subprocess.TimeoutExpired):
                     harness.invoke(self.adapter, "measure", request, 3)
             wait_for_marker(marker)
+            self.assertFalse(marker.with_name(marker.name + ".release").exists())
             self.assertTrue(child_released(marker), "TERM-exited parent left its TERM-ignoring child alive")
         finally:
             reap_fixture(marker)
@@ -283,6 +294,7 @@ class ScannerAbbaTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "injected measurement failure"):
                     harness.collect_live({"collector": {"alias": "fixture", "endpoint": "fixture", "metrics_endpoints": "fixture"}},
                                          {"duration_seconds": 900}, request, self.adapter)
+            self.assertFalse(marker.with_name(marker.name + ".release").exists())
             self.assertTrue(child_released(marker), "collector parent exit did not end its telemetry child")
         finally:
             reap_fixture(marker)
@@ -299,6 +311,14 @@ class ScannerAbbaTest(unittest.TestCase):
             self.assertTrue(child_released(marker), "adapter stop must release its service")
         finally:
             reap_fixture(marker)
+
+    def test_invalid_fixture_deadline_does_not_count_as_cleaned_up(self):
+        marker = self.root / "stubborn.pid"
+        for value in ("invalid;ready", "nan;ready", str(time.monotonic() - 1) + ";ready", "1.2"):
+            with self.subTest(value=value):
+                marker.write_text(value)
+                with self.assertRaisesRegex(AssertionError, "fixture deadline"):
+                    child_released(marker)
 
     def test_reaped_owner_never_signals_a_reused_process_group(self):
         with (self.root / "owner.log").open("wb") as log:
@@ -330,6 +350,7 @@ class ScannerAbbaTest(unittest.TestCase):
                 with patch.object(harness.time, "sleep", side_effect=interrupt_once):
                     with self.assertRaises(KeyboardInterrupt):
                         owner.finish(terminate=True)
+                self.assertFalse(marker.with_name(marker.name + ".release").exists())
                 self.assertTrue(child_released(marker), "cleanup cancellation left its child alive")
                 self.assertIsNotNone(owner.process.returncode, "cleanup cancellation must reap its leader")
             finally:
@@ -353,6 +374,7 @@ class ScannerAbbaTest(unittest.TestCase):
                  patch.object(harness.os, "write", side_effect=release_then_fail):
                 with self.assertRaisesRegex(OSError, "injected failure after gate release"):
                     harness.OwnedCommand([str(self.adapter), "measure", str(request), str(self.root / "unused.json")], log)
+            self.assertFalse(marker.with_name(marker.name + ".release").exists())
             self.assertTrue(child_released(marker), "initialization failure left its child alive")
         finally:
             reap_fixture(marker)
@@ -1020,12 +1042,22 @@ class ScannerAbbaTest(unittest.TestCase):
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--stubborn-worker":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        with Path(sys.argv[2]).open("w+") as marker:
-            fcntl.flock(marker, fcntl.LOCK_EX)
-            marker.write(str(os.getpid()))
-            marker.flush()
-            while True:
-                time.sleep(1)
+        marker = Path(sys.argv[2])
+        release = marker.with_name(marker.name + ".release")
+        with marker.open("w+") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            deadline = time.monotonic() + 30
+            ready = (repr(deadline) + ";ready").encode("ascii")
+            if os.write(stream.fileno(), ready) != len(ready):
+                raise OSError("short fixture marker write")
+            while time.monotonic() < deadline:
+                try:
+                    if release.exists():
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.05)
+        sys.exit(0)
     if len(sys.argv) == 4 and sys.argv[1] in ("prepare", "measure", "oracle", "stop"):
         sys.exit(fake_adapter())
     unittest.main()
