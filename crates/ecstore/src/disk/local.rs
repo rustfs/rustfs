@@ -11309,9 +11309,12 @@ impl LocalDisk {
 #[cfg(unix)]
 pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, usize)>) -> Vec<Result<Bytes>> {
     let n = requests.len();
+    let metrics = rustfs_io_metrics::LocalBatchReadMetrics::capture();
+    let submitted = metrics.as_ref().map(|_| std::time::Instant::now());
     #[cfg(feature = "diagnostic-local-batch")]
     let diagnostic = crate::diagnostics::batch_read_diagnostics::Sample::capture();
     tokio::task::spawn_blocking(move || {
+        use rustfs_io_metrics::LocalBatchReadStage;
         use std::os::unix::fs::FileExt;
 
         // The disabled build expands directly to the original operation.
@@ -11341,39 +11344,59 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
             sample.worker_started();
             sample.start()
         });
+        let execution_started = metrics.as_ref().map(|_| std::time::Instant::now());
+        if let (Some(metrics), Some(submitted)) = (&metrics, submitted) {
+            metrics.record_stage(LocalBatchReadStage::QueueWait, true, submitted.elapsed());
+            metrics.record_batch(n);
+        }
         let mut results = Vec::with_capacity(n);
         for (file_path, offset, length) in requests {
             #[cfg(feature = "diagnostic-local-batch")]
             let _index = results.len();
             let mut total = 0usize;
             let r = (|| -> Result<Bytes> {
-                let meta = diagnostic_stage!(Metadata, _index, || std::fs::metadata(&file_path).map_err(DiskError::from))?;
+                let meta = diagnostic_stage!(Metadata, _index, || measure_local_batch_stage(
+                    metrics.as_deref(),
+                    LocalBatchReadStage::Metadata,
+                    || std::fs::metadata(&file_path).map_err(DiskError::from),
+                ))?;
                 let end = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
                 if meta.len() < u64::try_from(end).unwrap_or(u64::MAX) {
                     return Err(DiskError::FileCorrupt);
                 }
 
-                let file = diagnostic_stage!(Open, _index, || std::fs::File::open(&file_path).map_err(DiskError::from))?;
+                let file = diagnostic_stage!(Open, _index, || measure_local_batch_stage(
+                    metrics.as_deref(),
+                    LocalBatchReadStage::Open,
+                    || std::fs::File::open(&file_path).map_err(DiskError::from),
+                ))?;
                 let mut buf = diagnostic_stage!(Allocation, _index, || Ok::<_, DiskError>(vec![0u8; length]))?;
                 if length > 0 {
-                    diagnostic_stage!(Read, _index, || {
-                        while total < length {
-                            let nbytes = file
-                                .read_at(&mut buf[total..], u64::try_from(offset + total).unwrap_or(u64::MAX))
-                                .map_err(DiskError::from)?;
-                            if nbytes == 0 {
-                                return Err(DiskError::FileCorrupt);
+                    diagnostic_stage!(Read, _index, || measure_local_batch_stage(
+                        metrics.as_deref(),
+                        LocalBatchReadStage::Read,
+                        || {
+                            while total < length {
+                                let nbytes = file
+                                    .read_at(&mut buf[total..], u64::try_from(offset + total).unwrap_or(u64::MAX))
+                                    .map_err(DiskError::from)?;
+                                if nbytes == 0 {
+                                    return Err(DiskError::FileCorrupt);
+                                }
+                                total += nbytes;
                             }
-                            total += nbytes;
+                            Ok::<_, DiskError>(())
                         }
-                        Ok::<_, DiskError>(())
-                    })?;
+                    ))?;
                 }
                 Ok(Bytes::from(buf))
             })();
             #[cfg(feature = "diagnostic-local-batch")]
             if let Some(sample) = &diagnostic {
                 sample.shard_result(_index, length, total, r.is_ok());
+            }
+            if let Some(metrics) = &metrics {
+                metrics.record_shard(r.is_ok(), length, total);
             }
             results.push(r);
         }
@@ -11386,6 +11409,9 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
                 results.iter().all(Result::is_ok),
             );
         }
+        if let (Some(metrics), Some(started)) = (&metrics, execution_started) {
+            metrics.record_stage(LocalBatchReadStage::Execution, results.iter().all(Result::is_ok), started.elapsed());
+        }
         results
     })
     .await
@@ -11393,6 +11419,20 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
         let msg = format!("spawn_blocking join: {e}");
         (0..n).map(|_| Err(DiskError::other(msg.clone()))).collect()
     })
+}
+
+#[cfg(unix)]
+fn measure_local_batch_stage<T>(
+    metrics: Option<&rustfs_io_metrics::LocalBatchReadMetrics>,
+    stage: rustfs_io_metrics::LocalBatchReadStage,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let started = metrics.map(|_| std::time::Instant::now());
+    let result = operation();
+    if let (Some(metrics), Some(started)) = (metrics, started) {
+        metrics.record_stage(stage, result.is_ok(), started.elapsed());
+    }
+    result
 }
 
 #[async_trait::async_trait]
@@ -31004,6 +31044,109 @@ mod test {
             mean,
             (reads * shard_mib) as f64 / wall,
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_batch_read_metrics_cover_success_and_unattempted_failure_stages() {
+        use crate::test_metrics::CapturingRecorder;
+
+        let dir = tempfile::tempdir().expect("batch metrics directory");
+        let good = dir.path().join("good.bin");
+        std::fs::write(&good, b"good data").expect("write batch metrics payload");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("batch metrics runtime");
+        let recorder = CapturingRecorder::default();
+        let previous = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        let results = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(batch_shard_pread(vec![
+                (good.clone(), 0, 9),
+                (dir.path().join("missing.bin"), 0, 4),
+                (good.clone(), 0, 1024),
+                (good, 0, 0),
+            ]))
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous);
+
+        assert_eq!(results[0].as_ref().expect("valid shard read").as_ref(), b"good data");
+        assert!(results[1].is_err(), "missing shard must remain an error");
+        assert!(matches!(results[2], Err(DiskError::FileCorrupt)), "range failure must preserve its error");
+        assert!(results[3].as_ref().expect("empty range succeeds").is_empty());
+        let counter = "rustfs_io_get_object_local_batch_shards_total";
+        assert_eq!(recorder.counter_value(counter, &[("outcome", "success")]), 2);
+        assert_eq!(recorder.counter_value(counter, &[("outcome", "error")]), 2);
+        assert_eq!(recorder.counter_value("rustfs_io_get_object_local_batch_read_bytes_total", &[]), 9);
+        let stages = "rustfs_io_get_object_local_batch_stage_seconds";
+        for (stage, success, errors) in [("metadata", 3, 1), ("open", 2, 0), ("read", 1, 0), ("execution", 0, 1)] {
+            assert_eq!(
+                recorder
+                    .histogram_values(stages, &[("stage", stage), ("outcome", "success")])
+                    .len(),
+                success
+            );
+            assert_eq!(
+                recorder
+                    .histogram_values(stages, &[("stage", stage), ("outcome", "error")])
+                    .len(),
+                errors
+            );
+        }
+        assert_eq!(recorder.histogram_values(stages, &[("stage", "queue_wait")]).len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_batch_read_metrics_survive_caller_cancellation() {
+        use crate::test_metrics::CapturingRecorder;
+
+        let dir = tempfile::tempdir().expect("cancelled batch directory");
+        let path = dir.path().join("shard");
+        std::fs::write(&path, b"data").expect("write cancellation fixture");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("single blocking-worker runtime");
+        let recorder = CapturingRecorder::default();
+        let previous = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started_tx.send(()).expect("signal occupied blocking worker");
+                    release_rx.recv().expect("release occupied blocking worker");
+                });
+                started_rx.await.expect("blocking worker has started");
+                let mut batch = Box::pin(batch_shard_pread(vec![(path, 0, 4)]));
+                let pending = futures::FutureExt::now_or_never(&mut batch).is_none();
+                drop(batch);
+                rustfs_io_metrics::set_get_stage_metrics_enabled(false);
+                release_tx.send(()).expect("release worker after dropping caller");
+                blocker.await.expect("blocking worker finishes");
+                assert!(pending, "batch must have been submitted while the worker was occupied");
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while recorder
+                        .histogram_values("rustfs_io_get_object_local_batch_stage_seconds", &[("stage", "execution")])
+                        .is_empty()
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("detached batch must still record completion");
+            });
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous);
+        assert_eq!(
+            recorder.counter_value("rustfs_io_get_object_local_batch_shards_total", &[("outcome", "success")]),
+            1
+        );
+        assert_eq!(recorder.counter_value("rustfs_io_get_object_local_batch_read_bytes_total", &[]), 4);
     }
 
     #[cfg(unix)]

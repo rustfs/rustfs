@@ -480,65 +480,83 @@ mod tests {
         }
         let _interest = crate::test_tracing::pin_callsite_interest_for_test();
         let state = records();
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
         let subscriber = tracing_subscriber::registry().with(Recorder(Arc::clone(&state)));
-        tracing::subscriber::with_default(subscriber, || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("test runtime");
-            runtime.block_on(async {
-                let directory = tempfile::tempdir().expect("diagnostic test directory");
-                let path = directory.path().join("must-not-appear-in-trace");
-                std::fs::write(&path, b"abcdef").expect("write payload");
-                let results = REQUEST_ID
-                    .scope(
-                        Some(Arc::from("server-original")),
-                        crate::disk::local::batch_shard_pread(vec![
-                            (path.clone(), 1, 3),
-                            (directory.path().join("missing-secret-path"), 0, 3),
-                            (path.clone(), 0, 0),
-                            (path.clone(), 7, 1),
-                        ]),
-                    )
-                    .await;
-                assert_eq!(results[0].as_ref().expect("positioned read").as_ref(), b"bcd");
-                assert!(results[1].is_err());
-                assert!(results[2].as_ref().expect("zero-length read").is_empty());
-                assert!(results[3].is_err());
-                {
-                    let events = state.events.lock().expect("normal events");
-                    assert!(
-                        !events
-                            .iter()
-                            .any(|e| e.get("stage") == Some(&json!("read")) && e.get("shard_index") == Some(&json!(2)))
-                    );
-                    assert!(!format!("{events:?}").contains("must-not-appear"));
-                    assert!(!format!("{events:?}").contains("missing-secret"));
-                }
-                let (sender, receiver) = mpsc::channel();
-                *state.queue_started.lock().expect("install queue signal") = Some(sender);
-                state.block_queue.store(true, Ordering::SeqCst);
-                let mut future = Box::pin(REQUEST_ID.scope(
-                    Some(Arc::from("server-cancelled")),
-                    crate::disk::local::batch_shard_pread(vec![(path, 0, 6)]),
-                ));
-                assert!(futures::poll!(future.as_mut()).is_pending());
-                receiver
-                    .recv_timeout(std::time::Duration::from_secs(5))
-                    .expect("blocking worker started");
-                drop(future);
-                state.release.wait();
-                let deadline = Instant::now() + std::time::Duration::from_secs(5);
-                loop {
-                    if state.events.lock().expect("completion events").iter().any(|e| {
-                        e.get("stage") == Some(&json!("execution")) && e.get("request_id") == Some(&json!("server-cancelled"))
-                    }) {
-                        break;
+        metrics::with_local_recorder(&recorder, || {
+            tracing::subscriber::with_default(subscriber, || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                runtime.block_on(async {
+                    let directory = tempfile::tempdir().expect("diagnostic test directory");
+                    let path = directory.path().join("must-not-appear-in-trace");
+                    std::fs::write(&path, b"abcdef").expect("write payload");
+                    let results = REQUEST_ID
+                        .scope(
+                            Some(Arc::from("server-original")),
+                            crate::disk::local::batch_shard_pread(vec![
+                                (path.clone(), 1, 3),
+                                (directory.path().join("missing-secret-path"), 0, 3),
+                                (path.clone(), 0, 0),
+                                (path.clone(), 7, 1),
+                            ]),
+                        )
+                        .await;
+                    assert_eq!(results[0].as_ref().expect("positioned read").as_ref(), b"bcd");
+                    assert!(results[1].is_err());
+                    assert!(results[2].as_ref().expect("zero-length read").is_empty());
+                    assert!(results[3].is_err());
+                    let counter = "rustfs_io_get_object_local_batch_shards_total";
+                    assert_eq!(recorder.counter_value(counter, &[("outcome", "success")]), 2);
+                    assert_eq!(recorder.counter_value(counter, &[("outcome", "error")]), 2);
+                    assert_eq!(recorder.counter_value("rustfs_io_get_object_local_batch_read_bytes_total", &[]), 3);
+                    {
+                        let events = state.events.lock().expect("normal events");
+                        for (index, result) in [(0, "success"), (1, "error"), (2, "success"), (3, "error")] {
+                            assert!(
+                                events.iter().any(|event| {
+                                    event.get("stage") == Some(&json!("shard_result"))
+                                        && event.get("shard_index") == Some(&json!(index))
+                                        && event.get("result") == Some(&json!(result))
+                                }),
+                                "missing diagnostic result for shard {index}"
+                            );
+                        }
+                        assert!(
+                            !events
+                                .iter()
+                                .any(|e| e.get("stage") == Some(&json!("read")) && e.get("shard_index") == Some(&json!(2)))
+                        );
+                        assert!(!format!("{events:?}").contains("must-not-appear"));
+                        assert!(!format!("{events:?}").contains("missing-secret"));
                     }
-                    assert!(Instant::now() < deadline, "detached worker must complete diagnostic");
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                }
-            });
+                    let (sender, receiver) = mpsc::channel();
+                    *state.queue_started.lock().expect("install queue signal") = Some(sender);
+                    state.block_queue.store(true, Ordering::SeqCst);
+                    let mut future = Box::pin(REQUEST_ID.scope(
+                        Some(Arc::from("server-cancelled")),
+                        crate::disk::local::batch_shard_pread(vec![(path, 0, 6)]),
+                    ));
+                    assert!(futures::poll!(future.as_mut()).is_pending());
+                    receiver
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("blocking worker started");
+                    drop(future);
+                    state.release.wait();
+                    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+                    loop {
+                        if state.events.lock().expect("completion events").iter().any(|e| {
+                            e.get("stage") == Some(&json!("execution")) && e.get("request_id") == Some(&json!("server-cancelled"))
+                        }) {
+                            break;
+                        }
+                        assert!(Instant::now() < deadline, "detached worker must complete diagnostic");
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                });
+            })
         });
     }
 }

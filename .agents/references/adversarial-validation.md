@@ -27,7 +27,4 @@ Risk and review shape:
   and list verified and unverified target classes in the PR Impact section.
 
 Available domain lenses are security, concurrency/durability, compatibility,
-and performance. Select `.agents/skills/adversarial-validation/SKILL.md` for an
-explicit adversarial request, a high-risk change, or a substantial PR review;
-then read only its matching role references. A routine standard pass does not
-load the playbook unless the reviewer needs a RustFS-specific probe.
+and performance; select only those matched by the change.

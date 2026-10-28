@@ -264,6 +264,11 @@ enum MetadataReadPurpose {
     GetObjectReader,
 }
 
+/// Upper bound on exact-version reads a latest read spends looking past
+/// dangling versions before it keeps the read-quorum error; each read is one
+/// metadata fan-out.
+const MAX_DANGLING_LATEST_VERSIONS: usize = 8;
+
 /// How a metadata read-quorum failure is reported when the replies prove the
 /// object or version dangling. Only the object read entry points
 /// (`get_object_info`, `get_object_reader` and prepared GET metadata) report
@@ -971,6 +976,18 @@ impl SetDisks {
             {
                 Ok(selection) => selection,
                 Err(err) => {
+                    if err == DiskError::ErasureReadQuorum
+                        && vid.is_empty()
+                        && dangling_read == DanglingRead::ReportNotFound
+                        && metadata_fanout_complete
+                        && !crate::bucket::utils::is_meta_bucketname(bucket)
+                        && let Some(snapshot) =
+                            Box::pin(self.read_latest_past_dangling_versions(bucket, object, opts, read_data, purpose, &disks))
+                                .await
+                    {
+                        rustfs_io_metrics::record_get_object_metadata_quorum_result(metadata_metrics_path, "reached");
+                        return Ok(snapshot);
+                    }
                     let err = StorageError::from(err);
                     rustfs_io_metrics::record_get_object_metadata_quorum_result(
                         metadata_metrics_path,
@@ -1049,6 +1066,168 @@ impl SetDisks {
         }
         snapshot.condition_stopped = condition_stopped;
         Ok(snapshot)
+    }
+
+    /// A latest read whose split cannot reach read quorum may still have a
+    /// readable older version under newer versions that never committed;
+    /// MinIO resolves this in `pickLatestQuorumFilesInfo`. With every drive
+    /// answering, try versions newest first through exact-version reads and
+    /// serve the readable one with the newest selected modification time. A
+    /// version whose exact read proves it dangling (the NoSuchVersion an
+    /// explicit GET reports) is skipped and queued for heal, which owns its
+    /// cleanup; any other outcome keeps the read-quorum error.
+    async fn read_latest_past_dangling_versions(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        read_data: bool,
+        purpose: MetadataReadPurpose,
+        disks: &[Option<DiskStore>],
+    ) -> Option<GetObjectFileInfo> {
+        let disk_object = rustfs_utils::path::encode_dir_object(object);
+        let (raw, errs) = Self::read_all_raw_file_info(disks, bucket, &disk_object, false).await;
+        if errs
+            .iter()
+            .any(|err| err.as_ref().is_some_and(|err| !matches!(err, DiskError::FileNotFound)))
+        {
+            return None;
+        }
+        // Stacks are newest first, so only each drive's first few headers can
+        // matter. Keep a version's newest modification time across drives: a
+        // rewritten null version can carry different times on different drives.
+        let mut newest = std::collections::HashMap::<Option<uuid::Uuid>, Option<time::OffsetDateTime>>::new();
+        let mut truncated = false;
+        let mut metadata = Vec::with_capacity(raw.len());
+        for raw in raw.into_iter().flatten() {
+            let mut meta = rustfs_filemeta::FileMeta::load(&raw.buf).ok()?;
+            let mut versions = meta
+                .versions
+                .iter()
+                .enumerate()
+                .filter(|(_, version)| !version.header.free_version());
+            let mut retained_end = 0;
+            for (index, version) in versions.by_ref().take(MAX_DANGLING_LATEST_VERSIONS) {
+                let mod_time = newest.entry(version.header.version_id).or_insert(version.header.mod_time);
+                *mod_time = (*mod_time).max(version.header.mod_time);
+                retained_end = index + 1;
+            }
+            truncated |= versions.next().is_some();
+            meta.versions.truncate(retained_end);
+            metadata.push(meta);
+        }
+        let mut candidates = newest.into_iter().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+        // Use the stored header for equal-time ordering: re-encoding a selected
+        // FileInfo can change legacy signatures or omit part-checksum metadata.
+        let selected_header = |snapshot: &GetObjectFileInfo| {
+            let mut selected = snapshot.fi().clone();
+            selected.data = None;
+            let version_id = selected.version_id.unwrap_or_else(uuid::Uuid::nil).to_string();
+            let include_part_checksums =
+                opts.include_part_checksums || opts.part_number.is_some() || opts.data_movement || opts.raw_data_movement_read;
+            metadata.iter().find_map(|meta| {
+                let version = meta
+                    .versions
+                    .iter()
+                    .filter(|version| !version.header.free_version())
+                    .take(MAX_DANGLING_LATEST_VERSIONS)
+                    .find(|version| {
+                        version.header.version_id.unwrap_or_else(uuid::Uuid::nil)
+                            == selected.version_id.unwrap_or_else(uuid::Uuid::nil)
+                            && version.header.mod_time == selected.mod_time
+                    })?;
+                let mut original = if include_part_checksums {
+                    meta.into_fileinfo(&selected.volume, &selected.name, &version_id, false, opts.incl_free_versions, true)
+                } else {
+                    meta.into_fileinfo_without_part_checksums(
+                        &selected.volume,
+                        &selected.name,
+                        &version_id,
+                        false,
+                        opts.incl_free_versions,
+                    )
+                }
+                .ok()?;
+                if !include_part_checksums {
+                    rustfs_utils::http::remove_str(&mut original.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS);
+                }
+                original.data = None;
+                original.is_latest = selected.is_latest;
+                original.successor_mod_time = selected.successor_mod_time;
+                original.num_versions = selected.num_versions;
+                (original == selected).then_some(version.header.clone())
+            })
+        };
+
+        let mut best: Option<(Option<time::OffsetDateTime>, GetObjectFileInfo)> = None;
+        let mut skipped = Vec::new();
+        let mut settled = false;
+        for (reads, (version_id, newest_mod_time)) in candidates.into_iter().enumerate() {
+            if best.as_ref().is_some_and(|(selected, _)| newest_mod_time < *selected) {
+                settled = true;
+                break;
+            }
+            if reads == MAX_DANGLING_LATEST_VERSIONS {
+                return None;
+            }
+            // The nil UUID addresses the null version slot at this layer.
+            let version_id = version_id.unwrap_or_else(uuid::Uuid::nil).to_string();
+            let exact = ObjectOptions {
+                version_id: Some(version_id.clone()),
+                ..opts.clone()
+            };
+            match Box::pin(self.get_object_fileinfo_gated_inner(
+                bucket,
+                object,
+                &exact,
+                read_data,
+                false,
+                purpose,
+                DanglingRead::ReportNotFound,
+            ))
+            .await
+            {
+                Ok(snapshot) => {
+                    let selected = snapshot.fi().mod_time;
+                    let replace = match best.as_ref() {
+                        Some((current, previous)) if selected == *current => {
+                            selected_header(&snapshot)?.sorts_before(&selected_header(previous)?)
+                        }
+                        Some((current, _)) => selected > *current,
+                        None => true,
+                    };
+                    if replace {
+                        best = Some((selected, snapshot));
+                    }
+                }
+                Err(StorageError::VersionNotFound(..)) => skipped.push(version_id),
+                Err(_) => return None,
+            }
+        }
+        // Headers past each drive's first few were not compared; only a walk
+        // that proved no remaining candidate can be newer may stop early.
+        if !settled && truncated {
+            return None;
+        }
+        let (_, mut snapshot) = best?;
+        snapshot.mark_selected_as_latest();
+        if !opts.suppress_read_repair {
+            for version_id in &skipped {
+                submit_read_repair_heal(
+                    bucket,
+                    object,
+                    Some(version_id),
+                    self.pool_index,
+                    self.set_index,
+                    None,
+                    "dangling_latest_version",
+                )
+                .await;
+            }
+        }
+        Some(snapshot)
     }
 
     #[hotpath::measure(impl_type = "SetDisks")]
@@ -9761,9 +9940,13 @@ mod dangling_read_tests {
     const PARITY: usize = 2;
 
     async fn dangling_test_set(bucket: &str) -> (Vec<TempDir>, Arc<SetDisks>) {
+        dangling_test_set_with(bucket, DRIVES, PARITY).await
+    }
+
+    async fn dangling_test_set_with(bucket: &str, drives: usize, parity: usize) -> (Vec<TempDir>, Arc<SetDisks>) {
         let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         ctx.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
-        let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(DRIVES, PARITY, ctx).await;
+        let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(drives, parity, ctx).await;
         set.make_bucket(bucket, &MakeBucketOptions::default())
             .await
             .expect("test bucket should be created on every drive");
@@ -9777,6 +9960,9 @@ mod dangling_read_tests {
             &mut PutObjReader::from_vec(body.to_vec()),
             &ObjectOptions {
                 versioned,
+                // Wait for every drive so tests that edit one drive's metadata
+                // do not race the PUT's background tail writes.
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
                 ..Default::default()
             },
         )
@@ -9793,6 +9979,25 @@ mod dangling_read_tests {
             tokio::fs::remove_dir_all(object_dir(dirs, disk, bucket, object))
                 .await
                 .expect("object directory should be removable to model a drive that never received the write");
+        }
+    }
+
+    /// Drops `version_id` from `disks`, modelling drives a failed PUT never
+    /// reached while the older versions below it stay intact.
+    async fn drop_version_from(set: &SetDisks, bucket: &str, object: &str, version_id: Uuid, disks: std::ops::Range<usize>) {
+        let all = set.disks.read().await.clone();
+        for disk in &all[disks] {
+            let disk = disk.as_ref().expect("every drive should be online");
+            let mut remove = FileInfo {
+                volume: bucket.to_string(),
+                name: object.to_string(),
+                version_id: Some(version_id),
+                ..Default::default()
+            };
+            remove.set_skip_tier_free_version();
+            disk.delete_version(bucket, object, remove, false, DeleteOptions::default())
+                .await
+                .expect("dropping the version should model a drive that never received it");
         }
     }
 
@@ -9955,12 +10160,295 @@ mod dangling_read_tests {
         head(&set, bucket, object, Some(&v1))
             .await
             .expect("HEAD of the committed version must succeed");
-        // The latest read sees two generations (version two on three drives,
-        // version one on the rest), which is not proof of absence.
-        let Err(err) = head(&set, bucket, object, None).await else {
-            panic!("a split latest version must not resolve without quorum");
+        // The latest read sees version two on three drives and version one on
+        // the rest. Version two's exact read proves it dangling, so the latest
+        // read serves version one, the newest version an exact read can serve.
+        let latest = head(&set, bucket, object, None)
+            .await
+            .expect("the latest read must serve the newest readable version");
+        assert_eq!(latest.version_id.map(|id| id.to_string()).as_deref(), Some(v1.as_str()));
+        assert_eq!(get(&set, bucket, object, None).await.expect("latest GET"), b"version one");
+    }
+
+    #[tokio::test]
+    async fn latest_read_skips_dangling_versions_above_a_committed_version() {
+        // EC 12+4: a failed PUT that left version two on 5..=11 drives keeps
+        // version one, present in every stack, below its read quorum of twelve
+        // when only the top of each stack is read. Up to seven copies the
+        // listing quorum already shows version one; from eight it lists the
+        // dangling version two.
+        let bucket = "dangling-latest-12-4";
+        let (_dirs, set) = dangling_test_set_with(bucket, 16, 4).await;
+        for copies in 5..=11 {
+            let object = format!("torn/latest-{copies:02}");
+            let v1 = put(&set, bucket, &object, b"committed version", true)
+                .await
+                .version_id
+                .expect("versioned PUT should assign a version id");
+            let v2 = put(&set, bucket, &object, b"failed overwrite", true)
+                .await
+                .version_id
+                .expect("versioned PUT should assign a version id");
+            drop_version_from(&set, bucket, &object, v2, copies..16).await;
+
+            let context = format!("version two on {copies} of 16 drives");
+            let latest = head(&set, bucket, &object, None)
+                .await
+                .unwrap_or_else(|err| panic!("{context}: HEAD must serve version one: {err:?}"));
+            assert_eq!(latest.version_id, Some(v1), "{context}");
+            assert!(latest.is_latest, "{context}: the served version is the latest one");
+            assert_eq!(
+                get(&set, bucket, &object, None)
+                    .await
+                    .unwrap_or_else(|err| panic!("{context}: GET must serve version one: {err:?}")),
+                b"committed version",
+                "{context}"
+            );
+            let Err(err) = head(&set, bucket, &object, Some(&v2.to_string())).await else {
+                panic!("{context}: the dangling version must not be served");
+            };
+            assert!(matches!(err, StorageError::VersionNotFound(..)), "{context}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_read_keeps_quorum_error_when_the_newest_version_is_uncertain() {
+        // Version two is on every drive, but a torn metadata update left two
+        // identities at one modification time, three copies each. Its exact
+        // read fails with a quorum error rather than NoSuchVersion, so the
+        // walk must not fall through to version one.
+        let bucket = "dangling-latest-uncertain";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        put(&set, bucket, object, b"version one", true).await;
+        let v2 = put(&set, bucket, object, b"version two", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id")
+            .to_string();
+        let disks = set.disks.read().await.clone();
+        for disk in disks.iter().take(3) {
+            let disk = disk.as_ref().expect("every drive should be online");
+            let mut fi = disk
+                .read_version("", bucket, object, &v2, &ReadOptions::default())
+                .await
+                .expect("version two should be on every drive");
+            fi.metadata.insert("x-amz-meta-torn".to_string(), "half-applied".to_string());
+            disk.update_metadata(bucket, object, fi, &crate::disk::UpdateMetadataOpts::default())
+                .await
+                .expect("a half-applied metadata update should be stored");
+        }
+
+        assert_get_and_head_keep_read_quorum_error(&set, bucket, object, "torn metadata update on version two").await;
+    }
+
+    #[tokio::test]
+    async fn latest_read_serves_a_committed_null_version_below_a_dangling_version() {
+        // A null version written while versioning was suspended sits between
+        // version one and a dangling version three. The walk reaches the null
+        // slot through the nil UUID and serves it, not version one.
+        let bucket = "dangling-latest-null";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        let v1 = put(&set, bucket, object, b"version one", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id");
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(b"null version".to_vec()),
+            &ObjectOptions {
+                version_suspended: true,
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a suspended-versioning PUT should commit the null version");
+        let v3 = put(&set, bucket, object, b"version three", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id");
+        drop_version_from(&set, bucket, object, v3, 3..DRIVES).await;
+
+        let latest = head(&set, bucket, object, None)
+            .await
+            .expect("the committed null version must be served");
+        assert_ne!(latest.version_id, Some(v1));
+        assert_ne!(latest.version_id, Some(v3));
+        assert!(latest.is_latest);
+        assert_eq!(get(&set, bucket, object, None).await.expect("latest GET"), b"null version");
+    }
+
+    #[tokio::test]
+    async fn latest_read_orders_versions_by_their_newest_modification_time() {
+        // Drive 0 missed the suspended-versioning rewrite of the null version,
+        // so its null copy predates version one while every other drive holds
+        // the committed rewrite. Ordering by the first drive's time would try
+        // version one before the null version and serve it.
+        let bucket = "dangling-latest-order";
+        let object = "torn/latest";
+        let (dirs, set) = dangling_test_set(bucket).await;
+        let suspended = ObjectOptions {
+            version_suspended: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
         };
-        assert!(is_read_quorum_error(&err), "a split latest version keeps the quorum error: {err:?}");
+        set.put_object(bucket, object, &mut PutObjReader::from_vec(b"stale null".to_vec()), &suspended)
+            .await
+            .expect("the first null version should commit");
+        let v1 = put(&set, bucket, object, b"version one", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id");
+        let drive_zero = object_dir(&dirs, 0, bucket, object).join(STORAGE_FORMAT_FILE);
+        let stale = tokio::fs::read(&drive_zero)
+            .await
+            .expect("drive zero metadata should be readable");
+        set.put_object(bucket, object, &mut PutObjReader::from_vec(b"committed null".to_vec()), &suspended)
+            .await
+            .expect("the null rewrite should commit");
+        tokio::fs::write(&drive_zero, stale)
+            .await
+            .expect("drive zero should keep the pre-rewrite stack");
+        let v5 = put(&set, bucket, object, b"version five", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id");
+        drop_version_from(&set, bucket, object, v5, 3..DRIVES).await;
+
+        let latest = head(&set, bucket, object, None)
+            .await
+            .expect("the committed null rewrite must be served");
+        assert_ne!(latest.version_id, Some(v1));
+        assert_eq!(get(&set, bucket, object, None).await.expect("latest GET"), b"committed null");
+    }
+
+    #[tokio::test]
+    async fn latest_read_preserves_object_before_equal_time_marker() {
+        let bucket = "dangling-latest-equal-time-marker";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        let same_time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed source mtime");
+        for suspended in [false, true] {
+            let object = if suspended {
+                "torn/equal-time-null"
+            } else {
+                "torn/equal-time-versioned"
+            };
+            let object_id = if suspended { Uuid::nil() } else { Uuid::from_u128(2) };
+            set.put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(b"committed object".to_vec()),
+                &ObjectOptions {
+                    versioned: !suspended,
+                    version_suspended: suspended,
+                    replication_request: true,
+                    version_id: Some(object_id.to_string()),
+                    mod_time: Some(same_time),
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("commit object version");
+            set.delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    version_id: Some(Uuid::from_u128(1).to_string()),
+                    mod_time: Some(same_time),
+                    data_movement: true,
+                    delete_marker: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("recreate source delete marker during data movement");
+            let expected = head(&set, bucket, object, None)
+                .await
+                .expect("canonical latest before dangling write");
+            assert_eq!(expected.version_id, (!suspended).then_some(object_id));
+            assert!(!expected.delete_marker, "canonical header order prefers object to equal-time marker");
+            assert_eq!(get(&set, bucket, object, None).await.expect("canonical GET"), b"committed object");
+            let dangling_id = Uuid::from_u128(3);
+            set.put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(b"failed newer version".to_vec()),
+                &ObjectOptions {
+                    versioned: true,
+                    replication_request: true,
+                    version_id: Some(dangling_id.to_string()),
+                    mod_time: Some(same_time + time::Duration::seconds(1)),
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("commit newer version before modeling failed rollback");
+            drop_version_from(&set, bucket, object, dangling_id, 3..DRIVES).await;
+            let actual = head(&set, bucket, object, None)
+                .await
+                .expect("latest HEAD past dangling version");
+            let actual_get = get(&set, bucket, object, None).await;
+            assert_eq!(
+                actual.version_id, expected.version_id,
+                "{object}: unreadable newer version must preserve canonical equal-time latest; GET result: {actual_get:?}"
+            );
+            assert!(
+                !actual.delete_marker,
+                "{object}: fallback must preserve the object before its equal-time marker"
+            );
+            assert_eq!(actual_get.expect("latest GET"), b"committed object");
+
+            let checksum_opts = ObjectOptions {
+                include_part_checksums: true,
+                ..Default::default()
+            };
+            let checksum_head = set
+                .get_object_info(bucket, object, &checksum_opts)
+                .await
+                .expect("latest HEAD with part checksums");
+            assert_eq!(checksum_head.version_id, expected.version_id, "{object}: checksum HEAD version");
+            assert!(!checksum_head.delete_marker, "{object}: checksum HEAD must return the object");
+            let mut checksum_reader = set
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &checksum_opts)
+                .await
+                .expect("latest GET with part checksums");
+            let mut checksum_body = Vec::new();
+            checksum_reader
+                .stream
+                .read_to_end(&mut checksum_body)
+                .await
+                .expect("checksum GET should stream the committed bytes");
+            assert_eq!(checksum_body, b"committed object", "{object}: checksum GET bytes");
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_read_past_dangling_versions_requires_every_drive_to_answer() {
+        let bucket = "dangling-latest-offline";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        put(&set, bucket, object, b"version one", true).await;
+        let v2 = put(&set, bucket, object, b"version two", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id");
+        drop_version_from(&set, bucket, object, v2, 3..DRIVES).await;
+        // The offline drive may hold the copy that makes version two readable.
+        let offline = set.disks.write().await[5].take().expect("drive five should start online");
+
+        assert_get_and_head_keep_read_quorum_error(&set, bucket, object, "one drive offline").await;
+
+        set.disks.write().await[5] = Some(offline);
+        let latest = head(&set, bucket, object, None)
+            .await
+            .expect("with every drive answering the dangling version is skipped");
+        assert_ne!(latest.version_id, Some(v2));
     }
 
     #[tokio::test]
