@@ -608,12 +608,13 @@ fn publication_lease_retries_local_channel_deadline_and_stops_on_cancel() {
             )
             .await
             .unwrap_or_else(|_| {
+                let started = attempts.load(Ordering::SeqCst);
                 let completed = returned.load(Ordering::SeqCst);
                 assert!(
-                    completed >= 3,
-                    "SCANNER_NO_DEADLINE_ACQUISITION_STALLED: only {completed} typed timeouts returned"
+                    completed >= 3 && started == completed,
+                    "SCANNER_NO_DEADLINE_ACQUISITION_STALLED: attempts={started} returned={completed}"
                 );
-                panic!("SCANNER_NO_DEADLINE_TIMEOUT_MUST_DEFER: {completed} typed timeouts returned without deferring");
+                panic!("SCANNER_NO_DEADLINE_TIMEOUT_MUST_DEFER: attempts={started} returned={completed}");
             });
             let ScannerPublicationProofWait::Rejected(error) = &result else {
                 panic!("persistent local channel timeouts must reject this publication attempt");
