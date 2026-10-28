@@ -103,7 +103,7 @@ def prepare(env, report):
     require(isinstance(attempt, str) and re.fullmatch(r"[1-9][0-9]{0,9}", attempt), "exact source run attempt required")
     defaults = {"validation_retain_evidence_run_id": source,
                 "validation_retain_evidence_run_attempt": attempt,
-                "i05_diagnostic_branch": "timeout", "validation_tools_run_attempt": "1"}
+                "i05_diagnostic_branch": "source-plan", "validation_tools_run_attempt": "1"}
     require(all(value == defaults[key] if key in defaults else value in ("", False, None)
                 for key, value in inputs.items()), "evidence retention is exclusive with all execution modes")
     require(source != env["GITHUB_RUN_ID"], "cannot retain the running collection job")

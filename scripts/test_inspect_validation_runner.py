@@ -9,13 +9,20 @@ import unittest
 from unittest.mock import patch
 
 import inspect_validation_runner as inspection
+from check_test_wiring import yaml_block
 
 
 class RunnerInspectionTests(unittest.TestCase):
     def request(self):
         return {"validation_runner_inspect_only": True, "validation_case": "",
-                "validation_tools_only": False, "i05_diagnostic_branch": "timeout",
+                "validation_tools_only": False, "i05_diagnostic_branch": "source-plan",
                 "validation_tools_run_attempt": "1"}
+
+    def test_workflow_default_allows_inspection_request(self):
+        workflow = Path(__file__).resolve().parents[1] / ".github/workflows/rustfs-functional-chain.yml"
+        block = yaml_block(workflow.read_text().splitlines(), "i05_diagnostic_branch", 6)
+        default = next(line.split(":", 1)[1].strip() for line in block if line.strip().startswith("default:"))
+        inspection.validate_request({**self.request(), "i05_diagnostic_branch": default})
 
     def test_exclusive_request_rejects_every_execution_mode_before_api_access(self):
         inspection.validate_request(self.request())
@@ -26,6 +33,7 @@ class RunnerInspectionTests(unittest.TestCase):
                            ("validation_manager_tools", True), ("validation_cleanup_run_id", "123"),
                            ("auto_testing_sha", "a" * 40), ("validation_tools_run_id", "123"),
                            ("i05_diagnostic_branch", "queued-successor"),
+                           ("i05_diagnostic_branch", "timeout"),
                            ("validation_tools_run_attempt", "2")]:
             with self.subTest(key=key), self.assertRaises(ValueError):
                 inspection.validate_request({**self.request(), key: value})

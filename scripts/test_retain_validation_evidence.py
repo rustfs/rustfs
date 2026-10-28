@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import retain_validation_evidence as retain
 import prepare_retained_validation_recovery as recovery_input
+from check_test_wiring import yaml_block
 
 
 class RetainEvidenceTests(unittest.TestCase):
@@ -27,13 +28,24 @@ class RetainEvidenceTests(unittest.TestCase):
         env = {"RUNNER_TEMP": str(temporary), "GITHUB_RUN_ID": "88", "GITHUB_RUN_ATTEMPT": "1",
                "RUNNER_NAME": "owned-runner", "GITHUB_ENV": str(temporary / "env"),
                "EVIDENCE_RETAIN_INPUTS": json.dumps({"validation_retain_evidence_run_id": "77",
-                    "i05_diagnostic_branch": "timeout", "validation_tools_run_attempt": "1"})}
+                    "i05_diagnostic_branch": "source-plan", "validation_tools_run_attempt": "1"})}
         run = {"id": 77, "run_attempt": 1, "status": "completed", "conclusion": "failure",
                "event": "workflow_dispatch", "repository": {"full_name": "rustfs/rustfs"},
                "path": ".github/workflows/rustfs-functional-chain.yml", "head_sha": "a" * 40,
                "html_url": "source-url"}
         jobs = {"total_count": 1, "jobs": [{"name": "validation", "runner_name": "owned-runner"}]}
         return env, root, run, jobs
+
+    def test_workflow_default_allows_evidence_retention(self):
+        workflow = Path(__file__).resolve().parents[1] / ".github/workflows/rustfs-functional-chain.yml"
+        block = yaml_block(workflow.read_text().splitlines(), "i05_diagnostic_branch", 6)
+        default = next(line.split(":", 1)[1].strip() for line in block if line.strip().startswith("default:"))
+        with tempfile.TemporaryDirectory() as directory:
+            env, root, run, jobs = self.fixture(directory)
+            inputs = json.loads(env["EVIDENCE_RETAIN_INPUTS"])
+            env["EVIDENCE_RETAIN_INPUTS"] = json.dumps({**inputs, "i05_diagnostic_branch": default})
+            with patch.object(retain, "api", side_effect=[run, jobs]):
+                self.assertEqual(retain.prepare(env, {}), root)
 
     def test_existing_bytes_and_original_running_verdict_remain_unchanged(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -57,6 +69,8 @@ class RetainEvidenceTests(unittest.TestCase):
             for field, value in [("validation_case", "heal.admin-healthy-noop"),
                                  ("validation_runner_inspect_only", True), ("validation_tools_only", True),
                                  ("build_run_id", "1"), ("validation_retain_evidence_run_id", "../77"),
+                                 ("i05_diagnostic_branch", "timeout"),
+                                 ("i05_diagnostic_branch", "queued-successor"),
                                  ("validation_retain_evidence_run_id", "88")]:
                 with self.subTest(field=field, value=value), patch.object(retain, "api") as api:
                     altered = {**env, "EVIDENCE_RETAIN_INPUTS": json.dumps({**inputs, field: value})}

@@ -20,7 +20,7 @@ def validate_request(inputs):
             "runner inspection must be explicitly selected")
     defaults = {"validation_runner_inspect_only": True,
                 "validation_retain_evidence_run_attempt": "1",
-                "i05_diagnostic_branch": "timeout", "validation_tools_run_attempt": "1"}
+                "i05_diagnostic_branch": "source-plan", "validation_tools_run_attempt": "1"}
     require(all(value == defaults[key] if key in defaults else value in ("", False, None)
                 for key, value in inputs.items()),
             "runner inspection cannot select a candidate, tools, fleet case or recovery")
