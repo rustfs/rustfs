@@ -81,6 +81,14 @@ pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Resu
         let admission = None;
         let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()).with_admission(admission.clone()));
         init_heal_manager_with_workload_provider(heal_storage, None, Some(workload_provider.clone())).await?;
+        if let Some(admission) = &admission
+            && !rustfs_scanner::set_scanner_node_admission(admission.clone())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "scanner node admission is already initialized",
+            ));
+        }
         #[cfg(any(target_os = "linux", all(test, unix)))]
         if let Some(admission) = admission {
             crate::background_admission::start(admission, background_cancel.clone(), workload_provider);

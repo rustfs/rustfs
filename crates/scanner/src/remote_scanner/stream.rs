@@ -705,7 +705,7 @@ async fn scan_and_persist_local_bucket(
         RemoteScannerServerError::worker("remote namespace scanner cache publication is blocked by data movement")
     })?;
     let cache_name = path_join_buf(&[&bucket, DATA_USAGE_CACHE_NAME]);
-    let guard = acquire_scanner_cache_locks(set.as_ref(), &cache_name, source)
+    let mut guard = acquire_scanner_cache_locks(set.as_ref(), &cache_name, source)
         .await
         .map_err(|err| {
             if err.is_contention() {
@@ -791,19 +791,23 @@ async fn scan_and_persist_local_bucket(
 
     let set_disks = scanner_set_disk_inventory(set.as_ref()).await;
     let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel::<DataUsageCache>(1);
+    let (node_tx, mut node_rx) = crate::workload_admission::scanner_node_request_channel();
     let scan_ctx = ctx.child_token();
-    let scan = ScannerIODisk::nsscanner_disk(
-        disk.clone(),
-        scan_ctx.clone(),
-        budget,
-        set_disks,
-        cache,
-        None,
-        ScannerDiskScanOptions {
-            scan_mode,
-            prefix_scan_scope: None,
-            checkpoint_tx: Some(checkpoint_tx),
-        },
+    let scan = crate::workload_admission::with_scanner_node_requests(
+        node_tx,
+        ScannerIODisk::nsscanner_disk(
+            disk.clone(),
+            scan_ctx.clone(),
+            budget,
+            set_disks,
+            cache,
+            None,
+            ScannerDiskScanOptions {
+                scan_mode,
+                prefix_scan_scope: None,
+                checkpoint_tx: Some(checkpoint_tx),
+            },
+        ),
     );
     tokio::pin!(scan);
     let fence_watch = watch_remote_scanner_request_fence(next_cycle, leader_epoch, store.clone(), NS_SCANNER_FENCE_POLL_INTERVAL);
@@ -813,6 +817,27 @@ async fn scan_and_persist_local_bucket(
     let mut checkpoint_channel_closed = false;
     let outcome = loop {
         tokio::select! {
+            request = async {
+                match node_rx.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(request) = request else {
+                    node_rx = None;
+                    continue;
+                };
+                if let Err(error) = wait_for_remote_node_resumption(
+                    guard.resume_node_operation(set.clone(), &cache_name, source, &revisions, request),
+                    fence_watch.as_mut(),
+                ).await {
+                    scan_ctx.cancel();
+                    let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                    return Err(RemoteScannerServerError::retry_bucket(format!(
+                        "remote namespace scanner could not resume node admission: {error}",
+                    )));
+                }
+            }
             result = &mut scan => {
                 match result {
                     Ok(outcome) => break outcome,
@@ -1119,6 +1144,22 @@ pub(crate) async fn scan_remote_bucket(
     .await;
     path_guard.close().await;
     result
+}
+
+/// Resource waits must keep checking the persisted leader fence.
+async fn wait_for_remote_node_resumption<F, G>(resume: F, fence_watch: Pin<&mut G>) -> Result<(), StorageError>
+where
+    F: Future<Output = Result<(), StorageError>>,
+    G: Future<Output = Result<(), ScannerError>>,
+{
+    tokio::select! {
+        biased;
+        result = fence_watch => Err(match result {
+            Ok(()) => StorageError::other("remote namespace scanner fence watcher stopped unexpectedly"),
+            Err(error) => StorageError::other(error),
+        }),
+        result = resume => result,
+    }
 }
 
 fn finish_remote_scanner_stream(

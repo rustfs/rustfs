@@ -30,7 +30,9 @@ use std::sync::Mutex;
 pub(super) mod checkpoint_fixture;
 pub(super) mod enumeration_restart;
 mod incremental_enumeration;
+mod listing_completion;
 mod metadata_visits;
+mod node_admission;
 mod usage_updates;
 
 /// Reset the process-global alert cooldown map; test-only.
@@ -364,6 +366,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         failed_object_paths_seen: HashSet::new(),
         resolved_failed_object_paths: HashSet::new(),
         sleeper: SCANNER_SLEEPER.clone(),
+        node_admission: None,
         disks: Vec::new(),
         disks_quorum: 0,
         usage_updates: None,
@@ -394,6 +397,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,
         list_path_raw_options_observer: None,
+        defer_abandoned_entries_until_finished: false,
     };
 
     (scanner, temp_dir)
@@ -2262,7 +2266,7 @@ async fn test_heal_actions_returns_actual_size_without_inline_heal() {
     };
     let mut size_summary = SizeSummary::default();
 
-    let size = item.heal_actions(&object_info, 123, &mut size_summary).await;
+    let size = item.heal_actions(&object_info, 123, &mut size_summary, None).await;
     assert_eq!(size, 123);
 }
 
