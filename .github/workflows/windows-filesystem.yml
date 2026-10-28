@@ -23,7 +23,7 @@ jobs:
       - name: Checkout candidate
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
-          fetch-depth: 5
+          fetch-depth: 6
           persist-credentials: false
 
       - name: Verify candidate and workflow head
@@ -33,9 +33,9 @@ jobs:
         run: |
           set -euo pipefail
           actual_head=$(git rev-parse HEAD)
-          source=$(git rev-parse HEAD^)
-          test_base=$(git rev-parse HEAD^^)
-          main_base=$(git rev-parse HEAD~4)
+          source=$(git rev-parse 'e8382ebefc8f6feac681fbbd67d30fefdd3bf46b^{commit}')
+          test_base=$(git rev-parse "${source}^")
+          main_base=$(git rev-parse "${source}~3")
           base_tree=$(git rev-parse "${test_base}^{tree}")
           candidate_tree=$(git rev-parse "${source}^{tree}")
           workflow_tree=$(git rev-parse "${actual_head}^{tree}")
@@ -48,6 +48,7 @@ jobs:
           printf 'source_files=%s workflow_files=%s\n' "$source_files" "$workflow_files"
           [[ "$EXPECTED_HEAD" =~ ^[0-9a-f]{40}$ ]]
           [[ "$actual_head" == "$EXPECTED_HEAD" && "$actual_head" == "$GITHUB_SHA" ]]
+          git merge-base --is-ancestor "$source" "$actual_head"
           [[ "$source" == e8382ebefc8f6feac681fbbd67d30fefdd3bf46b ]]
           [[ "$test_base" == 41d06b4d7a1eee1cec4db8df65bc741b834831eb ]]
           [[ "$main_base" == 7a3bf8cdbd781116a0970585b995ade668c0e662 ]]
@@ -81,16 +82,32 @@ jobs:
           TEST_NAME: dangling_metadata_read_repair_and_scanner_have_distinct_queued_owners
         run: |
           set -euo pipefail
+          validate_test_log() {
+            local test_status="$1" log_file="$2" test_name="$3"
+            if (( test_status != 0 )); then
+              printf 'cargo test exited %s\n' "$test_status" >&2
+              return "$test_status"
+            fi
+            awk -v name="$test_name" '
+              $0 == "running 1 test" { runs++ }
+              index($0, "test " name " ...") == 1 {
+                suffix = substr($0, length("test " name " ...") + 1)
+                if (suffix == "" || suffix ~ /^[[:space:]]/) names++
+              }
+              /^test result: ok[.] 1 passed; 0 failed; 0 ignored; [0-9]+ measured; [0-9]+ filtered out; finished in / { passed++ }
+              END {
+                printf "Harness markers: running=%d named=%d passed=%d\n", runs, names, passed
+                if (runs != 1 || names != 1 || passed != 1) exit 1
+              }
+            ' "$log_file"
+          }
           [[ ! -e "$TEST_LOG" ]]
           set +e
           cargo test --locked -p rustfs-scanner --test read_repair_scanner_queue -- "$TEST_NAME" --exact --test-threads=1 >"$TEST_LOG" 2>&1
           status=$?
           set -e
           cat "$TEST_LOG"
-          [[ "$status" -eq 0 ]]
-          grep -Fxq 'running 1 test' "$TEST_LOG"
-          grep -Fxq "test $TEST_NAME ... ok" "$TEST_LOG"
-          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; [0-9]+ measured; [0-9]+ filtered out; finished in ' "$TEST_LOG"
+          validate_test_log "$status" "$TEST_LOG" "$TEST_NAME"
 
       - name: Upload test log
         if: ${{ always() && (steps.scoped_test.outcome == 'success' || steps.scoped_test.outcome == 'failure') }}
