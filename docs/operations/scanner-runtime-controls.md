@@ -626,7 +626,9 @@ typed terminal result:
 | `rustfs_scanner_heal_pending_tasks` | Canonical tasks awaiting a terminal observation. |
 | `rustfs_scanner_heal_pending_oldest_seconds` | Age of the oldest retained pending candidate; refreshed every five seconds. |
 | `rustfs_scanner_heal_candidate_terminal_total` | Associated candidates, labeled by object `disposition`, expected `scan_mode`, and unresolved `scope`. |
+| `rustfs_scanner_heal_candidate_generation_mismatch_total` | Associated candidates whose non-nil data-directory IDs differ for the same kind, bucket, and object name. It has no object labels and can overlap `scope` values such as `insufficient_scan`. It proves neither payload integrity nor leader identity. |
 | `rustfs_scanner_heal_task_terminal_observations_total` | Associated task observations, deduplicated within the bounded recent history. This is not an execution count. |
+| `rustfs_scanner_heal_task_deep_payload_verified_observations_total` | The first associated observation of a canonical task that is `Completed`, is not a dry run, and carries storage's payload-integrity proof. A `Normal` request can be upgraded to a deep scan internally. Restart or recent-history eviction can allow recounts; this does not prove candidate coverage, leader identity, or full-bucket verification. |
 | `rustfs_scanner_heal_candidate_unknown_total` | Candidates whose integrity remains unknown, labeled by reason. |
 | `rustfs_scanner_heal_completion_lost_total` | Terminal notifications skipped by a lagging observer. |
 

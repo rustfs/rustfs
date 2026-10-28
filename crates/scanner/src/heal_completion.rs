@@ -28,8 +28,10 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::{broadcast, mpsc};
+use uuid::Uuid;
 
 const MAX_PENDING: usize = 1024;
+const MAX_PENDING_GROUPS: usize = 1024;
 const MAX_RECENT: usize = 1024;
 const PENDING_TTL: Duration = Duration::from_secs(60 * 60);
 const RECENT_TTL: Duration = Duration::from_secs(10 * 60);
@@ -90,6 +92,7 @@ impl Default for ScannerHealObservationStatus {
 #[derive(Debug)]
 pub(crate) struct Candidate {
     identity: Option<HealObjectIdentity>,
+    data_dir: Option<Uuid>,
     mode: HealScanMode,
     dry_run: bool,
     first_seen: Instant,
@@ -97,7 +100,7 @@ pub(crate) struct Candidate {
 }
 
 impl Candidate {
-    fn from_request(request: &HealChannelRequest) -> Option<Self> {
+    fn from_request(request: &HealChannelRequest, data_dir: Option<Uuid>) -> Option<Self> {
         let bytes = request
             .bucket
             .len()
@@ -116,11 +119,35 @@ impl Candidate {
                 pool_index: request.pool_index,
                 set_index: request.set_index,
             }),
+            data_dir: data_dir.filter(|id| !id.is_nil()),
             mode: request.scan_mode.unwrap_or_default(),
             dry_run: request.dry_run.unwrap_or(false),
             first_seen: Instant::now(),
             count: 1,
         })
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.identity == other.identity
+            && self.data_dir == other.data_dir
+            && self.mode == other.mode
+            && self.dry_run == other.dry_run
+    }
+}
+
+struct Pending {
+    first: Candidate,
+    // The common single-candidate case does not allocate a vector.
+    others: Vec<Candidate>,
+}
+
+impl Pending {
+    fn iter(&self) -> impl Iterator<Item = &Candidate> {
+        std::iter::once(&self.first).chain(self.others.iter())
+    }
+
+    fn into_iter(self) -> impl Iterator<Item = Candidate> {
+        std::iter::once(self.first).chain(self.others)
     }
 }
 
@@ -131,7 +158,8 @@ struct Recent {
 
 #[derive(Default)]
 struct Observations {
-    pending: HashMap<String, Candidate>,
+    pending: HashMap<String, Pending>,
+    pending_groups: usize,
     recent: HashMap<String, Recent>,
     recent_order: VecDeque<(Instant, String)>,
     // All keys come from fixed execution/disposition/scope/mode labels, never task or object identities.
@@ -145,6 +173,8 @@ struct Observations {
 struct Settlement {
     candidates: u64,
     first_task_observation: bool,
+    generation_mismatch: bool,
+    deep_payload_verified_task: bool,
     execution: &'static str,
     disposition: &'static str,
     scope: &'static str,
@@ -175,37 +205,109 @@ impl Settlement {
             Some(HealObjectDisposition::DryRunObserved) => "dry_run",
             Some(HealObjectDisposition::Unknown) | None => "unknown",
         };
+        let generation_comparison = match (candidate.identity.as_ref(), completion.object.as_ref()) {
+            (Some(expected), Some(actual))
+                if expected.kind == actual.identity.kind
+                    && expected.bucket == actual.identity.bucket
+                    && expected.object == actual.identity.object =>
+            {
+                candidate
+                    .data_dir
+                    .filter(|id| !id.is_nil())
+                    .zip(actual.resolved_data_dir.filter(|id| !id.is_nil()))
+                    .map(|(left, right)| left == right)
+            }
+            _ => None,
+        };
+        let generation_mismatch = generation_comparison == Some(false);
+        let payload_verified = completion
+            .object
+            .as_ref()
+            .is_some_and(|object| object.payload_integrity_verified);
         let scope = if candidate.dry_run || completion.dry_run {
             "dry_run"
         } else if completion.execution != Some(HealExecutionOutcome::Completed) {
             "execution_incomplete"
-        } else if candidate.mode == HealScanMode::Deep && completion.scan_mode != HealScanMode::Deep {
+        } else if candidate.mode == HealScanMode::Deep
+            && completion.scan_mode != HealScanMode::Deep
+            && !(payload_verified && generation_comparison == Some(true))
+        {
             "insufficient_scan"
         } else {
             match (candidate.identity.as_ref(), completion.object.as_ref()) {
-                (Some(expected), Some(actual)) if expected != &actual.identity => "identity_mismatch",
-                (Some(expected), Some(_))
-                    if expected.bucket_incarnation_id.is_some_and(|id| !id.is_nil())
-                        && expected.pool_index.is_some()
-                        && expected.set_index.is_some()
-                        && expected.version_id.as_ref().is_some_and(|version| !version.is_empty()) =>
-                {
-                    // Even an exact version and VerifiedHealthy do not bind the
-                    // candidate's content and leader epoch with today's contract.
-                    "content_and_leader_unknown"
+                (Some(expected), Some(actual)) => {
+                    Self::identity_scope(expected, &actual.identity, candidate.data_dir, actual.resolved_data_dir)
                 }
                 _ => "identity_unknown",
             }
         };
         let first_task_observation = !recent.counted;
+        let deep_payload_verified_task = first_task_observation
+            && completion.execution == Some(HealExecutionOutcome::Completed)
+            && !completion.dry_run
+            && payload_verified;
         recent.counted = true;
         Self {
             candidates: candidate.count,
             first_task_observation,
+            generation_mismatch,
+            deep_payload_verified_task,
             execution,
             disposition,
             scope,
             mode: candidate.mode,
+        }
+    }
+
+    fn identity_scope(
+        expected: &HealObjectIdentity,
+        actual: &HealObjectIdentity,
+        expected_data_dir: Option<Uuid>,
+        resolved_data_dir: Option<Uuid>,
+    ) -> &'static str {
+        let expected_version = expected.version_id.as_deref().filter(|version| !version.is_empty());
+        let actual_version = actual.version_id.as_deref().filter(|version| !version.is_empty());
+        let expected_incarnation = expected.bucket_incarnation_id.filter(|id| !id.is_nil());
+        let actual_incarnation = actual.bucket_incarnation_id.filter(|id| !id.is_nil());
+        let expected_data_dir = expected_data_dir.filter(|id| !id.is_nil());
+        let resolved_data_dir = resolved_data_dir.filter(|id| !id.is_nil());
+        if expected.kind != actual.kind
+            || expected.bucket != actual.bucket
+            || expected.object != actual.object
+            || expected_version
+                .zip(actual_version)
+                .is_some_and(|(left, right)| left != right)
+            || expected_incarnation
+                .zip(actual_incarnation)
+                .is_some_and(|(left, right)| left != right)
+            || expected
+                .pool_index
+                .zip(actual.pool_index)
+                .is_some_and(|(left, right)| left != right)
+            || expected
+                .set_index
+                .zip(actual.set_index)
+                .is_some_and(|(left, right)| left != right)
+            || expected_data_dir
+                .zip(resolved_data_dir)
+                .is_some_and(|(left, right)| left != right)
+        {
+            "identity_mismatch"
+        } else if expected_version.is_none()
+            || actual_version.is_none()
+            || expected_incarnation.is_none()
+            || actual_incarnation.is_none()
+            || expected.pool_index.is_none()
+            || actual.pool_index.is_none()
+            || expected.set_index.is_none()
+            || actual.set_index.is_none()
+            || expected_data_dir.is_none()
+            || resolved_data_dir.is_none()
+        {
+            "identity_unknown"
+        } else {
+            // Matching identities still do not bind content and leader epoch.
+            "content_and_leader_unknown"
         }
     }
 
@@ -215,6 +317,14 @@ impl Settlement {
         .increment(self.candidates);
         if self.first_task_observation {
             counter!("rustfs_scanner_heal_task_terminal_observations_total").increment(1);
+        }
+        // This is independent of scope: an insufficient scan can also have
+        // resolved a different object generation.
+        if self.generation_mismatch {
+            counter!("rustfs_scanner_heal_candidate_generation_mismatch_total").increment(self.candidates);
+        }
+        if self.deep_payload_verified_task {
+            counter!("rustfs_scanner_heal_task_deep_payload_verified_observations_total").increment(1);
         }
     }
 }
@@ -247,18 +357,30 @@ impl Observations {
             return Some(settlement);
         }
         if let Some(pending) = self.pending.get_mut(&task_id) {
-            pending.count = pending.count.saturating_add(candidate.count);
-            if pending.identity != candidate.identity {
-                pending.identity = None;
+            if pending.first.matches(&candidate) {
+                pending.first.count = pending.first.count.saturating_add(candidate.count);
+            } else if let Some(index) = pending.others.iter().position(|group| group.matches(&candidate)) {
+                let group = &mut pending.others[index];
+                group.count = group.count.saturating_add(candidate.count);
+            } else if self.pending_groups < MAX_PENDING_GROUPS {
+                pending.others.push(candidate);
+                self.pending_groups += 1;
+            } else {
+                self.record_unknown("pending_groups_full", candidate.count);
             }
-            if candidate.mode == HealScanMode::Deep {
-                pending.mode = HealScanMode::Deep;
-            }
-            pending.dry_run |= candidate.dry_run;
-        } else if self.pending.len() < MAX_PENDING {
-            self.pending.insert(task_id, candidate);
-        } else {
+        } else if self.pending.len() >= MAX_PENDING {
             self.record_unknown("pending_full", candidate.count);
+        } else if self.pending_groups >= MAX_PENDING_GROUPS {
+            self.record_unknown("pending_groups_full", candidate.count);
+        } else {
+            self.pending.insert(
+                task_id,
+                Pending {
+                    first: candidate,
+                    others: Vec::new(),
+                },
+            );
+            self.pending_groups += 1;
         }
         None
     }
@@ -272,18 +394,22 @@ impl Observations {
             completion,
             counted: false,
         };
-        let settled = self
-            .pending
-            .remove(&task_id)
-            .map(|candidate| Settlement::new(candidate, &mut recent));
+        let mut settled = None;
+        if let Some(pending) = self.pending.remove(&task_id) {
+            self.pending_groups -= 1 + pending.others.len();
+            for candidate in pending.into_iter() {
+                let settlement = Settlement::new(candidate, &mut recent);
+                self.record_settlement(&settlement);
+                if settled.is_none() {
+                    settled = Some(settlement);
+                }
+            }
+        }
         if self.recent.len() == MAX_RECENT {
             self.evict_recent();
         }
         self.recent_order.push_back((now, task_id.clone()));
         self.recent.insert(task_id, recent);
-        if let Some(settlement) = &settled {
-            self.record_settlement(settlement);
-        }
         settled
     }
 
@@ -297,7 +423,9 @@ impl Observations {
         let candidates = self
             .pending
             .drain()
-            .fold(0u64, |count, (_, candidate)| count.saturating_add(candidate.count));
+            .flat_map(|(_, pending)| pending.into_iter())
+            .fold(0u64, |count, candidate| count.saturating_add(candidate.count));
+        self.pending_groups = 0;
         if candidates > 0 {
             self.record_unknown("completion_lost", candidates);
         }
@@ -313,14 +441,32 @@ impl Observations {
 
     fn maintain(&mut self, now: Instant) {
         let mut expired = 0u64;
-        self.pending.retain(|_, candidate| {
-            if now.saturating_duration_since(candidate.first_seen) >= PENDING_TTL {
-                expired = expired.saturating_add(candidate.count);
-                false
-            } else {
-                true
+        let mut expired_groups = 0usize;
+        self.pending.retain(|_, pending| {
+            let previous_len = pending.others.len();
+            pending.others.retain(|candidate| {
+                if now.saturating_duration_since(candidate.first_seen) >= PENDING_TTL {
+                    expired = expired.saturating_add(candidate.count);
+                    expired_groups += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            if now.saturating_duration_since(pending.first.first_seen) >= PENDING_TTL {
+                expired = expired.saturating_add(pending.first.count);
+                expired_groups += 1;
+                if pending.others.is_empty() {
+                    return false;
+                }
+                pending.first = pending.others.remove(0);
             }
+            if pending.others.len() != previous_len {
+                pending.others.shrink_to_fit();
+            }
+            true
         });
+        self.pending_groups -= expired_groups;
         if expired > 0 {
             self.record_unknown("expired", expired);
         }
@@ -334,6 +480,7 @@ impl Observations {
         let oldest = self
             .pending
             .values()
+            .flat_map(Pending::iter)
             .map(|candidate| now.saturating_duration_since(candidate.first_seen))
             .max();
         gauge!("rustfs_scanner_heal_pending_tasks").set(self.pending.len() as f64);
@@ -445,12 +592,14 @@ fn observation_status_from(registry: &Mutex<Option<ObserverHandle>>) -> ScannerH
             observations
                 .pending
                 .values()
+                .flat_map(Pending::iter)
                 .fold(0u64, |count, candidate| count.saturating_add(candidate.count)),
         );
         let now = Instant::now();
         status.oldest_pending_seconds = observations
             .pending
             .values()
+            .flat_map(Pending::iter)
             .map(|candidate| now.saturating_duration_since(candidate.first_seen))
             .max()
             .map(|age| age.as_secs_f64());
@@ -484,9 +633,9 @@ pub fn scanner_heal_observation_status() -> ScannerHealObservationStatus {
 }
 
 /// Capture only the identity actually available at discovery, before dispatch.
-pub(crate) fn prepare(request: &HealChannelRequest) -> Option<Candidate> {
+pub(crate) fn prepare(request: &HealChannelRequest, data_dir: Option<Uuid>) -> Option<Candidate> {
     let _ = observer();
-    Candidate::from_request(request)
+    Candidate::from_request(request, data_dir)
 }
 
 pub(crate) fn observe(candidate: Option<Candidate>, receipt: Result<&HealAdmissionReceipt, ()>) {
