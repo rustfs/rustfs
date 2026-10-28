@@ -507,7 +507,7 @@ mod native_abort_closure_tests {
         let path = SetDisks::get_upload_id_dir(bucket, object, &upload);
         pin_historical_unmarked_upload(&disks, bucket, &path).await;
         let before = originals(&disks, &path).await;
-        set.check_multipart_upload_path_exists(bucket, object, &upload, &path, false, true)
+        set.check_multipart_upload_path_exists(bucket, object, &upload, &path, MultipartMetadataQuorum::Read, true)
             .await
             .expect("readonly legacy cleanup identity lookup");
         assert_eq!(
@@ -786,7 +786,7 @@ mod native_abort_closure_tests {
             "known orphan native evidence remains unknown: {inspected:?}"
         );
         let readonly = set
-            .check_multipart_upload_path_exists(bucket, object, &upload, &path, false, true)
+            .check_multipart_upload_path_exists(bucket, object, &upload, &path, MultipartMetadataQuorum::Read, true)
             .await;
         assert!(
             matches!(
