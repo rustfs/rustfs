@@ -308,9 +308,15 @@ mod tests {
     #[test]
     fn event_writer_rejects_existing_fifo_symlinks_and_creates_a_regular_file() {
         use rustix::fs::{CWD, Mode, mkfifoat};
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
-        let directory = tempfile::tempdir().expect("private fixture directory");
+        let directory = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("private fixture directory");
+        assert!(open_private_directory(directory.path()).is_some(), "private fixture must be admitted");
+        let file = open_new_event_file(directory.path(), 103).expect("new event file");
+        assert!(file.metadata().expect("event metadata").is_file());
         let fifo = directory.path().join("get-reader-101.events");
         mkfifoat(CWD, fifo.as_path(), Mode::from_raw_mode(0o600)).expect("FIFO fixture");
         let owned_directory = directory.path().to_path_buf();
@@ -332,8 +338,6 @@ mod tests {
         let directory_link = directory.path().join("directory-link");
         symlink(directory.path(), &directory_link).expect("directory symlink fixture");
         assert!(open_new_event_file(&directory_link, 104).is_none());
-        let file = open_new_event_file(directory.path(), 103).expect("new event file");
-        assert!(file.metadata().expect("event metadata").is_file());
     }
 
     #[test]
