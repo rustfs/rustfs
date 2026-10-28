@@ -1493,6 +1493,17 @@ pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<
     project_data_usage_from_backend_cached(store, DataUsageInfo::clone).await
 }
 
+/// Read one bucket's persisted usage without cloning the complete snapshot.
+pub async fn load_bucket_usage_from_backend_cached(store: Arc<ECStore>, bucket: &str) -> Result<Option<u64>, Error> {
+    project_data_usage_from_backend_cached(store, |info| {
+        info.buckets_usage
+            .get(bucket)
+            .map(|usage| usage.size)
+            .or_else(|| info.bucket_sizes.get(bucket).copied())
+    })
+    .await
+}
+
 // Project under the cache guard so scalar readers never copy the snapshot's
 // bucket maps. The owned API shares the same TTL, refresh and invalidation path.
 async fn project_data_usage_from_backend_cached<T>(

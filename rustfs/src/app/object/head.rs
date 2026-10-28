@@ -307,7 +307,7 @@ impl DefaultObjectUsecase {
         part_number: Option<usize>,
         range: Option<&HTTPRangeSpec>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        let (full, etag_hex, last_modified) = veeam_sosapi::generated(self, store, &req.input.bucket, kind).await;
+        let (full, etag_hex, last_modified) = veeam_sosapi::generated(self, store, &req.input.bucket, kind).await?;
         check_generated_read_preconditions(&req.headers, &etag_hex, last_modified)?;
         let representation =
             veeam_sosapi::representation_from(full, etag_hex, last_modified, part_number, range).map_err(|err| match err {
@@ -380,7 +380,9 @@ impl DefaultObjectUsecase {
         };
         validate_bucket_exists(&store, &bucket).await?;
 
-        if let Some(kind) = veeam_sosapi::handled_kind(&key) {
+        if version_id.is_none()
+            && let Some(kind) = veeam_sosapi::handled_kind(&key)
+        {
             let response = self
                 .serve_veeam_sosapi_head(&req, &store, kind, part_number, rs.as_ref())
                 .await?;

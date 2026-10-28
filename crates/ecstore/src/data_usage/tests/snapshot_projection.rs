@@ -151,6 +151,12 @@ async fn persisted_scalar_projection_shares_cache_refresh_and_invalidation() {
 
     for (bucket, expected) in [("known", Some(42)), ("empty", Some(0)), ("missing", None)] {
         assert_eq!(persisted_bucket_usage(store.clone(), bucket).await, expected);
+        assert_eq!(
+            load_bucket_usage_from_backend_cached(store.clone(), bucket)
+                .await
+                .expect("project bucket usage"),
+            expected
+        );
         let owned = load_data_usage_from_backend_cached(store.clone())
             .await
             .expect("owned cached snapshot");

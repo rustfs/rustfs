@@ -107,6 +107,14 @@ pub(crate) mod data_usage {
         crate::storage::storage_api::ecstore_data_usage::load_admin_data_usage_from_backend_cached(store).await
     }
 
+    pub(crate) async fn load_bucket_usage_from_backend_cached(
+        store: Arc<crate::storage::storage_api::ECStore>,
+        bucket: &str,
+    ) -> Result<Option<u64>, crate::storage::storage_api::StorageError> {
+        crate::storage::storage_api::ecstore_data_usage::load_bucket_usage_from_backend_cached(store, bucket).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn load_data_usage_from_backend_cached(
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {

@@ -612,7 +612,8 @@ mod tests {
         info!("🧪 TEST: Veeam SOSAPI system.xml and capacity.xml");
 
         let mut env = RustFSTestEnvironment::new().await?;
-        env.start_rustfs_server(vec![]).await?;
+        env.start_rustfs_server_with_env(vec![], crate::common::FAST_DATA_USAGE_SCANNER_ENV)
+            .await?;
         let client = create_s3_client(&env);
         let bucket = "veeam-sosapi";
         create_bucket(&client, bucket).await?;
@@ -654,7 +655,18 @@ mod tests {
         let ranged_body = ranged.body.collect().await?.into_bytes();
         assert_eq!(&ranged_body[..], &system_body[..4]);
 
-        let capacity = client.get_object().bucket(bucket).key(CAPACITY_KEY).send().await?;
+        let capacity = tokio::time::timeout(std::time::Duration::from_secs(180), async {
+            loop {
+                match client.get_object().bucket(bucket).key(CAPACITY_KEY).send().await {
+                    Ok(capacity) => break Ok(capacity),
+                    Err(err) if err.code() == Some("ServiceUnavailable") => {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    Err(err) => break Err(err),
+                }
+            }
+        })
+        .await??;
         assert_eq!(capacity.content_type(), Some("application/xml"));
         let capacity_body = capacity.body.collect().await?.into_bytes();
         let capacity_xml = std::str::from_utf8(&capacity_body)?;
