@@ -316,8 +316,7 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
             })
         if "throughput_ops" in comparison:
             throughput_values.append(maybe_number(comparison.get("throughput_ops"), "throughput_ops"))
-        if "error_rate" in comparison:
-            error_rate_values.append(maybe_number(comparison.get("error_rate"), "error_rate"))
+        error_rate_values.append(maybe_number(comparison.get("error_rate"), "error_rate"))
         w11 = comparison.get("w11")
         if isinstance(w11, dict) and comparison.get("scenario") == "running-heal" and comparison.get("comparison") == "build":
             w11_rows.append({
@@ -370,7 +369,8 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
         "foreground_p95_ms": None if max_decimal(foreground_p95_values) is None else float(max_decimal(foreground_p95_values)),
         "foreground_p99_ms": None if max_decimal(foreground_p99_values) is None else float(max_decimal(foreground_p99_values)),
         "throughput_ops": None if max_decimal(throughput_values) is None else float(max_decimal(throughput_values)),
-        "error_rate": 0.0 if not error_rate_values else float(max(error_rate_values)),
+        "error_rate": (None if not error_rate_values or any(value is None for value in error_rate_values)
+                       else float(max_decimal(error_rate_values))),
         "foreground_pressure_samples": pressure_samples,
         "foreground_pressure_high_samples": pressure_high_samples,
         "attempt_cost_samples": attempt_cost_samples,

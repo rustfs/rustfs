@@ -226,6 +226,7 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         })
         result = summary.build_summary(args)
         self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["abba"]["error_rate"], 0.0)
         self.assertEqual(result["abba"]["provenance"]["manifest_sha256"], sha(self.abba / "manifest.json"))
         self.assertEqual(result["abba"]["w09_duplicate_task_count"], 0.0)
         self.assertEqual(result["abba"]["w09_worst_heal_start_p95_ms"], 43.0)
@@ -325,9 +326,21 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         self.assertEqual(result["verdict"], "FAIL")
         self.assertEqual(result["abba"]["completed_cells"], 7)
         self.assertEqual(result["abba"]["comparisons_total"], 0)
+        self.assertIsNone(result["abba"]["error_rate"])
         self.assertIn("collector failed", result["reason"])
         self.assertIn("- completed_cells: 7", summary.markdown(result))
         self.assertIn("- error: collector failed", summary.markdown(result))
+
+    def test_partial_error_rate_is_unknown(self):
+        self.report.update(status="inconclusive", performance="pending")
+        for value in (None, "missing"):
+            with self.subTest(value=value):
+                if value == "missing":
+                    self.report["comparisons"][0].pop("error_rate")
+                else:
+                    self.report["comparisons"][0]["error_rate"] = value
+                self.write_inputs()
+                self.assertIsNone(summary.summarize_abba(self.abba)["error_rate"])
 
     def test_passing_abba_report_requires_comparisons(self):
         del self.report["comparisons"]
