@@ -283,6 +283,23 @@ fn ensure_decommission_tier_free_version_commit_fence(bucket: &str, object: &str
     Ok(())
 }
 
+/// Names a `bucket/object` key prefix whose best-effort rename-tail repairs
+/// are not submitted. A root-heal fixture arms it so the explicit admin heal
+/// remains the only owner of objects written while their target was offline.
+#[cfg(feature = "e2e-test-hooks")]
+const RENAME_TAIL_HEAL_SUPPRESS_PREFIX_ENV: &str = "RUSTFS_E2E_SUPPRESS_RENAME_TAIL_HEAL_PREFIX";
+
+#[cfg(feature = "e2e-test-hooks")]
+fn rename_tail_heal_suppressed_for_e2e(bucket: &str, object: Option<&str>) -> bool {
+    let Some(prefix) = std::env::var(RENAME_TAIL_HEAL_SUPPRESS_PREFIX_ENV)
+        .ok()
+        .filter(|prefix| !prefix.is_empty())
+    else {
+        return false;
+    };
+    object.is_some_and(|object| format!("{bucket}/{object}").starts_with(&prefix))
+}
+
 impl SetDisks {
     pub(super) async fn require_current_restore_operation_id(
         &self,
@@ -5141,6 +5158,11 @@ impl SetDisks {
                 let _ = capture.send(request);
                 return Ok(());
             }
+        }
+
+        #[cfg(feature = "e2e-test-hooks")]
+        if rename_tail_heal_suppressed_for_e2e(&request.bucket, request.object_prefix.as_deref()) {
+            return Ok(());
         }
 
         let _ = rustfs_heal_contracts::heal_channel::send_heal_request(request).await;
