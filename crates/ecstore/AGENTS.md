@@ -12,6 +12,9 @@ Applies to `crates/ecstore/`.
 
 - Be careful with allocations and locking in hot paths.
 - Keep network and disk operations async-friendly; avoid introducing unnecessary blocking.
+- Coalesce related `open`, `read`/`write`, `fsync`, and `close` filesystem steps into a single per-disk blocking closure rather than chaining multiple async or blocking dispatches, and route any closure that performs file or directory sync to the disk's dedicated fsync lane so stalled syncs cannot starve foreground metadata reads.
+- Pin a parent directory once (`openat2(BENEATH | NO_SYMLINKS)` on Linux) and reuse the pinned handle across sibling reads or same-directory renames instead of re-walking ancestor components per file.
+- When the file size is already known from `fstat` metadata, pre-size the destination buffer (`len + 1`) before reading to EOF so small metadata reads complete in a single `read()` + EOF check rather than exponential-growth reallocations and syscalls.
 - Benchmark-sensitive changes should include measurable rationale.
 
 ## Allocation Discipline in Hot Paths

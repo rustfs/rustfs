@@ -111,7 +111,7 @@ pub trait StorageBackend: Send + Sync {
     ///
     /// Backends that implement this must apply per-bucket authorization. The default denies the
     /// request so existing backends cannot expose unfiltered bucket names.
-    #[cfg(feature = "webdav")]
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
     async fn list_buckets_for_session(
         &self,
         _session_context: &SessionContext,

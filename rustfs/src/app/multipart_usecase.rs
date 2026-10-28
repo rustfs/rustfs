@@ -73,14 +73,15 @@ use super::trailer_adapter::trailer_source;
 use crate::app::object::{
     ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, guard_put_object_body_read_timeout,
     put_object_body_read_timeout, reject_non_wildcard_write_if_none_match, reject_oversize_single_upload,
+    reject_veeam_sosapi_mutation,
 };
 use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
     invalidate_object_data_cache_before_mutation,
 };
 use crate::app::object_usecase::{
-    acquire_copy_bucket_lifecycle_locks, apply_quota_admission, build_put_like_object_lock_metadata, map_quota_check_outcome,
-    s3s_body_error_to_io, validate_existing_object_lock_for_write,
+    apply_quota_admission, build_put_like_object_lock_metadata, map_quota_check_outcome, s3s_body_error_to_io,
+    validate_existing_object_lock_for_write,
 };
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
@@ -542,6 +543,8 @@ impl DefaultMultipartUsecase {
             bucket, key, upload_id, ..
         } = req.input;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
+
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -610,6 +613,7 @@ impl DefaultMultipartUsecase {
             ..
         } = input;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         reject_non_wildcard_write_if_none_match(if_none_match.as_ref(), &req.headers)?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
@@ -1020,6 +1024,7 @@ impl DefaultMultipartUsecase {
             return Err(s3_error!(InvalidStorageClass));
         }
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         let Some(store) = self.object_store() else {
@@ -1243,6 +1248,7 @@ impl DefaultMultipartUsecase {
 
         let part_id = parse_upload_part_number(part_number)?;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         let size = resolve_upload_part_size(content_length, body.as_ref())?;
@@ -1641,6 +1647,7 @@ impl DefaultMultipartUsecase {
             ..
         } = req.input;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         let params = parse_list_parts_params(part_number_marker, max_parts)?;
 
         let Some(store) = self.object_store() else {
@@ -1702,6 +1709,7 @@ impl DefaultMultipartUsecase {
             ..
         } = req.input;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         let (src_bucket, src_key, raw_src_version_id) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
@@ -1727,23 +1735,20 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let (source_bucket_lifecycle_guard, destination_bucket_lifecycle_guard_storage) =
-            acquire_copy_bucket_lifecycle_locks(store.as_ref(), &src_bucket, &bucket).await?;
-        let current_source_incarnation_id = store
-            .bucket_incarnation_id_from_disk(&src_bucket)
+        let (
+            source_bucket_lifecycle_guard,
+            current_source_incarnation_id,
+            destination_bucket_lifecycle_guard_storage,
+            current_destination_incarnation_id,
+        ) = store
+            .acquire_copy_bucket_incarnation_fences(
+                &src_bucket,
+                expected_source_incarnation_id,
+                &bucket,
+                expected_destination_incarnation_id,
+            )
             .await
             .map_err(ApiError::from)?;
-        if expected_source_incarnation_id.is_some_and(|expected| expected != current_source_incarnation_id) {
-            return Err(ApiError::from(StorageError::BucketNotFound(src_bucket.clone())).into());
-        }
-        let current_destination_incarnation_id = if src_bucket == bucket {
-            current_source_incarnation_id
-        } else {
-            store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)?
-        };
-        if expected_destination_incarnation_id.is_some_and(|expected| expected != current_destination_incarnation_id) {
-            return Err(ApiError::from(StorageError::BucketNotFound(bucket.clone())).into());
-        }
         let destination_bucket_lifecycle_guard = destination_bucket_lifecycle_guard_storage
             .as_ref()
             .unwrap_or(&source_bucket_lifecycle_guard);
@@ -1762,9 +1767,9 @@ impl DefaultMultipartUsecase {
             ..Default::default()
         };
         if src_bucket != bucket {
-            dst_opts.add_bucket_lifecycle_lock_guard(&source_bucket_lifecycle_guard);
+            source_bucket_lifecycle_guard.attach_to_object_options(&mut dst_opts);
         }
-        dst_opts.add_bucket_lifecycle_lock_guard(destination_bucket_lifecycle_guard);
+        destination_bucket_lifecycle_guard.attach_to_object_options(&mut dst_opts);
 
         let mp_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &dst_opts)

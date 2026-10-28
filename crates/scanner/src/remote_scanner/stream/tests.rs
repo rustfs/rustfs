@@ -1007,6 +1007,58 @@ async fn fence_watcher_stops_work_after_persisted_leader_changes() {
 }
 
 #[tokio::test]
+async fn node_admission_wait_does_not_hide_replacement_leader() {
+    use rustfs_concurrency::adaptive::{FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure};
+    use std::num::NonZeroU16;
+
+    let store = Arc::new(MutableCycleStateStore {
+        state: RwLock::new(crate::scanner::encode_scanner_cycle_fence_for_test(7, 9)),
+    });
+    let cache = Mutex::new(None);
+    let refresh = AsyncMutex::new(());
+    let watcher = watch_remote_scanner_request_fence_with_cache(
+        7,
+        9,
+        store.clone(),
+        Duration::from_millis(5),
+        &cache,
+        &refresh,
+        Duration::from_millis(5),
+    );
+    tokio::pin!(watcher);
+    let gate = NodeAdmission::new(NonZeroU16::new(1).expect("one shared node unit"));
+    let storage_polled = AtomicBool::new(false);
+    {
+        let resume = async {
+            let _permit = gate.acquire().await;
+            storage_polled.store(true, Ordering::Relaxed);
+            Ok(())
+        };
+        let waiting = wait_for_remote_node_resumption(resume, watcher.as_mut());
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending(), "no resource sample grants a node unit");
+        *store.state.write().expect("persist replacement leader") = crate::scanner::encode_scanner_cycle_fence_for_test(7, 10);
+        let error = tokio::time::timeout(Duration::from_millis(100), waiting)
+            .await
+            .expect("resource pause must not hide a changed leader")
+            .expect_err("old leader cannot resume storage work");
+        assert!(error.to_string().contains("requested_epoch=9"));
+    }
+    assert!(!storage_polled.load(Ordering::Relaxed));
+    assert_eq!(gate.snapshot().active, 0);
+    gate.update(
+        &mut FeedbackController::new(),
+        Some(FeedbackObservation {
+            generation: 1,
+            max_concurrency: 1,
+            pressure: ResourcePressure::Unknown,
+            completed_units: None,
+        }),
+    );
+    assert!(gate.try_acquire().is_some(), "failed fencing drops the old node queue ticket");
+}
+
+#[tokio::test]
 async fn concurrent_cycle_cache_misses_share_one_backend_read() {
     let request = RemoteScannerRequest(test_request(Uuid::new_v4()));
     let store = Arc::new(CountingCycleStateStore {

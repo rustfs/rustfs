@@ -39,7 +39,37 @@ struct GuardHolderKey {
     owner: Arc<str>,
 }
 
-/// Lock shard to reduce global contention
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TestPausePoint {
+    FastExisting,
+    BeforeFastWrite,
+    FastWriteExisting,
+    SlowLookup,
+}
+
+#[cfg(test)]
+struct TestPause {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static TEST_PAUSES: std::sync::LazyLock<parking_lot::Mutex<HashMap<(TestPausePoint, ObjectKey), TestPause>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn test_pause(point: TestPausePoint, key: &ObjectKey) {
+    let pause = TEST_PAUSES.lock().remove(&(point, key.clone()));
+    if let Some(pause) = pause {
+        pause.entered.send(()).expect("pause receiver");
+        pause.resume.recv_timeout(Duration::from_secs(5)).expect("resume signal");
+    }
+}
+
+/// Lock shard to reduce global contention.
+///
+/// When both are needed, lock `objects` before a state's owner metadata.
 #[derive(Debug)]
 pub struct LockShard {
     /// Object lock states - using parking_lot for better performance
@@ -133,13 +163,16 @@ impl LockShard {
             let objects = self.objects.read();
             if let Some(state) = objects.get(&request.key) {
                 let state = state.clone();
-                drop(objects);
+
+                #[cfg(test)]
+                test_pause(TestPausePoint::FastExisting, &request.key);
 
                 // Try atomic acquisition
                 let success = match request.mode {
                     LockMode::Shared => state.try_acquire_shared_fast(&request.owner, request.lock_timeout),
                     LockMode::Exclusive => state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout),
                 };
+                drop(objects);
 
                 if success {
                     return Some(state);
@@ -150,14 +183,21 @@ impl LockShard {
         // If object doesn't exist and we're requesting exclusive lock,
         // try to create and acquire atomically
         if request.mode == LockMode::Exclusive {
+            #[cfg(test)]
+            test_pause(TestPausePoint::BeforeFastWrite, &request.key);
             let mut objects = self.objects.write();
 
             // Double-check after acquiring write lock
             if let Some(state) = objects.get(&request.key) {
                 let state = state.clone();
-                drop(objects);
+                let objects = parking_lot::RwLockWriteGuard::downgrade(objects);
 
-                if state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout) {
+                #[cfg(test)]
+                test_pause(TestPausePoint::FastWriteExisting, &request.key);
+
+                let acquired = state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout);
+                drop(objects);
+                if acquired {
                     return Some(state);
                 }
             } else {
@@ -193,10 +233,10 @@ impl LockShard {
         const NOTIFY_WAIT_CAP: Duration = Duration::from_millis(50);
 
         loop {
-            // Get or create object state
-            let state = {
+            // Keep the state in the map until its acquisition attempt completes.
+            let (state, success) = {
                 let mut objects = self.objects.write();
-                match objects.get(&request.key) {
+                let state = match objects.get(&request.key) {
                     Some(state) => state.clone(),
                     None => {
                         let state_box = self.object_pool.acquire();
@@ -204,13 +244,17 @@ impl LockShard {
                         objects.insert(request.key.clone(), state.clone());
                         state
                     }
-                }
-            };
+                };
+                let objects = parking_lot::RwLockWriteGuard::downgrade(objects);
 
-            // Try acquisition again
-            let success = match request.mode {
-                LockMode::Shared => state.try_acquire_shared_fast(&request.owner, request.lock_timeout),
-                LockMode::Exclusive => state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout),
+                #[cfg(test)]
+                test_pause(TestPausePoint::SlowLookup, &request.key);
+                let success = match request.mode {
+                    LockMode::Shared => state.try_acquire_shared_fast(&request.owner, request.lock_timeout),
+                    LockMode::Exclusive => state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout),
+                };
+                drop(objects);
+                (state, success)
             };
 
             if success {
@@ -905,6 +949,184 @@ impl LockShard {
 mod tests {
     use super::*;
     use crate::fast_lock::types::{LockPriority, ObjectKey};
+    use crate::fast_lock::{FastLockGuard, FastObjectLockManager};
+
+    fn install_pause(point: TestPausePoint, key: &ObjectKey) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let previous = TEST_PAUSES.lock().insert(
+            (point, key.clone()),
+            TestPause {
+                entered: entered_tx,
+                resume: resume_rx,
+            },
+        );
+        assert!(previous.is_none());
+        (entered_rx, resume_tx)
+    }
+
+    fn test_manager() -> Arc<FastObjectLockManager> {
+        // Construct outside a runtime so no background cleanup races the test.
+        Arc::new(
+            std::thread::spawn(|| {
+                FastObjectLockManager::with_config(crate::fast_lock::types::LockConfig {
+                    shard_count: 4,
+                    ..Default::default()
+                })
+            })
+            .join()
+            .expect("manager construction"),
+        )
+    }
+
+    fn start_acquisition(
+        manager: &Arc<FastObjectLockManager>,
+        request: ObjectLockRequest,
+    ) -> tokio::task::JoinHandle<Result<FastLockGuard, LockResult>> {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.acquire_lock(request).await })
+    }
+
+    async fn assert_cleanup_cannot_split_state(
+        manager: Arc<FastObjectLockManager>,
+        key: ObjectKey,
+        entered: std::sync::mpsc::Receiver<()>,
+        resume: std::sync::mpsc::Sender<()>,
+        pending: tokio::task::JoinHandle<Result<FastLockGuard, LockResult>>,
+        seed: Option<FastLockGuard>,
+    ) {
+        entered.recv_timeout(Duration::from_secs(5)).expect("state lookup");
+        drop(seed);
+
+        // Idle timestamps have one-second precision, while cleanup compares milliseconds.
+        let initial_millis = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis();
+        while SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() == initial_millis {
+            std::thread::yield_now();
+        }
+
+        let can_write_map = manager.get_shard(&key).objects.try_write().is_some();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let mut cleanup = {
+            let manager = manager.clone();
+            let key = key.clone();
+            tokio::task::spawn_blocking(move || {
+                started_tx.send(()).expect("cleanup start receiver");
+                manager.get_shard(&key).cleanup_expired_millis(0)
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(5)).expect("cleanup started");
+        if can_write_map {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), &mut cleanup)
+                    .await
+                    .expect("cleanup completed")
+                    .expect("cleanup task"),
+                1
+            );
+            let successor = manager
+                .acquire_write_lock(key.clone(), "second")
+                .await
+                .expect("successor should acquire after cleanup");
+            resume.send(()).expect("resume acquisition");
+            let result = tokio::time::timeout(Duration::from_secs(5), pending)
+                .await
+                .expect("acquisition completed")
+                .expect("acquisition task");
+            assert!(result.is_err(), "a removed state must not grant a conflicting lock");
+            drop(successor);
+        } else {
+            resume.send(()).expect("resume acquisition");
+            let first = tokio::time::timeout(Duration::from_secs(5), pending)
+                .await
+                .expect("acquisition completed")
+                .expect("acquisition task")
+                .expect("first acquisition");
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), cleanup)
+                    .await
+                    .expect("cleanup completed")
+                    .expect("cleanup task"),
+                0
+            );
+            let second = ObjectLockRequest::new_write(key.clone(), "second").with_acquire_timeout(Duration::from_millis(100));
+            assert!(
+                manager.acquire_lock(second).await.is_err(),
+                "conflicting locks must remain mutually exclusive"
+            );
+            drop(first);
+            let successor = manager
+                .acquire_write_lock(key, "second")
+                .await
+                .expect("successor after release");
+            drop(successor);
+        }
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cleanup_during_fast_existing_state_acquisition() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "fast-existing-cleanup");
+        drop(manager.acquire_write_lock(key.clone(), "seed").await.expect("seed"));
+        let (entered, resume) = install_pause(TestPausePoint::FastExisting, &key);
+        let pending = start_acquisition(&manager, ObjectLockRequest::new_write(key.clone(), "first"));
+        assert_cleanup_cannot_split_state(manager, key, entered, resume, pending, None).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cleanup_during_fast_write_recheck_acquisition() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "fast-recheck-cleanup");
+        let (first_entered, first_resume) = install_pause(TestPausePoint::BeforeFastWrite, &key);
+        let pending = start_acquisition(&manager, ObjectLockRequest::new_write(key.clone(), "first"));
+        first_entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("before write recheck");
+        drop(manager.acquire_write_lock(key.clone(), "seed").await.expect("seed"));
+        let (entered, resume) = install_pause(TestPausePoint::FastWriteExisting, &key);
+        first_resume.send(()).expect("resume before write recheck");
+        assert_cleanup_cannot_split_state(manager, key, entered, resume, pending, None).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cleanup_during_slow_existing_state_acquisition() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "slow-existing-cleanup");
+        let seed = manager.acquire_write_lock(key.clone(), "seed").await.expect("seed");
+        let (entered, resume) = install_pause(TestPausePoint::SlowLookup, &key);
+        let pending = start_acquisition(&manager, ObjectLockRequest::new_write(key.clone(), "first"));
+        assert_cleanup_cannot_split_state(manager, key, entered, resume, pending, Some(seed)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cleanup_during_slow_new_state_acquisition() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "slow-new-cleanup");
+        let (entered, resume) = install_pause(TestPausePoint::SlowLookup, &key);
+        let pending = start_acquisition(&manager, ObjectLockRequest::new_read(key.clone(), "first"));
+        assert_cleanup_cannot_split_state(manager, key, entered, resume, pending, None).await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_keeps_new_fast_state_while_held() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "fast-new-cleanup");
+        let first = manager
+            .acquire_write_lock(key.clone(), "first")
+            .await
+            .expect("first acquisition");
+        assert_eq!(manager.get_shard(&key).cleanup_expired_millis(0), 0);
+        let second = ObjectLockRequest::new_write(key.clone(), "second").with_acquire_timeout(Duration::from_millis(100));
+        assert!(manager.acquire_lock(second).await.is_err());
+        drop(first);
+        drop(
+            manager
+                .acquire_write_lock(key, "second")
+                .await
+                .expect("successor after release"),
+        );
+        manager.shutdown().await;
+    }
 
     #[tokio::test]
     async fn test_shard_fast_path() {

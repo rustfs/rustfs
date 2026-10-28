@@ -1,0 +1,75 @@
+name: BTF prototype reference
+
+on:
+  pull_request:
+    paths:
+      - "scripts/inspect_btf_prototypes.py"
+      - "scripts/test_inspect_btf_prototypes.py"
+      - "scripts/fixtures/btf_prototypes.c"
+      - ".github/workflows/btf-prototype-reference.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: btf-prototype-reference-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Check prototype and CLI contracts
+        run: python3 -B scripts/test_inspect_btf_prototypes.py
+      - name: Install only missing native reference tools
+        run: |
+          select_bpftool() {
+            local candidate
+            local candidates=()
+            if command -v bpftool >/dev/null; then
+              candidates+=("$(command -v bpftool)")
+            fi
+            for candidate in /usr/lib/linux-tools-*/bpftool /usr/lib/linux-tools/*/bpftool; do
+              if [[ -x "$candidate" ]]; then
+                candidates+=("$candidate")
+              fi
+            done
+            while IFS= read -r candidate; do
+              if [[ -x "$candidate" ]] && file -Lb "$candidate" | grep -q 'ELF' \
+                && "$candidate" version >/dev/null 2>&1; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done < <(printf '%s\n' "${candidates[@]}" | sort -Vr)
+            return 1
+          }
+          packages=()
+          command -v clang >/dev/null || packages+=(clang)
+          command -v llvm-objcopy >/dev/null || packages+=(llvm)
+          command -v gcc >/dev/null || packages+=(gcc)
+          select_bpftool >/dev/null || packages+=(linux-tools-generic)
+          if (( ${#packages[@]} )); then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y "${packages[@]}"
+          fi
+          # File parsing needs a working binary, not a host-kernel wrapper.
+          selected_bpftool="$(select_bpftool)"
+          "$selected_bpftool" version
+          printf 'BPFTOOL=%s\n' "$selected_bpftool" >> "$GITHUB_ENV"
+      - name: Compare declarations and layouts with independent references
+        run: |
+          clang -target bpf -O2 -g -c scripts/fixtures/btf_prototypes.c -o "$RUNNER_TEMP/prototypes.o"
+          llvm-objcopy --dump-section ".BTF=$RUNNER_TEMP/prototypes.btf" "$RUNNER_TEMP/prototypes.o"
+          gcc -std=c11 -Wall -Wextra -Werror -DRUSTFS_BTF_LAYOUT_REFERENCE \
+            scripts/fixtures/btf_prototypes.c -o "$RUNNER_TEMP/layout-reference"
+          "$RUNNER_TEMP/layout-reference" > "$RUNNER_TEMP/layout-reference.json"
+          python3 -B scripts/test_inspect_btf_prototypes.py --native-reference "$RUNNER_TEMP/prototypes.btf" \
+            --layout-reference "$RUNNER_TEMP/layout-reference.json"

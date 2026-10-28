@@ -298,7 +298,7 @@ tokio-rustls = { workspace = true, default-features = false, features = ["loggin
 aws-smithy-runtime-api = { workspace = true, features = ["http-1x"] }
 aws-smithy-types = { workspace = true }
 google-cloud-auth = { workspace = true, optional = true }
-moka = { workspace = true, features = ["sync"] }
+moka = { workspace = true, features = ["future", "sync"] }
 xxhash-rust = { workspace = true, features = ["xxh3"] }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 tokio-stream.workspace = true
@@ -393,6 +393,7 @@ object = { workspace = true, optional = true, features = ["read", "std", "elf"] 
 symbolic-demangle = { version = "=13.9.0", default-features = false, features = ["rust"], optional = true }
 
 [dev-dependencies]
+rustfs-targets = { workspace = true, features = ["test-support"] }
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
 rustfs-iam = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }

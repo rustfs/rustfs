@@ -16,7 +16,7 @@
 
 use super::storage_api::admin_usecase::admin::get_server_info;
 use super::storage_api::admin_usecase::capacity::{
-    DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolMeta, PoolStatus, RebalStatus, RebalanceMeta,
+    DecommissionUnresolvedEntry, PoolAdminDiagnostic, PoolDecommissionInfo, PoolMeta, PoolStatus, RebalStatus, RebalanceMeta,
     get_total_usable_capacity, get_total_usable_capacity_free,
 };
 use super::storage_api::admin_usecase::contract::StorageAdminApi;
@@ -143,6 +143,20 @@ pub struct AdminPoolStatus {
     pub rebalance_status: String,
     #[serde(rename = "decommissionInfo")]
     pub decommission: Option<AdminPoolDecommissionInfo>,
+    #[serde(rename = "availability", skip_serializing_if = "Option::is_none")]
+    pub availability: Option<String>,
+    #[serde(rename = "poolMetadataStatus", skip_serializing_if = "Option::is_none")]
+    pub pool_metadata_status: Option<String>,
+    #[serde(rename = "rebalanceMetadataStatus", skip_serializing_if = "Option::is_none")]
+    pub rebalance_metadata_status: Option<String>,
+    #[serde(rename = "capacityStatus", skip_serializing_if = "Option::is_none")]
+    pub capacity_status: Option<String>,
+    #[serde(
+        rename = "observedAt",
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub observed_at: Option<time::OffsetDateTime>,
 }
 
 pub type AdminPoolListItem = AdminPoolStatus;
@@ -416,12 +430,19 @@ impl DefaultAdminUsecase {
         let Some(store) = self.object_store() else {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
-        let pool_statuses = self.execute_list_pool_statuses().await?;
-        let rebalance_meta = Self::rebalance_status_snapshot(store.as_ref()).await?;
-        let mut items = Vec::with_capacity(pool_statuses.len());
-        for status in pool_statuses {
-            let rebalance_status = ECStore::pool_rebalance_status(rebalance_meta.as_ref(), status.id);
-            items.push(Self::pool_list_item_from_status(status, rebalance_status));
+        let (pool_diagnostics, pool_metadata_status) = store.admin_pool_diagnostic_snapshot(None).await;
+        let (rebalance_meta, rebalance_metadata_status) = store.rebalance_admin_diagnostic_snapshot().await;
+        let observed_at = time::OffsetDateTime::now_utc();
+        let mut items = Vec::with_capacity(pool_diagnostics.len());
+        for diagnostic in pool_diagnostics {
+            let rebalance_status = ECStore::pool_rebalance_status(rebalance_meta.as_ref(), diagnostic.id);
+            items.push(Self::pool_list_item_from_diagnostic(
+                diagnostic,
+                rebalance_status,
+                pool_metadata_status,
+                rebalance_metadata_status,
+                observed_at,
+            ));
         }
         Ok(items)
     }
@@ -456,11 +477,19 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
-        let pool_meta = Self::pool_status_snapshot(store.as_ref()).await?;
-        let status = store.status(&pool_meta, idx).await.map_err(ApiError::from)?;
-        let rebalance_meta = Self::rebalance_status_snapshot(store.as_ref()).await?;
+        let (mut diagnostics, pool_metadata_status) = store.admin_pool_diagnostic_snapshot(Some(idx)).await;
+        let diagnostic = diagnostics
+            .pop()
+            .ok_or_else(|| Self::app_error_default(S3ErrorCode::InvalidArgument))?;
+        let (rebalance_meta, rebalance_metadata_status) = store.rebalance_admin_diagnostic_snapshot().await;
         let rebalance_status = ECStore::pool_rebalance_status(rebalance_meta.as_ref(), idx);
-        Ok(Self::pool_list_item_from_status(status, rebalance_status))
+        Ok(Self::pool_list_item_from_diagnostic(
+            diagnostic,
+            rebalance_status,
+            pool_metadata_status,
+            rebalance_metadata_status,
+            time::OffsetDateTime::now_utc(),
+        ))
     }
 
     pub async fn execute_list_decommission_status(&self) -> AdminUsecaseResult<AdminDecommissionStatus> {
@@ -535,7 +564,61 @@ impl DefaultAdminUsecase {
             decommission_status: decommission_status.to_string(),
             rebalance_status: rebalance_status.to_string(),
             decommission: decommission.map(Self::admin_decommission_info_from_pool),
+            availability: None,
+            pool_metadata_status: None,
+            rebalance_metadata_status: None,
+            capacity_status: None,
+            observed_at: None,
         }
+    }
+
+    fn pool_list_item_from_diagnostic(
+        diagnostic: PoolAdminDiagnostic,
+        rebalance_status: (RebalStatus, bool),
+        pool_metadata_status: &'static str,
+        rebalance_metadata_status: &'static str,
+        observed_at: time::OffsetDateTime,
+    ) -> AdminPoolListItem {
+        let availability = diagnostic.diagnostic.availability.as_str().to_string();
+        let capacity_status = diagnostic.diagnostic.capacity_status.as_str().to_string();
+        let mut item = match diagnostic.pool {
+            Some(status) => Self::pool_list_item_from_status(status, rebalance_status),
+            None => AdminPoolStatus {
+                id: diagnostic.id,
+                cmd_line: diagnostic.cmd_line,
+                last_update: time::OffsetDateTime::UNIX_EPOCH,
+                total_size: 0,
+                current_size: 0,
+                used_size: 0,
+                used: 0.0,
+                status: Self::POOL_STATUS_UNKNOWN.to_string(),
+                decommission_status: Self::POOL_STATUS_UNKNOWN.to_string(),
+                rebalance_status: Self::POOL_STATUS_UNKNOWN.to_string(),
+                decommission: None,
+                availability: None,
+                pool_metadata_status: None,
+                rebalance_metadata_status: None,
+                capacity_status: None,
+                observed_at: None,
+            },
+        };
+        item.availability = Some(availability);
+        item.pool_metadata_status = Some(pool_metadata_status.to_string());
+        item.rebalance_metadata_status = Some(rebalance_metadata_status.to_string());
+        item.capacity_status = Some(capacity_status);
+        item.observed_at = Some(observed_at);
+        if pool_metadata_status == "unknown" {
+            item.status = Self::POOL_STATUS_UNKNOWN.to_string();
+            item.decommission_status = Self::POOL_STATUS_UNKNOWN.to_string();
+            item.decommission = None;
+        }
+        if rebalance_metadata_status != "fresh" {
+            item.rebalance_status = Self::POOL_STATUS_UNKNOWN.to_string();
+            if item.decommission.is_none() {
+                item.status = Self::POOL_STATUS_UNKNOWN.to_string();
+            }
+        }
+        item
     }
 
     fn pool_lifecycle_state(decommission: Option<&PoolDecommissionInfo>, rebalance_status: &'static str) -> &'static str {
@@ -701,9 +784,73 @@ impl DefaultAdminUsecase {
 
 #[cfg(test)]
 mod tests {
-    use super::super::storage_api::admin_usecase::capacity::{DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus};
+    use super::super::storage_api::admin_usecase::capacity::{
+        DecommissionUnresolvedEntry, PoolAvailability, PoolCapacityStatus, PoolDecommissionInfo, PoolDiagnosticStatus, PoolStatus,
+    };
     use super::*;
     use time::OffsetDateTime;
+
+    fn pool_diagnostic(
+        pool: Option<PoolStatus>,
+        availability: PoolAvailability,
+        capacity_status: PoolCapacityStatus,
+    ) -> PoolAdminDiagnostic {
+        PoolAdminDiagnostic {
+            id: pool.as_ref().map_or(1, |pool| pool.id),
+            cmd_line: pool
+                .as_ref()
+                .map_or_else(|| "pool-1".to_string(), |pool| pool.cmd_line.clone()),
+            pool,
+            diagnostic: PoolDiagnosticStatus {
+                availability,
+                capacity_status,
+            },
+        }
+    }
+
+    #[test]
+    fn admin_pool_diagnostic_serializes_availability_and_freshness() {
+        let item = DefaultAdminUsecase::pool_list_item_from_diagnostic(
+            pool_diagnostic(
+                Some(PoolStatus {
+                    id: 1,
+                    cmd_line: "pool-1".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: None,
+                }),
+                PoolAvailability::Offline,
+                PoolCapacityStatus::Cached,
+            ),
+            (RebalStatus::Started, false),
+            "stale",
+            "unknown",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+
+        assert_eq!(item.availability.as_deref(), Some("offline"));
+        assert_eq!(item.pool_metadata_status.as_deref(), Some("stale"));
+        assert_eq!(item.rebalance_metadata_status.as_deref(), Some("unknown"));
+        assert_eq!(item.capacity_status.as_deref(), Some("cached"));
+        assert_eq!(item.status, "unknown", "unverified rebalance state must not define lifecycle");
+        assert_eq!(item.rebalance_status, "unknown");
+        assert_eq!(item.observed_at, Some(OffsetDateTime::UNIX_EPOCH));
+    }
+
+    #[test]
+    fn admin_pool_diagnostic_without_metadata_never_fabricates_active_state() {
+        let item = DefaultAdminUsecase::pool_list_item_from_diagnostic(
+            pool_diagnostic(None, PoolAvailability::Unknown, PoolCapacityStatus::Unknown),
+            (RebalStatus::None, false),
+            "unknown",
+            "unknown",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+
+        assert_eq!(item.status, "unknown");
+        assert_eq!(item.decommission_status, "unknown");
+        assert_eq!(item.rebalance_status, "unknown");
+        assert_eq!(item.total_size, 0);
+    }
     use tracing_subscriber::{Layer, Registry, layer::Context, prelude::*};
 
     struct RejectEvents;

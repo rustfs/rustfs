@@ -72,6 +72,13 @@ pub(crate) mod admin {
 
 pub(crate) mod capacity {
     pub(crate) type DecommissionUnresolvedEntry = crate::storage::storage_api::ecstore_capacity::DecommissionUnresolvedEntry;
+    pub(crate) type PoolAdminDiagnostic = crate::storage::storage_api::ecstore_capacity::PoolAdminDiagnostic;
+    #[cfg(test)]
+    pub(crate) type PoolAvailability = crate::storage::storage_api::ecstore_capacity::PoolAvailability;
+    #[cfg(test)]
+    pub(crate) type PoolCapacityStatus = crate::storage::storage_api::ecstore_capacity::PoolCapacityStatus;
+    #[cfg(test)]
+    pub(crate) type PoolDiagnosticStatus = crate::storage::storage_api::ecstore_capacity::PoolDiagnosticStatus;
     pub(crate) type PoolDecommissionInfo = crate::storage::storage_api::ecstore_capacity::PoolDecommissionInfo;
     pub(crate) type PoolMeta = crate::storage::storage_api::ecstore_capacity::PoolMeta;
     pub(crate) type PoolStatus = crate::storage::storage_api::ecstore_capacity::PoolStatus;
@@ -100,6 +107,14 @@ pub(crate) mod data_usage {
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
         crate::storage::storage_api::ecstore_data_usage::load_admin_data_usage_from_backend_cached(store).await
+    }
+
+    pub(crate) async fn load_bucket_usage_from_backend_cached(
+        store: Arc<crate::storage::storage_api::ECStore>,
+        bucket: &str,
+        incarnation: uuid::Uuid,
+    ) -> Result<Option<u64>, crate::storage::storage_api::StorageError> {
+        crate::storage::storage_api::ecstore_data_usage::load_bucket_usage_from_backend_cached(store, bucket, incarnation).await
     }
 
     #[cfg(test)]
@@ -1113,8 +1128,8 @@ pub(crate) mod bucket {
             pub(crate) type QuotaChecker = crate::storage::storage_api::ecstore_bucket::quota::checker::QuotaChecker;
         }
 
-        #[cfg(test)]
         pub(crate) type BucketQuota = crate::storage::storage_api::ecstore_bucket::quota::BucketQuota;
+        pub(crate) type QuotaType = crate::storage::storage_api::ecstore_bucket::quota::QuotaType;
         pub(crate) type QuotaOperation = crate::storage::storage_api::ecstore_bucket::quota::QuotaOperation;
         pub(crate) type QuotaCheckResult = crate::storage::storage_api::ecstore_bucket::quota::QuotaCheckResult;
         pub(crate) type QuotaError = crate::storage::storage_api::ecstore_bucket::quota::QuotaError;
@@ -1639,7 +1654,6 @@ pub(crate) mod bucket_usecase {
 }
 
 pub(crate) mod object_usecase {
-    pub(crate) use super::storage_contracts::BUCKET_LIFECYCLE_LOCK_OBJECT;
     pub(crate) use super::storage_contracts::object::DeleteObjectCondition;
     pub(crate) use crate::storage::storage_api::ecstore_object::{WriteCommitGuard, WriteCompletion};
 

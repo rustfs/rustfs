@@ -52,6 +52,8 @@ pub mod object_data_cache;
 pub mod object_zip_download;
 pub mod oidc;
 pub mod on_demand_migration;
+pub mod plugin_attempt;
+pub mod plugin_delegation;
 pub mod plugins_catalog;
 pub mod plugins_instances;
 pub mod policies;

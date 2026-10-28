@@ -412,6 +412,11 @@ impl DistributedLockGuard {
         &self.lock_id
     }
 
+    /// Actual granted peer identities, which may differ from the logical guard ID.
+    pub fn granted_lock_ids(&self) -> impl Iterator<Item = &LockId> {
+        self.entries.iter().map(|entry| &entry.lock_id)
+    }
+
     /// Whether the guard's heartbeat has observed a refresh-quorum loss.
     pub fn is_lock_lost(&self) -> bool {
         self.lock_lost.is_lost()

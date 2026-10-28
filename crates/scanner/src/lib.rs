@@ -50,9 +50,9 @@ use storage_api::owner::{
 };
 #[cfg(test)]
 use storage_api::owner::{
-    EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, EcstoreEndpointServerPools, EcstoreEndpoints, EcstoreInstanceContext,
-    EcstorePoolEndpoints, ecstore_config_init, ecstore_init_bucket_metadata_sys, ecstore_init_local_disks_with_instance_ctx,
-    ecstore_new_disk,
+    EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, EcstoreEndpointServerPools, EcstoreEndpoints, EcstoreExpiryState,
+    EcstoreInstanceContext, EcstorePoolEndpoints, ecstore_config_init, ecstore_init_bucket_metadata_sys,
+    ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -125,7 +125,7 @@ pub use storage_api::scan::{
     SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
     SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES,
 };
-pub use workload_admission::set_scanner_workload_admission_snapshot_provider;
+pub use workload_admission::{set_scanner_node_admission, set_scanner_workload_admission_snapshot_provider};
 
 static SCANNER_ACTIVE_WORK_UNITS: AtomicU64 = AtomicU64::new(0);
 static SCANNER_RUNTIME_INSTANCES: AtomicU64 = AtomicU64::new(0);
@@ -682,8 +682,37 @@ fn reset_tier_name_cache_for_test() {
     TIER_REGISTRY_GENERATION.store(0, Ordering::Relaxed);
 }
 
-pub(crate) async fn enqueue_runtime_free_version(oi: ScannerObjectInfo) {
-    ecstore_expiry_state_handle().write().await.enqueue_free_version(oi);
+// Only a task running an isolated unit test can override these handles.
+#[cfg(test)]
+struct ExpiryLockTestContext {
+    state: Arc<tokio::sync::RwLock<EcstoreExpiryState>>,
+    store: Option<Arc<ECStore>>,
+    completed_incarnation_reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static EXPIRY_LOCK_TEST_CONTEXT: ExpiryLockTestContext;
+}
+
+pub(crate) async fn enqueue_runtime_free_version(oi: ScannerObjectInfo, cancellation: Option<&CancellationToken>) {
+    #[cfg(test)]
+    let state = EXPIRY_LOCK_TEST_CONTEXT
+        .try_with(|context| context.state.clone())
+        .unwrap_or_else(|_| ecstore_expiry_state_handle());
+    #[cfg(not(test))]
+    let state = ecstore_expiry_state_handle();
+    let state = match cancellation {
+        Some(cancel) => tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            state = state.write() => state,
+        },
+        None => state.write().await,
+    };
+    if !cancellation.is_some_and(CancellationToken::is_cancelled) {
+        state.enqueue_free_version(oi);
+    }
 }
 
 pub(crate) async fn enqueue_runtime_newer_noncurrent(
@@ -691,20 +720,50 @@ pub(crate) async fn enqueue_runtime_newer_noncurrent(
     to_delete_objs: Vec<ObjectToDelete>,
     event: Event,
     src: &LcEventSrc,
+    cancellation: Option<&CancellationToken>,
 ) -> bool {
-    let Some(store) = ecstore_resolve_object_store_handle() else {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return false;
+    }
+    #[cfg(test)]
+    let store = EXPIRY_LOCK_TEST_CONTEXT
+        .try_with(|context| context.store.clone())
+        .unwrap_or_else(|_| ecstore_resolve_object_store_handle());
+    #[cfg(not(test))]
+    let store = ecstore_resolve_object_store_handle();
+    let Some(store) = store else {
         return false;
     };
     let Ok(bucket_incarnation_id) = store.bucket_incarnation_id(bucket).await else {
         return false;
     };
-    ecstore_expiry_state_handle().write().await.enqueue_by_newer_noncurrent(
-        bucket,
-        to_delete_objs,
-        event,
-        src,
-        bucket_incarnation_id,
-    )
+    #[cfg(test)]
+    let _ = EXPIRY_LOCK_TEST_CONTEXT.try_with(|context| {
+        context
+            .completed_incarnation_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return false;
+    }
+    #[cfg(test)]
+    let state = EXPIRY_LOCK_TEST_CONTEXT
+        .try_with(|context| context.state.clone())
+        .unwrap_or_else(|_| ecstore_expiry_state_handle());
+    #[cfg(not(test))]
+    let state = ecstore_expiry_state_handle();
+    let mut state = match cancellation {
+        Some(cancel) => tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return false,
+            state = state.write() => state,
+        },
+        None => state.write().await,
+    };
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return false;
+    }
+    state.enqueue_by_newer_noncurrent(bucket, to_delete_objs, event, src, bucket_incarnation_id)
 }
 
 pub(crate) async fn queue_replication_heal(

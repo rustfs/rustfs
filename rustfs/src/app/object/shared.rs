@@ -564,6 +564,29 @@ pub(super) fn inject_accept_ranges_header(headers: &mut HeaderMap) {
     headers.insert(http::header::ACCEPT_RANGES, HeaderValue::from_static(ACCEPT_RANGES_BYTES));
 }
 
+/// Reject a mutation of a Veeam SOSAPI key while the feature is enabled.
+///
+/// The store closure runs only after the key matches, so ordinary object
+/// writes pay two string compares. Bucket existence is checked first so a
+/// missing bucket stays `NoSuchBucket`.
+pub(crate) async fn reject_veeam_sosapi_mutation(
+    store: impl FnOnce() -> Option<Arc<ECStore>>,
+    bucket: &str,
+    key: &str,
+) -> S3Result<()> {
+    if !super::veeam_sosapi::mutation_blocked(key) {
+        return Ok(());
+    }
+    let Some(store) = store() else {
+        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+    };
+    validate_bucket_exists(&store, bucket).await?;
+    Err(S3Error::with_message(
+        S3ErrorCode::MethodNotAllowed,
+        "Veeam SOSAPI system objects are read-only",
+    ))
+}
+
 /// Derive the response-header echo pairs for an additional-checksum algorithm
 /// (XXHash3/64/128, SHA-512) from the server-computed content checksum, for
 /// PutObject to echo back (#1256). Returns empty for the five s3s-typed algorithms

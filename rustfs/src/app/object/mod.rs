@@ -135,7 +135,6 @@ use rustfs_filemeta::{NULL_VERSION_ID, RestoreStatusOps, parse_restore_obj_statu
 use rustfs_gateway_types::persistence::PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration;
 use rustfs_io_core::{BytesPool, PooledBuffer};
 use rustfs_io_metrics;
-use rustfs_lock::NamespaceLockGuard;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 use rustfs_policy::policy::action::{Action, S3Action};
@@ -220,8 +219,8 @@ mod restore;
 pub(crate) mod shared;
 #[cfg(test)]
 mod test_support;
+mod veeam_sosapi;
 
-pub(crate) use self::copy::*;
 #[cfg(test)]
 pub(crate) use self::delete::*;
 pub(crate) use self::extract::*;
@@ -264,9 +263,8 @@ use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
 use super::storage_api::object_usecase::{
-    BUCKET_LIFECYCLE_LOCK_OBJECT, GetObjectReader, StorageDeletedObject, StorageObjectInfo as ObjectInfo,
-    StorageObjectLockDeleteOptions, StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete,
-    StoragePutObjReader as PutObjReader,
+    GetObjectReader, StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectLockDeleteOptions,
+    StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
 };
 use crate::app::object_data_cache::{
     ColdFillCoordinateOutcome, ColdFillDiskPermitOwner, ColdFillError, ColdFillProducer, GetObjectBodyCacheLookup,

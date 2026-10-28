@@ -634,6 +634,14 @@ async fn notify_bucket_metadata_reload(
     notify_bucket_metadata_reload_with_context(bucket, operation, request_context, scanner_maintenance_change, None).await;
 }
 
+pub(crate) async fn notify_table_bucket_metadata_reload(
+    bucket: String,
+    operation: &'static str,
+    app_context: Option<Arc<AppContext>>,
+) {
+    notify_bucket_metadata_reload_with_context(bucket, operation, None, false, app_context).await;
+}
+
 async fn notify_bucket_metadata_reload_with_context(
     bucket: String,
     operation: &'static str,

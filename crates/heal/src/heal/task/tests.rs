@@ -16,6 +16,7 @@ use super::super::{DiskOption, DiskStore, Endpoint, new_disk};
 use super::*;
 use crate::heal::EcstoreError;
 use crate::heal::storage::HealStorageObjectResult;
+use crate::heal::storage_api::owner::{EcstorePoolMetadataError, EcstorePoolMetadataFailure};
 
 mod absent_verdict;
 mod concurrent_delete;
@@ -784,7 +785,10 @@ mod canonical_outcome {
     async fn untraversable_bucket_does_not_claim_complete_cluster_coverage() {
         let storage = Arc::new(MockStorage {
             listed_buckets: Mutex::new(Some(vec!["bucket-a".to_string(), "bucket-b".to_string()])),
-            bucket_heal_errors: Mutex::new(HashMap::from([("bucket-a".to_string(), VecDeque::from(["metadata unavailable"]))])),
+            bucket_heal_errors: Mutex::new(HashMap::from([(
+                "bucket-a".to_string(),
+                VecDeque::from([Error::other("metadata unavailable")]),
+            )])),
             ..Default::default()
         });
         let task = HealTask::from_request(
@@ -1566,7 +1570,7 @@ struct MockStorage {
     include_object_dir_candidate: Mutex<bool>,
     listed_buckets: Mutex<Option<Vec<String>>>,
     bucket_discovery_incomplete: bool,
-    bucket_heal_errors: Mutex<HashMap<String, VecDeque<&'static str>>>,
+    bucket_heal_errors: Mutex<HashMap<String, VecDeque<Error>>>,
     bucket_heal_calls: Mutex<Vec<String>>,
     delete_recovery_results: Mutex<HashMap<String, Result<Option<HealResultItem>>>>,
     delete_recovery_calls: Mutex<Vec<String>>,
@@ -1990,6 +1994,7 @@ fn replacement_identity(
 
 #[derive(Clone)]
 enum MockHealObjectOutcome {
+    PoolMetadata { kind: EcstorePoolMetadataFailure, outer: bool },
     LegacyAmbiguous { outer: bool },
     MissingObject { outer: bool },
     MissingVersion,
@@ -2007,6 +2012,16 @@ enum MockHealObjectOutcome {
     InternodeHttp(http::StatusCode),
     RetryableSlowDown,
     PermanentOther(&'static str),
+}
+
+fn pool_metadata_error(kind: EcstorePoolMetadataFailure) -> Error {
+    Error::Storage(EcstoreError::other(EcstorePoolMetadataError {
+        kind,
+        operation: "bucket heal".to_owned(),
+        phase: "native_heal",
+        since: std::time::UNIX_EPOCH.into(),
+        source: None,
+    }))
 }
 
 fn unavailable_drive_heal_result(state: DriveState) -> (HealResultItem, Option<Error>) {
@@ -2180,6 +2195,14 @@ impl HealStorageAPI for MockStorage {
             .and_then(VecDeque::pop_front)
         {
             return match outcome {
+                MockHealObjectOutcome::PoolMetadata { kind, outer } => {
+                    let error = pool_metadata_error(kind);
+                    if outer {
+                        Err(error)
+                    } else {
+                        Ok((HealResultItem::default(), Some(error)))
+                    }
+                }
                 MockHealObjectOutcome::LegacyAmbiguous { outer } => {
                     let error = Error::Storage(EcstoreError::DeleteRecoveryLegacyAmbiguous);
                     if outer {
@@ -2256,6 +2279,14 @@ impl HealStorageAPI for MockStorage {
         }
         if let Some(outcome) = self.heal_object_outcome.lock().unwrap().take() {
             return match outcome {
+                MockHealObjectOutcome::PoolMetadata { kind, outer } => {
+                    let error = pool_metadata_error(kind);
+                    if outer {
+                        Err(error)
+                    } else {
+                        Ok((HealResultItem::default(), Some(error)))
+                    }
+                }
                 MockHealObjectOutcome::LegacyAmbiguous { outer } => {
                     let error = Error::Storage(EcstoreError::DeleteRecoveryLegacyAmbiguous);
                     if outer {
@@ -2387,14 +2418,14 @@ impl HealStorageAPI for MockStorage {
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
         self.bucket_heal_calls.lock().unwrap().push(bucket.to_string());
         self.bucket_heal_opts.lock().unwrap().push(*opts);
-        if let Some(message) = self
+        if let Some(error) = self
             .bucket_heal_errors
             .lock()
             .unwrap()
             .get_mut(bucket)
             .and_then(VecDeque::pop_front)
         {
-            return Err(Error::other(message));
+            return Err(error);
         }
         Ok(HealResultItem::default())
     }
@@ -2913,6 +2944,44 @@ fn mrf_task_for_item(object: &str, item: HealResultItem) -> (HealTask, Arc<MockS
 }
 
 #[tokio::test]
+async fn durable_mrf_slowdown_remains_retryable_without_a_storage_receipt() {
+    let (task, storage) = mrf_task_for_item("object", HealResultItem::default());
+    *storage.heal_object_outcome.lock().unwrap() = Some(MockHealObjectOutcome::RetryableSlowDown);
+
+    let error = task
+        .execute()
+        .await
+        .expect_err("a failed repair cannot discharge the responsibility");
+    assert!(matches!(error, Error::Storage(EcstoreError::SlowDown)), "{error:?}");
+    assert!(error.is_recoverable_heal());
+    assert_eq!(task.get_outcome().await.counters.healed, 0);
+}
+
+#[tokio::test]
+async fn durable_mrf_grace_remains_owned_by_the_responsibility() {
+    let (task, storage) = mrf_task_for_item("object", HealResultItem::default());
+    *storage.heal_object_outcome.lock().unwrap() = Some(MockHealObjectOutcome::DanglingGraceDeferred);
+
+    let error = task.execute().await.expect_err("grace must retain the responsibility");
+    assert!(error.is_dangling_delete_grace());
+    assert!(!error.is_recoverable_heal());
+    assert_eq!(task.get_outcome().await.counters.healed, 0);
+}
+
+#[tokio::test]
+async fn durable_mrf_unverified_object_names_cannot_change_retry_classification() {
+    for object in ["ordinary", "timed out", "network error"] {
+        let (task, _) = mrf_task_for_item(object, HealResultItem::default());
+        let error = task
+            .execute()
+            .await
+            .expect_err("missing proof must retain the responsibility");
+        assert!(!error.is_recoverable_heal(), "object name must not change retry classification: {object}");
+        assert_eq!(task.get_outcome().await.counters.healed, 0);
+    }
+}
+
+#[tokio::test]
 async fn mrf_legacy_object_names_cannot_change_retry_classification() {
     for object in [
         "ordinary",
@@ -3391,11 +3460,68 @@ async fn cluster_recreate_fails_when_pool_metadata_heal_fails() {
         .await
         .expect_err("cluster recreate heal must not hide pool metadata failure");
 
-    assert!(matches!(err, Error::TaskExecutionFailed { .. }));
+    assert!(matches!(err, Error::Other(ref message) if message == "pool metadata missing"));
     assert_eq!(
         storage.heal_object_calls.lock().expect("object calls").as_slice(),
         ["object-a".to_string(), "object-b".to_string(), POOL_META_NAME.to_string()]
     );
+}
+
+#[tokio::test]
+async fn cluster_pool_metadata_failures_preserve_recovery_classification_in_both_response_shapes() {
+    for outer in [false, true] {
+        for (kind, retryable) in [
+            (EcstorePoolMetadataFailure::ReadUnavailable, true),
+            (EcstorePoolMetadataFailure::TransactionUnknown, true),
+            (EcstorePoolMetadataFailure::RecoveryRequired, false),
+            (EcstorePoolMetadataFailure::FenceLost, false),
+        ] {
+            let storage = Arc::new(MockStorage {
+                listed_buckets: Mutex::new(Some(Vec::new())),
+                ..Default::default()
+            });
+            storage.heal_object_outcomes.lock().expect("object outcomes").insert(
+                POOL_META_NAME.to_string(),
+                VecDeque::from([MockHealObjectOutcome::PoolMetadata { kind, outer }]),
+            );
+            let mut request = HealRequest::new(
+                HealType::Cluster,
+                HealOptions {
+                    recreate_missing: true,
+                    timeout: None,
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            );
+            request.source = HealRequestSource::Admin;
+            let task = HealTask::from_request(request, storage.clone());
+            let error = task
+                .execute()
+                .await
+                .expect_err("pool metadata failure must reach the scheduler");
+            assert!(
+                matches!(&error, Error::Storage(error) if error.pool_metadata_failure().is_some_and(|failure| failure.kind == kind)),
+                "the original typed pool metadata state must survive either response shape: {error}"
+            );
+            assert_eq!(error.is_recoverable_heal(), retryable, "{kind:?}, outer={outer}");
+            assert_eq!(storage.heal_object_calls.lock().expect("object calls").as_slice(), [POOL_META_NAME]);
+            if retryable {
+                let retry = task
+                    .retry_request_with_remaining_timeout()
+                    .await
+                    .expect("existing retry request");
+                assert_eq!(retry.id, task.id, "recovery retains the accepted task token");
+                HealTask::from_request(retry, storage.clone())
+                    .execute()
+                    .await
+                    .expect("the same task should complete after pool metadata recovery");
+                assert_eq!(
+                    storage.heal_object_calls.lock().expect("object calls").as_slice(),
+                    [POOL_META_NAME, POOL_META_NAME]
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -3761,7 +3887,10 @@ async fn test_recursive_bucket_heal_reports_typed_exhausted_and_permanent_failur
 async fn test_cluster_heal_continues_after_bucket_failure() {
     let storage = Arc::new(MockStorage {
         listed_buckets: Mutex::new(Some(vec!["bucket-a".to_string(), "bucket-b".to_string()])),
-        bucket_heal_errors: Mutex::new(HashMap::from([("bucket-a".to_string(), VecDeque::from(["metadata unavailable"]))])),
+        bucket_heal_errors: Mutex::new(HashMap::from([(
+            "bucket-a".to_string(),
+            VecDeque::from([Error::other("metadata unavailable")]),
+        )])),
         ..Default::default()
     });
     let request = HealRequest::new(
@@ -3793,7 +3922,10 @@ async fn test_cluster_heal_continues_after_bucket_failure() {
 async fn test_cluster_heal_retries_only_recoverable_bucket() {
     let storage = Arc::new(MockStorage {
         listed_buckets: Mutex::new(Some(vec!["bucket-a".to_string(), "bucket-b".to_string()])),
-        bucket_heal_errors: Mutex::new(HashMap::from([("bucket-a".to_string(), VecDeque::from(["lock acquisition timeout"]))])),
+        bucket_heal_errors: Mutex::new(HashMap::from([(
+            "bucket-a".to_string(),
+            VecDeque::from([Error::other("lock acquisition timeout")]),
+        )])),
         ..Default::default()
     });
     let request = HealRequest::new(
@@ -3815,6 +3947,47 @@ async fn test_cluster_heal_retries_only_recoverable_bucket() {
         storage.bucket_heal_calls.lock().unwrap().as_slice(),
         ["bucket-a".to_string(), "bucket-a".to_string(), "bucket-b".to_string()]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cluster_bucket_heal_retries_only_recoverable_pool_metadata_failures() {
+    for (kind, retryable) in [
+        (EcstorePoolMetadataFailure::ReadUnavailable, true),
+        (EcstorePoolMetadataFailure::TransactionUnknown, true),
+        (EcstorePoolMetadataFailure::RecoveryRequired, false),
+        (EcstorePoolMetadataFailure::FenceLost, false),
+    ] {
+        let storage = Arc::new(MockStorage {
+            bucket_incarnation_id: Mutex::new(Some(Uuid::new_v4())),
+            bucket_heal_errors: Mutex::new(HashMap::from([("bucket-a".to_owned(), VecDeque::from([pool_metadata_error(kind)]))])),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Cluster,
+            HealOptions {
+                recursive: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Admin;
+        let task = HealTask::from_request(request, storage.clone());
+        let result = task.execute().await;
+        if retryable {
+            result.expect("a recoverable pool metadata state must not terminate the root heal");
+            assert_eq!(task.get_status().await, HealTaskStatus::Completed);
+            assert_eq!(
+                storage.bucket_heal_calls.lock().expect("bucket calls").as_slice(),
+                ["bucket-a", "bucket-a"]
+            );
+        } else {
+            result.expect_err("operator recovery and lost fences must remain terminal");
+            let failure = task.take_batch_failure().await.expect("permanent cluster failure");
+            assert_eq!((failure.retryable, failure.permanent), (0, 1));
+            assert_eq!(storage.bucket_heal_calls.lock().expect("bucket calls").as_slice(), ["bucket-a"]);
+        }
+    }
 }
 
 #[tokio::test]
@@ -4579,7 +4752,7 @@ async fn erasure_set_bucket_prepass_failure_stops_before_object_heal() {
     let storage = Arc::new(MockStorage {
         bucket_heal_errors: Mutex::new(HashMap::from([(
             "bucket-a".to_string(),
-            VecDeque::from(["injected bucket prepass failure"]),
+            VecDeque::from([Error::other("injected bucket prepass failure")]),
         )])),
         resume_disk: Mutex::new(Some(disk)),
         ..Default::default()

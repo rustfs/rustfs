@@ -16,9 +16,10 @@ use rustfs_io_metrics::internode_metrics::INTERNODE_OPERATION_PUT_FILE_STREAM;
 use rustfs_rio::{InternodeHttpError, InternodeHttpErrorKind};
 use thiserror::Error;
 
-use super::heal::{DiskError, EcstoreError};
+use super::heal::{DiskError, EcstoreError, storage_api::owner::EcstorePoolMetadataFailure};
 
 const HEAL_DANGLING_DELETE_GRACE_MESSAGE: &str = "dangling object deletion deferred by heal grace window";
+pub(crate) const MRF_MISSING_PROOF_PREFIX: &str = "Missing exact storage proof for durable MRF repair ";
 
 /// Custom error type for heal operations
 /// This enum defines various error variants that can occur during
@@ -221,6 +222,7 @@ pub(crate) fn classify_heal_error(error: &Error) -> HealErrorClass {
         Error::Storage(error) => classify_storage_error(error),
         Error::Disk(error) => classify_disk_error(error),
         Error::Io(error) => classify_io_error(error),
+        Error::TaskExecutionFailed { message } if message.starts_with(MRF_MISSING_PROOF_PREFIX) => HealErrorClass::Permanent,
         Error::TaskExecutionFailed { message } | Error::Other(message) => {
             classify_error_display(message).unwrap_or(HealErrorClass::Permanent)
         }
@@ -234,6 +236,14 @@ pub(crate) fn classify_heal_error(error: &Error) -> HealErrorClass {
 /// with object absence, the conflation that once let an offline drive be
 /// recorded as absent and skipped (backlog#856 / #799 B7).
 pub(crate) fn classify_storage_error(error: &EcstoreError) -> HealErrorClass {
+    if let Some(failure) = error.pool_metadata_failure() {
+        return match failure.kind {
+            EcstorePoolMetadataFailure::ReadUnavailable | EcstorePoolMetadataFailure::TransactionUnknown => {
+                HealErrorClass::Transient
+            }
+            EcstorePoolMetadataFailure::RecoveryRequired | EcstorePoolMetadataFailure::FenceLost => HealErrorClass::Permanent,
+        };
+    }
     if let EcstoreError::Lock(lock_error) = error {
         return if lock_error.is_fatal() {
             HealErrorClass::Permanent
@@ -436,6 +446,34 @@ impl From<Error> for std::io::Error {
 mod tests {
     use super::Error;
     use crate::heal::{DiskError, EcstoreError};
+
+    #[test]
+    fn pool_metadata_failures_keep_their_typed_recovery_classification() {
+        use crate::heal::storage_api::owner::{EcstorePoolMetadataError, EcstorePoolMetadataFailure};
+
+        for (kind, retryable) in [
+            (EcstorePoolMetadataFailure::ReadUnavailable, true),
+            (EcstorePoolMetadataFailure::TransactionUnknown, true),
+            (EcstorePoolMetadataFailure::RecoveryRequired, false),
+            (EcstorePoolMetadataFailure::FenceLost, false),
+        ] {
+            let error = EcstoreError::other(EcstorePoolMetadataError {
+                kind,
+                operation: "bucket heal".to_owned(),
+                phase: "native_heal",
+                since: std::time::UNIX_EPOCH.into(),
+                source: Some(std::sync::Arc::new(EcstoreError::SlowDown)),
+            });
+            let text = error.to_string();
+            for error in [error.clone(), error] {
+                assert_eq!(Error::Storage(error).is_recoverable_heal(), retryable, "{kind:?}");
+            }
+            assert!(
+                !Error::Storage(EcstoreError::other(text)).is_recoverable_heal(),
+                "display text must not grant recovery authority"
+            );
+        }
+    }
 
     #[test]
     fn namespace_lock_quorum_is_recoverable_across_io_error_conversions() {

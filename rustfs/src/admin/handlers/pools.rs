@@ -1498,6 +1498,11 @@ mod pools_handler_tests {
                 decommission_status: "none".to_string(),
                 rebalance_status: "none".to_string(),
                 decommission: None,
+                availability: None,
+                pool_metadata_status: None,
+                rebalance_metadata_status: None,
+                capacity_status: None,
+                observed_at: None,
             },
             admin_discovery: super::PoolAdminDiscovery {
                 runtime_capabilities: "/rustfs/admin/v4/runtime/capabilities".to_string(),

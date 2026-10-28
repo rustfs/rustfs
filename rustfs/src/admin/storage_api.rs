@@ -822,6 +822,12 @@ pub(crate) async fn read_admin_config_without_migrate(api: Arc<ECStore>) -> Resu
     ecstore_config::com::read_config_without_migrate(api).await
 }
 
+pub(crate) async fn read_admin_server_config_with_generation(
+    api: Arc<ECStore>,
+) -> Result<(rustfs_config::server_config::Config, Option<uuid::Uuid>)> {
+    crate::storage::storage_api::read_server_config_with_generation(api).await
+}
+
 pub(crate) async fn read_existing_admin_server_config_no_lock(api: Arc<ECStore>) -> Result<rustfs_config::server_config::Config> {
     ecstore_config::com::read_existing_server_config_no_lock(api).await
 }
@@ -997,8 +1003,8 @@ pub(crate) mod config {
     pub(crate) use super::{
         AdminServerConfigSaveResult, AdminServerConfigSnapshot, RUSTFS_META_BUCKET, STORAGE_CLASS_SUB_SYS, delete_admin_config,
         init_admin_config_defaults, read_admin_config, read_admin_config_without_migrate, read_admin_server_config_snapshot,
-        read_existing_admin_server_config_no_lock, save_admin_config, save_admin_server_config_snapshot,
-        with_admin_server_config_read_lock,
+        read_admin_server_config_with_generation, read_existing_admin_server_config_no_lock, save_admin_config,
+        save_admin_server_config_snapshot, with_admin_server_config_read_lock,
     };
     #[cfg(test)]
     pub(crate) use super::{

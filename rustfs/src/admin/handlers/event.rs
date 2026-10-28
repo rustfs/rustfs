@@ -52,7 +52,7 @@ use tracing::{error, info, warn};
 
 const LOG_COMPONENT_ADMIN_API: &str = "admin_api";
 
-async fn converge_target_mutation_on_cluster(
+pub(super) async fn converge_target_mutation_on_cluster(
     context: Option<&AppContext>,
     target_type: &str,
     local_result: Result<(), rustfs_notify::NotificationError>,
@@ -62,18 +62,26 @@ async fn converge_target_mutation_on_cluster(
 
     match (local_result, peer_result) {
         (Ok(()), Ok(())) => Ok(()),
-        (Err(local), Ok(())) => {
-            warn!(target_type, error = %local, "Local notification runtime failed to converge");
-            Err(s3_error!(InternalError, "local notification runtime failed to converge"))
-        }
-        (Ok(()), Err(peer)) => Err(peer),
-        (Err(local), Err(peer)) => {
-            warn!(target_type, error = %local, "Local notification runtime failed while peer convergence also failed");
-            Err(s3_error!(
-                InternalError,
-                "local notification runtime and peer convergence failed: {}",
-                peer
-            ))
+        (Ok(()), Err(_)) => Err(s3_error!(
+            InternalError,
+            "notification target update completed locally but peer convergence failed"
+        )),
+        (Err(local), peer) => {
+            let peer_failed = peer.is_err();
+            let message = match local {
+                rustfs_notify::NotificationError::ConfigurationConvergence { persisted: true, .. } => {
+                    "notification target configuration was persisted but local runtime convergence failed"
+                }
+                rustfs_notify::NotificationError::ConfigurationConvergence { persisted: false, .. } => {
+                    "notification target configuration was unchanged but local runtime convergence failed"
+                }
+                _ => "notification target update failed; persistence status is unknown",
+            };
+            if peer_failed {
+                Err(s3_error!(InternalError, "{}; peer convergence also failed", message))
+            } else {
+                Err(s3_error!(InternalError, "{}", message))
+            }
         }
     }
 }
@@ -86,7 +94,7 @@ fn notification_target_subsystem(target_type: &str) -> S3Result<&'static str> {
         .ok_or_else(|| s3_error!(InvalidArgument, "unsupported notification target type: {}", target_type))
 }
 
-async fn preflight_target_mutation_on_cluster(context: Option<&AppContext>, target_type: &str) -> S3Result<()> {
+pub(super) async fn preflight_target_mutation_on_cluster(context: Option<&AppContext>, target_type: &str) -> S3Result<()> {
     preflight_dynamic_config_reload_for_context(context, notification_target_subsystem(target_type)?).await
 }
 
@@ -704,7 +712,7 @@ mod tests {
         use crate::admin::handlers::{
             audit::ListAuditTargets,
             extensions::ListExtensionInstancesHandler,
-            plugins_instances::{GetPluginInstanceHandler, ListPluginInstancesHandler},
+            plugins_instances::{GetPluginInstanceHandler, ListPluginInstancesHandler, PutPluginInstanceHandler},
             target_read::load_target_read_snapshot,
         };
         use crate::admin::storage_api::config::{
@@ -767,6 +775,154 @@ mod tests {
                 .await
                 .expect("persist target without loading it into the runtime");
 
+            // A concurrent credential rotation must be observed under the commit transaction.
+            let initial = crate::admin::storage_api::config::read_admin_config_without_migrate(env.ecstore.clone())
+                .await
+                .expect("read initial notify config");
+            let generation_before = {
+                let snapshot = crate::admin::storage_api::config::read_admin_server_config_snapshot(env.ecstore.clone())
+                    .await
+                    .expect("read initial generation");
+                snapshot.generation().expect("test config has an object generation")
+            };
+            let expected = initial.0[NOTIFY_WEBHOOK_SUB_SYS]["unavailable"].clone();
+            let expected_default = initial.0[NOTIFY_WEBHOOK_SUB_SYS]
+                .get(rustfs_config::DEFAULT_DELIMITER)
+                .cloned();
+            let mut rotated = initial.clone();
+            rotated
+                .0
+                .get_mut(NOTIFY_WEBHOOK_SUB_SYS)
+                .expect("subsystem")
+                .get_mut("unavailable")
+                .expect("target")
+                .insert(rustfs_config::WEBHOOK_AUTH_TOKEN.to_owned(), "rotated-secret".to_owned());
+            save_admin_server_config(env.ecstore.clone(), &rotated)
+                .await
+                .expect("persist concurrent rotation");
+            let generation_after = {
+                let snapshot = crate::admin::storage_api::config::read_admin_server_config_snapshot(env.ecstore.clone())
+                    .await
+                    .expect("read rotated generation");
+                snapshot.generation().expect("rotated config has an object generation")
+            };
+            assert_ne!(generation_before, generation_after, "content change must publish a new generation");
+            let system = rustfs_notify::NotificationSystem::new(Config::default());
+            let result = system
+                .set_target_config_if_unchanged(
+                    NOTIFY_WEBHOOK_SUB_SYS,
+                    "unavailable",
+                    Some(expected.clone()),
+                    expected_default,
+                    None,
+                    expected,
+                )
+                .await;
+            assert!(matches!(result, Err(rustfs_notify::NotificationError::ConfigurationConflict)));
+            let actual = crate::admin::storage_api::config::read_admin_config_without_migrate(env.ecstore.clone())
+                .await
+                .expect("read rotated config");
+            assert_eq!(
+                actual.0[NOTIFY_WEBHOOK_SUB_SYS]["unavailable"]
+                    .lookup(rustfs_config::WEBHOOK_AUTH_TOKEN)
+                    .as_deref(),
+                Some("rotated-secret")
+            );
+            save_admin_server_config(env.ecstore.clone(), &initial)
+                .await
+                .expect("restore inventory config");
+            let generation = {
+                let snapshot = crate::admin::storage_api::config::read_admin_server_config_snapshot(env.ecstore.clone())
+                    .await
+                    .expect("read revision baseline");
+                snapshot.generation().expect("baseline generation").to_string()
+            };
+            let mut unrelated = initial.clone();
+            let mut other = KVS::new();
+            other.insert("enable".into(), "off".into());
+            other.insert("endpoint".into(), "http://127.0.0.1:9/other".into());
+            unrelated
+                .0
+                .entry(NOTIFY_WEBHOOK_SUB_SYS.to_owned())
+                .or_default()
+                .insert("other".to_owned(), other);
+            save_admin_server_config(env.ecstore.clone(), &unrelated)
+                .await
+                .expect("persist unrelated update");
+            let target = initial.0[NOTIFY_WEBHOOK_SUB_SYS]["unavailable"].clone();
+            let default = initial.0[NOTIFY_WEBHOOK_SUB_SYS]
+                .get(rustfs_config::DEFAULT_DELIMITER)
+                .cloned();
+            let result = system
+                .set_target_config_if_unchanged(
+                    NOTIFY_WEBHOOK_SUB_SYS,
+                    "unavailable",
+                    Some(target.clone()),
+                    default,
+                    Some(generation),
+                    target,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(rustfs_notify::NotificationError::ConfigurationConflict)),
+                "revision changes must reject even when target remains unchanged"
+            );
+            save_admin_server_config(env.ecstore.clone(), &initial)
+                .await
+                .expect("restore after unrelated update");
+
+            let mut with_default = initial.clone();
+            let mut default = KVS::new();
+            default.insert("queue_limit".into(), "15".into());
+            with_default
+                .0
+                .get_mut(NOTIFY_WEBHOOK_SUB_SYS)
+                .expect("subsystem")
+                .insert("_".into(), default.clone());
+            save_admin_server_config(env.ecstore.clone(), &with_default)
+                .await
+                .expect("persist inherited default");
+            let saved = crate::admin::storage_api::config::read_admin_config_without_migrate(env.ecstore.clone())
+                .await
+                .expect("read inherited config");
+            let original = saved.0[NOTIFY_WEBHOOK_SUB_SYS]["unavailable"].clone();
+            let old_default = saved.0[NOTIFY_WEBHOOK_SUB_SYS].get("_").cloned();
+            let expected = std::collections::HashMap::from([
+                ("endpoint".to_owned(), "http://127.0.0.1:9/hook".to_owned()),
+                ("queue_limit".to_owned(), "15".to_owned()),
+            ]);
+            let mut validated = original.clone();
+            validated.insert("endpoint".into(), "http://127.0.0.1:9/changed".into());
+            validated.insert("queue_limit".into(), "15".into());
+            let update = crate::admin::handlers::plugins_instances::merge_conditional_target_update(
+                &original,
+                &expected,
+                &["endpoint".into()],
+                &validated,
+            )
+            .expect("merge only edited field");
+            let result = system
+                .set_target_config_if_unchanged(NOTIFY_WEBHOOK_SUB_SYS, "unavailable", Some(original), old_default, None, update)
+                .await;
+            assert!(
+                result.is_ok()
+                    || matches!(
+                        result,
+                        Err(rustfs_notify::NotificationError::ConfigurationConvergence { persisted: true, .. })
+                    )
+            );
+            let saved = crate::admin::storage_api::config::read_admin_config_without_migrate(env.ecstore.clone())
+                .await
+                .expect("read conditional update");
+            assert_eq!(
+                saved.0[NOTIFY_WEBHOOK_SUB_SYS]["unavailable"].lookup("endpoint").as_deref(),
+                Some("http://127.0.0.1:9/changed")
+            );
+            assert_eq!(saved.0[NOTIFY_WEBHOOK_SUB_SYS]["unavailable"].lookup("queue_limit"), None);
+            assert_eq!(saved.0[NOTIFY_WEBHOOK_SUB_SYS]["_"].lookup("queue_limit").as_deref(), Some("15"));
+            save_admin_server_config(env.ecstore.clone(), &initial)
+                .await
+                .expect("restore inventory config");
             let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();
             let store = env.ecstore.clone();
@@ -793,6 +949,57 @@ mod tests {
             let (observed_config, ()) = snapshot.await.expect("snapshot task").expect("read durable snapshot");
             assert!(observed_config.0[NOTIFY_WEBHOOK_SUB_SYS].contains_key("unavailable"));
             mark_event_notifier_unreconciled();
+
+            // Conditional edits reject stale revisions before target validation or persistence.
+            let mut router = Router::new();
+            router.insert("/{id}", ()).expect("plugin detail route");
+            let matched = router.at("/builtin:webhook:notify:unavailable").expect("plugin params");
+            let transaction_guard = crate::admin::storage_api::config::read_admin_server_config_snapshot(env.ecstore.clone())
+                .await
+                .expect("hold config transaction lock");
+            let generation = transaction_guard.generation().expect("config generation").to_string();
+            let detail = response_json(GetPluginInstanceHandler {}.call(
+                request("/rustfs/admin/v4/plugins/instances/builtin:webhook:notify:unavailable"),
+                matched.params,
+            ))
+            .await
+            .expect("read conditional edit baseline");
+            let revision = detail["config_revision"].as_str().expect("GET includes opaque revision");
+            assert_eq!(
+                revision,
+                crate::admin::handlers::plugins_instances::config_revision("builtin:webhook:notify:unavailable", &generation)
+            );
+            assert_eq!(detail["config"]["auth_token"], "***redacted***");
+            drop(transaction_guard);
+            let put = crate::admin::operation::test_support::TestRequest::new(
+                Method::PUT,
+                "/rustfs/admin/v4/plugins/instances/builtin:webhook:notify:unavailable",
+            )
+            .credentials(&credentials.access_key, &credentials.secret_key, None)
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "expected_config": detail["config"],
+                    "expected_revision": "stale",
+                    "key_values": [{"key":"auth_token", "value":"replacement-secret"}]
+                }))
+                .expect("encode conditional edit"),
+            )
+            .build();
+            let matched = router.at("/builtin:webhook:notify:unavailable").expect("plugin params");
+            let err = PutPluginInstanceHandler {}
+                .call(put, matched.params)
+                .await
+                .expect_err("stale revision must be rejected");
+            assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+            let after = crate::admin::storage_api::config::read_admin_config_without_migrate(env.ecstore.clone())
+                .await
+                .expect("read unchanged config");
+            assert_eq!(
+                after.0[NOTIFY_WEBHOOK_SUB_SYS]["unavailable"]
+                    .lookup(rustfs_config::WEBHOOK_AUTH_TOKEN)
+                    .as_deref(),
+                Some("inventory-secret-token")
+            );
 
             with_notify_runtime_reconcile_lock(async {
                 for initialize_runtime in [false, true] {

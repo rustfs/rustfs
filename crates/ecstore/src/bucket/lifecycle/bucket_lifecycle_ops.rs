@@ -63,6 +63,7 @@ use crate::services::tier::{
 };
 use crate::set_disk::{
     MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks, get_lock_acquire_timeout,
+    multipart_part_logical_size, should_persist_encryption_original_size,
 };
 use crate::storage_api_contracts::{
     lifecycle::ExpirationOptions,
@@ -87,8 +88,8 @@ use rustfs_filemeta::{
     FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatus, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info,
     is_restored_object_on_disk,
 };
-use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
 use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
+use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedLifecycleFilter};
 use rustfs_lifecycle::{RestoreRequest, RestoreS3Location};
 use rustfs_lock::{NamespaceLockGuard, error::LockError};
 use rustfs_scanner_metrics::metrics::{
@@ -121,6 +122,7 @@ const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
 const EVENT_LIFECYCLE_WORKER_STATE: &str = "lifecycle_worker_state";
 const EVENT_LIFECYCLE_TRANSITION_COMPENSATION: &str = "lifecycle_transition_compensation";
 const EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP: &str = "lifecycle_stale_multipart_cleanup";
+const METRIC_STALE_MULTIPART_CLEANUP_BLOCKED_TOTAL: &str = "rustfs_stale_multipart_cleanup_blocked_total";
 const EVENT_LIFECYCLE_SCAN_SKIPPED: &str = "lifecycle_scan_skipped";
 const EVENT_LIFECYCLE_EVALUATION_FAILED: &str = "lifecycle_evaluation_failed";
 const EVENT_LIFECYCLE_EXPIRED_DETECTED: &str = "lifecycle_expired_detected";
@@ -1088,8 +1090,9 @@ impl ExpiryState {
         }))
     }
 
-    #[cfg(test)]
-    fn new_with_unconsumed_worker_channel(capacity: usize) -> Arc<RwLock<Self>> {
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn new_with_unconsumed_worker_channel(capacity: usize) -> Arc<RwLock<Self>> {
         let (tx, rx) = mpsc::channel(capacity);
         Arc::new(RwLock::new(Self {
             tasks_tx: vec![tx],
@@ -3512,19 +3515,29 @@ async fn stale_upload_current_size_with_opts(
             &ObjectOptions {
                 data_movement,
                 no_lock,
+                strict_multipart_part_sizes: true,
                 ..Default::default()
             },
         )
         .await
         .ok()?;
 
-    Some(
-        parts
-            .parts
-            .iter()
-            .map(|part| part.actual_size.max(part.size as i64).max(0) as usize)
-            .sum(),
-    )
+    stale_upload_size_from_parts(&parts)
+}
+
+fn stale_upload_size_from_parts(parts: &crate::storage_api_contracts::multipart::ListPartsInfo) -> Option<usize> {
+    if parts.is_truncated {
+        return None;
+    }
+    let transformed = rustfs_utils::http::contains_key_str(&parts.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION)
+        || should_persist_encryption_original_size(&parts.user_defined);
+    parts.parts.iter().try_fold(0usize, |total, part| {
+        // ListParts represents a quorum-confirmed missing part with an empty ETag.
+        if part.etag.as_deref().is_none_or(str::is_empty) {
+            return None;
+        }
+        total.checked_add(multipart_part_logical_size(part.size, part.actual_size, transformed)?)
+    })
 }
 
 async fn stale_upload_lifecycle_due(
@@ -3541,18 +3554,43 @@ async fn stale_upload_lifecycle_due(
     let bucket = metadata.get(RUSTFS_MULTIPART_BUCKET_KEY)?;
     let object = metadata.get(RUSTFS_MULTIPART_OBJECT_KEY)?;
 
-    let lifecycle = match metadata_boundary::get_lifecycle_config(bucket).await {
+    let mut lifecycle = match metadata_boundary::get_lifecycle_config(bucket).await {
         Ok((lifecycle, _)) => lifecycle,
         Err(_) => return None,
     };
 
+    let has_size_filter = |filter: &PersistedLifecycleFilter| {
+        filter.object_size_greater_than.is_some()
+            || filter.object_size_less_than.is_some()
+            || filter
+                .and
+                .as_ref()
+                .is_some_and(|and| and.object_size_greater_than.is_some() || and.object_size_less_than.is_some())
+    };
+    let needs_size = lifecycle
+        .rules
+        .iter()
+        .any(|rule| rule.abort_incomplete_multipart_upload.is_some() && rule.filter.as_ref().is_some_and(has_size_filter));
+    let size = if needs_size {
+        match stale_upload_current_size_with_opts(set, metadata, upload_dir, no_lock).await {
+            Some(size) => size,
+            None => {
+                // An unknown size cannot authorize a size-filtered abort.
+                // Unrelated rules can still be evaluated independently.
+                lifecycle
+                    .rules
+                    .retain(|rule| !rule.filter.as_ref().is_some_and(has_size_filter));
+                0
+            }
+        }
+    } else {
+        0
+    };
     let object_opts = ObjectOpts {
         name: object.clone(),
         user_tags: metadata.get(AMZ_OBJECT_TAGGING).cloned().unwrap_or_default(),
         mod_time: Some(initiated),
-        size: stale_upload_current_size_with_opts(set, metadata, upload_dir, no_lock)
-            .await
-            .unwrap_or_default(),
+        size,
         is_latest: true,
         delete_marker: false,
         user_defined: metadata.clone(),
@@ -3709,6 +3747,23 @@ async fn cleanup_empty_multipart_sha_dirs_on_local_disks(set: &Arc<SetDisks>) {
     }
 }
 
+fn record_stale_multipart_cleanup_blocked(stage: &'static str) {
+    metrics::counter!(METRIC_STALE_MULTIPART_CLEANUP_BLOCKED_TOTAL, "stage" => stage).increment(1);
+}
+
+fn record_stale_multipart_cleanup_lock_lost(path: &str) {
+    record_stale_multipart_cleanup_blocked("lock_lost");
+    debug!(
+        event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+        state = "skipped",
+        path = %path,
+        reason = "multipart_cleanup_lock_lost",
+        "Skipped stale multipart cleanup"
+    );
+}
+
 async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: OffsetDateTime, default_expiry: StdDuration) -> usize {
     let mut deleted = 0usize;
     let mut candidates = HashMap::new();
@@ -3805,7 +3860,8 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
     for candidate in candidates.into_values() {
         let upload_dir = candidate.path.rsplit('/').next().unwrap_or_default().to_string();
         let mut due = stale_upload_default_due(candidate.initiated, default_expiry);
-        if let Some(metadata) = candidate.metadata.as_ref()
+        if now < due
+            && let Some(metadata) = candidate.metadata.as_ref()
             && let Some(lifecycle_due) = stale_upload_lifecycle_due(set, metadata, candidate.initiated, &upload_dir, false).await
             && lifecycle_due < due
         {
@@ -3819,6 +3875,7 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
         let cleanup_guard = match set.lock_stale_multipart_cleanup(&candidate.path).await {
             Ok(guard) => guard,
             Err(err) => {
+                record_stale_multipart_cleanup_blocked("recheck");
                 debug!(
                     event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
                     component = LOG_COMPONENT_ECSTORE,
@@ -3834,13 +3891,18 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
         let current_metadata = cleanup_guard.file_info().metadata.clone();
         let current_initiated = initiated_from_upload_dir(&upload_dir, cleanup_guard.file_info().mod_time);
         let mut current_due = stale_upload_default_due(current_initiated, default_expiry);
-        if let Some(lifecycle_due) =
-            stale_upload_lifecycle_due(set, &current_metadata, current_initiated, &upload_dir, true).await
+        if now < current_due
+            && let Some(lifecycle_due) =
+                stale_upload_lifecycle_due(set, &current_metadata, current_initiated, &upload_dir, true).await
             && lifecycle_due < current_due
         {
             current_due = lifecycle_due;
         }
-        if now < current_due || cleanup_guard.is_lock_lost() {
+        if now < current_due {
+            continue;
+        }
+        if cleanup_guard.is_lock_lost() {
+            record_stale_multipart_cleanup_lock_lost(&candidate.path);
             continue;
         }
 
@@ -3860,15 +3922,18 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
                     "Removed stale multipart upload"
                 );
             }
-            Err(err) => debug!(
-                event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                path = %candidate.path,
-                error = ?err,
-                reason = "multipart_remove_failed",
-                "Failed to remove stale multipart upload"
-            ),
+            Err(err) => {
+                record_stale_multipart_cleanup_blocked("delete");
+                debug!(
+                    event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    path = %candidate.path,
+                    error = ?err,
+                    reason = "multipart_remove_failed",
+                    "Failed to remove stale multipart upload"
+                );
+            }
         }
     }
 
@@ -15889,6 +15954,530 @@ mod tests {
 
         let ecstore = ECStore::new("127.0.0.1:0".parse().unwrap(), endpoint_pools, CancellationToken::new()).await;
         assert!(ecstore.is_ok(), "fresh local ECStore boot should succeed, got {ecstore:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn stale_multipart_cleanup_preserves_partial_metadata_without_upload_part_warning() {
+        use tracing::instrument::WithSubscriber as _;
+        #[derive(Clone, Default)]
+        struct CapturedLogs(Arc<StdMutex<Vec<u8>>>);
+        struct LogWriter(Arc<StdMutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+            type Writer = LogWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                LogWriter(self.0.clone())
+            }
+        }
+
+        let (paths, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-partial-{}", Uuid::new_v4().simple());
+        create_test_bucket(&ecstore, &bucket).await;
+        for copies in [1, 2] {
+            let object = format!("partial-{copies}.bin");
+            let initiated = OffsetDateTime::now_utc() - time::Duration::hours(30);
+            let upload = ecstore
+                .new_multipart_upload(
+                    &bucket,
+                    &object,
+                    &ObjectOptions {
+                        mod_time: Some(initiated),
+                        max_parity: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("multipart upload should be created");
+            let decoded = base64_simd::URL_SAFE_NO_PAD
+                .decode_to_vec(upload.upload_id.as_bytes())
+                .unwrap();
+            let decoded = String::from_utf8(decoded).unwrap();
+            let (_, upload_dir) = decoded.split_once('.').expect("deployment-prefixed upload id");
+            let upload_path = format!("{}/{upload_dir}", multipart_sha_dir(&bucket, &object));
+            let physical_paths: Vec<_> = paths
+                .iter()
+                .map(|path| path.join(RUSTFS_META_MULTIPART_BUCKET).join(&upload_path))
+                .collect();
+            let original: Vec<_> = physical_paths
+                .iter()
+                .take(copies)
+                .map(|path| std::fs::read(path.join(STORAGE_FORMAT_FILE)).unwrap())
+                .collect();
+            let info = super::get_file_info(
+                &original[0],
+                RUSTFS_META_MULTIPART_BUCKET,
+                &upload_path,
+                "",
+                super::FileInfoOpts {
+                    data: false,
+                    include_free_versions: false,
+                    include_part_checksums: false,
+                },
+            )
+            .unwrap();
+            assert_eq!((info.erasure.data_blocks, info.erasure.parity_blocks), (2, 2));
+            for path in physical_paths.iter().skip(copies) {
+                fs::remove_dir_all(path).await.expect("remove selected metadata copies");
+            }
+            if copies == 2 {
+                ecstore
+                    .get_multipart_info(&bucket, &object, &upload.upload_id, &ObjectOptions::default())
+                    .await
+                    .expect("two metadata copies must meet read quorum");
+            }
+
+            let logs = CapturedLogs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            let recorder = crate::test_metrics::CapturingRecorder::default();
+            let recorder_guard = metrics::set_default_local_recorder(&recorder);
+            cleanup_stale_multipart_uploads_once_at(
+                ecstore.clone(),
+                OffsetDateTime::now_utc(),
+                StdDuration::from_secs(24 * 60 * 60),
+            )
+            .with_subscriber(subscriber)
+            .await;
+            drop(recorder_guard);
+            for (path, expected) in physical_paths.iter().zip(&original) {
+                assert_eq!(fs::read(path.join(STORAGE_FORMAT_FILE)).await.unwrap(), *expected);
+            }
+            let log_output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            let rechecks = log_output
+                .lines()
+                .filter(|line| line.contains("multipart_cleanup_lock_or_recheck_failed"));
+            let matching_path = rechecks.clone().any(|line| line.contains(&upload_path));
+            assert!(
+                matching_path,
+                "missing path-specific background diagnostic for {upload_path}: {log_output}"
+            );
+            assert_eq!(
+                recorder.counter_value(super::METRIC_STALE_MULTIPART_CLEANUP_BLOCKED_TOTAL, &[("stage", "recheck")]),
+                u64::try_from(rechecks.count()).expect("diagnostic count fits u64"),
+                "each observed recheck failure must increment the metric exactly once"
+            );
+            assert!(!log_output.contains("op=\"upload_part\""), "unexpected upload-part warning: {log_output}");
+            for path in physical_paths.iter().take(copies) {
+                fs::remove_dir_all(path).await.unwrap();
+            }
+        }
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            tracing::subscriber::with_default(subscriber, || {
+                super::record_stale_multipart_cleanup_lock_lost("test-hash/test-upload");
+            })
+        });
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("multipart_cleanup_lock_lost") && output.contains("test-hash/test-upload"),
+            "{output}"
+        );
+        assert!(!output.contains("op=\"upload_part\""), "{output}");
+        assert_eq!(
+            recorder.counter_value(super::METRIC_STALE_MULTIPART_CLEANUP_BLOCKED_TOTAL, &[("stage", "lock_lost")]),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn stale_multipart_cleanup_lists_parts_only_when_size_is_needed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::prelude::*;
+
+        struct PartListCounter {
+            calls: Arc<AtomicUsize>,
+            bucket: String,
+            object: &'static str,
+        }
+        struct PartListFields<'a> {
+            bucket: &'a str,
+            object: &'a str,
+            matching_bucket: bool,
+            matching_object: bool,
+        }
+        impl tracing::field::Visit for PartListFields<'_> {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                match field.name() {
+                    "bucket" => self.matching_bucket = value == self.bucket,
+                    "object" => self.matching_object = value == self.object,
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                let value = format!("{value:?}");
+                match field.name() {
+                    "bucket" => self.matching_bucket = value == format!("{:?}", self.bucket),
+                    "object" => self.matching_object = value == format!("{:?}", self.object),
+                    _ => {}
+                }
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PartListCounter {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::span::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if attrs.metadata().name() != "list_object_parts" {
+                    return;
+                }
+                let mut fields = PartListFields {
+                    bucket: &self.bucket,
+                    object: self.object,
+                    matching_bucket: false,
+                    matching_object: false,
+                };
+                attrs.record(&mut fields);
+                if fields.matching_bucket && fields.matching_object {
+                    self.calls.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let (_, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-list-parts-{}", Uuid::new_v4().simple());
+        create_test_bucket(&ecstore, &bucket).await;
+        set_abort_incomplete_lifecycle(&bucket, "logs/", 0).await;
+        let now = OffsetDateTime::now_utc();
+        for (object, age, size_filter, should_list) in [
+            ("logs/default-expired", time::Duration::hours(30), false, false),
+            ("logs/lifecycle-only", time::Duration::minutes(5), false, false),
+            ("logs/size-filter", time::Duration::minutes(5), true, true),
+        ] {
+            if size_filter {
+                set_abort_incomplete_lifecycle_with_size(&bucket, "logs/", 0, 0).await;
+            }
+            let upload = ecstore
+                .new_multipart_upload(
+                    &bucket,
+                    object,
+                    &ObjectOptions {
+                        mod_time: Some(now - age),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create multipart upload");
+            if size_filter {
+                let mut data = PutObjReader::from_vec(vec![1, 2, 3, 4]);
+                ecstore
+                    .put_object_part(&bucket, object, &upload.upload_id, 1, &mut data, &ObjectOptions::default())
+                    .await
+                    .expect("upload a part for size filtering");
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let subscriber = tracing_subscriber::registry().with(PartListCounter {
+                calls: Arc::clone(&calls),
+                bucket: bucket.clone(),
+                object,
+            });
+            cleanup_stale_multipart_uploads_once_at(ecstore.clone(), now, StdDuration::from_secs(24 * 60 * 60))
+                .with_subscriber(subscriber)
+                .await;
+            let listed = calls.load(Ordering::Relaxed);
+            assert_eq!(listed > 0, should_list, "unexpected ListParts calls for {object}: {listed}");
+            let result = ecstore
+                .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+                .await;
+            assert!(
+                matches!(result, Err(ref err) if is_err_invalid_upload_id(err)),
+                "upload must be removed: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_multipart_cleanup_rejects_incomplete_or_overflowing_part_sizes() {
+        use crate::storage_api_contracts::multipart::{ListPartsInfo, PartInfo};
+
+        let part = |size, actual_size, etag: &str| PartInfo {
+            size,
+            actual_size,
+            etag: Some(etag.to_owned()),
+            ..Default::default()
+        };
+        let mut parts = ListPartsInfo {
+            parts: vec![part(6, 6, "valid")],
+            ..Default::default()
+        };
+        assert_eq!(super::stale_upload_size_from_parts(&parts), Some(6));
+        parts.is_truncated = true;
+        assert_eq!(super::stale_upload_size_from_parts(&parts), None);
+        parts.is_truncated = false;
+        parts.parts = vec![part(0, 0, "")];
+        assert_eq!(super::stale_upload_size_from_parts(&parts), None);
+        parts.parts = vec![part(1, -1, "valid")];
+        assert_eq!(super::stale_upload_size_from_parts(&parts), None);
+        parts.parts = vec![part(8, 6, "valid")];
+        assert_eq!(super::stale_upload_size_from_parts(&parts), None);
+        parts.parts = vec![part(4, 6, "valid")];
+        assert_eq!(super::stale_upload_size_from_parts(&parts), None);
+        rustfs_utils::http::insert_str(&mut parts.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION, "test".to_owned());
+        assert_eq!(super::stale_upload_size_from_parts(&parts), Some(6));
+        parts.parts = vec![part(8, 6, "valid")];
+        assert_eq!(super::stale_upload_size_from_parts(&parts), Some(6));
+        rustfs_utils::http::remove_str(&mut parts.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
+        parts
+            .user_defined
+            .insert("x-amz-server-side-encryption".to_owned(), "AES256".to_owned());
+        assert_eq!(super::stale_upload_size_from_parts(&parts), Some(6));
+        parts.user_defined.clear();
+        parts.parts = vec![part(usize::MAX, 0, "valid"), part(1, 1, "valid")];
+        assert_eq!(super::stale_upload_size_from_parts(&parts), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_multipart_cleanup_handles_unknown_size_without_false_abort() {
+        let (_, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-unknown-size-{}", Uuid::new_v4().simple());
+        let object = "logs/object";
+        create_test_bucket(&ecstore, &bucket).await;
+        let size_rule = r#"<Rule><ID>size</ID><Status>Enabled</Status><Filter><ObjectSizeLessThan>5</ObjectSizeLessThan></Filter><AbortIncompleteMultipartUpload><DaysAfterInitiation>0</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule>"#;
+        let independent_rule = r#"<Rule><ID>prefix</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><AbortIncompleteMultipartUpload><DaysAfterInitiation>0</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule>"#;
+        let lifecycle = |rules: &str| format!("<LifecycleConfiguration>{rules}</LifecycleConfiguration>").into_bytes();
+        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle(size_rule))
+            .await
+            .expect("install upper-size lifecycle rule");
+        let metadata = HashMap::from([
+            (super::RUSTFS_MULTIPART_BUCKET_KEY.to_owned(), bucket.clone()),
+            (super::RUSTFS_MULTIPART_OBJECT_KEY.to_owned(), object.to_owned()),
+        ]);
+        let initiated = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let set = &ecstore.pools[0].disk_set[0];
+        let upload = ecstore
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create empty multipart upload");
+        let decoded = base64_simd::URL_SAFE_NO_PAD
+            .decode_to_vec(upload.upload_id.as_bytes())
+            .expect("decode upload ID");
+        let decoded = String::from_utf8(decoded).expect("upload ID must be UTF-8");
+        let (_, upload_dir) = decoded.split_once('.').expect("deployment-prefixed upload ID");
+        assert!(
+            super::stale_upload_lifecycle_due(set, &metadata, initiated, upload_dir, false)
+                .await
+                .is_some(),
+            "a known empty upload must match the upper-size rule"
+        );
+        let missing_upload = format!("{}x{}", Uuid::new_v4(), initiated.unix_timestamp_nanos());
+        assert!(
+            super::stale_upload_lifecycle_due(set, &metadata, initiated, &missing_upload, false)
+                .await
+                .is_none(),
+            "an unreadable size must not match the upper-size rule"
+        );
+        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle(&format!("{size_rule}{independent_rule}")))
+            .await
+            .expect("install size-independent lifecycle rule");
+        assert!(
+            super::stale_upload_lifecycle_due(set, &metadata, initiated, &missing_upload, false)
+                .await
+                .is_some(),
+            "a size-independent rule remains eligible when size is unknown"
+        );
+        ecstore
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("remove this test's remaining upload from the shared fixture");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn strict_multipart_lifecycle_size_skips_unavailable_participant_and_recovers() {
+        let (_, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-strict-size-{}", Uuid::new_v4().simple());
+        let object = "logs/object";
+        create_test_bucket(&ecstore, &bucket).await;
+        let rule = br#"<LifecycleConfiguration><Rule><ID>size</ID><Status>Enabled</Status><Filter><ObjectSizeLessThan>5</ObjectSizeLessThan></Filter><AbortIncompleteMultipartUpload><DaysAfterInitiation>0</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"#;
+        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, rule.to_vec())
+            .await
+            .expect("install upper-size rule");
+        let upload = ecstore
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create empty upload");
+        let decoded = base64_simd::URL_SAFE_NO_PAD
+            .decode_to_vec(upload.upload_id.as_bytes())
+            .expect("decode upload ID");
+        let decoded = String::from_utf8(decoded).expect("upload ID is UTF-8");
+        let (_, upload_dir) = decoded.split_once('.').expect("deployment-prefixed upload ID");
+        let metadata = HashMap::from([
+            (super::RUSTFS_MULTIPART_BUCKET_KEY.to_owned(), bucket.clone()),
+            (super::RUSTFS_MULTIPART_OBJECT_KEY.to_owned(), object.to_owned()),
+        ]);
+        let initiated = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let set = &ecstore.pools[0].disk_set[0];
+        assert!(
+            super::stale_upload_lifecycle_due(set, &metadata, initiated, upload_dir, false)
+                .await
+                .is_some()
+        );
+        let disk = set.disks.write().await[3].take();
+        assert!(disk.is_some());
+        let due = super::stale_upload_lifecycle_due(set, &metadata, initiated, upload_dir, false).await;
+        set.disks.write().await[3] = disk;
+        assert!(due.is_none(), "unknown size must not match an upper-size rule");
+        assert!(
+            super::stale_upload_lifecycle_due(set, &metadata, initiated, upload_dir, false)
+                .await
+                .is_some()
+        );
+        ecstore
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("remove this test's remaining upload from the shared fixture");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn strict_multipart_lifecycle_does_not_treat_a_minority_part_as_empty() {
+        let (paths, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-part-minority-{}", Uuid::new_v4().simple());
+        let object = "logs/object";
+        create_test_bucket(&ecstore, &bucket).await;
+        let initiated = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let upload = ecstore
+            .new_multipart_upload(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    mod_time: Some(initiated),
+                    max_parity: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create upload");
+        let mut body = PutObjReader::from_vec(vec![7; 6]);
+        ecstore
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut body, &ObjectOptions::default())
+            .await
+            .expect("write a known six-byte part");
+        let decoded = base64_simd::URL_SAFE_NO_PAD
+            .decode_to_vec(upload.upload_id.as_bytes())
+            .expect("decode upload ID");
+        let decoded = String::from_utf8(decoded).expect("upload ID is UTF-8");
+        let (_, upload_dir) = decoded.split_once('.').expect("deployment-prefixed upload ID");
+        let upload_path = format!("{}/{upload_dir}", multipart_sha_dir(&bucket, object));
+        let root = paths[0].join(RUSTFS_META_MULTIPART_BUCKET).join(&upload_path);
+        let bytes = fs::read(root.join(STORAGE_FORMAT_FILE)).await.expect("read source metadata");
+        let info = super::get_file_info(
+            &bytes,
+            RUSTFS_META_MULTIPART_BUCKET,
+            &upload_path,
+            "",
+            super::FileInfoOpts {
+                data: false,
+                include_free_versions: false,
+                include_part_checksums: false,
+            },
+        )
+        .expect("decode source metadata");
+        let data_dir = info.data_dir.expect("upload data directory").to_string();
+        let metadata = HashMap::from([
+            (super::RUSTFS_MULTIPART_BUCKET_KEY.to_owned(), bucket.clone()),
+            (super::RUSTFS_MULTIPART_OBJECT_KEY.to_owned(), object.to_owned()),
+        ]);
+        let set = &ecstore.pools[0].disk_set[0];
+        let rule = |filter: &str| {
+            format!("<LifecycleConfiguration><Rule><ID>size</ID><Status>Enabled</Status><Filter>{filter}</Filter><AbortIncompleteMultipartUpload><DaysAfterInitiation>0</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>").into_bytes()
+        };
+        let filters = [
+            "<ObjectSizeLessThan>10</ObjectSizeLessThan>",
+            "<ObjectSizeGreaterThan>5</ObjectSizeGreaterThan>",
+        ];
+        for filter in filters {
+            metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, rule(filter))
+                .await
+                .expect("install baseline size filter");
+            assert!(
+                super::stale_upload_lifecycle_due(set, &metadata, initiated, upload_dir, false)
+                    .await
+                    .is_some(),
+                "known six-byte part must satisfy {filter} before the fault"
+            );
+        }
+        let mut saved = Vec::new();
+        for path in paths.iter().take(3) {
+            for file in ["part.1", "part.1.meta"] {
+                let path = path
+                    .join(RUSTFS_META_MULTIPART_BUCKET)
+                    .join(&upload_path)
+                    .join(&data_dir)
+                    .join(file);
+                let bytes = fs::read(&path).await.expect("snapshot original part");
+                fs::remove_file(&path).await.expect("simulate a missing part on this disk");
+                saved.push((path, bytes));
+            }
+        }
+        for filter in filters {
+            metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, rule(filter))
+                .await
+                .expect("install size filter");
+            super::metadata_boundary::get_lifecycle_config(&bucket)
+                .await
+                .expect("size filter must be readable during the fault");
+            assert!(
+                super::stale_upload_lifecycle_due(set, &metadata, initiated, upload_dir, false)
+                    .await
+                    .is_none(),
+                "a minority part must not satisfy {filter}"
+            );
+        }
+        cleanup_stale_multipart_uploads_once_at(
+            ecstore.clone(),
+            OffsetDateTime::now_utc(),
+            StdDuration::from_secs(7 * 24 * 60 * 60),
+        )
+        .await;
+        ecstore
+            .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("unknown size must preserve the upload during cleanup");
+        for (path, bytes) in saved {
+            fs::write(path, bytes).await.expect("restore original part");
+        }
+        let size = super::stale_upload_current_size_with_opts(set, &metadata, upload_dir, false).await;
+        assert_eq!(size, Some(6), "restored part must have its original logical size");
+        for filter in filters {
+            metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, rule(filter))
+                .await
+                .expect("restore size filter");
+            let config = super::metadata_boundary::get_lifecycle_config(&bucket)
+                .await
+                .expect("read lifecycle");
+            let due = super::stale_upload_lifecycle_due(set, &metadata, initiated, upload_dir, false).await;
+            assert!(due.is_some(), "restored part must satisfy {filter}; size={size:?}, config={config:?}");
+        }
+        ecstore
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("remove the restored test upload from the shared fixture");
     }
 
     #[tokio::test]

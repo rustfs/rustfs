@@ -34,12 +34,15 @@ impl Operation for EnableTableBucketHandler {
         let warehouse = warehouse_from_params(&params)?;
         let resource = TableCatalogResource::warehouse(&warehouse);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableBucketAction).await?;
+        let app_context = runtime_sources::app_context_from_envelope(req.envelope());
         let backend = table_catalog_backend_from_envelope(req.envelope())?;
         let object_store = runtime_sources::object_store_from_envelope(req.envelope())
             .ok_or_else(|| table_catalog_internal_error("request object store is not initialized"))?;
         let store = table_catalog_store_from_backend(backend.clone())?;
         let publication = TableCommitObjectBackend::preauthorized(backend);
         let response = enable_table_bucket_response(&store, &publication, object_store.as_ref(), &warehouse).await?;
+        crate::app::bucket_usecase::notify_table_bucket_metadata_reload(warehouse.clone(), "enable table bucket", app_context)
+            .await;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -52,12 +55,15 @@ impl Operation for DisableTableBucketHandler {
         let warehouse = warehouse_from_params(&params)?;
         let resource = TableCatalogResource::warehouse(&warehouse);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableBucketAction).await?;
+        let app_context = runtime_sources::app_context_from_envelope(req.envelope());
         let backend = table_catalog_backend_from_envelope(req.envelope())?;
         let object_store = runtime_sources::object_store_from_envelope(req.envelope())
             .ok_or_else(|| table_catalog_internal_error("request object store is not initialized"))?;
         let store = table_catalog_store_from_backend(backend.clone())?;
         let publication = TableCommitObjectBackend::preauthorized(backend);
         let response = disable_table_bucket_response(&store, &publication, object_store.as_ref(), &warehouse).await?;
+        crate::app::bucket_usecase::notify_table_bucket_metadata_reload(warehouse.clone(), "disable table bucket", app_context)
+            .await;
         build_json_response(StatusCode::OK, &response)
     }
 }

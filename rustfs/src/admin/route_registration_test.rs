@@ -116,6 +116,48 @@ fn registered_admin_router() -> S3Router<AdminOperation> {
 
 fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
     vec![
+        admin_route(Method::POST, "/v3/plugin-delegations"),
+        admin_route_sample(Method::GET, "/v3/plugin-delegations/{id}", "/v3/plugin-delegations/test-delegation"),
+        admin_route_sample(
+            Method::POST,
+            "/v3/plugin-delegations/{id}/revoke",
+            "/v3/plugin-delegations/test-delegation/revoke",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/plugin-delegations/{id}/submit",
+            "/v3/plugin-delegations/test-delegation/submit",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/plugin-delegations/{id}/runs/query",
+            "/v3/plugin-delegations/test-delegation/runs/query",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/plugin-delegations/{id}/runs/history",
+            "/v3/plugin-delegations/test-delegation/runs/history",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/plugin-delegations/{id}/runs/cancel",
+            "/v3/plugin-delegations/test-delegation/runs/cancel",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/plugin-delegations/{id}/runs/page",
+            "/v3/plugin-delegations/test-delegation/runs/page",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/plugin-delegations/{id}/runs/replay",
+            "/v3/plugin-delegations/test-delegation/runs/replay",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/plugin-delegations/{id}/issue-attempt",
+            "/v3/plugin-delegations/test-delegation/issue-attempt",
+        ),
         route(Method::GET, HEALTH_PREFIX),
         route(Method::HEAD, HEALTH_PREFIX),
         route(Method::GET, HEALTH_READY_PATH),

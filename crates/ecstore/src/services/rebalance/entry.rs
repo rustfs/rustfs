@@ -1783,6 +1783,285 @@ mod tests {
         fixture.assert_moved().await;
     }
 
+    /// Each drive's copy of `version_id` of `object` on `pool`.
+    #[cfg(feature = "test-util")]
+    async fn drive_copies(store: &ECStore, pool: usize, bucket: &str, object: &str, version_id: uuid::Uuid) -> Vec<FileInfo> {
+        use crate::disk::DiskAPI as _;
+        let set = store.pools[pool].get_disks_by_key(object);
+        let mut copies = Vec::new();
+        for disk in set.disks.read().await.iter().flatten() {
+            let path = disk.path().join(bucket).join(object).join(crate::disk::STORAGE_FORMAT_FILE);
+            let Ok(bytes) = tokio::fs::read(&path).await else {
+                continue;
+            };
+            let meta = FileMeta::load(&bytes).expect("drive metadata should decode");
+            if meta.find_version(Some(version_id)).is_ok() {
+                copies.push(
+                    meta.into_fileinfo(bucket, object, &version_id.to_string(), false, false, false)
+                        .expect("drive copy should decode"),
+                );
+            }
+        }
+        copies
+    }
+
+    #[cfg(feature = "test-util")]
+    fn drive_space(total: u64, used: u64) -> crate::disk::DiskInfo {
+        crate::disk::DiskInfo {
+            total,
+            used,
+            free: total - used,
+            free_inodes: 1 << 20,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    const DANGLING_COPY_REBALANCE_ID: &str = "rebalance-dangling-target-copy";
+
+    /// A delete marker over one object version on pool 0 of three four-drive
+    /// pools, plus what an earlier attempt that lost write quorum left on one
+    /// drive of pool 1: both version ids, with older modification times and
+    /// different bytes. Object reads report such copies as absent. Pool 2
+    /// reports far more free space than pool 1, so a free-space choice picks
+    /// pool 2 (the kill-resume e2e case ended with the marker on two pools).
+    #[cfg(feature = "test-util")]
+    struct DanglingTargetCopy {
+        _temp_dirs: Vec<tempfile::TempDir>,
+        store: Arc<ECStore>,
+        _space: crate::store::PoolSpaceForTest,
+        bucket: &'static str,
+        object: &'static str,
+        incarnation: uuid::Uuid,
+        source_set: Arc<SetDisks>,
+        marker: FileInfo,
+        version: FileInfo,
+        payload: Vec<u8>,
+    }
+
+    #[cfg(feature = "test-util")]
+    impl DanglingTargetCopy {
+        async fn new(holder_space: crate::disk::DiskInfo) -> Self {
+            let (temp_dirs, store, _peer) =
+                crate::services::rebalance::test_three_pool_stores_with_four_disk_sets_with_isolated_node_contexts(None).await;
+            let space = crate::store::PoolSpaceForTest::install(store.id, &[(1, holder_space), (2, drive_space(1 << 50, 0))]);
+            let bucket = "rebalance-dangling-target";
+            let object = "versioned/06.bin";
+            Box::pin(store.make_bucket(bucket, &MakeBucketOptions::default()))
+                .await
+                .expect("create bucket");
+            let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+            let mut rebalance_meta = active_rebalance_meta(DANGLING_COPY_REBALANCE_ID);
+            rebalance_meta.pool_stats.push(RebalanceStats::default());
+            rebalance_meta
+                .save(Arc::clone(&store.pools[0]))
+                .await
+                .expect("persist the active rebalance run");
+            *store.rebalance_meta.write().await = Some(rebalance_meta);
+            let versioned = ObjectOptions {
+                versioned: true,
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            };
+
+            let payload = vec![0x5a; 2048];
+            let source_set = store.pools[0].get_disks_by_key(object);
+            Box::pin(source_set.put_object(bucket, object, &mut PutObjReader::from_vec(payload.clone()), &versioned))
+                .await
+                .expect("seed the object version");
+            let marker = Box::pin(source_set.delete_object(bucket, object, versioned.clone()))
+                .await
+                .expect("seed the delete marker");
+            assert!(marker.delete_marker);
+            let seeded = source_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("read seeded versions")
+                .expect("seeded versions must exist");
+            let [marker, version] = seeded.versions.as_slice() else {
+                panic!("expected a delete marker over one version: {seeded:?}");
+            };
+            let (marker, version) = (marker.clone(), version.clone());
+            let marker_id = marker.version_id.expect("the marker has a version id");
+            let version_id = version.version_id.expect("the object version has a version id");
+            let earlier = |time: Option<OffsetDateTime>| time.map(|time| time - time::Duration::hours(1));
+
+            let holder = store.pools[1].get_disks_by_key(object);
+            let mut marker_opts =
+                super::super::migration::rebalance_delete_marker_opts(&marker, Some(marker_id.to_string()), 0, Some(incarnation));
+            marker_opts.mod_time = earlier(marker.mod_time);
+            Box::pin(holder.delete_object(bucket, object, marker_opts))
+                .await
+                .expect("publish the earlier marker copy");
+            Box::pin(holder.put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(vec![0x11; 4096]),
+                &ObjectOptions {
+                    version_id: Some(version_id.to_string()),
+                    mod_time: earlier(version.mod_time),
+                    ..versioned
+                },
+            ))
+            .await
+            .expect("publish the earlier object version copy");
+            {
+                use crate::disk::DiskAPI as _;
+                for disk in holder.disks.read().await.iter().flatten().skip(1) {
+                    tokio::fs::remove_dir_all(disk.path().join(bucket).join(object))
+                        .await
+                        .expect("drop the copies from the drives the attempt missed");
+                }
+            }
+            for version_id in [marker_id, version_id] {
+                assert_eq!(drive_copies(&store, 1, bucket, object, version_id).await.len(), 1);
+            }
+
+            Self {
+                _temp_dirs: temp_dirs,
+                store,
+                _space: space,
+                bucket,
+                object,
+                incarnation,
+                source_set,
+                marker,
+                version,
+                payload,
+            }
+        }
+
+        async fn run_entry(&self) -> RebalanceEntryOutcome {
+            let entry = metacache_entry_from_source(&self.source_set, self.bucket, self.object).await;
+            Box::pin(Arc::clone(&self.store).rebalance_entry(
+                RebalanceEntryTarget {
+                    bucket: self.bucket.to_string(),
+                    pool_index: 0,
+                },
+                entry,
+                Arc::clone(&self.source_set),
+                Arc::new(RebalanceBucketConfigs {
+                    bucket_incarnation_id: Some(self.incarnation),
+                    ..Default::default()
+                }),
+                Arc::from(DANGLING_COPY_REBALANCE_ID),
+                CancellationToken::new(),
+            ))
+            .await
+            .expect("rebalance entry")
+        }
+
+        /// Pools whose drives hold `version_id`, with the number of drives.
+        async fn holders(&self, version_id: uuid::Uuid) -> Vec<(usize, usize)> {
+            let mut holders = Vec::new();
+            for pool in 0..self.store.pools.len() {
+                let drives = drive_copies(&self.store, pool, self.bucket, self.object, version_id)
+                    .await
+                    .len();
+                if drives > 0 {
+                    holders.push((pool, drives));
+                }
+            }
+            holders
+        }
+
+        /// The source entry is gone and `pool` serves both versions as the
+        /// source wrote them, on every drive.
+        async fn assert_moved_to(&self, pool: usize) {
+            assert!(
+                self.source_set
+                    .load_file_info_versions_exact(self.bucket, self.object)
+                    .await
+                    .expect("read source versions")
+                    .is_none(),
+                "the source entry must be cleaned up"
+            );
+            let target = self.store.pools[pool]
+                .get_disks_by_key(self.object)
+                .load_file_info_versions_exact(self.bucket, self.object)
+                .await
+                .expect("read target versions")
+                .expect("both versions must reach the target pool");
+            let moved = |id| {
+                target
+                    .versions
+                    .iter()
+                    .find(|version| version.version_id == id)
+                    .unwrap_or_else(|| panic!("version {id:?} must reach pool {pool}: {target:?}"))
+            };
+            let marker = moved(self.marker.version_id);
+            assert!(marker.deleted, "the marker must stay a delete marker");
+            assert_eq!(marker.mod_time, self.marker.mod_time);
+            let version = moved(self.version.version_id);
+            assert!(!version.deleted);
+            assert_eq!(version.mod_time, self.version.mod_time);
+
+            let version_id = self.version.version_id.expect("object version id");
+            let copies = drive_copies(&self.store, pool, self.bucket, self.object, version_id).await;
+            assert_eq!(copies.len(), 4, "the object version must be on every drive of pool {pool}");
+            for copy in &copies {
+                assert_eq!(copy.mod_time, self.version.mod_time, "an earlier copy must be replaced, not kept");
+                assert_eq!(copy.data_dir, copies[0].data_dir, "every drive must hold the same data");
+            }
+            let marker_id = self.marker.version_id.expect("marker version id");
+            let markers = drive_copies(&self.store, pool, self.bucket, self.object, marker_id).await;
+            assert_eq!(markers.len(), 4, "the marker must be on every drive of pool {pool}");
+            assert!(markers.iter().all(|copy| copy.deleted));
+
+            let mut reader = self.store.pools[pool]
+                .get_object_reader(
+                    self.bucket,
+                    self.object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(version_id.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the moved version must be readable");
+            let mut actual = Vec::new();
+            reader.stream.read_to_end(&mut actual).await.expect("drain the moved version");
+            assert_eq!(actual, self.payload, "the moved version must carry the source bytes");
+        }
+    }
+
+    /// A retry reuses the pool that holds an earlier attempt's copy, even
+    /// though free space favours another pool, and rewrites that copy from
+    /// the source instead of leaving the version in two pools.
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_retry_reuses_the_pool_holding_a_dangling_copy() {
+        run_large_stack_async_test("rebalance-dangling-target-copy", || async {
+            let fixture = DanglingTargetCopy::new(drive_space(64 << 20, 0)).await;
+            assert_eq!(fixture.run_entry().await, RebalanceEntryOutcome::Completed);
+            for version in [&fixture.marker, &fixture.version] {
+                let id = version.version_id.expect("version id");
+                assert_eq!(fixture.holders(id).await, vec![(1, 4)], "version {id} must be in one pool");
+            }
+            fixture.assert_moved_to(1).await;
+        });
+    }
+
+    /// A full pool holding an earlier copy must not pin the retry: placement
+    /// falls back to the free-space choice, and the stale copy stays for heal.
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_retry_skips_a_full_pool_holding_a_dangling_copy() {
+        run_large_stack_async_test("rebalance-dangling-full-holder", || async {
+            let fixture = DanglingTargetCopy::new(drive_space(1 << 30, 1 << 30)).await;
+            assert_eq!(fixture.run_entry().await, RebalanceEntryOutcome::Completed);
+            for version in [&fixture.marker, &fixture.version] {
+                let id = version.version_id.expect("version id");
+                assert_eq!(fixture.holders(id).await, vec![(1, 1), (2, 4)], "version {id}");
+            }
+            fixture.assert_moved_to(2).await;
+        });
+    }
+
     /// An `ExpiredObjectAllVersions` expiry is a prefix delete that takes the
     /// bucket lifecycle write lock, while the entry holds that lock for read
     /// through its bucket incarnation fence. Applied inline, it waited out the

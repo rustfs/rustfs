@@ -442,9 +442,11 @@ pub(crate) mod ecstore_bucket {
 
 pub(crate) mod ecstore_capacity {
     pub(crate) use rustfs_ecstore::api::capacity::{
-        DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolMeta, PoolStatus, get_total_usable_capacity,
+        DecommissionUnresolvedEntry, PoolAdminDiagnostic, PoolDecommissionInfo, PoolMeta, PoolStatus, get_total_usable_capacity,
         get_total_usable_capacity_free, is_pool_activation_fleet_proof_error, is_reserved_or_invalid_bucket,
     };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::capacity::{PoolAvailability, PoolCapacityStatus, PoolDiagnosticStatus};
 }
 
 pub(crate) mod ecstore_client {
@@ -475,9 +477,9 @@ pub(crate) mod ecstore_config {
 pub(crate) mod ecstore_data_usage {
     pub(crate) use rustfs_ecstore::api::data_usage::{
         apply_bucket_usage_memory_overlay, get_bucket_usage_memory, init_compression_total_memory_from_backend,
-        load_admin_data_usage_from_backend_cached, load_data_usage_from_backend, lookup_degraded_bucket_usage_baseline,
-        quota_object_size, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
-        record_bucket_object_version_write_memory, record_bucket_object_write_memory,
+        load_admin_data_usage_from_backend_cached, load_bucket_usage_from_backend_cached, load_data_usage_from_backend,
+        lookup_degraded_bucket_usage_baseline, quota_object_size, record_bucket_delete_marker_memory,
+        record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
         record_bucket_object_write_unknown_previous_memory, store_compression_total_in_backend,
     };
     // Test-only observables for the rustfs/backlog#1306 revert detector.
@@ -1347,6 +1349,12 @@ pub(crate) async fn read_config(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>
 
 pub(crate) async fn read_config_no_lock(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>> {
     ecstore_config::com::read_config_no_lock(api, file).await
+}
+
+pub(crate) async fn read_server_config_with_generation(
+    api: Arc<ECStore>,
+) -> Result<(rustfs_config::server_config::Config, Option<uuid::Uuid>)> {
+    ecstore_config::com::read_server_config_with_generation(api).await
 }
 
 pub(crate) async fn read_existing_server_config_no_lock(api: Arc<ECStore>) -> Result<rustfs_config::server_config::Config> {

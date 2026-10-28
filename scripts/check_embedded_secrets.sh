@@ -3,9 +3,8 @@ set -euo pipefail
 
 # Guard: no private key material and no long-lived provider credential may
 # exist as a literal anywhere in the repository — see AGENTS.md "Security
-# Baseline" ("Never commit secrets, credentials, or key material") and
-# .agents/skills/security-advisory-lessons ("Do not ship hard-coded shared
-# tokens, HMAC secrets, private keys, or production test keys").
+# Baseline" ("Never commit secrets, credentials, or key material"). This includes
+# shared tokens, HMAC secrets, private keys, and production test keys.
 #
 # This replaces the unit test `test_source_does_not_embed_private_key` that
 # used to live in crates/crypto/src/license_token.rs (rustfs/backlog#1884).

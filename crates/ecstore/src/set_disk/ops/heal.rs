@@ -3634,6 +3634,18 @@ impl SetDisks {
             return Ok((result, err.map(|e| e.into())));
         }
 
+        // Keep the transaction key through both replay and the metadata heal
+        // based on that replay. The raw target key always precedes this key.
+        let transaction_guard =
+            if _write_lock_guard.is_some() && !opts.read_repair && !crate::bucket::utils::is_meta_bucketname(bucket) {
+                Some(self.acquire_delete_transaction_lock(bucket, object).await?)
+            } else {
+                None
+            };
+        let locks_lost = || {
+            _write_lock_guard.as_deref().is_some_and(|guard| guard.is_lock_lost())
+                || transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+        };
         let mut recovery_removed_version = false;
         if !opts.read_repair
             && _write_lock_guard.is_some()
@@ -3655,12 +3667,17 @@ impl SetDisks {
                         dry_run: opts.dry_run,
                         explicit_delete,
                         repair_marker_source: true,
+                        transaction_guard: transaction_guard.clone(),
                         namespace_owner: (!opts.dry_run).then(|| {
-                            Arc::new((scope.clone(), self.ctx.begin_namespace_commit(), _write_lock_guard.clone()))
-                                as Arc<dyn Send + Sync>
+                            Arc::new((
+                                scope.clone(),
+                                self.ctx.begin_namespace_commit(),
+                                _write_lock_guard.clone(),
+                                transaction_guard.clone(),
+                            )) as Arc<dyn Send + Sync>
                         }),
                         ..crate::set_disk::DeleteRecoveryContext::new(Some(scope.incarnation), &|| {
-                            scope.check().is_ok() && !_write_lock_guard.as_deref().is_some_and(|guard| guard.is_lock_lost())
+                            scope.check().is_ok() && !locks_lost()
                         })
                     },
                 )
@@ -3752,7 +3769,7 @@ impl SetDisks {
                 && errs
                     .iter()
                     .all(|err| matches!(err, Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)))
-                && !_write_lock_guard.as_deref().is_some_and(|guard| guard.is_lock_lost())
+                && !locks_lost()
             {
                 *absence = Some(HealedObjectAbsence {
                     pool_index: self.pool_index,
@@ -3767,8 +3784,10 @@ impl SetDisks {
         // Pass no_lock=true since we already obtained write lock (or are already called with no_lock=true)
         let mut inner_opts = *opts;
         inner_opts.no_lock = true;
-        let commit_fence = || !_write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost());
-        let namespace_owner = _write_lock_guard.as_ref().map(|guard| guard.clone() as Arc<dyn Send + Sync>);
+        let commit_fence = || !locks_lost();
+        let namespace_owner = _write_lock_guard
+            .as_ref()
+            .map(|guard| Arc::new((Arc::clone(guard), transaction_guard.clone())) as Arc<dyn Send + Sync>);
         let (result, err) = pin_object_heal_future(|| {
             self.heal_object_with_explicit_version_regen(
                 bucket,
@@ -3815,7 +3834,7 @@ impl SetDisks {
                         result,
                         err.map(Into::into),
                         absence,
-                        _write_lock_guard.as_deref().is_some_and(|guard| guard.is_lock_lost()),
+                        locks_lost(),
                         bucket,
                         object,
                     ));
@@ -3827,7 +3846,7 @@ impl SetDisks {
             result,
             err.map(Into::into),
             absence,
-            _write_lock_guard.as_deref().is_some_and(|guard| guard.is_lock_lost()),
+            locks_lost(),
             bucket,
             object,
         ))

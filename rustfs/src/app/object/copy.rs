@@ -124,48 +124,6 @@ where
         .map_err(|err| ApiError::from(copy_namespace_lock_error(bucket, &object, "write", err)).into())
 }
 
-pub(crate) async fn acquire_copy_bucket_lifecycle_lock<S>(store: &S, bucket: &str) -> S3Result<NamespaceLockGuard>
-where
-    S: NamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + ?Sized,
-{
-    let lock = store
-        .new_ns_lock(bucket, BUCKET_LIFECYCLE_LOCK_OBJECT)
-        .await
-        .map_err(ApiError::from)?;
-    lock.get_read_lock(get_lock_acquire_timeout()).await.map_err(|err| {
-        ApiError::from(copy_namespace_lock_error(
-            bucket,
-            BUCKET_LIFECYCLE_LOCK_OBJECT,
-            "bucket_lifecycle_read",
-            err,
-        ))
-        .into()
-    })
-}
-
-pub(crate) async fn acquire_copy_bucket_lifecycle_locks<S>(
-    store: &S,
-    source_bucket: &str,
-    destination_bucket: &str,
-) -> S3Result<(NamespaceLockGuard, Option<NamespaceLockGuard>)>
-where
-    S: NamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + ?Sized,
-{
-    if source_bucket == destination_bucket {
-        return Ok((acquire_copy_bucket_lifecycle_lock(store, source_bucket).await?, None));
-    }
-
-    if source_bucket < destination_bucket {
-        let source_guard = acquire_copy_bucket_lifecycle_lock(store, source_bucket).await?;
-        let destination_guard = acquire_copy_bucket_lifecycle_lock(store, destination_bucket).await?;
-        Ok((source_guard, Some(destination_guard)))
-    } else {
-        let destination_guard = acquire_copy_bucket_lifecycle_lock(store, destination_bucket).await?;
-        let source_guard = acquire_copy_bucket_lifecycle_lock(store, source_bucket).await?;
-        Ok((source_guard, Some(destination_guard)))
-    }
-}
-
 impl DefaultObjectUsecase {
     pub fn execute_copy_object(
         &self,
@@ -281,6 +239,7 @@ impl DefaultObjectUsecase {
         // Validate both source and destination keys
         validate_object_key(&src_key, "COPY (source)")?;
         validate_object_key(&key, "COPY (dest)")?;
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
         let replaces_metadata = match metadata_directive.as_ref().map(|directive| directive.as_str()) {
             None | Some(MetadataDirective::COPY) => false,
@@ -383,29 +342,20 @@ impl DefaultObjectUsecase {
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
-        let (source_bucket_lifecycle_guard, destination_bucket_lifecycle_guard_storage) =
-            acquire_copy_bucket_lifecycle_locks(store.as_ref(), &src_bucket, &bucket).await?;
-        let current_source_incarnation_id = store
-            .bucket_incarnation_id_from_disk(&src_bucket)
+        let (
+            source_bucket_lifecycle_guard,
+            current_source_incarnation_id,
+            destination_bucket_lifecycle_guard_storage,
+            current_destination_incarnation_id,
+        ) = store
+            .acquire_copy_bucket_incarnation_fences(
+                &src_bucket,
+                src_get_opts.expected_bucket_incarnation_id,
+                &bucket,
+                dst_opts.expected_bucket_incarnation_id,
+            )
             .await
             .map_err(ApiError::from)?;
-        if src_get_opts
-            .expected_bucket_incarnation_id
-            .is_some_and(|expected| expected != current_source_incarnation_id)
-        {
-            return Err(ApiError::from(StorageError::BucketNotFound(src_bucket.clone())).into());
-        }
-        let current_destination_incarnation_id = if src_bucket == bucket {
-            current_source_incarnation_id
-        } else {
-            store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)?
-        };
-        if dst_opts
-            .expected_bucket_incarnation_id
-            .is_some_and(|expected| expected != current_destination_incarnation_id)
-        {
-            return Err(ApiError::from(StorageError::BucketNotFound(bucket.clone())).into());
-        }
         let destination_bucket_lifecycle_guard = destination_bucket_lifecycle_guard_storage
             .as_ref()
             .unwrap_or(&source_bucket_lifecycle_guard);
@@ -422,9 +372,9 @@ impl DefaultObjectUsecase {
         src_get_opts.expected_bucket_incarnation_id = Some(current_source_incarnation_id);
         dst_opts.expected_bucket_incarnation_id = Some(current_destination_incarnation_id);
         if src_bucket != bucket {
-            dst_opts.add_bucket_lifecycle_lock_guard(&source_bucket_lifecycle_guard);
+            source_bucket_lifecycle_guard.attach_to_object_options(&mut dst_opts);
         }
-        dst_opts.add_bucket_lifecycle_lock_guard(destination_bucket_lifecycle_guard);
+        destination_bucket_lifecycle_guard.attach_to_object_options(&mut dst_opts);
 
         // Bucket metadata uses the bucket name as its namespace-lock key. Load
         // every copy-time bucket snapshot before a same-object key can collide
@@ -1082,6 +1032,26 @@ mod tests {
 
         let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn copy_object_rejects_reserved_catalog_destination_before_store_lookup() {
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: "source-bucket".into(),
+                key: "source-key".into(),
+                version_id: None,
+            })
+            .bucket(format!("missing-{}", Uuid::new_v4()))
+            .key(".rustfs-table/metadata/current.json".to_string())
+            .build()
+            .unwrap();
+        let error = DefaultObjectUsecase::without_context()
+            .execute_copy_object(build_request(input, Method::PUT))
+            .await
+            .expect_err("reserved catalog destination must fail closed without bucket metadata");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(error.message(), Some(crate::table_catalog::RESERVED_CATALOG_OBJECT_MESSAGE));
     }
 
     #[tokio::test]

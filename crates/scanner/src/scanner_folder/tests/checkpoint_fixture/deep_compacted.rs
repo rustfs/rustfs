@@ -72,18 +72,16 @@ impl CompactedFixture {
             ..bound_checkpoint().1
         };
         let mut cache = DataUsageCache::default();
-        // The first real scan builds coverage; the second same-plan scan takes
-        // the normal compaction path. No synthetic compacted cache is injected.
-        for cycle in [11, 12] {
-            cache.prepare_bucket_checkpoint("bucket", cycle, 7, SOURCE, PLAN, identity);
-            cache.info.skip_healing = true;
-            let (outcome, budget) = scan(&scanner.local_disk, cache, mode, OBJECTS + 1).await;
-            let ScannerDiskScanOutcome::Complete(completed) = outcome else {
-                panic!("fixture baseline must complete")
-            };
-            assert_eq!(budget.progress().0, OBJECTS, "baseline must read every metadata object");
-            cache = completed;
-        }
+        // Build and compact coverage in the first real sweep. No synthetic
+        // compacted cache is injected.
+        cache.prepare_bucket_checkpoint("bucket", 11, 7, SOURCE, PLAN, identity);
+        cache.info.skip_healing = true;
+        let (outcome, budget) = scan(&scanner.local_disk, cache, mode, OBJECTS + 1).await;
+        let ScannerDiskScanOutcome::Complete(completed) = outcome else {
+            panic!("fixture baseline must complete")
+        };
+        assert_eq!(budget.progress().0, OBJECTS, "baseline must read every metadata object");
+        cache = completed;
         let store = FixtureStore::new();
         cache = save_reload(&store, &cache).await;
         assert!(cache.find(PREFIX).expect("baseline prefix").compacted);
@@ -263,9 +261,11 @@ async fn check_large_prefix_resumption(mode: HealScanMode) {
             assert!(cache.info.scan_checkpoint.is_none());
             assert!(cache.info.scan_coverage_receipt.is_none());
 
-            // Completing the sweep must restore compaction on the next same-plan scan.
+            // A completed prefix releases its children before the first sweep
+            // returns; a later same-plan scan keeps that compact representation.
             let retained_entries = cache.cache.len();
-            assert!(!cache.find(PREFIX).expect("completed prefix").compacted);
+            assert!(cache.find(PREFIX).expect("completed prefix").compacted);
+            assert_eq!(retained_entries, 3, "only the bucket, compacted prefix and tail remain");
             cache.prepare_bucket_checkpoint("bucket", 12 + round, 7 + round, SOURCE, PLAN, identity);
             assert!(cache.info.scan_progress.is_none(), "a complete same-plan cache needs no forward sweep");
             let (outcome, _) = scan(&scanner.local_disk, cache, mode, expected_reads + 1).await;
@@ -275,8 +275,8 @@ async fn check_large_prefix_resumption(mode: HealScanMode) {
             let reloaded = save_reload(&store, &compacted).await;
             assert!(reloaded.find(PREFIX).expect("compacted prefix").compacted);
             assert!(
-                reloaded.cache.len() < retained_entries,
-                "completed sweeps must release child cache entries"
+                reloaded.cache.len() <= retained_entries,
+                "later sweeps must not retain the compacted prefix's children"
             );
             let total = reloaded.checked_flatten("bucket").expect("compacted bucket coverage");
             assert_eq!((total.objects, total.size), (expected, expected));
