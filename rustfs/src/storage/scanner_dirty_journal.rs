@@ -634,6 +634,27 @@ mod tests {
     }
 
     #[test]
+    fn owned_replay_keeps_the_outer_json_recursion_boundary() {
+        // Ignored scope fields still consume the complete owned frame's depth
+        // budget. Parsing replay from a fresh JSON root must not bypass it.
+        for (depth, accepted) in [(122, true), (123, false)] {
+            let bytes = format!(
+                r#"{{"owner":"owner","replay":{{"schema":1,"cache_key_format":1,"writer_epoch":"epoch","entries":[{{"bucket":"bucket","generation":7,"scope":{{"type":"whole_bucket","ignored":{}0{}}},"producers":["put_object"]}}]}}}}"#,
+                "[".repeat(depth),
+                "]".repeat(depth),
+            );
+            assert!(bytes.len() < DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES);
+            let decoded = decode_owned_replay_record("owner", bytes.as_bytes());
+            assert_eq!(decoded.is_some(), accepted, "owned frame depth {depth}");
+            if let Some((state, _)) = decoded {
+                assert_eq!(state.buckets.len(), 1);
+                assert_eq!(state.buckets["bucket"].generation, 7);
+                assert_eq!(state.buckets["bucket"].scope, super::JournalScope::WholeBucket);
+            }
+        }
+    }
+
+    #[test]
     fn journal_owner_is_stable_and_never_defaults_to_a_shared_identity() {
         assert!(durable_dirty_usage_owner("").is_none());
         let first = durable_dirty_usage_owner("node-a:9000").expect("configured owner");
