@@ -40,11 +40,11 @@ on:
         required: false
         default: ''
       i05_diagnostic_branch:
-        description: I05 diagnostic-only branch; queued-successor requires the exact native evidence bundle
+        description: I05 source-plan runs both H1/H2 controllers with exact native evidence; subsets remain diagnostic
         type: choice
-        options: [timeout, queued-successor]
+        options: [source-plan, timeout, queued-successor]
         required: false
-        default: timeout
+        default: source-plan
       auto_testing_sha:
         description: Exact auto-testing commit for a validation case
         type: string
@@ -325,8 +325,8 @@ jobs:
               raise ValueError("manager regressions require tools-only execution, without a fleet case or cleanup")
           if cleanup and (not cleanup.isdigit() or int(cleanup) <= 0 or os.environ["SELECTED_CASE"] or os.environ["TOOLS_ONLY"] == "true"):
               raise ValueError("cleanup requires one exact failed run and is exclusive with case/tool execution")
-          diagnostic_branch = os.environ["I05_DIAGNOSTIC_BRANCH"] or "timeout"
-          if diagnostic_branch not in {"timeout", "queued-successor"}:
+          diagnostic_branch = os.environ["I05_DIAGNOSTIC_BRANCH"] or "source-plan"
+          if diagnostic_branch not in {"source-plan", "timeout", "queued-successor"}:
               raise ValueError("I05 diagnostic branch is not registered")
           if diagnostic_branch == "queued-successor" and os.environ["SELECTED_CASE"] != "heal.lock-timeout-and-caller-abort":
               raise ValueError("queued-successor is available only for the I05 diagnostic case")
@@ -453,7 +453,7 @@ jobs:
           printf 'required=%s\n' "${required}" >> "${GITHUB_OUTPUT}"
 
       - name: Download pinned native storage evidence
-        if: ${{ inputs.validation_case == 'heal.conflicting-subquorum-authority' || inputs.validation_case == 'heal.bucket-incarnation-recreation' || steps.race_native.outputs.required == 'true' || (inputs.validation_case == 'heal.lock-timeout-and-caller-abort' && inputs.i05_diagnostic_branch == 'queued-successor') }}
+        if: ${{ inputs.validation_case == 'heal.conflicting-subquorum-authority' || inputs.validation_case == 'heal.bucket-incarnation-recreation' || steps.race_native.outputs.required == 'true' || (inputs.validation_case == 'heal.lock-timeout-and-caller-abort' && inputs.i05_diagnostic_branch != 'timeout') || (inputs.validation_case == 'heal.checkpoint-and-mrf-corruption' && steps.candidate.outputs.source_sha == '1aa9be87d18cf941e5020f19e8622c26ba4b10ac') }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           github-token: ${{ github.token }}
@@ -508,18 +508,34 @@ jobs:
               > "${VALIDATION_ROOT}/native-race-runtime-preflight.json"
           printf 'VALIDATION_HEAL_NATIVE_DIRECTORY=%s\n' "${NATIVE_DIRECTORY}" >> "${GITHUB_ENV}"
 
-      - name: Verify I05 queued-successor native prerequisite
-        if: ${{ inputs.validation_case == 'heal.lock-timeout-and-caller-abort' && inputs.i05_diagnostic_branch == 'queued-successor' }}
+      - name: Verify I05 source-plan or queued-successor native prerequisites
+        if: ${{ inputs.validation_case == 'heal.lock-timeout-and-caller-abort' && inputs.i05_diagnostic_branch != 'timeout' }}
         env:
           AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+          I05_DIAGNOSTIC_BRANCH: ${{ inputs.i05_diagnostic_branch }}
         run: |
           set -euo pipefail
           NATIVE_DIRECTORY="${RUNNER_TEMP}/rustfs-validation-native-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           cp "${VALIDATION_ROOT}/tool-run.json" "${NATIVE_DIRECTORY}/tool-run.json"
-          python3 -B auto-testing/scripts/validation_heal/race_native_evidence.py \
-            --directory "${NATIVE_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
-            --testing-commit "${AUTO_TESTING_SHA}" --case-id heal.lock-timeout-and-caller-abort \
-            > "${VALIDATION_ROOT}/native-i05-prerequisite.json"
+          if [ "${I05_DIAGNOSTIC_BRANCH}" = 'queued-successor' ]; then
+            python3 -B auto-testing/scripts/validation_heal/race_native_evidence.py \
+              --directory "${NATIVE_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
+              --testing-commit "${AUTO_TESTING_SHA}" --case-id heal.lock-timeout-and-caller-abort \
+              > "${VALIDATION_ROOT}/native-i05-prerequisite.json"
+          else
+            python3 -B auto-testing/scripts/validation_heal/lock_source.py \
+              --directory "${NATIVE_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
+              --testing-commit "${AUTO_TESTING_SHA}" \
+              > "${VALIDATION_ROOT}/native-i05-source-prerequisites.json"
+          fi
+          printf 'VALIDATION_HEAL_NATIVE_DIRECTORY=%s\n' "${NATIVE_DIRECTORY}" >> "${GITHUB_ENV}"
+
+      - name: Bind F07 exact-candidate directory fsync evidence
+        if: ${{ inputs.validation_case == 'heal.checkpoint-and-mrf-corruption' && steps.candidate.outputs.source_sha == '1aa9be87d18cf941e5020f19e8622c26ba4b10ac' }}
+        run: |
+          set -euo pipefail
+          NATIVE_DIRECTORY="${RUNNER_TEMP}/rustfs-validation-native-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cp "${VALIDATION_ROOT}/tool-run.json" "${NATIVE_DIRECTORY}/tool-run.json"
           printf 'VALIDATION_HEAL_NATIVE_DIRECTORY=%s\n' "${NATIVE_DIRECTORY}" >> "${GITHUB_ENV}"
 
       - name: Download pinned manager persistence and incarnation evidence

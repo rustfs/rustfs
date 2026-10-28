@@ -196,33 +196,63 @@ class RaceNativeToolsWorkflowTests(unittest.TestCase):
         self.assertIn("inputs.validation_case == 'heal.race-multipart-complete-abort'", selection)
 
     def test_i05_native_prerequisite_propagates_failure_and_exports_only_after_verification(self):
-        shell = self.chain_shell_step('Verify I05 queued-successor native prerequisite')
-        for exit_code in (0, 42):
-            with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory() as name:
-                root = Path(name)
-                env = self.fixture(root, new_helper=True)
-                script = root / 'auto-testing/scripts/validation_heal/race_native_evidence.py'
-                script.write_text('import os,sys\n'
-                    'assert sys.argv[-2:] == ["--case-id", "heal.lock-timeout-and-caller-abort"]\n'
-                    'assert sys.argv[-3] == os.environ["AUTO_TESTING_SHA"]\n'
-                    'sys.exit(int(os.environ["VERIFY_EXIT"]))\n')
-                validation = root / 'validation'; validation.mkdir()
-                (validation / 'tool-run.json').write_text('{"id":123}')
-                native = root / 'rustfs-validation-native-77-1'; native.mkdir()
-                output = root / 'env'
-                env.update(RUNNER_TEMP=str(root), GITHUB_RUN_ID='77', GITHUB_RUN_ATTEMPT='1',
-                           VALIDATION_ROOT=str(validation), GITHUB_ENV=str(output), VERIFY_EXIT=str(exit_code))
-                result = subprocess.run(['bash', '-c', shell], cwd=root, env=env, capture_output=True, text=True)
-                self.assertEqual(result.returncode, exit_code, result.stderr)
-                self.assertEqual(output.exists(), exit_code == 0)
-                self.assertEqual((native / 'tool-run.json').read_bytes(), (validation / 'tool-run.json').read_bytes())
+        shell = self.chain_shell_step('Verify I05 source-plan or queued-successor native prerequisites')
+        for branch in ('source-plan', 'queued-successor'):
+            for exit_code in (0, 42):
+                with self.subTest(branch=branch, exit_code=exit_code), tempfile.TemporaryDirectory() as name:
+                    root = Path(name)
+                    env = self.fixture(root, new_helper=True)
+                    script_name = 'lock_source.py' if branch == 'source-plan' else 'race_native_evidence.py'
+                    script = root / 'auto-testing/scripts/validation_heal' / script_name
+                    script.write_text('import os,sys\n'
+                        'assert sys.argv[1] == "--directory"\n'
+                        'assert "--candidate" in sys.argv\n'
+                        'assert sys.argv[sys.argv.index("--testing-commit") + 1] == os.environ["AUTO_TESTING_SHA"]\n'
+                        'if os.environ["I05_DIAGNOSTIC_BRANCH"] == "queued-successor":\n'
+                        '    assert sys.argv[-2:] == ["--case-id", "heal.lock-timeout-and-caller-abort"]\n'
+                        'else:\n'
+                        '    assert "--case-id" not in sys.argv\n'
+                        'sys.exit(int(os.environ["VERIFY_EXIT"]))\n')
+                    validation = root / 'validation'; validation.mkdir()
+                    (validation / 'tool-run.json').write_text('{"id":123}')
+                    native = root / 'rustfs-validation-native-77-1'; native.mkdir()
+                    output = root / 'env'
+                    env.update(RUNNER_TEMP=str(root), GITHUB_RUN_ID='77', GITHUB_RUN_ATTEMPT='1',
+                               VALIDATION_ROOT=str(validation), GITHUB_ENV=str(output), VERIFY_EXIT=str(exit_code),
+                               I05_DIAGNOSTIC_BRANCH=branch)
+                    result = subprocess.run(['bash', '-c', shell], cwd=root, env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, exit_code, result.stderr)
+                    self.assertEqual(output.exists(), exit_code == 0)
+                    self.assertEqual((native / 'tool-run.json').read_bytes(), (validation / 'tool-run.json').read_bytes())
         workflow = (candidate.ROOT / '.github/workflows/rustfs-functional-chain.yml').read_text()
-        self.assertLess(workflow.index('Verify I05 queued-successor native prerequisite'),
+        self.assertLess(workflow.index('Verify I05 source-plan or queued-successor native prerequisites'),
                         workflow.index('Run selected canonical validation case'))
         download = workflow.split('      - name: Download pinned native storage evidence\n', 1)[1].split('        uses:', 1)[0]
-        self.assertIn("inputs.i05_diagnostic_branch == 'queued-successor'", download)
+        self.assertIn("inputs.i05_diagnostic_branch != 'timeout'", download)
         execution = workflow.split('      - name: Run selected canonical validation case\n', 1)[1].split('        run:', 1)[0]
         self.assertIn('I05_DIAGNOSTIC_BRANCH: ${{ inputs.i05_diagnostic_branch }}', execution)
+
+    def test_f07_directory_fsync_artifact_is_candidate_scoped_and_bound(self):
+        shell = self.chain_shell_step('Bind F07 exact-candidate directory fsync evidence')
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            validation = root / 'validation'; validation.mkdir()
+            (validation / 'tool-run.json').write_text('{"id":123}')
+            native = root / 'rustfs-validation-native-77-1'; native.mkdir()
+            output = root / 'env'
+            env = dict(os.environ, RUNNER_TEMP=str(root), GITHUB_RUN_ID='77', GITHUB_RUN_ATTEMPT='1',
+                       VALIDATION_ROOT=str(validation), GITHUB_ENV=str(output))
+            result = subprocess.run(['bash', '-c', shell], cwd=root, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((native / 'tool-run.json').read_bytes(), (validation / 'tool-run.json').read_bytes())
+            self.assertEqual(output.read_text(), 'VALIDATION_HEAL_NATIVE_DIRECTORY=' + str(native) + '\n')
+        workflow = (candidate.ROOT / '.github/workflows/rustfs-functional-chain.yml').read_text()
+        binding = workflow.split('      - name: Bind F07 exact-candidate directory fsync evidence\n', 1)[1]
+        guard = binding.split('        run:', 1)[0]
+        self.assertIn("inputs.validation_case == 'heal.checkpoint-and-mrf-corruption'", guard)
+        self.assertIn("steps.candidate.outputs.source_sha == '1aa9be87d18cf941e5020f19e8622c26ba4b10ac'", guard)
+        self.assertLess(workflow.index('Bind F07 exact-candidate directory fsync evidence'),
+                        workflow.index('Run selected canonical validation case'))
 
     def shell_step(self, name):
         from check_test_wiring import yaml_block
