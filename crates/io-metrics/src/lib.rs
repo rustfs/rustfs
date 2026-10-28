@@ -49,6 +49,11 @@
 #[macro_use]
 extern crate metrics;
 
+mod local_batch_read;
+pub use local_batch_read::{
+    LocalBatchReadDecision, LocalBatchReadMetrics, LocalBatchReadStage, record_local_batch_read_decision,
+};
+
 use std::collections::HashMap;
 use std::sync::{
     LazyLock, Mutex,

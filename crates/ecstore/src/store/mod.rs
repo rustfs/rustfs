@@ -452,6 +452,8 @@ pub use object::{
 };
 mod peer;
 mod rebalance;
+#[cfg(test)]
+pub(crate) use rebalance::PoolSpaceForTest;
 pub(crate) mod utils;
 
 use peer::init_local_peer;

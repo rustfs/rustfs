@@ -488,6 +488,18 @@ where
     Ok(data)
 }
 
+/// Read config bytes and metadata while preserving an existing empty payload.
+pub(crate) async fn read_config_preserve_empty_with_metadata_opts<S>(
+    api: Arc<S>,
+    file: &str,
+    opts: &ObjectOptions,
+) -> Result<(Vec<u8>, ObjectInfo)>
+where
+    S: EcstoreObjectIO,
+{
+    read_config_with_metadata_inner(api, file, opts, true, None).await
+}
+
 pub async fn read_config_no_lock<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
 where
     S: ObjectIO<
