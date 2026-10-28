@@ -202,6 +202,28 @@ fn candidate_group_expiry_uses_earliest_discovery_not_admission_order() {
 }
 
 #[test]
+fn later_candidate_group_also_expires_from_earliest_discovery() {
+    let mut observations = Observations::default();
+    let now = Instant::now();
+    let mut first_group = candidate();
+    first_group.first_seen = now + Duration::from_secs(2);
+    let mut later = candidate();
+    later.mode = HealScanMode::Normal;
+    later.first_seen = now + Duration::from_secs(1);
+    let mut earlier = candidate();
+    earlier.mode = HealScanMode::Normal;
+    earlier.first_seen = now;
+    for candidate in [first_group, later, earlier] {
+        assert!(observations.admit(key("reordered-other-group"), candidate).is_none());
+    }
+
+    observations.maintain(now + PENDING_TTL);
+    assert!(observations.pending.contains_key(&key("reordered-other-group")));
+    assert_eq!(observations.unknown_counts.get("expired"), Some(&2));
+    assert_eq!(observations.terminal_tasks, 0);
+}
+
+#[test]
 fn candidate_expiry_is_enforced_when_terminal_arrives_between_ticks() {
     let mut observations = Observations::default();
     let now = Instant::now();
