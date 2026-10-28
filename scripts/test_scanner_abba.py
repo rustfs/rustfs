@@ -705,11 +705,294 @@ class ScannerAbbaTest(unittest.TestCase):
             "metrics": metrics,
             "oracle": manifest["oracles"]["cold-hot"],
         }
-        harness.validate_result(result, request, manifest["oracles"]["cold-hot"])
+        with self.assertRaisesRegex(ValueError, "missing client request samples"):
+            harness.validate_result(result, request, manifest["oracles"]["cold-hot"])
+        with patch.object(harness, "validate_client_request_samples"):
+            harness.validate_result(result, request, manifest["oracles"]["cold-hot"])
         result["release_evidence"] = copy.deepcopy(result["release_evidence"])
         result["release_evidence"]["profile"]["required_artifacts"].remove("flamegraph")
         with self.assertRaisesRegex(ValueError, "release evidence provenance mismatch"):
             harness.validate_result(result, request, manifest["oracles"]["cold-hot"])
+
+    def test_measured_self_report_cannot_pass_without_source_evidence(self):
+        manifest = self.measured_manifest()
+
+        def invoke(_adapter, action, request_path, _timeout):
+            request = harness.read_json(request_path)
+            if action == "prepare":
+                return {"ready": True}
+            if action == "stop":
+                return {"stopped": True}
+            self.assertEqual(action, "oracle")
+            return {"complete": True, "errors": 0, "actual": request["expected_oracle"]}
+
+        regression = False
+
+        def collect(_prepared, request, _request_path, _adapter):
+            baseline = request["comparison"] == "build" and request["leg"].startswith("A")
+            metrics = dict.fromkeys(harness.METRICS, 10)
+            metrics.update(p99_ms=12 if regression and request["leg"].startswith("B") else 10,
+                           throughput_ops=100, errors=0, requests=100,
+                           walk_objects=100 if baseline else 20, cold_walk_objects=100 if baseline else 0,
+                           healed_objects=request["expected_healed_objects"], heal_duplicate_task_count=0)
+            result = {key: request[key] for key in ("evidence", "fixed", "build", "data_dir", "background", "release_evidence")}
+            result.update(sample_count=10, elapsed_seconds=request["duration_seconds"], metrics=metrics,
+                          client_observation={"p95_ns": 10_000_000,
+                                              "p99_ns": int(metrics["p99_ms"] * 1_000_000)},
+                          convergence={"writes_stopped": True, "last_mutation_observed": True,
+                                       "first_complete_publication": True, "last_mutation_time": 1,
+                                       "last_mutation_observed_time": 2, "writes_stopped_time": 2,
+                                       "window_start": 2, "window_end": 3, "budget_available_seconds": 1,
+                                       "walk_objects": 110, "full_walk_objects": 100})
+            return result
+
+        with patch.object(harness, "SCENARIOS", ("cold-hot",)), patch.object(harness, "invoke", side_effect=invoke), \
+             patch.object(harness, "validate_client_request_samples"), \
+             patch.object(harness, "collect_live", side_effect=collect), contextlib.redirect_stdout(io.StringIO()):
+            status = harness.run(manifest, self.adapter, self.root / "out", self.root / "data")
+        report = harness.read_json(self.root / "out/report.json")
+        self.assertEqual(status, 3)
+        self.assertEqual((report["status"], report["performance"]), ("inconclusive", "pending"))
+        self.assertEqual(report["measurement_provenance"], "unverified")
+        self.assertTrue(all(row["status"] == "inconclusive" and row["measurement_provenance"] == "unverified"
+                            for row in report["comparisons"]))
+
+        regression = True
+        with patch.object(harness, "SCENARIOS", ("cold-hot",)), patch.object(harness, "invoke", side_effect=invoke), \
+             patch.object(harness, "validate_client_request_samples"), \
+             patch.object(harness, "collect_live", side_effect=collect), contextlib.redirect_stdout(io.StringIO()):
+            status = harness.run(manifest, self.adapter, self.root / "failed-out", self.root / "failed-data")
+        report = harness.read_json(self.root / "failed-out/report.json")
+        self.assertEqual(status, 1)
+        self.assertEqual((report["status"], report["performance"]), ("fail", "fail"))
+        self.assertTrue(any(row["status"] == "fail" for row in report["comparisons"]))
+
+    def test_measured_percentile_threshold_uses_original_nanoseconds(self):
+        baseline = 9_000_000_000_000_001
+        candidate = 9_450_000_000_000_002
+        cells = []
+        for leg in harness.LEGS:
+            ns = baseline if leg.startswith("A") else candidate
+            metrics = dict.fromkeys(harness.METRICS, 1)
+            metrics.update(p95_ms=1.0, p99_ms=ns / 1_000_000, requests=100, errors=0,
+                           walk_objects=100 if leg.startswith("A") else 20,
+                           cold_walk_objects=100 if leg.startswith("A") else 0)
+            cells.append({"leg": leg, "evidence": "measured", "comparison": "build", "scenario": "cold-hot",
+                          "round": 1, "background": "on", "result": {"metrics": metrics,
+                          "client_observation": {"p95_ns": 1_000_000, "p99_ns": ns}}})
+        _, comparisons = harness.evaluate(cells)
+        self.assertGreater(comparisons[0]["p99_regression"], 0.05)
+        self.assertEqual(comparisons[0]["status"], "fail")
+        self.assertIsNone(comparisons[0]["foreground_p95_ms"])
+        self.assertIsNone(comparisons[0]["foreground_p99_ms"])
+
+    def test_measurement_and_stop_errors_are_both_preserved(self):
+        def invoke(_adapter, action, _request_path, _timeout):
+            if action == "prepare":
+                return {"ready": True}
+            if action == "measure":
+                raise ValueError("measurement failed")
+            if action == "stop":
+                raise ValueError("stop failed")
+            self.fail(f"unexpected action {action}")
+
+        with patch.object(harness, "SCENARIOS", ("cold-hot",)), patch.object(harness, "invoke", side_effect=invoke), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "measurement failed.*stop failed"):
+                self.run_harness()
+        report = harness.read_json(self.root / "out/report.json")
+        self.assertIn("measurement failed", report["error"])
+        self.assertIn("stop failed", report["error"])
+
+    def test_malformed_measured_collector_and_stop_errors_are_both_preserved(self):
+        manifest = self.measured_manifest()
+
+        def invoke(_adapter, action, _request_path, _timeout):
+            if action == "prepare":
+                return {"ready": True, "collector": None}
+            if action == "stop":
+                raise ValueError("stop failed")
+            self.fail(f"unexpected action {action}")
+
+        with patch.object(harness, "SCENARIOS", ("cold-hot",)), patch.object(harness, "invoke", side_effect=invoke), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "invalid collector connection.*stop failed"):
+                harness.run(manifest, self.adapter, self.root / "out", self.root / "data")
+        report = harness.read_json(self.root / "out/report.json")
+        self.assertIn("invalid collector connection", report["error"])
+        self.assertIn("stop failed", report["error"])
+        self.assertEqual(report["measurement_provenance"], "unverified")
+
+    def test_malformed_measured_collector_is_reported_after_successful_stop(self):
+        manifest = self.measured_manifest()
+
+        def invoke(_adapter, action, _request_path, _timeout):
+            if action == "prepare":
+                return {"ready": True, "collector": None}
+            if action == "stop":
+                return {"stopped": True}
+            self.fail(f"unexpected action {action}")
+
+        with patch.object(harness, "SCENARIOS", ("cold-hot",)), patch.object(harness, "invoke", side_effect=invoke), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "invalid collector connection"):
+                harness.run(manifest, self.adapter, self.root / "out", self.root / "data")
+        report = harness.read_json(self.root / "out/report.json")
+        self.assertEqual((report["status"], report["evidence"], report["measurement_provenance"]),
+                         ("failed", "measured", "unverified"))
+        self.assertIn("invalid collector connection", report["error"])
+
+    def test_interruption_is_preserved_when_stop_also_fails(self):
+        def invoke(_adapter, action, _request_path, _timeout):
+            if action == "prepare":
+                return {"ready": True}
+            if action == "measure":
+                raise KeyboardInterrupt("interrupted")
+            if action == "stop":
+                raise ValueError("stop failed")
+            self.fail(f"unexpected action {action}")
+
+        with patch.object(harness, "SCENARIOS", ("cold-hot",)), patch.object(harness, "invoke", side_effect=invoke), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_harness()
+        report = harness.read_json(self.root / "out/report.json")
+        self.assertIn("interrupted", report["error"])
+        self.assertIn("stop failed", report["error"])
+
+    def test_stop_interruption_preserves_prior_failure(self):
+        def invoke(_adapter, action, _request_path, _timeout):
+            if action == "prepare":
+                return {"ready": True}
+            if action == "measure":
+                raise ValueError("measurement failed")
+            if action == "stop":
+                raise KeyboardInterrupt("stop interrupted")
+            self.fail(f"unexpected action {action}")
+
+        with patch.object(harness, "SCENARIOS", ("cold-hot",)), patch.object(harness, "invoke", side_effect=invoke), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_harness()
+        report = harness.read_json(self.root / "out/report.json")
+        self.assertIn("measurement failed", report["error"])
+        self.assertIn("stop interrupted", report["error"])
+
+    def test_collector_cleanup_and_stop_errors_keep_measurement_failure(self):
+        manifest = self.measured_manifest()
+
+        def invoke(_adapter, action, _request_path, _timeout):
+            if action == "prepare":
+                return {"ready": True, "collector": {"alias": "test", "endpoint": "test", "metrics_endpoints": "test"}}
+            if action == "measure":
+                raise ValueError("measurement failed")
+            if action == "stop":
+                raise ValueError("stop failed")
+            self.fail(f"unexpected action {action}")
+
+        collector = Mock()
+        collector.finish.side_effect = ValueError("collector cleanup failed")
+        with patch.object(harness, "SCENARIOS", ("cold-hot",)), patch.object(harness, "invoke", side_effect=invoke), \
+             patch.object(harness, "OwnedCommand", return_value=collector), \
+             patch.dict(os.environ, {"RUSTFS_ACCESS_KEY": "test", "RUSTFS_SECRET_KEY": "test"}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(ValueError):
+                harness.run(manifest, self.adapter, self.root / "out", self.root / "data")
+        report = harness.read_json(self.root / "out/report.json")
+        for message in ("measurement failed", "collector cleanup failed", "stop failed"):
+            self.assertIn(message, report["error"])
+
+    def test_stop_interruption_keeps_nested_collector_failure_chain(self):
+        manifest = self.measured_manifest()
+
+        def invoke(_adapter, action, _request_path, _timeout):
+            if action == "prepare":
+                return {"ready": True, "collector": {"alias": "test", "endpoint": "test", "metrics_endpoints": "test"}}
+            if action == "measure":
+                raise ValueError("measurement failed")
+            if action == "stop":
+                raise KeyboardInterrupt("stop interrupted")
+            self.fail(f"unexpected action {action}")
+
+        collector = Mock()
+        collector.finish.side_effect = ValueError("collector cleanup failed")
+        with patch.object(harness, "SCENARIOS", ("cold-hot",)), patch.object(harness, "invoke", side_effect=invoke), \
+             patch.object(harness, "OwnedCommand", return_value=collector), \
+             patch.dict(os.environ, {"RUSTFS_ACCESS_KEY": "test", "RUSTFS_SECRET_KEY": "test"}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                harness.run(manifest, self.adapter, self.root / "out", self.root / "data")
+        report = harness.read_json(self.root / "out/report.json")
+        for message in ("measurement failed", "collector cleanup failed", "stop interrupted"):
+            self.assertIn(message, report["error"])
+
+    def test_collector_interruption_and_stop_failure_keep_measurement_error(self):
+        manifest = self.measured_manifest()
+
+        def invoke(_adapter, action, _request_path, _timeout):
+            if action == "prepare":
+                return {"ready": True, "collector": {"alias": "test", "endpoint": "test", "metrics_endpoints": "test"}}
+            if action == "measure":
+                raise ValueError("measurement failed")
+            if action == "stop":
+                raise ValueError("stop failed")
+            self.fail(f"unexpected action {action}")
+
+        collector = Mock()
+        collector.finish.side_effect = KeyboardInterrupt("collector interrupted")
+        with patch.object(harness, "SCENARIOS", ("cold-hot",)), patch.object(harness, "invoke", side_effect=invoke), \
+             patch.object(harness, "OwnedCommand", return_value=collector), \
+             patch.dict(os.environ, {"RUSTFS_ACCESS_KEY": "test", "RUSTFS_SECRET_KEY": "test"}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                harness.run(manifest, self.adapter, self.root / "out", self.root / "data")
+        report = harness.read_json(self.root / "out/report.json")
+        for message in ("measurement failed", "collector interrupted", "stop failed"):
+            self.assertIn(message, report["error"])
+
+    def test_subprocess_failures_do_not_expose_arguments(self):
+        sentinel = "TEST_ONLY_ARGUMENT_SENTINEL"
+
+        def invoke(_adapter, action, _request_path, _timeout):
+            if action == "prepare":
+                return {"ready": True}
+            if action == "measure":
+                raise subprocess.TimeoutExpired(["collector", sentinel], 5)
+            if action == "stop":
+                raise subprocess.CalledProcessError(7, ["adapter", sentinel])
+            self.fail(f"unexpected action {action}")
+
+        with patch.object(harness, "SCENARIOS", ("cold-hot",)), patch.object(harness, "invoke", side_effect=invoke), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(ValueError):
+                self.run_harness()
+        report = harness.read_json(self.root / "out/report.json")
+        self.assertFalse(sentinel in report["error"])
+        self.assertIn("timed out", report["error"])
+        self.assertIn("status 7", report["error"])
+
+        stderr = io.StringIO()
+        argv = ["scanner_abba.py", "--manifest", "unused", "--adapter", "unused", "--out-dir", "unused", "--data-root", "unused"]
+        with patch.object(sys, "argv", argv), patch.object(harness, "run", side_effect=subprocess.TimeoutExpired([sentinel], 5)), \
+             patch.object(harness, "read_json", return_value={}), contextlib.redirect_stderr(stderr):
+            self.assertEqual(harness.main(), 1)
+        self.assertFalse(sentinel in stderr.getvalue())
+
+    def test_unknown_release_evidence_values_are_not_echoed(self):
+        sentinel = "TEST_ONLY_UNTRUSTED_VALUE"
+        manifest = self.measured_manifest()
+        manifest["release_evidence"]["crash_restart"]["fault_modes"].append(sentinel)
+        with self.assertRaises(ValueError) as caught:
+            harness.validate_manifest(manifest)
+        self.assertFalse(sentinel in str(caught.exception))
+
+    def test_invalid_json_does_not_echo_filename(self):
+        sentinel = "TEST_ONLY_FILENAME_SENTINEL"
+        source = self.root / sentinel
+        source.write_text("[]", encoding="utf-8")
+        with self.assertRaises(ValueError) as caught:
+            harness.read_json(source)
+        self.assertFalse(sentinel in str(caught.exception))
 
     def test_existing_data_preserved(self):
         (self.root / "data").mkdir()

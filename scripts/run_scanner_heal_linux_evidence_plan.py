@@ -365,7 +365,7 @@ def performance_steps() -> list[dict[str, Any]]:
         {
             "id": "scanner-heal-abba",
             "description": "Run the isolated EC8+4 Scanner/Heal ABBA matrix through the deployment adapter.",
-            "covers": {"gates": ["G10", "P1", "P2", "P3"], "issues": ["2266", "2273", "2274", "2275"]},
+            "covers": {"gates": ["G10", "P1", "P3"], "issues": ["2266", "2273", "2274", "2275"]},
             "commands": [
                 existing_script_command(
                     "scripts/python_bin.sh",
@@ -385,7 +385,7 @@ def performance_steps() -> list[dict[str, Any]]:
         {
             "id": "scheduler-pressure",
             "description": "Assemble scheduler-pressure, profile, RSS, throughput, and latency descriptors.",
-            "covers": {"gates": ["G10", "P1", "P2", "P3"], "issues": ["2266", "2274", "2275"]},
+            "covers": {"gates": ["G10", "P1", "P3"], "issues": ["2266", "2274", "2275"]},
             "commands": [
                 existing_script_command(
                     "scripts/python_bin.sh",
@@ -402,11 +402,27 @@ def performance_steps() -> list[dict[str, Any]]:
                     "rss-samples=$RUN_ROOT/profile/rss-samples.json",
                     "--profile-artifact",
                     "save-frequency=$RUN_ROOT/profile/save-frequency.json",
+                    "--started-at",
+                    "$ORIGINAL_WINDOW_STARTED_AT",
+                    "--finished-at",
+                    "$ORIGINAL_WINDOW_FINISHED_AT",
+                    "--run-id",
+                    "$ORIGINAL_RUN_ID",
+                    "--measurement-window-id",
+                    "$ORIGINAL_WINDOW_ID",
                     "--out-dir",
                     "$RUN_ROOT/descriptors/scheduler-pressure",
                 )
             ],
             "expected_outputs": expected_outputs("$RUN_ROOT/descriptors/scheduler-pressure/release-bundle-scheduler-pressure.json"),
+        },
+        {
+            "id": "p2-independent-evidence",
+            "description": "P2 needs original post-stop and segment observations with independent full-walk and root oracles.",
+            "covers": {"gates": ["P2"], "issues": ["2274"]},
+            "commands": [],
+            "expected_outputs": [],
+            "pending_reason": "No producer verifies the required independent P2 evidence yet.",
         },
     ]
 
@@ -561,7 +577,10 @@ def build_status(plan: dict[str, Any], run_root: Path) -> dict[str, Any]:
             for key in counts:
                 totals[key] += counts[key]
             totals["expected"] += len(outputs)
-            if not outputs:
+            pending_reason = step.get("pending_reason")
+            if isinstance(pending_reason, str) and pending_reason:
+                status = "pending"
+            elif not outputs:
                 status = "not_tracked"
             elif counts["invalid"] or counts["empty"]:
                 status = "invalid"
@@ -578,12 +597,17 @@ def build_status(plan: dict[str, Any], run_root: Path) -> dict[str, Any]:
                         "status": status,
                         "commands": step["commands"],
                     }
-            step_statuses.append({
+                    if pending_reason:
+                        next_step["reason"] = pending_reason
+            step_status = {
                 "id": step["id"],
                 "status": status,
                 "covers": step.get("covers", {}),
                 "outputs": outputs,
-            })
+            }
+            if pending_reason:
+                step_status["reason"] = pending_reason
+            step_statuses.append(step_status)
         tracked = [step for step in step_statuses if step["status"] != "not_tracked"]
         if not tracked:
             stage_state = "not_tracked"
@@ -598,7 +622,7 @@ def build_status(plan: dict[str, Any], run_root: Path) -> dict[str, Any]:
         stage_statuses.append({"id": stage["id"], "status": stage_state, "steps": step_statuses})
     if totals["invalid"] or totals["empty"]:
         decision = "invalid"
-    elif totals["missing"]:
+    elif totals["missing"] or pending_gates:
         decision = "blocked"
     else:
         decision = "complete"
@@ -753,7 +777,8 @@ def self_test() -> None:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("{}\n")
     complete = build_status(plan, complete_root)
-    assert complete["decision"] == "complete"
+    assert complete["decision"] == "blocked"
+    assert "P2" in complete["pending_gates"]
     assert complete["release_approved"] is False
     print("PASS: scanner/heal Linux evidence plan self-test")
 
