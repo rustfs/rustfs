@@ -496,7 +496,7 @@ fn status_and_pending_metric_count_each_owner_generation() {
 fn reused_task_id_keeps_terminal_observations_on_their_owner_generation() {
     let mut observations = Observations::default();
     let old_key = key("owner");
-    assert!(observations.admit(old_key.clone(), candidate()).is_none());
+    assert!(observations.admit(old_key, candidate()).is_none());
     assert!(
         observations
             .complete(completion("owner", HealObjectDisposition::VerifiedHealthy), Instant::now())
@@ -508,7 +508,7 @@ fn reused_task_id_keeps_terminal_observations_on_their_owner_generation() {
         observation_id: 2,
     };
     assert!(
-        observations.admit(new_key.clone(), candidate()).is_none(),
+        observations.admit(new_key, candidate()).is_none(),
         "the old terminal cannot settle a new owner"
     );
     let mut new_terminal = (*completion("owner", HealObjectDisposition::Repaired)).clone();
