@@ -14,6 +14,7 @@
 
 //! HeadObject path.
 
+use super::veeam_sosapi;
 use super::*;
 use crate::on_demand_migration::{
     BucketOdmState, HeadPolicy, OdmLookup, OdmOp, OdmOutcome, OnDemandMigrationSys, SourceClient, SourceError, SourceHead,
@@ -298,6 +299,40 @@ impl DefaultObjectUsecase {
         }
     }
 
+    async fn serve_veeam_sosapi_head(
+        &self,
+        req: &S3Request<HeadObjectInput>,
+        store: &Arc<ECStore>,
+        kind: veeam_sosapi::SosapiKind,
+        part_number: Option<usize>,
+        range: Option<&HTTPRangeSpec>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
+        let representation =
+            veeam_sosapi::read_representation(store, &req.input.bucket, kind, &req.headers, part_number, range).await?;
+        let content_type = ContentType::from_str(veeam_sosapi::CONTENT_TYPE)
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "invalid SOSAPI content type"))?;
+        let content_range = representation.content_range;
+        let output = HeadObjectOutput {
+            content_length: Some(representation.content_length),
+            content_type: Some(content_type),
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
+            last_modified: Some(Timestamp::from(representation.last_modified)),
+            e_tag: Some(to_s3s_etag(&representation.etag_hex)),
+            ..Default::default()
+        };
+        let mut response = wrap_response_with_cors(&req.input.bucket, &req.method, &req.headers, output).await;
+        inject_accept_ranges_header(&mut response.headers);
+        if let Some(content_range) = content_range {
+            response.headers.insert(
+                http::header::CONTENT_RANGE,
+                HeaderValue::from_str(&content_range)
+                    .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "invalid content range"))?,
+            );
+            response.status = Some(StatusCode::PARTIAL_CONTENT);
+        }
+        Ok(response)
+    }
+
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_head_object(&self, mut req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
         if let Some(context) = &self.context {
@@ -335,6 +370,17 @@ impl DefaultObjectUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
         validate_bucket_exists(&store, &bucket).await?;
+
+        if version_id.is_none()
+            && let Some(kind) = veeam_sosapi::handled_kind(&key)
+        {
+            let response = self
+                .serve_veeam_sosapi_head(&req, &store, kind, part_number, rs.as_ref())
+                .await?;
+            let result = Ok(response);
+            let _ = helper.complete(&result);
+            return result;
+        }
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
             .await

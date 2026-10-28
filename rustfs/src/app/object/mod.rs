@@ -220,6 +220,7 @@ mod restore;
 pub(crate) mod shared;
 #[cfg(test)]
 mod test_support;
+mod veeam_sosapi;
 
 pub(crate) use self::copy::*;
 #[cfg(test)]

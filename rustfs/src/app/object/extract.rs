@@ -2461,6 +2461,7 @@ impl DefaultObjectUsecase {
             }
             let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&auth_req);
             drop(auth_req);
+            extract_try!(reject_veeam_sosapi_mutation(|| Some(Arc::clone(&commit_context.store)), &bucket, &fpath).await);
             if archive_entry_mod_time.is_some() {
                 opts.mod_time = archive_entry_mod_time;
             }

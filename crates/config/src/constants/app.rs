@@ -222,6 +222,16 @@ pub const ENV_RUSTFS_TLS_PATH: &str = "RUSTFS_TLS_PATH";
 /// Environment variable for server KMS enable.
 pub const ENV_RUSTFS_KMS_ENABLE: &str = "RUSTFS_KMS_ENABLE";
 
+/// Environment variable for Veeam SOSAPI virtual system objects.
+///
+/// When true (the default), authenticated GET and HEAD of the two Veeam
+/// SOSAPI keys return generated XML. When false, those keys use the normal
+/// object path so an operator can remove a real object stored there earlier.
+pub const ENV_VEEAM_SOSAPI_ENABLE: &str = "RUSTFS_VEEAM_SOSAPI_ENABLE";
+
+/// Default Veeam SOSAPI enablement.
+pub const DEFAULT_VEEAM_SOSAPI_ENABLE: bool = true;
+
 /// Default KMS enable for server-side encryption
 /// This is the default value for enabling KMS encryption for server-side encryption.
 /// Default value: false

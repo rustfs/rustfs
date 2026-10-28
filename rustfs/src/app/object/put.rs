@@ -1272,6 +1272,7 @@ impl DefaultObjectUsecase {
                 format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is not supported for archive extraction"),
             ));
         }
+        reject_veeam_sosapi_mutation(|| self.object_store(), req.input.bucket.as_str(), req.input.key.as_str()).await?;
         if is_put_object_extract_requested(&req.headers) && !inbound_replication_put {
             return Box::pin(self.execute_put_object_extract(req)).await;
         }
@@ -1504,6 +1505,8 @@ impl DefaultObjectUsecase {
             sse_customer_key,
             sse_customer_key_md5,
         } = sse;
+
+        reject_veeam_sosapi_mutation(|| self.object_store(), bucket.as_str(), key.as_str()).await?;
 
         // The app check preserves the existing S3 error contract; the storage
         // commit path reserves the exact net logical growth under its locks.

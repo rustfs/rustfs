@@ -73,6 +73,7 @@ use super::trailer_adapter::trailer_source;
 use crate::app::object::{
     ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, guard_put_object_body_read_timeout,
     put_object_body_read_timeout, reject_non_wildcard_write_if_none_match, reject_oversize_single_upload,
+    reject_veeam_sosapi_mutation,
 };
 use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
@@ -542,6 +543,8 @@ impl DefaultMultipartUsecase {
             bucket, key, upload_id, ..
         } = req.input;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
+
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -610,6 +613,7 @@ impl DefaultMultipartUsecase {
             ..
         } = input;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         reject_non_wildcard_write_if_none_match(if_none_match.as_ref(), &req.headers)?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
@@ -1020,6 +1024,7 @@ impl DefaultMultipartUsecase {
             return Err(s3_error!(InvalidStorageClass));
         }
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         let Some(store) = self.object_store() else {
@@ -1243,6 +1248,7 @@ impl DefaultMultipartUsecase {
 
         let part_id = parse_upload_part_number(part_number)?;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         let size = resolve_upload_part_size(content_length, body.as_ref())?;
@@ -1641,6 +1647,7 @@ impl DefaultMultipartUsecase {
             ..
         } = req.input;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         let params = parse_list_parts_params(part_number_marker, max_parts)?;
 
         let Some(store) = self.object_store() else {
@@ -1702,6 +1709,7 @@ impl DefaultMultipartUsecase {
             ..
         } = req.input;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         let (src_bucket, src_key, raw_src_version_id) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),

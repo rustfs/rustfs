@@ -997,6 +997,73 @@ fn completed_data_usage_info_adds_same_bucket_across_unique_sets() {
 }
 
 #[test]
+fn bucket_usage_incarnation_is_optional_and_old_readers_ignore_it() {
+    #[derive(serde::Deserialize)]
+    struct LegacyBucketUsage {
+        size: u64,
+    }
+    let legacy = BucketUsageInfo {
+        size: 42,
+        ..Default::default()
+    };
+    let without = serde_json::to_value(&legacy).expect("encode legacy usage");
+    assert!(without.get("bucket_incarnation").is_none());
+    let restored: BucketUsageInfo = serde_json::from_value(without).expect("decode old usage");
+    assert_eq!(restored.bucket_incarnation, None);
+    let certified = BucketUsageInfo {
+        size: 42,
+        bucket_incarnation: Some(uuid::Uuid::from_u128(7).to_string()),
+        ..Default::default()
+    };
+    let encoded = serde_json::to_vec(&certified).expect("encode certified usage");
+    let old: LegacyBucketUsage = serde_json::from_slice(&encoded).expect("old schema ignores additive field");
+    assert_eq!(old.size, 42);
+    let named = rmp_serde::to_vec_named(&certified).expect("encode certified named msgpack");
+    let old: LegacyBucketUsage = rmp_serde::from_slice(&named).expect("old named reader ignores additive field");
+    assert_eq!(old.size, 42);
+    let old_bytes = rmp_serde::to_vec_named(&legacy).expect("encode old shape");
+    let new: BucketUsageInfo = rmp_serde::from_slice(&old_bytes).expect("new reader accepts old shape");
+    assert_eq!(new.bucket_incarnation, None);
+}
+
+#[test]
+fn completed_usage_certifies_only_matching_non_nil_bucket_incarnations() {
+    let buckets = vec!["bucket".to_string()];
+    let id = uuid::Uuid::from_u128(7);
+    let mut a = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
+    let mut b = completed_root_cache("bucket", 3, 20, DataUsageCacheSource::new(1, 0));
+    a.info.scan_bucket_incarnations.insert("bucket".to_string(), id);
+    b.info.scan_bucket_incarnations.insert("bucket".to_string(), id);
+    let published = completed_data_usage_info_for_test(&[a.clone(), b.clone()], &buckets, false, false)
+        .unwrap()
+        .0;
+    assert_eq!(
+        published.buckets_usage["bucket"].bucket_incarnation.as_deref(),
+        Some(id.to_string().as_str())
+    );
+    let encoded = serde_json::to_vec(&published).expect("serialize certified usage");
+    let decoded: DataUsageInfo = serde_json::from_slice(&encoded).expect("read certified usage");
+    assert_eq!(decoded.buckets_usage["bucket"].bucket_incarnation, Some(id.to_string()));
+    b.info
+        .scan_bucket_incarnations
+        .insert("bucket".to_string(), uuid::Uuid::from_u128(8));
+    let mismatch = completed_data_usage_info_for_test(&[a.clone(), b.clone()], &buckets, false, false)
+        .unwrap()
+        .0;
+    assert_eq!(mismatch.buckets_usage["bucket"].bucket_incarnation, None);
+    b.info.scan_bucket_incarnations.remove("bucket");
+    let missing = completed_data_usage_info_for_test(&[a.clone(), b.clone()], &buckets, false, false)
+        .unwrap()
+        .0;
+    assert_eq!(missing.buckets_usage["bucket"].bucket_incarnation, None);
+    b.info
+        .scan_bucket_incarnations
+        .insert("bucket".to_string(), uuid::Uuid::nil());
+    let nil = completed_data_usage_info_for_test(&[a, b], &buckets, false, false).unwrap().0;
+    assert_eq!(nil.buckets_usage["bucket"].bucket_incarnation, None);
+}
+
+#[test]
 fn checked_bucket_usage_info_moves_replication_keys_and_preserves_the_snapshot() {
     let first_target = "arn:rustfs:replication:local::target-a".to_string();
     let zero_target = "arn:rustfs:replication:local::zero-counters".to_string();
@@ -1057,6 +1124,7 @@ fn checked_bucket_usage_info_moves_replication_keys_and_preserves_the_snapshot()
     }
     let expected = BucketUsageInfo {
         size: 32768,
+        bucket_incarnation: None,
         replication_pending_size_v1: 0,
         replication_failed_size_v1: 0,
         replicated_size_v1: 0,

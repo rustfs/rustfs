@@ -393,6 +393,10 @@ pub(crate) fn parse_object_version_id(version_id: Option<String>) -> S3Result<Op
     }
 }
 
+async fn reject_veeam_sosapi_mutation(fs: &FS, bucket: &str, key: &str) -> S3Result<()> {
+    s3_api::reject_veeam_sosapi_mutation(|| fs.server_ctx.object_store(), bucket, key).await
+}
+
 async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Result<()> {
     table_catalog::validate_bucket_object_mutation(bucket, key)
         .await
@@ -663,6 +667,7 @@ impl S3 for FS {
             ..
         } = req.input.clone();
 
+        reject_veeam_sosapi_mutation(self, &bucket, &object).await?;
         validate_table_catalog_object_mutation(&bucket, &object).await?;
 
         let Some(store) = self.server_ctx.object_store() else {
@@ -1004,6 +1009,8 @@ impl S3 for FS {
             bucket, key, version_id, ..
         } = req.input.clone();
 
+        reject_veeam_sosapi_mutation(self, &bucket, &key).await?;
+
         let Some(store) = self.server_ctx.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -1113,6 +1120,8 @@ impl S3 for FS {
             bucket, key, version_id, ..
         } = req.input.clone();
 
+        reject_veeam_sosapi_mutation(self, &bucket, &key).await?;
+
         let Some(store) = self.server_ctx.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -1155,6 +1164,8 @@ impl S3 for FS {
         let start_time = std::time::Instant::now();
         let bucket = req.input.bucket.as_str();
         let object = req.input.key.as_str();
+
+        reject_veeam_sosapi_mutation(self, bucket, object).await?;
 
         let Some(store) = self.server_ctx.object_store() else {
             error!(
@@ -1564,6 +1575,8 @@ impl S3 for FS {
         let key = &req.input.key;
         let version_id = req.input.version_id.clone();
 
+        reject_veeam_sosapi_mutation(self, bucket, key).await?;
+
         let Some(store) = self.server_ctx.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -1604,6 +1617,7 @@ impl S3 for FS {
             ..
         } = req.input.clone();
 
+        reject_veeam_sosapi_mutation(self, &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         let Some(store) = self.server_ctx.object_store() else {
@@ -1806,6 +1820,7 @@ impl S3 for FS {
             ..
         } = req.input.clone();
 
+        reject_veeam_sosapi_mutation(self, &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         let Some(store) = self.server_ctx.object_store() else {
@@ -1923,6 +1938,7 @@ impl S3 for FS {
             ..
         } = req.input.clone();
 
+        reject_veeam_sosapi_mutation(self, &bucket, &object).await?;
         validate_table_catalog_object_mutation(&bucket, &object).await?;
 
         crate::storage::s3_api::tagging::validate_object_tag_set(&tagging.tag_set)?;
