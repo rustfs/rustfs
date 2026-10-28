@@ -27,7 +27,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
-          fetch-depth: 4
+          fetch-depth: 5
           persist-credentials: false
           clean: false
 
@@ -38,16 +38,18 @@ jobs:
           output_dir="$RUNNER_TEMP/heal-id-reuse-stack"
           mkdir -p "$output_dir"
           workflow_sha=$(git rev-parse HEAD)
-          source_sha=$(git rev-parse HEAD^)
-          base_sha=$(git rev-parse HEAD^^)
+          previous_workflow_sha=$(git rev-parse HEAD^)
+          source_sha=$(git rev-parse HEAD^^)
+          base_sha=$(git rev-parse HEAD^^^)
           source_tree=$(git rev-parse "${source_sha}^{tree}")
           marker_diff=$(git diff --full-index --binary "$base_sha" "$source_sha" | sha256sum | cut -d' ' -f1)
           marker_files=$(git diff --name-only "$base_sha" "$source_sha")
           workflow_files=$(git diff --name-only "$source_sha" "$workflow_sha")
-          printf 'workflow=%s\nsource=%s\nbase=%s\nsource_tree=%s\nmarker_diff=%s\nmarker_files=%s\nworkflow_files=%s\n' \
-            "$workflow_sha" "$source_sha" "$base_sha" "$source_tree" "$marker_diff" "$marker_files" "$workflow_files" \
+          printf 'workflow=%s\nprevious_workflow=%s\nsource=%s\nbase=%s\nsource_tree=%s\nmarker_diff=%s\nmarker_files=%s\nworkflow_files=%s\n' \
+            "$workflow_sha" "$previous_workflow_sha" "$source_sha" "$base_sha" "$source_tree" "$marker_diff" "$marker_files" "$workflow_files" \
             | tee "$output_dir/source.txt"
           [[ "$workflow_sha" == "$GITHUB_SHA" ]]
+          [[ "$previous_workflow_sha" == 'dce2e710b5a6e7b6385749f898d0cb008b25b067' ]]
           [[ "$source_sha" == '12b3ee9f948be35e54a0cd008aab50009f446ad3' ]]
           [[ "$base_sha" == 'd31b9fe1b8777482a5ad90c46dedb27170c46d74' ]]
           [[ "$source_tree" == '55c91e3a126628e309092353ceff9766c3ea06f7' ]]
@@ -95,8 +97,34 @@ jobs:
           test_status=$?
           set -e
           printf '%s\n' "$test_status" | tee "$output_dir/exit-code.txt"
-          tail -n 120 "$log"
-          exit "$test_status"
+          tail -n 120 "$log" || printf '%s\n' 'Could not display the diagnostic log' >&2
+          if [[ "$test_status" -ne 0 ]]; then
+            exit "$test_status"
+          fi
+          set +e
+          python3 - "$log" "$test_name" >"$output_dir/selection.txt" 2>&1 <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          def valid_selection(output, expected_name):
+              output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+              runs = re.findall(r"(?m)^running (\d+) tests?[ \t]*\r?$", output)
+              names = re.findall(r"\btest ([^\s]+) \.\.\.", output)
+              summaries = re.findall(r"(?m)^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", output)
+              return runs == ["1"] and names == [expected_name] and summaries == [("ok", "1", "0", "0")]
+
+          if __name__ == "__main__":
+              output = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+              if not valid_selection(output, sys.argv[2]):
+                  print("Test selection or passing summary did not match the named test")
+                  sys.exit(1)
+              print("The named test ran once and passed")
+          PY
+          selection_status=$?
+          set -e
+          cat "$output_dir/selection.txt"
+          exit "$selection_status"
 
       - name: Preserve diagnostic output
         if: always()
