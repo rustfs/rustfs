@@ -11958,13 +11958,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let bucket_lifecycle_guard = if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
             && opts.bucket_lifecycle_lock_fence.is_none()
         {
-            let guard = metadata_sys::object_store_in(&self.ctx)
-                .await?
-                .acquire_bucket_lifecycle_read_lock(bucket)
-                .await?;
-            self.validate_bucket_incarnation(bucket, expected_incarnation_id, opts)
-                .await?;
-            Some(guard)
+            Some(
+                metadata_sys::object_store_in(&self.ctx)
+                    .await?
+                    .acquire_bucket_incarnation_fence_with_options(bucket, expected_incarnation_id, Some(opts))
+                    .await?,
+            )
         } else {
             None
         };

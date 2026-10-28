@@ -564,12 +564,39 @@ pub(crate) async fn validate_bucket_reconstruction_in(
     Ok(())
 }
 
-/// Validate against disk while retaining an already-held Object Lock fence.
+/// Resolve the authoritative bucket incarnation id for `opts`:
+/// 1. When namespace locking is enabled and `opts.object_lock_config_snapshot` is
+///    present, validate and return the snapshot's incarnation under its held
+///    lifecycle and metadata-transaction fences.
+/// 2. When namespace locking is enabled and `opts.bucket_lifecycle_lock_fence` is
+///    present and not lost, reuse the store's `BucketFenceRegistry` memo if a
+///    registered lifecycle read guard is currently held without lock loss.
+/// 3. Otherwise, acquire the bucket metadata transaction read lock (unless
+///    already held on `opts`) and read the incarnation from disk.
 pub(crate) async fn get_bucket_incarnation_id_for_options_in(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
     opts: &ObjectOptions,
 ) -> Result<Uuid> {
+    if !ctx.lock_manager().is_disabled() {
+        if let Some(snapshot) = opts.object_lock_config_snapshot.as_ref() {
+            let store = object_store_in(ctx).await?;
+            return snapshot
+                .validated_bucket_incarnation_for(store.id, bucket, opts.expected_bucket_incarnation_id)
+                .ok_or_else(|| {
+                    Error::other("Object Lock snapshot does not hold a valid metadata transaction fence for this bucket")
+                });
+        }
+        if opts
+            .bucket_lifecycle_lock_fence
+            .as_ref()
+            .is_some_and(|fence| !fence.is_lock_lost())
+            && let Some(store) = object_store_if_initialized_in(ctx).await
+            && let Some(incarnation) = store.bucket_fence_registry.validated_incarnation(bucket)
+        {
+            return Ok(incarnation);
+        }
+    }
     let sys = bucket_metadata_sys_of(ctx)?;
     let sys = sys.read().await.clone();
     let guard = acquire_bucket_metadata_transaction_read_lock_for_options_in(ctx, bucket, opts).await?;
