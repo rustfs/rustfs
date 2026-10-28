@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::admin::{
-    handlers::target_descriptor::{EndpointKey, RuntimeHealthStatus, collect_runtime_statuses},
+    handlers::target_descriptor::{
+        AdminTargetSpec, EndpointKey, RuntimeHealthStatus, collect_instance_runtime_statuses, collect_runtime_statuses,
+    },
     runtime_sources::{AppContext, current_app_context, current_object_store_handle_for_context},
     storage_api::{
         config::read_admin_config_without_migrate,
@@ -47,6 +49,23 @@ pub(crate) async fn load_target_read_snapshot<T>(runtime: impl Future<Output = T
 pub(crate) async fn collect_notification_runtime_statuses() -> HashMap<EndpointKey, RuntimeHealthStatus> {
     if let Some(system) = rustfs_notify::notification_system() {
         collect_runtime_statuses(system.get_target_values().await).await
+    } else {
+        HashMap::new()
+    }
+}
+
+pub(crate) async fn collect_notification_instance_runtime_statuses(
+    specs: &[AdminTargetSpec],
+    instance_id: &str,
+) -> HashMap<EndpointKey, RuntimeHealthStatus> {
+    if let Some(system) = rustfs_notify::notification_system() {
+        collect_instance_runtime_statuses(
+            system.get_target_values().await,
+            specs,
+            rustfs_targets::TargetDomain::Notify,
+            instance_id,
+        )
+        .await
     } else {
         HashMap::new()
     }
