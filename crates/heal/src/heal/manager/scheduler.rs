@@ -254,7 +254,9 @@ impl HealManager {
                 let config_for_spawn = config.clone();
 
                 // start heal task
-                tokio::spawn(async move {
+                #[cfg(test)]
+                let worker_completion = tests::take_worker_completion_hook(task.as_ref());
+                let worker = async move {
                     debug!(
                         target: "rustfs::heal::manager",
                         event = EVENT_HEAL_SCHEDULER_STATE,
@@ -718,7 +720,18 @@ impl HealManager {
                         });
                     }
                     notify_clone.notify_one();
-                });
+                };
+                #[cfg(test)]
+                if let Some(completed) = worker_completion {
+                    tokio::spawn(async move {
+                        worker.await;
+                        let _ = completed.send(());
+                    });
+                } else {
+                    tokio::spawn(worker);
+                }
+                #[cfg(not(test))]
+                tokio::spawn(worker);
                 tasks_started += 1;
             } else {
                 delayed_by_mainline_throttle = mainline_pressure.is_some();

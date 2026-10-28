@@ -354,6 +354,19 @@ struct CompletedRetentionHook {
 static COMPLETED_RETENTION_HOOKS: LazyLock<Mutex<HashMap<String, Arc<CompletedRetentionHook>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+static WORKER_COMPLETION_HOOKS: LazyLock<StdMutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+pub(super) fn take_worker_completion_hook(task: &HealTask) -> Option<tokio::sync::oneshot::Sender<()>> {
+    let HealType::Object { bucket, .. } = &task.heal_type else {
+        return None;
+    };
+    WORKER_COMPLETION_HOOKS
+        .lock()
+        .expect("worker completion hooks")
+        .remove(bucket)
+}
+
 pub(super) async fn pause_completed_retention_handoff(task_id: &str) {
     let hook = COMPLETED_RETENTION_HOOKS.lock().await.get(task_id).cloned();
     if let Some(hook) = hook {
@@ -475,6 +488,153 @@ async fn completed_retention_cancel_wins_over_a_prepared_retry_snapshot() {
         .lock()
         .await
         .retain(|key, _| key != bucket && key != &task_id);
+}
+
+#[tokio::test]
+async fn cancelled_worker_does_not_remove_a_same_id_successor() {
+    let old_bucket = format!("scheduler-old-{}", Uuid::new_v4());
+    let new_bucket = format!("scheduler-new-{}", Uuid::new_v4());
+    let manager = HealManager::new_without_root_recovery_for_test(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            queue_size: 32,
+            max_concurrent_heals: 1,
+            task_timeout: Duration::from_secs(60),
+            event_driven_scheduler_enable: false,
+            mainline_throttle_enable: false,
+            ..Default::default()
+        }),
+    );
+    let old_request = HealRequest::object(old_bucket.clone(), "object".to_string(), None);
+    let task_id = old_request.id.clone();
+    let old_hook = Arc::new(CompletedRetentionHook {
+        pause_before_publish: true,
+        ..Default::default()
+    });
+    let new_hook = Arc::new(CompletedRetentionHook::default());
+    let (worker_completion, worker_finished) = tokio::sync::oneshot::channel();
+    WORKER_COMPLETION_HOOKS
+        .lock()
+        .expect("install worker completion hook")
+        .insert(old_bucket.clone(), worker_completion);
+    {
+        let mut hooks = COMPLETED_RETENTION_HOOKS.lock().await;
+        hooks.insert(old_bucket.clone(), Arc::clone(&old_hook));
+        hooks.insert(new_bucket.clone(), Arc::clone(&new_hook));
+        hooks.insert(task_id.clone(), Arc::clone(&old_hook));
+    }
+
+    assert_eq!(
+        manager.submit_heal_request(old_request).await.expect("admit original owner"),
+        HealAdmissionResult::Accepted
+    );
+    process_manager_queue_once(&manager).await;
+    tokio::time::timeout(Duration::from_secs(5), old_hook.started.notified())
+        .await
+        .expect("original owner enters mock storage");
+    let old_task = manager
+        .active_heals
+        .lock()
+        .await
+        .get(&task_id)
+        .cloned()
+        .expect("original owner is active");
+    old_hook.execute.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), old_hook.before_publish.notified())
+        .await
+        .expect("original owner pauses after execution and before publication");
+    assert!(matches!(*old_hook.prepared_status.lock().await, Some(HealTaskStatus::Completed)));
+    manager.cancel_task(&task_id).await.expect("cancel original owner");
+    assert!(!manager.active_heals.lock().await.contains_key(&task_id));
+
+    let mut new_request = HealRequest::object(new_bucket.clone(), "object".to_string(), None);
+    new_request.id.clone_from(&task_id);
+    new_request.source = HealRequestSource::Admin;
+    new_request.force_start = true;
+    let receipt = manager
+        .submit_heal_request_with_receipt(new_request)
+        .await
+        .expect("successor admission decision");
+    if receipt.result == HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning) {
+        assert!(!manager.active_heals.lock().await.contains_key(&task_id));
+        assert!(
+            !manager
+                .heal_queue
+                .lock()
+                .await
+                .requests()
+                .any(|request| request.id == task_id)
+        );
+        old_hook.publish.notify_one();
+        old_hook.finish.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), worker_finished)
+            .await
+            .expect("cancelled original worker exits")
+            .expect("cancelled original worker returns normally");
+        let status = manager
+            .get_task_status(&task_id)
+            .await
+            .expect("cancelled original remains queryable");
+        let mut hooks = COMPLETED_RETENTION_HOOKS.lock().await;
+        hooks.remove(&old_bucket);
+        hooks.remove(&new_bucket);
+        hooks.remove(&task_id);
+        assert_eq!(status, HealTaskStatus::Cancelled);
+        return;
+    }
+    assert_eq!(
+        receipt.result,
+        HealAdmissionResult::Accepted,
+        "successor must either be admitted or safely rejected"
+    );
+    assert_eq!(receipt.task_id, task_id);
+    process_manager_queue_once(&manager).await;
+    tokio::time::timeout(Duration::from_secs(5), new_hook.started.notified())
+        .await
+        .expect("successor enters mock storage");
+    let new_task = manager
+        .active_heals
+        .lock()
+        .await
+        .get(&task_id)
+        .cloned()
+        .expect("successor is active");
+    assert!(!Arc::ptr_eq(&old_task, &new_task), "successor is a different task");
+    assert_eq!(
+        manager
+            .get_task_status_for_path(&format!("{new_bucket}/object"), &task_id)
+            .await
+            .expect("successor status before old handoff"),
+        HealTaskStatus::Running
+    );
+
+    old_hook.publish.notify_one();
+    old_hook.finish.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), worker_finished)
+        .await
+        .expect("original worker exits")
+        .expect("original worker returns normally");
+    let successor_is_active = manager
+        .active_heals
+        .lock()
+        .await
+        .get(&task_id)
+        .is_some_and(|current| Arc::ptr_eq(current, &new_task));
+    let successor_status = manager
+        .get_task_status_for_path(&format!("{new_bucket}/object"), &task_id)
+        .await;
+    println!(
+        "same_id_successor admission={:?} successor_is_active={} successor_status={:?}",
+        receipt.result, successor_is_active, successor_status
+    );
+    {
+        let mut hooks = COMPLETED_RETENTION_HOOKS.lock().await;
+        hooks.remove(&old_bucket);
+        hooks.remove(&new_bucket);
+        hooks.remove(&task_id);
+    }
+    assert!(successor_is_active, "the old worker must not remove the active successor");
+    assert!(matches!(successor_status, Ok(HealTaskStatus::Running)));
 }
 
 #[tokio::test]
