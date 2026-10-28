@@ -486,6 +486,27 @@ async fn scanner_item_drop_after_send_records_unknown_once() {
     assert!(matches!(legacy.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
     assert_eq!(manager.get_queue_length().await, 2);
 
+    let mut item = scanner_item("reply-before-drop");
+    let object = object_info("reply-before-drop");
+    let mut summary = SizeSummary::default();
+    let cancellation = CancellationToken::new();
+    let mut dropped = Box::pin(item.heal_actions(&object, 1, &mut summary, Some(&cancellation)));
+    assert!(futures::poll!(dropped.as_mut()).is_pending());
+    let (reply, _, receipt) = relay_observed(&mut observed, &observed_tx).await;
+    assert_eq!(receipt.result, HealAdmissionResult::Accepted);
+    cancellation.cancel();
+    reply.send(Ok(receipt)).expect("unpolled scanner receiver remains open");
+    assert_eq!(
+        unknown_count(&crate::heal_completion::scanner_heal_observation_status(), "admission_unknown"),
+        1
+    );
+    drop(dropped);
+    let status = crate::heal_completion::scanner_heal_observation_status();
+    assert_eq!(unknown_count(&status, "admission_unknown"), 2, "unobserved reply is unknown once");
+    assert!(matches!(observed.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    assert!(matches!(legacy.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    assert_eq!(manager.get_queue_length().await, 3);
+
     let mut item = scanner_item("observed-error");
     let object = object_info("observed-error");
     let mut summary = SizeSummary::default();
@@ -498,9 +519,34 @@ async fn scanner_item_drop_after_send_records_unknown_once() {
     drop(reply);
     assert_eq!(tokio::time::timeout(WAIT, error).await.expect("error call completes"), 1);
     let status = crate::heal_completion::scanner_heal_observation_status();
-    assert_eq!(unknown_count(&status, "admission_unknown"), 2, "error is counted once");
+    assert_eq!(unknown_count(&status, "admission_unknown"), 3, "error is counted once");
+    assert!(matches!(observed.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
     assert!(matches!(legacy.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
-    assert_eq!(manager.get_queue_length().await, 3);
+    assert_eq!(manager.get_queue_length().await, 4);
+
+    let mut item = scanner_item("observed-typed-error");
+    let object = object_info("observed-typed-error");
+    let mut summary = SizeSummary::default();
+    let cancellation = CancellationToken::new();
+    let mut error = Box::pin(item.heal_actions(&object, 1, &mut summary, Some(&cancellation)));
+    assert!(futures::poll!(error.as_mut()).is_pending());
+    let (reply, _, receipt) = relay_observed(&mut observed, &observed_tx).await;
+    assert_eq!(receipt.result, HealAdmissionResult::Accepted);
+    cancellation.cancel();
+    reply
+        .send(Err(HealObservationChannelError::LegacyCommandClosed))
+        .expect("receiver remains open");
+    assert_eq!(tokio::time::timeout(WAIT, error).await.expect("typed error call completes"), 1);
+    let status = crate::heal_completion::scanner_heal_observation_status();
+    assert_eq!(
+        unknown_count(&status, "admission_unknown"),
+        4,
+        "accepted send determines error classification"
+    );
+    assert_eq!(unknown_count(&status, "admission_not_sent"), 0);
+    assert!(matches!(observed.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    assert!(matches!(legacy.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    assert_eq!(manager.get_queue_length().await, 5);
 
     drop(observed);
     let mut item = scanner_item("legacy-drop");
@@ -530,21 +576,21 @@ async fn scanner_item_drop_after_send_records_unknown_once() {
     drop(dropped);
     assert!(command.response_tx.send(Ok(receipt)).is_err());
     let status = crate::heal_completion::scanner_heal_observation_status();
-    assert_eq!(unknown_count(&status, "admission_unknown"), 3, "legacy drop is counted once");
+    assert_eq!(unknown_count(&status, "admission_unknown"), 5, "legacy drop is counted once");
     assert!(matches!(legacy.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
-    assert_eq!(manager.get_queue_length().await, 4);
+    assert_eq!(manager.get_queue_length().await, 6);
 
     drop(legacy);
     assert!(send_scanner_heal_request("object", request("not-sent")).await.is_err());
     let status = crate::heal_completion::scanner_heal_observation_status();
     assert_eq!(
         unknown_count(&status, "admission_unknown"),
-        3,
+        5,
         "unaccepted send is not uncertain admission"
     );
     assert_eq!(unknown_count(&status, "admission_not_sent"), 1);
     assert_eq!(status.integrity_state, "unknown");
-    assert_eq!(manager.get_queue_length().await, 4);
+    assert_eq!(manager.get_queue_length().await, 6);
     assert_eq!(storage.0.load(Ordering::Relaxed), 0);
     processor_task.abort();
     assert!(processor_task.await.expect_err("processor is stopped").is_cancelled());
