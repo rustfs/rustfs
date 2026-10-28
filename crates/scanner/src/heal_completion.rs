@@ -212,17 +212,7 @@ impl Settlement {
             "insufficient_scan"
         } else {
             match (candidate.identity.as_ref(), completion.object.as_ref()) {
-                (Some(expected), Some(actual)) if expected != &actual.identity => "identity_mismatch",
-                (Some(expected), Some(_))
-                    if expected.bucket_incarnation_id.is_some_and(|id| !id.is_nil())
-                        && expected.pool_index.is_some()
-                        && expected.set_index.is_some()
-                        && expected.version_id.as_ref().is_some_and(|version| !version.is_empty()) =>
-                {
-                    // Even an exact version and VerifiedHealthy do not bind the
-                    // candidate's content and leader epoch with today's contract.
-                    "content_and_leader_unknown"
-                }
+                (Some(expected), Some(actual)) => Self::identity_scope(expected, &actual.identity),
                 _ => "identity_unknown",
             }
         };
@@ -235,6 +225,60 @@ impl Settlement {
             disposition,
             scope,
             mode: candidate.mode,
+        }
+    }
+
+    fn identity_scope(expected: &HealObjectIdentity, actual: &HealObjectIdentity) -> &'static str {
+        fn known_version(version: Option<&str>) -> Option<uuid::Uuid> {
+            version
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                .filter(|id| !id.is_nil())
+        }
+        let expected_bucket = (!expected.bucket.is_empty()).then_some(expected.bucket.as_str());
+        let actual_bucket = (!actual.bucket.is_empty()).then_some(actual.bucket.as_str());
+        let expected_object = (!expected.object.is_empty()).then_some(expected.object.as_str());
+        let actual_object = (!actual.object.is_empty()).then_some(actual.object.as_str());
+        let expected_version = known_version(expected.version_id.as_deref());
+        let actual_version = known_version(actual.version_id.as_deref());
+        let expected_incarnation = expected.bucket_incarnation_id.filter(|id| !id.is_nil());
+        let actual_incarnation = actual.bucket_incarnation_id.filter(|id| !id.is_nil());
+
+        if expected.kind != actual.kind
+            || expected_bucket.zip(actual_bucket).is_some_and(|(left, right)| left != right)
+            || expected_object.zip(actual_object).is_some_and(|(left, right)| left != right)
+            || expected_version
+                .zip(actual_version)
+                .is_some_and(|(left, right)| left != right)
+            || expected_incarnation
+                .zip(actual_incarnation)
+                .is_some_and(|(left, right)| left != right)
+            || expected
+                .pool_index
+                .zip(actual.pool_index)
+                .is_some_and(|(left, right)| left != right)
+            || expected
+                .set_index
+                .zip(actual.set_index)
+                .is_some_and(|(left, right)| left != right)
+        {
+            "identity_mismatch"
+        } else if expected_bucket.is_none()
+            || actual_bucket.is_none()
+            || expected_object.is_none()
+            || actual_object.is_none()
+            || expected_version.is_none()
+            || actual_version.is_none()
+            || expected_incarnation.is_none()
+            || actual_incarnation.is_none()
+            || expected.pool_index.is_none()
+            || actual.pool_index.is_none()
+            || expected.set_index.is_none()
+            || actual.set_index.is_none()
+        {
+            "identity_unknown"
+        } else {
+            // Matching identities still do not bind content or leader epoch.
+            "content_and_leader_unknown"
         }
     }
 
