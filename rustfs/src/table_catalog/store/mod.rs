@@ -16,15 +16,15 @@ use super::identifier::is_valid_table_metadata_file_name;
 use super::*;
 use crate::storage_api::table::{WriteCommitGuard, WriteCompletion};
 
-mod backup;
+mod backup_types;
 mod manifest;
 mod object;
 mod object_backup;
 mod strong;
 
-pub(crate) use backup::{TableCatalogBackupReport, TableCatalogRestoreReport};
-#[cfg(test)]
-pub(crate) use backup::{TableCatalogBackupStatus, TableCatalogRestoreStatus};
+pub(crate) use backup_types::{
+    TableCatalogBackupReport, TableCatalogBackupStatus, TableCatalogRestoreReport, TableCatalogRestoreStatus,
+};
 use manifest::table_catalog_backing_manifest;
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]

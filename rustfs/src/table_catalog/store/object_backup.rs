@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::backup::{TableCatalogBackupStatus, TableCatalogRestoreStatus};
+use super::backup_types::{TableCatalogBackupStatus, TableCatalogRestoreStatus};
 use super::object::ObjectTableCatalogStore;
 use super::*;
 use sha2::{Digest, Sha256};

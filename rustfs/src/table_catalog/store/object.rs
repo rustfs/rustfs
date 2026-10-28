@@ -3658,7 +3658,7 @@ where
             }
         };
 
-        let report = self
+        let mut report = self
             .plan_table_metadata_maintenance(
                 table_bucket,
                 &namespace_name,
@@ -5331,7 +5331,7 @@ where
         _snapshot_expiration: Option<TableSnapshotExpirationConfig>,
         _compaction: Option<TableCompactionPlanningConfig>,
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
-        let mut report = self
+        let report = self
             .plan_table_metadata_maintenance(table_bucket, namespace, table, retain_recent_metadata_files)
             .await?;
         Ok(report)
