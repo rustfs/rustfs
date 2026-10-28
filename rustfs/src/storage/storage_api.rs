@@ -1349,6 +1349,12 @@ pub(crate) async fn read_config_no_lock(api: Arc<ECStore>, file: &str) -> Result
     ecstore_config::com::read_config_no_lock(api, file).await
 }
 
+pub(crate) async fn read_server_config_with_generation(
+    api: Arc<ECStore>,
+) -> Result<(rustfs_config::server_config::Config, Option<uuid::Uuid>)> {
+    ecstore_config::com::read_server_config_with_generation(api).await
+}
+
 pub(crate) async fn read_existing_server_config_no_lock(api: Arc<ECStore>) -> Result<rustfs_config::server_config::Config> {
     ecstore_config::com::read_existing_server_config_no_lock(api).await
 }

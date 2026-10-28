@@ -279,6 +279,34 @@ pub(crate) fn target_mutation_block_reason(
     })
 }
 
+/// A default environment override participates in every instance's effective config.
+pub(crate) fn target_has_environment_default(
+    specs: &[AdminTargetSpec],
+    route_prefix: &str,
+    config: &Config,
+    target_type: &str,
+    target_name: &str,
+) -> S3Result<bool> {
+    let spec = target_spec(specs, target_type).ok_or_else(|| s3_error!(InvalidArgument, "unsupported target type"))?;
+    let mut probe = Config::new();
+    if let Some(section) = config.0.get(target_type) {
+        probe.0.insert(target_type.to_owned(), section.clone());
+    }
+    let section = probe.0.entry(target_type.to_owned()).or_default();
+    if !section.keys().any(|name| name.eq_ignore_ascii_case(target_name)) {
+        let mut kvs = KVS::new();
+        kvs.insert(ENABLE_KEY.to_owned(), EnableState::On.to_string());
+        section.insert(target_name.to_owned(), kvs);
+    }
+    Ok(normalized_target_instances(std::slice::from_ref(spec), route_prefix, &probe)?
+        .iter()
+        .any(|instance| {
+            instance.subsystem == target_type
+                && instance.instance_id.eq_ignore_ascii_case(target_name)
+                && instance.source_hints.has_env_default
+        }))
+}
+
 pub(crate) fn target_module_disabled_reason(module_name: &str, env_key: &str, enabled: bool, action: &str) -> Option<String> {
     (!enabled).then(|| {
         format!(
