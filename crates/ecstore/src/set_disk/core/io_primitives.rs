@@ -149,6 +149,42 @@ use tokio::sync::{RwLock, oneshot};
 use tokio::task::JoinSet;
 
 pub(in crate::set_disk) const EVENT_SET_DISK_READ: &str = "set_disk_read";
+const EVENT_SET_DISK_RENAME_PROBE: &str = "set_disk_rename_probe";
+
+fn rename_probe_enabled(bucket: &str, object: &str) -> bool {
+    static TARGET: OnceLock<Option<String>> = OnceLock::new();
+    TARGET
+        .get_or_init(|| std::env::var("RUSTFS_E2E_DIAG_RENAME_TARGET").ok())
+        .as_deref()
+        .and_then(|target| target.strip_prefix(bucket))
+        .and_then(|target| target.strip_prefix('/'))
+        == Some(object)
+}
+
+fn rename_probe(
+    state: &'static str,
+    bucket: &str,
+    object: &str,
+    transaction: &str,
+    disk_index: Option<usize>,
+    local: Option<bool>,
+    success: Option<bool>,
+) {
+    info!(
+        target: "rustfs_ecstore::rename_probe",
+        event = EVENT_SET_DISK_RENAME_PROBE,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_SET_DISK,
+        state,
+        bucket,
+        object,
+        transaction,
+        disk_index = ?disk_index,
+        local = ?local,
+        success = ?success,
+        "rename tail probe"
+    );
+}
 pub(in crate::set_disk) const ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP: &str = "RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP";
 pub(crate) const ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE: &str = "RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE";
 /// Default reader-setup strategy for the GET read path (rustfs/backlog#1215,
@@ -3543,6 +3579,14 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
     Submit: FnOnce(rustfs_heal_contracts::heal_channel::HealChannelRequest) -> SubmitFuture + Send,
     SubmitFuture: Future<Output = ()> + Send,
 {
+    let object = request.object_prefix.as_deref().unwrap_or_default();
+    let probe = rename_probe_enabled(&request.bucket, object);
+    let probe_event = |state| {
+        if probe {
+            rename_probe(state, &request.bucket, object, "", None, None, None);
+        }
+    };
+    probe_event("tail_wait_start");
     let tail_async_started = rustfs_io_metrics::put_stage_timer();
     let (needs_heal, tail_cleanup, tail_complete) = match tail_drain.await {
         Ok(Some(outcome)) => (outcome.convergence.needs_heal(), outcome.cleanup, true),
@@ -3572,6 +3616,7 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
             (true, Vec::new(), false)
         }
     };
+    probe_event("tail_wait_end");
     rustfs_io_metrics::record_put_object_stage_duration_from(
         rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_ASYNC_WAIT,
         tail_async_started,
@@ -3580,7 +3625,10 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
     // must still run; only the explicit `false` used by the hard-crash harness
     // suppresses all in-process continuation work.
     let guard_release_wait_started = rustfs_io_metrics::put_stage_timer();
-    if matches!(guard_release.await, Ok(false)) {
+    probe_event("guard_release_wait_start");
+    let guard_release = guard_release.await;
+    probe_event("guard_release_wait_end");
+    if matches!(guard_release, Ok(false)) {
         rustfs_io_metrics::record_put_object_stage_duration_from(
             rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_GUARD_RELEASE_WAIT,
             guard_release_wait_started,
@@ -3593,7 +3641,9 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
         guard_release_wait_started,
     );
     let finalize_started = rustfs_io_metrics::put_stage_timer();
+    probe_event("finalize_start");
     finalize().await;
+    probe_event("finalize_end");
     rustfs_io_metrics::record_put_object_stage_duration_from(
         rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_FINALIZE,
         finalize_started,
@@ -3612,12 +3662,25 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
             drop(guards);
         } else if rename_tail_cleanup_defer_enabled() {
             let targets = tail_cleanup.len();
+            let probe_bucket = probe.then(|| request.bucket.clone());
+            let probe_object = probe.then(|| object.to_owned());
+            let cleanup_future = cleanup(guards, tail_cleanup);
             let job = RenameTailCleanupJob {
                 enqueued_at: Instant::now(),
                 targets,
-                future: Box::pin(cleanup(guards, tail_cleanup)),
+                future: Box::pin(async move {
+                    if let (Some(bucket), Some(object)) = (&probe_bucket, &probe_object) {
+                        rename_probe("cleanup_start", bucket, object, "", None, None, None);
+                    }
+                    cleanup_future.await;
+                    if let (Some(bucket), Some(object)) = (&probe_bucket, &probe_object) {
+                        rename_probe("cleanup_end", bucket, object, "", None, None, None);
+                    }
+                }),
             };
+            probe_event("cleanup_enqueue_start");
             if let Err(job) = rename_tail_cleanup_queue().try_enqueue(job).await {
+                probe_event("cleanup_enqueue_fallback");
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_SUBMIT,
                     cleanup_submit_started,
@@ -3629,6 +3692,7 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
                     cleanup_started,
                 );
             } else {
+                probe_event("cleanup_enqueued");
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_SUBMIT,
                     cleanup_submit_started,
@@ -3640,7 +3704,9 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
                 cleanup_submit_started,
             );
             let cleanup_started = rustfs_io_metrics::put_stage_timer();
+            probe_event("cleanup_start");
             cleanup(guards, tail_cleanup).await;
+            probe_event("cleanup_end");
             rustfs_io_metrics::record_put_object_stage_duration_from(
                 rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP,
                 cleanup_started,
@@ -3949,6 +4015,7 @@ impl SetDisks {
             }
         }
 
+        let probe = rename_probe_enabled(dst_bucket, dst_object);
         let disk_count = disks.len();
         let fanout_disks = disks.to_vec();
         let fanout_fence_tokens = Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?;
@@ -3991,8 +4058,20 @@ impl SetDisks {
                             let _fanout_task_guard = Self::rename_fanout_task_guard(&dst_object);
 
                             let Some(disk) = disk else {
+                                if probe {
+                                    rename_probe(
+                                        "disk_missing",
+                                        &dst_bucket,
+                                        &dst_object,
+                                        &src_object,
+                                        Some(i),
+                                        None,
+                                        Some(false),
+                                    );
+                                }
                                 return Err(DiskError::DiskNotFound);
                             };
+                            let disk_is_local = disk.is_local();
                             let disk_wait_location_stage = if disk.is_local() {
                                 rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL
                             } else {
@@ -4018,6 +4097,17 @@ impl SetDisks {
                             let disk_wait_started = rustfs_io_metrics::put_stage_timer();
                             dispatch_state = RenameDispatchState::MayHavePublished;
                             let _foreground_active_guard = rename_foreground_active_guard(i);
+                            if probe {
+                                rename_probe(
+                                    "disk_start",
+                                    &dst_bucket,
+                                    &dst_object,
+                                    &src_object,
+                                    Some(i),
+                                    Some(disk_is_local),
+                                    None,
+                                );
+                            }
                             let observed = disk
                                 .rename_data_borrowed_with_fence_observed(
                                     &src_bucket,
@@ -4036,6 +4126,17 @@ impl SetDisks {
                                 .await;
                             let rejected_before_publication = observed.rejected_before_publication();
                             let result = observed.result;
+                            if probe {
+                                rename_probe(
+                                    "disk_end",
+                                    &dst_bucket,
+                                    &dst_object,
+                                    &src_object,
+                                    Some(i),
+                                    Some(disk_is_local),
+                                    Some(result.is_ok()),
+                                );
+                            }
                             #[cfg(test)]
                             if result.is_ok() {
                                 rollback_fault_injection::after_rename(&dst_object, i)?;
@@ -4140,6 +4241,9 @@ impl SetDisks {
                         if let Some(commit_tx) = commit_tx.take() {
                             let _ = commit_tx.send(snapshot_commit);
                         }
+                        if probe {
+                            rename_probe("quorum", &fanout_dst_bucket, &fanout_dst_object, &fanout_src_object, None, None, None);
+                        }
                         sent_commit = true;
                         tail_after_quorum_started = rustfs_io_metrics::put_stage_timer();
                     }
@@ -4148,6 +4252,9 @@ impl SetDisks {
                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_AFTER_QUORUM_WAIT,
                     tail_after_quorum_started,
                 );
+                if probe {
+                    rename_probe("fanout_end", &fanout_dst_bucket, &fanout_dst_object, &fanout_src_object, None, None, None);
+                }
 
                 #[cfg(test)]
                 rollback_fault_injection::after_fanout(&fanout_dst_object);
@@ -4221,10 +4328,38 @@ impl SetDisks {
                     };
                     let dst_bucket = fanout_dst_bucket.clone();
                     let dst_object = fanout_dst_object.clone();
+                    let src_object = fanout_src_object.clone();
                     backup_reclaims.push(tokio::spawn(async move {
                         let backup_path = format!("{dst_object}/{rollback_dir}/{STORAGE_FORMAT_FILE_BACKUP}");
-                        disk.delete(&dst_bucket, &backup_path, DeleteOptions::default()).await
+                        let local = disk.is_local();
+                        if probe {
+                            rename_probe("backup_start", &dst_bucket, &dst_object, &src_object, Some(idx), Some(local), None);
+                        }
+                        let result = disk.delete(&dst_bucket, &backup_path, DeleteOptions::default()).await;
+                        if probe {
+                            rename_probe(
+                                "backup_end",
+                                &dst_bucket,
+                                &dst_object,
+                                &src_object,
+                                Some(idx),
+                                Some(local),
+                                Some(result.is_ok()),
+                            );
+                        }
+                        result
                     }));
+                }
+                if probe {
+                    rename_probe(
+                        "backups_wait_start",
+                        &fanout_dst_bucket,
+                        &fanout_dst_object,
+                        &fanout_src_object,
+                        None,
+                        None,
+                        None,
+                    );
                 }
                 for result in join_all(backup_reclaims).await {
                     match result {
@@ -4247,6 +4382,17 @@ impl SetDisks {
                             );
                         }
                     }
+                }
+                if probe {
+                    rename_probe(
+                        "backups_wait_end",
+                        &fanout_dst_bucket,
+                        &fanout_dst_object,
+                        &fanout_src_object,
+                        None,
+                        None,
+                        None,
+                    );
                 }
 
                 // The caller marks every candidate disk before returning the
