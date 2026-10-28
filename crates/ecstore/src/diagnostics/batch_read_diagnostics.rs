@@ -14,8 +14,8 @@
 
 //! Sampled local batch diagnostics for a separate, default-off build.
 //!
-//! Events contain server-owned correlation IDs, sizes and timing, never paths
-//! or I/O error strings. They are not metrics or performance acceptance.
+//! Event fields contain server-owned correlation IDs, sizes and timing, never
+//! object/disk paths or I/O error strings. They are not performance acceptance.
 //! Linux supplies thread CPU time; other targets report it absent.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +26,7 @@ use tracing::{Dispatch, Level};
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_LOCAL_BATCH: &str = "local_batch_diagnostic";
 const EVENT_LOCAL_BATCH_DIAGNOSTIC: &str = "local_batch_diagnostic";
-const TARGET: &str = "rustfs_ecstore::batch_read_diagnostics";
+const TARGET: &str = rustfs_config::LOCAL_BATCH_DIAGNOSTIC_LOG_TARGET;
 const ENV_SAMPLE_EVERY: &str = "RUSTFS_DIAGNOSTIC_LOCAL_BATCH_SAMPLE_EVERY";
 const MAX_SAMPLE_EVERY: u64 = 65_536;
 static SAMPLE_EVERY: OnceLock<u64> = OnceLock::new();
@@ -514,6 +514,12 @@ mod tests {
                     assert_eq!(recorder.counter_value("rustfs_io_get_object_local_batch_read_bytes_total", &[]), 3);
                     {
                         let events = state.events.lock().expect("normal events");
+                        let indices: Vec<_> = events
+                            .iter()
+                            .filter(|event| event.get("stage") == Some(&json!("shard_result")))
+                            .map(|event| event["shard_index"].as_u64().expect("shard index"))
+                            .collect();
+                        assert_eq!(indices, [0, 1, 2, 3], "errors and empty reads retain their input index");
                         for (index, result) in [(0, "success"), (1, "error"), (2, "success"), (3, "error")] {
                             assert!(
                                 events.iter().any(|event| {
