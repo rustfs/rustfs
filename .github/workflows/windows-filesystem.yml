@@ -1,224 +1,175 @@
-# Copyright 2024 RustFS Team
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-name: Windows Filesystem Tests
+name: Heal Observation Contracts Preflight
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - "crates/ecstore/src/disk/**"
-      - "crates/ecstore/src/layout/**"
-      - "crates/ecstore/src/store/init_format.rs"
-      - "crates/ecstore/src/set_disk/ops/locking.rs"
-      - "crates/ecstore/src/object_api/write_commit_context.rs"
-      - "crates/ecstore/src/bucket/utils.rs"
-      - "crates/ecstore/Cargo.toml"
-      - "crates/utils/src/dunce.rs"
-      - "crates/utils/src/os/**"
-      - "crates/utils/Cargo.toml"
-      - "crates/utils/src/path.rs"
-      - "rustfs/build.rs"
-      - "rustfs/Cargo.toml"
-      - "rustfs/src/main.rs"
-      - "rustfs/src/server/runtime.rs"
-      - "rustfs/src/startup_*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/actions/setup/**"
-      - ".github/workflows/windows-filesystem.yml"
-  pull_request:
-    branches: [ main ]
-    paths:
-      - "crates/ecstore/src/disk/**"
-      - "crates/ecstore/src/layout/**"
-      - "crates/ecstore/src/store/init_format.rs"
-      - "crates/ecstore/src/set_disk/ops/locking.rs"
-      - "crates/ecstore/src/object_api/write_commit_context.rs"
-      - "crates/ecstore/src/bucket/utils.rs"
-      - "crates/ecstore/Cargo.toml"
-      - "crates/utils/src/dunce.rs"
-      - "crates/utils/src/os/**"
-      - "crates/utils/Cargo.toml"
-      - "crates/utils/src/path.rs"
-      - "rustfs/build.rs"
-      - "rustfs/Cargo.toml"
-      - "rustfs/src/main.rs"
-      - "rustfs/src/server/runtime.rs"
-      - "rustfs/src/startup_*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/actions/setup/**"
-      - ".github/workflows/windows-filesystem.yml"
   workflow_dispatch:
+    inputs:
+      expected_head:
+        description: Full SHA of this workflow commit
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: heal-observation-contracts-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
 
-env:
-  CARGO_TERM_COLOR: always
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  RUST_BACKTRACE: 1
-
+# Only the local contracts crate is checked. This is not full CI or MRF validation.
 jobs:
-  rename-safety:
-    name: Rename Safety
-    runs-on: windows-latest
-    timeout-minutes: 60
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: build-x86_64-pc-windows-msvc
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-          install-test-tools: 'false'
-
-      - name: Check production Windows dependencies
-        shell: pwsh
-        run: cargo check -p rustfs-ecstore --lib
-
-      - name: Test guarded rename publication
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib rename_all_ -- --nocapture
-
-      - name: Test multipart parent durability barriers
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib multipart_owned_record_parent_barriers_ -- --nocapture
-
-      - name: Test Windows path conversion
-        shell: pwsh
-        run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"
-
-      - name: Test Windows volume and disk-space probes
-        shell: pwsh
-        run: |
-          # Map a drive letter to the temp drive's administrative share so the
-          # remote-volume probe also covers mapped network drives.
-          $drive = (Split-Path -Qualifier ([System.IO.Path]::GetTempPath())).TrimEnd(':')
-          net use R: "\\localhost\$drive`$" /persistent:no
-          if ($LASTEXITCODE -eq 0) {
-            $env:RUSTFS_TEST_WINDOWS_MAPPED_DRIVE = 'R:'
-          } else {
-            Write-Output "::warning::could not map R: to \\localhost\$drive`$; mapped-drive test will skip"
-          }
-          cargo test -p rustfs-utils --features os --lib os:: -- --nocapture
-          $status = $LASTEXITCODE
-          if ($env:RUSTFS_TEST_WINDOWS_MAPPED_DRIVE) { net use R: /delete /y | Out-Null }
-          exit $status
-
-      - name: Test Windows handle guards
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib windows_ -- --nocapture
-
-      - name: Test endpoint path parsing
-        shell: pwsh
-        run: "cargo test -p rustfs-ecstore --lib layout::endpoint:: -- --nocapture"
-
-      - name: Test startup temporary-directory cleanup
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib cleanup_tmp_on_startup_ -- --nocapture
-
-      - name: Test object key Windows admission
-        shell: pwsh
-        run: "cargo test -p rustfs-ecstore --lib bucket::utils:: -- --nocapture"
-
-      - name: Test Windows file-name rules
-        shell: pwsh
-        run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"
-
-      - name: Test fresh format publication
-        shell: pwsh
-        run: cargo test -p rustfs-ecstore --lib fresh_format_load_initializes_all_disks -- --nocapture
-
-  # The native Windows main thread only gets the 1 MiB PE stack reserve, while
-  # Linux and macOS hand out 8 MiB. Startup runs the whole root future on the
-  # thread that calls `block_on`, so a debug server once overflowed before it
-  # listened on Windows only. Start a real server to keep that covered.
-  startup-smoke:
-    name: Startup Smoke
-    runs-on: windows-latest
+  contracts:
+    runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUSTUP_TOOLCHAIN: '1.99.0'
+      RUST_BACKTRACE: '1'
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+      NO_PROXY: 127.0.0.1,localhost
     steps:
-      - name: Checkout repository
+      - name: Checkout candidate
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
+          fetch-depth: 8
           persist-credentials: false
 
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: build-x86_64-pc-windows-msvc
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-          install-test-tools: 'false'
-
-      - name: Build debug server binary
-        shell: pwsh
-        run: cargo build --locked -p rustfs --bin rustfs
-
-      - name: Print version
-        shell: pwsh
-        run: |
-          & .\target\debug\rustfs.exe --version
-          if ($LASTEXITCODE -ne 0) { throw "rustfs --version exited with $LASTEXITCODE" }
-
-      - name: Start server and wait for readiness
-        shell: pwsh
+      - name: Verify exact source and workflow
+        shell: bash
         env:
-          RUSTFS_ACCESS_KEY: rustfsadmin
-          RUSTFS_SECRET_KEY: rustfsadmin
+          EXPECTED_HEAD: ${{ inputs.expected_head }}
+          LOG_DIR: ${{ runner.temp }}/heal-observation-contracts-evidence
         run: |
-          $volume = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke'
-          $stdout = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke.out.log'
-          $stderr = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke.err.log'
-          New-Item -ItemType Directory -Force -Path $volume | Out-Null
-          $server = Start-Process -FilePath .\target\debug\rustfs.exe `
-            -ArgumentList @('--address', '127.0.0.1:9000', "`"$volume`"") `
-            -RedirectStandardOutput $stdout -RedirectStandardError $stderr `
-            -NoNewWindow -PassThru
-          # Cache the process handle now; otherwise ExitCode reads back empty.
-          $null = $server.Handle
-          $ready = $false
-          try {
-            for ($i = 0; $i -lt 180; $i++) {
-              if ($server.HasExited) { break }
-              try {
-                $response = Invoke-WebRequest -Uri 'http://127.0.0.1:9000/health/ready' -UseBasicParsing -NoProxy -TimeoutSec 2
-                if ($response.StatusCode -eq 200) { $ready = $true; break }
-              } catch {}
-              Start-Sleep -Seconds 1
-            }
-          } finally {
-            if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force }
-            $server.WaitForExit()
-            Write-Host '--- server stdout (tail) ---'
-            Get-Content $stdout -Tail 100 -ErrorAction SilentlyContinue
-            Write-Host '--- server stderr (tail) ---'
-            Get-Content $stderr -Tail 100 -ErrorAction SilentlyContinue
+          set -euo pipefail
+          [[ ! -e "$LOG_DIR" ]]
+          mkdir "$LOG_DIR"
+          head=$(git rev-parse HEAD)
+          source=$(git rev-parse 'HEAD^')
+          source_parent=$(git rev-parse "$source^")
+          base=$(git rev-parse "$source_parent^")
+          tree=$(git rev-parse "$source^{tree}")
+          source_diff=$(git diff --binary --full-index "$base" "$source" | sha256sum | cut -d' ' -f1)
+          fix_diff=$(git diff --binary --full-index "$source_parent" "$source" | sha256sum | cut -d' ' -f1)
+          workflow_files=$(git diff --name-only "$source" "$head")
+          printf 'head=%s source=%s source_parent=%s base=%s tree=%s source_diff=%s fix_diff=%s workflow_files=%s\n' \
+            "$head" "$source" "$source_parent" "$base" "$tree" "$source_diff" "$fix_diff" "$workflow_files" | tee "$LOG_DIR/snapshot.log"
+          [[ "$EXPECTED_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$head" == "$EXPECTED_HEAD" && "$head" == "$GITHUB_SHA" ]]
+          [[ "$source" == 25c62e59908fc06494d366c9af32b251291a26e6 ]]
+          [[ "$source_parent" == 839467a01b122fb84f1e0bea8f305616207ae45c ]]
+          [[ "$base" == 7a3bf8cdbd781116a0970585b995ade668c0e662 ]]
+          [[ "$tree" == 66a2904fdca485c4b8a3450bbdefd10a98d7c55c ]]
+          [[ "$source_diff" == 246c930695a6d9aaca98a600feb2eaf6f80cf49577d8a243bcbf3b00376e46af ]]
+          [[ "$fix_diff" == c44a7ecd99ccf98f5e39af1301d1fbb4c5f7177cc5e3d006b607ebf52a5c4b4c ]]
+          [[ "$workflow_files" == .github/workflows/windows-filesystem.yml ]]
+          [[ -z "$(git status --porcelain --untracked-files=all)" ]]
+
+      - name: Install Rust and Clippy
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: '1.99.0'
+          components: clippy
+
+      - name: Check and lint the standalone contracts crate
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/heal-observation-contracts-target
+          LOG_DIR: ${{ runner.temp }}/heal-observation-contracts-evidence
+        run: |
+          set -euo pipefail
+          rustc --version --verbose | tee "$LOG_DIR/rustc.log"
+          cargo --version | tee "$LOG_DIR/cargo.log"
+          run_cargo() {
+            local label="$1"
+            shift
+            local available status
+            df -h . | tee -a "$LOG_DIR/disk.log"
+            available=$(df -Pk . | awk 'NR == 2 {print $4}')
+            [[ "$available" =~ ^[0-9]+$ ]]
+            if (( available < 4194304 )); then
+              printf 'not_started\n' > "$LOG_DIR/$label.exit"
+              printf 'insufficient disk before %s\n' "$label" | tee -a "$LOG_DIR/disk.log"
+              return 1
+            fi
+            set +e
+            "$@" >"$LOG_DIR/$label.log" 2>&1
+            status=$?
+            set -e
+            printf '%s\n' "$status" > "$LOG_DIR/$label.exit"
+            cat "$LOG_DIR/$label.log"
+            return "$status"
           }
-          if (-not $ready) {
-            throw ("rustfs did not report ready on /health/ready (exit code: {0})" -f $server.ExitCode)
-          }
+          run_cargo check cargo check --locked -p rustfs-heal-contracts --lib
+          run_cargo clippy cargo clippy --locked -p rustfs-heal-contracts --lib -- -D warnings
+
+      - name: Run eight named contracts tests
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/heal-observation-contracts-target
+          LOG_DIR: ${{ runner.temp }}/heal-observation-contracts-evidence
+        run: |
+          set -euo pipefail
+          tests=(
+            completion::tests::public_completion_facades_share_receipts_and_preserve_missing_tokens
+            completion::tests::legacy_and_observed_subscribers_receive_the_same_completion_in_each_channel_order
+            completion::tests::legacy_and_observed_channels_report_lag_independently
+            completion::tests::completion_delivery_is_bounded_and_does_not_require_a_consumer
+            heal_channel::tests::observed_receipt_falls_back_only_when_no_observed_command_was_accepted
+            heal_channel::tests::lost_observed_reply_never_resends_the_request
+            heal_channel::tests::fallback_reports_a_typed_error_if_legacy_channel_is_closed
+            heal_channel::tests::observed_receipt_keeps_the_owner_token_from_the_processor
+          )
+          printf '%s\n' "${tests[@]}" > "$LOG_DIR/selected.txt"
+          unique=$(printf '%s\n' "${tests[@]}" | sort -u | wc -l | tr -d '[:space:]')
+          [[ "${#tests[@]}" -eq 8 && "$unique" -eq 8 ]]
+          failures=0
+          completed=0
+          for name in "${tests[@]}"; do
+            short="${name##*::}"
+            log="$LOG_DIR/$short.log"
+            available=$(df -Pk . | awk 'NR == 2 {print $4}')
+            [[ "$available" =~ ^[0-9]+$ ]]
+            if (( available < 4194304 )); then
+              printf 'not_started\n' > "$LOG_DIR/$short.exit"
+              printf 'insufficient disk before %s\n' "$name" | tee -a "$LOG_DIR/disk.log"
+              break
+            fi
+            set +e
+            cargo test --locked -p rustfs-heal-contracts --lib -- "$name" --exact --test-threads=1 >"$log" 2>&1
+            status=$?
+            set -e
+            printf '%s\n' "$status" > "$LOG_DIR/$short.exit"
+            cat "$log"
+            if (( status == 0 )) && awk -v name="$name" '
+              $0 == "running 1 test" { runs++ }
+              $0 == "test " name " ... ok" { named++ }
+              /^test result: ok[.] 1 passed; 0 failed; 0 ignored; [0-9]+ measured; [0-9]+ filtered out; finished in / { passed++ }
+              END {
+                printf "Harness markers: running=%d named=%d passed=%d\n", runs, named, passed
+                if (runs != 1 || named != 1 || passed != 1) exit 1
+              }
+            ' "$log" > "$LOG_DIR/$short.validation"; then
+              completed=$((completed + 1))
+            else
+              failures=$((failures + 1))
+              if ! grep -Eq '^running [0-9]+ tests?$' "$log"; then
+                echo "Stopping: test execution did not start for $name" >&2
+                break
+              fi
+            fi
+            if [[ -f "$LOG_DIR/$short.validation" ]]; then cat "$LOG_DIR/$short.validation"; fi
+          done
+          printf 'expected=8 passed=%s failed=%s\n' "$completed" "$failures" | tee "$LOG_DIR/summary.log"
+          [[ "$completed" -eq 8 && "$failures" -eq 0 ]]
+
+      - name: Upload raw logs and exit codes
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: heal-observation-contracts-${{ github.run_id }}
+          path: ${{ runner.temp }}/heal-observation-contracts-evidence/
+          retention-days: 7
+          if-no-files-found: warn
