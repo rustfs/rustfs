@@ -361,6 +361,8 @@ pub(crate) struct PluginInstanceDiagnosticCount {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PluginInstanceDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_revision: Option<String>,
     #[serde(flatten)]
     pub instance: PluginInstanceEntry,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -539,6 +541,7 @@ mod tests {
     #[test]
     fn plugin_instance_detail_contract_serializes_diagnostics_when_present() {
         let detail = PluginInstanceDetail {
+            config_revision: None,
             instance: PluginInstanceEntry {
                 id: "builtin:webhook:notify:primary".to_string(),
                 plugin_id: "builtin:webhook".to_string(),

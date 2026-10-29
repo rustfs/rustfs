@@ -100,7 +100,7 @@ Standard S3 areas that must not be described as complete:
 | Bucket access logging | Handlers exist (`get_bucket_logging`, `put_bucket_logging` in `rustfs/src/storage/ecfs.rs`); the `test_*bucket_logging*` s3tests cases are still listed as unimplemented | `unimplemented_tests.txt` |
 | POST Object form upload checksum handling | Not yet passing | `unimplemented_tests.txt` |
 | Bucket ownership controls | No handler | `unimplemented_tests.txt` |
-| Multipart upload listing and part lookup compatibility edge cases | Not part of default gate | `excluded_tests.txt` |
+| Multipart upload listing and part lookup compatibility edge cases | Not part of default gate; ListParts returns HTTP 503 `SlowDownRead` when no directory was listed and any participant is unavailable, instead of treating one missing directory as an empty upload | `excluded_tests.txt`; `collect_list_parts_results_rejects_unavailable_empty_upload_dirs` |
 | IAM-account or multi-storage-class dependent cases | Not part of default gate | `unimplemented_tests.txt` |
 | Tenanted bucket policy edge cases | Needs investigation | `unimplemented_tests.txt` |
 

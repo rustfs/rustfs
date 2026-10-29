@@ -62,7 +62,7 @@
 1|crates/ecstore/src/set_disk/ops/heal.rs
 8|crates/ecstore/src/set_disk/ops/multipart.rs
 2|crates/ecstore/src/set_disk/ops/object.rs
-3|crates/ecstore/src/set_disk/read.rs
+1|crates/ecstore/src/set_disk/read.rs
 5|crates/ecstore/src/store/bucket.rs
 1|crates/ecstore/src/store/heal_walk.rs
 10|crates/ecstore/src/store/init.rs

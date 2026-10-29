@@ -220,6 +220,11 @@ impl HealTask {
         let mut expected_identity =
             self.outcome_identity(bucket, object, version_id, self.options.pool_index, self.options.set_index);
         expected_identity.bucket_incarnation_id = self.outcome_bucket_incarnation_id(bucket, self.options.dry_run).await?;
+        if matches!(self.heal_type, HealType::Object { .. }) {
+            expected_identity.bucket_incarnation_id = *self
+                .single_object_incarnation
+                .get_or_init(|| expected_identity.bucket_incarnation_id);
+        }
 
         let heal_fut = self.storage.heal_object_with_receipt(bucket, object, version_id, &heal_opts);
         let heal_result = if self.source == HealRequestSource::ReadRepair {

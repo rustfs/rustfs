@@ -146,6 +146,8 @@ impl ScannerIODisk for Disk {
         // `object_infos`.
         global_metrics().record_scanner_versions_scanned(object_infos.len() as u64);
 
+        // A caller-provided item or persisted usage cache cannot choose another set.
+        item.heal_scope = crate::scanner_folder::scanner_disk_heal_scope(self);
         #[cfg(test)]
         let _ = crate::scanner_folder::observe_test_size_dispatch_boundary("apply_actions");
         item.apply_actions_cancellable(

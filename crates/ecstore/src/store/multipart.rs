@@ -412,7 +412,7 @@ impl ECStore {
 
     /// Multipart lock order is bucket lifecycle, generation validation, then
     /// object/upload locks in the selected set.
-    async fn guard_multipart_bucket_incarnation(
+    pub(super) async fn guard_multipart_bucket_incarnation(
         &self,
         bucket: &str,
         opts: &ObjectOptions,

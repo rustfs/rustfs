@@ -24,12 +24,16 @@ use crate::bucket::lifecycle::bucket_lifecycle_ops::enqueue_recovered_free_versi
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::Result;
 use crate::object_api::ObjectInfo;
+use crate::services::tier::tier::{ERR_TIER_INVALID_CONFIG, TierConfigMgr};
+use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use crate::storage_api_contracts::{
     bucket::{BucketOperations, BucketOptions},
     list::{ListOperations as _, StorageObjectInfoOrErr, StorageWalkOptions},
 };
 use crate::store::ECStore;
 use rustfs_filemeta::FileInfo;
+use rustfs_lock::error::LockError;
+use rustfs_s3_client::admin_handler_utils::AdminError;
 
 pub const DEFAULT_FREE_VERSION_RECOVERY_LIMIT: usize = 1_000;
 // These are page-wide repair budgets. Applying them per bucket would still let
@@ -128,6 +132,153 @@ pub(super) fn set_recovery_bucket_list_wait_hook(started: Arc<tokio::sync::Notif
         .expect("recovery bucket-list test hook lock should not poison");
     *hook = Some(started);
     RecoveryBucketListWaitHookGuard
+}
+
+/// A bounded retry queues existing cleanup ownership; it never deletes a tier.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TierCleanupRetryReport {
+    pub tier_name: String,
+    pub status: TierCleanupRetryStatus,
+    pub scanned: usize,
+    pub enqueued: usize,
+    pub failed: usize,
+    pub scan_truncated: bool,
+}
+
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TierCleanupRetryStatus {
+    Accepted,
+    Busy,
+}
+
+impl TierCleanupRetryReport {
+    fn new(tier_name: &str, status: TierCleanupRetryStatus) -> Self {
+        Self {
+            tier_name: tier_name.to_string(),
+            status,
+            scanned: 0,
+            enqueued: 0,
+            failed: 0,
+            scan_truncated: false,
+        }
+    }
+}
+
+fn tier_cleanup_retry_error() -> AdminError {
+    let mut error = ERR_TIER_INVALID_CONFIG.clone();
+    error.code = "XRustFSAdminTierCleanupRetryFailed".to_string();
+    error.status_code = http::StatusCode::SERVICE_UNAVAILABLE;
+    error.message = "Tier cleanup retry could not finish; existing cleanup records are retained".to_string();
+    error
+}
+
+/// Reuses the recovery reader and expiry queue on whichever node receives the
+/// request. This does not depend on a node-local wakeup reaching the recovery
+/// leader. The identity lease and distributed retry lock are acquired in that
+/// order; no manager lock is held during namespace I/O.
+pub async fn retry_tier_free_version_cleanup(
+    api: Arc<ECStore>,
+    tier_name: &str,
+) -> std::result::Result<TierCleanupRetryReport, AdminError> {
+    let cancel = api.ctx.background_cancel_token().unwrap_or_default().child_token();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    let deadline = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(deadline);
+    let retry = retry_tier_free_version_cleanup_with_cancel(api, tier_name, cancel.clone());
+    tokio::pin!(retry);
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            let _ = retry.await;
+            Err(tier_cleanup_retry_error())
+        }
+        _ = &mut deadline => {
+            cancel.cancel();
+            // Poll cancellation through the recovery reader's walk shutdown.
+            let _ = retry.await;
+            Err(tier_cleanup_retry_error())
+        }
+        result = &mut retry => result,
+    }
+}
+
+pub(super) async fn retry_tier_free_version_cleanup_with_cancel(
+    api: Arc<ECStore>,
+    tier_name: &str,
+    cancel: CancellationToken,
+) -> std::result::Result<TierCleanupRetryReport, AdminError> {
+    let manager = api.tier_config_mgr();
+    let lease = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(tier_cleanup_retry_error()),
+        result = TierConfigMgr::acquire_operation_lease(&manager, tier_name) => result?,
+    };
+    let lock_name = format!(
+        "tier-cleanup-retry/{}",
+        hex_simd::encode_to_string(lease.backend_identity(), hex_simd::AsciiCase::Lower)
+    );
+    let lock = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(tier_cleanup_retry_error()),
+        result = api.new_ns_lock(RUSTFS_META_BUCKET, &lock_name) => result.map_err(|_| tier_cleanup_retry_error())?,
+    };
+    let mut guard = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(tier_cleanup_retry_error()),
+        result = lock.get_write_lock_quiet(Duration::from_millis(100)) => match result {
+            Ok(guard) => guard,
+            Err(LockError::Timeout { .. }) => return Ok(TierCleanupRetryReport::new(tier_name, TierCleanupRetryStatus::Busy)),
+            Err(_) => return Err(tier_cleanup_retry_error()),
+        },
+    };
+    let recovery = retry_tier_free_version_cleanup_page(api, tier_name, cancel.clone());
+    tokio::pin!(recovery);
+    let result = tokio::select! {
+        biased;
+        _ = guard.lock_lost_notified() => {
+            cancel.cancel();
+            let _ = recovery.await;
+            Err(tier_cleanup_retry_error())
+        }
+        result = &mut recovery => result,
+    };
+    guard.release();
+    drop(lease);
+    result
+}
+
+async fn retry_tier_free_version_cleanup_page(
+    api: Arc<ECStore>,
+    tier_name: &str,
+    cancel: CancellationToken,
+) -> std::result::Result<TierCleanupRetryReport, AdminError> {
+    let page = list_tier_free_versions_for_tier(
+        api.clone(),
+        DEFAULT_FREE_VERSION_RECOVERY_LIMIT,
+        None,
+        None,
+        cancel.clone(),
+        recovery_work_budget(DEFAULT_FREE_VERSION_RECOVERY_LIMIT),
+        Some(tier_name),
+    )
+    .await
+    .map_err(|_| tier_cleanup_retry_error())?;
+    let mut report = TierCleanupRetryReport::new(tier_name, TierCleanupRetryStatus::Accepted);
+    report.scanned = page.scanned_entries;
+    report.scan_truncated = page.truncated;
+    for object in page.items {
+        if cancel.is_cancelled() {
+            return Err(tier_cleanup_retry_error());
+        }
+        if enqueue_recovered_free_version_with_cancel(&api, object, &cancel).await {
+            report.enqueued += 1;
+        } else {
+            report.failed += 1;
+        }
+    }
+    Ok(report)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,6 +453,18 @@ pub(super) async fn list_tier_free_versions_with_budget(
     object_marker: Option<String>,
     cancel_token: CancellationToken,
     work_budget: RecoveryWorkBudget,
+) -> Result<FreeVersionRecoveryPage> {
+    list_tier_free_versions_for_tier(api, limit, bucket_marker, object_marker, cancel_token, work_budget, None).await
+}
+
+async fn list_tier_free_versions_for_tier(
+    api: Arc<ECStore>,
+    limit: usize,
+    bucket_marker: Option<String>,
+    object_marker: Option<String>,
+    cancel_token: CancellationToken,
+    work_budget: RecoveryWorkBudget,
+    tier_name: Option<&str>,
 ) -> Result<FreeVersionRecoveryPage> {
     let mut page = FreeVersionRecoveryPage {
         items: Vec::new(),
@@ -539,7 +702,7 @@ pub(super) async fn list_tier_free_versions_with_budget(
                 drain_deadline = Some(tokio::time::Instant::now() + BACKGROUND_WALK_SHUTDOWN_TIMEOUT);
                 continue;
             }
-            if is_recoverable_tier_free_version(&oi) {
+            if is_recoverable_tier_free_version_for_tier(&oi, tier_name) {
                 let current_cursor = RecoveryCursor {
                     bucket: bucket.name.clone(),
                     object: oi.name.clone(),
@@ -547,7 +710,15 @@ pub(super) async fn list_tier_free_versions_with_budget(
                 page.items.push(oi);
                 page.next_bucket_marker = Some(current_cursor.bucket.clone());
                 page.next_object_marker = Some(current_cursor.object.clone());
-                if page.items.len() >= limit && truncated_after.is_none() {
+                if page.items.len() >= limit && tier_name.is_some() {
+                    // Manual passes do not expose a continuation cursor, so they can
+                    // stop within one key. Background recovery keeps complete key
+                    // groups to avoid skipping versions when it resumes by key.
+                    page.truncated = true;
+                    cancel.cancel();
+                    draining_after_truncation = true;
+                    drain_deadline = Some(tokio::time::Instant::now() + BACKGROUND_WALK_SHUTDOWN_TIMEOUT);
+                } else if page.items.len() >= limit && truncated_after.is_none() {
                     truncated_after = Some(current_cursor);
                 }
             }
@@ -622,6 +793,10 @@ fn mark_scan_truncated_if_needed(
         page.next_bucket_marker = Some(bucket.to_string());
         page.next_object_marker = Some(last_seen_object.to_string());
     }
+}
+
+fn is_recoverable_tier_free_version_for_tier(oi: &ObjectInfo, tier_name: Option<&str>) -> bool {
+    is_recoverable_tier_free_version(oi) && tier_name.is_none_or(|tier| oi.transitioned_object.tier == tier)
 }
 
 fn is_recoverable_tier_free_version(oi: &ObjectInfo) -> bool {

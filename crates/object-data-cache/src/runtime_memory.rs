@@ -76,7 +76,9 @@ pub fn effective_memory_from_system(system: &System) -> EffectiveMemory {
 
 /// Resolves the effective memory using a fresh, memory-refreshed system handle.
 pub fn resolve_effective_memory() -> EffectiveMemory {
-    let mut system = System::new();
+    let Ok(mut system) = System::new() else {
+        return select_effective_memory(0, 0, None);
+    };
     system.refresh_memory();
     effective_memory_from_system(&system)
 }

@@ -37,7 +37,7 @@ git -C "$CONSOLE_SCRATCH/console" tag -a "<console-tag>" -m "Release <console-ta
 git -C "$CONSOLE_SCRATCH/console" push origin "<console-tag>"
 ```
 
-Console tags include the `v` prefix. Pushing the tag triggers `.github/workflows/release.yml` (`🚀 Release`). Remove `CONSOLE_SCRATCH` after the gate completes.
+Console tags include the `v` prefix. Pushing the tag triggers the Console repository's [release workflow](https://github.com/rustfs/console/blob/main/.github/workflows/release.yml) (`🚀 Release`). Remove the task-owned `CONSOLE_SCRATCH` after the gate completes.
 
 3. Find the exact tag run and wait for completion:
 
@@ -55,4 +55,4 @@ test "$(gh api "repos/${CONSOLE_REPO}/releases/tags/<console-tag>" \
   --jq '[.assets[] | select(.name == "rustfs-console-<console-tag>.zip" and .state == "uploaded" and .size > 0 and (.digest | startswith("sha256:")))] | length')" -eq 1
 ```
 
-Treat a missing/mismatched asset, digest, latest tag, or failed/cancelled workflow as BLOCKED. Do not start Phase 1 until the Console gate passes. Record `CONSOLE_TAG`, `CONSOLE_HASH`, Console run URL, and Release URL for the final report.
+Treat a missing/mismatched asset, digest, latest tag, or failed/cancelled workflow as BLOCKED. Do not start Phase 1 until the Console gate passes. Record `CONSOLE_TAG`, `CONSOLE_HASH`, the asset URL/SHA256, Console run URL, and Release URL for comparison with the inputs actually consumed by the RustFS builds and the final report.

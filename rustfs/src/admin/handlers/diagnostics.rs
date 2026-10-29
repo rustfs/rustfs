@@ -26,6 +26,7 @@
 use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::storage_api::access::spawn_traced;
+use crate::admin::storage_api::s3::{self, S3ErrorCode};
 use crate::admin::utils::json_response;
 use crate::server::ADMIN_PREFIX;
 use crate::storage::storage_api::get_global_lock_clients;
@@ -587,10 +588,11 @@ struct HealthInfoResponse {
     unsupported_probes: Vec<&'static str>,
 }
 
-async fn collect_health_info() -> HealthInfoResponse {
+async fn collect_health_info() -> S3Result<HealthInfoResponse> {
     use sysinfo::{Pid, System};
 
-    let mut sys = System::new_all();
+    let mut sys = System::new_all()
+        .map_err(|error| s3::error(S3ErrorCode::InternalError, format!("System information unavailable: {error}")))?;
     sys.refresh_cpu_all();
     // A second sample after a short interval yields meaningful CPU usage.
     tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
@@ -603,7 +605,7 @@ async fn collect_health_info() -> HealthInfoResponse {
         brand: sys.cpus().first().map(|c| c.brand().to_string()).unwrap_or_default(),
         frequency_mhz: sys.cpus().first().map(|c| c.frequency()).unwrap_or(0),
         usage_percent: if logical_cores > 0 {
-            sys.cpus().iter().map(|c| c.cpu_usage() as f64).sum::<f64>() / logical_cores as f64
+            sys.cpus().iter().map(|c| c.usage() as f64).sum::<f64>() / logical_cores as f64
         } else {
             0.0
         },
@@ -619,11 +621,11 @@ async fn collect_health_info() -> HealthInfoResponse {
 
     let os = HealthOsInfo {
         os: std::env::consts::OS.to_string(),
-        kernel_version: System::kernel_version(),
-        os_version: System::long_os_version(),
-        hostname: System::host_name(),
+        kernel_version: System::kernel_version().ok(),
+        os_version: System::long_os_version().ok(),
+        hostname: System::host_name().ok(),
         arch: std::env::consts::ARCH.to_string(),
-        uptime_secs: System::uptime(),
+        uptime_secs: System::uptime().unwrap_or_default(),
     };
 
     let pid = std::process::id();
@@ -642,7 +644,7 @@ async fn collect_health_info() -> HealthInfoResponse {
 
     let drives = collect_drive_info().await;
 
-    HealthInfoResponse {
+    Ok(HealthInfoResponse {
         version: crate::version::get_version(),
         deployment_id: crate::admin::runtime_sources::current_deployment_id(),
         region: crate::admin::runtime_sources::current_region().map(|r| r.as_str().to_string()),
@@ -653,7 +655,7 @@ async fn collect_health_info() -> HealthInfoResponse {
         process,
         drives,
         unsupported_probes: vec!["perf-net", "perf-drive-obd", "config-obd", "sys-services"],
-    }
+    })
 }
 
 async fn collect_drive_info() -> Vec<HealthDriveInfo> {
@@ -689,7 +691,7 @@ pub struct HealthInfoHandler {}
 impl Operation for HealthInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize(&req, AdminAction::HealthInfoAdminAction).await?;
-        let response = collect_health_info().await;
+        let response = collect_health_info().await?;
         json_response(StatusCode::OK, &response)
     }
 }
@@ -737,7 +739,7 @@ impl Operation for ConsoleLogHandler {
         // single capability record, then a keep-alive heartbeat, so `mc admin
         // logs` connects and stays open without being misled into believing it
         // received real buffered logs.
-        let node_name = sysinfo::System::host_name().unwrap_or_else(|| "rustfs".to_string());
+        let node_name = sysinfo::System::host_name().unwrap_or_else(|_| "rustfs".to_string());
         let (tx, rx) = mpsc::channel::<Result<Bytes, StdError>>(8);
 
         spawn_traced(async move {

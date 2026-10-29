@@ -550,3 +550,159 @@ fn admin_normal_protected_repairs_report_repaired_for_data_and_parity() {
         .join()
         .expect("heal fixture result");
 }
+
+#[test]
+#[serial]
+fn admin_mixed_batch_retains_repairs_after_object_retry_exhaustion() {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("mixed batch runtime")
+                .block_on(async {
+                    use rustfs_heal::heal::{
+                        manager::{HealConfig, HealManager},
+                        outcome::{HealExecutionOutcome, HealFailureClass, HealTraversalCoverage},
+                        task::{HealOptions, HealPriority, HealRequest, HealTaskStatus, HealType},
+                    };
+                    use rustfs_heal_contracts::heal_channel::HealRequestSource;
+                    use std::sync::Arc;
+
+                    let root = tempfile::tempdir().expect("mixed batch fixture");
+                    let env = TestECStoreEnv::builder().base_dir(root.path()).build().await;
+                    let bucket = "admin-mixed-batch";
+                    env.make_bucket(bucket, false).await;
+                    let set = env.ecstore.pools[0].get_disks(0);
+                    let disks = set.disks.read().await.iter().flatten().cloned().collect::<Vec<_>>();
+                    let mut originals = Vec::new();
+                    for (object, missing, byte) in [("healthy", 0, 0x11), ("repaired", 1, 0x52), ("failed", 3, 0xa3)] {
+                        env.ecstore
+                            .put_object(
+                                bucket,
+                                object,
+                                &mut PutObjReader::from_vec(vec![byte; 5 * 1024 * 1024 + 123]),
+                                &ObjectOptions {
+                                    shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                                    write_completion: WriteCompletion::TailDrained,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .expect("commit complete fixture");
+                        for (slot, disk) in disks.iter().enumerate() {
+                            let meta = disk
+                                .read_version("", bucket, object, "", &ReadOptions::default())
+                                .await
+                                .expect("fixture metadata");
+                            assert_eq!(meta.erasure.data_blocks, 2, "failed fixture must retain R-1 shards");
+                            let path = env.disk_paths[slot]
+                                .join(bucket)
+                                .join(object)
+                                .join(meta.data_dir.expect("external shard").to_string())
+                                .join("part.1");
+                            let bytes = tokio::fs::read(&path).await.expect("original part");
+                            if slot < missing {
+                                tokio::fs::remove_file(&path).await.expect("inject missing part");
+                            }
+                            originals.push((object, path, bytes, slot < missing));
+                        }
+                    }
+                    let storage = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+                    let manager = HealManager::new(
+                        storage.clone(),
+                        Some(HealConfig {
+                            enable_auto_heal: false,
+                            ..Default::default()
+                        }),
+                    );
+                    manager.start().await.expect("start mixed batch manager");
+                    let mut request = HealRequest::new(
+                        HealType::Bucket {
+                            bucket: bucket.to_owned(),
+                        },
+                        HealOptions {
+                            recursive: true,
+                            scan_mode: HealScanMode::Deep,
+                            pool_index: Some(0),
+                            set_index: Some(0),
+                            timeout: Some(Duration::from_secs(150)),
+                            ..Default::default()
+                        },
+                        HealPriority::High,
+                    );
+                    request.source = HealRequestSource::Admin;
+                    let token = request.id.clone();
+                    manager.submit_heal_request(request).await.expect("admit original mixed task");
+                    let report = tokio::time::timeout(Duration::from_secs(150), async {
+                        loop {
+                            let report = manager.get_task_report(&token).await.expect("same-token report");
+                            if matches!(
+                                report.status,
+                                HealTaskStatus::Completed | HealTaskStatus::Failed { .. } | HealTaskStatus::Timeout
+                            ) {
+                                break report;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    })
+                    .await
+                    .expect("mixed task terminal deadline");
+                    manager.stop().await.expect("stop mixed task manager");
+                    for (object, path, original, missing) in originals {
+                        if object == "failed" && missing {
+                            assert!(!path.exists(), "below-R failure must not invent a shard");
+                        } else {
+                            assert_eq!(tokio::fs::read(&path).await.expect("preserved or repaired shard"), original);
+                        }
+                    }
+                    assert!(matches!(report.status, HealTaskStatus::Failed { .. }), "{report:?}");
+                    let outcome = report.outcome.as_ref().expect("canonical mixed outcome");
+                    assert_eq!(outcome.execution, HealExecutionOutcome::CompletedWithErrors);
+                    assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+                    assert_eq!(
+                        (
+                            outcome.counters.processed,
+                            outcome.counters.healed,
+                            outcome.counters.unchanged,
+                            outcome.counters.failed,
+                            outcome.counters.skipped,
+                            outcome.counters.unknown,
+                            outcome.counters.attempt_failures
+                        ),
+                        (3, 1, 1, 1, 0, 0, 4),
+                        "{outcome:?}"
+                    );
+                    for (object, disposition) in [
+                        ("healthy", HealObjectDisposition::VerifiedHealthy),
+                        ("repaired", HealObjectDisposition::Repaired),
+                        ("failed", HealObjectDisposition::Failed(HealFailureClass::RetryExhausted)),
+                    ] {
+                        let receipt = outcome
+                            .objects
+                            .iter()
+                            .find(|item| item.identity.object == object)
+                            .expect("exact object receipt");
+                        assert_eq!(receipt.disposition, disposition);
+                    }
+                    drop(manager);
+                    let restarted = HealManager::new(
+                        storage,
+                        Some(HealConfig {
+                            enable_auto_heal: false,
+                            ..Default::default()
+                        }),
+                    );
+                    restarted.start().await.expect("restart with retained failed batch");
+                    let restored = restarted.get_task_report(&token).await.expect("original token after restart");
+                    assert_eq!(restored.status, report.status);
+                    assert_eq!(restored.outcome, report.outcome);
+                    assert_eq!(restarted.get_queue_length().await, 0, "terminal batch must not replay");
+                    restarted.stop().await.expect("stop restarted mixed batch manager");
+                });
+        })
+        .expect("mixed batch thread")
+        .join()
+        .expect("mixed batch result");
+}

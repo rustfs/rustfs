@@ -63,14 +63,7 @@ pub(crate) async fn get_expiry_configs_for_options(
     bucket: &str,
     opts: &crate::object_api::ObjectOptions,
 ) -> Result<LifecycleExpiryConfigs> {
-    let bucket_incarnation_id = match opts
-        .object_lock_config_snapshot
-        .as_ref()
-        .and_then(|snapshot| snapshot.validated_bucket_incarnation_for(api.id, bucket, opts.expected_bucket_incarnation_id))
-    {
-        Some(incarnation_id) => incarnation_id,
-        None => metadata_sys::get_bucket_incarnation_id_for_options_in(&api.ctx, bucket, opts).await?,
-    };
+    let bucket_incarnation_id = metadata_sys::get_bucket_incarnation_id_for_options_in(&api.ctx, bucket, opts).await?;
     let metadata = get_authoritative_metadata(api, bucket, bucket_incarnation_id).await?;
     let table_bucket_enabled = metadata.table_bucket_enabled();
 

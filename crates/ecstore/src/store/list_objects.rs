@@ -1030,16 +1030,19 @@ impl ECStore {
         // Lock order matches writes: bucket lifecycle, metadata validation,
         // then object namespace. Borrow fences supplied by an outer operation.
         let bucket_guard = if opts.bucket_lifecycle_lock_fence.is_none() {
-            let guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
-            opts.add_bucket_lifecycle_lock_guard(&guard);
+            let guard = self
+                .acquire_bucket_incarnation_fence_with_options(bucket, bucket_incarnation_id, Some(&opts))
+                .await?;
+            guard.attach_to_object_options(&mut opts);
             Some(guard)
         } else {
+            let incarnation =
+                crate::bucket::metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
+            if incarnation != bucket_incarnation_id {
+                return Err(Error::BucketNotFound(bucket.to_owned()));
+            }
             None
         };
-        let incarnation = crate::bucket::metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
-        if incarnation != bucket_incarnation_id {
-            return Err(Error::BucketNotFound(bucket.to_owned()));
-        }
         let metadata_sys = crate::bucket::metadata_sys::bucket_metadata_sys_of(&self.ctx)?;
         let metadata_sys = metadata_sys.read().await.clone();
         let (versioning, _) = metadata_sys.get_versioning_config(bucket).await?;

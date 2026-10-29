@@ -30,8 +30,8 @@ use crate::bucket::lifecycle::{
     },
 };
 use crate::bucket::metadata_sys::{
-    acquire_bucket_metadata_transaction_read_lock_in, get_bucket_incarnation_id_for_options_in,
-    get_cached_bucket_incarnation_id_in, get_delete_config_from_disk_in, get_object_lock_config_and_incarnation_from_disk_in,
+    acquire_bucket_metadata_transaction_read_lock_in, get_cached_bucket_incarnation_id_in, get_delete_config_from_disk_in,
+    get_object_lock_config_and_incarnation_from_disk_in,
 };
 use crate::bucket::object_lock::objectlock_sys::{
     check_object_lock_for_deletion_with_state, ensure_recursive_force_delete_allowed_for_state,
@@ -4883,24 +4883,20 @@ impl ECStore {
         if !is_meta_bucketname(dst_bucket) && dst_opts.expected_bucket_incarnation_id.is_none() {
             dst_opts.expected_bucket_incarnation_id = Some(self.bucket_incarnation_id(dst_bucket).await?);
         }
-        let _bucket_lifecycle_guard = if is_meta_bucketname(dst_bucket) || dst_opts.bucket_lifecycle_lock_fence.is_some() {
-            None
-        } else {
-            Some(self.acquire_bucket_lifecycle_read_lock(dst_bucket).await?)
-        };
-        let current_bucket_incarnation_id = if let Some(guard) = _bucket_lifecycle_guard.as_ref() {
-            dst_opts.add_bucket_lifecycle_lock_guard(guard);
-            let current_incarnation_id = get_bucket_incarnation_id_for_options_in(&self.ctx, dst_bucket, &dst_opts).await?;
-            if dst_opts
-                .expected_bucket_incarnation_id
-                .is_some_and(|expected| expected != current_incarnation_id)
-            {
-                return Err(StorageError::BucketNotFound(dst_bucket.to_string()));
-            }
-            Some(current_incarnation_id)
-        } else {
-            dst_opts.expected_bucket_incarnation_id
-        };
+        let (_bucket_lifecycle_guard, current_bucket_incarnation_id) =
+            if is_meta_bucketname(dst_bucket) || dst_opts.bucket_lifecycle_lock_fence.is_some() {
+                (None, dst_opts.expected_bucket_incarnation_id)
+            } else {
+                let (guard, current_incarnation_id) = self
+                    .acquire_bucket_incarnation_fence_for_options(
+                        dst_bucket,
+                        dst_opts.expected_bucket_incarnation_id,
+                        Some(&dst_opts),
+                    )
+                    .await?;
+                guard.attach_to_object_options(&mut dst_opts);
+                (Some(guard), Some(current_incarnation_id))
+            };
         if dst_opts
             .bucket_lifecycle_lock_fence
             .as_ref()
@@ -6504,24 +6500,8 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<()> {
         let object = encode_dir_object(object);
-        let mut opts = transition_restore_pool_opts(opts);
-        if !is_meta_bucketname(bucket) && opts.expected_bucket_incarnation_id.is_none() {
-            opts.expected_bucket_incarnation_id = Some(self.bucket_incarnation_id(bucket).await?);
-        }
-        let bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
-            None
-        } else {
-            Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
-        };
-        if let Some(guard) = bucket_lifecycle_guard.as_ref() {
-            opts.add_bucket_lifecycle_lock_guard(guard);
-        }
-        if !is_meta_bucketname(bucket) {
-            let current_incarnation_id = get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
-            if opts.expected_bucket_incarnation_id != Some(current_incarnation_id) {
-                return Err(StorageError::BucketNotFound(bucket.to_string()));
-            }
-        }
+        let opts = transition_restore_pool_opts(opts);
+        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, &opts).await?;
         if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
             let expected_incarnation_id = opts
                 .expected_bucket_incarnation_id
@@ -6589,16 +6569,11 @@ impl ECStore {
         let bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
             None
         } else {
-            let guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
-            let current_incarnation_id = get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
-            if opts
-                .expected_bucket_incarnation_id
-                .is_some_and(|expected| expected != current_incarnation_id)
-            {
-                return Err(StorageError::BucketNotFound(bucket.to_string()));
-            }
+            let (guard, current_incarnation_id) = self
+                .acquire_bucket_incarnation_fence_for_options(bucket, opts.expected_bucket_incarnation_id, Some(&opts))
+                .await?;
             opts.expected_bucket_incarnation_id = Some(current_incarnation_id);
-            opts.add_bucket_lifecycle_lock_guard(&guard);
+            guard.attach_to_object_options(&mut opts);
             if guard.is_lock_lost() {
                 return Err(Error::other("bucket lifecycle lock was lost before the metadata update"));
             }
@@ -13166,6 +13141,202 @@ mod tests {
             drop(reader);
         })
         .await;
+    }
+
+    async fn assert_delete_excludes_recovery_across_pool_lock_domains(topology: &str, batch: bool) {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_first_dirs, first_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let (_second_dirs, second_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let mut store = new_prepared_reader_test_store_with_ctx(&[first_set, second_set], Arc::clone(&ctx)).await;
+        let clients: Vec<Arc<dyn rustfs_lock::LockClient>> = (0..4)
+            .map(|_| {
+                Arc::new(rustfs_lock::LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::Enabled(
+                    Arc::new(rustfs_lock::FastObjectLockManager::new()),
+                )))) as Arc<dyn rustfs_lock::LockClient>
+            })
+            .collect();
+        let domains = match topology {
+            "disjoint" => [vec![clients[0].clone()], vec![clients[1].clone()]],
+            "identical" => [clients[..3].to_vec(), clients[..3].to_vec()],
+            "overlapping" => [clients[..3].to_vec(), clients[1..].to_vec()],
+            _ => panic!("unknown lock topology"),
+        };
+        for (pool, lockers) in store.pools.iter_mut().zip(domains) {
+            let mut set = (*pool.disk_set[0]).clone();
+            set.lockers = lockers;
+            Arc::make_mut(pool).disk_set[0] = Arc::new(set);
+        }
+        let store = Arc::new(store);
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = "delete-nonzero-pool-lock";
+        let object = "object.bin";
+        store
+            .handle_make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create the bucket in both pools");
+        if batch {
+            // Latest-marker routing sends this batch only to the nonzero pool,
+            // so the cleanup barrier observes its prepared journal directly.
+            store
+                .update_bucket_metadata_config(
+                    bucket,
+                    crate::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+                    b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+                )
+                .await
+                .expect("enable versioning for the routed batch");
+        }
+        let target = store.pools[1].get_disks_by_key(object);
+        let source = target
+            .put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(b"delete lock regression".to_vec()),
+                &ObjectOptions {
+                    versioned: batch,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed an object only in the nonzero pool");
+        ctx.update_erasure_type(SetupType::DistErasure).await;
+
+        let object_barrier = (!batch).then(|| crate::set_disk::DeleteObjectCommitBarrier::install(bucket, object));
+        let batch_barrier = batch.then(|| crate::set_disk::DeleteCleanupBarrier::install(bucket));
+        let delete_store = Arc::clone(&store);
+        let delete = tokio::spawn(async move {
+            if batch {
+                let (_, errors) = delete_store
+                    .delete_objects(
+                        bucket,
+                        vec![ObjectToDelete {
+                            object_name: object.to_owned(),
+                            ..Default::default()
+                        }],
+                        ObjectOptions::default(),
+                    )
+                    .await;
+                match errors.into_iter().flatten().next() {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            } else {
+                delete_store
+                    .delete_object(bucket, object, ObjectOptions::default())
+                    .await
+                    .map(|_| ())
+            }
+        });
+        if let Some(barrier) = &object_barrier {
+            barrier.wait_until_paused().await;
+        }
+        if let Some(barrier) = &batch_barrier {
+            barrier.wait_until_paused().await;
+        }
+        let recovery_store = Arc::clone(&store);
+        let mut recovery = tokio::spawn(async move {
+            recovery_store
+                .recover_delete_transactions_at_incarnation(
+                    bucket,
+                    Some(object),
+                    None,
+                    &HealOpts {
+                        pool: Some(1),
+                        set: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        let early_recovery = tokio::time::timeout(Duration::from_millis(100), &mut recovery).await;
+        let recovery_was_blocked = early_recovery.is_err();
+        if let Some(barrier) = &object_barrier {
+            barrier.release();
+        }
+        if let Some(barrier) = &batch_barrier {
+            barrier.release();
+        }
+        tokio::time::timeout(Duration::from_secs(10), delete)
+            .await
+            .expect("the delete should finish after releasing its commit barrier")
+            .expect("the delete task should join")
+            .expect("the delete should succeed");
+        let recovered = match early_recovery {
+            Ok(result) => result,
+            Err(_) => tokio::time::timeout(Duration::from_secs(10), recovery)
+                .await
+                .expect("recovery should finish after the frontend delete"),
+        };
+        recovered
+            .expect("the recovery task should join")
+            .expect("recovery should succeed");
+        assert!(
+            recovery_was_blocked,
+            "recovery must not inspect an in-flight frontend delete with {topology} pool lock clients"
+        );
+        if batch {
+            let marker = target
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("the versioned batch must publish a current delete marker");
+            assert!(marker.delete_marker && marker.is_latest);
+            assert_eq!(marker.num_versions, 2, "the source version must remain beside the new marker");
+            assert_ne!(marker.version_id, source.version_id);
+            let mut reader = target
+                .get_object_reader(
+                    bucket,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(source.version_id.expect("versioned source identity").to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the original source version must remain readable");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("read the retained source version");
+            assert_eq!(body, b"delete lock regression");
+        } else {
+            let error = target
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .expect_err("the deleted object must be absent");
+            assert!(is_err_object_not_found(&error));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(storage_class_env)]
+    async fn batch_delete_excludes_recovery_on_nonzero_pool() {
+        assert_delete_excludes_recovery_across_pool_lock_domains("disjoint", true).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(storage_class_env)]
+    async fn delete_excludes_recovery_with_disjoint_pool_lock_clients() {
+        assert_delete_excludes_recovery_across_pool_lock_domains("disjoint", false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(storage_class_env)]
+    async fn delete_excludes_recovery_with_identical_pool_lock_clients() {
+        assert_delete_excludes_recovery_across_pool_lock_domains("identical", false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(storage_class_env)]
+    async fn delete_excludes_recovery_with_overlapping_pool_lock_clients() {
+        assert_delete_excludes_recovery_across_pool_lock_domains("overlapping", false).await;
     }
 }
 

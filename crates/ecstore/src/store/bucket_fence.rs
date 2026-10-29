@@ -149,6 +149,18 @@ impl BucketFenceRegistry {
             }
         }
     }
+
+    /// Return the memoized incarnation id for `bucket` when at least one
+    /// registered lifecycle read guard is currently held without lock loss.
+    pub(crate) fn validated_incarnation(&self, bucket: &str) -> Option<Uuid> {
+        let mut entries = self.entries.lock().expect("bucket fence registry poisoned");
+        let entry = entries.get_mut(bucket)?;
+        if entry.guards.iter().any(|guard| guard.loss_probe.is_lost()) {
+            entry.validated = None;
+            return None;
+        }
+        entry.validated
+    }
 }
 
 /// Owns continuous lifecycle coverage and its incarnation validation memo.
@@ -221,7 +233,7 @@ impl BucketIncarnationFenceGuard {
         }
     }
 
-    pub(crate) fn is_lock_lost(&self) -> bool {
+    pub fn is_lock_lost(&self) -> bool {
         self.inner.as_ref().is_some_and(NamespaceLockGuard::is_lock_lost)
     }
 
@@ -310,9 +322,16 @@ mod tests {
         let (first_probe, first_lost) = controllable_probe();
         let first = reg.enter("b", first_probe);
         assert_eq!(first.memoized, None);
+        assert_eq!(reg.validated_incarnation("b"), None);
         reg.memoize("b", uuid(7));
+        assert_eq!(reg.validated_incarnation("b"), Some(uuid(7)));
 
         first_lost.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            reg.validated_incarnation("b"),
+            None,
+            "live lost guard must clear and block validated_incarnation"
+        );
 
         let second = reg.enter("b", live_probe());
         assert_eq!(second.memoized, None, "live lost guard must force disk revalidation");
@@ -320,9 +339,11 @@ mod tests {
 
         let third = reg.enter("b", live_probe());
         assert_eq!(third.memoized, None, "memo remains blocked while the lost guard is live");
+        assert_eq!(reg.validated_incarnation("b"), None);
 
         reg.exit("b", first.token, true);
         reg.memoize("b", uuid(8));
+        assert_eq!(reg.validated_incarnation("b"), Some(uuid(8)));
         let fourth = reg.enter("b", live_probe());
         assert_eq!(fourth.memoized, Some(uuid(8)), "memo resumes after lost coverage leaves");
 

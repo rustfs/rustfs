@@ -168,11 +168,11 @@ impl InlineData {
         self.0.as_slice()
     }
     pub fn version_ok(&self) -> bool {
-        if self.0.is_empty() {
-            return true;
-        }
+        Self::version_ok_slice(&self.0)
+    }
 
-        self.0[0] > 0 && self.0[0] <= INLINE_DATA_VER
+    pub(crate) fn version_ok_slice(raw: &[u8]) -> bool {
+        raw.first().is_none_or(|version| *version > 0 && *version <= INLINE_DATA_VER)
     }
 
     pub fn after_version(&self) -> &[u8] {

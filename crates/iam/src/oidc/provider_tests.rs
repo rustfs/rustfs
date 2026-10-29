@@ -234,6 +234,69 @@ fn workload_verifier_preserves_algorithm_secret_and_audience_policy() {
         }
     }
 }
+#[test]
+fn configured_verifier_rejects_malformed_hmac_signature_lengths() {
+    let secret = "synthetic-oidc-hmac-regression-secret-0123456789-abcdefghijklmnopqrstuvwxyz";
+    let mut config = build_mocked_oidc_provider_config("hmac", "https://issuer.example.com");
+    config.client_secret = Some(secret.to_owned());
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let payload = serde_json::json!({
+        "iss": config.config_url, "sub": "synthetic-subject", "aud": config.client_id,
+        "iat": now, "exp": now + 300,
+    });
+
+    for (algorithm, name, signature_length) in [
+        (Algorithm::HS256, "HS256", 32),
+        (Algorithm::HS384, "HS384", 48),
+        (Algorithm::HS512, "HS512", 64),
+    ] {
+        let signed = jsonwebtoken::encode(&Header::new(algorithm), &payload, &EncodingKey::from_secret(secret.as_bytes()))
+            .expect("sign a valid HMAC control token");
+        let valid: CoreIdToken = signed.parse().expect("parse valid HMAC token");
+        let (signing_input, signature) = signed.rsplit_once('.').expect("JWT signature segment");
+        assert_eq!(
+            base64_simd::URL_SAFE_NO_PAD
+                .decode_to_vec(signature)
+                .expect("decode valid signature")
+                .len(),
+            signature_length
+        );
+
+        for workload in [false, true] {
+            let mut document = serde_json::json!({
+                "issuer": config.config_url, "jwks_uri": "https://issuer.example.com/jwks",
+                "response_types_supported": ["id_token"], "subject_types_supported": ["public"],
+                "id_token_signing_alg_values_supported": [name],
+            });
+            if !workload {
+                document["authorization_endpoint"] = serde_json::json!("https://issuer.example.com/authorize");
+            }
+            let metadata = DiscoveredProviderMetadata::parse(&serde_json::to_vec(&document).expect("encode metadata"), true)
+                .expect("parse configured provider metadata");
+            let verifier = metadata.verifier(&config);
+            assert!(
+                valid.claims(&verifier, |_: Option<&Nonce>| Ok(())).is_ok(),
+                "valid {name} token must pass for workload={workload}"
+            );
+
+            for length in [1, 0, signature_length - 1, signature_length, signature_length + 1, 128] {
+                let signature = base64_simd::URL_SAFE_NO_PAD.encode_to_string(vec![0_u8; length]);
+                let malformed: CoreIdToken = format!("{signing_input}.{signature}")
+                    .parse()
+                    .expect("invalid signature length must still reach cryptographic verification");
+                assert!(
+                    malformed.claims(&verifier, |_: Option<&Nonce>| Ok(())).is_err(),
+                    "{name} signature length {length} must return an error for workload={workload}"
+                );
+            }
+            assert!(
+                valid.claims(&verifier, |_: Option<&Nonce>| Ok(())).is_ok(),
+                "invalid inputs must not prevent later valid {name} verification"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn workload_discovery_stops_after_forbidden_jwks() {
     let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));

@@ -11,6 +11,11 @@ import unittest
 
 import scanner_otlp_window as collector
 
+try:
+    from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import ExportMetricsServiceRequest
+except ImportError:
+    ExportMetricsServiceRequest = None
+
 METRIC = "rustfs_heal_admission_start_duration_seconds"
 START = 1_800_000_000_000_000_001
 
@@ -36,6 +41,21 @@ def metric(document):
 
 def point(document):
     return metric(document)["histogram"]["dataPoints"][0]
+
+
+def protobuf_export(end, buckets):
+    request = ExportMetricsServiceRequest()
+    scope = request.resource_metrics.add().scope_metrics.add()
+    metric = scope.metrics.add()
+    metric.name = METRIC
+    metric.histogram.aggregation_temporality = 2
+    sample = metric.histogram.data_points.add()
+    sample.start_time_unix_nano = START
+    sample.time_unix_nano = end
+    sample.count = sum(buckets)
+    sample.bucket_counts.extend(buckets)
+    sample.explicit_bounds.extend([0.001, 0.01])
+    return request.SerializeToString()
 
 
 class WindowTests(unittest.TestCase):
@@ -65,6 +85,44 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(row["count"], 0)
         self.assertIsNone(row["p95"])
         self.assertIsNone(row["p99"])
+
+    def test_missing_histogram_count_is_not_an_empty_sample(self):
+        self.before = export(START + 10, [0, 0, 0])
+        self.after = export(START + 20, [0, 0, 0])
+        del point(self.before)["count"]
+        with self.assertRaisesRegex(ValueError, "histogram count"):
+            self.result()
+
+    def test_explicit_zero_histogram_count_remains_a_valid_empty_sample(self):
+        self.before = export(START + 10, [0, 0, 0])
+        self.after = export(START + 20, [0, 0, 0])
+        row = self.result()["series"][0]
+        self.assertEqual(row["count"], 0)
+        self.assertIsNone(row["p95"])
+        self.assertIsNone(row["p99"])
+
+    @unittest.skipUnless(ExportMetricsServiceRequest is not None, "requires opentelemetry-proto")
+    def test_protobuf_default_zero_count_without_presence_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "zero.pb"
+            path.write_bytes(protobuf_export(START + 10, [0, 0, 0]))
+            before, _ = collector.load(path, "protobuf")
+        self.after = export(START + 20, [0, 0, 0])
+        with self.assertRaisesRegex(ValueError, "histogram count"):
+            collector.window(before, self.after, [METRIC])
+
+    @unittest.skipUnless(ExportMetricsServiceRequest is not None, "requires opentelemetry-proto")
+    def test_protobuf_nonzero_counts_produce_window_bounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            before_path = Path(tmp) / "before.pb"
+            after_path = Path(tmp) / "after.pb"
+            before_path.write_bytes(protobuf_export(START + 10, [0, 1, 0]))
+            after_path.write_bytes(protobuf_export(START + 20, [0, 2, 0]))
+            before, _ = collector.load(before_path, "protobuf")
+            after, _ = collector.load(after_path, "protobuf")
+        row = collector.window(before, after, [METRIC], START + 10, START + 20)["series"][0]
+        self.assertEqual(row["count"], 1)
+        self.assertEqual(row["p99"], {"lower_exclusive": 0.001, "upper_inclusive": 0.01})
 
     def test_open_tail_is_not_replaced_with_historical_max(self):
         self.after = export(START + 20, [200, 100, 105])

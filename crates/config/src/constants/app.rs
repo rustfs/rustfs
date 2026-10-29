@@ -384,6 +384,9 @@ pub const DEFAULT_OBS_PROFILING_EXPORT_ENABLED: bool = true;
 /// Environment variable: RUSTFS_OBS_LOG_STDOUT_ENABLED
 pub const DEFAULT_OBS_LOG_STDOUT_ENABLED: bool = false;
 
+/// Fixed target for sampled local-batch diagnostics with isolated JSON output.
+pub const LOCAL_BATCH_DIAGNOSTIC_LOG_TARGET: &str = "rustfs_local_batch_diagnostic";
+
 /// Constant representing 1 Kibibyte (1024 bytes)
 /// Default value: 1024
 pub const KI_B: usize = 1024;

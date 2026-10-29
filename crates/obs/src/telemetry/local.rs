@@ -192,7 +192,7 @@ impl<T> RequestIdJsonFormat<T> {
 impl<S, T> FormatEvent<S, JsonFields> for RequestIdJsonFormat<T>
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-    T: tracing_subscriber::fmt::time::FormatTime,
+    T: tracing_subscriber::fmt::time::FormatTime + Clone,
 {
     fn format_event(
         &self,
@@ -200,6 +200,17 @@ where
         mut writer: Writer<'_>,
         event: &tracing::Event<'_>,
     ) -> fmt::Result {
+        #[cfg(feature = "diagnostic-local-batch")]
+        if event.is_root() && event.metadata().target() == rustfs_config::LOCAL_BATCH_DIAGNOSTIC_LOG_TARGET {
+            // Explicit root events must not acquire the formatter's current
+            // request span or an inferred request ID from that span.
+            return self
+                .inner
+                .clone()
+                .with_current_span(false)
+                .with_span_list(false)
+                .format_event(ctx, writer, event);
+        }
         let mut buffer = String::new();
         self.inner.format_event(ctx, Writer::new(&mut buffer), event)?;
 
@@ -811,6 +822,74 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[cfg(feature = "diagnostic-local-batch")]
+    fn render_local_batch_diagnostic(request_id: Option<&str>) -> (Value, Value) {
+        let writer = SharedWriter::default();
+        let layer = build_json_log_layer(writer.clone(), false, FmtSpan::FULL, true);
+        let subscriber = Registry::default().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            let parent = tracing::info_span!("request", request_id = "parent-request", uri = "/must-not-copy-parent-path");
+            let _entered = parent.enter();
+            tracing::trace!(target: rustfs_config::LOCAL_BATCH_DIAGNOSTIC_LOG_TARGET, parent: None,
+                event = "local_batch_diagnostic", component = "ecstore", subsystem = "local_batch_diagnostic",
+                result = "success", request_id,
+                request_context = if request_id.is_some() { "present" } else { "missing" },
+                "diagnostic root event");
+            tracing::info!(
+                event = EVENT_LOCAL_LOGGING_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+                result = "test",
+                "ordinary context event"
+            );
+        });
+        let bytes = writer.inner.lock().expect("formatted diagnostic records");
+        let records: Vec<Value> = std::str::from_utf8(&bytes)
+            .expect("UTF-8 JSON")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON record"))
+            .collect();
+        let diagnostic = records
+            .iter()
+            .find(|record| record["target"] == rustfs_config::LOCAL_BATCH_DIAGNOSTIC_LOG_TARGET)
+            .expect("diagnostic event")
+            .clone();
+        let ordinary = records
+            .into_iter()
+            .find(|record| record["message"] == "ordinary context event")
+            .expect("ordinary event");
+        (diagnostic, ordinary)
+    }
+
+    #[cfg(feature = "diagnostic-local-batch")]
+    #[test]
+    fn local_batch_diagnostic_root_omits_parent_span_without_changing_ordinary_logs() {
+        let (diagnostic, ordinary) = render_local_batch_diagnostic(Some("server-owned"));
+        assert_eq!(diagnostic["request_id"], "server-owned");
+        assert!(diagnostic.get("request-id").is_none());
+        assert!(diagnostic.get("span").is_none());
+        assert!(diagnostic.get("spans").is_none());
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .expect("diagnostic JSON")
+                .contains("must-not-copy")
+        );
+        assert_eq!(ordinary["span"]["uri"], "/must-not-copy-parent-path");
+        assert_eq!(ordinary["request_id"], "parent-request");
+        assert_eq!(ordinary["request-id"], "parent-request");
+    }
+
+    #[cfg(feature = "diagnostic-local-batch")]
+    #[test]
+    fn local_batch_diagnostic_missing_context_does_not_infer_parent_request_id() {
+        let (diagnostic, _) = render_local_batch_diagnostic(None);
+        assert_eq!(diagnostic["request_context"], "missing");
+        assert!(diagnostic.get("request_id").is_none());
+        assert!(diagnostic.get("request-id").is_none());
+        assert!(diagnostic.get("span").is_none());
+        assert!(diagnostic.get("spans").is_none());
     }
 
     fn render_json_log(enable_ansi: bool) -> (String, Value) {

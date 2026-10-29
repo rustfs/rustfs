@@ -37,7 +37,7 @@ use std::{
     collections::VecDeque,
     future::Future,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},
@@ -58,6 +58,19 @@ pub(crate) struct OutcomeFinishTestHook {
 #[cfg(test)]
 pub(crate) static OUTCOME_FINISH_TEST_HOOK: std::sync::LazyLock<tokio::sync::Mutex<Option<Arc<OutcomeFinishTestHook>>>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+#[cfg(test)]
+static STORAGE_RECEIPT_TEST_HOOK: std::sync::LazyLock<tokio::sync::Mutex<Option<Arc<OutcomeFinishTestHook>>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+#[cfg(test)]
+async fn pause_storage_receipt(task_id: &str) {
+    let hook = STORAGE_RECEIPT_TEST_HOOK.lock().await.clone();
+    if let Some(hook) = hook.filter(|hook| hook.task_id == task_id) {
+        hook.reached.notify_one();
+        hook.release.notified().await;
+    }
+}
 
 #[cfg(test)]
 async fn pause_outcome_finish(task_id: &str) {
@@ -436,6 +449,9 @@ pub struct HealTask {
     replacement_start_retry_count: Arc<AtomicU32>,
     /// Set when the locked storage read classified the single target as absent.
     object_absent: Arc<AtomicBool>,
+    /// The first resolved incarnation belongs to this task even if storage
+    /// fails or the bucket is recreated before its terminal outcome is recorded.
+    single_object_incarnation: Arc<OnceLock<Option<Uuid>>>,
     /// Task status
     pub status: Arc<RwLock<HealTaskStatus>>,
     /// Progress tracking
@@ -508,6 +524,7 @@ impl HealTask {
             replacement_running: Arc::new(AtomicBool::new(false)),
             replacement_start_retry_count: Arc::new(AtomicU32::new(0)),
             object_absent: Arc::new(AtomicBool::new(false)),
+            single_object_incarnation: Arc::new(OnceLock::new()),
             status: Arc::new(RwLock::new(HealTaskStatus::Pending)),
             progress: Arc::new(RwLock::new(HealProgress::new())),
             result_items: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_RETAINED_HEAL_RESULT_ITEMS))),
@@ -669,7 +686,9 @@ impl HealTask {
             } => (bucket, object, Some(version_id.as_str())),
             _ => return None,
         };
-        Some(self.outcome_identity(bucket, object, version, self.options.pool_index, self.options.set_index))
+        let mut identity = self.outcome_identity(bucket, object, version, self.options.pool_index, self.options.set_index);
+        identity.bucket_incarnation_id = self.single_object_incarnation.get().copied().flatten();
+        Some(identity)
     }
 
     pub(super) async fn record_verified_storage_receipt(

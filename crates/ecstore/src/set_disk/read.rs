@@ -1818,7 +1818,10 @@ impl SetDisks {
                         "Create bitrot reader failed read quorum"
                     );
                     record_get_object_pipeline_failure(GET_STAGE_READER_SETUP, reason);
-                    return Err(to_object_err(read_err.into(), vec![bucket, object]));
+                    // The metadata selected this object, but the part cannot
+                    // be reconstructed. A dominant disk I/O/not-found error
+                    // must not erase the object's read-quorum failure.
+                    return Err(to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]));
                 }
                 let reason = GetObjectFailureReason::ReadQuorum;
                 error!(
@@ -1843,7 +1846,7 @@ impl SetDisks {
                     "Create bitrot reader did not have enough disks"
                 );
                 record_get_object_pipeline_failure(GET_STAGE_READER_SETUP, reason);
-                return Err(Error::other(format!("not enough disks to read: {:?}", reader_setup.errors)));
+                return Err(to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]));
             }
 
             // Check if we have missing shards even though we can read successfully
@@ -2378,10 +2381,10 @@ impl SetDisks {
             if let Some(read_err) = reduce_read_quorum_errs(&reader_setup.errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
                 let reason = classify_disk_error(&read_err);
                 record_get_object_pipeline_failure_for_path(metrics_path, GET_STAGE_READER_SETUP, reason);
-                return Err(to_object_err(read_err.into(), vec![bucket, object]));
+                return Err(to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]));
             }
             record_get_object_pipeline_failure_for_path(metrics_path, GET_STAGE_READER_SETUP, GetObjectFailureReason::ReadQuorum);
-            return Err(Error::other(format!("not enough disks to read: {:?}", reader_setup.errors)));
+            return Err(to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]));
         }
 
         let missing_shards = reader_setup.completed_failed_shards();
@@ -8190,6 +8193,105 @@ mod tests {
                 .expect("external fixture shard should be written");
         }
         (data_dir, files)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn external_missing_shards_keep_typed_read_quorum() {
+        use tokio::io::AsyncReadExt;
+
+        let payload = vec![0x37; 256 * 1024];
+        for readable_shards in [1, 2, 4] {
+            let erasure = coding::Erasure::new(4, 2, 1024 * 1024);
+            let mut fi = codec_streaming_test_fileinfo(i64::try_from(payload.len()).expect("fixture size fits i64"), 1);
+            fi.erasure.data_blocks = erasure.data_shards;
+            fi.erasure.parity_blocks = erasure.parity_shards;
+            fi.erasure.block_size = erasure.block_size;
+            fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+            let (dirs, disks) = local_test_disks(erasure.total_shard_count(), CODEC_STREAMING_TEST_BUCKET).await;
+            let (data_dir, files) = codec_streaming_external_files(&erasure, &payload, &disks).await;
+            fi.data_dir = Some(data_dir);
+            for directory in dirs.iter().skip(readable_shards) {
+                tokio::fs::remove_file(
+                    directory
+                        .path()
+                        .join(CODEC_STREAMING_TEST_BUCKET)
+                        .join(CODEC_STREAMING_TEST_OBJECT)
+                        .join(data_dir.to_string())
+                        .join("part.1"),
+                )
+                .await
+                .expect("remove real part while retaining its selected metadata");
+            }
+
+            let mut output = Vec::new();
+            let legacy = SetDisks::get_object_with_fileinfo(
+                CODEC_STREAMING_TEST_BUCKET,
+                CODEC_STREAMING_TEST_OBJECT,
+                Arc::new(ErasureCache::new()),
+                0,
+                fi.size,
+                &mut output,
+                fi.clone(),
+                files.clone(),
+                &disks,
+                0,
+                0,
+                false,
+                true,
+                false,
+                false,
+                GET_OBJECT_PATH_LEGACY_DUPLEX,
+                "plain_single_part",
+                "le_1mib",
+            )
+            .await;
+            let streaming = SetDisks::get_object_mid_size_reader_with_fileinfo(
+                CODEC_STREAMING_TEST_BUCKET,
+                CODEC_STREAMING_TEST_OBJECT,
+                Arc::new(ErasureCache::new()),
+                &fi,
+                &files,
+                &disks,
+                0,
+                0,
+                false,
+                true,
+                "plain_single_part",
+                "le_1mib",
+                false,
+            )
+            .await;
+            if readable_shards < erasure.data_shards {
+                for error in [
+                    legacy.expect_err("legacy read must reject quorum minus one"),
+                    streaming.err().expect("streaming setup must reject quorum minus one"),
+                ] {
+                    assert_eq!(
+                        error,
+                        Error::InsufficientReadQuorum(
+                            CODEC_STREAMING_TEST_BUCKET.to_owned(),
+                            CODEC_STREAMING_TEST_OBJECT.to_owned(),
+                        )
+                    );
+                }
+                assert!(output.is_empty(), "quorum rejection must precede all response bytes");
+            } else {
+                legacy.expect("legacy reader retains reconstructable quorum");
+                assert_eq!(output, payload, "legacy read returns every original byte at quorum");
+                let GetCodecStreamingReaderBuildOutcome::Reader(mut reader) =
+                    streaming.expect("streaming quorum remains readable")
+                else {
+                    panic!("mid-size quorum must yield an actual reader");
+                };
+                let mut decoded = Vec::new();
+                reader
+                    .read_to_end(&mut decoded)
+                    .await
+                    .expect("streaming reader returns the complete body");
+                assert_eq!(decoded, payload, "streaming read returns every original byte at quorum");
+            }
+        }
     }
 
     #[test]

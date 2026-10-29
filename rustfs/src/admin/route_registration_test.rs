@@ -254,6 +254,8 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/tier"),
         admin_route(Method::GET, "/v3/tier-stats"),
         admin_route_sample(Method::GET, "/v3/tier/{tier}", "/v3/tier/HOT"),
+        admin_route_sample(Method::GET, "/v3/tier/{tier}/deletion-check", "/v3/tier/HOT/deletion-check"),
+        admin_route_sample(Method::POST, "/v3/tier/{tier}/cleanup-retry", "/v3/tier/HOT/cleanup-retry"),
         admin_route_sample(Method::DELETE, "/v3/tier/{tiername}", "/v3/tier/HOT"),
         admin_route(Method::PUT, "/v3/tier"),
         admin_route_sample(Method::POST, "/v3/tier/{tiername}", "/v3/tier/HOT"),

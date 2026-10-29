@@ -42,13 +42,14 @@ enum NotifyConfigStoreError {
     Read(String),
     Save(String),
     Converge { persisted: bool, error: String },
+    Conflict,
 }
 
 fn notification_convergence_error(persisted: bool, error: impl std::fmt::Display) -> NotificationError {
-    let durable_state = if persisted { "persisted" } else { "unchanged" };
-    NotificationError::Configuration(format!(
-        "configuration was {durable_state} but notification runtime convergence failed: {error}"
-    ))
+    NotificationError::ConfigurationConvergence {
+        persisted,
+        detail: error.to_string(),
+    }
 }
 
 async fn supervise_config_update<T>(
@@ -63,12 +64,62 @@ where
     })?
 }
 
+fn configs_equal(first: Option<&KVS>, second: Option<&KVS>) -> bool {
+    match (first, second) {
+        (None, None) => true,
+        (Some(first), Some(second)) => {
+            if first == second {
+                return true;
+            }
+            let mut first: Vec<_> = first.0.iter().collect();
+            let mut second: Vec<_> = second.0.iter().collect();
+            // Lookup uses the first occurrence of a key, so preserve duplicate-key order.
+            first.sort_by(|a, b| a.key.cmp(&b.key));
+            second.sort_by(|a, b| a.key.cmp(&b.key));
+            first == second
+        }
+        _ => false,
+    }
+}
+
+fn replace_target_if_unchanged(
+    config: &mut Config,
+    target_type: &str,
+    target_name: &str,
+    expected: Option<&KVS>,
+    expected_default: Option<&KVS>,
+    kvs: &KVS,
+) -> Result<bool, NotifyConfigStoreError> {
+    let targets = config.0.get(target_type);
+    let mut matching = targets
+        .into_iter()
+        .flat_map(|targets| targets.iter())
+        .filter(|(name, _)| name.eq_ignore_ascii_case(target_name));
+    let current = matching.next();
+    if matching.next().is_some() {
+        return Err(NotifyConfigStoreError::Conflict);
+    }
+    let stored_name = current
+        .map(|(name, _)| name.clone())
+        .unwrap_or_else(|| target_name.to_owned());
+    let current_default = targets.and_then(|targets| targets.get(rustfs_config::DEFAULT_DELIMITER));
+    if !configs_equal(current.map(|(_, kvs)| kvs), expected) || !configs_equal(current_default, expected_default) {
+        return Err(NotifyConfigStoreError::Conflict);
+    }
+    config
+        .0
+        .entry(target_type.to_owned())
+        .or_default()
+        .insert(stored_name, kvs.clone());
+    Ok(true)
+}
+
 async fn update_server_config<F>(
     mut modifier: F,
     lifecycle: NotifyLifecycleCoordinator,
 ) -> Result<Option<(crate::lifecycle::NotificationLifecycleTransition, bool)>, NotifyConfigStoreError>
 where
-    F: FnMut(&mut Config) -> bool + Send + 'static,
+    F: FnMut(&mut Config, Option<String>) -> Result<bool, NotifyConfigStoreError> + Send + 'static,
 {
     let Some(store) = resolve_notify_object_store_handle() else {
         return Err(NotifyConfigStoreError::StorageNotAvailable);
@@ -79,7 +130,8 @@ where
             .await
             .map_err(NotifyConfigStoreError::Read)?;
         let mut config = snapshot.config.clone();
-        if !modifier(&mut config) {
+        let generation = snapshot.generation().map(|value| value.to_string());
+        if !modifier(&mut config, generation)? {
             return Ok(None);
         }
 
@@ -245,6 +297,30 @@ impl NotifyConfigManager {
         .await
     }
 
+    /// Replace a target only when its persisted configuration is unchanged since validation.
+    pub async fn set_target_config_if_unchanged(
+        &self,
+        target_type: &str,
+        target_name: &str,
+        expected: Option<KVS>,
+        expected_default: Option<KVS>,
+        expected_generation: Option<String>,
+        kvs: KVS,
+    ) -> Result<(), NotificationError> {
+        let ttype = target_type.to_lowercase();
+        let tname = target_name.to_lowercase();
+        self.update_config_and_reload_checked(move |config, generation| {
+            if expected_generation
+                .as_ref()
+                .is_some_and(|expected| generation.as_ref() != Some(expected))
+            {
+                return Err(NotifyConfigStoreError::Conflict);
+            }
+            replace_target_if_unchanged(config, &ttype, &tname, expected.as_ref(), expected_default.as_ref(), &kvs)
+        })
+        .await
+    }
+
     pub async fn remove_target_config(&self, target_type: &str, target_name: &str) -> Result<(), NotificationError> {
         debug!(
             event = EVENT_NOTIFY_CONFIG_UPDATE,
@@ -338,9 +414,17 @@ impl NotifyConfigManager {
         Ok(())
     }
 
-    async fn update_config_and_reload<F>(&self, modifier: F) -> Result<(), NotificationError>
+    async fn update_config_and_reload<F>(&self, mut modifier: F) -> Result<(), NotificationError>
     where
         F: FnMut(&mut Config) -> bool + Send + 'static,
+    {
+        self.update_config_and_reload_checked(move |config, _generation| Ok(modifier(config)))
+            .await
+    }
+
+    async fn update_config_and_reload_checked<F>(&self, modifier: F) -> Result<(), NotificationError>
+    where
+        F: FnMut(&mut Config, Option<String>) -> Result<bool, NotifyConfigStoreError> + Send + 'static,
     {
         if self.lifecycle.state() == NotificationRuntimeState::Terminated {
             return Err(NotificationError::Initialization("Notification runtime has terminated".to_string()));
@@ -356,6 +440,7 @@ impl NotifyConfigManager {
                     NotifyConfigStoreError::Read(err) => NotificationError::ReadConfig(err),
                     NotifyConfigStoreError::Save(err) => NotificationError::SaveConfig(err),
                     NotifyConfigStoreError::Converge { persisted, error } => notification_convergence_error(persisted, error),
+                    NotifyConfigStoreError::Conflict => NotificationError::ConfigurationConflict,
                 })?
         else {
             debug!(
@@ -393,6 +478,126 @@ mod tests {
     };
     use crate::rules::RulesMap;
     use crate::{NotificationError, NotificationRuntimeState};
+
+    #[test]
+    fn config_comparison_preserves_duplicates_and_hidden_flags() {
+        use rustfs_config::server_config::{KV, KVS};
+        let field = |key: &str, value: &str, hidden_if_empty: bool| KV {
+            key: key.into(),
+            value: value.into(),
+            hidden_if_empty,
+        };
+        let original = KVS(vec![
+            field("password", "secret", false),
+            field("token", "", true),
+            field("password", "secret", false),
+        ]);
+        let reordered = KVS(vec![
+            field("password", "secret", false),
+            field("password", "secret", false),
+            field("token", "", true),
+        ]);
+        let missing_duplicate = KVS(vec![field("password", "secret", false), field("token", "", true)]);
+        let changed_flag = KVS(vec![
+            field("password", "secret", false),
+            field("password", "secret", false),
+            field("token", "", false),
+        ]);
+        assert!(super::configs_equal(Some(&original), Some(&reordered)));
+        assert!(!super::configs_equal(Some(&original), Some(&missing_duplicate)));
+        assert!(!super::configs_equal(Some(&original), Some(&changed_flag)));
+        assert!(!super::configs_equal(Some(&original), None));
+        let first_value = KVS(vec![
+            field("password", "old", false),
+            field("token", "", true),
+            field("password", "new", false),
+        ]);
+        let reordered_keys = KVS(vec![
+            field("token", "", true),
+            field("password", "old", false),
+            field("password", "new", false),
+        ]);
+        let reordered_duplicates = KVS(vec![
+            field("token", "", true),
+            field("password", "new", false),
+            field("password", "old", false),
+        ]);
+        assert!(super::configs_equal(Some(&first_value), Some(&reordered_keys)));
+        assert!(!super::configs_equal(Some(&first_value), Some(&reordered_duplicates)));
+    }
+
+    #[test]
+    fn conditional_target_update_rejects_rotation_and_deletion() {
+        use rustfs_config::server_config::{Config, KVS};
+        let mut old = KVS::new();
+        old.insert("password".into(), "old".into());
+        let mut rotated = KVS::new();
+        rotated.insert("password".into(), "new".into());
+        let mut config = Config::new();
+        config
+            .0
+            .entry("notify_nats".into())
+            .or_default()
+            .insert("primary".into(), rotated.clone());
+        let result = super::replace_target_if_unchanged(&mut config, "notify_nats", "primary", Some(&old), None, &old);
+        assert!(matches!(result, Err(super::NotifyConfigStoreError::Conflict)));
+        assert_eq!(config.0["notify_nats"]["primary"], rotated);
+        config.0.get_mut("notify_nats").expect("subsystem exists").remove("primary");
+        assert!(matches!(
+            super::replace_target_if_unchanged(&mut config, "notify_nats", "primary", Some(&old), None, &old),
+            Err(super::NotifyConfigStoreError::Conflict)
+        ));
+        assert!(
+            super::replace_target_if_unchanged(&mut config, "notify_nats", "primary", None, None, &old)
+                .expect("create unchanged target")
+        );
+        assert!(
+            super::replace_target_if_unchanged(&mut config, "notify_nats", "primary", Some(&old), None, &rotated)
+                .expect("replace unchanged target")
+        );
+        assert_eq!(config.0["notify_nats"]["primary"], rotated);
+
+        let mut first = KVS::new();
+        first.insert("url".into(), "nats://example.com".into());
+        first.insert("token".into(), "secret".into());
+        let mut reordered = KVS::new();
+        reordered.insert("token".into(), "secret".into());
+        reordered.insert("url".into(), "nats://example.com".into());
+        config
+            .0
+            .get_mut("notify_nats")
+            .expect("subsystem")
+            .insert("primary".into(), first);
+        assert!(
+            super::replace_target_if_unchanged(&mut config, "notify_nats", "primary", Some(&reordered), None, &rotated)
+                .expect("key order does not signal a change")
+        );
+        let targets = config.0.get_mut("notify_nats").expect("subsystem");
+        targets.remove("primary");
+        targets.insert("Primary".into(), rotated.clone());
+        assert!(
+            super::replace_target_if_unchanged(&mut config, "notify_nats", "primary", Some(&rotated), None, &old)
+                .expect("case-insensitive match")
+        );
+        let targets = &config.0["notify_nats"];
+        assert!(targets.contains_key("Primary"));
+        assert!(!targets.contains_key("primary"));
+        let mut old_default = KVS::new();
+        old_default.insert("password".into(), "old-default".into());
+        let mut new_default = KVS::new();
+        new_default.insert("password".into(), "new-default".into());
+        config
+            .0
+            .get_mut("notify_nats")
+            .expect("subsystem")
+            .insert("_".into(), new_default.clone());
+        assert!(matches!(
+            super::replace_target_if_unchanged(&mut config, "notify_nats", "primary", Some(&old), Some(&old_default), &rotated),
+            Err(super::NotifyConfigStoreError::Conflict)
+        ));
+        assert_eq!(config.0["notify_nats"]["Primary"], old);
+        assert_eq!(config.0["notify_nats"]["_"], new_default);
+    }
 
     #[tokio::test]
     async fn supervised_config_update_survives_waiter_cancellation() {
@@ -550,13 +755,9 @@ mod tests {
 
     #[test]
     fn convergence_error_reports_durable_write_state() {
-        for (persisted, expected) in [(true, "configuration was persisted"), (false, "configuration was unchanged")] {
+        for persisted in [true, false] {
             let error = notification_convergence_error(persisted, "injected failure");
-            let NotificationError::Configuration(message) = error else {
-                panic!("convergence error should be a configuration error");
-            };
-            assert!(message.contains(expected), "unexpected convergence error: {message}");
-            assert!(message.contains("injected failure"));
+            assert!(matches!(error, NotificationError::ConfigurationConvergence { persisted: value, .. } if value == persisted));
         }
     }
 }

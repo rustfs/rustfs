@@ -90,7 +90,7 @@ impl UserAgent {
     /// Get Windows platform information
     #[cfg(windows)]
     fn get_windows_platform() -> String {
-        let version = System::os_version().unwrap_or_else(|| "NT Unknown".to_string());
+        let version = System::os_version().unwrap_or_else(|_| "NT Unknown".to_string());
         if version.starts_with("Windows") {
             version
         } else {
@@ -106,7 +106,7 @@ impl UserAgent {
     /// Get macOS platform information
     #[cfg(target_os = "macos")]
     fn get_macos_platform() -> String {
-        let version_str = System::os_version().unwrap_or_else(|| "14.0.0".to_string());
+        let version_str = System::os_version().unwrap_or_else(|_| "14.0.0".to_string());
         let mut parts = version_str.split('.');
         let major = parts.next().unwrap_or("14");
         let minor = parts.next().unwrap_or("0");
@@ -125,7 +125,7 @@ impl UserAgent {
     /// Get Linux platform information
     #[cfg(target_os = "linux")]
     fn get_linux_platform() -> String {
-        let os_name = System::long_os_version().unwrap_or_else(|| "Linux Unknown".to_string());
+        let os_name = System::long_os_version().unwrap_or_else(|_| "Linux Unknown".to_string());
         format!("X11; {os_name}")
     }
 

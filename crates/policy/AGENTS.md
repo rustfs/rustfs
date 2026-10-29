@@ -22,4 +22,4 @@ Applies to `crates/policy/`.
 
 ## Suggested Validation
 
-- `cargo test -p rustfs-policy`
+- `cargo nextest run -p rustfs-policy --no-tests fail`, narrowed to the affected tests.

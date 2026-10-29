@@ -2169,6 +2169,210 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn bucket_incarnation_fence_survives_caller_abort_at_real_repair_commit() {
+        use crate::set_disk::ReadRepairPauseScope;
+
+        let (_root, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = format!("heal-commit-owner-{}", Uuid::new_v4().simple());
+        let object = "history.bin";
+        let version = Uuid::new_v4().to_string();
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("original bucket");
+        let old = store
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("original identity");
+        let set = store.pools[0].get_disks(0);
+        let mut reader = PutObjReader::from_vec(vec![0x17; 1024 * 1024]);
+        set.put_object(
+            &bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                versioned: true,
+                version_id: Some(version.clone()),
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("original acknowledged version");
+        let missing = set.disks.read().await[0].clone().expect("repair target");
+        let healthy = set.disks.read().await[1].clone().expect("healthy target");
+        let baseline = healthy
+            .read_all(&bucket, &format!("{object}/xl.meta"))
+            .await
+            .expect("healthy metadata baseline");
+        let original = healthy
+            .read_version("", &bucket, object, &version, &Default::default())
+            .await
+            .expect("original version metadata");
+        assert!(original.data.is_none(), "the commit barrier fixture must use actual external data shards");
+        missing
+            .delete(
+                &bucket,
+                object,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("remove one physical shard");
+
+        // The scope pauses the real repair after reconstruction, immediately
+        // before its generation check and final shard rename.
+        let (_pause, arrived, release) = ReadRepairPauseScope::install_incarnation_commit(&bucket, object);
+        let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+        let worker_store = store.clone();
+        let worker_bucket = bucket.clone();
+        let worker_version = version.clone();
+        let opts = HealOpts {
+            pool: Some(0),
+            set: Some(0),
+            scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Deep,
+            ..Default::default()
+        };
+        let mut waiter = tokio::spawn(async move {
+            worker_store
+                .run_bucket_heal_at_incarnation(&worker_bucket, old, &opts, move |store, bucket, opts| async move {
+                    let result = store.heal_object_with_proof(&bucket, object, &worker_version, &opts).await?;
+                    drained_tx
+                        .send(result)
+                        .expect("retain the actual storage result after caller cancellation");
+                    Ok(())
+                })
+                .await
+        });
+        tokio::select! {
+            paused = tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified()) => {
+                paused.expect("real missing-shard repair reaches the final commit pause");
+            }
+            completed = &mut waiter => panic!("repair ended before the actual final commit barrier: {completed:?}"),
+        }
+        assert!(
+            missing.read_xl(&bucket, object, false).await.is_err(),
+            "final shard is not published at the pause"
+        );
+        println!("incarnation_commit_barrier: final_rename_paused");
+        waiter.abort();
+        assert!(waiter.await.expect_err("caller aborted").is_cancelled());
+        let mut writer = Box::pin(store.acquire_bucket_lifecycle_write_lock(&bucket));
+        assert!(
+            futures::poll!(&mut writer).is_pending(),
+            "bucket deletion/recreation cannot acquire its generation writer while the cancelled repair still owns commit"
+        );
+        println!("incarnation_commit_barrier: caller_aborted_writer_pending");
+        release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), drained_rx)
+            .await
+            .expect("actual repair drains after release")
+            .expect("retained repair result");
+        assert!(
+            result.error.is_none(),
+            "physical repair must succeed before lifecycle handoff: {:?}",
+            result.error
+        );
+        let guard = tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+            .await
+            .expect("generation writer acquires only after physical repair drains")
+            .expect("generation writer");
+        assert!(
+            missing.read_xl(&bucket, object, false).await.is_ok(),
+            "the physical shard is published before writer admission"
+        );
+        let repaired = missing
+            .read_version("", &bucket, object, &version, &Default::default())
+            .await
+            .expect("repaired exact version metadata");
+        assert_eq!(repaired.version_id, original.version_id);
+        assert_eq!(repaired.data_dir, original.data_dir);
+        let checked = missing
+            .check_parts(&bucket, object, &repaired)
+            .await
+            .expect("verify the published physical shard");
+        assert_eq!(
+            checked.results,
+            vec![crate::disk::CHECK_PART_SUCCESS],
+            "the actual published part passes bitrot verification"
+        );
+        assert_eq!(
+            healthy
+                .read_all(&bucket, &format!("{object}/xl.meta"))
+                .await
+                .expect("healthy after repair"),
+            baseline,
+            "repair does not overwrite the surviving version"
+        );
+        println!("incarnation_commit_barrier: repair_drained_writer_acquired");
+        drop(guard);
+
+        set.delete_object(
+            &bucket,
+            object,
+            ObjectOptions {
+                versioned: true,
+                version_id: Some(version.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("normal explicit deletion of the old version");
+        store
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("normal empty bucket deletion");
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("same-name successor bucket");
+        let new = store
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("successor identity");
+        assert_ne!(old, new);
+        let successor_version = Uuid::new_v4().to_string();
+        let mut successor_reader = PutObjReader::from_vec(vec![0x29; 512 * 1024]);
+        set.put_object(
+            &bucket,
+            object,
+            &mut successor_reader,
+            &ObjectOptions {
+                versioned: true,
+                version_id: Some(successor_version),
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("acknowledged successor version");
+        let successor = healthy
+            .read_all(&bucket, &format!("{object}/xl.meta"))
+            .await
+            .expect("successor metadata");
+        assert!(
+            store
+                .heal_object_at_incarnation(&bucket, object, &version, old, &opts)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            healthy
+                .read_all(&bucket, &format!("{object}/xl.meta"))
+                .await
+                .expect("successor after obsolete admission"),
+            successor,
+            "obsolete admission cannot change the same-name successor"
+        );
+        println!("incarnation_commit_barrier: successor_rejects_obsolete_admission");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn bucket_incarnation_heal_owner_survives_cancelled_waiter_and_queued_writer() {
         use crate::disk::{current_resource_unit, with_background_resource_unit};
         use rustfs_concurrency::adaptive::AdaptiveAdmission;

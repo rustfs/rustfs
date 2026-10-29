@@ -221,5 +221,171 @@ SH
         self.assertNotIn("          overwrite: true", upload)
 
 
+class ValidationPackageTests(unittest.TestCase):
+    def setUp(self):
+        # Exercise the real upload shell with the same conditional object-store
+        # fixture used by the nightly publication tests.
+        self.fixture = NightlyCandidateTests("test_success_binds_actual_package_checkout_and_attempt")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.temp.cleanup)
+        self.workflow = ROOT / ".github/workflows/rustfs-validation-package.yml"
+        job = yaml_block(self.workflow.read_text().splitlines(), "publish", 2)
+        start = job.index("      - name: Upload validation package to immutable R2 path")
+        end = job.index("      - name: Upload validation candidate manifest")
+        upload = job[start:end]
+        begin = upload.index("        run: |") + 1
+        self.fixture.shell = "\n".join(line[10:] for line in upload[begin:] if not line.strip() or line.startswith("          "))
+        self.fixture.shims.write_text(self.fixture.shims.read_text().replace("/packages/nightly/runs/*", "/packages/validation/runs/*"))
+        self.fixture.env.update(PACKAGE_FILE=self.fixture.package.name, VALIDATION_SOURCE_SHA=self.fixture.sha,
+                                VALIDATION_SOURCE_REF=self.fixture.sha, GITHUB_SHA="f" * 40, AWS_CLI="aws")
+        def shell(name, end_name):
+            step = job[job.index("      - name: " + name):job.index("      - name: " + end_name)]
+            return "\n".join(line[10:] for line in step[step.index("        run: |") + 1:]
+                             if not line.strip() or line.startswith("          "))
+        self.stage_shell = shell("Validate and stage opaque package bytes", "Prepare trusted publication tools")
+        self.tools_shell = shell("Prepare trusted publication tools", "Upload validation package to immutable R2 path")
+
+    def stage(self):
+        env = dict(os.environ, RUNNER_TEMP=str(self.fixture.root))
+        env.pop("BASH_ENV", None)
+        return subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", self.stage_shell],
+                              cwd=self.fixture.root, env=env, capture_output=True, text=True)
+
+    def test_success_uploads_only_one_immutable_object_and_exact_source(self):
+        result = self.fixture.run_publish()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = self.fixture.manifest()
+        self.assertEqual(manifest["schema"], 3)
+        self.assertEqual(manifest["channel"], "validation")
+        self.assertEqual(manifest["source_sha"], self.fixture.sha)
+        self.assertEqual(manifest["source_ref"], self.fixture.sha)
+        self.assertEqual(manifest["workflow_sha"], "f" * 40)
+        validate_manifest(manifest, {"id": 12345, "run_attempt": 1, "head_sha": "f" * 40})
+        objects = [path for path in self.fixture.store.rglob("*") if path.is_file()]
+        self.assertEqual(len(objects), 1)
+        self.assertEqual(objects[0].read_bytes(), self.fixture.package.read_bytes())
+        self.assertEqual(str(objects[0].relative_to(self.fixture.store)),
+                         f"artifacts/rustfs/packages/validation/runs/12345/1/{self.fixture.digest}/rustfs.deb")
+        self.assertNotIn("s3 cp", (self.fixture.root / "aws.log").read_text())
+
+    def test_failure_or_missing_credentials_cannot_certify_a_candidate(self):
+        for index, mode in enumerate(("upload-failure", "missing-public-url", "wrong-public-bytes", "incomplete-download")):
+            with self.subTest(mode=mode):
+                result = self.fixture.run_publish(FAKE_MODE=mode, GITHUB_RUN_ID=str(20000 + index))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.fixture.output.exists())
+                self.assertEqual(list(self.fixture.root.glob("validation-candidate-*.json")), [])
+        for key in ("R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_ENDPOINT", "R2_BUCKET"):
+            with self.subTest(key=key):
+                self.assertNotEqual(self.fixture.run_publish(**{key: ""}).returncode, 0)
+                self.assertFalse(self.fixture.output.exists())
+
+    def test_stale_source_and_duplicate_objects_are_rejected(self):
+        for source in ("not-an-exact-sha", "e" * 40):
+            with self.subTest(source=source):
+                result = self.fixture.run_publish(VALIDATION_SOURCE_SHA=source)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.fixture.store.exists())
+        result = self.fixture.run_publish()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = self.fixture.manifest()
+        key = manifest["package_url"].removeprefix("https://dl.rustfs.com/")
+        stored = self.fixture.store / key
+        stored.write_bytes(b"preexisting conflicting object")
+        (self.fixture.root / "validation-candidate-12345-1.json").unlink()
+        result = self.fixture.run_publish()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(stored.read_bytes(), b"preexisting conflicting object")
+        self.assertFalse(self.fixture.output.exists())
+
+    def test_exact_source_and_workflow_identity_are_preserved_separately(self):
+        lines = self.workflow.read_text().splitlines()
+        build = "\n".join(yaml_block(lines, "build", 2))
+        publish = "\n".join(yaml_block(lines, "publish", 2))
+        source = "\n".join(yaml_block(lines, "resolve-source", 2))
+        self.assertIn('[[ "${REQUESTED_SHA}" =~ ^[0-9a-f]{40}$ ]]', source)
+        self.assertIn('test "$(git -C "${source_directory}" rev-parse FETCH_HEAD)" = "${REQUESTED_SHA}"', source)
+        self.assertIn("ref: ${{ needs.resolve-source.outputs.source_sha }}", build)
+        self.assertIn('--arg source_sha "${VALIDATION_SOURCE_SHA}"', publish)
+        self.assertIn('--arg workflow_sha "${GITHUB_SHA}"', publish)
+        self.assertNotIn("PF_TESTING_GH_TOKEN", build)
+        self.assertNotIn("publish_nightly_assets", build)
+
+    def test_candidate_execution_and_publication_credentials_are_in_separate_jobs(self):
+        lines = self.workflow.read_text().splitlines()
+        build = "\n".join(yaml_block(lines, "build", 2))
+        publish = "\n".join(yaml_block(lines, "publish", 2))
+        self.assertIn("uses: ./.github/actions/setup", build)
+        self.assertIn("cargo build", build)
+        self.assertNotIn("secrets.", build)
+        self.assertNotIn("id-token: write", build)
+        self.assertIn("needs: [resolve-source, build]", publish)
+        self.assertIn("runs-on: ubuntu-latest", publish)
+        for forbidden in ("actions/checkout@", "actions/cache@", "uses: ./", "needs.build.outputs", "cargo ", "dpkg", "source "):
+            with self.subTest(forbidden=forbidden): self.assertNotIn(forbidden, publish)
+        name = "name: validation-package-bytes-${{ github.run_id }}-${{ github.run_attempt }}"
+        self.assertIn(name, build)
+        self.assertIn(name, publish)
+        self.assertIn("VALIDATION_SOURCE_SHA: ${{ needs.resolve-source.outputs.source_sha }}", publish)
+        self.assertIn("VALIDATION_SOURCE_REF: ${{ needs.resolve-source.outputs.source_ref }}", publish)
+        prepare = publish.split("      - name: Upload validation package to immutable R2 path")[0]
+        self.assertNotIn("secrets.", prepare)
+        self.assertIn("secrets.R2_SECRET_ACCESS_KEY", publish)
+
+    def test_staging_rejects_nonregular_empty_or_extra_artifact_entries(self):
+        incoming = self.fixture.root / "validation-package-input"
+        incoming.mkdir()
+        package = incoming / "rustfs.deb"
+        for kind in ("missing", "empty", "symlink", "directory", "fifo", "extra", "directory-symlink"):
+            with self.subTest(kind=kind):
+                if kind == "empty": package.touch()
+                elif kind == "symlink": package.symlink_to(self.fixture.package)
+                elif kind == "directory": package.mkdir()
+                elif kind == "fifo": os.mkfifo(package)
+                elif kind == "extra":
+                    package.write_bytes(b"opaque")
+                    (incoming / "BASH_ENV").write_text("exit 1")
+                elif kind == "directory-symlink":
+                    incoming.rmdir()
+                    incoming.symlink_to(self.fixture.root, target_is_directory=True)
+                self.assertNotEqual(self.stage().returncode, 0)
+                self.assertFalse((self.fixture.root / "validation-publication").exists())
+                if incoming.is_symlink():
+                    incoming.unlink()
+                    incoming.mkdir()
+                elif package.is_dir(): package.rmdir()
+                else: package.unlink(missing_ok=True)
+                (incoming / "BASH_ENV").unlink(missing_ok=True)
+
+    def test_staging_and_publication_never_execute_candidate_package_or_python_hooks(self):
+        incoming = self.fixture.root / "validation-package-input"
+        incoming.mkdir()
+        marker = self.fixture.root / "candidate-executed"
+        payload = f'#!/bin/bash\nprintf "%s" "$R2_SECRET_ACCESS_KEY" > "{marker}"\n'.encode()
+        (incoming / "rustfs.deb").write_bytes(payload)
+        (self.fixture.root / "sitecustomize.py").write_text(f"open({str(marker)!r}, 'w').write('python hook')")
+        result = self.stage()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        staged = self.fixture.root / "validation-publication/rustfs.deb"
+        self.assertEqual(staged.read_bytes(), payload)
+        result = self.fixture.run_publish(PACKAGE_FILE=str(staged))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.fixture.manifest()["package_sha256"], hashlib.sha256(payload).hexdigest())
+
+    def test_cli_bootstrap_finishes_without_publication_secrets(self):
+        for mode in ("success", "old-cli", "bootstrap-failure", "install-failure", "broken-install"):
+            with self.subTest(mode=mode):
+                (self.fixture.root / "installed").unlink(missing_ok=True)
+                env = dict(self.fixture.env, FAKE_MODE=mode)
+                for key in ("R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_ENDPOINT", "R2_BUCKET"):
+                    env.pop(key)
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", self.tools_shell],
+                                        cwd=self.fixture.root, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, mode in ("success", "old-cli"), result.stderr)
+                self.assertFalse(self.fixture.store.exists())
+                self.assertEqual(list(self.fixture.root.glob("validation-candidate-*.json")), [])
+
+
 if __name__ == "__main__":
     unittest.main()

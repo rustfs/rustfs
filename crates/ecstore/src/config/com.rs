@@ -2617,6 +2617,15 @@ where
     save_server_config_snapshot(api, cfg, &snapshot).await.map(|_| ())
 }
 
+/// Read config and generation from the same object without taking the transaction write lock.
+pub async fn read_server_config_with_generation(api: Arc<ECStore>) -> Result<(Config, Option<Uuid>)> {
+    match read_config_with_metadata_inner(api.clone(), &server_config_path(), &ObjectOptions::default(), false, None).await {
+        Ok((raw, info)) => Ok((decode_persisted_server_config(&raw)?.merge(), info.data_dir.filter(|id| !id.is_nil()))),
+        Err(Error::ConfigNotFound) => read_config_without_migrate(api).await.map(|config| (config, None)),
+        Err(error) => Err(error),
+    }
+}
+
 /// One serialized read of the persisted server config used as the seed and
 /// compare-and-swap fence for an admin update.
 #[derive(Debug)]

@@ -959,6 +959,10 @@ pub struct ObjectOptions {
     /// Persisted bucket incarnation observed before authorization.
     pub expected_bucket_incarnation_id: Option<Uuid>,
     pub no_lock: bool,
+    /// Require complete participant observations for internal multipart size decisions.
+    /// This transient flag is never derived from client input or stored on disk.
+    #[doc(hidden)]
+    pub strict_multipart_part_sizes: bool,
     /// A genuine target write guard; loss fences alone do not authorize a borrowed write.
     #[doc(hidden)]
     pub write_lock_context: Option<WriteLockContext>,

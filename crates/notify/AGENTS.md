@@ -2,9 +2,7 @@
 
 Applies to `crates/notify/`.
 
-`rustfs-notify` is the domain layer for bucket notification semantics. It
-builds rules, event dispatch flow, and config/runtime orchestration on top of
-shared plugin/runtime primitives from `rustfs-targets`.
+`rustfs-notify` is the domain layer for bucket notification semantics. It builds rules, event dispatch flow, and config/runtime orchestration on top of shared plugin/runtime primitives from `rustfs-targets`.
 
 ## Domain Boundaries
 
@@ -19,14 +17,9 @@ shared plugin/runtime primitives from `rustfs-targets`.
 
 ## Runtime Layering Rules
 
-- `runtime_facade.rs` is the mutation/orchestration boundary:
-  activation, replace, stop workers, shutdown.
-- `runtime_view.rs` is read-only runtime observation:
-  active targets, metrics/health snapshots, runtime status snapshots.
-- `config_manager.rs` should map config to runtime updates through facade/view
-  and `runtime_target_id_for_subsystem`; avoid bypassing these boundaries.
-- `stream.rs` is a compatibility shim; new replay/runtime work should prefer
-  shared helpers in `rustfs-targets::runtime`.
+- `runtime_facade.rs` is the mutation/orchestration boundary: activation, replace, stop workers, shutdown.
+- `runtime_view.rs` is read-only runtime observation: active targets, metrics/health snapshots, runtime status snapshots.
+- `config_manager.rs` should map config to runtime updates through facade/view and `runtime_target_id_for_subsystem`; avoid bypassing these boundaries.
 
 ## Concurrency
 
@@ -37,11 +30,9 @@ shared plugin/runtime primitives from `rustfs-targets`.
 
 ## Change Style
 
-- Preserve best-effort dispatch semantics and observability signals unless the
-  task explicitly requests behavior changes.
+- Preserve best-effort dispatch semantics and observability signals unless the task explicitly requests behavior changes.
 - Reuse existing notify constants and subsystem mappings from `rustfs_config`.
-- Keep changes local and avoid cross-crate refactors from this crate unless
-  required by the task.
+- Keep changes local and avoid cross-crate refactors from this crate unless required by the task.
 
 ## Testing
 
@@ -51,7 +42,7 @@ shared plugin/runtime primitives from `rustfs-targets`.
   - runtime facade replace/shutdown behavior
   - runtime view health/status/metrics snapshots
 - Suggested validation:
-  - `cargo test -p rustfs-notify`
-  - Focused: `cargo test -p rustfs-notify runtime_facade`
-  - Focused: `cargo test -p rustfs-notify runtime_view`
-  - Focused: `cargo test -p rustfs-notify config_manager`
+  - `cargo nextest run -p rustfs-notify --no-tests fail`
+  - Focused: `cargo nextest run -p rustfs-notify --no-tests fail -E 'test(runtime_facade)'`
+  - Focused: `cargo nextest run -p rustfs-notify --no-tests fail -E 'test(runtime_view)'`
+  - Focused: `cargo nextest run -p rustfs-notify --no-tests fail -E 'test(config_manager)'`

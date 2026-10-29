@@ -226,6 +226,7 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         })
         result = summary.build_summary(args)
         self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["abba"]["error_rate"], 0.0)
         self.assertEqual(result["abba"]["provenance"]["manifest_sha256"], sha(self.abba / "manifest.json"))
         self.assertEqual(result["abba"]["w09_duplicate_task_count"], 0.0)
         self.assertEqual(result["abba"]["w09_worst_heal_start_p95_ms"], 43.0)
@@ -325,9 +326,63 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         self.assertEqual(result["verdict"], "FAIL")
         self.assertEqual(result["abba"]["completed_cells"], 7)
         self.assertEqual(result["abba"]["comparisons_total"], 0)
+        self.assertIsNone(result["abba"]["error_rate"])
+        self.assertIsNone(result["abba"]["foreground_pressure_samples"])
+        self.assertIsNone(result["abba"]["foreground_pressure_high_samples"])
         self.assertIn("collector failed", result["reason"])
         self.assertIn("- completed_cells: 7", summary.markdown(result))
         self.assertIn("- error: collector failed", summary.markdown(result))
+
+    def test_partial_error_rate_is_unknown(self):
+        self.report.update(status="inconclusive", performance="pending")
+        for value in (None, "missing"):
+            with self.subTest(value=value):
+                if value == "missing":
+                    self.report["comparisons"][0].pop("error_rate")
+                else:
+                    self.report["comparisons"][0]["error_rate"] = value
+                self.write_inputs()
+                self.assertIsNone(summary.summarize_abba(self.abba)["error_rate"])
+
+    def test_partial_pressure_samples_are_unknown(self):
+        self.report.update(status="inconclusive", performance="pending")
+        self.report["comparisons"][0]["w10_w11"].pop("foreground_pressure_samples")
+        for high_samples in ([0, 0, 0], [0, 0, 0, None]):
+            with self.subTest(high_samples=high_samples):
+                self.report["comparisons"][1]["w10_w11"]["foreground_pressure_high_samples"] = high_samples
+                self.write_inputs()
+                result = summary.summarize_abba(self.abba)
+                self.assertIsNone(result["foreground_pressure_samples"])
+                self.assertIsNone(result["foreground_pressure_high_samples"])
+
+    def test_complete_zero_pressure_samples_remain_zero(self):
+        self.report.update(status="inconclusive", performance="pending")
+        for row in self.report["comparisons"]:
+            row["w10_w11"]["foreground_pressure_high_samples"] = [0, 0, 0, 0]
+        self.write_inputs()
+        self.assertEqual(summary.summarize_abba(self.abba)["foreground_pressure_high_samples"], 0)
+
+    def test_missing_comparison_keeps_matrix_totals_unknown(self):
+        self.report.update(status="inconclusive", performance="pending")
+        self.report["comparisons"].pop()
+        self.write_inputs()
+        result = summary.summarize_abba(self.abba)
+        self.assertIsNone(result["error_rate"])
+        self.assertIsNone(result["foreground_pressure_samples"])
+        self.assertIsNone(result["foreground_pressure_high_samples"])
+
+    def test_passing_report_requires_error_and_pressure_samples(self):
+        for field in ("error_rate", "foreground_pressure_samples", "foreground_pressure_high_samples"):
+            with self.subTest(field=field):
+                self.setUp()
+                row = self.report["comparisons"][0]
+                if field == "error_rate":
+                    row.pop(field)
+                else:
+                    row["w10_w11"].pop(field)
+                self.write_inputs()
+                with self.assertRaisesRegex(ValueError, "must be measured"):
+                    summary.summarize_abba(self.abba)
 
     def test_passing_abba_report_requires_comparisons(self):
         del self.report["comparisons"]

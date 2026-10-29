@@ -554,7 +554,8 @@ impl HostEnvironment {
         }
 
         // Processes, names, addresses, paths, mount options and device labels are outside this schema.
-        let system = System::new_with_specifics(RefreshKind::everything().without_processes());
+        let system = System::new_with_specifics(RefreshKind::everything().without_processes())
+            .map_err(|_| EnvironmentError::SourceUnavailable(EnvironmentSource::Cpu))?;
         let cores = system.cpus().len();
         if cores == 0 {
             return Err(EnvironmentError::SourceUnavailable(EnvironmentSource::Cpu));
@@ -564,27 +565,32 @@ impl HostEnvironment {
             return Err(EnvironmentError::SourceUnavailable(EnvironmentSource::Memory));
         }
         let available_memory = system.available_memory();
-        let disks = Disks::new_with_refreshed_list();
+        let disks =
+            Disks::new_with_refreshed_list().map_err(|_| EnvironmentError::SourceUnavailable(EnvironmentSource::Filesystem))?;
         let reported_filesystems = disks
             .iter()
             .map(|disk| disk.file_system().to_string_lossy())
             .collect::<Vec<_>>();
         let filesystem_types = filesystem_types(reported_filesystems.iter().map(AsRef::as_ref))?;
-        let networks = Networks::new_with_refreshed_list();
+        let networks =
+            Networks::new_with_refreshed_list().map_err(|_| EnvironmentError::SourceUnavailable(EnvironmentSource::Network))?;
         if networks.is_empty() {
             return Err(EnvironmentError::SourceUnavailable(EnvironmentSource::Network));
         }
 
         Ok(Self {
-            os_summary: System::long_os_version().unwrap_or_else(|| "unknown".to_owned()),
-            kernel_summary: System::kernel_long_version(),
+            os_summary: System::long_os_version().unwrap_or_else(|_| "unknown".to_owned()),
+            kernel_summary: System::kernel_long_version().unwrap_or_default(),
             architecture: std::env::consts::ARCH,
             cores,
             total_memory_bytes,
             under_memory_pressure: available_memory.saturating_mul(10) < total_memory_bytes,
             filesystem_types,
             interface_count: networks.len(),
-            bond_count: networks.keys().filter(|name| name.starts_with("bond")).count(),
+            bond_count: networks
+                .keys()
+                .filter(|name| name.as_encoded_bytes().starts_with(b"bond"))
+                .count(),
         })
     }
 }
