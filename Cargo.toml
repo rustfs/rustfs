@@ -429,5 +429,5 @@ strip = "none"
 zstd = { path = "crates/zstd-compat" }
 # Preserve RustFS OIDC flows while migrating the old elliptic-curve dependency chain.
 # Upstream: openidconnect-rs#244 and oauth2-rs#352.
-openidconnect = { git = "https://github.com/ramosbugs/openidconnect-rs", rev = "e20ddbb01ca68356f2979bc125f5613ab45b4e7e" }
+openidconnect = { git = "https://github.com/ramosbugs/openidconnect-rs", rev = "2f77ee73bc4554e1cb6279adb386005429fb4e41" }
 oauth2 = { git = "https://github.com/ramosbugs/oauth2-rs", rev = "89585f4a280afd7b285eaf1c9be0068874e03d22" }
