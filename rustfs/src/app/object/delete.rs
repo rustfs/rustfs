@@ -1147,15 +1147,20 @@ impl DefaultObjectUsecase {
         let replicate_force_delete = force_delete && !replica && has_active_delete_rule(&delete_config_snapshot, &key);
         let mut force_delete_intent = None;
 
-        let existing_object_info = match store.get_object_info_for_delete(&bucket, &key, &opts).await {
-            Ok(obj_info) => Some(obj_info),
-            Err(err) => {
-                // If object not found, allow deletion to proceed (will return 204 No Content)
-                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                    return Err(ApiError::from(err).into());
+        let need_eager_pre_stat = cfg!(test) || opts.http_preconditions.is_some();
+        let existing_object_info = if need_eager_pre_stat {
+            match Box::pin(store.get_object_info_for_delete(&bucket, &key, &opts)).await {
+                Ok(obj_info) => Some(obj_info),
+                Err(err) => {
+                    // If object not found, allow deletion to proceed (will return 204 No Content)
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                        return Err(ApiError::from(err).into());
+                    }
+                    None
                 }
-                None
             }
+        } else {
+            None
         };
         #[cfg(test)]
         wait_for_delete_source_test_hook(&bucket).await;
@@ -1209,16 +1214,21 @@ impl DefaultObjectUsecase {
                         return result;
                     }
 
-                    if matches!(&err, StorageError::PrefixAccessDenied(_, _))
-                        && let Some(existing_object_info) = existing_object_info.as_ref()
-                        && let Some(reason) = check_object_lock_for_deletion(
-                            &bucket,
-                            existing_object_info,
-                            has_bypass_governance_header(&req.headers),
-                        )
-                        .await
-                    {
-                        return Err(S3Error::with_message(S3ErrorCode::AccessDenied, reason.error_message()));
+                    if matches!(&err, StorageError::PrefixAccessDenied(_, _)) {
+                        let existing_object_info = match existing_object_info {
+                            Some(info) => Some(info),
+                            None => Box::pin(store.get_object_info_for_delete(&bucket, &key, &opts)).await.ok(),
+                        };
+                        if let Some(existing_object_info) = existing_object_info.as_ref()
+                            && let Some(reason) = check_object_lock_for_deletion(
+                                &bucket,
+                                existing_object_info,
+                                has_bypass_governance_header(&req.headers),
+                            )
+                            .await
+                        {
+                            return Err(S3Error::with_message(S3ErrorCode::AccessDenied, reason.error_message()));
+                        }
                     }
 
                     return Err(ApiError::from(err).into());

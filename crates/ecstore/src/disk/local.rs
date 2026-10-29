@@ -74,8 +74,8 @@ use crate::disk::{
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
     format::FormatV3,
     fs::{
-        O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, cached_access, invalidate_bucket_cache, lstat, lstat_std,
-        remove, remove_all_std, remove_std, rename,
+        O_APPEND, O_CREATE, O_RDONLY, O_WRONLY, access, cached_access, invalidate_bucket_cache, lstat, lstat_std, remove,
+        remove_all_std, remove_std, rename,
     },
     is_quota_mutation_fence_path, os,
     os::{check_path_length, is_dir_not_empty_error, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
@@ -2986,6 +2986,43 @@ fn has_inline_commit_test_failpoints(dst_path: &str) -> bool {
 }
 
 #[cfg(test)]
+pub(super) fn has_rename_data_test_failpoints(dst_path: &str) -> bool {
+    has_inline_commit_test_failpoints(dst_path)
+        || RENAME_DATA_FAIL_BEFORE_OLD_METADATA_BACKUP
+            .lock()
+            .expect("test failpoint lock should not be poisoned")
+            .as_deref()
+            == Some(dst_path)
+        || RENAME_DATA_FAIL_AFTER_METADATA_COMMIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|target| target == dst_path)
+        || RENAME_DATA_FAIL_COMMIT_RENAME
+            .lock()
+            .expect("test failpoint lock should not be poisoned")
+            .as_deref()
+            == Some(dst_path)
+        || os::has_dir_fsync_test_failures()
+        || os::file_sync_probe::is_active()
+}
+
+#[cfg(all(not(test), feature = "test-util"))]
+pub(super) fn has_rename_data_test_failpoints(dst_path: &str) -> bool {
+    RENAME_DATA_FAIL_AFTER_METADATA_COMMIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|target| target == dst_path)
+        || os::has_dir_fsync_test_failures()
+}
+
+#[cfg(not(any(test, feature = "test-util")))]
+pub(super) fn has_rename_data_test_failpoints(_dst_path: &str) -> bool {
+    false
+}
+
+#[cfg(test)]
 fn run_inline_preparation_before_backup(dst_path: &str) {
     let hook = INLINE_PREPARATION_BEFORE_BACKUP
         .lock()
@@ -3054,6 +3091,43 @@ fn should_fail_after_delete_data_staged(path: &str) -> bool {
     } else {
         false
     }
+}
+
+#[cfg(test)]
+pub(crate) fn has_delete_version_test_failpoints() -> bool {
+    #[cfg(not(windows))]
+    if os::prepared_publication_test_hooks::has_any_hooks() {
+        return true;
+    }
+    #[cfg(feature = "e2e-test-hooks")]
+    if std::env::var_os("RUSTFS_DELETE_RECOVERY_BARRIER_DIR").is_some() {
+        return true;
+    }
+    !OWNED_FILE_WRITE_BEFORE_OPEN
+        .lock()
+        .expect("test file write hook lock should not be poisoned")
+        .is_empty()
+        || !DELETE_VERSION_FAIL_AFTER_DATA_STAGED
+            .lock()
+            .expect("test failpoint lock should not be poisoned")
+            .is_empty()
+        || !DELETE_VERSION_FAIL_AFTER_COMMIT
+            .lock()
+            .expect("test failpoint lock should not be poisoned")
+            .is_empty()
+}
+
+#[cfg(not(test))]
+pub(crate) fn has_delete_version_test_failpoints() -> bool {
+    #[cfg(all(feature = "test-util", not(windows)))]
+    if os::prepared_publication_test_hooks::has_any_hooks() {
+        return true;
+    }
+    #[cfg(feature = "e2e-test-hooks")]
+    if std::env::var_os("RUSTFS_DELETE_RECOVERY_BARRIER_DIR").is_some() {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -3590,6 +3664,266 @@ impl AsyncRead for FileCacheReclaimReader {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn reclaim_std_file_cache(file: &std::fs::File, reclaim_len: usize, reclaim_on_shutdown: bool) {
+    use core::num::NonZeroU64;
+    use rustix::fs::{Advice, fadvise};
+
+    if !reclaim_on_shutdown || reclaim_len == 0 {
+        return;
+    }
+    let started = std::time::Instant::now();
+    if let Some(len) = u64::try_from(reclaim_len).ok().and_then(NonZeroU64::new) {
+        if let Err(err) = fadvise(file, 0, Some(len), Advice::DontNeed) {
+            record_file_cache_reclaim_error("write");
+            debug!(error = ?err, reclaim_len, "failed to reclaim file cache after write");
+        } else {
+            record_file_cache_reclaim_success("write", reclaim_len, started);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reclaim_std_file_cache(_file: &std::fs::File, _reclaim_len: usize, _reclaim_on_shutdown: bool) {}
+
+static PRESYNCED_TMP_DATA_DIRS: std::sync::LazyLock<ParkingLotMutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| ParkingLotMutex::new(HashSet::new()));
+
+fn mark_presynced_tmp_data_dir(dir: PathBuf) {
+    let mut set = PRESYNCED_TMP_DATA_DIRS.lock();
+    if set.len() >= 4096 {
+        set.clear();
+    }
+    set.insert(dir);
+}
+
+fn unmark_presynced_tmp_data_dir(dir: &Path) {
+    PRESYNCED_TMP_DATA_DIRS.lock().remove(dir);
+}
+
+pub(in crate::disk) fn take_presynced_tmp_data_dir(dir: &Path) -> bool {
+    PRESYNCED_TMP_DATA_DIRS.lock().remove(dir)
+}
+
+fn open_lazy_local_file_std(file_path: &Path, volume_dir: &Path, _reclaim_on_shutdown: bool) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = file_path.parent()
+        && (volume_dir.as_os_str().is_empty() || !volume_dir.starts_with(parent))
+        && let Err(err) = super::fs::create_dir_all_std(parent)
+        && err.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err(to_file_error(err));
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(file_path)
+        .map_err(to_file_error)?;
+    #[cfg(target_os = "macos")]
+    if _reclaim_on_shutdown {
+        let _ = set_std_fd_nocache(&file);
+    }
+    Ok(file)
+}
+
+struct LazyLocalFileWriter {
+    file_path: PathBuf,
+    volume_dir: PathBuf,
+    reclaim_len: usize,
+    reclaim_on_shutdown: bool,
+    sync_on_close: bool,
+    bytes_written: usize,
+    state: LazyLocalFileWriterState,
+}
+
+enum LazyLocalFileWriterState {
+    Unopened,
+    Writing(tokio::task::JoinHandle<std::io::Result<(Option<std::fs::File>, usize)>>),
+    Open(std::fs::File),
+    Closing(tokio::task::JoinHandle<std::io::Result<()>>),
+    Closed,
+}
+
+impl LazyLocalFileWriter {
+    fn new(file_path: PathBuf, volume_dir: PathBuf, reclaim_len: usize, reclaim_on_shutdown: bool, sync_on_close: bool) -> Self {
+        Self {
+            file_path,
+            volume_dir,
+            reclaim_len,
+            reclaim_on_shutdown,
+            sync_on_close,
+            bytes_written: 0,
+            state: LazyLocalFileWriterState::Unopened,
+        }
+    }
+
+    fn start_write_payload(&mut self, payload: Vec<u8>) {
+        let len = payload.len();
+        let close_after = self.reclaim_len > 0 && self.bytes_written.saturating_add(len) >= self.reclaim_len;
+        let reclaim_len = self.bytes_written.saturating_add(len).max(self.reclaim_len);
+        let reclaim_on_shutdown = self.reclaim_on_shutdown;
+        let sync_on_close = self.sync_on_close;
+        match std::mem::replace(&mut self.state, LazyLocalFileWriterState::Closed) {
+            LazyLocalFileWriterState::Unopened => {
+                let file_path = self.file_path.clone();
+                let volume_dir = self.volume_dir.clone();
+                self.state = LazyLocalFileWriterState::Writing(tokio::task::spawn_blocking(move || {
+                    let mut file = open_lazy_local_file_std(&file_path, &volume_dir, reclaim_on_shutdown)?;
+                    std::io::Write::write_all(&mut file, &payload).map_err(to_file_error)?;
+                    if close_after {
+                        if sync_on_close {
+                            file.sync_data().map_err(to_file_error)?;
+                        }
+                        reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
+                        drop(file);
+                        if sync_on_close && let Some(parent) = file_path.parent() {
+                            os::fsync_dir_std(parent).map_err(to_file_error)?;
+                            mark_presynced_tmp_data_dir(parent.to_path_buf());
+                        }
+                        Ok((None, len))
+                    } else {
+                        Ok((Some(file), len))
+                    }
+                }));
+            }
+            LazyLocalFileWriterState::Open(mut file) => {
+                self.state = LazyLocalFileWriterState::Writing(tokio::task::spawn_blocking(move || {
+                    std::io::Write::write_all(&mut file, &payload).map_err(to_file_error)?;
+                    if close_after {
+                        reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
+                        drop(file);
+                        Ok((None, len))
+                    } else {
+                        Ok((Some(file), len))
+                    }
+                }));
+            }
+            other => self.state = other,
+        }
+    }
+
+    fn poll_in_flight_write(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<usize>> {
+        let LazyLocalFileWriterState::Writing(fut) = &mut self.state else {
+            return std::task::Poll::Ready(Ok(0));
+        };
+        match std::pin::Pin::new(fut).poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(Err(join_err)) => {
+                self.state = LazyLocalFileWriterState::Closed;
+                std::task::Poll::Ready(Err(std::io::Error::other(join_err)))
+            }
+            std::task::Poll::Ready(Ok(Err(err))) => {
+                self.state = LazyLocalFileWriterState::Closed;
+                std::task::Poll::Ready(Err(err))
+            }
+            std::task::Poll::Ready(Ok(Ok((maybe_file, written)))) => {
+                self.bytes_written = self.bytes_written.saturating_add(written);
+                self.state = maybe_file.map_or(LazyLocalFileWriterState::Closed, LazyLocalFileWriterState::Open);
+                std::task::Poll::Ready(Ok(written))
+            }
+        }
+    }
+}
+
+impl AsyncWrite for LazyLocalFileWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if matches!(self.state, LazyLocalFileWriterState::Writing(_)) {
+            return self.poll_in_flight_write(cx);
+        }
+        if buf.is_empty() {
+            return std::task::Poll::Ready(Ok(0));
+        }
+        if matches!(self.state, LazyLocalFileWriterState::Closed | LazyLocalFileWriterState::Closing(_)) {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "local file writer is already closed",
+            )));
+        }
+        self.start_write_payload(buf.to_vec());
+        self.poll_in_flight_write(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if matches!(self.state, LazyLocalFileWriterState::Writing(_)) {
+            return self.poll_in_flight_write(cx);
+        }
+        let total_len: usize = bufs.iter().map(|b| b.len()).sum();
+        if total_len == 0 {
+            return std::task::Poll::Ready(Ok(0));
+        }
+        if matches!(self.state, LazyLocalFileWriterState::Closed | LazyLocalFileWriterState::Closing(_)) {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "local file writer is already closed",
+            )));
+        }
+        let mut payload = Vec::with_capacity(total_len);
+        for slice in bufs {
+            payload.extend_from_slice(slice);
+        }
+        self.start_write_payload(payload);
+        self.poll_in_flight_write(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        if matches!(self.state, LazyLocalFileWriterState::Writing(_)) {
+            std::task::ready!(self.poll_in_flight_write(cx))?;
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if matches!(self.state, LazyLocalFileWriterState::Writing(_)) {
+            std::task::ready!(self.poll_in_flight_write(cx))?;
+        }
+        if !matches!(self.state, LazyLocalFileWriterState::Closing(_)) {
+            match std::mem::replace(&mut self.state, LazyLocalFileWriterState::Closed) {
+                LazyLocalFileWriterState::Closed => return std::task::Poll::Ready(Ok(())),
+                LazyLocalFileWriterState::Unopened => {
+                    let file_path = self.file_path.clone();
+                    let volume_dir = self.volume_dir.clone();
+                    let reclaim_on_shutdown = self.reclaim_on_shutdown;
+                    self.state = LazyLocalFileWriterState::Closing(tokio::task::spawn_blocking(move || {
+                        open_lazy_local_file_std(&file_path, &volume_dir, reclaim_on_shutdown).map(drop)
+                    }));
+                }
+                LazyLocalFileWriterState::Open(file) => {
+                    let reclaim_len = self.bytes_written.max(self.reclaim_len);
+                    let reclaim_on_shutdown = self.reclaim_on_shutdown;
+                    self.state = LazyLocalFileWriterState::Closing(tokio::task::spawn_blocking(move || {
+                        reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
+                        drop(file);
+                        Ok(())
+                    }));
+                }
+                LazyLocalFileWriterState::Writing(_) | LazyLocalFileWriterState::Closing(_) => unreachable!(),
+            }
+        }
+        let LazyLocalFileWriterState::Closing(fut) = &mut self.state else {
+            return std::task::Poll::Ready(Ok(()));
+        };
+        let res = std::task::ready!(std::pin::Pin::new(fut).poll(cx));
+        self.state = LazyLocalFileWriterState::Closed;
+        std::task::Poll::Ready(res.unwrap_or_else(|join_err| Err(std::io::Error::other(join_err))))
+    }
+}
+
+#[cfg(test)]
 impl FileCacheReclaimWriter {
     fn new(inner: File, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
         #[cfg(target_os = "macos")]
@@ -3630,6 +3964,7 @@ impl FileCacheReclaimWriter {
     }
 }
 
+#[cfg(test)]
 impl AsyncWrite for FileCacheReclaimWriter {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
@@ -4498,9 +4833,8 @@ impl LocalIoBackend for StdBackend {
                 let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
                 let file_path = local_disk_object_path(self.io_root(), volume, path)?;
                 check_path_length(file_path.to_string_lossy().as_ref())?;
-
                 if let Some(parent) = file_path.parent() {
-                    os::make_dir_all(parent, &volume_dir).await?;
+                    check_path_length(parent.to_string_lossy().as_ref())?;
                 }
 
                 // O_DIRECT streaming write (Linux, opt-in): shard bytes stream
@@ -4511,6 +4845,9 @@ impl LocalIoBackend for StdBackend {
                 // EINVAL (which would masquerade as a missing shard).
                 #[cfg(target_os = "linux")]
                 if is_direct_io_write_enabled() && self.direct_io_write.supported.load(Ordering::Relaxed) {
+                    if let Some(parent) = file_path.parent() {
+                        os::make_dir_all(parent, &volume_dir).await?;
+                    }
                     let write_state = self.direct_io_write.clone();
                     let direct_path = file_path.clone();
                     let direct = tokio::task::spawn_blocking(move || open_direct_writer(&direct_path, &write_state))
@@ -4521,14 +4858,27 @@ impl LocalIoBackend for StdBackend {
                     }
                 }
 
-                // O_TRUNC: if a file already exists at this path, stale trailing bytes past
-                // the new content would otherwise survive and mismatch the metadata size.
-                let f = super::fs::open_file(&file_path, O_CREATE | O_WRONLY | O_TRUNC)
-                    .await
-                    .map_err(to_file_error)?;
                 let reclaim_on_shutdown = should_reclaim_file_cache_after_write(size_hint);
+                let sync_on_close = if volume == RUSTFS_META_TMP_BUCKET {
+                    if path.ends_with("/part.1") {
+                        !os::file_fdatasync_group_commit_enabled()
+                    } else {
+                        if let Some(parent) = file_path.parent() {
+                            unmark_presynced_tmp_data_dir(parent);
+                        }
+                        false
+                    }
+                } else {
+                    false
+                };
 
-                Ok(Box::new(FileCacheReclaimWriter::new(f, size_hint.max(0) as usize, reclaim_on_shutdown)))
+                Ok(Box::new(LazyLocalFileWriter::new(
+                    file_path,
+                    volume_dir,
+                    size_hint.max(0) as usize,
+                    reclaim_on_shutdown,
+                    sync_on_close,
+                )))
             }
             WriteMode::Append => {
                 let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
@@ -7077,6 +7427,9 @@ impl LocalDisk {
         fi: FileInfo,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
+        if volume == RUSTFS_META_BUCKET {
+            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+        }
         if volume == RUSTFS_META_MULTIPART_BUCKET {
             crate::disk::multipart_source::native_source_protocol(&fi)?;
         }
@@ -7323,6 +7676,9 @@ impl LocalDisk {
         mut fi: FileInfo,
         mutation: DeleteVersionMutation,
     ) -> Result<()> {
+        if volume == RUSTFS_META_BUCKET {
+            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+        }
         pool_meta_native::reject_noncanonical_object(&self.root, volume, path)?;
         let DeleteVersionMutation {
             force_del_marker,
@@ -7394,6 +7750,13 @@ impl LocalDisk {
         }
 
         let rollback_dir = opts.old_data_dir;
+        if let Some(rollback_dir) = rollback_dir
+            && let Some(()) = self
+                .try_fused_recoverable_delete_version(volume, path, &fi, &opts, rollback_dir, namespace_owner.clone())
+                .await?
+        {
+            return Ok(());
+        }
         let buf = match self.read_all_data(volume, &volume_dir, &xl_path).await {
             Ok(res) => res,
             Err(err) => {
@@ -7919,6 +8282,9 @@ impl LocalDisk {
         opt: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
+        if volume == RUSTFS_META_BUCKET {
+            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+        }
         multipart_staging::reject_native_control_write(&self.root, self.io_root(), volume, path)?;
         let mut source_owner = self.acquire_multipart_delete_owner(volume, path, namespace_owner).await?;
         let namespace_owner = source_owner.namespace_owner();
@@ -9536,6 +9902,9 @@ impl LocalDisk {
     // write_all_private with check_path_length
     #[tracing::instrument(level = "trace", skip_all)]
     async fn write_all_private(&self, volume: &str, path: &str, buf: Bytes, sync: SyncMode, skip_parent: &Path) -> Result<()> {
+        if volume == RUSTFS_META_BUCKET {
+            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+        }
         let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
@@ -11476,20 +11845,32 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
                     return Err(DiskError::FileCorrupt);
                 }
 
-                let mut buf = diagnostic_stage!(Allocation, _index, || Ok::<_, DiskError>(vec![0u8; length]))?;
+                let mut buf = diagnostic_stage!(Allocation, _index, || Ok::<_, DiskError>(Vec::with_capacity(length)))?;
                 if length > 0 {
                     diagnostic_stage!(Read, _index, || measure_local_batch_stage(
                         metrics.as_deref(),
                         LocalBatchReadStage::Read,
                         || {
-                            while total < length {
-                                let nbytes = file
-                                    .read_at(&mut buf[total..], u64::try_from(offset + total).unwrap_or(u64::MAX))
+                            if offset == 0 {
+                                use std::io::Read as _;
+                                total = (&file)
+                                    .take(u64::try_from(length).unwrap_or(u64::MAX))
+                                    .read_to_end(&mut buf)
                                     .map_err(DiskError::from)?;
-                                if nbytes == 0 {
+                                if total < length {
                                     return Err(DiskError::FileCorrupt);
                                 }
-                                total += nbytes;
+                            } else {
+                                buf.resize(length, 0);
+                                while total < length {
+                                    let nbytes = file
+                                        .read_at(&mut buf[total..], u64::try_from(offset + total).unwrap_or(u64::MAX))
+                                        .map_err(DiskError::from)?;
+                                    if nbytes == 0 {
+                                        return Err(DiskError::FileCorrupt);
+                                    }
+                                    total += nbytes;
+                                }
                             }
                             Ok::<_, DiskError>(())
                         }

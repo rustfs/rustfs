@@ -154,6 +154,8 @@ pub struct ObjectLockConfigSnapshot {
     lifecycle_fence: NamespaceLockFence,
     _lifecycle_guard: Option<rustfs_lock::NamespaceLockGuard>,
     metadata_transaction_guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
+    fresh_put_quota:
+        std::sync::Mutex<Option<std::result::Result<(Option<crate::bucket::quota::BucketQuota>, Uuid, OffsetDateTime), String>>>,
 }
 
 impl ObjectLockConfigSnapshot {
@@ -167,6 +169,7 @@ impl ObjectLockConfigSnapshot {
             lifecycle_fence: NamespaceLockFence::new(),
             _lifecycle_guard: None,
             metadata_transaction_guard: None,
+            fresh_put_quota: std::sync::Mutex::new(None),
         }
     }
 
@@ -187,6 +190,7 @@ impl ObjectLockConfigSnapshot {
             lifecycle_fence: NamespaceLockFence::new(),
             _lifecycle_guard: None,
             metadata_transaction_guard: None,
+            fresh_put_quota: std::sync::Mutex::new(None),
         }
     }
 
@@ -212,6 +216,7 @@ impl ObjectLockConfigSnapshot {
             lifecycle_fence,
             _lifecycle_guard: Some(lifecycle_guard),
             metadata_transaction_guard: Some(Arc::new(metadata_transaction_guard)),
+            fresh_put_quota: std::sync::Mutex::new(None),
         }
     }
 
@@ -233,7 +238,29 @@ impl ObjectLockConfigSnapshot {
             lifecycle_fence,
             _lifecycle_guard: None,
             metadata_transaction_guard: Some(metadata_transaction_guard),
+            fresh_put_quota: std::sync::Mutex::new(None),
         }
+    }
+
+    pub(crate) fn set_fresh_put_quota(
+        &self,
+        quota: std::result::Result<(Option<crate::bucket::quota::BucketQuota>, Uuid, OffsetDateTime), String>,
+    ) {
+        if self._lifecycle_guard.is_some() && self.metadata_transaction_guard.is_some() {
+            *self
+                .fresh_put_quota
+                .lock()
+                .expect("fresh_put_quota mutex should not be poisoned") = Some(quota);
+        }
+    }
+
+    pub(crate) fn take_fresh_put_quota(
+        &self,
+    ) -> Option<std::result::Result<(Option<crate::bucket::quota::BucketQuota>, Uuid, OffsetDateTime), String>> {
+        self.fresh_put_quota
+            .lock()
+            .expect("fresh_put_quota mutex should not be poisoned")
+            .take()
     }
 
     #[allow(dead_code, reason = "snapshot-scope predicate asserted by this file's tests (backlog#1823)")]

@@ -2090,6 +2090,438 @@ impl LocalDisk {
     pub(super) async fn delete_recovery_barrier(&self, volume: &str, object: &str, transaction: Uuid, stage: &str) -> Result<()> {
         barrier(volume, object, transaction, stage, &self.root).await
     }
+
+    pub(super) async fn try_fused_recoverable_delete_version(
+        &self,
+        volume: &str,
+        object: &str,
+        fi: &FileInfo,
+        opts: &DeleteOptions,
+        transaction: Uuid,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<Option<()>> {
+        if !opts.recoverable_delete
+            || opts.undo_write
+            || opts.expected_delete_marker.is_some()
+            || pool_meta_native::is_object(&self.root, volume, object)
+            || has_delete_version_test_failpoints()
+        {
+            return Ok(None);
+        }
+        self.reject_multipart_delete_recovery_mutation(volume, object)?;
+        self.wait_for_startup_cleanup().await;
+
+        let (_, file_path) = self.io_get_bucket_and_object_path(volume, object)?;
+        check_path_length(file_path.to_string_lossy().as_ref())?;
+        let xl_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
+        let destination = file_path.join(transaction.to_string());
+        let staging_root = self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?;
+        let sync = effective_durability(volume).syncs_commit_metadata();
+        let incarnation = opts.delete_recovery_bucket_incarnation;
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&destination, owner).await;
+        let fi_clone = fi.clone();
+        let volume_str = volume.to_owned();
+        let object_str = object.to_owned();
+
+        let res = os::run_blocking_namespace_operation_with_sync(
+            lease,
+            sync,
+            move || -> std::io::Result<Result<Option<Option<Uuid>>>> {
+                let buf = match std::fs::read(&xl_path) {
+                    Ok(buf) => buf,
+                    Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Ok(None)),
+                    Err(err) => return Err(err),
+                };
+                let (old_dir, journal_raw) = match (|| -> Result<Option<(Option<Uuid>, Vec<u8>)>> {
+                    let mut meta = FileMeta::load(&buf)?;
+                    let deleted_versions: Vec<_> = meta
+                        .versions
+                        .iter()
+                        .map(|v| v.header.version_id.unwrap_or_default())
+                        .collect();
+                    let original_versions: Vec<_> = meta
+                        .versions
+                        .iter()
+                        .map(|v| generation(v.into_fileinfo(&volume_str, &object_str, true)?))
+                        .collect::<Result<_>>()?;
+                    let old_dir = meta.delete_version(&fi_clone)?;
+                    if old_dir.is_some_and(|dir| dir == transaction || dir.is_nil()) {
+                        return Err(DiskError::FileCorrupt);
+                    }
+                    if let Some(uuid) = old_dir {
+                        meta.data.remove(vec![fi_clone.version_id.unwrap_or_default(), uuid])?;
+                        let old_path = path_join(&[file_path.as_path(), Path::new(uuid.to_string().as_str())]);
+                        check_path_length(old_path.to_string_lossy().as_ref())?;
+                    }
+                    if !meta.versions.is_empty() {
+                        return Ok(None);
+                    }
+                    let mut predecessors = BTreeSet::new();
+                    if let Ok(entries) = std::fs::read_dir(&file_path) {
+                        for (visited, entry) in entries.enumerate() {
+                            if visited >= 65536 {
+                                return Err(DiskError::DiskOngoingReq);
+                            }
+                            let entry = entry.map_err(to_file_error)?;
+                            let Some(id) = entry
+                                .file_name()
+                                .to_str()
+                                .and_then(|name| Uuid::parse_str(name).ok())
+                                .filter(|id| !id.is_nil() && *id != transaction)
+                            else {
+                                continue;
+                            };
+                            if !entry.file_type().map_err(to_file_error)?.is_dir() {
+                                return Err(DiskError::InvalidPath);
+                            }
+                            let prepared = regular_bytes(&entry.path().join(PREPARED))?;
+                            let receipt = regular_bytes(&entry.path().join(DELETE_QUORUM_COMMITTED_FILE))?;
+                            let mut records = Vec::new();
+                            if let Some(bytes) = prepared {
+                                records.push(
+                                    serde_json::from_slice::<DeleteRecoveryJournal>(&bytes)
+                                        .map_err(|_| DiskError::FileCorrupt)?,
+                                );
+                            }
+                            if let Some(bytes) = receipt.filter(|bytes| !bytes.is_empty()) {
+                                records.push(
+                                    serde_json::from_slice::<CommitReceipt>(&bytes)
+                                        .map_err(|_| DiskError::FileCorrupt)?
+                                        .journal,
+                                );
+                            }
+                            for record in records {
+                                if record.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
+                                    || record.volume != volume_str
+                                    || record.object != object_str
+                                    || record.transaction != id
+                                    || incarnation.zip(record.bucket_incarnation).is_some_and(|(a, b)| a != b)
+                                    || record.predecessors.iter().any(|before| before.is_nil() || *before == id)
+                                {
+                                    return Err(DiskError::FileCorrupt);
+                                }
+                                predecessors.insert(id);
+                            }
+                        }
+                    }
+                    let mut sparse = fi_clone;
+                    sparse.data = None;
+                    let journal = DeleteRecoveryJournal {
+                        protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+                        volume: volume_str,
+                        object: object_str,
+                        transaction,
+                        bucket_incarnation: incarnation,
+                        original_digest: Some(digest(&buf)),
+                        target_digest: None,
+                        data_dirs: old_dir.into_iter().collect(),
+                        deleted_versions,
+                        requests: vec![sparse],
+                        original_versions,
+                        predecessors: predecessors.into_iter().collect(),
+                    };
+                    Ok(Some((old_dir, journal_bytes(&journal)?)))
+                })() {
+                    Ok(Some(pair)) => pair,
+                    Ok(None) => return Ok(Ok(None)),
+                    Err(err) => return Ok(Err(err)),
+                };
+                std::fs::create_dir_all(&staging_root)?;
+                let staged = tempfile::Builder::new()
+                    .prefix("delete-preparation-")
+                    .tempdir_in(&staging_root)?;
+                for (name, bytes) in [
+                    (STORAGE_FORMAT_FILE_BACKUP, buf.as_slice()),
+                    (PREPARED, journal_raw.as_slice()),
+                ] {
+                    let mut file = std::fs::File::create(staged.path().join(name))?;
+                    std::io::Write::write_all(&mut file, bytes)?;
+                    if sync && !bytes.is_empty() {
+                        file.sync_data()?;
+                    }
+                }
+                if sync {
+                    os::fsync_dir_std(staged.path())?;
+                }
+                match std::fs::symlink_metadata(&destination) {
+                    Ok(metadata) if metadata.is_dir() => match std::fs::remove_dir(&destination) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == ErrorKind::NotFound => {}
+                        Err(err) if is_dir_not_empty_error(&err) => return Ok(Err(DiskError::OutdatedXLMeta)),
+                        Err(err) => return Err(err),
+                    },
+                    Ok(_) => return Ok(Err(DiskError::OutdatedXLMeta)),
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                }
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::rename(staged.path(), &destination)?;
+                let mut reserved_data_path = None;
+                if let Some(uuid) = old_dir {
+                    let old_path = file_path.join(uuid.to_string());
+                    if old_path.is_dir() {
+                        let reserved_marker = old_path.join(format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}"));
+                        let marker = std::fs::File::create(&reserved_marker)?;
+                        if sync {
+                            marker.sync_all()?;
+                            os::fsync_dir_std(&old_path)?;
+                        }
+                        reserved_data_path = Some((old_path, reserved_marker));
+                    }
+                }
+                if let Err(err) = std::fs::remove_file(&xl_path)
+                    && err.kind() != ErrorKind::NotFound
+                {
+                    if let Some((_, reserved_marker)) = &reserved_data_path {
+                        let _ = std::fs::remove_file(reserved_marker);
+                    }
+                    let _ = std::fs::remove_dir_all(&destination);
+                    return Err(err);
+                }
+                if sync {
+                    os::fsync_dir_std(&file_path)?;
+                }
+                if let Some((old_path, reserved_marker)) = reserved_data_path {
+                    let recovery_marker = old_path.join(format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}"));
+                    match std::fs::rename(&reserved_marker, &recovery_marker) {
+                        Ok(()) if sync => os::fsync_dir_std(&old_path)?,
+                        Ok(()) => {}
+                        Err(err) if err.kind() == ErrorKind::NotFound => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                Ok(Ok(Some(old_dir)))
+            },
+        )
+        .await
+        .map_err(to_file_error)??;
+
+        let Some(old_dir) = res else {
+            return Ok(None);
+        };
+        if let Some(uuid) = old_dir {
+            self.io_backend
+                .invalidate_cached_fds_under(volume, &format!("{object}/{uuid}"));
+        }
+        Ok(Some(()))
+    }
+
+    pub(crate) async fn try_publish_prepared_delete_local(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<Option<(DeleteRecoveryJournal, bool, bool)>> {
+        self.reject_multipart_delete_recovery_mutation(volume, object)?;
+        if !safe_path(object, false) || transaction.is_nil() {
+            return Err(DiskError::InvalidPath);
+        }
+        let object_path = self.get_object_path(volume, object)?;
+        let metadata_owner = os::acquire_metadata_mutation_lease(&object_path, namespace_owner).await;
+        let volume_guard = os::disk_volume_mutation_lock(&self.root, volume).read_owned().await;
+        let owner: Option<Arc<dyn Send + Sync>> = Some(Arc::new((metadata_owner, volume_guard)));
+
+        let root = self.io_get_object_path(volume, object)?;
+        let rollback = root.join(transaction.to_string());
+        let receipt_path = rollback.join(DELETE_QUORUM_COMMITTED_FILE);
+        let staging_root = self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?;
+        let sync = effective_durability(volume).syncs_commit_metadata();
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&receipt_path, owner).await;
+        let volume_str = volume.to_owned();
+        let object_str = object.to_owned();
+
+        os::run_blocking_namespace_operation_with_sync(
+            lease,
+            sync,
+            move || -> std::io::Result<Result<Option<(DeleteRecoveryJournal, bool, bool)>>> {
+                let prepared = match regular_bytes(&rollback.join(PREPARED)) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => return Ok(Ok(None)),
+                    Err(e) => return Ok(Err(e)),
+                };
+                let Ok(journal) = serde_json::from_slice::<DeleteRecoveryJournal>(&prepared) else {
+                    return Ok(Err(DiskError::FileCorrupt));
+                };
+                if journal.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
+                    || journal.volume != volume_str
+                    || journal.object != object_str
+                    || journal.transaction != transaction
+                    || journal.transaction.is_nil()
+                    || journal.data_dirs.iter().any(|id| id.is_nil() || *id == transaction)
+                {
+                    return Ok(Err(DiskError::FileCorrupt));
+                }
+                let current_exists = match regular_file_exists(&root.join(STORAGE_FORMAT_FILE)) {
+                    Ok(exists) => exists,
+                    Err(e) => return Ok(Err(e)),
+                };
+                let unversioned_target_absent = journal.target_digest.is_none() && !current_exists;
+                if !unversioned_target_absent {
+                    return Ok(Ok(None));
+                }
+                let mut sole_transaction = journal.predecessors.is_empty();
+                if sole_transaction {
+                    match std::fs::read_dir(&root) {
+                        Ok(entries) => {
+                            for entry in entries {
+                                let entry = entry?;
+                                let Ok(name) = entry.file_name().into_string() else {
+                                    sole_transaction = false;
+                                    break;
+                                };
+                                if let Some(id) = canonical_uuid(&name).filter(|id| !id.is_nil())
+                                    && id != transaction
+                                    && !journal.data_dirs.contains(&id)
+                                {
+                                    sole_transaction = false;
+                                    break;
+                                }
+                            }
+                        }
+                        Err(err) if err.kind() == ErrorKind::NotFound => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                let receipt = CommitReceipt {
+                    journal: journal.clone(),
+                    finished: false,
+                };
+                let receipt_bytes = serde_json::to_vec(&receipt).map_err(std::io::Error::other)?;
+                std::fs::create_dir_all(&staging_root)?;
+                let mut staged = tempfile::NamedTempFile::new_in(&staging_root)?;
+                std::io::Write::write_all(staged.as_file_mut(), &receipt_bytes)?;
+                if sync && !receipt_bytes.is_empty() {
+                    staged.as_file().sync_data()?;
+                }
+                std::fs::rename(staged.path(), &receipt_path)?;
+                if sync {
+                    os::fsync_dir_std(&rollback)?;
+                }
+                Ok(Ok(Some((journal, sole_transaction, unversioned_target_absent))))
+            },
+        )
+        .await
+        .map_err(to_file_error)?
+    }
+
+    pub(crate) async fn try_finish_and_finalize_prepared_delete_local(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        journal: &DeleteRecoveryJournal,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<bool> {
+        fn ignore_not_found(res: std::io::Result<()>) -> std::io::Result<()> {
+            match res {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err),
+            }
+        }
+        self.reject_multipart_delete_recovery_mutation(volume, object)?;
+        if !safe_path(object, false) || transaction.is_nil() {
+            return Err(DiskError::InvalidPath);
+        }
+        let object_path = self.get_object_path(volume, object)?;
+        let metadata_owner = os::acquire_metadata_mutation_lease(&object_path, namespace_owner).await;
+        let volume_guard = os::disk_volume_mutation_lock(&self.root, volume).read_owned().await;
+        let owner: Option<Arc<dyn Send + Sync>> = Some(Arc::new((metadata_owner, volume_guard)));
+
+        let mut claims: Vec<SnapshotLeaseDeleteClaim> = Vec::with_capacity(journal.data_dirs.len());
+        for data_dir in &journal.data_dirs {
+            let key = SnapshotLeaseKey {
+                volume: volume.to_owned(),
+                path: format!("{object}/{data_dir}"),
+            };
+            let opts = DeleteOptions {
+                recursive: true,
+                old_data_dir: Some(transaction),
+                ..Default::default()
+            };
+            let Some(claim) = self.claim_snapshot_delete(key, SnapshotPendingDelete::Ordinary(opts)) else {
+                for prior in claims {
+                    prior.finish(false);
+                }
+                return Ok(false);
+            };
+            claims.push(claim);
+        }
+
+        let bucket_path = self.io_get_bucket_path(volume)?;
+        let root = self.io_get_object_path(volume, object)?;
+        let rollback = root.join(transaction.to_string());
+        let receipt_path = rollback.join(DELETE_QUORUM_COMMITTED_FILE);
+        let sync = effective_durability(volume).syncs_commit_metadata();
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&receipt_path, owner).await;
+        let data_dirs = journal.data_dirs.clone();
+        let prune_paths: Vec<_> = rollback
+            .ancestors()
+            .take_while(|dir| *dir != bucket_path.as_path() && dir.starts_with(&bucket_path))
+            .map(Path::to_path_buf)
+            .collect();
+
+        let res = os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<()> {
+            for data_dir in &data_dirs {
+                for base in [&root, &rollback] {
+                    let dir_path = base.join(data_dir.to_string());
+                    match std::fs::read_dir(&dir_path) {
+                        Ok(entries) => {
+                            for entry in entries {
+                                ignore_not_found(std::fs::remove_file(entry?.path()))?;
+                            }
+                            if sync {
+                                os::fsync_dir_std(&dir_path)?;
+                            }
+                            ignore_not_found(std::fs::remove_dir(&dir_path))?;
+                        }
+                        Err(err) if err.kind() == ErrorKind::NotFound => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+            if !data_dirs.is_empty() && sync && root.is_dir() {
+                os::fsync_dir_std(&root)?;
+            }
+            for name in [
+                STORAGE_FORMAT_FILE_BACKUP,
+                DELETE_MARKER_ROLLBACK_FILE,
+                TARGET,
+                PREPARED,
+                FINISHED,
+            ] {
+                ignore_not_found(std::fs::remove_file(rollback.join(name)))?;
+            }
+            if sync {
+                os::fsync_dir_std(&rollback)?;
+            }
+            ignore_not_found(std::fs::remove_file(&receipt_path))?;
+            for dir_path in &prune_paths {
+                if let Err(err) = std::fs::remove_dir(dir_path) {
+                    if is_dir_not_empty_error(&err) {
+                        break;
+                    }
+                    if !is_benign_object_rmdir_error(&err) {
+                        return Err(std::io::Error::other(FileAccessDeniedWithContext {
+                            path: dir_path.clone(),
+                            source: err,
+                        }));
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await;
+
+        let ok = res.is_ok();
+        for claim in claims {
+            claim.finish(ok);
+        }
+        res.map(|()| true).map_err(|err| to_file_error(err).into())
+    }
 }
 
 #[cfg(not(feature = "e2e-test-hooks"))]

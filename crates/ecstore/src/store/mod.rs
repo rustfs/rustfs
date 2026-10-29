@@ -1388,6 +1388,18 @@ impl crate::storage_api_contracts::object::ObjectIO for ECStore {
 }
 
 impl ECStore {
+    pub(crate) fn all_disks_local_and_online(&self) -> bool {
+        !self.disk_map.is_empty()
+            && self.disk_map.values().all(|disks| {
+                !disks.is_empty()
+                    && disks.iter().all(|disk| {
+                        disk.as_ref().is_some_and(|d| {
+                            d.is_local() && d.runtime_state() == crate::disk::health_state::RuntimeDriveHealthState::Online
+                        })
+                    })
+            })
+    }
+
     /// `put_object` plus the rename_data old-size backfill
     /// (rustfs/backlog#1009); see `SetDisks::put_object_with_old_current_size`.
     /// Post-write hooks (immediate ILM transition enqueue, list-cache
@@ -1400,14 +1412,7 @@ impl ECStore {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, Option<crate::disk::OldCurrentSize>)> {
-        let result = match self.handle_put_object(bucket, object, data, opts).await {
-            Ok((object_info, old_current_size)) => {
-                enqueue_transition_after_write(self, Ok(object_info), LcEventSrc::S3PutObject, opts)
-                    .await
-                    .map(|object_info| (object_info, old_current_size))
-            }
-            Err(err) => Err(err),
-        };
+        let result = self.handle_put_object(bucket, object, data, opts).await;
         if result.is_ok() {
             list_objects::observe_scanner_namespace_mutations(bucket, 1);
         }
@@ -1763,15 +1768,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for ECStore {
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
-        let result = enqueue_transition_after_write(
-            self.as_ref(),
-            self.clone()
-                .handle_complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
-                .await,
-            LcEventSrc::S3CompleteMultipartUpload,
-            opts,
-        )
-        .await;
+        let result = self
+            .clone()
+            .handle_complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
+            .await;
         if result.is_ok() {
             list_objects::observe_scanner_namespace_mutations(bucket, 1);
         }

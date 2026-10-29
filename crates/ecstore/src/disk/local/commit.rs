@@ -329,6 +329,38 @@ pub(super) async fn lock_rename_commit_directories(
     result.map_err(to_file_error).map_err(DiskError::from)
 }
 
+#[cfg(target_os = "linux")]
+fn prepare_rename_commit_and_destination_metadata_std(
+    create_source_parent: bool,
+    source_parent: &Path,
+    destination_parent: &Path,
+    destination_metadata: &Path,
+    base_dir: &Path,
+    publication_root: &os::PublicationRoot,
+) -> std::io::Result<(os::RenameCommitGuard, Option<Bytes>)> {
+    if create_source_parent {
+        std::fs::create_dir_all(source_parent)?;
+    }
+    let guard = match os::prepare_rename_commit_guard(source_parent, destination_parent, base_dir, publication_root) {
+        Ok(guard) => guard,
+        Err(err) => {
+            return Err(match std::fs::symlink_metadata(base_dir) {
+                Err(base_err) if base_err.kind() == ErrorKind::NotFound => base_err,
+                _ => err,
+            });
+        }
+    };
+    let data = os::read_destination_file_with_commit_guard(destination_metadata, &guard)?;
+    Ok((guard, data.map(Bytes::from)))
+}
+
+#[cfg(target_os = "linux")]
+enum FusedCommitAttempt {
+    Committed(RenameDataResp),
+    CommitErr(DiskError),
+    Fallback(os::RenameCommitGuard, Option<Bytes>, FileInfo),
+}
+
 async fn prepare_rename_commit_and_destination_metadata(
     create_source_parent: bool,
     source_parent: &Path,
@@ -571,6 +603,9 @@ impl LocalDisk {
                 return Err(err);
             }
         }
+        if dst_volume == crate::disk::RUSTFS_META_BUCKET {
+            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+        }
         if fi.is_legacy_indexed_delete_marker() {
             fi.erasure.index = 0;
         }
@@ -698,6 +733,208 @@ impl LocalDisk {
         let dst_file_parent = dst_file_path
             .parent()
             .ok_or_else(|| DiskError::other("missing object metadata parent"))?;
+
+        #[cfg(target_os = "linux")]
+        let (rename_commit_guard, has_dst_buf) = if !preserve_upload_metadata
+            && multipart_publication.is_none()
+            && pool_meta_condition.is_none()
+            && !fi_healing
+            && !os::dst_dir_fsync_group_commit_enabled()
+            && !os::file_fdatasync_group_commit_enabled()
+            && !super::has_rename_data_test_failpoints(dst_path)
+            && !crash_inject::should_crash_at(CrashPoint::RenameAfterDataRename, dst_path)
+            && !crash_inject::should_crash_at(CrashPoint::RenameAfterBackupBeforeMetaCommit, dst_path)
+            && !crash_inject::should_crash_at(CrashPoint::RenameAfterMetaCommit, dst_path)
+            && !super::has_delete_version_test_failpoints()
+        {
+            #[cfg(test)]
+            if !no_inline {
+                run_inline_before_file_sync_admission(dst_path);
+            }
+            let sync_data_shards = no_inline && durability.syncs_data_shards();
+            let sync_commit_metadata = durability.syncs_commit_metadata();
+            let file_sync_admission = if sync_data_shards || sync_commit_metadata {
+                Some(
+                    os::acquire_file_sync_admission(self.file_sync_permits.clone())
+                        .await
+                        .map_err(to_file_error)
+                        .map_err(DiskError::from)?,
+                )
+            } else {
+                None
+            };
+            let src_parent_owned = src_file_parent.to_path_buf();
+            let dst_parent_owned = dst_file_parent.to_path_buf();
+            let src_file_path_owned = src_file_path.clone();
+            let dst_file_path_owned = dst_file_path.clone();
+            let dst_volume_dir_owned = dst_volume_dir.clone();
+            let publication_root_owned = self.publication_root.clone();
+            let has_data_dir_path_owned = has_data_dir_path.clone();
+            let dst_volume_str = dst_volume.to_string();
+            let dst_path_str = dst_path.to_string();
+            let fi_moved = fi;
+            #[cfg(test)]
+            let root_owned = self.root.clone();
+
+            let fused_attempt = move |is_cancelled: &dyn Fn() -> bool| -> std::io::Result<FusedCommitAttempt> {
+                let (guard, has_dst_buf) = prepare_rename_commit_and_destination_metadata_std(
+                    !no_inline,
+                    &src_parent_owned,
+                    &dst_parent_owned,
+                    &dst_file_path_owned,
+                    &dst_volume_dir_owned,
+                    &publication_root_owned,
+                )?;
+                if is_cancelled() {
+                    return Ok(FusedCommitAttempt::Fallback(guard, has_dst_buf, fi_moved));
+                }
+                let mut xlmeta = FileMeta::new();
+                let mut dst_meta_unparsable = false;
+                if let Some(ref dst_buf) = has_dst_buf {
+                    if FileMeta::is_xl2_v1_format(dst_buf)
+                        && let Ok(nmeta) = FileMeta::load(dst_buf)
+                    {
+                        xlmeta = nmeta;
+                    } else {
+                        dst_meta_unparsable = true;
+                    }
+                }
+                let version_id = fi_moved.version_id.unwrap_or_default();
+                let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
+                let rollback_data_dir = has_old_data_dir.or_else(|| {
+                    if has_dst_buf.is_some() && xlmeta.find_version(Some(version_id)).is_ok() {
+                        Some(inline_metadata_rollback_dir(version_id, &xlmeta))
+                    } else {
+                        None
+                    }
+                });
+                if rollback_data_dir.is_some() {
+                    return Ok(FusedCommitAttempt::Fallback(guard, has_dst_buf, fi_moved));
+                }
+                let (old_current_size, old_current_source_checked, old_current_source) = observe_old_current(
+                    has_dst_buf.is_some(),
+                    dst_meta_unparsable,
+                    &xlmeta,
+                    &dst_volume_str,
+                    &dst_path_str,
+                    version_id,
+                );
+                xlmeta.add_version(fi_moved)?;
+                let version_signature = rename_data_versions_signature(&xlmeta);
+                let new_dst_buf = xlmeta.marshal_msg().map_err(std::io::Error::other)?;
+                let destination_was_absent = has_dst_buf.is_none();
+                let mut skip_parent = dst_volume_dir_owned.clone();
+                if has_dst_buf.is_some() {
+                    skip_parent = dst_parent_owned.clone();
+                }
+
+                let mut prepared_metadata_source =
+                    os::create_prepared_rename_source_with_commit_guard(&src_file_path_owned, &dst_file_path_owned, &guard)?;
+                prepared_metadata_source.write_all(&new_dst_buf, sync_commit_metadata)?;
+
+                if no_inline {
+                    if sync_data_shards
+                        && let Some((src_data_path, _)) = has_data_dir_path_owned.as_ref()
+                        && !super::take_presynced_tmp_data_dir(src_data_path)
+                        && let Err(err) = os::sync_dir_files_std(src_data_path)
+                        && err.kind() != ErrorKind::NotFound
+                    {
+                        return Err(err);
+                    }
+                    if let Some((src_data_path, dst_data_path)) = has_data_dir_path_owned.as_ref()
+                        && let Err(err) = os::rename_all_with_commit_guard_on_thread(src_data_path, dst_data_path, &guard)
+                    {
+                        return Ok(FusedCommitAttempt::CommitErr(err));
+                    }
+                    #[cfg(test)]
+                    if has_data_dir_path_owned.is_some() {
+                        run_rename_data_after_first_publication(&root_owned, &dst_volume_str, &dst_path_str);
+                    }
+                }
+
+                if let Err(err) = os::rename_prepared_source_on_thread(
+                    prepared_metadata_source,
+                    &src_file_path_owned,
+                    &dst_file_path_owned,
+                    &skip_parent,
+                    &publication_root_owned,
+                    &guard,
+                ) {
+                    if no_inline && let Some((src_data_path, dst_data_path)) = has_data_dir_path_owned.as_ref() {
+                        let _ = std::fs::rename(dst_data_path, src_data_path);
+                    }
+                    return Ok(FusedCommitAttempt::CommitErr(err));
+                }
+
+                if sync_commit_metadata
+                    && let Err(err) =
+                        fsync_inline_commit_std(&dst_file_path_owned, &dst_volume_dir_owned, destination_was_absent, None, &guard)
+                {
+                    if no_inline && let Some((src_data_path, dst_data_path)) = has_data_dir_path_owned.as_ref() {
+                        let _ = std::fs::rename(dst_data_path, src_data_path);
+                    }
+                    return Err(err);
+                }
+
+                if let Some(parent) = src_file_path_owned.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+
+                Ok(FusedCommitAttempt::Committed(RenameDataResp {
+                    multipart_source: None,
+                    old_data_dir: None,
+                    rollback_data_dir: None,
+                    cleanup_data_dir: None,
+                    sign: version_signature,
+                    old_current_size,
+                    old_current_source_checked,
+                    old_current_source,
+                }))
+            };
+
+            let attempt_res = if let Some(admission) = file_sync_admission.as_ref() {
+                os::run_cancellable_blocking_namespace_file_sync_operation(mutation_lease.clone(), admission, fused_attempt).await
+            } else {
+                os::run_cancellable_blocking_namespace_operation(mutation_lease.clone(), fused_attempt).await
+            }
+            .map_err(to_file_error)
+            .map_err(DiskError::from);
+            drop(file_sync_admission);
+            match attempt_res {
+                Ok(FusedCommitAttempt::Committed(resp)) => {
+                    for part_path in &invalidate_part_paths {
+                        self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                    }
+                    #[cfg(unix)]
+                    if let Some(receipt_mutation) = receipt_mutation.as_mut() {
+                        receipt_mutation.complete();
+                    }
+                    return Ok(resp);
+                }
+                Ok(FusedCommitAttempt::CommitErr(err)) | Err(err) => {
+                    for part_path in &invalidate_part_paths {
+                        self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                    }
+                    return Err(err);
+                }
+                Ok(FusedCommitAttempt::Fallback(guard, dst_buf, restored_fi)) => {
+                    fi = restored_fi;
+                    (guard, dst_buf)
+                }
+            }
+        } else {
+            prepare_rename_commit_and_destination_metadata(
+                !no_inline && !preserve_upload_metadata,
+                src_file_parent,
+                dst_file_parent,
+                &dst_file_path,
+                &dst_volume_dir,
+                &self.publication_root,
+                mutation_lease.clone(),
+            )
+            .await?
+        };
+        #[cfg(not(target_os = "linux"))]
         // Acquire the common trees before reading destination metadata. On
         // Windows this pins the object directory identity across publication.
         // Multipart authority already created its source tree. Recreating it
