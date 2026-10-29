@@ -29,7 +29,7 @@ use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
 use crate::admin::operation::{AdminRequest, Operation as OwnedOperation};
 use crate::admin::runtime_sources::{
-    ServerContextSlot, app_context_from_req, current_boot_time, current_bucket_monitor_handle, current_deployment_id,
+    ServerContextSlot, app_context_from_extensions, current_boot_time, current_bucket_monitor_handle, current_deployment_id,
     current_notification_system, current_object_store_handle, current_region, current_replication_pool_handle,
     current_server_config, default_object_usecase,
 };
@@ -3021,7 +3021,7 @@ async fn handle_replication_extension_request(
     match ext_req.route {
         ReplicationExtRoute::MetricsV1 | ReplicationExtRoute::MetricsV2 => {
             ensure_replication_config_exists(&ext_req.bucket).await?;
-            build_replication_metrics_response(&ext_req.bucket, ext_req.route, app_context_from_req(req)).await
+            build_replication_metrics_response(&ext_req.bucket, ext_req.route, app_context_from_extensions(&req.extensions)).await
         }
         ReplicationExtRoute::Check => {
             let (versioning, _) = metadata_sys::get_versioning_config(&ext_req.bucket)
