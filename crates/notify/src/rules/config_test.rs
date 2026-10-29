@@ -267,6 +267,7 @@ mod integration_tests {
             "s3:ObjectCreated:CreateMultipartUpload",
             "s3:ObjectRemoved:AbortMultipartUpload",
             "s3:ObjectRemoved:DeleteObjects",
+            "audit:S3:Operation",
         ] {
             let xml = format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>

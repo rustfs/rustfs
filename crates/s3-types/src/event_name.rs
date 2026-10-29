@@ -116,6 +116,12 @@ pub enum EventName {
     // Splitting these per-operation would need `mask()` widened first.
     IamIdentityCredentialChanged,
     IamIdentityAuthChallenge,
+
+    // Audit-only S3 API operations that have no bucket notification event, such as
+    // `UploadPart` and the bucket configuration writes. One coarse variant covers
+    // all of them for the same mask-budget reason as the IAM block above: the
+    // specific operation lives in `AuditEntry::api.name`. It must stay last.
+    AuditS3Operation,
 }
 
 // Single event type sequential array for Everything.expand()
@@ -170,7 +176,7 @@ const LAST_SINGLE_TYPE_VALUE: u32 = EventName::IntelligentTiering as u32;
 /// meaningful: `mask()` turns a leaf variant's discriminant `v` into the bit
 /// `1 << (v - 1)`, so the highest discriminant is also the highest bit index in
 /// use. Keep this pointing at whatever variant is declared last.
-const LAST_EVENT_NAME_VALUE: u32 = EventName::IamIdentityAuthChallenge as u32;
+const LAST_EVENT_NAME_VALUE: u32 = EventName::AuditS3Operation as u32;
 
 /// `mask()` returns a `u64`, so discriminants may run from 1 to 64 inclusive.
 ///
@@ -275,6 +281,8 @@ impl EventName {
             "s3:ObjectRemoved:AbortMultipartUpload" => Some(EventName::ObjectRemovedAbortMultipartUpload),
             "s3:ObjectCreated:CreateMultipartUpload" => Some(EventName::ObjectCreatedCreateMultipartUpload),
             "s3:ObjectRemoved:DeleteObjects" => Some(EventName::ObjectRemovedDeleteObjects),
+            // Audit-only S3 operations: reach the audit sink, never a notification rule.
+            "audit:S3:Operation" => Some(EventName::AuditS3Operation),
             _ => None,
         }
     }
@@ -351,6 +359,7 @@ impl EventName {
             EventName::KmsServiceStopped => "kms:Service:Stopped",
             EventName::IamIdentityCredentialChanged => "iam:Identity:CredentialChanged",
             EventName::IamIdentityAuthChallenge => "iam:Identity:AuthChallenge",
+            EventName::AuditS3Operation => "audit:S3:Operation",
         }
     }
 
@@ -757,7 +766,8 @@ mod tests {
             | EventName::KmsServiceStarted
             | EventName::KmsServiceStopped
             | EventName::IamIdentityCredentialChanged
-            | EventName::IamIdentityAuthChallenge => {}
+            | EventName::IamIdentityAuthChallenge
+            | EventName::AuditS3Operation => {}
         }
     }
 
@@ -827,6 +837,7 @@ mod tests {
         EventName::KmsServiceStopped,
         EventName::IamIdentityCredentialChanged,
         EventName::IamIdentityAuthChallenge,
+        EventName::AuditS3Operation,
     ];
 
     /// Every KMS management-plane event.
@@ -915,7 +926,7 @@ mod tests {
     /// only as one element of an array someone may forget to extend.
     #[test]
     fn test_last_variant_still_gets_its_own_bit() {
-        let last = EventName::IamIdentityAuthChallenge;
+        let last = EventName::AuditS3Operation;
         assert_ne!(last.mask(), 0, "the last variant's mask overflowed to zero");
         assert_eq!(
             last.mask(),
@@ -979,6 +990,7 @@ mod tests {
             EventName::ObjectRemovedAbortMultipartUpload,
             EventName::ObjectCreatedCreateMultipartUpload,
             EventName::ObjectRemovedDeleteObjects,
+            EventName::AuditS3Operation,
         ];
 
         for ev in ALL_EVENT_NAMES {
@@ -1019,6 +1031,7 @@ mod tests {
             EventName::ObjectRemovedAbortMultipartUpload,
             EventName::ObjectCreatedCreateMultipartUpload,
             EventName::ObjectRemovedDeleteObjects,
+            EventName::AuditS3Operation,
         ] {
             assert!(EventName::parse(internal.as_str()).is_err(), "parse must reject {internal:?}");
             let json = serde_json::to_string(&internal).unwrap();
@@ -1114,6 +1127,23 @@ mod tests {
 
         for ev in ALL_EVENT_NAMES.iter().filter(|ev| !ev.is_iam()) {
             assert!(!ev.as_str().starts_with("iam:"), "{ev} must not claim the IAM namespace");
+        }
+    }
+
+    /// The audit-only S3 operation event must stay out of the `s3:` namespace and out of
+    /// every compound selector, so a bucket notification can never subscribe to it,
+    /// and it must survive the audit queue round trip.
+    #[test]
+    fn test_audit_s3_operation_is_audit_only_and_round_trips() {
+        let ev = EventName::AuditS3Operation;
+        assert!(ev.as_str().starts_with("audit:"), "unexpected name {:?}", ev.as_str());
+        // Notification configuration and the default `Deserialize` reject it; only the
+        // persisted path (queued audit entries) accepts it.
+        assert!(EventName::parse(ev.as_str()).is_err());
+        assert!(serde_json::from_str::<EventName>(&serde_json::to_string(&ev).unwrap()).is_err());
+        assert_eq!(ev.expand(), vec![ev]);
+        for other in ALL_EVENT_NAMES.iter().filter(|other| **other != ev) {
+            assert_eq!(other.mask() & ev.mask(), 0, "{other} shares a mask bit with {ev}");
         }
     }
 
