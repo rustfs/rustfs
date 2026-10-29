@@ -26,6 +26,7 @@ members = [
     "crates/ecstore", # Erasure coding storage implementation
     "crates/e2e_test", # End-to-end test suite
     "crates/filemeta", # File metadata management
+    "crates/gateway-adapter", # RustFS implementations of the gateway extension traits
     "crates/heal", # Erasure set and object healing
     "crates/heal-contracts", # Heal request/response channel contracts
     "crates/iam", # Identity and Access Management
@@ -106,6 +107,7 @@ rustfs-credentials = { path = "crates/credentials", version = "1.0.2" }
 rustfs-crypto = { path = "crates/crypto", version = "1.0.2" }
 rustfs-ecstore = { path = "crates/ecstore", version = "1.0.2" }
 rustfs-filemeta = { path = "crates/filemeta", version = "1.0.2" }
+rustfs-gateway-adapter = { path = "crates/gateway-adapter", version = "1.0.2" }
 rustfs-iam = { path = "crates/iam", version = "1.0.2" }
 rustfs-keystone = { path = "crates/keystone", version = "1.0.2" }
 rustfs-license = { path = "crates/license", version = "1.0.2" }
@@ -149,6 +151,10 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.2" }
 # the s3s-facing edge of the rustfs binary.
 rustfs-gateway-types = { git = "https://github.com/rustfs/gateway.git", rev = "21283e874c2381bab611e9347acbc5b92e9e2b3c", version = "0.32.0", default-features = false }
 rustfs-gateway-stream = { git = "https://github.com/rustfs/gateway.git", rev = "21283e874c2381bab611e9347acbc5b92e9e2b3c", version = "0.2.0", default-features = false }
+# The gateway framework itself, consumed for its extension traits by the ring-2
+# adapter. `default-features = false` keeps the `server` feature, and with it the
+# server crate, out of the build.
+rustfs-gateway = { git = "https://github.com/rustfs/gateway.git", rev = "21283e874c2381bab611e9347acbc5b92e9e2b3c", version = "0.57.0", default-features = false }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"

@@ -23,6 +23,7 @@ rustfs-data-usage	56	0
 rustfs-ecstore	7415	2
 rustfs-extension-schema	23	0
 rustfs-filemeta	353	0
+rustfs-gateway-adapter	11	0
 rustfs-heal	1033	3
 rustfs-heal-contracts	8	0
 rustfs-iam	401	0
