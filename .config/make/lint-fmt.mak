@@ -95,6 +95,7 @@ test-wiring-check: ## Check tests stay registered and selected by their intended
 	@echo "🧪 Checking test wiring..."
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/ci_gate.py --check-workflow
+	$(RUSTFS_PYTHON_BIN) ./scripts/validation_registry.py check
 
 .PHONY: log-analyzer-rules-check
 log-analyzer-rules-check: core-deps ## Check log-analyzer rule anchors still exist verbatim in source

@@ -61,12 +61,17 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_upgrade_workflow.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_migration_gate_evidence.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/ci_gate.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_connect_release_boundary.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_test_artifact.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_merge_queue.py
+	$(RUSTFS_PYTHON_BIN) -m unittest discover -s scripts/ci -p 'test_*.py'
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_security_coverage.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_scheduled_validation_freshness.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_security_workflow.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_nightly_candidate.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_functional_chain.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_functional_chain_health.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_validation_registry.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_inspect_validation_runner.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_retain_validation_evidence.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_timing_report.py

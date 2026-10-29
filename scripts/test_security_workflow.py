@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise functional failures, chain dispatch, and security evidence without remote VMs."""
+"""Exercise functional failures, cleanup isolation, and evidence without remote VMs."""
 
 from __future__ import annotations
 
@@ -298,7 +298,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
             self.assertFalse(body.exists())
 
     def test_all_suites_hold_the_expected_lock_for_manual_and_chain_runs(self) -> None:
-        for suite in ("upgrade", "s3-compat", "kms", "tier", "storage", "heal", "pool-expand", "security", "replication", "performance"):
+        for suite in (*FunctionalWorkflowTests.JOBS, "security"):
             with self.subTest(suite=suite):
                 source = (ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text().splitlines()
                 # Workflow-level concurrency covers every job, including cleanup,
@@ -312,88 +312,41 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                     f"group: {expected_group}", "cancel-in-progress: false",
                 ])
                 self.assertIsNotNone(yaml_block(source, "workflow_dispatch", 2))
-                self.assertIsNotNone(yaml_block(source, "repository_dispatch", 2))
+                self.assertIsNotNone(yaml_block(source, "workflow_call", 2))
+                self.assertIsNone(yaml_block(source, "repository_dispatch", 2))
+                self.assertNotIn("Continue functional chain", "\n".join(source))
                 cleanup_name = "Reset test environment (after)" if suite == "performance" else "Cleanup environment (after)"
                 cleanup = named_steps(yaml_block(source, "jobs", 0))[cleanup_name]
                 self.assertTrue(any(line.startswith("        if:") and "always()" in line for line in cleanup))
 
-    def test_legacy_replication_hands_off_after_failure(self) -> None:
-        for failed_attempts, issue_exit, token in ((0, 0, "fixture"), (2, 0, "fixture"), (3, 0, "fixture"), (3, 7, "fixture"), (0, 0, "")):
-            with self.subTest(failed_attempts=failed_attempts, issue_exit=issue_exit, token=bool(token)):
-                self.setUp()
-                fake_bin = self.directory / "bin"
-                fake_bin.mkdir()
-                commands = {
-                    "gh": '''#!/usr/bin/env bash
-set -euo pipefail
-if [ "$1" = api ]; then
-  printf '%s\\n' "$*" >> "$DISPATCHES"
-  attempt=$(wc -l < "$DISPATCHES")
-  [ "$attempt" -gt "$FAILED_ATTEMPTS" ]
-elif [ "$1 $2" = 'issue create' ]; then
-  printf 'issue\\n' >> "$EXECUTED"
-  while [ "$#" -gt 0 ]; do
-    if [ "$1" = --body-file ]; then
-      cat "$2" > "$CAPTURE_BODY"
-      printf '%s\\n' "$2" > "$CAPTURE_BODY_PATH"
-    fi
-    shift
-  done
-  exit "$ISSUE_EXIT"
-else
-  exit 99
-fi
-''',
-                    "sleep": '#!/bin/sh\nprintf "sleep %s\\n" "$1" >> "$EXECUTED"\n',
-                    "ssh": '#!/bin/sh\nprintf "cleanup\\n" >> "$EXECUTED"\n',
-                }
-                for name, contents in commands.items():
-                    command = fake_bin / name
-                    command.write_text(contents)
-                    command.chmod(0o755)
-                dispatches = self.directory / "dispatches"
-                executed = self.directory / "executed"
-                body = self.directory / "issue-body.md"
-                body_path = self.directory / "issue-body-path"
-                self.env.update(
-                    PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}", DISPATCHES=str(dispatches),
-                    EXECUTED=str(executed), CAPTURE_BODY=str(body), CAPTURE_BODY_PATH=str(body_path),
-                    FAILED_ATTEMPTS="0", ISSUE_EXIT=str(issue_exit),
-                    RUSTFS_NODES="fixture-node", RUSTFS_SSH_USER="fixture-user",
-                    RUSTFS_NIGHTLY_PACKAGE_URL="https://example.invalid/package.deb",
+    def test_reusable_chain_continues_selected_suites_after_predecessor_failure(self) -> None:
+        source = (ROOT / ".github/workflows/rustfs-functional-chain.yml").read_text().splitlines()
+        ordered = ("upgrade", "s3", "kms", "tier", "storage", "heal", "pool", "security",
+                   "replication", "fault-tolerance", "table")
+        for index, suite in enumerate((*ordered, "performance")):
+            with self.subTest(suite=suite):
+                job = yaml_block(source, suite, 2)
+                self.assertIsNotNone(job)
+                dependencies = "prepare" if index == 0 or suite == "performance" else f"prepare, {ordered[index - 1]}"
+                self.assertIn(f"    needs: [{dependencies}]", job)
+                condition = (
+                    "    if: ${{ always() && needs.prepare.result == 'success' && "
+                    f"contains(fromJSON(needs.prepare.outputs.suites || '[]'), '{suite}')"
                 )
-                self.context.update({"secrets.PF_TESTING_GH_TOKEN": "fixture", "inputs.suite": "all"})
-                replication = (ROOT / ".github/workflows/rustfs-replication-test.yml").read_text()
-                job = yaml_block(replication.splitlines(), "replication-test", 2)
-                self.assertFalse(any(line.startswith("    continue-on-error:") for line in job))
-                self.steps = named_steps(job)
-                handoff = "Continue functional chain (next: Fault tolerance)"
-                self.assertIn("        if: ${{ always() && github.event_name == 'repository_dispatch' }}", self.steps[handoff])
-                self.assertFalse(any(line.strip().startswith("continue-on-error:") for line in self.steps[handoff]))
-                self.assertIn("        if: always()", self.steps["Cleanup environment (after)"])
-                self.assertLess(list(self.steps).index("Cleanup environment (after)"), list(self.steps).index(handoff))
-                initialized = self.run_step("Initialize functional evidence")
-                self.assertEqual(initialized.returncode, 0, initialized.stderr)
-                suite = self.directory / "auto-testing/rustfs-replication-test.sh"
-                suite.write_text('#!/bin/sh\nprintf "suite failed\\n" >> "$EXECUTED"\nexit 17\n')
-                failed = self.run_step("Run replication suite")
-                self.assertEqual(failed.returncode, 17, failed.stderr)
-                cleaned = self.run_step("Cleanup environment (after)")
-                self.assertEqual(cleaned.returncode, 0, cleaned.stderr)
-                self.assertEqual(executed.read_text().splitlines(), ["suite failed", "cleanup"])
-                self.env["FAILED_ATTEMPTS"] = str(failed_attempts)
-                self.context["secrets.PF_TESTING_GH_TOKEN"] = token
-                forwarded = self.run_step(handoff)
-                self.assertEqual(forwarded.returncode == 0, bool(token) and failed_attempts < 3, forwarded.stderr)
-                calls = dispatches.read_text().splitlines() if dispatches.exists() else []
-                self.assertEqual(calls, [
-                    "api --method POST repos/rustfs/rustfs/dispatches -f event_type=rustfs-chain-fault-tolerance -F client_payload[from_suite]=replication",
-                ] * (min(failed_attempts + 1, 3) if token else 0))
-                if failed_attempts == 3:
-                    self.assertIn("could not hand off from **replication** to **Fault tolerance**", body.read_text())
-                    self.assertIn("rustfs-chain-fault-tolerance", body.read_text())
-                    self.assertEqual(executed.read_text().splitlines().count("issue"), 2 if issue_exit else 1)
-                    self.assertFalse(Path(body_path.read_text().strip()).exists())
+                if suite == "performance":
+                    condition += " && needs.prepare.outputs.performance_ready == 'online'"
+                self.assertIn(condition + " }}", job)
+                self.assertFalse(any("continue-on-error:" in line for line in job))
+                self.assertIn("      chain_manifest: ${{ needs.prepare.outputs.manifest }}", job)
+        aggregate = yaml_block(source, "complete-chain", 2)
+        self.assertIn("    if: ${{ always() && needs.prepare.result != 'skipped' }}", aggregate)
+        steps = named_steps(aggregate)
+        for name in ("Summarize every suite including failures and missing evidence",
+                     "Retain chain report regardless of test verdict", "Verify every required suite"):
+            self.assertIn("        if: always()", steps[name])
+        names = list(steps)
+        self.assertLess(names.index("Retain chain report regardless of test verdict"),
+                        names.index("Verify every required suite"))
 
 
 class FunctionalWorkflowTests(unittest.TestCase):
@@ -411,7 +364,7 @@ class FunctionalWorkflowTests(unittest.TestCase):
     }
 
     def test_failure_and_always_step_wiring(self) -> None:
-        for suite, job_id in self.JOBS.items():
+        for suite, job_id in {**self.JOBS, "security": "security-test"}.items():
             if suite in getattr(self, "EXCLUDED", ()):
                 continue
             with self.subTest(suite=suite):
@@ -422,57 +375,75 @@ class FunctionalWorkflowTests(unittest.TestCase):
                 steps = named_steps(job)
                 if suite in self.DIRECT_TESTS:
                     test = steps[self.DIRECT_TESTS[suite]]
-                    # Case failures keep the run green; the step records its
-                    # outcome for the report and the backlog issue manager.
+                    # Collect reports after a suite failure; the final verdict
+                    # still rejects failed, cancelled, and skipped suites.
                     self.assertRegex("\n".join(test), r'''(?m)^        continue-on-error: true$''')
                     self.assertIn("        if: ${{ always() && steps.evidence.outcome == 'success' }}", steps["Generate report"])
                 cleanup = steps["Reset test environment (after)" if suite == "performance" else "Cleanup environment (after)"]
                 condition = next(line.strip() for line in cleanup if line.startswith("        if:"))
                 if suite == "pool-expand":
-                    self.assertEqual(condition, "if: ${{ always() && steps.topology.outcome == 'success' && inputs.cleanup_after != 'false' }}")
+                    self.assertEqual(condition, "if: ${{ always() && steps.topology.outcome == 'success' && inputs.cleanup_after != 'false' && steps.environment.outcome == 'success' }}")
                     self.assertIn("        id: topology", steps["Validate pool topology before destructive cleanup"])
                     self.assertLess(list(steps).index("Validate pool topology before destructive cleanup"),
                                     list(steps).index("Cleanup environment (before)"))
                 else:
                     self.assertIn(condition, (
-                        "if: always()",
-                        "if: ${{ always() && inputs.cleanup_after != 'false' }}",
-                        "if: ${{ always() && (inputs.cleanup_after != 'false' || github.event_name != 'workflow_dispatch') }}",
+                        "if: ${{ always() && steps.environment.outcome == 'success' }}",
+                        "if: ${{ always() && inputs.cleanup_after != 'false' && steps.environment.outcome == 'success' }}",
+                        "if: ${{ always() && (inputs.cleanup_after != 'false' || github.event_name != 'workflow_dispatch') && steps.environment.outcome == 'success' }}",
                     ))
-                if suite != "performance":
-                    handoff = next(
-                        value for name, value in steps.items() if name.startswith("Continue functional chain")
-                    )
-                    self.assertIn("        if: ${{ always() && github.event_name == 'repository_dispatch' }}", handoff)
+                self.assertIn("        id: environment_cleanup", cleanup)
+                self.assertNotIn("        continue-on-error: true", cleanup)
+                release = steps["Release environment only after successful cleanup"]
+                self.assertIn("        if: ${{ always() && steps.environment.outcome == 'success' }}", release)
+                self.assertIn("          CLEANUP_OUTCOME: ${{ steps.environment_cleanup.outcome }}", release)
+                self.assertTrue(any('finish --suite ' in line and '--cleanup-outcome "$CLEANUP_OUTCOME"' in line
+                                    for line in release))
+                names = list(steps)
+                admission = next(name for name, lines in steps.items() if "        id: environment" in lines)
+                self.assertLess(names.index(admission), names.index("Reset test environment (before)" if suite == "performance" else "Cleanup environment (before)"))
+                self.assertLess(names.index("Reset test environment (after)" if suite == "performance" else "Cleanup environment (after)"),
+                                names.index("Release environment only after successful cleanup"))
+                verdict = steps["Enforce suite and report result"]
+                self.assertIn("        if: ${{ always() }}", verdict)
+                self.assertNotIn("        continue-on-error: true", verdict)
+                self.assertEqual(names[-1], "Enforce suite and report result")
+                self.assertLess(names.index("Upload chain evidence"), names.index("Enforce suite and report result"))
 
-    def test_failed_suite_preserves_exit_and_cleanup_and_dispatch_execute(self) -> None:
-        for suite, test_name in self.DIRECT_TESTS.items():
-            with self.subTest(suite=suite), tempfile.TemporaryDirectory() as directory:
+    def test_failed_suite_preserves_exit_and_cleanup_failures(self) -> None:
+        for suite, test_name, cleanup_exit in ((suite, name, status)
+                                             for suite, name in self.DIRECT_TESTS.items() for status in (0, 23)):
+            with self.subTest(suite=suite, cleanup_exit=cleanup_exit), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / "auto-testing").mkdir()
                 script = root / f"auto-testing/rustfs-{suite}-test.sh"
                 if suite == "fault-tolerance":
-                    # FT cleans up through the suite script itself (--cleanup), not ssh;
-                    # emit the marker so the ordering assertion holds
-                    script.write_text('#!/bin/sh\n[ "$1" = "--cleanup" ] && printf "cleanup\\n" >> "$EXECUTED"\nprintf "partial suite diagnostics\\n"\nexit 17\n')
+                    # FT cleanup must propagate its own status independently of
+                    # the preceding suite failure.
+                    script.write_text('#!/bin/sh\nif [ "$1" = "--cleanup" ]; then\n'
+                                      '  printf "cleanup\\n" >> "$EXECUTED"; exit "$CLEANUP_EXIT"\n'
+                                      'fi\nprintf "partial suite diagnostics\\n"\nexit 17\n')
                 else:
                     script.write_text('#!/bin/sh\nprintf "partial suite diagnostics\\n"\nexit 17\n')
                 script.chmod(0o755)
                 fake_bin = root / "bin"
                 fake_bin.mkdir()
-                for command, marker in (("ssh", "cleanup"), ("gh", "dispatch")):
-                    fake = fake_bin / command
-                    fake.write_text(f'#!/bin/sh\nprintf "{marker}\\n" >> "$EXECUTED"\n')
-                    fake.chmod(0o755)
+                fake = fake_bin / "ssh"
+                fake.write_text('#!/bin/sh\nprintf "cleanup\\n" >> "$EXECUTED"\n'
+                                'case "$*" in *fixture-user@clean-node*) exit 0 ;; esac\n'
+                                'exit "$CLEANUP_EXIT"\n')
+                fake.chmod(0o755)
+                nodes = "failure-node clean-node" if suite == "table" else "fixture-node"
                 env = {
                     **os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
-                    "EXECUTED": str(root / "executed"), "RUSTFS_NODES": "fixture-node",
+                    "EXECUTED": str(root / "executed"), "RUSTFS_NODES": nodes,
                     "RUSTFS_SSH_USER": "fixture-user", "RUSTFS_NIGHTLY_PACKAGE_URL": "https://example.invalid/package.deb",
-                    "GH_TOKEN": "local-fixture", "GITHUB_EVENT_NAME": "repository_dispatch", "GITHUB_RUN_ID": "314159",
+                    "GH_TOKEN": "local-fixture", "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_RUN_ID": "314159",
+                    "CLEANUP_EXIT": str(cleanup_exit),
                 }
                 source = (ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text()
                 steps = named_steps(yaml_block(source.splitlines(), self.JOBS[suite], 2))
-                context = {"github.event_name": "repository_dispatch", "steps.test.outcome": "failure"}
+                context = {"github.event_name": "workflow_dispatch", "steps.test.outcome": "failure"}
                 if suite == "table":
                     context["steps.chain_package.outputs.package_url || inputs.package_url"] = env["RUSTFS_NIGHTLY_PACKAGE_URL"]
                 for expression in re.findall(r"\$\{\{\s*(.*?)\s*\}\}", source):
@@ -496,14 +467,45 @@ class FunctionalWorkflowTests(unittest.TestCase):
                 self.assertEqual(failed.returncode, 17, failed.stderr)
                 self.assertIn("partial suite diagnostics", failed.stdout)
                 cleanup = execute("Cleanup environment (after)")
-                self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
-                handoff_name = next(
-                    name for name in steps if name.startswith("Continue functional chain")
-                )
-                handoff = execute(handoff_name)
-                self.assertEqual(handoff.returncode, 0, handoff.stderr)
-                markers = (root / "executed").read_text().splitlines()
-                self.assertEqual(markers, ["cleanup", "dispatch"])
+                self.assertEqual(cleanup.returncode, cleanup_exit, cleanup.stderr)
+                self.assertEqual((root / "executed").read_text().splitlines(), ["cleanup"] * len(nodes.split()))
+
+    def test_final_verdict_rejects_failed_outcomes_even_when_report_is_valid(self) -> None:
+        cases = [(suite_outcome, report_outcome, 0)
+                 for suite_outcome in ("success", "failure", "skipped", "cancelled")
+                 for report_outcome in ("success", "failure", "skipped", "cancelled")]
+        cases.append(("success", "success", 9))
+        for suite, job_id in {**self.JOBS, "security": "security-test"}.items():
+            source = (ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text().splitlines()
+            steps = named_steps(yaml_block(source, job_id, 2))
+            verdict = steps["Enforce suite and report result"]
+            report_name = "Upload report to dashboard (reports/YYYY-MM-DD.md)" if suite == "performance" else "Generate report"
+            report_id = next(line.split(": ", 1)[1] for line in steps[report_name] if line.startswith("        id: "))
+            self.assertIn("          REPORT_OUTCOME: ${{ steps." + report_id + ".outcome }}", verdict)
+            suite_id = "benchmark" if suite == "performance" else "pool_test" if suite == "pool-expand" else "test"
+            self.assertIn("          SUITE_OUTCOME: ${{ steps." + suite_id + ".outcome }}", verdict)
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                validator = root / "python3"
+                validator.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$VALIDATOR_CALL"\nexit "$VALIDATOR_EXIT"\n')
+                validator.chmod(0o755)
+                marker = root / "called"
+                for suite_outcome, report_outcome, report_exit in cases:
+                    with self.subTest(suite=suite, suite_outcome=suite_outcome,
+                                      report_outcome=report_outcome, report_exit=report_exit):
+                        marker.unlink(missing_ok=True)
+                        result = subprocess.run(
+                            ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", shell_body(verdict)],
+                            env={**os.environ, "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+                                 "SUITE_OUTCOME": suite_outcome, "REPORT_OUTCOME": report_outcome,
+                                 "VALIDATOR_CALL": str(marker), "VALIDATOR_EXIT": str(report_exit)},
+                            capture_output=True, text=True,
+                        )
+                        outcomes_passed = suite_outcome == report_outcome == "success"
+                        self.assertEqual(result.returncode == 0, outcomes_passed and report_exit == 0, result.stderr)
+                        self.assertEqual(marker.exists(), outcomes_passed)
+                        if marker.exists():
+                            self.assertIn("functional_chain_evidence.py verify-report --suite ", marker.read_text())
 
 
 class FaultToleranceWorkflowContractTests(unittest.TestCase):
@@ -721,7 +723,7 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
         self.context.update({
             "github.server_url": "https://github.com", "github.repository": "rustfs/rustfs",
             "github.run_id": "314159", "github.run_attempt": "2", "github.sha": "0123456789abcdef0123456789abcdef01234567",
-            "github.event_name": "repository_dispatch", "steps.test.outcome": "success",
+            "github.event_name": "workflow_dispatch", "steps.test.outcome": "success",
             "secrets.PF_TESTING_GH_TOKEN": "local-fixture", "env.PF_TESTING_GH_TOKEN": "local-fixture",
         })
         self.artifacts = self.directory / f"rustfs-{suite}-314159-2"
@@ -761,6 +763,13 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
                 if suite in FunctionalWorkflowTests.DIRECT_TESTS:
                     self.assertLess(names.index("Checkout repository (for report parser)"), names.index("Checkout auto-testing scripts"))
                 for name, lines in self.steps.items():
+                    if name == "Retain environment ownership and cleanup receipt":
+                        self.assertIn("        if: ${{ always() }}", lines)
+                        suite_id = "s3" if suite == "s3-compat" else suite
+                        self.assertIn("          path: ${{ runner.temp }}/environment-" + suite_id + ".json", lines)
+                        self.assertIn("          if-no-files-found: error", lines)
+                        self.assertFalse(any("*" in line for line in lines))
+                        continue
                     if name == "Upload chain evidence":
                         self.assertIn("        if: ${{ always() && steps.chain_record.outputs.written == 'true' }}", lines)
                         self.assertIn("        if: ${{ always() && inputs.chain_manifest != '' && steps.evidence.outcome == 'success' }}", self.steps["Record chain evidence"])

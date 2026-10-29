@@ -2,21 +2,21 @@
 """Select conservative PR scopes and verify the complete required job set."""
 from __future__ import annotations
 
+import fnmatch
 import json
+import posixpath
 import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
-import tempfile
 import tomllib
-from unittest.mock import patch
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks")
 CODE_JOBS = (
-    "test-and-lint", "connect-feature-boundaries", "test-and-lint-rio-v2",
+    "test-and-lint", "workspace-tests", "core-contract", "connect-feature-boundaries", "test-and-lint-rio-v2",
     "test-and-lint-protocols", "build-rustfs-debug-binary", "uring-integration",
     "e2e-tests", "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
@@ -29,7 +29,7 @@ EXTENDED_FEATURE_JOBS = ("test-and-lint-rio-v2", "test-and-lint-protocols")
 # Rust sources change. Production code, manifests and shared test configuration
 # always select the full matrix. No production package depends on e2e_test.
 E2E_JOBS = (
-    "test-and-lint", "build-rustfs-debug-binary", "e2e-tests",
+    "test-and-lint", "workspace-tests", "core-contract", "build-rustfs-debug-binary", "e2e-tests",
     "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
 E2E_SELECTION_FILES = {
@@ -45,7 +45,17 @@ NON_VALIDATION_JOBS = {"required-checks", "cancel-closed-pr-runs", "alert-on-fai
 # the named steps must stay identical to that job's and the change must stay.
 REPORT_ONLY_JOBS = {
     # rustfs/backlog#2734: required at T2.10.
-    "e2e-tests-gateway": ("e2e-tests", ("Archive e2e smoke test binaries", "Run e2e smoke suite"), "RUSTFS_S3_STACK: gateway"),
+    "e2e-tests-gateway": (
+        "e2e-tests",
+        (
+            "Download E2E test binaries",
+            "Verify E2E archive identity",
+            "Verify e2e smoke test membership",
+            "Run e2e smoke suite",
+            "Verify e2e smoke execution completeness",
+        ),
+        "RUSTFS_S3_STACK: gateway",
+    ),
 }
 INTEGRATION_PUSH_REFS = ("refs/heads/main", "refs/heads/gateway/integration")
 
@@ -63,100 +73,323 @@ def documentation_path(path: str) -> bool:
     return path.startswith("docs/") and path.endswith((".png", ".jpg", ".svg"))
 
 
-def e2e_crate_is_isolated(root: Path) -> bool:
-    """A new dependency on the harness invalidates the test-only shortcut."""
-    target = (root / "crates/e2e_test").resolve()
-    manifests = {root / "Cargo.toml"}
-
-    def references_harness(value: object, directory: Path) -> bool:
-        if not isinstance(value, dict):
-            return False
-        for key, item in value.items():
-            if key in ("dependencies", "dev-dependencies", "build-dependencies") and isinstance(item, dict):
-                for name, dependency in item.items():
-                    if name == "e2e_test":
-                        return True
-                    if isinstance(dependency, dict):
-                        if dependency.get("package") == "e2e_test":
-                            return True
-                        if isinstance(dependency.get("path"), str):
-                            dependency_root = (directory / dependency["path"]).resolve()
-                            if dependency_root == target or not dependency_root.is_relative_to(root.resolve()):
-                                return True
-                            # Cargo also includes in-tree path dependencies that
-                            # are not explicitly listed as workspace members.
-                            manifests.add(dependency_root / "Cargo.toml")
-            if references_harness(item, directory):
-                return True
-        return False
-
-    try:
-        workspace = tomllib.loads((root / "Cargo.toml").read_text())
-        for member in workspace["workspace"]["members"]:
-            members = list(root.glob(member))
-            if not members:
-                return False
-            manifests.update(directory / "Cargo.toml" for directory in members if directory.resolve() != target)
-        visited = set()
-        while manifests:
-            path = manifests.pop().resolve()
-            if path in visited:
-                continue
-            visited.add(path)
-            if references_harness(tomllib.loads(path.read_text()), path.parent):
-                return False
-        return True
-    except (OSError, ValueError, KeyError, TypeError):
-        return False
+POLICY_PATH = ".config/ci-plan.json"
+SHA = re.compile(r"[0-9a-f]{40}")
+EVENTS = ("pull_request", "push", "merge_group", "schedule", "workflow_dispatch")
 
 
-def select_mode(event: str, base: str, head: str, root: Path) -> str:
-    if event != "pull_request" or not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (base, head)):
-        return "full"
-    try:
-        changed = subprocess.check_output(
-            ["git", "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", base, head, "--"],
-            cwd=root, stderr=subprocess.PIPE,
-        ).decode("utf-8")
-    except (subprocess.CalledProcessError, UnicodeError):
-        return "full"
-    paths = changed.rstrip("\0").split("\0") if changed else []
-    if paths and all(documentation_path(path) for path in paths):
-        return "docs"
-    if paths and all(documentation_path(path) or path in E2E_SELECTION_FILES or (
-        path.startswith("crates/e2e_test/src/") and path.endswith(".rs")
-        and not any(part in (".", "..") for part in path.split("/"))
-        and not any(ord(char) < 32 for char in path)
-    ) for path in paths) and e2e_crate_is_isolated(root):
-        return "e2e"
-    return "full"
+def git(root: Path, *args: str) -> str:
+    return subprocess.check_output(["git", *args], cwd=root, stderr=subprocess.PIPE).decode("utf-8")
 
 
-def expected_results(mode: str, event: str, ref: str) -> dict[str, str]:
-    if event not in ("pull_request", "push", "merge_group", "schedule", "workflow_dispatch"):
+def git_file(root: Path, revision: str, path: str) -> str:
+    if not SHA.fullmatch(revision):
+        raise ValueError("revision must be a full commit SHA")
+    return git(root, "show", f"{revision}:{path}")
+
+
+def dependency_tables(document: dict):
+    for key, value in document.items():
+        if key in ("dependencies", "dev-dependencies", "build-dependencies"):
+            if not isinstance(value, dict):
+                raise ValueError("dependency table is not an object")
+            yield value
+        elif key == "target":
+            for target in value.values():
+                yield from dependency_tables(target)
+
+
+def cargo_graph(root: Path, revision: str) -> tuple[dict[str, str], dict[str, set[str]]]:
+    """Read Cargo inputs without resolving the network or executing candidate code.
+
+    All dependency kinds and target predicates are unioned. This intentionally
+    over-selects optional/target dependencies instead of guessing active cfgs.
+    """
+    workspace = tomllib.loads(git_file(root, revision, "Cargo.toml"))
+    files = set(git(root, "ls-tree", "-r", "--name-only", "-z", revision).rstrip("\0").split("\0"))
+    manifests = {path for path in files if path.endswith("/Cargo.toml")}
+    members = workspace.get("workspace", {}).get("members", [])
+    excluded = workspace.get("workspace", {}).get("exclude", [])
+    selected = {path for path in manifests if any(fnmatch.fnmatchcase(path[:-11], member) for member in members)
+                and not any(fnmatch.fnmatchcase(path[:-11], pattern) for pattern in excluded)}
+    if "package" in workspace:
+        selected.add("Cargo.toml")
+    if not selected:
+        raise ValueError("workspace has no packages")
+    for member in members:
+        if not any(fnmatch.fnmatchcase(path[:-11], member) for path in manifests):
+            raise ValueError(f"workspace member has no manifest: {member}")
+    shared = workspace.get("workspace", {}).get("dependencies", {})
+    packages, graph, documents = {}, {}, {}
+    pending = set(selected)
+    while pending:
+        manifest = pending.pop()
+        if manifest in documents:
+            continue
+        document = tomllib.loads(git_file(root, revision, manifest))
+        directory = posixpath.dirname(manifest)
+        name = document["package"]["name"]
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise ValueError("invalid Cargo package name")
+        if name in packages and packages[name] != directory:
+            raise ValueError(f"duplicate workspace package {name}")
+        packages[name] = directory
+        documents[manifest] = (name, document)
+        graph[name] = set()
+        for table in dependency_tables(document):
+            for alias, value in table.items():
+                dependency = shared.get(alias) if isinstance(value, dict) and value.get("workspace") is True else value
+                if not isinstance(dependency, dict) or "path" not in dependency:
+                    continue
+                owner = "" if isinstance(value, dict) and value.get("workspace") is True else directory
+                path = posixpath.normpath(posixpath.join(owner, dependency["path"], "Cargo.toml"))
+                if path.startswith("../") or path.startswith("/") or path not in files:
+                    raise ValueError(f"unresolved workspace path dependency: {path}")
+                pending.add(path)
+    by_directory = {directory: name for name, directory in packages.items()}
+    for manifest, (name, document) in documents.items():
+        for table in dependency_tables(document):
+            for alias, value in table.items():
+                inherited = isinstance(value, dict) and value.get("workspace") is True
+                dependency = shared.get(alias) if inherited else value
+                if inherited and dependency is None:
+                    raise ValueError(f"missing inherited dependency: {alias}")
+                if isinstance(dependency, dict) and "path" in dependency:
+                    owner = "" if inherited else posixpath.dirname(manifest)
+                    directory = posixpath.normpath(posixpath.join(owner, dependency["path"]))
+                    graph[name].add(by_directory[directory])
+                else:
+                    dependency_name = dependency.get("package", alias) if isinstance(dependency, dict) else alias
+                    if dependency_name in packages:
+                        graph[name].add(dependency_name)
+    return packages, graph
+
+
+def closure(seeds: set[str], graph: dict[str, set[str]], reverse: bool = False) -> set[str]:
+    reached = set(seeds)
+    while True:
+        expanded = reached | ({name for name, deps in graph.items() if deps & reached} if reverse
+                              else {dep for name in reached for dep in graph.get(name, set())})
+        if expanded == reached:
+            return reached
+        reached = expanded
+
+
+def expected_results(mode: str, event: str, ref: str, connect: bool = True, action: str = "") -> dict[str, str]:
+    if event not in EVENTS:
         raise ValueError(f"unsupported CI event: {event!r}")
     if mode not in ("docs", "e2e", "full") or (mode != "full" and event != "pull_request"):
         raise ValueError(f"invalid CI selection: {mode!r} for {event!r}")
     expected = {job: "success" for job in ALWAYS_JOBS}
     expected.update({job: "success" if mode == "full" or (mode == "e2e" and job in E2E_JOBS) else "skipped" for job in CODE_JOBS})
+    expected["connect-feature-boundaries"] = "success" if mode == "full" and connect else "skipped"
     if event in ("pull_request", "push"):
         expected.update({job: "skipped" for job in EXTENDED_FEATURE_JOBS})
     rio = mode == "full" and event in ("schedule", "workflow_dispatch")
     expected.update({job: "success" if rio else "skipped" for job in OPTIONAL_JOBS[:2]})
     full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref in INTEGRATION_PUSH_REFS))
     expected["e2e-full"] = "success" if full else "skipped"
+    if event == "pull_request" and action == "closed":
+        return {job: "skipped" for job in expected}
     return expected
 
 
-def verify_results(needs: object, event: str, ref: str) -> list[str]:
+def read_policy(root: Path, revision: str) -> dict:
+    policy = json.loads(git_file(root, revision, POLICY_PATH))
+    if policy.get("schema_version") != 1 or policy.get("rollout") not in ("shadow", "enforced"):
+        raise ValueError("unsupported CI policy")
+    for field in ("core_packages", "connect_packages", "full_paths"):
+        if not isinstance(policy.get(field), list) or not all(isinstance(value, str) and value for value in policy[field]):
+            raise ValueError(f"invalid CI policy {field}")
+    return policy
+
+
+def configurations(jobs: dict[str, str]) -> list[dict]:
+    values = [
+        ("workspace-lint", "test-and-lint", "dev", []),
+        ("workspace-tests", "test-and-lint", "test", []),
+        ("e2e-harness", "build-rustfs-debug-binary", "test", []),
+        ("uring-tests", "uring-integration", "test", []),
+        ("server-e2e-hooks", "build-rustfs-debug-binary", "dev", ["e2e-test-hooks"]),
+        ("connect-debug", "connect-feature-boundaries", "test", ["connect-e2e-short-credentials"]),
+        ("connect-offline-cli", "connect-feature-boundaries", "dev", ["offline-enrollment-e2e-root"]),
+        ("connect-offline-tests", "connect-feature-boundaries", "test", ["offline-enrollment-e2e-root"]),
+        ("connect-release", "connect-feature-boundaries", "release", []),
+        ("connect-release-rejection", "connect-feature-boundaries", "release", ["connect-e2e-short-credentials"]),
+        ("rio-v2-lint", "test-and-lint-rio-v2", "dev", ["rio-v2"]),
+        ("rio-v2-tests", "test-and-lint-rio-v2", "test", ["rio-v2"]),
+        ("protocol-swift-lint", "test-and-lint-protocols", "dev", ["swift"]),
+        ("protocol-swift-tests", "test-and-lint-protocols", "test", ["swift"]),
+        ("protocol-sftp-lint", "test-and-lint-protocols", "dev", ["sftp"]),
+        ("protocol-sftp-tests", "test-and-lint-protocols", "test", ["sftp"]),
+        ("protocol-http3-lint", "test-and-lint-protocols", "dev", ["http3", "swift"]),
+        ("protocol-http3-tests", "test-and-lint-protocols", "test", ["http3", "swift"]),
+        ("server-rio-v2", "build-rustfs-debug-binary-rio-v2", "dev", ["e2e-test-hooks", "rio-v2"]),
+    ]
+    return [{"id": identity, "job": job, "target": "x86_64-unknown-linux-gnu", "profile": profile,
+             "default_features": True, "features": features} for identity, job, profile, features in values if jobs[job] == "success"]
+
+
+def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: str = "") -> dict:
+    if event not in EVENTS or not SHA.fullmatch(head):
+        raise ValueError("unsupported event or missing candidate SHA")
+    tree = git(root, "rev-parse", f"{head}^{{tree}}").strip()
+    if not SHA.fullmatch(tree):
+        raise ValueError("candidate tree cannot be resolved")
+    head_packages, head_graph = cargo_graph(root, head)
+    all_packages = sorted(set(head_packages) - {"e2e_test"})
+    if not all_packages:
+        raise ValueError("candidate has no workspace validation packages")
+    policy_revision = base if event == "pull_request" and SHA.fullmatch(base) else head
+    reasons, changed, mode = [], [], "full"
+    policy = None
+    full = event != "pull_request"
+    try:
+        policy = read_policy(root, policy_revision)
+        base_packages, base_graph = cargo_graph(root, base) if SHA.fullmatch(base) else (head_packages, head_graph)
+        if event == "pull_request":
+            if not SHA.fullmatch(base):
+                raise ValueError("missing base SHA")
+            changed = git(root, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", base, head, "--").rstrip("\0").split("\0")
+            if not changed or changed == [""]:
+                raise ValueError("empty change range")
+        else:
+            reasons.append(f"{event} validates the complete candidate")
+    except (OSError, subprocess.CalledProcessError, UnicodeError, KeyError, TypeError, ValueError) as error:
+        full = True
+        base_packages, base_graph = head_packages, head_graph
+        reasons.append(f"conservative fallback: {type(error).__name__}")
+    graph = {name: head_graph.get(name, set()) | base_graph.get(name, set()) for name in set(head_graph) | set(base_graph)}
+    affected = set()
+    if not full and policy is not None:
+        for path in changed:
+            if documentation_path(path):
+                continue
+            if path in E2E_SELECTION_FILES:
+                affected.add("e2e_test")
+                continue
+            if any(fnmatch.fnmatchcase(path, pattern) for pattern in policy["full_paths"]):
+                full = True
+                reasons.append(f"shared build or policy input: {path}")
+                continue
+            owners = {name for packages in (base_packages, head_packages) for name, directory in packages.items()
+                      if directory and path.startswith(directory + "/")}
+            if not owners or path.startswith("/") or any(part in (".", "..") for part in path.split("/")) or any(ord(c) < 32 for c in path):
+                full = True
+                reasons.append(f"unmapped input: {path}")
+            affected.update(owners)
+        if not affected and not full:
+            mode = "docs"
+            reasons.append("all changes are documentation")
+        elif affected == {"e2e_test"} and not full and not (closure({"e2e_test"}, graph, reverse=True) - {"e2e_test"}) and all(
+                documentation_path(path) or path in E2E_SELECTION_FILES or
+                (path.startswith("crates/e2e_test/src/") and path.endswith(".rs")) for path in changed):
+            mode = "e2e"
+            reasons.append("isolated E2E harness changes")
+    core = set(policy["core_packages"]) if policy else set()
+    try:
+        # Union both inventories: a PR may add tests, but cannot remove baseline responsibility.
+        for revision in {policy_revision, head}:
+            inventory = json.loads(git_file(root, revision, ".config/ecstore-required-tests.json"))
+            if not inventory["tests"]:
+                raise ValueError("empty core test inventory")
+            core.update(test["suite"].split("::", 1)[0] for test in inventory["tests"])
+        if not core <= set(head_packages):
+            raise ValueError("core package missing from candidate")
+    except (subprocess.CalledProcessError, KeyError, TypeError, ValueError):
+        full = True
+        mode = "full"
+        reasons.append("core inventory cannot be resolved; require the full workspace")
+    selected = (closure(affected, graph, reverse=True) | core) & set(head_packages) - {"e2e_test"}
+    if full:
+        selected = set(all_packages)
+    if mode == "docs":
+        selected = set()
+    connect_inputs = closure(set(policy["connect_packages"]), graph) if policy else set(head_packages)
+    connect = mode == "full" and (full or "rustfs" in affected or bool(affected & connect_inputs))
+    reasons.append("selected changed packages, reverse dependencies and fixed core contracts")
+    reasons.append("Connect boundary or a shared input changed" if connect else "Connect has no changed credential/configuration dependency")
+    proposed = {"packages": sorted(selected), "connect": connect, "full_validation": full, "reasons": reasons,
+                "jobs": expected_results(mode, event, ref, connect, action)}
+    shadow = policy is None or policy["rollout"] == "shadow"
+    effective_packages = all_packages if shadow and mode != "docs" else sorted(selected)
+    effective_connect = mode == "full" if shadow else connect
+    effective_full = mode == "full" if shadow else full
+    jobs = expected_results(mode, event, ref, effective_connect, action)
+    plan = {"schema_version": 1, "event": event, "action": action, "ref": ref, "base": base if SHA.fullmatch(base) else "",
+            "head": head, "tree": tree, "policy": {"revision": policy_revision, "rollout": "shadow" if shadow else "enforced"},
+            "mode": mode, "packages": effective_packages, "full_validation": effective_full, "connect": effective_connect,
+            "configurations": configurations(jobs), "jobs": jobs, "proposed": proposed,
+            "reasons": ["shadow rollout preserves current validation responsibility"] + reasons if shadow else reasons,
+            "not_applicable": {job: f"not required for {mode}/{event}" for job, result in jobs.items() if result == "skipped"}}
+    return plan
+
+
+def validate_plan(plan: object, event: str, ref: str, head: str = "", tree: str = "", base: str | None = None, action: str | None = None) -> dict[str, str]:
+    if not isinstance(plan, dict) or type(plan.get("schema_version")) is not int or plan["schema_version"] != 1:
+        raise ValueError("invalid plan schema")
+    if plan.get("event") != event or plan.get("ref") != ref:
+        raise ValueError("plan event/ref does not match this run")
+    if not isinstance(plan.get("base"), str) or plan["base"] and not SHA.fullmatch(plan["base"]):
+        raise ValueError("invalid plan base identity")
+    if not isinstance(plan.get("action"), str):
+        raise ValueError("invalid plan event action")
+    if (base is not None and plan["base"] != base) or (action is not None and plan["action"] != action):
+        raise ValueError("plan base/action does not match this run")
+    for field in ("head", "tree"):
+        if not isinstance(plan.get(field), str) or not SHA.fullmatch(plan[field]):
+            raise ValueError(f"invalid plan {field}")
+    if (head and plan["head"] != head) or (tree and plan["tree"] != tree):
+        raise ValueError("plan candidate identity does not match this run")
+    if type(plan.get("connect")) is not bool or type(plan.get("full_validation")) is not bool:
+        raise ValueError("invalid plan selection flags")
+    policy = plan.get("policy")
+    if not isinstance(policy, dict) or policy.get("rollout") not in ("shadow", "enforced") or not isinstance(policy.get("revision"), str) or not SHA.fullmatch(policy["revision"]):
+        raise ValueError("invalid plan policy identity")
+    if policy["rollout"] == "shadow" and plan.get("mode") == "full" and (not plan["connect"] or not plan["full_validation"]):
+        raise ValueError("shadow plan cannot reduce full validation responsibility")
+    packages = plan.get("packages")
+    if not isinstance(packages, list) or not all(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_-]+", name) for name in packages) or len(packages) != len(set(packages)):
+        raise ValueError("invalid plan packages")
+    if plan.get("mode") != "docs" and not packages:
+        raise ValueError("code validation plan must not be empty")
+    expected = expected_results(plan.get("mode"), event, ref, plan["connect"], plan.get("action", ""))
+    if plan.get("jobs") != expected:
+        raise ValueError("plan job contract differs from selected responsibilities")
+    if plan.get("configurations") != configurations(expected):
+        raise ValueError("plan configuration matrix is incomplete")
+    if not isinstance(plan.get("reasons"), list) or not plan["reasons"] or not all(isinstance(reason, str) and reason for reason in plan["reasons"]):
+        raise ValueError("plan selection has no explanation")
+    not_applicable = plan.get("not_applicable")
+    if not isinstance(not_applicable, dict) or not all(isinstance(reason, str) and reason for reason in not_applicable.values()) or set(not_applicable) != {job for job, value in expected.items() if value == "skipped"}:
+        raise ValueError("plan skips lack explicit not-applicable reasons")
+    return expected
+
+
+def verify_results(needs: object, event: str, ref: str, head: str = "", tree: str = "", base: str | None = None, action: str | None = None) -> list[str]:
     if not isinstance(needs, dict):
         return ["needs must be a job-result object"]
     selection = needs.get("classify-changes", {})
     outputs = selection.get("outputs", {}) if isinstance(selection, dict) else {}
-    mode = outputs.get("mode") if isinstance(outputs, dict) else None
     try:
-        expected = expected_results(mode, event, ref)
-    except ValueError as error:
+        raw = outputs.get("plan") if isinstance(outputs, dict) else None
+        if raw:
+            plan = json.loads(raw)
+            expected = validate_plan(plan, event, ref, head, tree, base, action)
+            if outputs.get("mode") != plan["mode"]:
+                raise ValueError("plan mode differs from scheduling output")
+            for name in ("connect", "full_validation"):
+                if name in outputs and outputs[name] != str(plan[name]).lower():
+                    raise ValueError(f"plan {name} differs from scheduling output")
+            if outputs.get("packages") and json.loads(outputs["packages"]) != plan["packages"]:
+                raise ValueError("plan packages differ from scheduling output")
+        else:
+            # During adoption the trusted base script only emits `mode`. No
+            # legacy output may authorize an omitted job in the new workflow.
+            if not isinstance(outputs, dict) or outputs.get("mode") != "full":
+                raise ValueError("missing plan requires conservative full mode")
+            expected = expected_results("full", event, ref)
+    except (TypeError, ValueError) as error:
         return [str(error)]
     errors = []
     if set(needs) != set(expected):
@@ -169,464 +402,269 @@ def verify_results(needs: object, event: str, ref: str) -> list[str]:
     return errors
 
 
+def workflow_document(text: str) -> dict:
+    try:
+        import yaml
+    except ImportError as error:
+        raise ValueError("workflow checking requires PyYAML") from error
+
+    class UniqueLoader(yaml.BaseLoader):
+        pass
+
+    def mapping(loader, node):
+        result = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node)
+            if key in result:
+                raise ValueError(f"duplicate YAML key: {key}")
+            result[key] = loader.construct_object(value_node)
+        return result
+
+    UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
+    try:
+        value = yaml.load(text, Loader=UniqueLoader)
+    except yaml.YAMLError as error:
+        raise ValueError(f"invalid workflow YAML: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError("workflow must be a mapping")
+    return value
+
+
+def condition(expression: str | bool, context: dict) -> bool:
+    """Evaluate the finite condition grammar used by CI, never Python eval."""
+    if isinstance(expression, bool):
+        return expression
+    expression = expression.strip()
+    if expression.startswith("${{") and expression.endswith("}}"):
+        expression = expression[3:-2].strip()
+    token = re.compile(r"\s*(?:('(?:[^']|'')*')|([A-Za-z_][A-Za-z_0-9.-]*)|(&&|\|\||==|!=|[!(),]))")
+    values, cursor = [], 0
+    while cursor < len(expression):
+        match = token.match(expression, cursor)
+        if not match:
+            raise ValueError(f"unsupported condition near {expression[cursor:]!r}")
+        values.append(next(value for value in match.groups() if value is not None))
+        cursor = match.end()
+    position = 0
+
+    def atom():
+        nonlocal position
+        if position >= len(values):
+            raise ValueError("incomplete condition")
+        value = values[position]
+        position += 1
+        if value == "!":
+            return not atom()
+        if value == "(":
+            result = parse(0)
+            if position >= len(values) or values[position] != ")":
+                raise ValueError("unclosed condition")
+            position += 1
+            return result
+        if value.startswith("'"):
+            return value[1:-1].replace("''", "'")
+        if position < len(values) and values[position] == "(":
+            position += 1
+            arguments = []
+            while position < len(values) and values[position] != ")":
+                arguments.append(parse(0))
+                if position < len(values) and values[position] == ",":
+                    position += 1
+                else:
+                    break
+            if position >= len(values) or values[position] != ")":
+                raise ValueError("unclosed function")
+            position += 1
+            if value == "contains" and len(arguments) == 2:
+                return arguments[1] in arguments[0]
+            if value == "fromJSON" and len(arguments) == 1:
+                return json.loads(arguments[0])
+            if value in ("always", "success", "failure", "cancelled") and not arguments:
+                return True if value == "always" else context.get(value, False)
+            raise ValueError(f"unsupported condition function: {value}")
+        if value in ("true", "false"):
+            return value == "true"
+        if value not in context:
+            raise ValueError(f"unknown condition input: {value}")
+        return context[value]
+
+    precedence = {"||": 1, "&&": 2, "==": 3, "!=": 3}
+
+    def parse(minimum):
+        nonlocal position
+        left = atom()
+        while position < len(values) and precedence.get(values[position], 0) > minimum:
+            operator = values[position]
+            position += 1
+            right = parse(precedence[operator])
+            if operator == "||":
+                left = left or right
+            elif operator == "&&":
+                left = left and right
+            elif operator == "==":
+                left = left == right
+            else:
+                left = left != right
+        return left
+
+    result = parse(0)
+    if position != len(values):
+        raise ValueError("unexpected condition tokens")
+    return bool(result)
+
+
 def check_workflow(root: Path) -> list[str]:
-    # Reuse the repository's canonical-indentation checker; actionlint validates YAML syntax.
-    from check_test_wiring import workflow_step_block, yaml_block, yaml_scalar_continues
-
+    try:
+        document = workflow_document((root / ".github/workflows/ci.yml").read_text())
+        jobs = document["jobs"]
+        if not isinstance(jobs, dict):
+            raise ValueError("jobs must be a mapping")
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        return [str(error)]
     errors = []
-    lines = (root / ".github/workflows/ci.yml").read_text().splitlines()
-    jobs = yaml_block(lines, "jobs", 0) or []
-    names = set()
-    for index, line in enumerate(jobs):
-        if not re.match(r"^  \S", line) or line.lstrip().startswith("#"):
-            continue
-        header = re.fullmatch(r'''  (["']?)([A-Za-z_][A-Za-z0-9_-]*)\1\s*:\s*(?:#.*)?''', line)
-        if header is None:
-            errors.append("CI job declarations must use single-line job IDs")
-            continue
-        name = header[2]
-        if name in names:
-            errors.append(f"duplicate CI job ID: {name}")
-        names.add(name)
-        jobs[index] = f"  {name}:"
     required = set(ALWAYS_JOBS + CODE_JOBS + OPTIONAL_JOBS)
-    if names - NON_VALIDATION_JOBS - set(REPORT_ONLY_JOBS) != required:
+    if set(jobs) - NON_VALIDATION_JOBS - set(REPORT_ONLY_JOBS) != required:
         errors.append("CI verification jobs and the required gate contract differ")
-
-    def code(block):
-        return [line for line in block if line.strip() and not line.lstrip().startswith("#")]
-
     for job, (mirror, steps, env) in REPORT_ONLY_JOBS.items():
-        block, mirrored = yaml_block(jobs, job, 2), yaml_block(jobs, mirror, 2)
-        if block is None or mirrored is None:
+        block, mirrored = jobs.get(job), jobs.get(mirror)
+        if not isinstance(block, dict) or not isinstance(mirrored, dict):
             errors.append(f"report-only {job} and its required {mirror} must both exist")
             continue
-        if f"      {env}" not in (yaml_block(block, "env", 4) or []):
+        key, _, value = env.partition(": ")
+        if (block.get("env") or {}).get(key) != value:
             errors.append(f"{job} must set {env}")
+
+        def named(job_block, step):
+            matches = [item for item in job_block.get("steps") or [] if isinstance(item, dict) and item.get("name") == step]
+            return matches[0] if len(matches) == 1 else None
+
         for step in steps:
-            ours, theirs = workflow_step_block(block, step, "name"), workflow_step_block(mirrored, step, "name")
-            if ours is None or theirs is None or code(ours[1]) != code(theirs[1]):
+            ours, theirs = named(block, step), named(mirrored, step)
+            if ours is None or theirs is None or ours != theirs:
                 errors.append(f"{job} step {step!r} must match {mirror}")
-    for job in required:
-        block = yaml_block(jobs, job, 2) or []
-        if any(re.match(r"\s+(?:- )?[\"']?continue-on-error[\"']?\s*:", line) for line in block):
-            errors.append(f"{job} cannot convert a validation failure into success")
-    gate = yaml_block(jobs, "required-checks", 2) or []
-    def scalar(block, key, indent):
-        prefix = " " * indent + key + ": "
-        matches = [index for index, line in enumerate(block) if line.startswith(prefix)]
-        if len(matches) != 1:
-            return None
-        index = matches[0]
-        if yaml_scalar_continues(block, index, indent):
-            return None
-        return block[index][len(prefix):]
-
-    display_names = {}
-    for job in names:
-        block = [re.sub(r'''^    (?:'name'|"name")\s*:\s*''', "    name: ", line)
-                 for line in yaml_block(jobs, job, 2) or []]
-        value = scalar(block, "name", 4)
-        display = re.fullmatch(r'''(?:"([^"\\]*)"|'([^']*)'|([^'"#][^#]*?))(?:\s+#.*)?\s*''', (value or "").strip())
-        if display is None or (display[3] is not None and display[3].startswith(tuple("|>*&!{[?"))):
-            errors.append(f"{job} must use a verifiable single-line display name")
-            continue
-        name = next(value for value in display.groups() if value is not None)
-        if "${{" in name and (job != "test-and-lint-protocols" or name != "Test and Lint (${{ matrix.features.name }})"):
-            errors.append(f"{job} has an unverifiable dynamic display name")
-        display_names[job] = name
-
-    dependencies = yaml_block(gate, "needs", 4) or []
-    declared = [line.strip().removeprefix("- ") for line in dependencies if line.strip()]
-    if set(declared) != required or len(declared) != len(required):
+    for job in required | {"required-checks"}:
+        block = jobs.get(job, {})
+        for item in [block, *block.get("steps", [])]:
+            if item.get("continue-on-error", "false") != "false":
+                errors.append(f"{job} cannot convert a validation failure into success")
+    gate = jobs.get("required-checks", {})
+    dependencies = gate.get("needs", [])
+    if not isinstance(dependencies, list) or set(dependencies) != required or len(dependencies) != len(required):
         errors.append("required-checks must directly depend on every verification job exactly once")
-    if display_names.get("required-checks") != "Test and Lint" or list(display_names.values()).count("Test and Lint") != 1:
+    if gate.get("name") != "Test and Lint" or sum(block.get("name") == "Test and Lint" for block in jobs.values()) != 1:
         errors.append("Test and Lint must uniquely name the aggregate gate")
-    if scalar(gate, "if", 4) != "always() && (github.event_name != 'pull_request' || github.event.action != 'closed')":
-        errors.append("required-checks must run after failed or skipped dependencies")
-    for job in EXTENDED_FEATURE_JOBS:
-        block = yaml_block(jobs, job, 2) or []
-        if scalar(block, "if", 4) != "needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('[\"merge_group\", \"schedule\", \"workflow_dispatch\"]'), github.event_name)":
-            errors.append(f"{job} must run on every merge-group, scheduled and manual event")
-    workspace = "\n".join(yaml_block(jobs, "test-and-lint", 2) or [])
-    clippy = re.search(r"^      - name: Run clippy lints\n(?P<body>.*?)(?=^      - name:|\Z)", workspace, re.MULTILINE | re.DOTALL)
-    clippy_lines = clippy["body"].splitlines() if clippy else []
-    if (clippy is None or any(re.match(r'''\s{8}["']?if["']?\s*:''', line) for line in clippy_lines)
-            or "cargo clippy --all-targets -- -D warnings" not in clippy["body"]):
-        errors.append("workspace Clippy must run on every event, pull requests included")
-    if scalar(gate, "shell", 8) != "bash" or scalar(gate, "run", 8) != "python3 scripts/ci_gate.py verify" or scalar(gate, "CI_NEEDS", 10) != "${{ toJSON(needs) }}":
-        errors.append("required-checks must verify the actual needs results")
-    if any(re.match(r'''\s+(?:- )?(?:["']?continue-on-error["']?\s*:|["']?if["']?\s*:)''', line) and not line.startswith("    if:") for line in gate):
-        errors.append("required-checks cannot ignore failures")
-    pr = yaml_block(lines, "pull_request", 2) or []
-    if any(line.strip().startswith(("paths:", "paths-ignore:")) for line in pr):
+    for job, block in jobs.items():
+        if not isinstance(block.get("name"), str):
+            errors.append(f"{job} needs a stable display name")
+        name = block.get("name", "")
+        if "${{" in name and any(value.strip() not in ("matrix.features.name", "matrix.shard") for value in re.findall(r"\$\{\{(.*?)\}\}", name)):
+            errors.append(f"{job} has an unverifiable dynamic display name")
+    verifiers = [step for step in gate.get("steps", []) if "scripts/ci_gate.py verify" in step.get("run", "")]
+    if len(verifiers) != 1 or (verifiers[0].get("run", "").strip() != "python3 scripts/ci_gate.py verify"
+                              or verifiers[0].get("env", {}).get("CI_NEEDS") != "${{ toJSON(needs) }}"
+                              or verifiers[0].get("shell") != "bash" or "if" in verifiers[0]):
+        errors.append("required-checks must unconditionally verify actual needs and preserve its exit status")
+    lint_commands = ("cargo clippy --all-targets -- -D warnings", "python3 scripts/ci_test_artifact.py cargo lint --configuration workspace")
+    clippy = [step for step in jobs.get("test-and-lint", {}).get("steps", [])
+              if any(command in step.get("run", "") for command in lint_commands)]
+    if not clippy or any("if" in step for step in clippy):
+        errors.append("workspace Clippy must run on every code event, pull requests included")
+    matrix = jobs.get("test-and-lint-protocols", {}).get("strategy", {}).get("matrix", {})
+    features = matrix.get("features", [])
+    if not isinstance(features, list) or {item.get("name"): item.get("flags") for item in features} != {
+            "swift": "--features swift", "sftp": "--features sftp", "http3": "--features http3,swift"} or len(features) != 3:
+        errors.append("protocol matrix must retain every required feature configuration")
+    triggers = document.get("on", {})
+    if isinstance(triggers, dict) and isinstance(triggers.get("pull_request"), dict) and any(key in triggers["pull_request"] for key in ("paths", "paths-ignore")):
         errors.append("all pull requests must enter the single CI workflow")
     if (root / ".github/workflows/ci-docs-only.yml").exists():
         errors.append("the duplicate required-status companion must be removed")
-    return errors
+    # Truth tables protect behavior while allowing equivalent expression and YAML formatting.
+    for event in EVENTS:
+        for mode in (("docs", "e2e", "full") if event == "pull_request" else ("full",)):
+            for ref in ("refs/heads/main", "refs/heads/release"):
+                for connect in (True, False) if event == "pull_request" and mode == "full" else (mode == "full",):
+                    for action in ("opened", "closed") if event == "pull_request" else ("",):
+                        expected = expected_results(mode, event, ref, connect, action)
+                        context = {"github.event_name": event, "github.ref": ref, "github.event.action": action,
+                                   "needs.classify-changes.outputs.mode": mode, "needs.classify-changes.outputs.connect": str(connect).lower(),
+                                   "success": True}
+                        evaluated, evaluating = {}, set()
 
+                        def scheduled(job):
+                            if job in evaluated:
+                                return evaluated[job]
+                            if job in evaluating or job not in jobs:
+                                raise ValueError(f"cyclic or unknown job dependency: {job}")
+                            evaluating.add(job)
+                            block = jobs[job]
+                            dependencies = block.get("needs", [])
+                            if isinstance(dependencies, str):
+                                dependencies = [dependencies]
+                            dependency_results = [scheduled(dependency) for dependency in dependencies]
+                            success = all(dependency_results)
+                            expression = block.get("if", "success()")
+                            unquoted = re.sub(r"'(?:[^']|'')*'", "", expression)
+                            status_function = re.search(r"\b(always|success|failure|cancelled)\s*\(", unquoted)
+                            actual = condition(expression, dict(context, success=success))
+                            evaluated[job] = actual and (bool(status_function) or success)
+                            evaluating.remove(job)
+                            return evaluated[job]
 
-class SelfTests(unittest.TestCase):
-    def test_e2e_shortcut_rejects_new_direct_renamed_and_target_dependencies(self):
-        self.assertTrue(e2e_crate_is_isolated(ROOT))
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "rustfs").mkdir()
-            (root / "Cargo.toml").write_text('[workspace]\nmembers = ["rustfs"]\n')
-            path = root / "rustfs/Cargo.toml"
-            path.write_text('[package]\nname = "rustfs"\n')
-            self.assertTrue(e2e_crate_is_isolated(root))
-            for dependency in (
-                '[dependencies]\ne2e_test = "1"\n',
-                '[dev-dependencies]\nharness = { package = "e2e_test", version = "1" }\n',
-                '[target.\'cfg(unix)\'.build-dependencies]\nharness = { path = "../crates/e2e_test" }\n',
-            ):
-                path.write_text(dependency)
-                self.assertFalse(e2e_crate_is_isolated(root), dependency)
-            path.unlink()
-            self.assertFalse(e2e_crate_is_isolated(root))
-
-    def test_e2e_shortcut_traverses_implicit_path_dependencies(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "rustfs").mkdir()
-            (root / "helper").mkdir()
-            (root / "Cargo.toml").write_text('[workspace]\nmembers = ["rustfs"]\n')
-            (root / "rustfs/Cargo.toml").write_text('[dependencies]\nhelper = { path = "../helper" }\n')
-            helper = root / "helper/Cargo.toml"
-            helper.write_text('[package]\nname = "helper"\n')
-            self.assertTrue(e2e_crate_is_isolated(root))
-            helper.write_text('[dependencies]\nharness = { path = "../crates/e2e_test" }\n')
-            self.assertFalse(e2e_crate_is_isolated(root))
-            helper.unlink()
-            self.assertFalse(e2e_crate_is_isolated(root))
-
-    def test_e2e_scope_keeps_production_and_shared_configuration_full(self):
-        cases = (
-            (["crates/e2e_test/src/distributed/harness.rs"], "e2e"),
-            (["README.md", "crates/e2e_test/src/common.rs"], "e2e"),
-            (["crates/e2e_test/src/distributed/harness.rs", ".config/e2e-distributed-selection.txt"], "e2e"),
-            ([".config/e2e-full-selection.txt"], "e2e"),
-            ([".config/unrecognized-selection.txt"], "full"),
-            (["crates/e2e_test/src/common.rs", "crates/ecstore/src/lib.rs"], "full"),
-            (["crates/e2e_test/src/common.rs", "crates/e2e_test/Cargo.toml"], "full"),
-            (["crates/e2e_test/build.rs"], "full"),
-            (["crates/e2e_test/src/fixture.json"], "full"),
-            ([".config/nextest.toml"], "full"),
-            (["Cargo.lock"], "full"),
-            (["scripts/e2e_binary.py"], "full"),
-            (["crates/e2e_test/src/../Cargo.toml.rs"], "full"),
-            (["crates/e2e_test/src/unusual\nname.rs"], "full"),
-            ([], "full"),
-        )
-        for paths, expected in cases:
-            with self.subTest(paths=paths), patch("subprocess.check_output", return_value=("\0".join(paths) + "\0").encode()):
-                self.assertEqual(select_mode("pull_request", "a" * 40, "b" * 40, ROOT), expected)
-
-    def test_documentation_paths_do_not_hide_build_or_fixture_changes(self):
-        for path in ("README.md", "AGENTS.md", "crates/utils/AGENTS.md", "docs/testing/README.md", "docs/diagram.svg", ".agents/skills/example/SKILL.md"):
-            self.assertTrue(documentation_path(path), path)
-        for path in ("", "src/lib.rs", "crates/foo/tests/fixtures/data.md", "Cargo.lock", "build.rs", "deploy/chart.yaml", ".github/workflows/ci.yml", "scripts/dev_build.sh", "assets/logo.png", "docs/test.rs", "README.md\n", "../README.md"):
-            self.assertFalse(documentation_path(path), path)
-
-    def test_git_range_includes_deleted_source_and_rename_origins(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            def git(*args):
-                return subprocess.check_output(["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=CI Test", "-c", "user.email=ci@example.invalid", *args], cwd=root, stderr=subprocess.PIPE).decode().strip()
-            git("init", "-q")
-            (root / "server.rs").write_text("fn main() {}\n")
-            (root / "README.md").write_text("old\n")
-            git("add", "."); git("commit", "-qm", "base")
-            base = git("rev-parse", "HEAD")
-            (root / "README.md").write_text("new\n")
-            git("add", "."); git("commit", "-qm", "docs")
-            docs = git("rev-parse", "HEAD")
-            self.assertEqual(select_mode("pull_request", base, docs, root), "docs")
-            (root / "server.rs").rename(root / "server.md")
-            git("add", "-A"); git("commit", "-qm", "rename source")
-            head = git("rev-parse", "HEAD")
-            self.assertEqual(select_mode("pull_request", base, head, root), "full")
-            self.assertEqual(select_mode("pull_request", docs, docs, root), "full")
-            self.assertEqual(select_mode("pull_request", "0" * 40, head, root), "full")
-            self.assertEqual(select_mode("pull_request", "--output=bad", head, root), "full")
-            self.assertEqual(select_mode("merge_group", base, docs, root), "full")
-
-    def test_event_contract_requires_complete_candidate_and_optional_lanes(self):
-        ordinary = expected_results("full", "pull_request", "refs/pull/1/merge")
-        self.assertEqual({job for job, state in ordinary.items() if state == "skipped"}, set(OPTIONAL_JOBS + EXTENDED_FEATURE_JOBS))
-        docs = expected_results("docs", "pull_request", "refs/pull/1/merge")
-        self.assertEqual({job for job, state in docs.items() if state == "success"}, set(ALWAYS_JOBS))
-        e2e = expected_results("e2e", "pull_request", "refs/pull/1/merge")
-        self.assertEqual({job for job, state in e2e.items() if state == "success"}, set(ALWAYS_JOBS + E2E_JOBS))
-        for event in ("schedule", "workflow_dispatch", "merge_group", "push"):
-            result = expected_results("full", event, "refs/heads/main")
-            for job in CODE_JOBS:
-                self.assertEqual(result[job], "skipped" if event == "push" and job in EXTENDED_FEATURE_JOBS else "success", (event, job))
-            self.assertEqual(result["e2e-full"], "skipped" if event == "schedule" else "success")
-            self.assertEqual(result["e2e-tests-rio-v2"], "success" if event in ("schedule", "workflow_dispatch") else "skipped")
-            with self.assertRaises(ValueError):
-                expected_results("docs", event, "refs/heads/main")
-            with self.assertRaises(ValueError):
-                expected_results("e2e", event, "refs/heads/main")
-
-    def test_every_wrong_result_missing_job_or_selection_fails_closed(self):
-        for mode, event in (("full", "pull_request"), ("docs", "pull_request"), ("e2e", "pull_request"), ("full", "push"), ("full", "schedule"), ("full", "workflow_dispatch"), ("full", "merge_group")):
-            good = {job: {"result": value} for job, value in expected_results(mode, event, "refs/heads/main").items()}
-            good["classify-changes"]["outputs"] = {"mode": mode}
-            self.assertEqual(verify_results(good, event, "refs/heads/main"), [])
-            for job in good:
-                for value in ("success", "skipped", "failure", "cancelled", "neutral", "", None):
-                    if value == good[job]["result"]:
-                        continue
-                    with self.subTest(mode=mode, event=event, job=job, result=value):
-                        bad = {**good, job: {**good[job], "result": value}}
-                        self.assertTrue(verify_results(bad, event, "refs/heads/main"))
-                self.assertTrue(verify_results({key: value for key, value in good.items() if key != job}, event, "refs/heads/main"))
-                missing_result = {key: value for key, value in good[job].items() if key != "result"}
-                self.assertTrue(verify_results({**good, job: missing_result}, event, "refs/heads/main"))
-            self.assertTrue(verify_results({**good, "unknown-job": {"result": "success"}}, event, "refs/heads/main"))
-            for selection in ({}, {"mode": ""}, {"mode": True}, []):
-                bad = {**good, "classify-changes": {"result": "success", "outputs": selection}}
-                self.assertTrue(verify_results(bad, event, "refs/heads/main"))
-
-    def test_full_e2e_gate_preserves_workflow_branch_and_event_scope(self):
-        for event, ref, required in (
-            ("push", "refs/heads/main", "success"),
-            ("push", "refs/heads/gateway/integration", "success"),
-            ("push", "refs/heads/gateway/integration-old", "skipped"),
-            ("push", "refs/heads/release", "skipped"),
-            ("push", "refs/heads/feature", "skipped"),
-            ("push", "refs/heads/release-candidate", "skipped"),
-            ("push", "refs/tags/release", "skipped"),
-            ("pull_request", "refs/pull/1/merge", "skipped"),
-            ("schedule", "refs/heads/release", "skipped"),
-            ("workflow_dispatch", "refs/heads/feature", "success"),
-            ("merge_group", "refs/heads/gh-readonly-queue/release/pr-1", "success"),
-        ):
-            with self.subTest(event=event, ref=ref):
-                expected = expected_results("full", event, ref)
-                self.assertEqual(expected["e2e-full"], required)
-                needs = {job: {"result": result} for job, result in expected.items()}
-                needs["classify-changes"]["outputs"] = {"mode": "full"}
-                for result in ("success", "skipped", "failure", "cancelled"):
-                    needs["e2e-full"]["result"] = result
-                    self.assertEqual(verify_results(needs, event, ref) == [], result == required)
-
-    def test_repository_wiring_and_missing_dependency_regression(self):
-        self.assertEqual(check_workflow(ROOT), [])
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / ".github/workflows").mkdir(parents=True)
-            source = (ROOT / ".github/workflows/ci.yml").read_text()
-            path = root / ".github/workflows/ci.yml"
-            for condition in ("false", "github.event_name == 'schedule'", "github.event_name != 'pull_request'"):
-                path.write_text(source.replace("      - name: Run clippy lints\n", f"      - name: Run clippy lints\n        if: {condition}\n", 1))
-                self.assertIn("workspace Clippy must run on every event, pull requests included", check_workflow(root))
-            path.write_text(source.replace("cargo clippy --all-targets -- -D warnings", "cargo clippy --all-targets", 1))
-            self.assertIn("workspace Clippy must run on every event, pull requests included", check_workflow(root))
-            for job in EXTENDED_FEATURE_JOBS:
-                before, block = source.split(f"  {job}:\n", 1)
-                for condition in ("false", "github.event_name == 'schedule'", "github.event_name != 'pull_request'"):
-                    changed = re.sub(r"^    if: .*", f"    if: {condition}", block, count=1, flags=re.MULTILINE)
-                    path.write_text(before + f"  {job}:\n" + changed)
-                    self.assertIn(f"{job} must run on every merge-group, scheduled and manual event", check_workflow(root))
-            for job in ALWAYS_JOBS + CODE_JOBS + OPTIONAL_JOBS:
-                before, gate = source.split("  required-checks:\n", 1)
-                path.write_text(before + "  required-checks:\n" + gate.replace(f"      - {job}\n", "", 1))
-                self.assertTrue(check_workflow(root), job)
-            for old, new in (
-                ("run: python3 scripts/ci_gate.py verify", "run: python3 scripts/ci_gate.py verify || true"),
-                ("run: python3 scripts/ci_gate.py verify", "run: python3 scripts/ci_gate.py verify\n          || true"),
-                ("CI_NEEDS: ${{ toJSON(needs) }}", "CI_NEEDS: '{}'"),
-                ("name: Test and Lint\n", "name: Unrequired result\n"),
-                ("        shell: bash\n        run: python3 scripts/ci_gate.py verify", "        shell: echo {0}\n        run: python3 scripts/ci_gate.py verify"),
-                ("        shell: bash\n        run: python3 scripts/ci_gate.py verify", "        run: python3 scripts/ci_gate.py verify"),
-                ("        run: python3 scripts/ci_gate.py verify", '        "if": false\n        run: python3 scripts/ci_gate.py verify'),
-            ):
-                path.write_text(source.replace(old, new))
-                self.assertTrue(check_workflow(root), new)
-            for job in ALWAYS_JOBS + CODE_JOBS + OPTIONAL_JOBS:
-                for field in ("continue-on-error", '"continue-on-error"', "'continue-on-error'"):
-                    path.write_text(source.replace(f"  {job}:\n", f"  {job}:\n    {field}: true\n", 1))
-                    self.assertTrue(check_workflow(root), (job, field))
-                    before, block = source.split(f"  {job}:\n", 1)
-                    block = block.replace("      - name:", f"      - {field}: true\n        name:", 1)
-                    path.write_text(before + f"  {job}:\n" + block)
-                    self.assertTrue(check_workflow(root), (job, field, "step"))
-            path.write_text(source + "\n  cancel-after-test-and-lint-failure:\n    runs-on: ubuntu-latest\n")
-            self.assertTrue(check_workflow(root))
-
-    def test_report_only_stack_lane_mirrors_e2e_smoke_outside_the_aggregate(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / ".github/workflows").mkdir(parents=True)
-            source = (ROOT / ".github/workflows/ci.yml").read_text()
-            path = root / ".github/workflows/ci.yml"
-            before, lane = source.split("  e2e-tests-gateway:\n", 1)
-            lane, after = lane.split("  e2e-full:\n", 1)
-            legacy = before.split("  e2e-tests:\n", 1)[1]
-
-            def with_lane(text):
-                return before + "  e2e-tests-gateway:\n" + text + "  e2e-full:\n" + after
-
-            smoke = "--profile e2e-smoke --archive-file"
-            run_ignored = "--profile e2e-smoke --run-ignored all --archive-file"
-            for case, broken in enumerate((
-                # The lane can neither gate the aggregate nor vanish.
-                source.replace("      - e2e-tests\n", "      - e2e-tests\n      - e2e-tests-gateway\n", 1),
-                before + "  e2e-full:\n" + after,
-                # It must select the gateway stack.
-                with_lane(lane.replace("RUSTFS_S3_STACK: gateway", "RUSTFS_S3_STACK: legacy")),
-                with_lane(lane.replace("    env:\n      RUSTFS_S3_STACK: gateway\n", "")),
-                # Its suite must not drift from the required lane in either direction.
-                with_lane(lane.replace(smoke, run_ignored)),
-                with_lane(lane).replace(legacy, legacy.replace(smoke, run_ignored), 1),
-                with_lane(lane.replace("check_security_smoke_count.sh check", "check_security_smoke_count.sh update")),
-                with_lane(lane.replace("      - name: Run e2e smoke suite\n", "      - name: Run gateway smoke suite\n")),
-            )):
-                path.write_text(broken)
-                self.assertTrue(check_workflow(root), case)
-            path.write_text(with_lane(lane.replace("          if-no-files-found: warn\n", "          if-no-files-found: ignore\n")))
-            self.assertEqual(check_workflow(root), [], "only the mirrored archive and run steps are bound")
-
-    def test_job_ids_and_display_names_cannot_hide_validation(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / ".github/workflows").mkdir(parents=True)
-            source = (ROOT / ".github/workflows/ci.yml").read_text()
-            path = root / ".github/workflows/ci.yml"
-            for header in ("typos", "'typos'", '"typos"'):
-                path.write_text(source.replace("  typos:\n", f"  {header}: # spelling\n"))
-                self.assertEqual(check_workflow(root), [], header)
-            for name in ("Test and Lint # required", "'Test and Lint'", '"Test and Lint" # required'):
-                path.write_text(source.replace("    name: Test and Lint\n", f"    name: {name}\n"))
-                self.assertEqual(check_workflow(root), [], name)
-            for key in ("'name'", '"name"'):
-                path.write_text(source.replace("    name: Typos\n", f"    {key}: Typos\n"))
-                self.assertEqual(check_workflow(root), [], key)
-            for header in ("new_test", "NewTest", "_new_test", "'new_test'", '"new_test"', '"new\\u005ftest"'):
-                path.write_text(source + f"\n  {header}:\n    name: New test\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 1\n")
-                self.assertTrue(check_workflow(root), header)
-            path.write_text(source + "\n  'typos':\n    name: Duplicate\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 1\n")
-            self.assertIn("duplicate CI job ID: typos", check_workflow(root))
-            for name in (
-                "Test and Lint", "Test and Lint # duplicate", "'Test and Lint'",
-                '"Test and Lint" # duplicate', '"Test\\u0020and Lint"',
-                ">-\n      Test and Lint", "|-\n      Test and Lint", "Test and\n      Lint",
-                "*required_name", "&required_name Test and Lint", "!!str Test and Lint",
-                "${{ 'Test and Lint' }}", '"${{ github.event.inputs.check_name }}"',
-            ):
-                path.write_text(source.replace("    name: Typos\n", f"    name: {name}\n"))
-                self.assertTrue(check_workflow(root), name)
-            path.write_text(source.replace("    name: Typos\n", ""))
-            self.assertIn("typos must use a verifiable single-line display name", check_workflow(root))
-
-    def test_verify_command_preserves_failures(self):
-        good = {job: {"result": value} for job, value in expected_results("full", "pull_request", "refs/pull/1/merge").items()}
-        good["classify-changes"]["outputs"] = {"mode": "full"}
-        failed = {**good, "e2e-tests": {"result": "failure"}}
-        for needs, code in ((json.dumps(good), 0), (json.dumps(failed), 1), ("{}", 1), ("{", 1)):
-            with self.subTest(needs=needs):
-                env = dict(os.environ, CI_NEEDS=needs, GITHUB_EVENT_NAME="pull_request", GITHUB_REF="refs/pull/1/merge")
-                result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "verify"], env=env, capture_output=True, text=True)
-                self.assertEqual(result.returncode, code, result.stderr)
-                self.assertIn("ERROR:" if code else "CI contract passed", result.stderr if code else result.stdout)
-
-    def test_merged_ilm_step_preserves_exit_status_and_core_report(self):
-        from check_test_wiring import yaml_block
-        from test_security_workflow import named_steps, shell_body
-
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text().splitlines()
-        step = named_steps(yaml_block(workflow, "test-and-lint", 2))["Run ignored ILM integration tests serially"]
-        body = shell_body(step)
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            commands = root / "bin"
-            commands.mkdir()
-            # Exercise the actual pipeline without building the workspace.
-            fake_timeout = commands / "timeout"
-            fake_timeout.write_text('#!/bin/sh\nshift 4\nexec "$@"\n')
-            fake_timeout.chmod(0o755)
-            cargo = commands / "cargo"
-            cargo.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ILM_ARGS"\nexit "$ILM_STATUS"\n')
-            cargo.chmod(0o755)
-            report = root / "target/nextest/ci/junit.xml"
-            report.parent.mkdir(parents=True)
-            report.write_text("existing workspace report")
-            args = root / "args.txt"
-            for status in (0, 23, 124):
-                env = dict(os.environ, PATH=f"{commands}{os.pathsep}{os.environ['PATH']}",
-                           ILM_ARGS=str(args), ILM_STATUS=str(status))
-                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=root, env=env, capture_output=True, text=True)
-                self.assertEqual(result.returncode, status, result.stderr)
-                self.assertEqual(report.read_text(), "existing workspace report")
-                arguments = args.read_text().splitlines()
-                self.assertEqual(arguments[:9], ["nextest", "run", "--profile", "default", "-j1", "--run-ignored", "ignored-only", "--all", "--exclude"])
-                self.assertEqual(arguments[9], "e2e_test")
-                self.assertIn(f"exit_status={status}", (root / "artifacts/ilm-integration/diagnostics.txt").read_text())
-
-    def test_actual_selector_bootstrap_uses_base_policy_and_fails_closed(self):
-        from check_test_wiring import yaml_block
-        jobs = yaml_block((ROOT / ".github/workflows/ci.yml").read_text().splitlines(), "jobs", 0)
-        selector = yaml_block(jobs, "classify-changes", 2)
-        body = "\n".join(line[10:] for line in selector[selector.index("        run: |") + 1:])
-        for event, changed, base_sha, available, broken, expected in (
-            ("pull_request", "README.md", "b" * 40, True, False, "docs"),
-            ("pull_request", "src/server.rs", "b" * 40, True, False, "full"),
-            ("pull_request", "crates/e2e_test/src/distributed/harness.rs", "b" * 40, True, False, "e2e"),
-            ("pull_request", "crates/e2e_test/Cargo.toml", "b" * 40, True, False, "full"),
-            ("pull_request", ".config/nextest.toml", "b" * 40, True, False, "full"),
-            ("pull_request", "README.md", "b" * 40, False, False, "full"),
-            ("merge_group", "README.md", "b" * 40, False, False, "full"),
-            ("pull_request", "README.md", "b" * 40, True, True, None),
-            ("pull_request", "README.md", "", True, True, "full"),
-        ):
-            with self.subTest(event=event, changed=changed, available=available, broken=broken), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                (root / "scripts").mkdir()
-                (root / "scripts/ci_gate.py").write_text("raise SystemExit(71)\n")
-                (root / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
-                (root / "python3").symlink_to(sys.executable)
-                base = root / "base-policy.py"
-                base.write_text("raise SystemExit(29)\n" if broken else Path(__file__).read_text())
-                git = root / "git"
-                git.write_text('''#!/bin/sh
-if [ "$1" = show ]; then
-  [ "$2" = "$CI_BASE_SHA:scripts/ci_gate.py" ] || exit 19
-  [ "$BASE_AVAILABLE" = yes ] || exit 128
-  cat "$BASE_POLICY"
-elif [ "$1" = diff ]; then
-  printf '%s\\0' "$CHANGED_PATH"
-else
-  exit 20
-fi
-''')
-                git.chmod(0o755)
-                output = root / "output"
-                output.touch()
-                env = dict(os.environ, GITHUB_EVENT_NAME=event, CI_BASE_SHA=base_sha, GITHUB_SHA="c" * 40,
-                           RUNNER_TEMP=str(root), GITHUB_OUTPUT=str(output), BASE_POLICY=str(base),
-                           BASE_AVAILABLE="yes" if available else "no", CHANGED_PATH=changed,
-                           PATH=f"{root}{os.pathsep}{os.environ['PATH']}")
-                result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", body], cwd=root, env=env, capture_output=True, text=True)
-                self.assertEqual(result.returncode, 29 if expected is None else 0, result.stderr)
-                self.assertEqual(output.read_text(), "" if expected is None else f"mode={expected}\n")
+                        for job in required | {"required-checks"}:
+                            should_run = expected.get(job, "success") == "success" if job != "required-checks" else action != "closed"
+                            try:
+                                actual = scheduled(job)
+                            except (KeyError, TypeError, ValueError) as error:
+                                errors.append(f"{job}: {error}")
+                                continue
+                            if actual != should_run:
+                                errors.append(f"{job} condition differs from plan for {event}/{mode}/{connect}/{action}/{ref}")
+                        for status in ("failure", "cancelled"):
+                            context.update(success=False, failure=status == "failure", cancelled=status == "cancelled")
+                            try:
+                                if condition(gate.get("if", "true"), context) != (action != "closed") or not re.search(r"\balways\s*\(", re.sub(r"'(?:[^']|'')*'", "", gate.get("if", ""))):
+                                    errors.append("required-checks must run after failed or skipped dependencies")
+                            except (TypeError, ValueError) as error:
+                                errors.append(str(error))
+    return sorted(set(errors))
 
 
 def main() -> int:
     if sys.argv[1:] == ["--self-test"]:
-        return not unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(SelfTests)).wasSuccessful()
+        suite = unittest.defaultTestLoader.discover(str(ROOT / "scripts"), pattern="test_ci_plan.py")
+        return not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()
     if sys.argv[1:] == ["select"]:
-        mode = select_mode(os.environ.get("GITHUB_EVENT_NAME", ""), os.environ.get("CI_BASE_SHA", ""), os.environ.get("GITHUB_SHA", ""), Path.cwd())
-        with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-            output.write(f"mode={mode}\n")
-        print(f"CI selection: {mode}")
-        return 0
+        try:
+            plan = select_plan(os.environ.get("GITHUB_EVENT_NAME", ""), os.environ.get("CI_BASE_SHA", ""),
+                               os.environ.get("GITHUB_SHA", ""), os.environ.get("GITHUB_REF", ""),
+                               Path.cwd(), os.environ.get("CI_EVENT_ACTION", ""))
+            with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                for name, value in (("mode", plan["mode"]), ("plan", json.dumps(plan, separators=(",", ":"))),
+                                    ("connect", str(plan["connect"]).lower()), ("packages", json.dumps(plan["packages"], separators=(",", ":"))),
+                                    ("full_validation", str(plan["full_validation"]).lower())):
+                    output.write(f"{name}={value}\n")
+            print(json.dumps(plan, indent=2))
+            if os.environ.get("GITHUB_STEP_SUMMARY"):
+                with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+                    summary.write("### CI validation plan\n\n```json\n" + json.dumps(plan, indent=2) + "\n```\n")
+            return 0
+        except (OSError, subprocess.CalledProcessError, UnicodeError, KeyError, TypeError, ValueError) as error:
+            print(f"ERROR: cannot safely plan CI: {error}", file=sys.stderr)
+            return 1
     if sys.argv[1:] == ["verify"]:
         try:
-            errors = verify_results(json.loads(os.environ["CI_NEEDS"]), os.environ.get("GITHUB_EVENT_NAME", ""), os.environ.get("GITHUB_REF", ""))
-        except (KeyError, ValueError) as error:
+            head = os.environ.get("GITHUB_SHA", "")
+            tree = git(Path.cwd(), "rev-parse", f"{head}^{{tree}}").strip() if SHA.fullmatch(head) else ""
+            event = os.environ.get("GITHUB_EVENT_NAME", "")
+            base, action = None, None
+            if os.environ.get("GITHUB_EVENT_PATH"):
+                payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+                base = (payload["pull_request"]["base"]["sha"] if event == "pull_request" else
+                        payload["merge_group"]["base_sha"] if event == "merge_group" else payload.get("before", ""))
+                action = payload.get("action", "")
+            errors = verify_results(json.loads(os.environ["CI_NEEDS"]), event, os.environ.get("GITHUB_REF", ""), head, tree, base, action)
+        except (OSError, KeyError, TypeError, ValueError, subprocess.CalledProcessError) as error:
             errors = [str(error)]
     elif sys.argv[1:] == ["--check-workflow"]:
         errors = check_workflow(ROOT)
