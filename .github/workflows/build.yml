@@ -398,7 +398,7 @@ jobs:
 
           FEATURE_ARGS=()
           if [[ -n "${{ matrix.features }}" ]]; then
-            FEATURE_ARGS=(--features "${{ matrix.features }}")
+            FEATURE_ARGS=(--features "${{ matrix.features }},diagnostic-prefix-attribution")
           fi
 
           # gnu targets pin an explicit glibc baseline (`<target>.<glibc>` for
@@ -455,7 +455,7 @@ jobs:
         shell: bash
         run: |
           cargo metadata --locked --format-version 1 --filter-platform '${{ matrix.target }}' \
-            --features rustfs/pyroscope > "$RUNNER_TEMP/cpu-catalog-metadata.json"
+            --features rustfs/pyroscope,rustfs/diagnostic-prefix-attribution > "$RUNNER_TEMP/cpu-catalog-metadata.json"
           features=$(jq -ce '
             (.packages[] | select(.name == "rustfs") | .id) as $id |
             .resolve.nodes[] | select(.id == $id) | .features | map(select(. != "default")) | sort
