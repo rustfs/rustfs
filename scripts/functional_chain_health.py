@@ -99,8 +99,9 @@ def expected_attempt(run):
     name = f"functional-plan-{run['id']}-{run['run_attempt']}"
     artifacts = [item for item in run_artifacts(run["id"]) if item.get("name") == name]
     if not artifacts:
-        # Package/tools/inspection/recovery entrypoints do not select suites.
-        return False
+        # Missing evidence cannot distinguish a non-suite dispatch from a
+        # full-plan attempt that failed before uploading its selection.
+        return True
     require(len(artifacts) == 1, "ambiguous suite plan artifact")
     artifact = artifacts[0]
     require(type(artifact.get("size_in_bytes")) is int and 0 < artifact["size_in_bytes"] <= 1024 * 1024,
@@ -141,9 +142,8 @@ def collect(limit=100, source_ref="main"):
     workflow = api(f"repos/{REPOSITORY}/actions/workflows/{WORKFLOW}")
     expected_sha = expected_source_sha(source_ref)
     runs = list_runs(limit)
-    # Manual full-plan attempts can refresh evidence; package/tools/recovery
-    # jobs do not claim suite completion. Automatic attempts remain visible
-    # even if they never produce an artifact.
+    # Only verified partial plans exclude manual attempts. Missing evidence
+    # must not hide an early failure behind an older complete success.
     runs.sort(key=lambda run: timestamp(run["run_started_at"]), reverse=True)
     result = {"schema": 1, "observed_at": observed.isoformat(), "workflow_state": workflow["state"],
               "owner": ENTRY["owner"], "policy": ENTRY["policy"], "scan_limit": limit,

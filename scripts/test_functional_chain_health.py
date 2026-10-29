@@ -160,8 +160,33 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(result["latest_attempt"]["conclusion"], "cancelled")
         self.assertTrue(result["last_complete_success"]["release"]["fresh"])
 
+    def test_manual_attempt_without_plan_cannot_hide_behind_recent_success(self):
+        old = {**self.run, "status": "completed", "conclusion": "success"}
+        complete = self.validate()
+        for status, conclusion in (("completed", "failure"), ("completed", "cancelled"), ("in_progress", None), ("completed", "success")):
+            with self.subTest(status=status, conclusion=conclusion):
+                new = {**old, "id": 124, "run_started_at": self.now, "event": "workflow_dispatch",
+                       "status": status, "conclusion": conclusion}
+                payload = {"workflow_runs": [new, old], "total_count": 2}
+                responses = [{"state": "active"}, {"object": {"sha": "b" * 40}}, payload, new,
+                             {"total_count": 0, "artifacts": []}, old, payload, {"object": {"sha": "b" * 40}}]
 
-    def test_manual_full_plan_failure_is_latest_but_subset_and_tools_are_not(self):
+                def completed(run):
+                    if run["id"] == new["id"]:
+                        raise ValueError("missing complete-chain artifact")
+                    return complete
+
+                with mock.patch.object(health, "api", side_effect=responses), \
+                     mock.patch.object(health, "complete_success", side_effect=completed):
+                    result = health.collect(source_ref="release")
+                self.assertFalse(result["healthy"])
+                self.assertEqual(result["latest_attempt"]["run_id"], 124)
+                self.assertEqual(result["latest_attempt"]["conclusion"], conclusion)
+                self.assertNotEqual(result["latest_attempt"]["verification"], "complete")
+                self.assertTrue(result["last_complete_success"]["release"]["fresh"])
+
+
+    def test_manual_full_plan_failure_is_latest_but_verified_subset_is_not(self):
         import hashlib
         import io
         import zipfile
@@ -179,7 +204,7 @@ class HealthTests(unittest.TestCase):
             with mock.patch.object(health, "api", side_effect=[{"total_count": 1, "artifacts": [artifact]}, raw]):
                 self.assertEqual(health.expected_attempt(run), expected)
         with mock.patch.object(health, "api", return_value={"total_count": 0, "artifacts": []}):
-            self.assertFalse(health.expected_attempt(run))
+            self.assertTrue(health.expected_attempt(run))
         new = {**run, "status": "completed", "conclusion": "failure", "id": 124, "run_started_at": self.now}
         old = {**self.run, "status": "completed", "conclusion": "success"}
         payload = {"workflow_runs": [new, old], "total_count": 2}
