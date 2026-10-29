@@ -93,6 +93,12 @@ jobs:
             printf 'TMPDIR=%s-scratch\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
           } >> "${GITHUB_ENV}"
 
+      - name: Checkout environment guard
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+          path: rustfs-tools
+
       - name: Checkout auto-testing scripts
         timeout-minutes: 5
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -117,6 +123,13 @@ jobs:
           aws --version
           echo "auto-testing: ${AUTO_TESTING_SHA}"
           df -h /data | tail -1
+
+      - name: Admit clean shared environment
+        id: environment
+        timeout-minutes: 5
+        env:
+          FUNCTIONAL_ENVIRONMENT_RECEIPT: ${{ runner.temp }}/environment-matrix.json
+        run: python3 rustfs-tools/scripts/functional_environment.py enter --suite fault-tolerance
 
       - name: Cleanup environment (before)
         timeout-minutes: 5
@@ -215,7 +228,24 @@ jobs:
           if-no-files-found: warn
 
       - name: Cleanup environment (after)
+        id: environment_cleanup
         timeout-minutes: 5
-        if: ${{ always() && inputs.cleanup_after != 'false' }}
+        if: ${{ always() && inputs.cleanup_after != 'false' && steps.environment.outcome == 'success' }}
         run: |
-          ./auto-testing/rustfs-fault-tolerance-test.sh --cleanup -y --log-file "${LOG_FILE}" || true
+          ./auto-testing/rustfs-fault-tolerance-test.sh --cleanup -y --log-file "${LOG_FILE}"
+
+      - name: Release environment only after successful cleanup
+        if: ${{ always() && steps.environment.outcome == 'success' }}
+        timeout-minutes: 5
+        env:
+          FUNCTIONAL_ENVIRONMENT_RECEIPT: ${{ runner.temp }}/environment-matrix.json
+          CLEANUP_OUTCOME: ${{ steps.environment_cleanup.outcome }}
+        run: python3 rustfs-tools/scripts/functional_environment.py finish --suite fault-tolerance --cleanup-outcome "$CLEANUP_OUTCOME"
+
+      - name: Retain environment ownership and cleanup receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: functional-environment-matrix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/environment-matrix.json
+          if-no-files-found: error

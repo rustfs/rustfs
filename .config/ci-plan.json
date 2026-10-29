@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "rollout": "shadow",
+  "core_packages": ["rustfs", "rustfs-ecstore", "rustfs-filemeta", "rustfs-iam", "rustfs-policy"],
+  "connect_packages": [
+    "rustfs-credentials", "rustfs-config", "rustfs-common", "rustfs-crypto",
+    "rustfs-iam", "rustfs-policy", "rustfs-kms", "rustfs-license", "rustfs-security-governance",
+    "rustfs-utils", "rustfs-tls-runtime", "rustfs-trusted-proxies", "rustfs-filemeta",
+    "rustfs-lock", "rustfs-obs", "rustfs-signer", "rustfs-io-metrics", "rustfs-s3-ops"
+  ],
+  "full_paths": [
+    "Cargo.toml", "Cargo.lock", "*/Cargo.toml", "rust-toolchain*", "rustfmt.toml",
+    "clippy.toml", ".cargo/*", ".config/*", ".github/*", "Makefile",
+    "scripts/*", "build.rs", "*.proto"
+  ]
+}
