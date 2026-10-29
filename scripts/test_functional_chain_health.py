@@ -16,7 +16,7 @@ class HealthTests(unittest.TestCase):
         now = datetime.now(timezone.utc)
         self.now = now.isoformat()
         self.run = {"id": 123, "run_attempt": 2, "head_sha": "a" * 40, "html_url": "https://github.com/rustfs/rustfs/actions/runs/123",
-                    "run_started_at": (now - timedelta(hours=1)).isoformat()}
+                    "run_started_at": (now - timedelta(hours=1)).isoformat(), "event": "workflow_run"}
         self.candidate = {"manifest": {"build_run_id": 456, "build_run_attempt": 3, "source_ref": "release", "source_sha": "b" * 40},
                           "workflow_sha": "c" * 40, "workflow_ref": "main", "build_started_at": (now - timedelta(hours=2)).isoformat()}
         self.chain = {"run_id": 123, "attempt": 2, "workflow_sha": "a" * 40, "testing_sha": "d" * 40, "candidate": self.candidate}
@@ -85,8 +85,8 @@ class HealthTests(unittest.TestCase):
 
     def test_collection_rejects_a_concurrent_rerun(self):
         run = {**self.run, "status": "completed", "conclusion": "failure"}
-        responses = [{"state": "active"}, {"workflow_runs": [run]}, run,
-                     {"workflow_runs": [{**run, "run_attempt": 3, "status": "queued"}]}]
+        responses = [{"state": "active"}, {"object": {"sha": "b" * 40}}, {"workflow_runs": [run], "total_count": 1}, run,
+                     {"workflow_runs": [{**run, "run_attempt": 3, "status": "queued"}], "total_count": 1}]
         with mock.patch.object(health, "api", side_effect=responses):
             with self.assertRaisesRegex(ValueError, "changed during inspection"):
                 health.collect()
@@ -95,10 +95,115 @@ class HealthTests(unittest.TestCase):
         run = {**self.run, "status": "completed", "conclusion": "success"}
         complete = self.validate()
         for expected, healthy in (("release", True), ("refs/heads/release", True), ("main", False)):
-            responses = [{"state": "active"}, {"workflow_runs": [run]}, run, {"workflow_runs": [run]}]
+            responses = [{"state": "active"}, {"object": {"sha": "b" * 40}}, {"workflow_runs": [run], "total_count": 1}, run,
+                         {"workflow_runs": [run], "total_count": 1}, {"object": {"sha": "b" * 40}}]
             with mock.patch.object(health, "api", side_effect=responses), mock.patch.object(health, "complete_success", return_value=complete):
                 result = health.collect(source_ref=expected)
             self.assertEqual(result["healthy"], healthy)
+
+    def test_same_source_new_execution_refreshes_completion_even_for_old_build(self):
+        self.candidate["build_started_at"] = "2000-01-01T00:00:00Z"
+        complete = self.validate()
+        self.assertGreater(health.timestamp(complete["expires_at"]), datetime.now(timezone.utc))
+        run = {**self.run, "status": "completed", "conclusion": "success"}
+        payload = {"workflow_runs": [run], "total_count": 1}
+        responses = [{"state": "active"}, {"object": {"sha": "b" * 40}}, payload, run, payload,
+                     {"object": {"sha": "b" * 40}}]
+        with mock.patch.object(health, "api", side_effect=responses), mock.patch.object(health, "complete_success", return_value=complete):
+            self.assertTrue(health.collect(source_ref="release")["healthy"])
+        wrong = copy.deepcopy(self.summary)
+        wrong["chain"]["attempt"] = 1
+        with self.assertRaises(ValueError):
+            self.validate(wrong)
+
+    def test_success_on_stale_sha_or_incomplete_listing_never_becomes_healthy(self):
+        run = {**self.run, "status": "completed", "conclusion": "success"}
+        payload = {"workflow_runs": [run], "total_count": 1}
+        complete = self.validate()
+        responses = [{"state": "active"}, {"object": {"sha": "c" * 40}}, payload, run, payload,
+                     {"object": {"sha": "c" * 40}}]
+        with mock.patch.object(health, "api", side_effect=responses), mock.patch.object(health, "complete_success", return_value=complete):
+            result = health.collect(source_ref="release")
+        self.assertFalse(result["healthy"])
+        self.assertFalse(result["last_complete_success"]["release"]["fresh"])
+        with mock.patch.object(health, "api", side_effect=[{"workflow_runs": [run], "total_count": 2},
+                                                          {"workflow_runs": [], "total_count": 2}]):
+            with self.assertRaisesRegex(ValueError, "incomplete chain run page"):
+                health.list_runs(1)
+
+    def test_optional_omission_is_explicit_and_partial_manual_is_not_full_health(self):
+        from validation_registry import load_registry, select_plan
+        value = copy.deepcopy(self.summary)
+        value["plan"] = select_plan(load_registry())
+        value["suites"] = value["suites"][:-1]
+        value["skipped_lanes"] = ["performance"]
+        value["skip_reasons"] = {"performance": "optional fleet unavailable during preflight"}
+        self.assertEqual(self.validate(value)["skipped_lanes"], ["performance"])
+        del value["skip_reasons"]
+        with self.assertRaises(ValueError):
+            self.validate(value)
+        value = copy.deepcopy(self.summary)
+        value["plan"] = select_plan(load_registry(), requested="s3")
+        value["suites"] = [value["suites"][1]]
+        with self.assertRaisesRegex(ValueError, "partial"):
+            self.validate(value)
+
+    def test_new_failed_attempt_does_not_hide_behind_recent_complete_success(self):
+        old = {**self.run, "status": "completed", "conclusion": "success"}
+        new = {**old, "id": 124, "run_started_at": self.now, "conclusion": "cancelled"}
+        payload = {"workflow_runs": [new, old], "total_count": 2}
+        responses = [{"state": "active"}, {"object": {"sha": "b" * 40}}, payload, new, old, payload,
+                     {"object": {"sha": "b" * 40}}]
+        with mock.patch.object(health, "api", side_effect=responses), mock.patch.object(health, "complete_success", return_value=self.validate()):
+            result = health.collect(source_ref="release")
+        self.assertFalse(result["healthy"])
+        self.assertEqual(result["latest_attempt"]["conclusion"], "cancelled")
+        self.assertTrue(result["last_complete_success"]["release"]["fresh"])
+
+
+    def test_manual_full_plan_failure_is_latest_but_subset_and_tools_are_not(self):
+        import hashlib
+        import io
+        import zipfile
+        from validation_registry import load_registry, select_plan
+        run = {**self.run, "event": "workflow_dispatch"}
+        name = "functional-plan-123-2"
+        for suites, expected in (("", True), ("s3", False)):
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w") as archive:
+                archive.writestr("suite-plan.json", json.dumps(select_plan(load_registry(), requested=suites)))
+            raw = buffer.getvalue()
+            artifact = {"id": 77, "name": name, "expired": False, "size_in_bytes": len(raw),
+                        "digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+                        "workflow_run": {"id": 123, "head_sha": "a" * 40}}
+            with mock.patch.object(health, "api", side_effect=[{"total_count": 1, "artifacts": [artifact]}, raw]):
+                self.assertEqual(health.expected_attempt(run), expected)
+        with mock.patch.object(health, "api", return_value={"total_count": 0, "artifacts": []}):
+            self.assertFalse(health.expected_attempt(run))
+        new = {**run, "status": "completed", "conclusion": "failure", "id": 124, "run_started_at": self.now}
+        old = {**self.run, "status": "completed", "conclusion": "success"}
+        payload = {"workflow_runs": [new, old], "total_count": 2}
+        complete = self.validate()
+        responses = [{"state": "active"}, {"object": {"sha": "b" * 40}}, payload, new, old, payload,
+                     {"object": {"sha": "b" * 40}}]
+        with mock.patch.object(health, "api", side_effect=responses), \
+             mock.patch.object(health, "expected_attempt", return_value=True), \
+             mock.patch.object(health, "complete_success", return_value=complete):
+            result = health.collect(source_ref="release")
+        self.assertFalse(result["healthy"])
+        self.assertEqual(result["latest_attempt"]["run_id"], 124)
+
+    def test_artifact_pagination_must_be_complete_and_unique(self):
+        first = [{"id": index} for index in range(100)]
+        final = [{"id": 100}]
+        with mock.patch.object(health, "api", side_effect=[{"total_count": 101, "artifacts": first},
+                                                          {"total_count": 101, "artifacts": final}]):
+            self.assertEqual(len(health.run_artifacts(1)), 101)
+        for final in ([], [{"id": 0}]):
+            with mock.patch.object(health, "api", side_effect=[{"total_count": 101, "artifacts": first},
+                                                              {"total_count": 101, "artifacts": final}]):
+                with self.assertRaises(ValueError):
+                    health.run_artifacts(1)
 
     def test_publication_uses_the_read_blob_sha(self):
         current = {"schema": 1, "observed_at": self.now, "last_complete_success": {}, "healthy": False}
