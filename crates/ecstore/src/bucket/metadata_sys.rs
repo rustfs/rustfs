@@ -683,6 +683,7 @@ pub(crate) async fn update_validated_in<F>(
     bucket: &str,
     config_file: &str,
     data: Vec<u8>,
+    expected_incarnation_id: Option<Uuid>,
     validate: F,
 ) -> Result<OffsetDateTime>
 where
@@ -690,7 +691,7 @@ where
 {
     Box::pin(async {
         let sys = require_bucket_metadata_sys_in(ctx)?;
-        let guard = acquire_config_write_guard(sys.clone(), bucket).await?;
+        let guard = acquire_config_write_guard_for_incarnation(sys.clone(), bucket, expected_incarnation_id).await?;
         validate()?;
         update_under_config_write_guard(sys, &guard, config_file, data, None).await
     })
@@ -5198,6 +5199,61 @@ mod tests {
             replacement_incarnation,
             "peer reload must converge the complete cached metadata snapshot"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validated_config_update_rejects_a_different_bucket_incarnation() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "catalog-cleanup-incarnation";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("read bucket incarnation");
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let result = store
+            .update_bucket_metadata_config_for_incarnation_validated(
+                bucket,
+                "quota.json",
+                br#"{"quota":1}"#.to_vec(),
+                Uuid::new_v4(),
+                || {
+                    called.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(Error::BucketNotFound(name)) if name == bucket));
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "incarnation must be checked before the external fence"
+        );
+        let (metadata, _) = get_config_from_disk_with_presence_in(&store.ctx, bucket)
+            .await
+            .expect("read unchanged bucket metadata");
+        assert!(
+            metadata.quota_config_json.is_empty(),
+            "a stale cleanup must not modify the replacement bucket"
+        );
+        store
+            .update_bucket_metadata_config_for_incarnation_validated(
+                bucket,
+                "quota.json",
+                br#"{"quota":1}"#.to_vec(),
+                incarnation,
+                || Ok(()),
+            )
+            .await
+            .expect("the current incarnation permits the validated update");
+        let (metadata, _) = get_config_from_disk_with_presence_in(&store.ctx, bucket)
+            .await
+            .expect("read updated bucket metadata");
+        assert_eq!(metadata.quota_config_json, br#"{"quota":1}"#);
     }
 
     #[tokio::test]

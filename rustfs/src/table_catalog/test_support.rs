@@ -1142,6 +1142,17 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
             .await
     }
 
+    async fn delete_object_if_match_fenced_for_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        expected_etag: &str,
+        _expected_incarnation_id: Uuid,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        self.delete_object_if_match_fenced(bucket, object, expected_etag, fence).await
+    }
+
     async fn list_objects(&self, bucket: &str, prefix: &str) -> TableCatalogStoreResult<Vec<String>> {
         let mut state = self.state.lock().await;
         state.list_calls += 1;
@@ -1151,6 +1162,30 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
             .filter(|(entry_bucket, object)| entry_bucket == bucket && object.starts_with(prefix))
             .map(|(_, object)| object.clone())
             .collect())
+    }
+
+    async fn list_objects_for_cleanup(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> TableCatalogStoreResult<Vec<TableCatalogCleanupObject>> {
+        let mut state = self.state.lock().await;
+        state.list_calls += 1;
+        Ok(state
+            .objects
+            .iter()
+            .filter(|((entry_bucket, object), _)| entry_bucket == bucket && object.starts_with(prefix))
+            .map(|(key, record)| TableCatalogCleanupObject {
+                key: key.1.clone(),
+                version_id: None,
+                etag: (!state.etagless_objects.contains(key)).then(|| record.etag.clone()),
+                delete_marker: false,
+            })
+            .collect())
+    }
+
+    async fn ensure_no_multipart_uploads(&self, _bucket: &str) -> TableCatalogStoreResult<()> {
+        Ok(())
     }
 
     async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {

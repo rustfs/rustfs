@@ -7178,6 +7178,212 @@ async fn object_catalog_registration_scans_warehouse_prefixes_once() {
 }
 
 #[tokio::test]
+async fn object_catalog_registration_bounds_concurrent_catalog_reads() {
+    const MAX_CONCURRENT_READS: usize = 8;
+
+    let backend = TestCatalogObjectBackend {
+        reject_reads_while_write_locked: true,
+        ..Default::default()
+    };
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .unwrap();
+
+    let mut table_objects = Vec::new();
+    let mut index_objects = Vec::new();
+    for number in 0..MAX_CONCURRENT_READS + 2 {
+        let name = format!("orders_{number:02}");
+        let table = IdentifierSegment::parse(&name).unwrap();
+        let mut entry = test_table_entry(
+            bucket,
+            &namespace,
+            &table,
+            default_table_metadata_file_path(&namespace, &table, "00001.metadata.json"),
+        );
+        entry.table_id = format!("table-{name}");
+        entry.warehouse_location = format!("s3://{bucket}/tables/{name}");
+        store.create_table(entry).await.unwrap();
+        table_objects.push(store.paths.table_entry_path(bucket, &namespace, &table));
+        index_objects.push(store.paths.warehouse_index_entry_path(bucket, &format!("tables/{name}/")));
+    }
+
+    let mut scans = Vec::new();
+    for mut objects in [table_objects, index_objects] {
+        objects.sort();
+        let mut scan = Vec::new();
+        for object in objects {
+            let previous_reads = backend
+                .state
+                .lock()
+                .await
+                .read_attempts
+                .get(&(RUSTFS_META_BUCKET.to_string(), object.clone()))
+                .copied()
+                .unwrap_or_default();
+            let pause = backend.pause_before_next_read(RUSTFS_META_BUCKET, &object).await;
+            scan.push((object, pause, previous_reads));
+        }
+        scans.push(scan);
+    }
+
+    let table = IdentifierSegment::parse("new_orders").unwrap();
+    let mut entry = test_table_entry(
+        bucket,
+        &namespace,
+        &table,
+        default_table_metadata_file_path(&namespace, &table, "00001.metadata.json"),
+    );
+    entry.table_id = "new-table-id".to_string();
+    entry.warehouse_location = format!("s3://{bucket}/tables/new_orders");
+    let registering_store = store.clone();
+    let registration = tokio::spawn(async move { registering_store.create_table(entry).await });
+
+    for scan in scans {
+        for (_, pause, _) in scan.iter().take(MAX_CONCURRENT_READS) {
+            tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, pause.wait_started())
+                .await
+                .expect("independent catalog reads should start concurrently");
+        }
+        let state = backend.state.lock().await;
+        let started = scan
+            .iter()
+            .filter(|(object, _, previous_reads)| {
+                state
+                    .read_attempts
+                    .get(&(RUSTFS_META_BUCKET.to_string(), object.clone()))
+                    .copied()
+                    .unwrap_or_default()
+                    > *previous_reads
+            })
+            .count();
+        assert_eq!(started, MAX_CONCURRENT_READS, "catalog reads must respect the concurrency limit");
+        drop(state);
+        for (_, pause, _) in scan {
+            pause.release();
+        }
+    }
+
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, registration)
+        .await
+        .expect("registration should finish after its reads are released")
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .load_table(bucket, &namespace.public_name(), table.as_str())
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn object_catalog_registration_propagates_catalog_scan_read_errors() {
+    for fail_index_read in [false, true] {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let existing = IdentifierSegment::parse("orders").unwrap();
+        seed_table_for_metadata_maintenance(
+            &store,
+            bucket,
+            &namespace,
+            &existing,
+            default_table_metadata_file_path(&namespace, &existing, "00001.metadata.json"),
+        )
+        .await;
+        let failed_object = if fail_index_read {
+            store.paths.warehouse_index_entry_path(bucket, "tables/table-id/")
+        } else {
+            store.paths.table_entry_path(bucket, &namespace, &existing)
+        };
+        backend.fail_next_read(RUSTFS_META_BUCKET, &failed_object).await;
+
+        let table = IdentifierSegment::parse("returns").unwrap();
+        let mut entry = test_table_entry(
+            bucket,
+            &namespace,
+            &table,
+            default_table_metadata_file_path(&namespace, &table, "00001.metadata.json"),
+        );
+        entry.table_id = "new-table-id".to_string();
+        entry.warehouse_location = format!("s3://{bucket}/tables/new-table-id");
+        assert_matches!(
+            store.create_table(entry.clone()).await,
+            Err(TableCatalogStoreError::Internal(message)) if message.contains(&failed_object)
+        );
+        assert!(
+            store
+                .load_table(bucket, &namespace.public_name(), table.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .read_object(
+                    RUSTFS_META_BUCKET,
+                    &store.paths.warehouse_index_entry_path(bucket, "tables/new-table-id/")
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store
+            .create_table(entry)
+            .await
+            .expect("a failed scan must release its read locks for retry");
+    }
+}
+
+#[tokio::test]
+async fn object_catalog_registration_reuses_locked_deleted_entry() {
+    let backend = TestCatalogObjectBackend {
+        reject_reads_while_write_locked: true,
+        ..Default::default()
+    };
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .unwrap();
+    let mut entry = test_table_entry(
+        bucket,
+        &namespace,
+        &table,
+        default_table_metadata_file_path(&namespace, &table, "00001.metadata.json"),
+    );
+    entry.state = TableCatalogEntryState::Deleted;
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &store.paths.table_entry_path(bucket, &namespace, &table),
+            serde_json::to_vec(&entry).unwrap(),
+        )
+        .await;
+    entry.state = TableCatalogEntryState::Active;
+    entry.table_id = "replacement-table-id".to_string();
+    store.create_table(entry.clone()).await.unwrap();
+    assert_eq!(
+        store
+            .load_table(bucket, &namespace.public_name(), table.as_str())
+            .await
+            .unwrap(),
+        Some(entry)
+    );
+}
+
+#[tokio::test]
 async fn catalog_backings_reject_overlapping_registered_warehouse_prefixes() {
     let backend = TestCatalogObjectBackend::default();
     let store = ObjectTableCatalogStore::new(backend);

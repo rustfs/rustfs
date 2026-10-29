@@ -366,6 +366,8 @@ pub struct WalkOptions<Filter> {
     pub filter: Option<Filter>,
     pub marker: Option<String>,
     pub latest_only: bool,
+    /// Resolve every set at its version read quorum and fail on incomplete scans.
+    pub authoritative: bool,
     pub ask_disks: String,
     pub versions_sort: WalkVersionsSortOrder,
     pub limit: usize,
@@ -380,6 +382,7 @@ impl<Filter> Default for WalkOptions<Filter> {
             filter: None,
             marker: None,
             latest_only: false,
+            authoritative: false,
             ask_disks: String::new(),
             versions_sort: WalkVersionsSortOrder::default(),
             limit: 0,
@@ -999,6 +1002,7 @@ mod tests {
         assert!(opts.filter.is_none());
         assert!(opts.marker.is_none());
         assert!(!opts.latest_only);
+        assert!(!opts.authoritative);
         assert!(opts.ask_disks.is_empty());
         assert!(matches!(opts.versions_sort, WalkVersionsSortOrder::Ascending));
         assert_eq!(opts.limit, 0);

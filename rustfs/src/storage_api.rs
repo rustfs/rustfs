@@ -498,6 +498,10 @@ pub(crate) mod table {
             pub(crate) use super::super::super::storage_contracts::NamespaceLocking;
         }
 
+        pub(crate) mod multipart {
+            pub(crate) use super::super::super::storage_contracts::MultipartUploadInspection;
+        }
+
         pub(crate) mod object {
             pub(crate) use super::super::super::storage_contracts::{ObjectIO, ObjectOperations};
         }

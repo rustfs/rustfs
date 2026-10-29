@@ -1364,6 +1364,10 @@ impl ECStore {
     ) -> Result<()> {
         check_list_objs_args(bucket, prefix, &None)?;
 
+        if opts.authoritative {
+            return self.walk_authoritatively(rx, bucket, prefix, result, opts).await;
+        }
+
         let rx = rx.child_token();
         let mut futures = Vec::new();
         let mut inputs = Vec::new();
@@ -1518,6 +1522,57 @@ impl ECStore {
         }
 
         result
+    }
+
+    async fn walk_authoritatively(
+        self: Arc<Self>,
+        cancellation: CancellationToken,
+        bucket: &str,
+        prefix: &str,
+        result: Sender<ObjectInfoOrErr>,
+        opts: WalkOptions,
+    ) -> Result<()> {
+        let cancel = cancellation.child_token();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let mut scans = Vec::new();
+        let mut inputs = Vec::new();
+        for pool in &self.pools {
+            for set in &pool.disk_set {
+                let (sender, receiver) = mpsc::channel(1);
+                inputs.push(receiver);
+                let mut scan = recursive_walk_list_path_options(bucket.to_owned(), prefix, &opts);
+                // Internal absence checks must include reserved object prefixes.
+                scan.skip_hidden_prefix_check = true;
+                scans.push(set.list_versions_authoritatively(cancel.clone(), scan, sender));
+            }
+        }
+        if scans.is_empty() {
+            return Err(StorageError::ErasureReadQuorum);
+        }
+
+        let (sender, receiver) = mpsc::channel(100);
+        let forwarder = spawn_walk_entry_forwarder(cancel.clone(), receiver, result, opts, bucket.to_owned());
+        let merge = spawn_listing_merge(cancel.clone(), inputs, sender);
+        let scan_results = join_all(scans).await;
+        let merge_result = merge.await.map_err(Error::from)?;
+        let forward_result = forwarder.await.map_err(Error::from);
+
+        // An unavailable set cannot establish absence, even when another set
+        // completed. Only an explicitly missing directory or volume is empty.
+        for scan in scan_results {
+            match scan {
+                Ok(outcome) if !outcome.limit_reached => {}
+                Ok(_) => return Err(StorageError::ErasureReadQuorum),
+                Err(StorageError::FileNotFound | StorageError::VolumeNotFound) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        merge_result?;
+        forward_result?;
+        if cancellation.is_cancelled() {
+            return Err(Error::other("authoritative object walk was cancelled"));
+        }
+        Ok(())
     }
 }
 
@@ -2828,6 +2883,7 @@ mod test {
     use crate::error::{Result, StorageError};
     use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
     use crate::set_disk::{SetDisks, hermetic_set_disks_isolated};
+    use crate::storage_api_contracts::list::ListOperations as _;
     use crate::storage_api_contracts::namespace::NamespaceLocking as _;
     use crate::storage_api_contracts::object::ObjectIO as _;
     use bytes::Bytes;
@@ -6029,6 +6085,56 @@ mod test {
         Bytes::from(meta.marshal_msg().expect("encode fixture xl.meta"))
     }
 
+    #[tokio::test]
+    async fn authoritative_store_walk_includes_reserved_prefix_versions() {
+        let bucket = "catalog-cleanup-versions";
+        let name = ".rustfs-table/namespaces/ns/tables/table/metadata/metadata.json";
+        let (_dirs, store) = single_set_store(16).await;
+        let set = &store.pools[0].disk_set[0];
+        for (slot, disk) in set.disks.read().await.iter().enumerate() {
+            let disk = disk.as_ref().expect("fixture drive is online");
+            disk.make_volume(bucket).await.expect("create bucket volume");
+            disk.write_all(
+                bucket,
+                &format!("{name}/{STORAGE_FORMAT_FILE}"),
+                versioned_object_metadata(bucket, name, &[(2, 1_700_000_002), (1, 1_700_000_001)], slot),
+            )
+            .await
+            .expect("persist reserved metadata versions");
+        }
+        let (sender, mut receiver) = mpsc::channel(1);
+        let walk = store.clone().walk(
+            CancellationToken::new(),
+            bucket,
+            "",
+            sender,
+            super::WalkOptions {
+                authoritative: true,
+                ..Default::default()
+            },
+        );
+        let collect = async {
+            let mut versions = Vec::new();
+            while let Some(item) = receiver.recv().await {
+                assert!(item.err.is_none(), "reserved metadata must decode: {:?}", item.err);
+                let item = item.item.expect("walk must return an object");
+                versions.push((item.name, item.version_id));
+            }
+            versions
+        };
+        let (walk, versions) = timeout(Duration::from_secs(10), async { tokio::join!(walk, collect) })
+            .await
+            .expect("authoritative reserved-prefix walk must terminate");
+        walk.expect("authoritative walk must succeed");
+        assert_eq!(
+            versions,
+            [
+                (name.to_string(), Some(Uuid::from_u128(1))),
+                (name.to_string(), Some(Uuid::from_u128(2)))
+            ]
+        );
+    }
+
     // A versioned DeleteObject(versionId) can reach write quorum while three
     // drives are offline; they keep the deleted version after they return. A
     // different drive going offline later must not turn that sub-quorum
@@ -6098,6 +6204,22 @@ mod test {
             let (walk, ()) = timeout(Duration::from_secs(10), async { tokio::join!(walk, drain) })
                 .await
                 .expect("set walk must terminate");
+            assert!(matches!(walk, Err(StorageError::ErasureReadQuorum)), "{walk:?}");
+            let (sender, mut receiver) = mpsc::channel(16);
+            let walk = store.clone().walk(
+                CancellationToken::new(),
+                bucket,
+                "",
+                sender,
+                super::WalkOptions {
+                    authoritative: true,
+                    ..Default::default()
+                },
+            );
+            let drain = async { while receiver.recv().await.is_some() {} };
+            let (walk, ()) = timeout(Duration::from_secs(10), async { tokio::join!(walk, drain) })
+                .await
+                .expect("authoritative store walk must terminate");
             assert!(matches!(walk, Err(StorageError::ErasureReadQuorum)), "{walk:?}");
             let recursive_delete_scan = set
                 .clone()

@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use super::*;
+use futures::{StreamExt, TryStreamExt, stream};
 
+const TABLE_REGISTRATION_READ_CONCURRENCY: usize = 8;
 const TABLE_MAINTENANCE_RENAME_MAX_OBJECTS: usize = 4096;
 const TABLE_MAINTENANCE_SCHEDULER_HISTORY_MAX_OBJECTS: usize = 4096;
 
@@ -261,7 +263,7 @@ fn validate_table_rename_intent_object(
     Ok(())
 }
 
-fn next_table_catalog_update_time(previous: Option<&str>) -> String {
+pub(super) fn next_table_catalog_update_time(previous: Option<&str>) -> String {
     let now = OffsetDateTime::now_utc();
     let update_time = previous
         .and_then(|value| OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok())
@@ -360,7 +362,7 @@ pub(super) fn validate_table_maintenance_report_owner(
     Ok(())
 }
 
-fn validate_table_warehouse_index_entry_object(
+pub(super) fn validate_table_warehouse_index_entry_object(
     paths: &TableCatalogObjectPaths,
     object: &str,
     index: &TableWarehouseIndexEntry,
@@ -374,7 +376,10 @@ fn validate_table_warehouse_index_entry_object(
     Ok(())
 }
 
-fn table_warehouse_index_state_ready(state: &TableWarehouseIndexStateEntry, table_bucket: &str) -> TableCatalogStoreResult<bool> {
+pub(super) fn table_warehouse_index_state_ready(
+    state: &TableWarehouseIndexStateEntry,
+    table_bucket: &str,
+) -> TableCatalogStoreResult<bool> {
     if state.version == 0 || state.version > TABLE_WAREHOUSE_INDEX_STATE_VERSION {
         return Err(TableCatalogStoreError::Invalid(format!(
             "unsupported warehouse index state version: {}",
@@ -1217,7 +1222,7 @@ where
             .await
     }
 
-    async fn write_entry_unlocked<T>(
+    pub(super) async fn write_entry_unlocked<T>(
         &self,
         bucket: &str,
         object: &str,
@@ -1264,7 +1269,7 @@ where
         }
     }
 
-    async fn read_table_bucket_with_etag_unlocked(
+    pub(super) async fn read_table_bucket_with_etag_unlocked(
         &self,
         table_bucket: &str,
     ) -> TableCatalogStoreResult<Option<(TableBucketEntry, String)>> {
@@ -1873,7 +1878,12 @@ where
         let candidate = table_warehouse_index_entry(entry)?;
         validate_table_entry_version_and_id(entry)?;
         for existing in self
-            .list_all_table_entries_with_limit(&candidate.table_bucket, None, locked_table_entry)
+            .list_all_table_entries_with_limit(
+                &candidate.table_bucket,
+                None,
+                locked_table_entry,
+                TABLE_REGISTRATION_READ_CONCURRENCY,
+            )
             .await?
         {
             if existing.state != TableCatalogEntryState::Active {
@@ -1896,18 +1906,20 @@ where
             }
         }
         let state_object = self.paths.warehouse_index_state_path(&candidate.table_bucket);
-        for object in self
+        let index_objects = self
             .backend
             .list_objects(self.catalog_bucket(), &self.paths.warehouse_index_entries_prefix(&candidate.table_bucket))
-            .await?
-        {
-            if object == state_object {
-                continue;
-            }
-            let Some((existing, _)) = self
-                .read_entry::<TableWarehouseIndexEntry>(self.catalog_bucket(), &object)
-                .await?
-            else {
+            .await?;
+        let mut indexes = stream::iter(index_objects.into_iter().filter(|object| object != &state_object))
+            .map(|object| async move {
+                let entry = self
+                    .read_entry::<TableWarehouseIndexEntry>(self.catalog_bucket(), &object)
+                    .await?;
+                Ok::<_, TableCatalogStoreError>((object, entry))
+            })
+            .buffered(TABLE_REGISTRATION_READ_CONCURRENCY);
+        while let Some((object, entry)) = indexes.try_next().await? {
+            let Some((existing, _)) = entry else {
                 continue;
             };
             validate_table_warehouse_index_entry_object(&self.paths, &object, &existing)?;
@@ -2364,7 +2376,7 @@ where
     ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
         let mut matched: Option<TableDataPlaneResource> = None;
         for table in self
-            .list_all_table_entries_with_limit(table_bucket, Some(TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS), None)
+            .list_all_table_entries_with_limit(table_bucket, Some(TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS), None, 1)
             .await?
         {
             if table.state != TableCatalogEntryState::Active {
@@ -2456,7 +2468,7 @@ where
             return Ok(());
         }
         let tables = self
-            .list_all_table_entries_with_limit(table_bucket, max_catalog_objects, None)
+            .list_all_table_entries_with_limit(table_bucket, max_catalog_objects, None, 1)
             .await?
             .into_iter()
             .filter(|table| table.state == TableCatalogEntryState::Active)
@@ -2537,7 +2549,7 @@ where
     }
 
     async fn list_all_table_entries(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
-        self.list_all_table_entries_with_limit(table_bucket, None, None).await
+        self.list_all_table_entries_with_limit(table_bucket, None, None, 1).await
     }
 
     async fn list_table_entry_objects_for_data_plane_scan(
@@ -2586,8 +2598,8 @@ where
         table_bucket: &str,
         max_catalog_objects: Option<usize>,
         locked_table_entry: Option<&str>,
+        read_concurrency: usize,
     ) -> TableCatalogStoreResult<Vec<TableEntry>> {
-        let mut entries = Vec::new();
         let table_objects = match max_catalog_objects {
             Some(max_catalog_objects) => {
                 self.list_table_entry_objects_for_data_plane_scan(table_bucket, max_catalog_objects)
@@ -2601,19 +2613,24 @@ where
                 .filter(|object| object.ends_with(TABLE_ENTRY_FILE))
                 .collect(),
         };
-        for object in table_objects {
-            // Only the exact entry protected by the caller's write lock can bypass a read lock.
-            let entry = if locked_table_entry == Some(object.as_str()) {
-                self.read_entry_unlocked::<TableEntry>(self.catalog_bucket(), &object).await?
-            } else {
-                self.read_entry::<TableEntry>(self.catalog_bucket(), &object).await?
-            };
-            let Some((entry, _)) = entry else {
-                continue;
-            };
-            validate_table_entry_object(&self.paths, &object, &entry)?;
-            entries.push(entry);
-        }
+        let mut entries = stream::iter(table_objects)
+            .map(|object| async move {
+                // Only the exact entry protected by the caller's write lock can bypass a read lock.
+                let entry = if locked_table_entry == Some(object.as_str()) {
+                    self.read_entry_unlocked::<TableEntry>(self.catalog_bucket(), &object).await?
+                } else {
+                    self.read_entry::<TableEntry>(self.catalog_bucket(), &object).await?
+                };
+                let Some((entry, _)) = entry else {
+                    return Ok(None);
+                };
+                validate_table_entry_object(&self.paths, &object, &entry)?;
+                Ok::<_, TableCatalogStoreError>(Some(entry))
+            })
+            .buffered(read_concurrency)
+            .try_filter_map(|entry| async move { Ok(entry) })
+            .try_collect::<Vec<_>>()
+            .await?;
         entries.sort_by(|left, right| (&left.namespace, &left.table).cmp(&(&right.namespace, &right.table)));
         Ok(entries)
     }
@@ -6258,27 +6275,15 @@ where
         .await
     }
 
-    async fn disable_empty_table_bucket(&self, mut entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
-        validate_table_bucket_entry(&entry)?;
-        let _registry_guard = self.acquire_table_bucket_registry_write_permit().await?;
-        let _migration_guard = self.acquire_object_backed_catalog_write_permit(&entry.table_bucket).await?;
-        let object = self.paths.table_bucket_entry_path(&entry.table_bucket);
-        let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &object).await?;
-        if let Some((current, _)) = self.read_table_bucket_with_etag_unlocked(&entry.table_bucket).await? {
-            if current.active_rename_id.is_some()
-                || !matches!(current.state, TableCatalogEntryState::Active | TableCatalogEntryState::Deleted)
-            {
-                return Err(TableCatalogStoreError::Conflict("table bucket has an operation in progress".to_string()));
-            }
-            entry = current;
-        }
+    async fn disable_empty_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
+        let mut disablement = self.begin_table_bucket_disablement(entry, None).await?;
         // Namespace creation holds this same bucket lock. Retained table, view, and
         // maintenance records also prevent removing their data-plane protections.
         let page = self
             .backend
             .list_objects_page(
                 self.catalog_bucket(),
-                &self.paths.namespace_entries_prefix(&entry.table_bucket),
+                &self.paths.namespace_entries_prefix(&disablement.entry.table_bucket),
                 None,
                 NonZeroUsize::MIN,
             )
@@ -6288,16 +6293,7 @@ where
                 "table bucket contains namespaces or retained catalog resources".to_string(),
             ));
         }
-        entry.state = TableCatalogEntryState::Deleted;
-        entry.updated_at = Some(next_table_catalog_update_time(entry.updated_at.as_deref()));
-        self.write_entry_unlocked(
-            self.catalog_bucket(),
-            &object,
-            &entry,
-            TableCatalogPutPrecondition::Any,
-            _guard.write_commit_guards(),
-        )
-        .await
+        self.finish_table_bucket_disablement(&mut disablement).await
     }
 
     async fn create_namespace(&self, entry: NamespaceEntry) -> TableCatalogStoreResult<()> {

@@ -2092,17 +2092,25 @@ fn warehouse_from_config_query(uri: &http::Uri) -> S3Result<Option<String>> {
 }
 
 fn rest_purge_requested_from_query(uri: &http::Uri) -> S3Result<bool> {
-    let mut purge_requested = None;
+    table_catalog_boolean_query(uri, "purgeRequested")
+}
+
+fn table_bucket_cleanup_requested_from_query(uri: &http::Uri) -> S3Result<bool> {
+    table_catalog_boolean_query(uri, "cleanup")
+}
+
+fn table_catalog_boolean_query(uri: &http::Uri, parameter: &str) -> S3Result<bool> {
+    let mut requested = None;
     if let Some(query) = uri.query() {
         for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            if key != "purgeRequested" {
+            if key != parameter {
                 continue;
             }
-            if purge_requested.is_some() {
+            if requested.is_some() {
                 return Err(iceberg_rest_error(
                     ICEBERG_ERROR_BAD_REQUEST,
                     StatusCode::BAD_REQUEST,
-                    "purgeRequested query parameter must not be repeated",
+                    format!("{parameter} query parameter must not be repeated"),
                 ));
             }
             let value = if value.eq_ignore_ascii_case("true") {
@@ -2113,13 +2121,13 @@ fn rest_purge_requested_from_query(uri: &http::Uri) -> S3Result<bool> {
                 return Err(iceberg_rest_error(
                     ICEBERG_ERROR_BAD_REQUEST,
                     StatusCode::BAD_REQUEST,
-                    "purgeRequested query parameter must be true or false",
+                    format!("{parameter} query parameter must be true or false"),
                 ));
             };
-            purge_requested = Some(value);
+            requested = Some(value);
         }
     }
-    Ok(purge_requested.unwrap_or(false))
+    Ok(requested.unwrap_or(false))
 }
 
 fn rest_table_snapshot_selection_from_query(uri: &http::Uri) -> S3Result<RestTableSnapshotSelection> {
@@ -2570,6 +2578,61 @@ where
     }
     ensure_table_bucket_entry(store, bucket, true).await?;
     table_bucket_response(store, bucket, true).await
+}
+
+async fn cleanup_empty_table_bucket_response<B>(
+    store: &crate::table_catalog::ConfiguredTableCatalogStore<B>,
+    publication: &TableCommitObjectBackend<B>,
+    object_store: &ECStore,
+    bucket: &str,
+) -> S3Result<TableBucketResponse>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend,
+{
+    if !publication.publication_fence_fleet_confirmed {
+        return Err(catalog_store_error(crate::table_catalog::TableCatalogStoreError::Conflict(
+            "empty table bucket cleanup requires publication fences on every cluster node".to_string(),
+        )));
+    }
+    crate::table_catalog::TableCommitPublication::begin_table_bucket(publication, bucket)
+        .await
+        .map_err(catalog_store_error)?;
+    let _publication_completion = crate::table_catalog::TableCommitPublicationCompletion::new(publication);
+    let incarnation = object_store
+        .bucket_incarnation_id_from_disk(bucket)
+        .await
+        .map_err(|err| ApiError::other(format!("failed to read table bucket identity: {err}")))?;
+    let prepared = store
+        .prepare_empty_table_bucket_cleanup(table_bucket_entry_from_metadata_marker(bucket), publication)
+        .await
+        .map_err(catalog_store_error);
+    let mut cleanup = publication.finish(prepared).await?;
+    for object in cleanup.metadata_objects() {
+        if let Err(err) = publication.authorize(bucket, object, S3Action::DeleteObjectAction).await {
+            return publication.finish(Err(catalog_store_error(err))).await;
+        }
+    }
+    store
+        .execute_empty_table_bucket_cleanup(&mut cleanup, incarnation)
+        .await
+        .map_err(catalog_store_error)?;
+    let fence = cleanup.mutation_fence();
+    object_store
+        .update_bucket_metadata_config_for_incarnation_validated(
+            bucket,
+            crate::table_catalog::TABLE_BUCKET_MARKER_CONFIG,
+            Vec::new(),
+            incarnation,
+            || {
+                fence
+                    .ensure_held()
+                    .map_err(|err| crate::admin::storage_api::error::StorageError::other(err.to_string()))
+            },
+        )
+        .await
+        .map_err(|err| ApiError::other(format!("failed to disable table bucket: {err}")))?;
+    drop(cleanup);
+    table_bucket_response(store, bucket, false).await
 }
 
 async fn disable_table_bucket_response<S, B>(

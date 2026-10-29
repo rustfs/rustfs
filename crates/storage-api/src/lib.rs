@@ -90,6 +90,7 @@ pub use bucket::BUCKET_LIFECYCLE_LOCK_OBJECT;
 pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
 pub use capability::{CapabilitySnapshotError, CapabilityState, CapabilityStatus};
 pub use error::{StorageErrorCode, StorageResult};
+pub use multipart::MultipartUploadInspection;
 pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};
 pub use object::DeleteAccounting;
 pub use object::ObjectLockDeleteOptions;

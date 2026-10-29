@@ -87,6 +87,15 @@ async fn call_load_table_handler(request: S3Request<Body>) -> S3Result<S3Respons
     RestLoadTableHandler {}.call(request, matched.params).await
 }
 
+async fn call_disable_table_bucket_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let mut router = matchit::Router::new();
+    router.insert("/iceberg/v1/buckets/{warehouse}", ()).unwrap();
+    router.insert("/_iceberg/v1/buckets/{warehouse}", ()).unwrap();
+    let path = request.uri.path().to_string();
+    let matched = router.at(&path).unwrap();
+    DisableTableBucketHandler {}.call(request, matched.params).await
+}
+
 async fn call_maintenance_worker_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
     let mut router = matchit::Router::new();
     router
@@ -1256,6 +1265,28 @@ fn drop_table_purge_query_is_explicit_and_strict() {
 }
 
 #[test]
+fn table_bucket_cleanup_query_is_explicit_and_strict() {
+    for (uri, expected) in [
+        ("/iceberg/v1/buckets/analytics", false),
+        ("/iceberg/v1/buckets/analytics?cleanup=false", false),
+        ("/iceberg/v1/buckets/analytics?cleanup=true", true),
+        ("/_iceberg/v1/buckets/analytics?cleanup=true", true),
+    ] {
+        assert_eq!(table_bucket_cleanup_requested_from_query(&uri.parse().unwrap()).unwrap(), expected);
+    }
+    for query in [
+        "cleanup=",
+        "cleanup=1",
+        "cleanup=yes",
+        "cleanup=true&cleanup=false",
+        "cleanup=true&cleanup=true",
+    ] {
+        let uri = format!("/iceberg/v1/buckets/analytics?{query}").parse().unwrap();
+        assert!(table_bucket_cleanup_requested_from_query(&uri).is_err(), "invalid query: {query}");
+    }
+}
+
+#[test]
 fn catalog_conflicts_use_operation_specific_iceberg_errors() {
     let already_exists = catalog_store_already_exists_error(crate::table_catalog::TableCatalogStoreError::Conflict(
         "table already exists".to_string(),
@@ -1689,9 +1720,7 @@ fn table_bucket_toggle_handlers_reload_peer_metadata_after_publication() {
         (enable, "enable_table_bucket_response", "enable table bucket"),
         (disable, "disable_table_bucket_response", "disable table bucket"),
     ] {
-        let response_offset = block
-            .find(&format!("let response = {response}"))
-            .expect("table bucket toggle should publish local state");
+        let response_offset = block.find(response).expect("table bucket toggle should publish local state");
         let reload = block
             .find(&format!("notify_table_bucket_metadata_reload(warehouse.clone(), \"{operation}\""))
             .expect("table bucket toggle should reload peer metadata");
@@ -16273,4 +16302,699 @@ async fn disable_table_bucket_preserves_objects_and_can_be_reenabled() {
             .unwrap()
             .table_bucket_enabled()
     );
+}
+
+async fn create_dropped_empty_tables_for_cleanup<S, B>(
+    catalog: &S,
+    backend: &B,
+    object_store: &ECStore,
+    bucket: &str,
+    table_count: usize,
+) -> Vec<String>
+where
+    S: TableCatalogStore + ?Sized,
+    B: TableCatalogObjectBackend,
+{
+    object_store.make_bucket(bucket, &MakeBucketOptions::default()).await.unwrap();
+    enable_table_bucket_response(catalog, &TableCommitObjectBackend::trusted(backend.clone()), object_store, bucket)
+        .await
+        .unwrap();
+    let namespace = crate::table_catalog::Namespace::parse("analytics").unwrap();
+    create_namespace_response(
+        catalog,
+        bucket,
+        CreateNamespaceRequest {
+            namespace: vec!["analytics".to_string()],
+            properties: BTreeMap::new(),
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    let mut metadata_objects = Vec::new();
+    for number in 0..table_count {
+        let name = format!("events_{number:02}");
+        let request = serde_json::from_value(serde_json::json!({
+            "name": name,
+            "schema": {
+                "type": "struct",
+                "schema-id": 0,
+                "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+            }
+        }))
+        .unwrap();
+        create_table_response(
+            catalog,
+            &TableCommitObjectBackend::trusted(backend.clone()),
+            bucket,
+            &namespace,
+            request,
+            true,
+        )
+        .await
+        .unwrap();
+        metadata_objects.push(
+            catalog
+                .load_table(bucket, &namespace.public_name(), &name)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata_location,
+        );
+    }
+    for number in 0..table_count {
+        catalog
+            .drop_table(bucket, &namespace.public_name(), &format!("events_{number:02}"))
+            .await
+            .unwrap();
+    }
+    catalog.drop_namespace(bucket, &namespace.public_name()).await.unwrap();
+    metadata_objects
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cleanup_empty_table_bucket_reclaims_twenty_dropped_tables_and_allows_bucket_deletion() {
+    let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    let bucket = format!("cleanup-{}", Uuid::new_v4().simple());
+    let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
+        object_store.clone(),
+        crate::table_catalog::StrongTableCatalogRuntime::default(),
+    );
+    let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+        backend.clone(),
+        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+    );
+    let metadata_objects = create_dropped_empty_tables_for_cleanup(&catalog, &backend, object_store.as_ref(), &bucket, 20).await;
+    assert!(
+        disable_table_bucket_response(
+            &catalog,
+            &TableCommitObjectBackend::trusted(backend.clone()),
+            object_store.as_ref(),
+            &bucket,
+        )
+        .await
+        .is_err()
+    );
+    for object in &metadata_objects {
+        assert!(backend.object_exists(&bucket, object).await.unwrap());
+    }
+
+    let authorizations = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let publication = TableCommitObjectBackend::test(backend.clone(), authorizations.clone(), None);
+    let result = cleanup_empty_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket).await;
+    assert!(!publication.finish(result).await.unwrap().enabled);
+    for object in &metadata_objects {
+        assert!(!backend.object_exists(&bucket, object).await.unwrap());
+        let authorized = authorizations.lock().await;
+        assert!(authorized.contains(&(object.clone(), S3Action::GetObjectAction)));
+        assert!(authorized.contains(&(object.clone(), S3Action::DeleteObjectAction)));
+    }
+    assert!(
+        !object_store
+            .get_bucket_metadata(&bucket)
+            .await
+            .unwrap()
+            .table_bucket_enabled()
+    );
+    let publication = TableCommitObjectBackend::trusted(backend);
+    assert!(
+        !cleanup_empty_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+            .await
+            .unwrap()
+            .enabled
+    );
+    object_store.delete_bucket(&bucket, &Default::default()).await.unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cleanup_empty_table_bucket_validates_authorization_and_metadata_before_deleting() {
+    let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    let bucket = format!("cleanup-check-{}", Uuid::new_v4().simple());
+    let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
+        object_store.clone(),
+        crate::table_catalog::StrongTableCatalogRuntime::default(),
+    );
+    let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+        backend.clone(),
+        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+    );
+    let metadata_objects = create_dropped_empty_tables_for_cleanup(&catalog, &backend, object_store.as_ref(), &bucket, 2).await;
+    let publication = TableCommitObjectBackend::rolling_upgrade(backend.clone());
+    assert!(
+        cleanup_empty_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+            .await
+            .is_err()
+    );
+    for object in &metadata_objects {
+        assert!(backend.object_exists(&bucket, object).await.unwrap());
+    }
+
+    let authorizations = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let denied_object = metadata_objects.last().unwrap().clone();
+    let publication = TableCommitObjectBackend::test(backend.clone(), authorizations, Some(denied_object.clone()));
+    let result = cleanup_empty_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket).await;
+    assert_eq!(publication.finish(result).await.unwrap_err().code(), &S3ErrorCode::AccessDenied);
+    for object in &metadata_objects {
+        assert!(backend.object_exists(&bucket, object).await.unwrap());
+    }
+
+    let original = backend.read_object(&bucket, &denied_object).await.unwrap().unwrap().data;
+    backend
+        .put_object(
+            &bucket,
+            &denied_object,
+            b"{".to_vec(),
+            crate::table_catalog::TableCatalogPutPrecondition::Any,
+        )
+        .await
+        .unwrap();
+    let publication = TableCommitObjectBackend::trusted(backend.clone());
+    assert!(
+        cleanup_empty_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+            .await
+            .is_err()
+    );
+    for object in &metadata_objects {
+        assert!(backend.object_exists(&bucket, object).await.unwrap());
+    }
+    assert!(
+        object_store
+            .get_bucket_metadata(&bucket)
+            .await
+            .unwrap()
+            .table_bucket_enabled()
+    );
+
+    backend
+        .put_object(&bucket, &denied_object, original, crate::table_catalog::TableCatalogPutPrecondition::Any)
+        .await
+        .unwrap();
+    let publication = TableCommitObjectBackend::trusted(backend);
+    assert!(
+        !cleanup_empty_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+            .await
+            .unwrap()
+            .enabled
+    );
+    object_store.delete_bucket(&bucket, &Default::default()).await.unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cleanup_empty_table_bucket_handler_enforces_request_object_permissions() {
+    temp_env::async_with_vars(
+        [
+            (
+                crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
+                Some(crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT),
+            ),
+            (crate::table_catalog::ENV_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED, Some("true")),
+        ],
+        async {
+            let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            let bucket = format!("cleanup-request-{}", Uuid::new_v4().simple());
+            rustfs_iam::store::object::ObjectStore::new(object_store.clone())
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .unwrap();
+            let iam = rustfs_iam::build_iam_sys(object_store.clone()).await.unwrap();
+            let access_key = "cleanup-request-user";
+            let secret_key = "cleanup-request-user-secret";
+            iam.create_user(
+                access_key,
+                &AddOrUpdateUserReq {
+                    secret_key: secret_key.to_string(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .unwrap();
+            let context = Arc::new(AppContext::new(
+                object_store.clone(),
+                Arc::new(RequestIam { handle: iam.clone() }),
+                Arc::new(RequestKms),
+            ));
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: "cleanup-request-root".to_string(),
+                secret_key: "cleanup-request-root-secret".to_string(),
+                status: "on".to_string(),
+                ..Default::default()
+            }));
+            let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
+                object_store.clone(),
+                context.table_catalog_strong_runtime(),
+            );
+            let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+                backend.clone(),
+                crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+            );
+            let metadata_objects =
+                create_dropped_empty_tables_for_cleanup(&catalog, &backend, object_store.as_ref(), &bucket, 2).await;
+            let request = |prefix: &str| {
+                let mut request = table_catalog_handler_request(context.clone(), access_key, secret_key);
+                request.method = Method::DELETE;
+                request.uri = format!("{prefix}/v1/buckets/{bucket}?cleanup=true").parse().unwrap();
+                request
+            };
+            let object_resource = format!("arn:aws:s3:::{bucket}/*");
+            let first_metadata_resource = format!("arn:aws:s3:::{bucket}/{}", metadata_objects[0]);
+            for (policy_name, object_statements, allowed) in [
+                ("cleanup-request-no-read", Vec::new(), false),
+                (
+                    "cleanup-request-partial-delete",
+                    vec![
+                        serde_json::json!({"Effect":"Allow","Action":["s3:GetObject"],"Resource":[object_resource]}),
+                        serde_json::json!({"Effect":"Allow","Action":["s3:DeleteObject"],"Resource":[first_metadata_resource]}),
+                    ],
+                    false,
+                ),
+                (
+                    "cleanup-request-full",
+                    vec![serde_json::json!({
+                        "Effect":"Allow",
+                        "Action":["s3:GetObject","s3:DeleteObject"],
+                        "Resource":[object_resource],
+                    })],
+                    true,
+                ),
+            ] {
+                let mut statements = vec![serde_json::json!({"Effect":"Allow","Action":["admin:SetTableBucket"]})];
+                statements.extend(object_statements);
+                let policy = serde_json::to_vec(&serde_json::json!({"Version":"2012-10-17","Statement":statements})).unwrap();
+                iam.set_policy(policy_name, Policy::parse_config(&policy).unwrap())
+                    .await
+                    .unwrap();
+                iam.policy_db_set(access_key, UserType::Reg, false, policy_name)
+                    .await
+                    .unwrap();
+
+                let result = call_disable_table_bucket_handler(request(if allowed { "/_iceberg" } else { "/iceberg" })).await;
+                if allowed {
+                    let response = result.expect("request-scoped object permissions should authorize cleanup");
+                    assert_eq!(response.output.0, StatusCode::OK);
+                    let body: serde_json::Value = serde_json::from_slice(&response.output.1.bytes().unwrap()).unwrap();
+                    assert_eq!(body["enabled"], false);
+                    for object in &metadata_objects {
+                        assert!(!backend.object_exists(&bucket, object).await.unwrap());
+                    }
+                } else {
+                    assert_eq!(result.unwrap_err().code(), &S3ErrorCode::AccessDenied);
+                    for object in &metadata_objects {
+                        assert!(backend.object_exists(&bucket, object).await.unwrap());
+                    }
+                    assert!(
+                        object_store
+                            .get_bucket_metadata(&bucket)
+                            .await
+                            .unwrap()
+                            .table_bucket_enabled()
+                    );
+                    assert_eq!(
+                        catalog.get_table_bucket(&bucket).await.unwrap().unwrap().state,
+                        crate::table_catalog::TableCatalogEntryState::Active,
+                    );
+                }
+            }
+            object_store.delete_bucket(&bucket, &Default::default()).await.unwrap();
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cleanup_empty_table_bucket_retries_after_marker_write_rejection() {
+    use crate::table_catalog::TableCommitPublication;
+
+    let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    let bucket = format!("cleanup-marker-{}", Uuid::new_v4().simple());
+    let backend = TestTableCatalogObjectBackend::default();
+    let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+        backend.clone(),
+        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+    );
+    let metadata_objects = create_dropped_empty_tables_for_cleanup(&catalog, &backend, object_store.as_ref(), &bucket, 2).await;
+    let publication = TableCommitObjectBackend::trusted(backend.clone());
+    TableCommitPublication::begin_table_bucket(&publication, &bucket)
+        .await
+        .unwrap();
+    let incarnation = object_store.bucket_incarnation_id_from_disk(&bucket).await.unwrap();
+    let mut cleanup = catalog
+        .prepare_empty_table_bucket_cleanup(table_bucket_entry_from_metadata_marker(&bucket), &publication)
+        .await
+        .unwrap();
+    catalog
+        .execute_empty_table_bucket_cleanup(&mut cleanup, incarnation)
+        .await
+        .unwrap();
+    let marker_result = object_store
+        .update_bucket_metadata_config_for_incarnation_validated(
+            &bucket,
+            crate::table_catalog::TABLE_BUCKET_MARKER_CONFIG,
+            Vec::new(),
+            incarnation,
+            || {
+                Err(crate::admin::storage_api::error::StorageError::other(
+                    "injected marker publication rejection",
+                ))
+            },
+        )
+        .await;
+    assert!(marker_result.is_err());
+    drop(cleanup);
+    TableCommitPublication::complete(&publication);
+    for object in &metadata_objects {
+        assert!(!backend.object_exists(&bucket, object).await.unwrap());
+    }
+    assert_eq!(
+        catalog.get_table_bucket(&bucket).await.unwrap().unwrap().state,
+        crate::table_catalog::TableCatalogEntryState::Deleted,
+    );
+    assert!(
+        object_store
+            .get_bucket_metadata(&bucket)
+            .await
+            .unwrap()
+            .table_bucket_enabled()
+    );
+
+    let publication = TableCommitObjectBackend::trusted(backend);
+    assert!(
+        !cleanup_empty_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+            .await
+            .unwrap()
+            .enabled
+    );
+    assert!(
+        !object_store
+            .get_bucket_metadata(&bucket)
+            .await
+            .unwrap()
+            .table_bucket_enabled()
+    );
+    object_store.delete_bucket(&bucket, &Default::default()).await.unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cleanup_empty_table_bucket_reads_incarnation_after_publication_wait() {
+    let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    let bucket = format!("cleanup-recreated-{}", Uuid::new_v4().simple());
+    let backend = TestTableCatalogObjectBackend::default();
+    let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+        backend.clone(),
+        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+    );
+    create_dropped_empty_tables_for_cleanup(&catalog, &backend, object_store.as_ref(), &bucket, 0).await;
+    let original_incarnation = object_store.bucket_incarnation_id_from_disk(&bucket).await.unwrap();
+    let publication_lock = crate::table_catalog::default_table_bucket_publication_lock_path();
+    let guard = backend.acquire_write_lock(&bucket, &publication_lock).await.unwrap();
+    let attempts = backend.write_lock_acquisition_count(&bucket, &publication_lock).await;
+    let cleanup_bucket = bucket.clone();
+    let cleanup_store = object_store.clone();
+    let publication = TableCommitObjectBackend::trusted(backend.clone());
+    let cleanup = tokio::spawn(async move {
+        cleanup_empty_table_bucket_response(&catalog, &publication, cleanup_store.as_ref(), &cleanup_bucket).await
+    });
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        while backend.write_lock_acquisition_count(&bucket, &publication_lock).await == attempts {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cleanup should wait for its publication lock");
+
+    // Replace the real bucket while the in-memory publication backend holds cleanup at its lock boundary.
+    object_store.delete_bucket(&bucket, &Default::default()).await.unwrap();
+    object_store
+        .make_bucket(&bucket, &MakeBucketOptions::default())
+        .await
+        .unwrap();
+    enable_table_bucket_marker(object_store.as_ref(), &bucket).await.unwrap();
+    let replacement_incarnation = object_store.bucket_incarnation_id_from_disk(&bucket).await.unwrap();
+    assert_ne!(replacement_incarnation, original_incarnation);
+    drop(guard);
+    let response = tokio::time::timeout(StdDuration::from_secs(10), cleanup)
+        .await
+        .expect("cleanup should resume after publication becomes available")
+        .unwrap()
+        .expect("cleanup must use the incarnation observed while holding its publication lock");
+    assert!(!response.enabled);
+    assert_eq!(
+        object_store.bucket_incarnation_id_from_disk(&bucket).await.unwrap(),
+        replacement_incarnation
+    );
+    object_store.delete_bucket(&bucket, &Default::default()).await.unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cleanup_empty_table_bucket_retries_metadata_delete_failures_without_removing_protection() {
+    use crate::admin::storage_api::RUSTFS_META_BUCKET;
+    use crate::table_catalog::{TableCatalogEntryState, TableCatalogObjectPaths};
+
+    let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    for fail_after_delete in [false, true] {
+        let bucket = format!("cleanup-retry-{}", Uuid::new_v4().simple());
+        let backend = TestTableCatalogObjectBackend::content_addressed();
+        let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+            backend.clone(),
+            crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+        );
+        let mut metadata_objects =
+            create_dropped_empty_tables_for_cleanup(&catalog, &backend, object_store.as_ref(), &bucket, 3).await;
+        metadata_objects.sort();
+        let paths = TableCatalogObjectPaths::default();
+        let index_prefix = paths.warehouse_index_entries_prefix(&bucket);
+        let indexes = backend.list_objects(RUSTFS_META_BUCKET, &index_prefix).await.unwrap();
+        assert!(indexes.len() >= metadata_objects.len());
+        if fail_after_delete {
+            backend.fail_after_next_delete(&bucket, &metadata_objects[1]).await;
+        } else {
+            backend.fail_delete_attempt(&bucket, &metadata_objects[1], 1).await;
+        }
+
+        let publication = TableCommitObjectBackend::trusted(backend.clone());
+        let error = cleanup_empty_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("injected"));
+        assert!(!backend.object_exists(&bucket, &metadata_objects[0]).await.unwrap());
+        assert_eq!(backend.object_exists(&bucket, &metadata_objects[1]).await.unwrap(), !fail_after_delete);
+        assert!(backend.object_exists(&bucket, &metadata_objects[2]).await.unwrap());
+        assert_eq!(backend.list_objects(RUSTFS_META_BUCKET, &index_prefix).await.unwrap(), indexes);
+        assert_eq!(
+            catalog.get_table_bucket(&bucket).await.unwrap().unwrap().state,
+            TableCatalogEntryState::Active
+        );
+        assert!(
+            object_store
+                .get_bucket_metadata(&bucket)
+                .await
+                .unwrap()
+                .table_bucket_enabled()
+        );
+
+        let restarted = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+            backend.clone(),
+            crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+        );
+        let publication = TableCommitObjectBackend::trusted(backend.clone());
+        assert!(
+            !cleanup_empty_table_bucket_response(&restarted, &publication, object_store.as_ref(), &bucket)
+                .await
+                .unwrap()
+                .enabled
+        );
+        assert!(backend.list_objects(&bucket, "").await.unwrap().is_empty());
+        assert!(
+            backend
+                .list_objects(RUSTFS_META_BUCKET, &index_prefix)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            restarted.get_table_bucket(&bucket).await.unwrap().unwrap().state,
+            TableCatalogEntryState::Deleted
+        );
+        assert!(
+            !object_store
+                .get_bucket_metadata(&bucket)
+                .await
+                .unwrap()
+                .table_bucket_enabled()
+        );
+        object_store.delete_bucket(&bucket, &Default::default()).await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cleanup_empty_table_bucket_retries_partial_warehouse_index_deletion() {
+    use crate::admin::storage_api::RUSTFS_META_BUCKET;
+    use crate::table_catalog::{TableCatalogEntryState, TableCatalogObjectPaths};
+
+    let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    let bucket = format!("cleanup-index-retry-{}", Uuid::new_v4().simple());
+    let backend = TestTableCatalogObjectBackend::content_addressed();
+    let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+        backend.clone(),
+        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+    );
+    create_dropped_empty_tables_for_cleanup(&catalog, &backend, object_store.as_ref(), &bucket, 2).await;
+    let index_prefix = TableCatalogObjectPaths::default().warehouse_index_entries_prefix(&bucket);
+    let indexes = backend.list_objects(RUSTFS_META_BUCKET, &index_prefix).await.unwrap();
+    assert!(indexes.len() >= 2);
+    let last_index = indexes.last().unwrap();
+    backend.fail_delete_attempt(RUSTFS_META_BUCKET, last_index, 1).await;
+
+    let publication = TableCommitObjectBackend::trusted(backend.clone());
+    let error = cleanup_empty_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("injected"));
+    assert!(backend.list_objects(&bucket, "").await.unwrap().is_empty());
+    assert_eq!(
+        backend.list_objects(RUSTFS_META_BUCKET, &index_prefix).await.unwrap(),
+        vec![last_index.clone()]
+    );
+    assert_eq!(
+        catalog.get_table_bucket(&bucket).await.unwrap().unwrap().state,
+        TableCatalogEntryState::Active
+    );
+    assert!(
+        object_store
+            .get_bucket_metadata(&bucket)
+            .await
+            .unwrap()
+            .table_bucket_enabled()
+    );
+
+    let publication = TableCommitObjectBackend::trusted(backend.clone());
+    assert!(
+        !cleanup_empty_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+            .await
+            .unwrap()
+            .enabled
+    );
+    assert!(
+        backend
+            .list_objects(RUSTFS_META_BUCKET, &index_prefix)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !object_store
+            .get_bucket_metadata(&bucket)
+            .await
+            .unwrap()
+            .table_bucket_enabled()
+    );
+    object_store.delete_bucket(&bucket, &Default::default()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn cleanup_empty_table_bucket_stops_before_delete_when_publication_lease_is_lost() {
+    use crate::admin::storage_api::RUSTFS_META_BUCKET;
+    use crate::table_catalog::test_support::RecordingLeaseClient;
+    use crate::table_catalog::{TableCatalogEntryState, TableCatalogLockGuard, TableCatalogObjectPaths, TableCommitPublication};
+    use rustfs_lock::LockClient;
+
+    let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    let bucket = format!("cleanup-lease-{}", Uuid::new_v4().simple());
+    let backend = TestTableCatalogObjectBackend::content_addressed();
+    let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+        backend.clone(),
+        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+    );
+    let metadata_objects = create_dropped_empty_tables_for_cleanup(&catalog, &backend, object_store.as_ref(), &bucket, 1).await;
+    let index_prefix = TableCatalogObjectPaths::default().warehouse_index_entries_prefix(&bucket);
+    let indexes = backend.list_objects(RUSTFS_META_BUCKET, &index_prefix).await.unwrap();
+    let publication = TableCommitObjectBackend::trusted(backend.clone());
+    TableCommitPublication::begin_table_bucket(&publication, &bucket)
+        .await
+        .unwrap();
+    let client = Arc::new(RecordingLeaseClient {
+        inner: rustfs_lock::LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::Enabled(Arc::new(
+            rustfs_lock::FastObjectLockManager::new(),
+        )))),
+        acquired: std::sync::Mutex::new(None),
+    });
+    let lock = rustfs_lock::NamespaceLockWrapper::new(
+        rustfs_lock::NamespaceLock::with_clients_and_quorum(
+            "cleanup-publication-fence".to_string(),
+            vec![client.clone() as Arc<dyn LockClient>],
+            1,
+        ),
+        rustfs_lock::ObjectKey::new(bucket.as_str(), "cleanup-publication-fence"),
+        "cleanup-publication-owner".to_string(),
+    );
+    let guard = lock.get_read_lock(StdDuration::from_secs(5)).await.unwrap();
+    let signal = guard.lock_lost_signal().unwrap();
+    let lock_id = client.acquired.lock().unwrap().clone().unwrap();
+    publication
+        .publication
+        .lock()
+        .guards
+        .push(TableCatalogLockGuard::test_namespace(guard));
+    let mut cleanup = catalog
+        .prepare_empty_table_bucket_cleanup(table_bucket_entry_from_metadata_marker(&bucket), &publication)
+        .await
+        .unwrap();
+    let incarnation = object_store.bucket_incarnation_id_from_disk(&bucket).await.unwrap();
+    let pause = backend.pause_next_delete(&bucket, &metadata_objects[0]).await;
+    let operation = catalog.execute_empty_table_bucket_cleanup(&mut cleanup, incarnation);
+    let interfere = async {
+        tokio::time::timeout(StdDuration::from_secs(5), pause.wait_started())
+            .await
+            .unwrap();
+        assert!(client.force_release(&lock_id).await.unwrap());
+        tokio::time::timeout(StdDuration::from_secs(15), signal.notified())
+            .await
+            .expect("cleanup publication must observe lease loss");
+        pause.release();
+    };
+    let (result, ()) = tokio::join!(operation, interfere);
+    assert!(matches!(result, Err(crate::table_catalog::TableCatalogStoreError::Unavailable(_))));
+    drop(cleanup);
+    TableCommitPublication::complete(&publication);
+    assert!(backend.object_exists(&bucket, &metadata_objects[0]).await.unwrap());
+    assert_eq!(backend.list_objects(RUSTFS_META_BUCKET, &index_prefix).await.unwrap(), indexes);
+    assert_eq!(
+        catalog.get_table_bucket(&bucket).await.unwrap().unwrap().state,
+        TableCatalogEntryState::Active
+    );
+    assert!(
+        object_store
+            .get_bucket_metadata(&bucket)
+            .await
+            .unwrap()
+            .table_bucket_enabled()
+    );
+
+    let publication = TableCommitObjectBackend::trusted(backend.clone());
+    assert!(
+        !cleanup_empty_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+            .await
+            .unwrap()
+            .enabled
+    );
+    assert!(!backend.object_exists(&bucket, &metadata_objects[0]).await.unwrap());
+    assert!(
+        !object_store
+            .get_bucket_metadata(&bucket)
+            .await
+            .unwrap()
+            .table_bucket_enabled()
+    );
+    object_store.delete_bucket(&bucket, &Default::default()).await.unwrap();
 }
