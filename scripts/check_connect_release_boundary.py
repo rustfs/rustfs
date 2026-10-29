@@ -60,7 +60,7 @@ def validate_rejection(status: int, output: str, root: Path) -> list[str]:
 
 
 def check(root: Path) -> int:
-    command = ["cargo", "check", "--locked", "-p", "rustfs", "--lib", "--release", "--message-format=json-render-diagnostics"]
+    command = ["cargo", "check", "--locked", "-p", "rustfs", "--lib", "--release", "--message-format=json"]
     positive = subprocess.run(command, cwd=root)
     if positive.returncode:
         print("ERROR: normal release configuration must compile before the negative check", file=sys.stderr)

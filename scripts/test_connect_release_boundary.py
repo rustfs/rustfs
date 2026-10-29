@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import copy
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -50,6 +51,31 @@ class ReleaseBoundaryTests(unittest.TestCase):
             run.return_value.returncode = 101
             self.assertEqual(guard.check(self.root), 1)
             self.assertEqual(run.call_count, 1)
+
+    def test_real_cargo_release_boundary(self):
+        (self.root / 'Cargo.toml').write_text(
+            '[package]\nname = "rustfs"\nversion = "0.1.0"\nedition = "2021"\n'
+            '[lib]\npath = "' + guard.SOURCE + '"\n'
+            '[features]\nconnect-e2e-short-credentials = []\n[workspace]\n'
+        )
+        (self.root / 'Cargo.lock').write_text(
+            'version = 3\n\n[[package]]\nname = "rustfs"\nversion = "0.1.0"\n'
+        )
+        # The fixture is outside the checkout, so retain its selected toolchain
+        # while keeping compilation offline and out of the workspace target.
+        toolchain = Path(__file__).resolve().parents[1] / 'rust-toolchain.toml'
+        (self.root / toolchain.name).write_text(toolchain.read_text())
+        condition = '#[cfg(all(feature = "connect-e2e-short-credentials", not(debug_assertions)))]\n'
+        cases = (
+            ('expected rejection', condition + 'compile_error!("' + guard.MESSAGE + '");\n', 0),
+            ('missing rejection', '', 1),
+            ('unrelated rejection', condition + 'compile_error!("unrelated compiler error");\n', 1),
+        )
+        with patch.dict(os.environ, {'CARGO_TARGET_DIR': str(self.root / 'target'), 'CARGO_NET_OFFLINE': 'true'}):
+            for name, source, expected in cases:
+                with self.subTest(name=name):
+                    (self.root / guard.SOURCE).write_text(source)
+                    self.assertEqual(guard.check(self.root), expected)
 
 
 if __name__ == '__main__':
