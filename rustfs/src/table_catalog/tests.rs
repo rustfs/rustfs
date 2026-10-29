@@ -4930,6 +4930,39 @@ async fn object_catalog_backup_is_idempotent_and_restorable() {
             .unwrap()
             .is_some()
     );
+
+    store
+        .drop_table(bucket, &namespace.public_name(), &table.as_str())
+        .await
+        .unwrap();
+    store.drop_namespace(bucket, &namespace.public_name()).await.unwrap();
+    let table_root = TableCatalogObjectPaths::default()
+        .table_bucket_entry_path(bucket)
+        .rsplit_once('/')
+        .map(|(prefix, _)| prefix.to_string())
+        .expect("table bucket entry path should have a parent");
+    let extra_path = format!("{table_root}/stale-object");
+    backend.seed_object(RUSTFS_META_BUCKET, &extra_path, b"stale".to_vec()).await;
+    backend.fail_after_next_delete(RUSTFS_META_BUCKET, &extra_path).await;
+    let interrupted_delete = store
+        .restore_object_catalog_backup(bucket, &first.backup_id, None, true)
+        .await
+        .expect_err("restore should surface an ambiguous post-delete interruption");
+    assert!(
+        matches!(interrupted_delete, TableCatalogStoreError::Internal(message) if message.contains("injected post-commit delete failure"))
+    );
+    store
+        .restore_object_catalog_backup(bucket, &first.backup_id, None, true)
+        .await
+        .expect("retrying after interrupted replacement cleanup should converge");
+    assert!(
+        store
+            .load_table(bucket, &namespace.public_name(), &table.as_str())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(backend.read_object(RUSTFS_META_BUCKET, &extra_path).await.unwrap().is_none());
 }
 
 #[tokio::test]
