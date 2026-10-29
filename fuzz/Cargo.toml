@@ -19,18 +19,6 @@ rustfs-security-governance = { path = "../crates/security-governance" }
 rustfs-utils = { path = "../crates/utils", features = ["compress", "path"] }
 serde_json = "1"
 
-[patch.crates-io]
-# Standalone workspaces must repeat the root workspace's fixed SigV4a backend.
-aws-sigv4 = { git = "https://github.com/smithy-lang/smithy-rs", rev = "5c1c4bca2ea7af97496e077c9f1a718eaac64bf8" }
-
-[patch."https://github.com/smithy-lang/smithy-rs"]
-# Keep the signer's path dependencies on the SDK's existing registry types.
-aws-credential-types = { version = "=1.3.1" }
-aws-smithy-eventstream = { version = "=0.61.6" }
-aws-smithy-http = { version = "=0.64.3" }
-aws-smithy-runtime-api = { version = "=1.19.2" }
-aws-smithy-types = { version = "=1.9.1" }
-
 [[bin]]
 name = "bucket_validation"
 path = "fuzz_targets/bucket_validation.rs"

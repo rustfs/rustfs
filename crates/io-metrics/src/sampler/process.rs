@@ -25,7 +25,7 @@ fn current_pid() -> Pid {
 #[derive(Debug)]
 pub struct ProcessSampler {
     pid: Pid,
-    sys: System,
+    sys: Option<System>,
 }
 
 impl Default for ProcessSampler {
@@ -38,8 +38,10 @@ impl ProcessSampler {
     #[inline]
     pub fn new() -> Self {
         let pid = current_pid();
-        let mut sys = System::new();
-        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::everything());
+        let mut sys = System::new().ok();
+        if let Some(sys) = sys.as_mut() {
+            sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::everything());
+        }
         Self { pid, sys }
     }
 
@@ -129,13 +131,14 @@ pub fn snapshot_process_resource_and_system() -> (ProcessResourceSnapshot, Proce
 pub fn snapshot_process_resource_and_system_with(
     sampler: &mut ProcessSampler,
 ) -> (ProcessResourceSnapshot, ProcessSystemSnapshot) {
+    let Some(sys) = sampler.sys.as_mut() else {
+        return (ProcessResourceSnapshot::default(), ProcessSystemSnapshot::default());
+    };
     let platform_stats = crate::snapshot_process_platform_stats();
     let lock_snapshot = crate::snapshot_process_lock_counts();
-    sampler
-        .sys
-        .refresh_processes_specifics(ProcessesToUpdate::Some(&[sampler.pid]), true, ProcessRefreshKind::everything());
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[sampler.pid]), true, ProcessRefreshKind::everything());
 
-    if let Some(process) = sampler.sys.process(sampler.pid) {
+    if let Some(process) = sys.process(sampler.pid) {
         let disk_usage = process.disk_usage();
         let status = ProcessStatusSnapshot::from(process.status());
         let uptime_seconds = process.run_time();
@@ -179,6 +182,18 @@ pub fn snapshot_process_resource_and_system_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_process_source_returns_empty_snapshots() {
+        let mut sampler = ProcessSampler {
+            pid: current_pid(),
+            sys: None,
+        };
+        assert_eq!(
+            sampler.snapshot_resource_and_system(),
+            (ProcessResourceSnapshot::default(), ProcessSystemSnapshot::default())
+        );
+    }
 
     #[test]
     fn process_status_snapshot_maps_sysinfo_values() {
