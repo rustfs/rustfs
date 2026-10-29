@@ -26,6 +26,11 @@ pub trait Store: Clone + Send + Sync + 'static {
     fn has_watcher(&self) -> bool;
     async fn save_iam_config<Item: Serialize + Send>(&self, item: Item, path: impl AsRef<str> + Send) -> Result<()>;
     async fn load_iam_config<Item: DeserializeOwned>(&self, path: impl AsRef<str> + Send) -> Result<Item>;
+    /// Only confirmed storage absence may return ConfigNotFound. Corrupt or
+    /// undecryptable objects must remain errors, especially for revocations.
+    async fn load_iam_config_strict<Item: DeserializeOwned>(&self, _path: impl AsRef<str> + Send) -> Result<Item> {
+        Err(crate::error::Error::IamSysNotInitialized)
+    }
     async fn delete_iam_config(&self, path: impl AsRef<str> + Send) -> Result<()>;
 
     async fn save_user_identity(&self, name: &str, user_type: UserType, item: UserIdentity, ttl: Option<usize>) -> Result<()>;

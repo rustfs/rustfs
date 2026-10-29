@@ -15,23 +15,29 @@
 use crate::admin::{
     auth::authorize_admin_request,
     handlers::audit_runtime_config::{remove_audit_target_config, set_audit_target_config},
+    handlers::event::{converge_target_mutation_on_cluster, preflight_target_mutation_on_cluster},
     handlers::notify_runtime_access::{
-        load_notification_mutation_snapshot, remove_notification_target_config, set_notification_target_config,
+        get_notification_system, load_notification_mutation_snapshot, remove_notification_target_config,
+        set_notification_target_config,
     },
+    handlers::supervise_admin_mutation,
     handlers::target_descriptor::{
         AdminTargetSpec, RuntimeHealthStatus, TargetEndpointSource, TargetInstanceReadModel, admin_target_spec_from_builtin,
-        build_enabled_target_kvs, build_json_response, collect_target_instances, find_target_instance,
-        target_module_disabled_reason, target_mutation_block_reason as shared_target_mutation_block_reason,
+        allowed_target_keys, build_enabled_target_kvs, build_json_response, build_validated_target_kvs, collect_target_instances,
+        collect_validated_key_values, find_target_instance, target_module_disabled_reason,
+        target_mutation_block_reason as shared_target_mutation_block_reason,
     },
     handlers::target_read::{
-        collect_audit_runtime_statuses, collect_notification_runtime_statuses, load_server_config_from_store,
-        load_target_read_snapshot,
+        collect_audit_runtime_statuses, collect_notification_instance_runtime_statuses, collect_notification_runtime_statuses,
+        load_server_config_from_store, load_target_read_snapshot,
     },
     plugin_contract::{
         PluginContractDomain, PluginInstanceDetail, PluginInstanceDiagnostic, PluginInstanceDiagnosticCode,
         PluginInstanceDiagnosticCount, PluginInstanceEntry, PluginInstanceSource, PluginInstancesResponse,
     },
     router::{AdminOperation, Operation, S3Router},
+    runtime_sources::{app_context_from_req, current_object_store_handle_for_context},
+    storage_api::config::{read_admin_server_config_snapshot, read_admin_server_config_with_generation},
     storage_api::s3::{self, S3ErrorCode},
 };
 use crate::server::{
@@ -48,6 +54,7 @@ use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, builtin_notify_target_admin_descriptors};
 use rustfs_targets::{builtin_target_plugin_operational_state, runtime_state_from_status_label};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 use tracing::warn;
@@ -281,6 +288,7 @@ fn plugin_instance_detail(instance: TargetInstanceReadModel) -> PluginInstanceDe
     mapped.diagnostic_codes = diagnostics.iter().map(|item| item.code.clone()).collect();
 
     PluginInstanceDetail {
+        config_revision: None,
         instance: mapped,
         diagnostics,
     }
@@ -320,6 +328,10 @@ struct KeyValue {
 #[serde(deny_unknown_fields)]
 struct PluginInstanceBody {
     key_values: Vec<KeyValue>,
+    #[serde(default)]
+    expected_config: Option<HashMap<String, String>>,
+    #[serde(default)]
+    expected_revision: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -683,6 +695,106 @@ async fn find_plugin_instance(instance_id: &str) -> S3Result<Option<TargetInstan
     find_target_instance(context.specs, context.route_prefix, &config, runtime_statuses, instance_id)
 }
 
+fn effective_validation_fields(
+    context: PluginInstanceDomainContext,
+    subsystem: &str,
+    effective: &KVS,
+    requested: &[KeyValue],
+) -> S3Result<HashMap<String, String>> {
+    let allowed = allowed_target_keys(context.specs, subsystem);
+    let requested = collect_validated_key_values(
+        requested.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
+        &allowed,
+        subsystem,
+        "plugin instance",
+    )?;
+    let mut candidate: HashMap<String, String> = effective
+        .0
+        .iter()
+        .filter(|kv| allowed.contains(kv.key.as_str()))
+        .map(|kv| (kv.key.clone(), kv.value.clone()))
+        .collect();
+    candidate.extend(requested);
+    Ok(candidate)
+}
+
+pub(super) fn merge_conditional_target_update(
+    original: &KVS,
+    expected: &HashMap<String, String>,
+    changed_keys: &[String],
+    validated: &KVS,
+) -> S3Result<KVS> {
+    let mut result = original.clone();
+    for key in changed_keys {
+        if key == rustfs_config::ENABLE_KEY {
+            return Err(s3::error(
+                S3ErrorCode::InvalidRequest,
+                "target enable state cannot be changed using expected_config",
+            ));
+        }
+        let value = validated
+            .lookup(key)
+            .ok_or_else(|| s3::error(S3ErrorCode::InvalidArgument, "missing validated target field"))?;
+        if expected.get(key) != Some(&value) {
+            result.insert(key.clone(), value);
+        }
+    }
+    Ok(result)
+}
+
+pub(super) fn config_revision(instance_id: &str, generation: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rustfs-plugin-instance-config-revision-v1\0");
+    hasher.update(generation.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(instance_id.as_bytes());
+    faster_hex::hex_string(&hasher.finalize())
+}
+
+fn validate_expected_config(
+    context: PluginInstanceDomainContext,
+    config: &Config,
+    instance_id: &str,
+    expected: &HashMap<String, String>,
+) -> S3Result<TargetInstanceReadModel> {
+    if context.domain != PluginContractDomain::Notify {
+        return Err(s3::error(
+            S3ErrorCode::InvalidArgument,
+            "expected_config is only supported for notification targets",
+        ));
+    }
+    let resolved = resolve_plugin_instance_target(instance_id)?;
+    let instance = find_target_instance(
+        std::slice::from_ref(&resolved.target_spec),
+        context.route_prefix,
+        config,
+        HashMap::new(),
+        instance_id,
+    )?
+    .filter(|instance| instance.source == TargetEndpointSource::Config)
+    .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "expected_config requires an existing config-managed target"))?;
+    if instance.has_env_default {
+        return Err(s3::error(
+            S3ErrorCode::InvalidRequest,
+            "notification target inherits environment configuration and cannot be edited",
+        ));
+    }
+    if !instance.enabled {
+        return Err(s3::error(
+            S3ErrorCode::InvalidRequest,
+            "disabled targets cannot be edited with expected_config",
+        ));
+    }
+    if &map_instance_config(instance.config.clone(), secret_fields_for_instance(context.domain, &instance.subsystem)) != expected
+    {
+        return Err(s3::error(
+            S3ErrorCode::InvalidRequest,
+            "target configuration changed since it was read; refresh and retry",
+        ));
+    }
+    Ok(instance)
+}
+
 async fn set_plugin_instance_config(
     context: PluginInstanceDomainContext,
     resolved: &ResolvedPluginInstanceTarget,
@@ -744,12 +856,31 @@ impl Operation for GetPluginInstanceHandler {
             .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'id'"))?;
 
         refresh_persisted_module_switches().await?;
-        let instance = find_plugin_instance(instance_id)
-            .await?
-            .ok_or_else(|| s3_error!(NoSuchKey, "plugin instance not found"))?;
-
-        let data = serde_json::to_vec(&plugin_instance_detail(instance))
-            .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
+        let domain = parse_plugin_instance_id(instance_id)?.1;
+        let (instance, generation) = if domain == PluginContractDomain::Notify {
+            let app_context = app_context_from_req(&req);
+            let context = plugin_instance_domain_context(domain);
+            let read_config = async {
+                match current_object_store_handle_for_context(app_context.as_deref()) {
+                    Some(store) => read_admin_server_config_with_generation(store)
+                        .await
+                        .map_err(|_| s3::error(S3ErrorCode::InternalError, "failed to read server config")),
+                    None => Ok((Config::new(), None)),
+                }
+            };
+            let ((config, generation), runtime) = tokio::try_join!(read_config, async {
+                Ok::<_, s3s::S3Error>(collect_notification_instance_runtime_statuses(context.specs, instance_id).await)
+            })?;
+            let instance = find_target_instance(context.specs, context.route_prefix, &config, runtime, instance_id)?;
+            (instance, generation.map(|value| value.to_string()))
+        } else {
+            (find_plugin_instance(instance_id).await?, None)
+        };
+        let instance = instance.ok_or_else(|| s3::error(S3ErrorCode::NoSuchKey, "plugin instance not found"))?;
+        let mut detail = plugin_instance_detail(instance);
+        detail.config_revision = generation.map(|value| config_revision(instance_id, &value));
+        let data = serde_json::to_vec(&detail)
+            .map_err(|e| s3::error(S3ErrorCode::InternalError, format!("failed to serialize response: {}", e)))?;
         Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
     }
 }
@@ -760,6 +891,7 @@ pub struct PutPluginInstanceHandler {}
 impl Operation for PutPluginInstanceHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_plugin_instance_write_request(&req).await?;
+        let app_context = app_context_from_req(&req);
         let instance_id = params
             .get("id")
             .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'id'"))?;
@@ -780,7 +912,16 @@ impl Operation for PutPluginInstanceHandler {
         let mut body: PluginInstanceBody = serde_json::from_slice(&body_bytes)
             .map_err(|e| s3_error!(InvalidArgument, "invalid json body for plugin instance config: {}", e))?;
 
-        let config_snapshot = plugin_instance_mutation_config_snapshot(context).await?;
+        let (config_snapshot, generation) = if context.domain == PluginContractDomain::Notify {
+            let store = current_object_store_handle_for_context(app_context.as_deref())
+                .ok_or_else(|| s3::error(S3ErrorCode::InternalError, "server storage not initialized"))?;
+            let snapshot = read_admin_server_config_snapshot(store)
+                .await
+                .map_err(|_| s3::error(S3ErrorCode::InternalError, "failed to read server config"))?;
+            (snapshot.config.clone(), snapshot.generation().map(|value| value.to_string()))
+        } else {
+            (plugin_instance_mutation_config_snapshot(context).await?, None)
+        };
         if let Some(reason) = plugin_instance_mutation_block_reason(
             context,
             &config_snapshot,
@@ -791,25 +932,104 @@ impl Operation for PutPluginInstanceHandler {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
+        if body.expected_revision.is_some() && body.expected_config.is_none() {
+            return Err(s3::error(S3ErrorCode::InvalidArgument, "expected_revision requires expected_config"));
+        }
+        let effective_instance = if let Some(expected) = body.expected_config.as_ref() {
+            let revision = generation
+                .as_ref()
+                .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "target configuration revision unavailable"))?;
+            if body.expected_revision.as_deref() != Some(config_revision(instance_id, revision).as_str()) {
+                return Err(s3::error(
+                    S3ErrorCode::InvalidRequest,
+                    "target configuration changed since it was read; refresh and retry",
+                ));
+            }
+            Some(validate_expected_config(context, &config_snapshot, instance_id, expected)?.config)
+        } else {
+            None
+        };
+
+        let changed_keys: Vec<String> = body
+            .expected_config
+            .as_ref()
+            .map(|expected| {
+                body.key_values
+                    .iter()
+                    .filter(|kv| expected.get(&kv.key) != Some(&kv.value))
+                    .map(|kv| kv.key.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // GET responses redact secret values; a read-modify-write round trip
         // sends the placeholder back, which must restore the stored secret
         // instead of persisting the placeholder literal.
-        restore_redacted_secret_values(
-            &mut body.key_values,
-            resolved.target_spec.secret_fields,
-            stored_instance_config(&config_snapshot, resolved.target_spec.subsystem, &resolved.target_name),
-        )?;
+        let stored_secrets = if body.expected_config.is_some() && context.domain == PluginContractDomain::Notify {
+            effective_instance.as_ref()
+        } else {
+            stored_instance_config(&config_snapshot, resolved.target_spec.subsystem, &resolved.target_name)
+        };
+        restore_redacted_secret_values(&mut body.key_values, resolved.target_spec.secret_fields, stored_secrets)?;
 
-        let kvs = build_enabled_target_kvs(
-            context.specs,
-            body.key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
-            resolved.target_spec.subsystem,
-            context.default_queue_dir,
-            "plugin instance",
-        )
-        .await?;
+        let validated_kvs = if let Some(effective) = effective_instance.as_ref() {
+            let candidate = effective_validation_fields(context, resolved.target_spec.subsystem, effective, &body.key_values)?;
+            build_validated_target_kvs(&resolved.target_spec, candidate, context.default_queue_dir).await?
+        } else {
+            build_enabled_target_kvs(
+                context.specs,
+                body.key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
+                resolved.target_spec.subsystem,
+                context.default_queue_dir,
+                "plugin instance",
+            )
+            .await?
+        };
 
-        set_plugin_instance_config(context, &resolved, kvs).await?;
+        let kvs = if let Some(expected_config) = body.expected_config.as_ref() {
+            let original = stored_instance_config(&config_snapshot, resolved.target_spec.subsystem, &resolved.target_name)
+                .ok_or_else(|| {
+                    s3::error(S3ErrorCode::InvalidRequest, "expected_config requires an existing config-managed target")
+                })?;
+            merge_conditional_target_update(original, expected_config, &changed_keys, &validated_kvs)?
+        } else {
+            validated_kvs
+        };
+
+        if context.domain == PluginContractDomain::Notify {
+            let expected =
+                stored_instance_config(&config_snapshot, resolved.target_spec.subsystem, &resolved.target_name).cloned();
+            let expected_default =
+                stored_instance_config(&config_snapshot, resolved.target_spec.subsystem, rustfs_config::DEFAULT_DELIMITER)
+                    .cloned();
+            let expected_generation = if body.expected_config.is_some() { generation } else { None };
+            let system = get_notification_system().await?;
+            let subsystem = resolved.target_spec.subsystem.to_owned();
+            let target_name = resolved.target_name.clone();
+            supervise_admin_mutation("plugin notification target mutation", async move {
+                preflight_target_mutation_on_cluster(app_context.as_deref(), &subsystem).await?;
+                let local = system
+                    .set_target_config_if_unchanged(
+                        &subsystem,
+                        &target_name,
+                        expected,
+                        expected_default,
+                        expected_generation,
+                        kvs,
+                    )
+                    .await;
+                if matches!(local, Err(rustfs_notify::NotificationError::ConfigurationConflict)) {
+                    return Err(s3::error(
+                        S3ErrorCode::InvalidRequest,
+                        "target configuration changed during validation; retry the request",
+                    ));
+                }
+                converge_target_mutation_on_cluster(app_context.as_deref(), &subsystem, local).await
+            })
+            .await?;
+        } else {
+            set_plugin_instance_config(context, &resolved, kvs).await?;
+        }
 
         Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
     }
@@ -1102,6 +1322,7 @@ mod tests {
             health_state: "offline".to_string(),
             health_reason: "not_loaded_in_runtime".to_string(),
             runtime_present: false,
+            has_env_default: false,
             source: TargetEndpointSource::Config,
             enabled: true,
             config: enabled_kvs("on"),
@@ -1126,6 +1347,7 @@ mod tests {
             health_state: "online".to_string(),
             health_reason: "reachable".to_string(),
             runtime_present: true,
+            has_env_default: false,
             source: TargetEndpointSource::Config,
             enabled: true,
             config: KVS(vec![
@@ -1216,6 +1438,202 @@ mod tests {
         let found = super::stored_instance_config(&config, NOTIFY_WEBHOOK_SUB_SYS, "primary")
             .expect("case-insensitive lookup should find the stored section");
         assert_eq!(found.lookup(WEBHOOK_AUTH_TOKEN).as_deref(), Some("stored-secret-token"));
+    }
+
+    #[test]
+    fn expected_config_round_trips_redacted_read_and_rejects_stale_values() {
+        let mut target = KVS::new();
+        target.insert(ENABLE_KEY.into(), "on".into());
+        target.insert(WEBHOOK_ENDPOINT.into(), "https://example.com/a".into());
+        target.insert(WEBHOOK_AUTH_TOKEN.into(), "secret-one".into());
+        let mut config = Config(HashMap::from([(
+            NOTIFY_WEBHOOK_SUB_SYS.into(),
+            HashMap::from([("primary".into(), target)]),
+        )]));
+        let context = super::plugin_instance_domain_context(PluginContractDomain::Notify);
+        let id = canonical_target_instance_id("builtin:webhook", TargetDomain::Notify, "primary");
+        let instance = super::find_target_instance(context.specs, context.route_prefix, &config, HashMap::new(), &id)
+            .expect("find instance")
+            .expect("configured target");
+        let expected = super::map_instance(instance).config;
+        assert_eq!(expected.get(WEBHOOK_AUTH_TOKEN).map(String::as_str), Some(super::REDACTED_SECRET_VALUE));
+        super::validate_expected_config(context, &config, &id, &expected).expect("GET config should be accepted");
+        config
+            .0
+            .get_mut(NOTIFY_WEBHOOK_SUB_SYS)
+            .expect("subsystem")
+            .get_mut("primary")
+            .expect("target")
+            .insert(WEBHOOK_AUTH_TOKEN.into(), "secret-two".into());
+        super::validate_expected_config(context, &config, &id, &expected).expect("rotation remains redacted");
+        config
+            .0
+            .get_mut(NOTIFY_WEBHOOK_SUB_SYS)
+            .expect("subsystem")
+            .get_mut("primary")
+            .expect("target")
+            .insert(WEBHOOK_ENDPOINT.into(), "https://example.com/b".into());
+        assert!(super::validate_expected_config(context, &config, &id, &expected).is_err());
+        config
+            .0
+            .get_mut(NOTIFY_WEBHOOK_SUB_SYS)
+            .expect("subsystem")
+            .get_mut("primary")
+            .expect("target")
+            .insert(ENABLE_KEY.into(), "off".into());
+        let disabled = super::find_target_instance(context.specs, context.route_prefix, &config, HashMap::new(), &id)
+            .expect("find disabled instance")
+            .expect("disabled target exists");
+        let disabled_expected = super::map_instance(disabled).config;
+        let error = super::validate_expected_config(context, &config, &id, &disabled_expected)
+            .expect_err("disabled target must not be enabled by editing");
+        assert!(error.to_string().contains("disabled targets"));
+        config.0.get_mut(NOTIFY_WEBHOOK_SUB_SYS).expect("subsystem").remove("primary");
+        assert!(super::validate_expected_config(context, &config, &id, &expected).is_err());
+        let legacy: PluginInstanceBody = serde_json::from_str(r#"{"key_values":[]}"#).expect("legacy input");
+        assert!(legacy.expected_config.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn conditional_edit_rejects_inherited_environment_defaults() {
+        temp_env::with_vars(
+            [(rustfs_config::notify::ENV_NOTIFY_WEBHOOK_ENDPOINT, Some("https://example.com/hook"))],
+            || {
+                let context = super::plugin_instance_domain_context(PluginContractDomain::Notify);
+                let mut config = Config::new();
+                let mut target = KVS::new();
+                target.insert(ENABLE_KEY.into(), "on".into());
+                config
+                    .0
+                    .entry(NOTIFY_WEBHOOK_SUB_SYS.into())
+                    .or_default()
+                    .insert("Primary".into(), target);
+                let id = canonical_target_instance_id("builtin:webhook", TargetDomain::Notify, "primary");
+                let error = super::validate_expected_config(context, &config, &id, &HashMap::new())
+                    .expect_err("inherited environment defaults must prevent edits");
+                assert!(error.to_string().contains("inherits environment configuration"));
+            },
+        );
+    }
+
+    #[test]
+    fn conditional_edit_keeps_inherited_fields_in_default_layer() {
+        let mut original = KVS::new();
+        original.insert("endpoint".into(), "https://example.com/old".into());
+        let expected = HashMap::from([
+            ("endpoint".into(), "https://example.com/old".into()),
+            ("auth_token".into(), super::REDACTED_SECRET_VALUE.into()),
+            ("queue_limit".into(), "10".into()),
+        ]);
+        let mut validated = KVS::new();
+        validated.insert("endpoint".into(), "https://example.com/new".into());
+        validated.insert("auth_token".into(), "default-secret".into());
+        validated.insert("queue_limit".into(), "10".into());
+        let result = super::merge_conditional_target_update(&original, &expected, &["endpoint".into()], &validated)
+            .expect("merge edited endpoint");
+        assert_eq!(result.lookup("endpoint").as_deref(), Some("https://example.com/new"));
+        assert_eq!(result.lookup("auth_token"), None);
+        assert_eq!(result.lookup("queue_limit"), None);
+        for value in ["replacement-secret", ""] {
+            validated.insert("auth_token".into(), value.into());
+            let changed = super::merge_conditional_target_update(&original, &expected, &["auth_token".into()], &validated)
+                .expect("merge explicit secret change");
+            assert_eq!(changed.lookup("auth_token").as_deref(), Some(value));
+            assert_eq!(changed.lookup("queue_limit"), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_nats_update_validates_merged_authentication() {
+        use rustfs_config::{NATS_ADDRESS, NATS_PASSWORD, NATS_SUBJECT, NATS_TOKEN, NATS_USERNAME};
+        let context = super::plugin_instance_domain_context(PluginContractDomain::Notify);
+        let subsystem = rustfs_config::notify::NOTIFY_NATS_SUB_SYS;
+        let mut effective = KVS::new();
+        effective.insert(NATS_ADDRESS.into(), "nats://127.0.0.1:4222".into());
+        effective.insert(NATS_SUBJECT.into(), "events".into());
+        effective.insert(NATS_USERNAME.into(), "user".into());
+        effective.insert(NATS_PASSWORD.into(), "password".into());
+        for mut requested in [
+            vec![super::KeyValue {
+                key: NATS_TOKEN.into(),
+                value: "new-token".into(),
+            }],
+            vec![
+                super::KeyValue {
+                    key: NATS_ADDRESS.into(),
+                    value: "nats://127.0.0.1:4222".into(),
+                },
+                super::KeyValue {
+                    key: NATS_SUBJECT.into(),
+                    value: "events".into(),
+                },
+                super::KeyValue {
+                    key: NATS_USERNAME.into(),
+                    value: "user".into(),
+                },
+                super::KeyValue {
+                    key: NATS_PASSWORD.into(),
+                    value: super::REDACTED_SECRET_VALUE.into(),
+                },
+                super::KeyValue {
+                    key: NATS_TOKEN.into(),
+                    value: "new-token".into(),
+                },
+            ],
+        ] {
+            super::restore_redacted_secret_values(&mut requested, &[NATS_PASSWORD, NATS_TOKEN], Some(&effective))
+                .expect("restore placeholders before validation");
+            let candidate =
+                super::effective_validation_fields(context, subsystem, &effective, &requested).expect("merge request");
+            assert_eq!(candidate.get(NATS_PASSWORD).map(String::as_str), Some("password"));
+            let spec = context
+                .specs
+                .iter()
+                .find(|spec| spec.subsystem == subsystem)
+                .expect("NATS descriptor");
+            let error = super::build_validated_target_kvs(spec, candidate, context.default_queue_dir)
+                .await
+                .expect_err("mixed NATS authentication must fail before connection");
+            assert!(error.to_string().contains("only one auth method"));
+        }
+    }
+
+    #[test]
+    fn conditional_update_rejects_unknown_and_duplicate_keys() {
+        let context = super::plugin_instance_domain_context(PluginContractDomain::Notify);
+        let subsystem = rustfs_config::notify::NOTIFY_NATS_SUB_SYS;
+        let unknown = [super::KeyValue {
+            key: "unknown".into(),
+            value: "value".into(),
+        }];
+        let duplicate = [
+            super::KeyValue {
+                key: rustfs_config::NATS_SUBJECT.into(),
+                value: "one".into(),
+            },
+            super::KeyValue {
+                key: rustfs_config::NATS_SUBJECT.into(),
+                value: "two".into(),
+            },
+        ];
+        for request in [&unknown[..], &duplicate[..]] {
+            assert!(super::effective_validation_fields(context, subsystem, &KVS::new(), request).is_err());
+        }
+    }
+
+    #[test]
+    fn config_revision_is_scoped_to_instance_and_generation() {
+        let revision = super::config_revision("builtin:webhook:notify:one", "00000000-0000-4000-8000-000000000001");
+        assert_eq!(revision.len(), 64);
+        assert_ne!(
+            revision,
+            super::config_revision("builtin:webhook:notify:two", "00000000-0000-4000-8000-000000000001")
+        );
+        assert_ne!(
+            revision,
+            super::config_revision("builtin:webhook:notify:one", "00000000-0000-4000-8000-000000000002")
+        );
     }
 
     #[test]
@@ -1559,6 +1977,7 @@ mod tests {
             health_state: "offline".to_string(),
             health_reason: "not_loaded_in_runtime".to_string(),
             runtime_present: false,
+            has_env_default: false,
             source: TargetEndpointSource::Config,
             enabled: true,
             config: enabled_kvs("on"),
@@ -1585,6 +2004,7 @@ mod tests {
             health_state: "offline".to_string(),
             health_reason: "unreachable".to_string(),
             runtime_present: true,
+            has_env_default: false,
             source: TargetEndpointSource::Runtime,
             enabled: true,
             config: KVS::new(),
@@ -1611,6 +2031,7 @@ mod tests {
             health_state: "disabled".to_string(),
             health_reason: "disabled".to_string(),
             runtime_present: false,
+            has_env_default: false,
             source: TargetEndpointSource::Mixed,
             enabled: false,
             config: enabled_kvs("off"),
@@ -1654,6 +2075,7 @@ mod tests {
             health_state: "offline".to_string(),
             health_reason: "not_loaded_in_runtime".to_string(),
             runtime_present: false,
+            has_env_default: false,
             source: TargetEndpointSource::Config,
             enabled: true,
             config: enabled_kvs("on"),

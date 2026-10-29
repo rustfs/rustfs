@@ -1090,7 +1090,7 @@ impl ScannerIOCache for SetDisks {
 
                     // Lock order: scanner leader fence -> set-scoped per-bucket cache lock ->
                     // cache object read/write.
-                    let cache_guard = match acquire_scanner_cache_locks(store_clone_clone.as_ref(), &cache_name, source).await {
+                    let mut cache_guard = match acquire_scanner_cache_locks(store_clone_clone.as_ref(), &cache_name, source).await {
                         Ok(guard) => guard,
                         Err(e) => {
                             if e.is_contention() {
@@ -1320,9 +1320,10 @@ impl ScannerIOCache for SetDisks {
                     );
 
                     let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel::<DataUsageCache>(1);
+                    let (node_tx, mut node_rx) = crate::workload_admission::scanner_node_request_channel();
 
                     let scan_ctx = ctx_clone.child_token();
-                    let scan = disk.clone().nsscanner_disk(
+                    let scan = crate::workload_admission::with_scanner_node_requests(node_tx, disk.clone().nsscanner_disk(
                         scan_ctx.clone(),
                         budget_clone.clone(),
                         set_disk_inventory_clone.as_ref().clone(),
@@ -1333,7 +1334,7 @@ impl ScannerIOCache for SetDisks {
                             prefix_scan_scope,
                             checkpoint_tx: Some(checkpoint_tx),
                         },
-                    );
+                    ));
                     tokio::pin!(scan);
                     let mut lock_watch = tokio::time::interval(SCANNER_CACHE_LOCK_POLL_INTERVAL);
                     lock_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1341,6 +1342,24 @@ impl ScannerIOCache for SetDisks {
                     let scan_result = loop {
                         tokio::select! {
                             result = &mut scan => break result,
+                            request = async {
+                                match node_rx.as_mut() {
+                                    Some(receiver) => receiver.recv().await,
+                                    None => std::future::pending().await,
+                                }
+                            } => {
+                                let Some(request) = request else {
+                                    node_rx = None;
+                                    continue;
+                                };
+                                if let Err(error) = cache_guard.resume_node_operation(
+                                    store_clone_clone.clone(), &cache_name, source, &revisions, request,
+                                ).await {
+                                    scan_ctx.cancel();
+                                    await_scanner_disk_shutdown(scan.as_mut()).await;
+                                    break Err(error);
+                                }
+                            }
                             _ = lock_watch.tick() => {
                                 if cache_guard.is_lock_lost() {
                                     scan_ctx.cancel();

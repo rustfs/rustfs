@@ -8450,6 +8450,23 @@ impl LocalDisk {
                     return Err(std::io::Error::other("metadata read worker cancelled"));
                 }
                 let _io_permit = io_permit;
+                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                {
+                    let opened = root.open_readonly(&path);
+                    if opened.is_ok() {
+                        os::prepared_publication_test_hooks::run(
+                            os::prepared_publication_test_hooks::Stage::MetadataReadAfterOpen,
+                            &path,
+                        );
+                    }
+                    let result = read_fn(opened);
+                    os::prepared_publication_test_hooks::run(
+                        os::prepared_publication_test_hooks::Stage::MetadataReadAfterRead,
+                        &path,
+                    );
+                    Ok(result)
+                }
+                #[cfg(not(all(any(test, feature = "test-util"), not(windows))))]
                 Ok(read_fn(root.open_readonly(&path)))
             })
             .await
@@ -11315,7 +11332,7 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
     let diagnostic = crate::diagnostics::batch_read_diagnostics::Sample::capture();
     tokio::task::spawn_blocking(move || {
         use rustfs_io_metrics::LocalBatchReadStage;
-        use std::os::unix::fs::FileExt;
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
         // The disabled build expands directly to the original operation.
         macro_rules! diagnostic_stage {
@@ -11355,21 +11372,28 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
             let _index = results.len();
             let mut total = 0usize;
             let r = (|| -> Result<Bytes> {
-                let meta = diagnostic_stage!(Metadata, _index, || measure_local_batch_stage(
-                    metrics.as_deref(),
-                    LocalBatchReadStage::Metadata,
-                    || std::fs::metadata(&file_path).map_err(DiskError::from),
-                ))?;
                 let end = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
-                if meta.len() < u64::try_from(end).unwrap_or(u64::MAX) {
-                    return Err(DiskError::FileCorrupt);
-                }
-
+                let end = u64::try_from(end).map_err(|_| DiskError::FileCorrupt)?;
+                // Bind validation and reads to one descriptor. Nonblocking open
+                // lets corrupt non-regular entries fail without waiting on a FIFO.
                 let file = diagnostic_stage!(Open, _index, || measure_local_batch_stage(
                     metrics.as_deref(),
                     LocalBatchReadStage::Open,
-                    || std::fs::File::open(&file_path).map_err(DiskError::from),
+                    || std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&file_path)
+                        .map_err(DiskError::from),
                 ))?;
+                let meta = diagnostic_stage!(Metadata, _index, || measure_local_batch_stage(
+                    metrics.as_deref(),
+                    LocalBatchReadStage::Metadata,
+                    || file.metadata().map_err(DiskError::from),
+                ))?;
+                if !meta.is_file() || meta.len() < end {
+                    return Err(DiskError::FileCorrupt);
+                }
+
                 let mut buf = diagnostic_stage!(Allocation, _index, || Ok::<_, DiskError>(vec![0u8; length]))?;
                 if length > 0 {
                     diagnostic_stage!(Read, _index, || measure_local_batch_stage(
@@ -31080,7 +31104,7 @@ mod test {
         assert_eq!(recorder.counter_value(counter, &[("outcome", "error")]), 2);
         assert_eq!(recorder.counter_value("rustfs_io_get_object_local_batch_read_bytes_total", &[]), 9);
         let stages = "rustfs_io_get_object_local_batch_stage_seconds";
-        for (stage, success, errors) in [("metadata", 3, 1), ("open", 2, 0), ("read", 1, 0), ("execution", 0, 1)] {
+        for (stage, success, errors) in [("open", 3, 1), ("metadata", 3, 0), ("read", 1, 0), ("execution", 0, 1)] {
             assert_eq!(
                 recorder
                     .histogram_values(stages, &[("stage", stage), ("outcome", "success")])
@@ -31147,6 +31171,70 @@ mod test {
             1
         );
         assert_eq!(recorder.counter_value("rustfs_io_get_object_local_batch_read_bytes_total", &[]), 4);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_batch_shard_pread_rejects_nonregular_files_without_blocking() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().expect("nonregular shard fixture");
+        let fifo = dir.path().join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("run POSIX mkfifo for the shard fixture")
+                .success()
+        );
+        let good = dir.path().join("good");
+        std::fs::write(&good, b"data").expect("write regular shard");
+        let mut batch = Box::pin(batch_shard_pread(vec![
+            (dir.path().to_owned(), 0, 0),
+            (fifo.clone(), 0, 0),
+            (fifo.clone(), 0, 4),
+            (good, 0, 4),
+        ]));
+        let results = match tokio::time::timeout(Duration::from_secs(2), &mut batch).await {
+            Ok(results) => results,
+            Err(_) => {
+                // Release a regressed blocking open before failing, so runtime
+                // shutdown does not leave the test waiting on its worker.
+                let _release = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo)
+                    .expect("release blocked FIFO reader");
+                batch.await;
+                panic!("a nonregular shard must not block its batch");
+            }
+        };
+        for result in &results[..3] {
+            assert!(matches!(result, Err(DiskError::FileCorrupt)), "nonregular shard: {result:?}");
+        }
+        assert_eq!(results[3].as_ref().expect("later regular shard remains readable").as_ref(), b"data");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_batch_shard_pread_validates_descriptor_ranges() {
+        let dir = tempfile::tempdir().expect("range validation fixture");
+        let path = dir.path().join("shard");
+        std::fs::write(&path, b"01234567").expect("write range fixture");
+        let results = batch_shard_pread(vec![
+            (path.clone(), 3, 5),
+            (path.clone(), 8, 0),
+            (path.clone(), 8, 1),
+            (path.clone(), 9, 0),
+            (path, usize::MAX, 1),
+        ])
+        .await;
+        assert_eq!(results[0].as_ref().expect("range ending at EOF").as_ref(), b"34567");
+        assert!(results[1].as_ref().expect("empty range at EOF").is_empty());
+        for result in &results[2..] {
+            assert!(matches!(result, Err(DiskError::FileCorrupt)), "invalid range: {result:?}");
+        }
     }
 
     #[cfg(unix)]

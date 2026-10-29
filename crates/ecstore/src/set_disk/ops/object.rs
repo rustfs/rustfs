@@ -73,6 +73,7 @@ struct DeleteCommitContext<'a> {
     incarnation: Option<Uuid>,
     options: Option<&'a ObjectOptions>,
     guard: Option<Arc<super::super::ObjectLockDiagGuard>>,
+    transaction_guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
 }
 
 impl<'a> DeleteCommitContext<'a> {
@@ -81,17 +82,37 @@ impl<'a> DeleteCommitContext<'a> {
             incarnation: options.expected_bucket_incarnation_id,
             options: Some(options),
             guard: guard.cloned(),
+            transaction_guard: None,
         }
     }
 
+    fn with_transaction_guard(mut self, guard: Option<&Arc<rustfs_lock::NamespaceLockGuard>>) -> Self {
+        self.transaction_guard = guard.cloned();
+        self
+    }
+
+    fn ensure_transaction_lock_held(&self, bucket: &str, object: &str) -> Result<()> {
+        if self.transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "delete_transaction",
+                bucket: bucket.to_owned(),
+                object: object.to_owned(),
+                required: 1,
+                achieved: 0,
+            });
+        }
+        Ok(())
+    }
+
     fn can_commit(&self, bucket: &str, object: &str) -> bool {
-        self.options.is_none_or(|options| {
-            ensure_delete_commit_locks_held(self.guard.as_deref(), bucket, object, options).is_ok()
-                && options
-                    .scanner_publication_commit_scope
-                    .as_ref()
-                    .is_none_or(|scope| scope.can_commit())
-        })
+        !self.transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            && self.options.is_none_or(|options| {
+                ensure_delete_commit_locks_held(self.guard.as_deref(), bucket, object, options).is_ok()
+                    && options
+                        .scanner_publication_commit_scope
+                        .as_ref()
+                        .is_none_or(|scope| scope.can_commit())
+            })
     }
 }
 
@@ -3855,6 +3876,7 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
         lock_guard: Option<&Arc<super::super::ObjectLockDiagGuard>>,
+        transaction_guard: Option<&Arc<rustfs_lock::NamespaceLockGuard>>,
     ) -> Result<bool> {
         if is_meta_bucketname(bucket)
             || opts.version_id.is_some()
@@ -3891,6 +3913,7 @@ impl SetDisks {
                 object,
                 DeleteRecoveryContext {
                     explicit_delete: true,
+                    transaction_guard: transaction_guard.cloned(),
                     namespace_owner: Some(Arc::new((
                         self.ctx.begin_namespace_commit(),
                         lock_guard.cloned(),
@@ -8842,7 +8865,7 @@ impl SetDisks {
         // quorum, failing write quorum on update_object_meta (backlog#872).
         let read_opts = opts.as_read_opts();
         let (mut fi, _, disks) = self
-            .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
+            .get_object_fileinfo_for_metadata_update(bucket, object, &read_opts)
             .await?
             .into_owned();
 
@@ -8880,8 +8903,11 @@ impl SetDisks {
         fi: &FileInfo,
         force_del_marker: bool,
         delete_marker_purge: Option<MrfDeleteMarkerPurge>,
-        commit_context: DeleteCommitContext<'_>,
+        mut commit_context: DeleteCommitContext<'_>,
     ) -> Result<()> {
+        if !is_meta_bucketname(bucket) && commit_context.transaction_guard.is_none() {
+            commit_context.transaction_guard = Some(self.acquire_delete_transaction_lock(bucket, object).await?);
+        }
         let source_bucket_incarnation_id = commit_context.incarnation;
         let transported = delete_file_info_with_replication_transport_metadata(fi);
         let fi = &transported;
@@ -8890,6 +8916,7 @@ impl SetDisks {
             Arc::new((
                 self.ctx.begin_namespace_commit(),
                 commit_context.guard.clone(),
+                commit_context.transaction_guard.clone(),
                 commit_context
                     .options
                     .and_then(|options| options.object_lock_config_snapshot.clone()),
@@ -8929,7 +8956,11 @@ impl SetDisks {
 
         for disk in disks.iter() {
             let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
+            let transaction_guard = commit_context.transaction_guard.as_ref();
             futures.push(async move {
+                if transaction_guard.is_some_and(|guard| guard.is_lock_lost()) {
+                    return Err(DiskError::DiskOngoingReq);
+                }
                 if let Some(disk) = disk {
                     let options = DeleteOptions {
                         old_data_dir: Some(rollback_dir),
@@ -8979,6 +9010,7 @@ impl SetDisks {
             }
         }
 
+        commit_context.ensure_transaction_lock_held(bucket, object)?;
         let mut quorum_result = resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
         if !is_meta_bucketname(bucket) && errs.iter().flatten().any(super::delete_recovery::unsupported_recovery) {
             quorum_result = Err(DiskError::UnsupportedDisk.into());
@@ -9011,6 +9043,7 @@ impl SetDisks {
                 write_quorum,
                 DeleteRecoveryContext {
                     recovery_ticket,
+                    transaction_guard: commit_context.transaction_guard.clone(),
                     namespace_owner: namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>),
                     ..DeleteRecoveryContext::new(source_bucket_incarnation_id, &|| commit_context.can_commit(bucket, object))
                 },
@@ -9020,6 +9053,7 @@ impl SetDisks {
         }
         #[cfg(test)]
         pause_delete_before_cleanup(bucket).await;
+        commit_context.ensure_transaction_lock_held(bucket, object)?;
         let mut rollback_futures = Vec::new();
         for (index, err) in errs.iter().enumerate() {
             if structured_cleanup {
@@ -9045,7 +9079,11 @@ impl SetDisks {
             let object = object.to_string();
             let fi = fi.clone();
             let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
+            let transaction_guard = commit_context.transaction_guard.as_ref();
             rollback_futures.push(async move {
+                if transaction_guard.is_some_and(|guard| guard.is_lock_lost()) {
+                    return;
+                }
                 if should_rollback {
                     // The dedicated undo path never forwards the marker-only creation flag.
                     if let Err(err) = disk
@@ -9102,6 +9140,7 @@ impl SetDisks {
         }
 
         join_all(rollback_futures).await;
+        commit_context.ensure_transaction_lock_held(bucket, object)?;
         drop(namespace_owner);
         if quorum_result.is_ok()
             && errs.iter().any(Option::is_some)
@@ -9297,35 +9336,55 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         };
 
-        let (read_quorum, write_quorum) = match Self::object_quorum_from_meta(&metas, &errs, self.default_parity_count) {
-            Ok((r, w)) => (
-                usize::try_from(r)
-                    .map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![src_bucket, src_object]))?,
-                usize::try_from(w)
-                    .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![src_bucket, src_object]))?,
-            ),
+        let src_version_id = src_opts.version_id.as_deref().unwrap_or_default();
+        let quorum = Self::object_quorum_from_meta(&metas, &errs, self.default_parity_count);
+        let selection = match &quorum {
+            Ok((read_quorum, write_quorum)) => {
+                let read_quorum = usize::try_from(*read_quorum)
+                    .map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![src_bucket, src_object]))?;
+                let write_quorum = usize::try_from(*write_quorum)
+                    .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![src_bucket, src_object]))?;
+                Self::select_fileinfo_for_read(src_bucket, &disks, &metas, &errs, src_version_id, read_quorum, write_quorum)
+                    .map(|(online_disks, fi)| (online_disks, fi, write_quorum))
+            }
+            Err(err) => Err(err.clone()),
+        };
+        let (online_disks, mut fi, write_quorum) = match selection {
+            Ok(selection) => selection,
             Err(mut err) => {
-                if err == DiskError::ErasureReadQuorum
-                    && !src_bucket.starts_with(RUSTFS_META_BUCKET)
-                    && self
-                        .delete_if_dangling(src_bucket, src_object, &metas, &errs, &HashMap::new(), src_opts.clone())
-                        .await
-                        .is_ok()
+                // The merged latest version can be one a failed PUT left below
+                // quorum; resolve it like a latest GET before the dangling
+                // cleanup below can report a key with a committed version absent.
+                if let Some(snapshot) = self
+                    .select_latest_past_dangling_versions(src_bucket, src_object, src_opts, true, &disks, &err)
+                    .await
                 {
-                    if src_opts.version_id.is_some() {
-                        err = DiskError::FileVersionNotFound
-                    } else {
-                        err = DiskError::FileNotFound
+                    // A version-only copy writes the served version's own
+                    // copies, so they and its write quorum replace the latest
+                    // read's.
+                    let (fi, parts_metadata, online_disks) = snapshot.into_owned();
+                    metas = parts_metadata;
+                    let write_quorum = fi.write_quorum(self.default_write_quorum());
+                    (online_disks, fi, write_quorum)
+                } else {
+                    if quorum.is_err()
+                        && err == DiskError::ErasureReadQuorum
+                        && !src_bucket.starts_with(RUSTFS_META_BUCKET)
+                        && self
+                            .delete_if_dangling(src_bucket, src_object, &metas, &errs, &HashMap::new(), src_opts.clone())
+                            .await
+                            .is_ok()
+                    {
+                        if src_opts.version_id.is_some() {
+                            err = DiskError::FileVersionNotFound
+                        } else {
+                            err = DiskError::FileNotFound
+                        }
                     }
+                    return Err(to_object_err(err.into(), vec![src_bucket, src_object]));
                 }
-                return Err(to_object_err(err.into(), vec![src_bucket, src_object]));
             }
         };
-
-        let src_version_id = src_opts.version_id.as_deref().unwrap_or_default();
-        let (online_disks, mut fi) =
-            Self::select_fileinfo_for_read(src_bucket, &disks, &metas, &errs, src_version_id, read_quorum, write_quorum)
-                .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
 
         if fi.deleted {
             if src_opts.version_id.is_none() {
@@ -9464,6 +9523,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 }
             }
 
+            // A version-only copy writes and then reverts on a quorum miss;
+            // refuse it before writing when the served version's disks cannot
+            // reach its write quorum even if every write succeeds.
+            let reachable = online_disks
+                .iter()
+                .map(|disk| disk.is_none().then_some(DiskError::DiskNotFound))
+                .collect::<Vec<_>>();
+            if let Some(err) = reduce_write_quorum_errs(&reachable, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+                return Err(to_object_err(err.into(), vec![src_bucket, src_object]));
+            }
             Self::write_unique_file_info(&online_disks, "", src_bucket, src_object, &metas, write_quorum)
                 .await
                 .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
@@ -9531,9 +9600,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         &self,
         bucket: &str,
         objects: Vec<ObjectToDelete>,
-        opts: ObjectOptions,
+        mut opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
-        let current_generations = opts.conditional_delete_generations.as_deref();
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
         let mut accounting = vec![None; objects.len()];
         let delete_config_snapshot = opts
@@ -9628,6 +9696,30 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         }
 
+        let outer_namespace_lock_fence = opts.namespace_lock_fence.clone();
+        let mut transaction_guards = std::collections::BTreeMap::new();
+        if !is_meta_bucketname(bucket) {
+            // Every raw batch lock is acquired first. Canonical sorting also
+            // gives aliases of one disk key exactly one transaction owner.
+            let keys: std::collections::BTreeSet<_> = locked_objects.iter().cloned().collect();
+            for key in keys {
+                match self.acquire_delete_transaction_lock(bucket, &key).await {
+                    Ok(guard) => {
+                        opts.add_namespace_lock_guard(&guard);
+                        transaction_guards.insert(key, guard);
+                    }
+                    Err(error) => {
+                        for (index, lock_name) in lock_names.iter().enumerate() {
+                            if lock_name.as_ref() == key {
+                                del_errs[index] = Some(error.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let transaction_guards = Arc::new(transaction_guards);
+        let current_generations = opts.conditional_delete_generations.as_deref();
         let object_lock_config = if is_meta_bucketname(bucket) {
             Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))
         } else {
@@ -9725,6 +9817,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         &dobj.object_name,
                         DeleteRecoveryContext {
                             dry_run: !opts.no_lock,
+                            transaction_guard: transaction_guards.get(lock_names[i].as_ref()).cloned(),
                             namespace_owner: opts.delete_mutation_owner.clone(),
                             ..DeleteRecoveryContext::new(opts.expected_bucket_incarnation_id, &|| {
                                 ensure_delete_commit_locks_held(None, bucket, &dobj.object_name, &opts).is_ok()
@@ -10006,6 +10099,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let namespace_owner = (!is_meta_bucketname(bucket)).then(|| {
             Arc::new((
                 self.ctx.begin_namespace_commit(),
+                Arc::clone(&transaction_guards),
                 opts.delete_mutation_owner.clone(),
                 opts.object_lock_config_snapshot.clone(),
                 opts.scanner_publication_commit_scope.clone(),
@@ -10181,6 +10275,24 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         let results = join_all(futures).await;
+        if transaction_guards.values().any(|guard| guard.is_lock_lost()) {
+            for (index, object) in objects.iter().enumerate() {
+                if del_errs[index].is_none() {
+                    accounting[index] = None;
+                    del_errs[index] = Some(StorageError::NamespaceLockQuorumUnavailable {
+                        mode: "delete_transaction",
+                        bucket: bucket.to_owned(),
+                        object: object.object_name.clone(),
+                        required: 1,
+                        achieved: 0,
+                    });
+                }
+            }
+            if dist_erasure {
+                self.release_dist_delete_object_locks_batch(dist_batch_lock_ids).await;
+            }
+            return (del_objects, del_errs, accounting);
+        }
 
         let mut del_obj_errs: Vec<Vec<Option<DiskError>>> = vec![vec![None; objects.len()]; disks.len()];
 
@@ -10276,6 +10388,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 let group = &vers[index];
                 let recovery_ticket = recovery_tickets[index].clone();
                 let namespace_owner = namespace_owner.clone();
+                let transaction_guard = transaction_guards
+                    .get(object_name_disk_identity(&group.name).as_ref())
+                    .cloned();
                 let disks = &disks;
                 let opts = &opts;
                 async move {
@@ -10296,6 +10411,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             DeleteRecoveryContext {
                                 recovery_ticket,
                                 namespace_owner,
+                                transaction_guard,
                                 ..DeleteRecoveryContext::new(opts.expected_bucket_incarnation_id, &can_commit)
                             },
                         )
@@ -10342,7 +10458,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 let object = fi_vers.name.clone();
                 let versions = fi_vers.clone();
                 let disk_namespace_owner = namespace_owner.clone();
+                let transaction_guard = transaction_guards.get(object_name_disk_identity(&object).as_ref()).cloned();
                 rollback_futures.push(async move {
+                    if transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+                        return;
+                    }
                     if should_rollback {
                         let errs = disk
                             .delete_versions_with_namespace_owner(
@@ -10418,7 +10538,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if del_errs[index].is_none() {
                 let object = &objects[index].object_name;
                 let result = match ensure_delete_commit_locks_held(None, bucket, object, &opts) {
-                    Ok(()) => self.reclaim_missing_delete_residue(bucket, object, &opts, None).await,
+                    Ok(()) => {
+                        self.reclaim_missing_delete_residue(
+                            bucket,
+                            object,
+                            &opts,
+                            None,
+                            transaction_guards.get(object_name_disk_identity(object).as_ref()),
+                        )
+                        .await
+                    }
                     Err(err) => Err(err),
                 };
                 if let Err(err) = result {
@@ -10426,6 +10555,13 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 }
             }
         }
+
+        // Deferred recovery takes fresh raw and transaction locks. Discard the
+        // completed leases' deadlines while retaining every caller-owned fence.
+        opts.namespace_lock_fence = outer_namespace_lock_fence;
+        // Release inner owners before reacquiring any raw key lock.
+        drop(namespace_owner);
+        drop(transaction_guards);
 
         // TODO(backlog): support partial object deletion for multi-part objects
 
@@ -10536,6 +10672,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         } else {
             None
         };
+        // Lock order: the caller's raw object lock, then this target set's
+        // transaction key. The inner key remains distinct even when pool
+        // client quorums overlap, and no_lock never bypasses journal ownership.
+        let transaction_guard = if !is_meta_bucketname(bucket) && (!opts.delete_prefix || opts.delete_prefix_object) {
+            let guard = self.acquire_delete_transaction_lock(bucket, object).await?;
+            opts.add_namespace_lock_guard(&guard);
+            Some(guard)
+        } else {
+            None
+        };
         if opts.delete_prefix {
             let destructive_dispatch_phase = opts.lifecycle_delete_all.as_ref().is_none_or(|request| {
                 matches!(
@@ -10636,7 +10782,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 &delete_request,
                                 false,
                                 None,
-                                DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
+                                DeleteCommitContext::request(&opts, _lock_guard.as_ref())
+                                    .with_transaction_guard(transaction_guard.as_ref()),
                             )
                             .await?;
                             if let Some((_, deleted_object)) = replication_delete {
@@ -10670,7 +10817,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 &delete_request,
                                 false,
                                 None,
-                                DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
+                                DeleteCommitContext::request(&opts, _lock_guard.as_ref())
+                                    .with_transaction_guard(transaction_guard.as_ref()),
                             )
                             .await?;
                         }
@@ -10690,7 +10838,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 &delete_request,
                                 false,
                                 None,
-                                DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
+                                DeleteCommitContext::request(&opts, _lock_guard.as_ref())
+                                    .with_transaction_guard(transaction_guard.as_ref()),
                             )
                             .await?;
                         }
@@ -10779,6 +10928,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     bucket,
                     object,
                     DeleteRecoveryContext {
+                        transaction_guard: transaction_guard.clone(),
                         namespace_owner: Some(Arc::new((
                             self.ctx.begin_namespace_commit(),
                             _lock_guard.clone(),
@@ -10819,7 +10969,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 if is_err_object_not_found(err) {
                     ensure_delete_commit_locks_held(_lock_guard.as_deref(), bucket, object, &opts)?;
                     if self
-                        .reclaim_missing_delete_residue(bucket, object, &opts, _lock_guard.as_ref())
+                        .reclaim_missing_delete_residue(bucket, object, &opts, _lock_guard.as_ref(), transaction_guard.as_ref())
                         .await?
                     {
                         if let Some(scope) = scanner_publication_commit_scope.as_ref() {
@@ -10869,7 +11019,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 &dfi,
                 false,
                 None,
-                DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
+                DeleteCommitContext::request(&opts, _lock_guard.as_ref()).with_transaction_guard(transaction_guard.as_ref()),
             )
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -10971,7 +11121,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 &fi,
                 should_force_delete_marker_for_missing_version(&opts),
                 delete_marker_purge.clone(),
-                DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
+                DeleteCommitContext::request(&opts, _lock_guard.as_ref()).with_transaction_guard(transaction_guard.as_ref()),
             )
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -11036,7 +11186,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             &dfi,
             opts.delete_marker,
             delete_marker_purge,
-            DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
+            DeleteCommitContext::request(&opts, _lock_guard.as_ref()).with_transaction_guard(transaction_guard.as_ref()),
         )
         .await
         .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -11150,44 +11300,62 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         };
 
-        let (read_quorum, write_quorum) = match Self::object_quorum_from_meta(&metas, &errs, self.default_parity_count) {
-            Ok((read_quorum, write_quorum)) => (read_quorum, write_quorum),
+        let version_id = opts.version_id.as_deref().unwrap_or_default();
+        let quorum = Self::object_quorum_from_meta(&metas, &errs, self.default_parity_count);
+        let selection = match &quorum {
+            Ok((read_quorum, write_quorum)) => {
+                let read_quorum = usize::try_from(*read_quorum)
+                    .map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]))?;
+                let write_quorum = usize::try_from(*write_quorum)
+                    .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![bucket, object]))?;
+                Self::select_fileinfo_for_read(bucket, &disks, &metas, &errs, version_id, read_quorum, write_quorum)
+            }
+            Err(err) => Err(err.clone()),
+        };
+        let (online_disks, mut fi) = match selection {
+            Ok(selection) => selection,
             Err(mut err) => {
-                // A replication terminal CAS is a validation/write-back
-                // attempt, never a heal operation. In particular,
-                // ValidateOnly must remain zero-write, and a worker whose
-                // outer replication lease is already lost must not delete the
-                // surviving xl.meta copies before the namespace fence below
-                // can reject it. Leave dangling cleanup to heal/scanner.
-                if opts.replication_status_writeback.is_some() {
+                // The merged latest version can be one a failed PUT left below
+                // quorum; resolve it like a latest GET before the dangling
+                // cleanup below can report a key with a committed version absent.
+                // A replication terminal CAS stays side-effect free: the walk
+                // queues heal for the versions it skips, so it does not run.
+                let resolved = if opts.replication_status_writeback.is_none() {
+                    self.select_latest_past_dangling_versions(bucket, object, opts, false, &disks, &err)
+                        .await
+                } else {
+                    None
+                };
+                if let Some(snapshot) = resolved {
+                    let (fi, _, online_disks) = snapshot.into_owned();
+                    (online_disks, fi)
+                } else {
+                    // A replication terminal CAS is a validation/write-back
+                    // attempt, never a heal operation. In particular,
+                    // ValidateOnly must remain zero-write, and a worker whose
+                    // outer replication lease is already lost must not delete
+                    // the surviving xl.meta copies before the namespace fence
+                    // below can reject it. Leave dangling cleanup to
+                    // heal/scanner.
+                    if quorum.is_err()
+                        && opts.replication_status_writeback.is_none()
+                        && err == DiskError::ErasureReadQuorum
+                        && !bucket.starts_with(RUSTFS_META_BUCKET)
+                        && self
+                            .delete_if_dangling(bucket, object, &metas, &errs, &HashMap::new(), opts.clone())
+                            .await
+                            .is_ok()
+                    {
+                        if opts.version_id.is_some() {
+                            err = DiskError::FileVersionNotFound
+                        } else {
+                            err = DiskError::FileNotFound
+                        }
+                    }
                     return Err(to_object_err(err.into(), vec![bucket, object]));
                 }
-                if err == DiskError::ErasureReadQuorum
-                    && !bucket.starts_with(RUSTFS_META_BUCKET)
-                    && self
-                        .delete_if_dangling(bucket, object, &metas, &errs, &HashMap::new(), opts.clone())
-                        .await
-                        .is_ok()
-                {
-                    if opts.version_id.is_some() {
-                        err = DiskError::FileVersionNotFound
-                    } else {
-                        err = DiskError::FileNotFound
-                    }
-                }
-                return Err(to_object_err(err.into(), vec![bucket, object]));
             }
         };
-
-        let read_quorum =
-            usize::try_from(read_quorum).map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]))?;
-        let write_quorum = usize::try_from(write_quorum)
-            .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![bucket, object]))?;
-
-        let version_id = opts.version_id.as_deref().unwrap_or_default();
-        let (online_disks, mut fi) =
-            Self::select_fileinfo_for_read(bucket, &disks, &metas, &errs, version_id, read_quorum, write_quorum)
-                .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
 
         if fi.deleted {
             return Err(to_object_err(Error::MethodNotAllowed, vec![bucket, object]));
@@ -11793,13 +11961,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let bucket_lifecycle_guard = if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
             && opts.bucket_lifecycle_lock_fence.is_none()
         {
-            let guard = metadata_sys::object_store_in(&self.ctx)
-                .await?
-                .acquire_bucket_lifecycle_read_lock(bucket)
-                .await?;
-            self.validate_bucket_incarnation(bucket, expected_incarnation_id, opts)
-                .await?;
-            Some(guard)
+            Some(
+                metadata_sys::object_store_in(&self.ctx)
+                    .await?
+                    .acquire_bucket_incarnation_fence_with_options(bucket, expected_incarnation_id, Some(opts))
+                    .await?,
+            )
         } else {
             None
         };
@@ -25361,6 +25528,7 @@ mod delete_objects_lock_gating_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn delete_object_aborts_when_outer_lock_is_lost_at_commit() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "single-lost-outer-lock";
@@ -25581,6 +25749,13 @@ mod delete_objects_lock_gating_tests {
             .as_fast_lock_manager()
             .expect("isolated fixture should use the local lock manager");
         let lock_metrics = lock_manager.get_metrics().shard_metrics;
+        let raw_key = ObjectKey::new(bucket, "obj-a");
+        let raw_holder = lock_manager.get_lock_info(&raw_key).expect("outer holder must be visible");
+        let transaction_key = ObjectKey::with_version(
+            bucket,
+            "obj-a",
+            format!("rustfs:delete-transaction:{}:{}", set_disks.pool_index, set_disks.set_index),
+        );
         assert_eq!(lock_manager.current_lock_counts(), (1, 0));
         let mut delete = Box::pin(set_disks.delete_objects(
             bucket,
@@ -25597,23 +25772,43 @@ mod delete_objects_lock_gating_tests {
         // than a second on CI without waiting for the namespace lock at all.
         let deletion = futures::future::poll_fn(|cx| {
             let result = std::future::Future::poll(delete.as_mut(), cx);
+            let current_holder = lock_manager.get_lock_info(&raw_key).expect("outer holder must remain held");
+            assert_eq!(
+                (current_holder.mode, &current_holder.owner, current_holder.acquired_at),
+                (raw_holder.mode, &raw_holder.owner, raw_holder.acquired_at),
+                "no_lock must preserve the original raw object holder"
+            );
+            let transaction_holder = lock_manager.get_lock_info(&transaction_key);
+            if let Some(holder) = &transaction_holder {
+                assert_eq!(holder.mode, rustfs_lock::LockMode::Exclusive);
+            }
             assert_eq!(
                 lock_manager.current_lock_counts(),
-                (1, 0),
-                "no_lock batch delete must preserve the outer holder without adding lock waiters"
+                (1 + u64::from(transaction_holder.is_some()), 0),
+                "only the distinct transaction owner may be added, without raw-key waiters"
             );
             let current = lock_manager.get_metrics().shard_metrics;
-            assert_eq!(
-                (current.total_acquisitions(), current.timeouts),
-                (lock_metrics.total_acquisitions(), lock_metrics.timeouts),
-                "no_lock batch delete must not acquire or time out on another namespace lock"
+            assert!(
+                current.total_acquisitions() <= lock_metrics.total_acquisitions() + 1,
+                "the transaction owner must be reused by inline recovery"
             );
+            assert_eq!(current.timeouts, lock_metrics.timeouts, "the raw key must never be reacquired");
             result
         });
         let (deleted, errs) = tokio::time::timeout(Duration::from_secs(30), deletion)
             .await
             .expect("no_lock batch delete disk work should complete");
 
+        assert_eq!(lock_manager.current_lock_counts(), (1, 0));
+        assert!(
+            lock_manager.get_lock_info(&transaction_key).is_none(),
+            "the transaction owner must be released"
+        );
+        assert_eq!(
+            lock_manager.get_metrics().shard_metrics.total_acquisitions(),
+            lock_metrics.total_acquisitions() + 1,
+            "no_lock still requires exactly one distinct transaction owner"
+        );
         assert!(errs[0].is_none(), "no_lock batch delete should not fail with a lock error: {:?}", errs[0]);
         assert!(deleted[0].found, "existing object must still be deleted");
         for disk in &disk_stores {

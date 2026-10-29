@@ -530,6 +530,30 @@ mod tests {
                                 "missing diagnostic result for shard {index}"
                             );
                         }
+                        for stage in ["open", "metadata", "allocation", "read"] {
+                            assert!(
+                                events.iter().any(|event| {
+                                    event.get("stage") == Some(&json!(stage))
+                                        && event.get("shard_index") == Some(&json!(0))
+                                        && event.get("result") == Some(&json!("success"))
+                                }),
+                                "missing successful {stage} diagnostic"
+                            );
+                        }
+                        assert!(
+                            events.iter().any(|event| {
+                                event.get("stage") == Some(&json!("open"))
+                                    && event.get("shard_index") == Some(&json!(1))
+                                    && event.get("result") == Some(&json!("error"))
+                            }),
+                            "missing shard must emit an open failure"
+                        );
+                        assert!(
+                            !events.iter().any(|event| {
+                                event.get("stage") == Some(&json!("metadata")) && event.get("shard_index") == Some(&json!(1))
+                            }),
+                            "metadata must not be measured when open fails"
+                        );
                         assert!(
                             !events
                                 .iter()
