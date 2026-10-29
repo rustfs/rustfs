@@ -1919,15 +1919,6 @@ fn table_catalog_backing_mode_defaults_to_object() {
 
 #[test]
 #[serial_test::serial]
-fn table_catalog_backing_mode_rejects_retired_durable_strong_value() {
-    temp_env::with_var(ENV_TABLE_CATALOG_BACKING, Some("durable-strong"), || {
-        let error = TableCatalogBackingMode::from_env().unwrap_err();
-        assert!(matches!(error, TableCatalogStoreError::Invalid(message) if message.contains("has been retired")));
-    });
-}
-
-#[test]
-#[serial_test::serial]
 fn table_catalog_backing_mode_rejects_unknown_value() {
     temp_env::with_var(ENV_TABLE_CATALOG_BACKING, Some("memory"), || {
         assert!(matches!(

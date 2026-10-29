@@ -1144,17 +1144,17 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "capabilities"):
             validate(record)
 
-    def test_backing_discovery_uses_overrides_and_rejects_retired_or_mismatched_values(self) -> None:
+    def test_backing_discovery_uses_overrides_and_rejects_unknown_or_mismatched_values(self) -> None:
         args = self.parse_with_args(["--bucket", "lake", "--catalog-backing", "object"])
         config = {"defaults": {"rustfs.catalog-backing": "object"}, "overrides": {}}
         with mock.patch.object(pyiceberg_smoke, "signed_rest_request", return_value=config) as request:
             self.assertEqual(pyiceberg_smoke.discover_catalog_backing(args, mock.Mock()), "object")
         self.assertEqual(request.call_args.args[2:4], ("GET", "/iceberg/v1/config?warehouse=lake"))
-        for response in ({}, {"defaults": {}, "overrides": {}}, {"defaults": {"rustfs.catalog-backing": "durable-strong"}, "overrides": {}}):
+        for response in ({}, {"defaults": {}, "overrides": {}}, {"defaults": {"rustfs.catalog-backing": "retired"}, "overrides": {}}):
             with self.subTest(response=response), mock.patch.object(pyiceberg_smoke, "signed_rest_request", return_value=response):
                 with self.assertRaises(RuntimeError):
                     pyiceberg_smoke.discover_catalog_backing(args, mock.Mock())
-        config["overrides"] = {"rustfs.catalog-backing": "durable-strong"}
+        config["overrides"] = {"rustfs.catalog-backing": "retired"}
         with mock.patch.object(pyiceberg_smoke, "signed_rest_request", return_value=config):
             with self.assertRaisesRegex(RuntimeError, "supported RustFS backing"):
                 pyiceberg_smoke.discover_catalog_backing(args, mock.Mock())
