@@ -264,6 +264,21 @@ impl EventName {
         }
     }
 
+    /// Parses the string form of the internal events that `parse` rejects.
+    ///
+    /// These events are never valid in a bucket notification configuration, so
+    /// `parse` and the default `Deserialize` stay strict. They do reach the audit
+    /// sink and are persisted by the store targets, which read them back through
+    /// [`deserialize_persisted_event_name`].
+    fn parse_internal(s: &str) -> Option<Self> {
+        match s {
+            "s3:ObjectRemoved:AbortMultipartUpload" => Some(EventName::ObjectRemovedAbortMultipartUpload),
+            "s3:ObjectCreated:CreateMultipartUpload" => Some(EventName::ObjectCreatedCreateMultipartUpload),
+            "s3:ObjectRemoved:DeleteObjects" => Some(EventName::ObjectRemovedDeleteObjects),
+            _ => None,
+        }
+    }
+
     /// Parses an event string into an EventName with explicit error handling.
     #[inline]
     pub fn try_from_event_str(s: &str) -> Result<Self, ParseEventNameError> {
@@ -534,6 +549,20 @@ impl serde::ser::Serialize for EventName {
     {
         serializer.serialize_str(self.as_str())
     }
+}
+
+/// `deserialize_with` function for fields that hold an `EventName` the server itself
+/// persisted, such as queued audit payload metadata. Unlike the default `Deserialize`,
+/// which also backs user-supplied notification XML, it accepts the internal events.
+pub fn deserialize_persisted_event_name<'de, D>(deserializer: D) -> Result<EventName, D::Error>
+where
+    D: serde::de::Deserializer<'de>,
+{
+    let s = <String as serde::Deserialize>::deserialize(deserializer)?;
+    EventName::parse(&s)
+        .ok()
+        .or_else(|| EventName::parse_internal(&s))
+        .ok_or_else(|| serde::de::Error::custom(ParseEventNameError(s)))
 }
 
 impl<'de> serde::de::Deserialize<'de> for EventName {
@@ -964,6 +993,39 @@ mod tests {
             }
             let parsed = EventName::parse(ev.as_str());
             assert_eq!(parsed.as_ref(), Ok(ev), "round-trip failed for {ev} (as_str = {:?})", ev.as_str());
+        }
+    }
+
+    /// Audit entries are persisted by the store targets and read back through
+    /// `deserialize_persisted_event_name`, so every event that can be serialized, other than
+    /// `Everything`, must come back as itself. The default `Deserialize` also backs
+    /// user-supplied notification XML and must keep rejecting the internal events.
+    #[test]
+    fn test_persisted_round_trip_for_every_serializable_variant() {
+        #[derive(serde::Deserialize)]
+        struct Persisted(#[serde(deserialize_with = "deserialize_persisted_event_name")] EventName);
+
+        for ev in ALL_EVENT_NAMES {
+            if *ev == EventName::Everything {
+                continue;
+            }
+            let json = serde_json::to_string(ev).unwrap();
+            let back: Persisted = serde_json::from_str(&json)
+                .unwrap_or_else(|err| panic!("{ev:?} serialized as {json} does not deserialize: {err}"));
+            assert_eq!(back.0, *ev, "persisted round-trip changed {ev:?}");
+        }
+
+        for internal in [
+            EventName::ObjectRemovedAbortMultipartUpload,
+            EventName::ObjectCreatedCreateMultipartUpload,
+            EventName::ObjectRemovedDeleteObjects,
+        ] {
+            assert!(EventName::parse(internal.as_str()).is_err(), "parse must reject {internal:?}");
+            let json = serde_json::to_string(&internal).unwrap();
+            assert!(
+                serde_json::from_str::<EventName>(&json).is_err(),
+                "default Deserialize must reject {internal:?}"
+            );
         }
     }
 
