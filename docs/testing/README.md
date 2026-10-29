@@ -34,6 +34,8 @@ The [Pool layout compatibility reference](pool-layout-compatibility.md) defines 
 
 The [Scanner/Heal topology protection gates](scanner-heal-topology-gates.md) map G-EXP, G-REB and G-DEC and their fault windows to the `scanner_heal_topology_` cases, their recorded inventory, and the basis of their timeouts.
 
+The [immutable validation candidate reference](validation-candidates.md) describes isolated package builds and exact candidate resolution for the current auto-testing fleet.
+
 The [distributed multipart RPC delay gates](multipart-rpc-delay.md) define authenticated method-entry barriers, latency and peer-loss oracles, and the boundary between hook evidence and production incident attribution.
 
 ## Naming conventions
