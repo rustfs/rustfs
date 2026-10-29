@@ -3565,10 +3565,11 @@ async fn stale_upload_lifecycle_due(
                 .as_ref()
                 .is_some_and(|and| and.object_size_greater_than.is_some() || and.object_size_less_than.is_some())
     };
-    let needs_size = lifecycle
-        .rules
-        .iter()
-        .any(|rule| rule.abort_incomplete_multipart_upload.is_some() && rule.filter.as_ref().is_some_and(has_size_filter));
+    let needs_size = lifecycle.rules.iter().any(|rule| {
+        rule.status.as_str() != ExpirationStatus::DISABLED
+            && rule.abort_incomplete_multipart_upload.is_some()
+            && rule.filter.as_ref().is_some_and(has_size_filter)
+    });
     let size = if needs_size {
         match stale_upload_current_size_with_opts(set, metadata, upload_dir, no_lock).await {
             Some(size) => size,
@@ -16364,9 +16365,15 @@ mod tests {
             ("logs/default-expired", time::Duration::hours(30), false, false),
             ("logs/lifecycle-only", time::Duration::minutes(5), false, false),
             ("logs/size-filter", time::Duration::minutes(5), true, true),
+            ("logs/disabled-size-filter", time::Duration::minutes(5), false, false),
         ] {
             if size_filter {
                 set_abort_incomplete_lifecycle_with_size(&bucket, "logs/", 0, 0).await;
+            } else if object == "logs/disabled-size-filter" {
+                let rules = r#"<LifecycleConfiguration><Rule><ID>enabled</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><AbortIncompleteMultipartUpload><DaysAfterInitiation>0</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule><Rule><ID>disabled-size</ID><Status>Disabled</Status><Filter><ObjectSizeGreaterThan>0</ObjectSizeGreaterThan></Filter><AbortIncompleteMultipartUpload><DaysAfterInitiation>0</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"#;
+                metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, rules.as_bytes().to_vec())
+                    .await
+                    .expect("install enabled rule and disabled size rule");
             }
             let upload = ecstore
                 .new_multipart_upload(
