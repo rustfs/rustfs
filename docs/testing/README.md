@@ -1,7 +1,6 @@
 # RustFS Testing
 
-**Use this when:** you need to pick a test layer for a change, name a test so a gate keeps selecting it, understand why `#[serial]` does nothing under nextest, or handle a flaky test.
-**Source of truth:** `.config/nextest.toml` (profiles, test-groups, quarantine), `.config/make/tests.mak` (`make test`), `.github/workflows/*.yml` (what runs when; matrix in [ci-gates.md](ci-gates.md)).
+**Use this when:** you need to pick a test layer for a change, name a test so a gate keeps selecting it, understand why `#[serial]` does nothing under nextest, or handle a flaky test. **Source of truth:** `.config/nextest.toml` (profiles, test-groups, quarantine), `.config/make/tests.mak` (`make test`), `.github/workflows/*.yml` (what runs when; matrix in [ci-gates.md](ci-gates.md)).
 
 ## Test taxonomy
 
@@ -9,18 +8,20 @@ Pick the lowest layer that can prove the change; add a higher-layer test only wh
 
 | Layer | What it covers | Entry command | When it runs (details: [ci-gates.md](ci-gates.md)) |
 |---|---|---|---|
-| Unit & crate integration | Per-crate logic and in-process integration tests | `cargo nextest run --all --exclude e2e_test` (or `-p <crate>`); `make test` wraps it | Every PR, required (`Test and Lint`, `ci` profile) |
+| Unit & crate integration | Per-crate logic and in-process integration tests | `cargo nextest run --all --exclude e2e_test` (or `-p <crate>`); `make test` wraps it | Non-documentation PRs, required through `Test and Lint` (`ci` profile); documentation-only selection skips the Rust jobs |
 | ecstore black-box | Erasure-coded read/write/recovery validation; profiles `quick` / `full` / `destructive` / `fuzz` | `scripts/run_ecstore_validation_suite.sh --profile quick` | Local and release validation only; not wired into any workflow. Contract: [ecstore-validation-suite-design.md](ecstore-validation-suite-design.md) |
-| e2e (`e2e_test` crate) | A real `rustfs` binary per test, driven over the S3, admin, and protocol APIs | `python3 scripts/e2e_binary.py build --features e2e-test-hooks`, then `python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke -p e2e_test` | PR: `e2e-smoke` (report-only); merge queue / main push: `e2e-full`; nightly: `e2e-repl-nightly`, `e2e-nightly`, `e2e-protocols`, `e2e-distributed`. Guide: [`crates/e2e_test/README.md`](../../crates/e2e_test/README.md); 4-node 4-disk map: [distributed-e2e.md](distributed-e2e.md) |
+| e2e (`e2e_test` crate) | A real `rustfs` binary per test, driven over the S3, admin, and protocol APIs | `python3 scripts/e2e_binary.py build --features e2e-test-hooks`, then `python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke -p e2e_test` | Non-documentation PRs: `e2e-smoke`, required through `Test and Lint`; merge queue / main push: `e2e-full`; nightly: `e2e-repl-nightly`, `e2e-nightly`, `e2e-protocols`, `e2e-distributed`. Guide: [`crates/e2e_test/README.md`](../../crates/e2e_test/README.md); 4-node 4-disk map: [distributed-e2e.md](distributed-e2e.md) |
 | Outbound target matrix | Replication of every object shape (empty, plain, retention, legal hold, multipart, checksummed, SSE-S3) against every remote-target failure mode the fake target models; an explicit expectation table pins known-red cells to an open issue | `python3 scripts/e2e_binary.py build`, then `python3 scripts/e2e_binary.py run -- cargo nextest run -p e2e_test -E 'test(/^replication_target_matrix_test::/)'` | With `e2e-repl-nightly`; required locally for any change to outbound client defaults (SOP: [`docs/postmortems/2026-09-03-replication-checksum-default-regression.md`](../postmortems/2026-09-03-replication-checksum-default-regression.md)) |
-| s3s-e2e conformance | External S3 conformance tool against a live server | `./scripts/e2e-run.sh ./target/debug/rustfs <data-dir>` | PR, report-only (second half of the `End-to-End Tests` job) |
-| S3 compatibility | `ceph/s3-tests` (boto3; allow-list `scripts/s3-tests/implemented_tests.txt`) and MinIO `mint` | `scripts/s3-tests/run.sh`; mint via `.github/workflows/mint.yml` | s3-tests: PR report-only plus a weekly full sweep; mint: weekly, report-only |
+| s3s-e2e conformance | External S3 conformance tool against a live server | `./scripts/e2e-run.sh ./target/debug/rustfs <data-dir>` | Non-documentation PRs, required through `Test and Lint` (second half of the `End-to-End Tests` job) |
+| S3 compatibility | `ceph/s3-tests` (boto3; allow-list `scripts/s3-tests/implemented_tests.txt`) and MinIO `mint` | `scripts/s3-tests/run.sh`; mint via `.github/workflows/mint.yml` | Non-documentation PRs: implemented and lifecycle S3 lanes required through `Test and Lint`; the separate s3-tests workflow provides additional PR reporting and a weekly full sweep; mint: weekly, report-only |
 | Chaos / fault-injection | Single-node disk fault injection (`crates/e2e_test/src/chaos.rs`, `crates/e2e_test/src/fault_proxy.rs`) plus the 4-node kill/fresh-drive/blackhole cases in `crates/e2e_test/src/distributed/chaos_test.rs` | Part of the e2e crate (`e2e-reliability` and `e2e-distributed`) | Reliability cases with `e2e-full`; 4-node chaos on storage-sensitive PRs and nightly via `e2e-distributed` |
 | Fuzz | `cargo-fuzz` targets over untrusted parsing surfaces; isolated sub-workspace under `fuzz/` | `./scripts/fuzz/run.sh` (see [`fuzz/README.md`](../../fuzz/README.md)) | PR smoke on the paths listed in `.github/workflows/fuzz.yml`, plus nightly corpus |
 | Benchmarks | Criterion benches under each crate's `benches/` | `cargo bench -p <crate>` | On demand; never a gate |
 | Conditional reads | Paired ordinary/hit/miss GET latency, throughput and read-lock measurements | `scripts/run_conditional_read_abba.py` | Local conditional-read acceptance; [guide and scope](conditional-read-benchmark.md) |
 
 Every script named above is indexed with status and wiring in [`scripts/README.md`](../../scripts/README.md). Fixed GHSA advisories map to named regression tests in [security-regressions.md](security-regressions.md).
+
+For assistant setup, instruction-loading checks, and scenario-based validation of delivery-policy changes, use [Agent Setup and Instruction Validation](agent-instructions.md).
 
 The [ECStore core invariant gates](ecstore-core-invariants.md) map required native commit, rollback, lock, read, multipart and metadata regressions to the existing CI run and distinguish them from process and network fault evidence.
 
@@ -52,7 +53,7 @@ The [distributed multipart RPC delay gates](multipart-rpc-delay.md) define authe
 | `source_cleanup` | Post-migration source cleanup |
 | `delete_marker` | Delete-marker handling across migration |
 
-A deliberate reduction lowers the floor in the same PR. The list above mirrors the script; change both together.
+A renamed or replaced test must retain the protected invariant and remain selected. Lower the floor only for an explicitly reviewed change to the coverage policy, with evidence that removed cases are redundant or obsolete and required behavior remains protected; never lower it to hide a failure. The list above mirrors the script; change both together.
 
 ### General naming
 
@@ -101,9 +102,9 @@ cargo nextest list -p e2e_test --profile e2e-smoke --message-format json \
 A flaky test fails non-deterministically without a corresponding code change. Retry semantics live in `.config/nextest.toml`: `default` never retries, `ci` has global `retries = 0`, and only quarantined tests get `retries = 2` under `ci`. A quarantined test that passes on retry is marked `flaky` in `target/nextest/ci/junit.xml` (uploaded as a CI artifact); that marker, not a green check, is how a live flake stays visible.
 
 1. **Discover** — a non-deterministic failure (CI or local) or a `flaky` JUnit marker.
-2. **Open an issue within 24h** describing symptom, suspected cause, and affected suite. No silent re-runs.
-3. **Quarantine** — add a `[[profile.ci.overrides]]` entry with `retries = 2` and a comment linking exactly one OPEN issue. The current quarantine list is the `[[profile.ci.overrides]]` block in `.config/nextest.toml`.
-4. **Fix or delete within 30 days** — make the test robust and remove the entry, or delete the test. An entry without a live OPEN issue link is a policy violation.
+2. **Track within 24h** — use an existing matching open issue or, when posting is authorized, create one describing the symptom, evidence, suspected cause, and affected suite. Otherwise prepare that report and state the missing authority. Keep failed-attempt evidence; an explained diagnostic rerun does not erase the failure or prove a fix.
+3. **Quarantine only when authorized** — prefer a deterministic fix. When a reviewed quarantine is needed, add a `[[profile.ci.overrides]]` entry with `retries = 2` and a comment linking exactly one OPEN issue. Record ownership and a deadline; the current quarantine list is the `[[profile.ci.overrides]]` block in `.config/nextest.toml`.
+4. **Resolve within 30 days** — make the test robust and remove the entry. Delete a test only when review establishes it is obsolete or redundant and required behavior remains protected; a flake alone does not justify deleting coverage. An entry without a live OPEN issue link is a policy violation.
 
 ## Coverage
 
