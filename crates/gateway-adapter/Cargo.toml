@@ -1,0 +1,45 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "rustfs-gateway-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+description = "RustFS implementations of the rustfs-gateway extension traits (credentials over IAM)."
+keywords = ["rustfs", "gateway", "s3", "iam"]
+categories = ["web-programming", "authentication"]
+authors.workspace = true
+publish = false
+
+[package.metadata.gateway]
+# Documentary only: this crate is a ring-2 consumer of the gateway (it depends on
+# RustFS business crates). The RustFS repository does not run the gateway's ring guard.
+ring = 2
+
+[lints]
+workspace = true
+
+[dependencies]
+rustfs-gateway = { workspace = true }
+rustfs-iam = { workspace = true }
+rustfs-policy = { workspace = true }
+
+[dev-dependencies]
+rustfs-credentials = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
