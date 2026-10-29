@@ -334,7 +334,7 @@ compact_str = "0.10.0"
 snap = "1.1.2"
 starshard = { version = "2.4.0" }
 strum = { version = "0.28.0" }
-sysinfo = "0.39.6"
+sysinfo = "0.40.0"
 temp-env = "0.3.6"
 tempfile = "3.27.0"
 test-case = "3.4.0"

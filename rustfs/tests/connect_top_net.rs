@@ -119,7 +119,7 @@ fn top_network_uses_exact_counter_deltas_and_fails_closed_on_reset() {
 
 #[tokio::test]
 async fn top_network_capture_observes_real_loopback_traffic() {
-    if !sysinfo::IS_SUPPORTED_SYSTEM {
+    if matches!(sysinfo::Networks::new(), Err(sysinfo::Error::Unsupported)) {
         return;
     }
 
