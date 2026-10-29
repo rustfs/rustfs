@@ -7,6 +7,9 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
+import shutil
+from string import Template
 import tempfile
 import subprocess
 import sys
@@ -276,43 +279,93 @@ class ExecutionEvidenceTests(unittest.TestCase):
 
 
 class NextestSetupScriptTests(unittest.TestCase):
-    def test_real_nextest_setup_script_report(self):
+    def test_workflow_consumers_reuse_extraction_and_validate_setup_script_reports(self):
+        from ci_gate import workflow_document
+
+        workflow = workflow_document((artifact.ROOT / ".github/workflows/ci.yml").read_text())
+
+        def commands(job):
+            result = []
+            for step in workflow["jobs"][job]["steps"]:
+                for line in step.get("run", "").replace("\\\n", " ").splitlines():
+                    if "cargo nextest " not in line:
+                        continue
+                    words = shlex.split(line)
+                    for start in range(len(words) - 1):
+                        if words[start:start + 2] == ["cargo", "nextest"]:
+                            end = next((index for index in range(start, len(words))
+                                        if words[index] in ("|", ">", "2>&1")), len(words))
+                            result.append(words[start:end])
+                            break
+            return result
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "src").mkdir()
             (root / ".config").mkdir()
             (root / "Cargo.toml").write_text(
-                '[package]\nname = "evidence-fixture"\nversion = "0.1.0"\nedition = "2021"\n[workspace]\n'
+                '[package]\nname = "rustfs"\nversion = "0.1.0"\nedition = "2021"\n'
+                '[lib]\nname = "lifecycle_integration_test"\n[workspace]\n'
             )
             (root / "rust-toolchain.toml").write_text((artifact.ROOT / "rust-toolchain.toml").read_text())
             (root / "src/lib.rs").write_text(
                 '#[test]\nfn setup_is_applied() {\n'
                 '    assert_eq!(std::env::var("EVIDENCE_SETUP").unwrap(), "ready");\n}\n'
+                'mod lifecycle_transition_api_test {\n'
+                '    #[test]\n    #[ignore]\n    fn ignored_case() {}\n}\n'
             )
             config = root / ".config/nextest.toml"
             config.write_text(
                 'experimental = ["setup-scripts"]\n'
                 '[scripts.setup.prepare]\ncommand = ["sh", "prepare.sh"]\n'
                 '[[profile.default.scripts]]\nfilter = "all()"\nsetup = "prepare"\n'
-                '[profile.ci.junit]\npath = "junit.xml"\n'
+                + ''.join(f'[profile.{profile}.junit]\npath = "junit.xml"\n'
+                          for profile in ("default", "ci", "e2e-smoke", "e2e-full", "core-contract"))
             )
             script = root / "prepare.sh"
             script.write_text('echo EVIDENCE_SETUP=ready >> "$NEXTEST_ENV"\n')
-            environment = {**os.environ, "CARGO_TARGET_DIR": str(root / "target"), "CARGO_NET_OFFLINE": "true"}
+            environment = {**os.environ, "CARGO_TARGET_DIR": str(root / "target"), "CARGO_NET_OFFLINE": "true",
+                           "GITHUB_WORKSPACE": str(root), "RUNNER_TEMP": str(root),
+                           "NEXTEST_ARCHIVE": str(root / "e2e-tests.tar.zst")}
 
             def nextest(*arguments):
                 return subprocess.run(["cargo", "nextest", *arguments], cwd=root, env=environment,
                                       capture_output=True, text=True, timeout=120)
 
-            listed = nextest("list", "--profile", "ci", "--message-format", "json")
-            self.assertEqual(listed.returncode, 0, listed.stderr)
+            archive = root / "built-tests.tar.zst"
+            archived = nextest("archive", "--archive-file", str(archive))
+            self.assertEqual(archived.returncode, 0, archived.stderr)
+            # Any accidental compilation after the archive build must fail.
+            (root / "src/lib.rs").write_text('compile_error!("consumer attempted to rebuild");\n')
             listing_file = root / "listing.json"
-            listing_file.write_text(listed.stdout)
-            report = root / "target/nextest/ci/junit.xml"
-            executed = nextest("run", "--profile", "ci", "--no-tests", "fail")
-            self.assertEqual(executed.returncode, 0, executed.stderr)
-            suites = ET.parse(report).getroot().findall("testsuite")
-            self.assertIn("@setup-script:prepare", [suite.get("name") for suite in suites])
+            for job in ("workspace-tests", "core-contract", "e2e-tests", "e2e-full"):
+                with self.subTest(job=job):
+                    shutil.rmtree(root / "target")
+                    consumer_archive = root / ("workspace-tests.tar.zst" if job == "workspace-tests" else "e2e-tests.tar.zst")
+                    shutil.copyfile(archive, consumer_archive)
+                    selected = [[Template(word).substitute(environment) for word in command] for command in commands(job)]
+                    self.assertEqual(len(selected), 3 if job == "workspace-tests" else 2)
+                    self.assertEqual(selected[0][:3], ["cargo", "nextest", "list"])
+                    listed = nextest(*selected[0][2:])
+                    self.assertEqual(listed.returncode, 0, listed.stderr)
+                    listing_file.write_text(listed.stdout)
+                    self.assertTrue((root / "target/nextest/binaries-metadata.json").is_file())
+                    # The remaining commands cannot extract again, even for ignored tests.
+                    consumer_archive.unlink()
+                    for command in selected[1:]:
+                        executed = nextest(*command[2:])
+                        self.assertEqual(executed.returncode, 0, executed.stderr)
+                        profile = command[command.index("--profile") + 1]
+                        report = root / f"target/nextest/{profile}/junit.xml"
+                        suites = ET.parse(report).getroot().findall("testsuite")
+                        self.assertIn("@setup-script:prepare", [suite.get("name") for suite in suites])
+                        if "--run-ignored" in command:
+                            cases = [case.get("name") for suite in suites if not suite.get("name", "").startswith("@")
+                                     for case in suite.findall("testcase") if case.find("skipped") is None]
+                            self.assertEqual(cases, ["lifecycle_transition_api_test::ignored_case"])
+                        else:
+                            self.assertEqual(artifact.verify_execution(listing_file, report), 1)
+
             verified = subprocess.run(
                 [sys.executable, str(artifact.ROOT / "scripts/ci_test_artifact.py"), "evidence",
                  str(listing_file), str(report)], capture_output=True, text=True, timeout=30,
@@ -320,12 +373,22 @@ class NextestSetupScriptTests(unittest.TestCase):
             self.assertEqual(verified.returncode, 0, verified.stderr)
             self.assertIn("Verified 1 test executions", verified.stdout)
 
-            report.unlink()
-            script.write_text('exit 1\n')
-            failed = nextest("run", "--profile", "ci", "--no-tests", "fail")
-            self.assertNotEqual(failed.returncode, 0)
-            with self.assertRaisesRegex(ValueError, "successful nextest run"):
-                artifact.verify_execution(listing_file, report)
+            for setup in ('echo EVIDENCE_SETUP=wrong >> "$NEXTEST_ENV"\n', 'exit 1\n'):
+                report.unlink()
+                script.write_text(setup)
+                failed = nextest(*command[2:])
+                self.assertNotEqual(failed.returncode, 0)
+                with self.assertRaisesRegex(ValueError, "successful nextest run"):
+                    artifact.verify_execution(listing_file, report)
+
+            for name in ("cargo-metadata.json", "binaries-metadata.json"):
+                metadata = root / "target/nextest" / name
+                content = metadata.read_bytes()
+                metadata.unlink()
+                missing = nextest(*command[2:])
+                self.assertNotEqual(missing.returncode, 0)
+                self.assertIn(name, missing.stderr)
+                metadata.write_bytes(content)
 
 
 if __name__ == "__main__":

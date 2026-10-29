@@ -281,6 +281,13 @@ jobs:
       - name: Verify workspace archive identity
         run: python3 scripts/ci_test_artifact.py verify --configuration workspace --archive "$RUNNER_TEMP/workspace-tests.tar.zst"
 
+      - name: Extract and list workspace tests
+        run: |
+          mkdir -p artifacts/test-and-lint
+          cargo nextest list --profile ci --archive-file "$RUNNER_TEMP/workspace-tests.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --message-format json \
+            > artifacts/test-and-lint/core-test-listing.json
+          python3 scripts/check_test_wiring.py --check-core artifacts/test-and-lint/core-test-listing.json
+
       - name: Run nextest tests
         run: |
           mkdir -p artifacts/test-and-lint
@@ -289,16 +296,11 @@ jobs:
           trap './scripts/ci/resource_sampler.sh stop' EXIT
           set +e
           NEXTEST_HIDE_PROGRESS_BAR=1 timeout --verbose --signal=TERM --kill-after=30s 75m \
-            cargo nextest run --profile ci --archive-file "$RUNNER_TEMP/workspace-tests.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
+            cargo nextest run --profile ci --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json \
+            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
             --status-level all --final-status-level all \
             2>&1 | tee artifacts/test-and-lint/nextest.log
           status=${PIPESTATUS[0]}
-          if [[ "${status}" -eq 0 ]]; then
-            cargo nextest list --profile ci --archive-file "$RUNNER_TEMP/workspace-tests.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --message-format json \
-              > artifacts/test-and-lint/core-test-listing.json \
-              && python3 scripts/check_test_wiring.py --check-core artifacts/test-and-lint/core-test-listing.json \
-              && test -s target/nextest/ci/junit.xml || status=$?
-          fi
           {
             echo "command=workspace archive execution"
             echo "exit_status=${status}"
@@ -324,7 +326,8 @@ jobs:
           set +e
           NEXTEST_HIDE_PROGRESS_BAR=1 timeout --verbose --signal=TERM --kill-after=30s 80m \
             cargo nextest run --profile default -j1 --run-ignored ignored-only \
-            --archive-file "$RUNNER_TEMP/workspace-tests.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
+            --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json \
+            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
             -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))' \
             --status-level all --final-status-level all \
             2>&1 | tee artifacts/ilm-integration/nextest.log
@@ -380,12 +383,10 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "2"
         run: |
-          cargo test -p rustfs --test connect_registration \
-            --features connect-e2e-short-credentials \
-            registration_enforces_build_profile_credential_lifetime -- --exact
-          cargo test -p rustfs --test connect_registration \
-            --features connect-e2e-short-credentials \
-            rotation_waits_for_threshold_and_stops_on_revocation -- --exact
+          cargo test --locked -p rustfs --test connect_registration \
+            --features connect-e2e-short-credentials -- --exact --test-threads=1 \
+            registration_enforces_build_profile_credential_lifetime \
+            rotation_waits_for_threshold_and_stops_on_revocation
 
       # The guard in rustfs/src/connect/registration.rs is cfg(not(debug_assertions)),
       # and it must be tripped by a profile that turns debug assertions off for
@@ -778,8 +779,8 @@ jobs:
         run: |
           chmod +x target/debug/rustfs
           python3 scripts/ci_test_artifact.py verify --configuration e2e --archive "$RUNNER_TEMP/e2e-tests.tar.zst"
-          cargo nextest list --profile core-contract --archive-file "$RUNNER_TEMP/e2e-tests.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --message-format json > "$RUNNER_TEMP/core-contract-list.json"
-          python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile core-contract --archive-file "$RUNNER_TEMP/e2e-tests.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --no-tests fail
+          cargo nextest list --profile core-contract --archive-file "$RUNNER_TEMP/e2e-tests.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --message-format json > "$RUNNER_TEMP/core-contract-list.json"
+          python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile core-contract --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" --no-tests fail
           python3 scripts/ci_test_artifact.py evidence --core "$RUNNER_TEMP/core-contract-list.json" target/nextest/core-contract/junit.xml
       - name: Upload core contract evidence
         if: always()
@@ -866,7 +867,7 @@ jobs:
         run: |
           ./scripts/ci/resource_sampler.sh start e2e-smoke
           trap './scripts/ci/resource_sampler.sh stop' EXIT
-          python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke --archive-file "${NEXTEST_ARCHIVE}" --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
+          python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
             --status-level all --final-status-level all --failure-output final
 
       - name: Verify e2e smoke execution completeness
@@ -1064,7 +1065,7 @@ jobs:
           RUSTFS_E2E_STARTUP_CAS_BUILD_MANIFEST: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs.e2e-startup-cas-build.json
           RUSTFS_E2E_STARTUP_CAS_ARTIFACT_DIR: ${{ runner.temp }}/rustfs-startup-cas-evidence
           RUSTFS_HEAL_CHAOS_LOG_ROOT: ${{ runner.temp }}/rustfs-heal-chaos-logs
-        run: python3 scripts/e2e_binary.py run --binary "$RUSTFS_E2E_STARTUP_CAS_BINARY" --features e2e-test-hooks -- cargo nextest run --profile e2e-full --archive-file "$RUNNER_TEMP/e2e-tests.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite
+        run: python3 scripts/e2e_binary.py run --binary "$RUSTFS_E2E_STARTUP_CAS_BINARY" --features e2e-test-hooks -- cargo nextest run --profile e2e-full --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target"
 
       - name: Verify e2e full execution completeness
         run: python3 scripts/ci_test_artifact.py evidence "$RUNNER_TEMP/rustfs-e2e-full-list.json" target/nextest/e2e-full/junit.xml

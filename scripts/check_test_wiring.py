@@ -698,8 +698,32 @@ def check_ilm_build_budget(root: Path) -> list[str]:
                          "-E", "binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))"):
             if required not in tokens:
                 return [f"ILM integration is missing {required}"]
-        if "--archive-file" not in tokens or "test-and-lint" not in job.get("needs", []):
+        reuse_options = {
+            "--cargo-metadata": "target/nextest/cargo-metadata.json",
+            "--binaries-metadata": "target/nextest/binaries-metadata.json",
+            "--workspace-remap": "$GITHUB_WORKSPACE",
+            "--target-dir-remap": "$GITHUB_WORKSPACE/target",
+        }
+        if ("test-and-lint" not in job.get("needs", []) or "--archive-file" in tokens
+                or any(tokens.count(flag) != 1 or tokens[tokens.index(flag) + 1:tokens.index(flag) + 2] != [value]
+                       for flag, value in reuse_options.items())):
             return ["ILM integration must consume the workspace producer archive"]
+        preceding = job["steps"][:job["steps"].index(step)]
+        listings = [(index, item) for index, item in enumerate(preceding) if "cargo nextest list" in item.get("run", "")]
+        if len(listings) != 1:
+            return ["workspace tests must extract and list their archive exactly once"]
+        index, listing_step = listings[0]
+        listed = shlex.split(listing_step["run"].replace("\\\n", " "))
+        for flag, value in {"--archive-file": "$RUNNER_TEMP/workspace-tests.tar.zst", "--extract-to": "$GITHUB_WORKSPACE"}.items():
+            if listed.count(flag) != 1 or listed[listed.index(flag) + 1:listed.index(flag) + 2] != [value]:
+                return ["workspace listing must extract the producer archive into the checkout"]
+        verification = shell_command_contract(
+            'python3 scripts/ci_test_artifact.py verify --configuration workspace --archive "$RUNNER_TEMP/workspace-tests.tar.zst"'
+        )
+        verified = [item for item in preceding[:index] if shell_command_contract(item.get("run", "")) == verification]
+        if (len(verified) != 1 or any("if" in item or item.get("continue-on-error", "false") != "false"
+                                    for item in [listing_step, *verified])):
+            return ["workspace archive must be verified before extraction"]
         if any(item.get("continue-on-error", "false") != "false" for item in (job, step)):
             return ["ILM integration must propagate failures"]
         if 'status=${PIPESTATUS[0]}' not in command or 'exit "${status}"' not in command or "|| true" in command.split('status=${PIPESTATUS[0]}')[0]:
@@ -5569,6 +5593,11 @@ class SelfTests(unittest.TestCase):
                 ("binary(lifecycle_integration_test)", "none()"),
                 ('exit "${status}"', "exit 0"),
                 ("--archive-file", "--not-an-archive"),
+                ("--cargo-metadata", "--not-cargo-metadata"),
+                ("--binaries-metadata", "--not-binaries-metadata"),
+                ("target/nextest/binaries-metadata.json", "target/unrelated.json"),
+                ('--extract-to "$GITHUB_WORKSPACE"', '--extract-to "$RUNNER_TEMP"'),
+                ("verify --configuration workspace", "verify --configuration e2e"),
                 ("build --configuration workspace", "build --configuration e2e"),
             ):
                 workflow.write_text(valid.replace(old, new))

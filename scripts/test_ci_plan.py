@@ -313,7 +313,10 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(report.read_text(), 'existing core report')
                 arguments = args.read_text().splitlines()
                 self.assertEqual(arguments[:7], ['nextest', 'run', '--profile', 'default', '-j1', '--run-ignored', 'ignored-only'])
-                self.assertIn('--archive-file', arguments)
+                self.assertNotIn('--archive-file', arguments)
+                self.assertEqual(arguments[arguments.index('--cargo-metadata') + 1], 'target/nextest/cargo-metadata.json')
+                self.assertEqual(arguments[arguments.index('--binaries-metadata') + 1], 'target/nextest/binaries-metadata.json')
+                self.assertEqual(arguments[arguments.index('--target-dir-remap') + 1], str(root / 'target'))
                 self.assertIn(f'exit_status={status}', (root / 'artifacts/ilm-integration/diagnostics.txt').read_text())
 
     def test_semantic_yaml_equivalence_and_wiring_boundaries(self):
