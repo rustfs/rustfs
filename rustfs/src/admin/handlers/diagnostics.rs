@@ -26,6 +26,7 @@
 use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::storage_api::access::spawn_traced;
+use crate::admin::storage_api::s3::{self, S3ErrorCode};
 use crate::admin::utils::json_response;
 use crate::server::ADMIN_PREFIX;
 use crate::storage::storage_api::get_global_lock_clients;
@@ -590,7 +591,8 @@ struct HealthInfoResponse {
 async fn collect_health_info() -> S3Result<HealthInfoResponse> {
     use sysinfo::{Pid, System};
 
-    let mut sys = System::new_all().map_err(|error| s3_error!(InternalError, "System information unavailable: {error}"))?;
+    let mut sys = System::new_all()
+        .map_err(|error| s3::error(S3ErrorCode::InternalError, format!("System information unavailable: {error}")))?;
     sys.refresh_cpu_all();
     // A second sample after a short interval yields meaningful CPU usage.
     tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
