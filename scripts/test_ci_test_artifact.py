@@ -118,6 +118,16 @@ class ArtifactIdentityTests(unittest.TestCase):
         with patch.dict(os.environ, {"CI_PACKAGES": '["rustfs-utils", "rustfs", "rustfs"]'}):
             self.assertEqual(artifact.package_args("workspace"), ["-p", "rustfs", "-p", "rustfs-utils"])
             self.assertEqual(artifact.package_args("e2e"), ["-p", "e2e_test"])
+        locked = [{"name": "zstd", "version": "0.13.3"},
+                  {"name": "zstd", "version": "0.14.3", "source": "registry+https://github.com/rust-lang/crates.io-index"},
+                  {"name": "rustfs", "version": "0.1.0"}]
+        with patch.object(artifact, "locked_packages", return_value=locked), \
+                patch.dict(os.environ, {"CI_PACKAGES": '["zstd", "rustfs"]'}):
+            self.assertEqual(artifact.package_args("workspace"), ["-p", "rustfs", "-p", "zstd@0.13.3"])
+            for clash in ([*locked[:2], {"name": "zstd", "version": "0.14.3"}], [locked[1], {**locked[1], "version": "0.15.0"}]):
+                with self.subTest(clash=clash), patch.object(artifact, "locked_packages", return_value=clash), \
+                        self.assertRaisesRegex(ValueError, "unambiguously"):
+                    artifact.package_args("workspace")
         for value in ('[]', '{}', '[null]', '["--all-features"]', '["e2e_test"]', '[""]'):
             with self.subTest(value=value), patch.dict(os.environ, {"CI_PACKAGES": value}), self.assertRaises(ValueError):
                 artifact.package_args("workspace")

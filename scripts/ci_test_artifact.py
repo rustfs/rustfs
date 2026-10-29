@@ -8,6 +8,7 @@ from pathlib import Path
 import platform
 import subprocess
 import sys
+import tomllib
 import xml.etree.ElementTree as ET
 
 from e2e_binary import ROOT, file_hash, source_identity
@@ -71,8 +72,27 @@ def package_args(configuration):
             not isinstance(name, str) or not name or name.startswith("-") or name == "e2e_test" for name in packages
         ):
             raise ValueError("CI_PACKAGES must be a nonempty workspace package list")
-        return [part for name in sorted(set(packages)) for part in ("-p", name)]
+        return [part for name in sorted(set(packages)) for part in ("-p", package_spec(name))]
     return CONFIGURATIONS[configuration]
+
+
+def locked_packages():
+    return tomllib.loads((ROOT / "Cargo.lock").read_text()).get("package", [])
+
+
+def package_spec(name):
+    """Qualify a workspace package whose name also resolves to a dependency.
+
+    `crates/zstd-compat` is named `zstd` to patch crates.io, so a bare `-p zstd`
+    is ambiguous whenever another `zstd` version is locked.
+    """
+    entries = [entry for entry in locked_packages() if entry.get("name") == name]
+    if len(entries) <= 1:
+        return name
+    local = [entry for entry in entries if "source" not in entry]
+    if len(local) != 1 or any(entry["version"] == local[0]["version"] for entry in entries if entry is not local[0]):
+        raise ValueError(f"workspace package {name} cannot be selected unambiguously")
+    return f"{name}@{local[0]['version']}"
 
 
 def build(archive, configuration):
