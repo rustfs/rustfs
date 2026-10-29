@@ -3653,28 +3653,35 @@ impl SetDisks {
             // Read repair may stage under a shared lock, but must not perform
             // destructive cleanup or produce an authoritative absence proof.
             let can_commit = || proof.retirement.is_none_or(|context| !context.lifecycle_guard.is_lock_lost());
-            let (result, error) = pin_object_heal_future(|| {
-                self.heal_object_with_explicit_version_regen(
-                    bucket,
-                    object,
-                    version_id,
-                    ExplicitVersionHeal {
-                        opts,
-                        allow_regeneration: false,
-                        preserve_unrepairable: true,
-                        commit_fence: Some(&can_commit),
-                        namespace_owner: None,
-                        retirement: None,
-                    },
-                    absence,
-                )
-            })
-            .await
-            .map_err(|error| to_object_err(error.into(), vec![bucket, object]))?;
-            if !can_commit() {
-                return Err(DiskError::DiskOngoingReq.into());
+            let mut read_opts = *opts;
+            loop {
+                let (result, error) = pin_object_heal_future(|| {
+                    self.heal_object_with_explicit_version_regen(
+                        bucket,
+                        object,
+                        version_id,
+                        ExplicitVersionHeal {
+                            opts: &read_opts,
+                            allow_regeneration: false,
+                            preserve_unrepairable: true,
+                            commit_fence: Some(&can_commit),
+                            namespace_owner: None,
+                            retirement: None,
+                        },
+                        absence,
+                    )
+                })
+                .await
+                .map_err(|error| to_object_err(error.into(), vec![bucket, object]))?;
+                if !can_commit() {
+                    return Err(DiskError::DiskOngoingReq.into());
+                }
+                if matches!(error, Some(DiskError::FileCorrupt)) && read_opts.scan_mode != HealScanMode::Deep {
+                    read_opts.scan_mode = HealScanMode::Deep;
+                    continue;
+                }
+                return Ok((result, error.map(Into::into)));
             }
-            return Ok((result, error.map(Into::into)));
         }
         let _write_lock_guard = if !opts.no_lock {
             let ns_lock = self
