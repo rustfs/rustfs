@@ -224,6 +224,22 @@ def require_complete_abba_matrix(manifest: dict[str, Any], report: dict[str, Any
     require(not missing, f"missing ABBA matrix comparison: {missing[0] if missing else ''}")
 
 
+def has_complete_abba_matrix(manifest: dict[str, Any], report: dict[str, Any], comparisons: list[dict[str, Any]]) -> bool:
+    rounds = manifest.get("rounds")
+    if type(rounds) is not int or not 3 <= rounds <= 10:
+        return False
+    expected = {(scenario, comparison, round_id) for scenario in SCENARIOS
+                for comparison in ("build", "background") for round_id in range(1, rounds + 1)}
+    observed = []
+    for row in comparisons:
+        if not isinstance(row, dict) or not isinstance(row.get("scenario"), str) or not isinstance(row.get("comparison"), str) \
+                or type(row.get("round")) is not int:
+            return False
+        observed.append((row["scenario"], row["comparison"], row["round"]))
+    return (len(observed) == len(expected) and set(observed) == expected
+            and report.get("cells") == len(expected) * len(LEGS))
+
+
 def summarize_abba(abba_dir: Path) -> dict[str, Any]:
     manifest_path = abba_dir / "manifest.json"
     report_path = abba_dir / "report.json"
@@ -238,6 +254,7 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
         require(report_state not in PASS_STATES, "passing report requires comparisons")
         comparisons = []
     require(isinstance(comparisons, list), "report.comparisons must be a list")
+    matrix_complete = has_complete_abba_matrix(manifest, report, comparisons)
 
     counts = Counter()
     p99_regressions: list[Decimal] = []
@@ -250,6 +267,8 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
     error_rate_values: list[Decimal | None] = []
     pressure_samples = 0
     pressure_high_samples = 0
+    pressure_samples_complete = matrix_complete
+    pressure_high_samples_complete = matrix_complete
     attempt_cost_samples = 0
     start_p95_values: list[Decimal | None] = []
     duplicate_task_values: list[Decimal | None] = []
@@ -296,13 +315,22 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
                 lock_hold_values.append(maybe_number(value, "heal_lock_hold_p95_ms"))
         w10_w11 = comparison.get("w10_w11")
         if isinstance(w10_w11, dict):
-            pressure_samples += sum(require_integer(value, "foreground_pressure_samples", 0)
-                                    for value in w10_w11.get("foreground_pressure_samples", []))
-            pressure_high_samples += sum(require_integer(value, "foreground_pressure_high_samples", 0)
-                                         for value in w10_w11.get("foreground_pressure_high_samples", []))
+            samples = w10_w11.get("foreground_pressure_samples")
+            if isinstance(samples, list) and len(samples) == len(LEGS) and all(value is not None for value in samples):
+                pressure_samples += sum(require_integer(value, "foreground_pressure_samples", 0) for value in samples)
+            else:
+                pressure_samples_complete = False
+            high_samples = w10_w11.get("foreground_pressure_high_samples")
+            if isinstance(high_samples, list) and len(high_samples) == len(LEGS) and all(value is not None for value in high_samples):
+                pressure_high_samples += sum(require_integer(value, "foreground_pressure_high_samples", 0) for value in high_samples)
+            else:
+                pressure_high_samples_complete = False
             for value in w10_w11.get("attempt_cost_per_healed_object", []):
                 if value is not None:
                     attempt_cost_samples += 1
+        else:
+            pressure_samples_complete = False
+            pressure_high_samples_complete = False
         w10 = comparison.get("w10")
         if isinstance(w10, dict) and comparison.get("scenario") == "running-heal" and comparison.get("comparison") == "build":
             w10_rows.append({
@@ -316,8 +344,7 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
             })
         if "throughput_ops" in comparison:
             throughput_values.append(maybe_number(comparison.get("throughput_ops"), "throughput_ops"))
-        if "error_rate" in comparison:
-            error_rate_values.append(maybe_number(comparison.get("error_rate"), "error_rate"))
+        error_rate_values.append(maybe_number(comparison.get("error_rate"), "error_rate"))
         w11 = comparison.get("w11")
         if isinstance(w11, dict) and comparison.get("scenario") == "running-heal" and comparison.get("comparison") == "build":
             w11_rows.append({
@@ -338,6 +365,9 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
         validate_release_evidence_manifest({**manifest, "evidence": "measured"})
         for index, comparison in enumerate(comparisons):
             require_measured_comparison_evidence(comparison, index)
+        require(all(value is not None for value in error_rate_values), "error_rate must be measured")
+        require(pressure_samples_complete, "foreground_pressure_samples must be measured")
+        require(pressure_high_samples_complete, "foreground_pressure_high_samples must be measured")
     gate_state = "pass" if passed else "fail"
     if report_state == "synthetic_validated":
         reason = "synthetic evidence validates the harness only; measured performance remains pending"
@@ -370,9 +400,10 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
         "foreground_p95_ms": None if max_decimal(foreground_p95_values) is None else float(max_decimal(foreground_p95_values)),
         "foreground_p99_ms": None if max_decimal(foreground_p99_values) is None else float(max_decimal(foreground_p99_values)),
         "throughput_ops": None if max_decimal(throughput_values) is None else float(max_decimal(throughput_values)),
-        "error_rate": 0.0 if not error_rate_values else float(max(error_rate_values)),
-        "foreground_pressure_samples": pressure_samples,
-        "foreground_pressure_high_samples": pressure_high_samples,
+        "error_rate": (None if not matrix_complete or any(value is None for value in error_rate_values)
+                       else float(max_decimal(error_rate_values))),
+        "foreground_pressure_samples": pressure_samples if pressure_samples_complete else None,
+        "foreground_pressure_high_samples": pressure_high_samples if pressure_high_samples_complete else None,
         "attempt_cost_samples": attempt_cost_samples,
         "p2_worst_post_stop_work_multiple": None if max_decimal(p2_values) is None else float(max_decimal(p2_values)),
         "w09_worst_heal_start_p95_ms": None if max_decimal(start_p95_values) is None else float(max_decimal(start_p95_values)),
