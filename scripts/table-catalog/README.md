@@ -40,7 +40,7 @@ python3 scripts/table-catalog/pyiceberg_smoke.py \
   --cleanup \
   --rustfs-build rustfs-v1.0.0-beta.8 \
   --git-sha "$(git rev-parse HEAD)" \
-  --catalog-backing durable-strong \
+  --catalog-backing object \
   --live-evidence-output /tmp/rustfs-pyiceberg-live-evidence.json
 ```
 
@@ -58,19 +58,18 @@ instead of support-matrix proof.
 The smoke reads `rustfs.catalog-backing` from `/v1/config`, applying overrides
 after defaults, before creating objects. `--catalog-backing` is an optional
 expected value, not a way to relabel the deployment. A mismatch or an unknown
-server backing aborts the run. Object mode uses the wire value `object`; the
+server backing aborts the run. The only supported wire value is `object`; the
 legacy operator label `object-backed` is accepted as an expected-value alias.
-Durable-strong must already be provisioned through the
-[cutover procedure](../../docs/operations/s3-tables-cutover-runbook.md).
-`--client-version` likewise checks the installed PyIceberg version rather than
+A retired backing value fails closed instead of silently selecting another
+implementation. `--client-version` likewise checks the installed PyIceberg
+version rather than
 overriding the version recorded in evidence. A mismatch aborts before setup.
 
 New PyIceberg evidence includes `catalog_probes`, `rest_signing_name`, and
-`credential_vending_required`. Probe results distinguish `pass`,
-`expected-unsupported`, and `skipped`. Both backings exercise maintenance
-configuration, scheduler/worker dry-run, job inspection, quarantine inspection,
-diagnostics, and export. Only the direct metadata-maintenance endpoint is
-expected to reject durable-strong requests. A completed dry-run must retain its
+`credential_vending_required`. Probe results distinguish `pass` and `skipped`.
+The object catalog exercises maintenance configuration, scheduler/worker
+dry-run, job inspection, quarantine inspection, diagnostics, export, and the
+catalog pointer/token/generation checks. A completed dry-run must retain its
 queued job identity, report zero deletions, and leave the commit state unchanged;
 the smoke restores its disabled, paused configuration after execution.
 New full runs use `create-append-reload-scan-backing-contracts-v2`; historical
@@ -94,9 +93,8 @@ The smoke test covers:
 - round-trip an encoded multi-level namespace and reject double-encoded aliases
 - check LoadTable does not vend credentials for missing or unknown delegation
   tokens; when vending is required, check exact-token negotiation and scope
-- on both backings, check a successful maintenance dry-run and export against
-  the current pointer, token, and generation; in durable-strong mode, also
-  verify the direct metadata-maintenance rejection leaves commit state unchanged
+- check the object catalog maintenance dry-run and export against the current
+  pointer, token, and generation, including the complete referenced-object graph
 - optionally drop the table and namespace
 
 The default profile uses the canonical RustFS catalog URI:
@@ -170,8 +168,7 @@ temporary credentials:
   rejected.
 
 The direct REST catalog probes run by default after the PyIceberg append and
-scan. Both backings run maintenance control, diagnostics, and export probes.
-Durable-strong checks the direct metadata-maintenance rejection separately.
+scan. The object catalog runs maintenance control, diagnostics, export, and backup/restore contract probes.
 For deployments that intentionally expose only the core Iceberg REST
 Catalog table path, skip those probes explicitly:
 
@@ -333,24 +330,17 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
   inspected, released, retried, or abandoned through an operator endpoint
 - catalog diagnostics exposes the table recovery and consistency state used by
   operators
-- catalog export and diagnostics expose the current catalog backing manifest,
-  recoverable commit-log WAL state, strong backing migration target, single
-  active writer HA policy, and scale validation matrix; durable-strong responses
-  additionally identify the snapshot path, ETag, and format version, and
-  diagnostics retry a bounded number of times when the strong snapshot changes
-  during inspection, then fail closed if no stable observation is available.
-  Metadata scans follow the persisted directory, including renamed tables and
-  same-bucket S3 locations. Until strong maintenance configuration is persisted,
-  diagnostics add no count-based retention; current metadata, metadata-log entries,
-  and snapshot refs remain protected. Orphan candidates are read-only observations,
-  not deletion authorization. Object-backed reports share one recovery observation
-  but do not provide a cross-object linearizable snapshot.
-  diagnostics fail closed if the strong snapshot changes during inspection;
-  until strong maintenance configuration is persisted, diagnostics use a
-  conservative zero-file retention default. Durable catalog backup and restore
-  are controlled durable-strong operations; backup artifacts record catalog and
-  referenced-object watermarks, while restore verifies them and retains a
-  recoverable intent when maintenance-state finalization is interrupted.
+- catalog export and diagnostics expose the object catalog recovery state,
+  commit-log and idempotency information, single-active-writer policy, and scale
+  validation matrix. Metadata scans follow the persisted directory, including
+  renamed tables and same-bucket S3 locations. Current metadata, metadata-log
+  entries, and snapshot references remain protected while maintenance plans are
+  evaluated. Orphan candidates are read-only observations until a controlled
+  maintenance operation authorizes deletion.
+- catalog backup and restore are controlled object-backed recovery operations.
+  Backup artifacts record the catalog pointer and referenced Iceberg object graph;
+  restore verifies UUID, warehouse, metadata, manifest-list, manifest, data, and
+  delete-file references, and can be retried after an interrupted finalization.
 
 ## Client Matrix
 
@@ -386,7 +376,7 @@ The current failure matrix covers:
   commit
 - external catalog sync conflicts leaving pointer, token, and generation
   unchanged
-- backing migration remaining blocked until WAL/recovery replay is clean
+- object backup/restore remaining blocked until recovery and referenced-object validation are clean
 
 Do not promote a failure case from `probe-required` or `load-test-required` to
 an automated claim until the live probe or stress harness is repeatable and its
@@ -421,14 +411,14 @@ The generated phases cover:
 - baseline capture through catalog export and `loadTable`
 - recovery diagnostics and safe idempotency/commit repair
 - operator-selected rollback or import of a known metadata location
-- durable backing migration dry-run blocker checks
+- object catalog backup/restore blocker and retry checks
 - post-recovery `loadTable` and table warehouse data-plane policy probes
 
 Record the RustFS build, catalog backing mode, table identifier, metadata
-location, and expected response status for each run. Treat migration blockers,
+location, and expected response status for each run. Treat recovery blockers,
 manual-review diagnostics, stale rollback/import conflicts, and data-plane
 policy failures as fail-closed results that require operator investigation
-before cutover or release claims.
+before recovery or release claims.
 
 ## Scale And Fault Rehearsal
 
@@ -448,7 +438,7 @@ python3 scripts/table-catalog/failure_coverage.py \
   --writer-count 8 \
   --maintenance-worker-count 2 \
   --iteration-count 50 \
-  --catalog-backing durable-strong \
+  --catalog-backing object \
   --print-scale-fault-rehearsal
 ```
 
@@ -464,7 +454,7 @@ The generated phases cover:
   conflict group and retryable conflicts for stale writers
 - maintenance scheduler queueing, worker claim, lease expiry recovery, and stale
   plan fail-closed checks
-- durable backing migration dry-run and catalog backup evidence before cutover
+- object catalog backup/restore, including graph validation and retry evidence
 - safe recovery repair, rollback, and import conflict behavior after stress
 - final `loadTable`, table data-plane policy, and operator artifact capture
 
@@ -475,7 +465,7 @@ failed-closed operations before using the run as release evidence.
 ## Production Operations Guide
 
 The engine helper can print a machine-readable operations guide that ties client
-conformance, durable backing cutover, maintenance, recovery, permissions, and
+conformance, object catalog backup/restore, maintenance, recovery, permissions, and
 unsupported-claim governance to the exact evidence operators must record:
 
 ```bash

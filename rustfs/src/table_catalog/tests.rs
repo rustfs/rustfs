@@ -4907,10 +4907,20 @@ async fn object_catalog_backup_is_idempotent_and_restorable() {
             .is_none()
     );
 
+    let table_entry_path = TableCatalogObjectPaths::default().table_entry_path(bucket, &namespace, &table);
+    backend.fail_after_next_put(RUSTFS_META_BUCKET, &table_entry_path).await;
+    let interrupted = store
+        .restore_object_catalog_backup(bucket, &first.backup_id, None, true)
+        .await
+        .expect_err("restore should surface an ambiguous post-write interruption");
+    assert!(
+        matches!(interrupted, TableCatalogStoreError::Internal(message) if message.contains("injected post-commit put failure"))
+    );
+
     let restored = store
         .restore_object_catalog_backup(bucket, &first.backup_id, None, true)
         .await
-        .unwrap();
+        .expect("retrying an interrupted restore should converge");
     assert_eq!(restored.status, TableCatalogRestoreStatus::Restored);
     assert!(store.get_namespace(bucket, &namespace.public_name()).await.unwrap().is_some());
     assert!(

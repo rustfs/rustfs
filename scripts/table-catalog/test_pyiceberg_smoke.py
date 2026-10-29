@@ -463,10 +463,6 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
                     config = body.copy()
                 return config.copy()
             if path.endswith("/maintenance/metadata"):
-                if backing == "durable-strong":
-                    envelope = {"error": {"code": 400, "type": "BadRequestException",
-                                          "message": "operation is not supported with durable-strong table catalog backing"}}
-                    raise pyiceberg_smoke.RestRequestError(method, path, 400, json.dumps(envelope))
                 return {"job": {"job_id": "job-1"}, "audit-events": audit}
             if path.endswith("/maintenance/scheduler"):
                 return {"status": "DISABLED", "audit_timeline": []}
@@ -486,9 +482,9 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
 
         return request
 
-    def test_maintenance_dry_run_exercises_both_backings_and_leaves_worker_paused(self) -> None:
+    def test_maintenance_dry_run_leaves_worker_paused(self) -> None:
         args = self.parse_with_args([])
-        for backing in ("object", "durable-strong"):
+        for backing in ("object",):
             with self.subTest(backing=backing), mock.patch.object(
                 pyiceberg_smoke, "signed_rest_request", side_effect=self.maintenance_responses(backing)
             ) as request:
@@ -517,7 +513,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             ({"deleted_object_count": None}, "zero deletions"),
             ({"deleted_object_count": False}, "zero deletions"),
         ])
-        for backing in ("object", "durable-strong"):
+        for backing in ("object",):
             for changes, message in failures:
                 with self.subTest(backing=backing, changes=changes), mock.patch.object(
                     pyiceberg_smoke, "signed_rest_request",
@@ -529,7 +525,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
 
     def test_maintenance_detects_pointer_advance_and_pauses_after_transport_failure(self) -> None:
         args = self.parse_with_args([])
-        for backing in ("object", "durable-strong"):
+        for backing in ("object",):
             for transport_failure in (False, True):
                 base = self.maintenance_responses(backing, mutate_pointer=not transport_failure)
 
@@ -1045,11 +1041,11 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         inventory = pyiceberg_smoke.production_readiness_inventory()
         capabilities = {entry["capability"] for entry in inventory}
 
-        self.assertIn("strong-catalog-backing", capabilities)
+        self.assertIn("object-catalog-backup-restore", capabilities)
         self.assertIn("single-active-writer-ha", capabilities)
         self.assertIn("scale-validation-matrix", capabilities)
-        strong_backing = next(entry for entry in inventory if entry["capability"] == "strong-catalog-backing")
-        self.assertEqual(strong_backing["status"], "state-transfer-supported")
+        object_backup = next(entry for entry in inventory if entry["capability"] == "object-catalog-backup-restore")
+        self.assertEqual(object_backup["status"], "controlled-recovery-supported")
         for entry in inventory:
             self.assertIn("status", entry)
             self.assertIn("validation", entry)
@@ -1117,8 +1113,8 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             row_count=2,
             cleanup_result="not-requested",
             table_warehouse_location="s3://lake/tables/table-id",
-            catalog_backing="durable-strong",
-            catalog_probes=pyiceberg_smoke.engine_compatibility.pyiceberg_catalog_probe_results("durable-strong", skipped=False, vended=False),
+            catalog_backing="object",
+            catalog_probes=pyiceberg_smoke.engine_compatibility.pyiceberg_catalog_probe_results("object", skipped=False, vended=False),
         )
 
         record = pyiceberg_smoke.pyiceberg_live_evidence_record(
@@ -1127,7 +1123,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             client_version="0.10.0",
             rustfs_build="rustfs-test",
             git_sha="abc123",
-            catalog_backing="durable-strong",
+            catalog_backing="object",
             run_timestamp_utc="2026-07-09T00:00:00Z",
             operator="ci",
             command="python3 scripts/table-catalog/pyiceberg_smoke.py --live-evidence-output /tmp/rustfs-live-evidence.json",
@@ -1139,33 +1135,32 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertEqual(record["metadata_location"], "s3://lake/tables/table-id/metadata/v2.metadata.json")
         self.assertEqual(record["row_count"], 2)
         self.assertEqual(record["claim"], "automated-smoke")
-        self.assertEqual(record["catalog_probes"]["metadata-maintenance"], "expected-unsupported")
+        self.assertEqual(record["catalog_probes"]["metadata-maintenance"], "pass")
         self.assertEqual(record["catalog_probes"]["maintenance-worker-dry-run"], "pass")
         self.assertEqual(record["rest_signing_name"], "s3")
         validate = pyiceberg_smoke.engine_compatibility.validate_live_conformance_evidence
         self.assertEqual(validate(record)["status"], "accepted")
-        record["catalog_probes"]["metadata-maintenance"] = "pass"
-        with self.assertRaisesRegex(ValueError, "capabilities"):
-            validate(record)
         del record["catalog_probes"]
         with self.assertRaisesRegex(ValueError, "capabilities"):
             validate(record)
 
-    def test_backing_discovery_uses_overrides_and_rejects_mismatches(self) -> None:
-        args = self.parse_with_args(["--bucket", "lake", "--catalog-backing", "durable-strong"])
-        config = {"defaults": {"rustfs.catalog-backing": "object"}, "overrides": {"rustfs.catalog-backing": "durable-strong"}}
+    def test_backing_discovery_uses_overrides_and_rejects_retired_or_mismatched_values(self) -> None:
+        args = self.parse_with_args(["--bucket", "lake", "--catalog-backing", "object"])
+        config = {"defaults": {"rustfs.catalog-backing": "object"}, "overrides": {}}
         with mock.patch.object(pyiceberg_smoke, "signed_rest_request", return_value=config) as request:
-            self.assertEqual(pyiceberg_smoke.discover_catalog_backing(args, mock.Mock()), "durable-strong")
+            self.assertEqual(pyiceberg_smoke.discover_catalog_backing(args, mock.Mock()), "object")
         self.assertEqual(request.call_args.args[2:4], ("GET", "/iceberg/v1/config?warehouse=lake"))
-        for response in ({}, {"defaults": {}, "overrides": {}}, {"defaults": {"rustfs.catalog-backing": "unknown"}, "overrides": {}}):
+        for response in ({}, {"defaults": {}, "overrides": {}}, {"defaults": {"rustfs.catalog-backing": "durable-strong"}, "overrides": {}}):
             with self.subTest(response=response), mock.patch.object(pyiceberg_smoke, "signed_rest_request", return_value=response):
                 with self.assertRaises(RuntimeError):
                     pyiceberg_smoke.discover_catalog_backing(args, mock.Mock())
-        config["overrides"] = {}
+        config["overrides"] = {"rustfs.catalog-backing": "durable-strong"}
         with mock.patch.object(pyiceberg_smoke, "signed_rest_request", return_value=config):
-            with self.assertRaisesRegex(RuntimeError, "does not match"):
+            with self.assertRaisesRegex(RuntimeError, "supported RustFS backing"):
                 pyiceberg_smoke.discover_catalog_backing(args, mock.Mock())
-            args.catalog_backing = "object-backed"
+        config["overrides"] = {}
+        args.catalog_backing = "object-backed"
+        with mock.patch.object(pyiceberg_smoke, "signed_rest_request", return_value=config):
             self.assertEqual(pyiceberg_smoke.discover_catalog_backing(args, mock.Mock()), "object")
 
     def test_client_version_is_observed_and_mismatch_aborts_before_setup(self) -> None:
@@ -1189,42 +1184,13 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
                 pyiceberg_smoke.run_smoke(args, mock.Mock())
         bucket.assert_not_called()
 
-    def strong_probe_responses(self, *, status=400, error_type="BadRequestException", mutate=False):
-        pointer = {"metadata-location": "s3://lake/tables/id/metadata/v2.metadata.json", "version-token": "t2", "generation": 2}
-        reads = 0
-
-        def request(_args, _deps, method, path, body=None):
-            nonlocal reads
-            if path.endswith("/metadata-location"):
-                reads += 1
-                return {**pointer, "generation": 3} if mutate and reads > 1 else pointer.copy()
-            self.assertTrue(path.endswith("/maintenance/metadata"), path)
-            error = {"error": {"code": status, "type": error_type,
-                               "message": "operation is not supported with durable-strong table catalog backing"}}
-            raise pyiceberg_smoke.RestRequestError(method, path, status, json.dumps(error))
-
-        return request
-
-    def test_strong_metadata_boundary_checks_error_and_unchanged_pointer(self) -> None:
-        args = self.parse_with_args([])
-        with mock.patch.object(pyiceberg_smoke, "signed_rest_request", side_effect=self.strong_probe_responses()) as request:
-            pyiceberg_smoke.run_strong_backing_boundaries(args, mock.Mock())
-        self.assertEqual(request.call_count, 3)
-        for kwargs, message in (({"status": 403}, "expected one of"), ({"status": 500}, "expected one of"),
-                                ({"error_type": "RESTException"}, "error envelope"), ({"mutate": True}, "commit state")):
-            with self.subTest(kwargs=kwargs), mock.patch.object(
-                pyiceberg_smoke, "signed_rest_request", side_effect=self.strong_probe_responses(**kwargs)
-            ):
-                with self.assertRaisesRegex(RuntimeError, message):
-                    pyiceberg_smoke.run_strong_backing_boundaries(args, mock.Mock())
-
-    def test_catalog_export_checks_pointer_token_and_generation_on_both_backings(self) -> None:
+    def test_catalog_export_checks_pointer_token_and_generation(self) -> None:
         args = self.parse_with_args(["--bucket", "lake"])
         location = "s3://lake/tables/id/metadata/v2.metadata.json"
         table = {"metadata-location": location, "metadata": {"current-snapshot-id": 7}}
         pointer = {"metadata-location": location, "version-token": "token-2", "generation": 2}
         entry = {"metadata_location": location, "version_token": "token-2", "generation": 2}
-        for backing in ("object", "durable-strong"):
+        for backing in ("object",):
             for mismatch in (None, "metadata_location", "version_token", "generation"):
                 exported = {**entry, mismatch: "stale"} if mismatch else entry
                 with self.subTest(backing=backing, mismatch=mismatch), mock.patch.object(
@@ -1245,8 +1211,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
                         self.assertEqual(probes["diagnostics"], "pass")
                         self.assertEqual(probes["export"], "pass")
                         self.assertEqual(probes["maintenance-worker-dry-run"], "pass")
-                        self.assertEqual(probes["metadata-maintenance"],
-                                         "expected-unsupported" if backing == "durable-strong" else "pass")
+                        self.assertEqual(probes["metadata-maintenance"], "pass")
                 self.assertEqual(maintenance.call_args.args[2], backing)
 
     def test_namespace_properties_detect_partial_or_rejected_writes(self) -> None:
@@ -1284,18 +1249,23 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
 
     def test_rename_probe_restores_name_even_when_metadata_changes(self) -> None:
         args = self.parse_with_args(["--bucket", "lake", "--namespace", "sales", "--table", "orders"])
-        before = {"metadata-location": "s3://lake/tables/id/metadata/v2.metadata.json", "metadata": {"location": "s3://lake/tables/id", "table-uuid": "uuid"}}
+        before = {"metadata-location": "s3://lake/tables/id/metadata/v2.metadata.json", "metadata": {"location": "s3://lake/tables/id", "table-uuid": "uuid", "current-schema-id": 0, "schemas": [{"schema-id": 0, "type": "struct", "fields": []}]}}
         missing = pyiceberg_smoke.RestRequestError("GET", "/table", 404, "missing")
+        pointer = {"metadata-location": before["metadata-location"], "version-token": "t2", "generation": 2}
+        replacement = {"metadata": {"table-uuid": "fresh", "location": "s3://lake/fresh", "snapshots": [], "current-snapshot-id": -1}}
         for changed in (False, True):
             after = {**before, "metadata-location": "other"} if changed else before
+            responses = [before, {}, missing, after, {}, before]
+            if not changed:
+                responses.extend([pointer, replacement, {}, missing, before, pointer])
             with self.subTest(changed=changed), mock.patch.object(
-                pyiceberg_smoke, "signed_rest_request", side_effect=[before, {}, missing, after, {}, before]
+                pyiceberg_smoke, "signed_rest_request", side_effect=responses
             ) as request:
                 if changed:
                     with self.assertRaisesRegex(RuntimeError, "warehouse identity"):
-                        pyiceberg_smoke.run_table_rename_probe(args, mock.Mock(), "durable-strong")
+                        pyiceberg_smoke.run_table_rename_probe(args, mock.Mock(), "object")
                 else:
-                    pyiceberg_smoke.run_table_rename_probe(args, mock.Mock(), "durable-strong")
+                    pyiceberg_smoke.run_table_rename_probe(args, mock.Mock(), "object")
                 renames = [call.args[4] for call in request.call_args_list if call.args[2] == "POST"]
                 self.assertEqual(renames[0]["source"], renames[1]["destination"])
                 self.assertEqual(renames[0]["destination"], renames[1]["source"])
@@ -1347,7 +1317,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         record = pyiceberg_smoke.pyiceberg_live_evidence_record(args, result, **kwargs)
         self.assertEqual(record["scenario"], "create-append-reload-scan-core")
         self.assertEqual(record["catalog_probes"], {"direct-rest": "skipped"})
-        kwargs["catalog_backing"] = "durable-strong"
+        kwargs["catalog_backing"] = "retired"
         with self.assertRaisesRegex(ValueError, "observed server"):
             pyiceberg_smoke.pyiceberg_live_evidence_record(args, result, **kwargs)
 
@@ -1487,14 +1457,6 @@ class SmokeCleanupTest(unittest.TestCase):
         pyiceberg_smoke.cleanup_catalog(self.catalog(), ("sales", "orders"))
         self.assertFalse(self.namespace_present)
         self.assertEqual(self.entries, {})
-
-    def test_strong_rename_does_not_create_or_drop_a_cleanup_table(self) -> None:
-        self.backing = "durable-strong"
-        self.rename()
-        self.assertFalse(any(method == "DELETE" or (method == "POST" and path.endswith("/tables"))
-                             for method, path, _ in self.calls))
-        pyiceberg_smoke.cleanup_catalog(self.catalog(), ("sales", "orders"))
-        self.assertFalse(self.namespace_present)
 
     def test_rename_does_not_sweep_unrelated_inactive_entries(self) -> None:
         self.entries["unrelated"] = None
