@@ -247,6 +247,13 @@ pub(crate) mod server {
     pub(crate) mod layer {
         pub(crate) use crate::storage::storage_api::apply_cors_headers;
 
+        #[cfg(feature = "diagnostic-local-batch")]
+        pub(crate) mod batch_diagnostic {
+            #[cfg(test)]
+            pub(crate) use crate::storage::storage_api::ecstore_diagnostic::current_request_id;
+            pub(crate) use crate::storage::storage_api::ecstore_diagnostic::{in_request_context, request_context};
+        }
+
         pub(crate) mod request_context {
             pub(crate) use crate::storage::storage_api::request_context_consumer::{
                 RequestContext, extract_request_id_from_headers, spawn_traced,

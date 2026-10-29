@@ -762,7 +762,7 @@ pub async fn collect_disk_stats() -> Vec<DiskStats> {
 fn build_system_cpu_stats(system: &System, server: &str) -> CpuStats {
     let cpu_usage = system.global_cpu_usage() as f64;
     let cpu_count = system.cpus().len().max(1) as f64;
-    let load_avg = System::load_average().one;
+    let load_avg = System::load_average().map_or(0.0, |load| load.one);
 
     CpuStats {
         server: server.to_string(),
@@ -796,7 +796,19 @@ fn build_system_memory_stats(system: &System, server: &str) -> MemoryStats {
 
 /// Collect system CPU and memory statistics from a shared sysinfo snapshot.
 pub fn collect_system_cpu_and_memory_stats() -> (CpuStats, MemoryStats) {
-    let mut system = System::new_all();
+    let Ok(mut system) = System::new_all() else {
+        let server = current_local_node_identity();
+        return (
+            CpuStats {
+                server: server.clone(),
+                ..Default::default()
+            },
+            MemoryStats {
+                server,
+                ..Default::default()
+            },
+        );
+    };
     collect_system_cpu_and_memory_stats_with(&mut system)
 }
 
@@ -1040,7 +1052,7 @@ pub fn collect_host_network_stats_with(networks: &Networks) -> HostNetworkStats 
         let transmitted = data.transmitted();
         total_received += received;
         total_transmitted += transmitted;
-        per_interface.push((interface_name.to_string(), received, transmitted));
+        per_interface.push((interface_name.to_string_lossy().into_owned(), received, transmitted));
     }
 
     HostNetworkStats {
@@ -1965,9 +1977,9 @@ mod tests {
         let previous = rustfs_common::get_global_local_node_name().await;
         rustfs_common::set_global_local_node_name("node1:9000").await;
 
-        let mut system = System::new_all();
+        let mut system = System::new_all().expect("initialize system snapshot");
         let (cpu, memory) = collect_system_cpu_and_memory_stats_with(&mut system);
-        let host_network = collect_host_network_stats_with(&Networks::new());
+        let host_network = collect_host_network_stats_with(&Networks::new().expect("initialize network snapshot"));
         let process_bundle =
             process_metric_bundle_from_snapshots(ProcessResourceSnapshot::default(), ProcessSystemSnapshot::default());
 
@@ -2472,11 +2484,11 @@ mod tests {
 
     #[test]
     fn host_network_stats_require_a_persistent_networks_snapshot() -> std::io::Result<()> {
-        if !sysinfo::IS_SUPPORTED_SYSTEM {
-            return Ok(());
-        }
-
-        let mut persistent_networks = Networks::new();
+        let mut persistent_networks = match Networks::new() {
+            Ok(networks) => networks,
+            Err(sysinfo::Error::Unsupported) => return Ok(()),
+            Err(error) => return Err(std::io::Error::other(error)),
+        };
         persistent_networks.refresh(true);
         let initial_stats = collect_host_network_stats_with(&persistent_networks);
         assert_eq!(
@@ -2500,7 +2512,8 @@ mod tests {
             "a persistent Networks instance should report non-zero loopback deltas after traffic"
         );
 
-        let recreated_stats = collect_host_network_stats_with(&Networks::new_with_refreshed_list());
+        let recreated_stats =
+            collect_host_network_stats_with(&Networks::new_with_refreshed_list().map_err(std::io::Error::other)?);
         assert_eq!(
             recreated_stats.total_received + recreated_stats.total_transmitted,
             0,

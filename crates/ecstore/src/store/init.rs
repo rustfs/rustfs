@@ -11991,6 +11991,7 @@ mod tests {
             ..Default::default()
         });
 
+        let mut stage_started = std::time::Instant::now();
         futures::stream::iter(0..RECEIPT_COUNT)
             .map(|index| {
                 let store = store.clone();
@@ -12024,15 +12025,21 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .expect("more than one receipt page should persist");
+        eprintln!("receipt fixture: seed {:.3}s", stage_started.elapsed().as_secs_f64());
+        stage_started = std::time::Instant::now();
         store
             .persist_decommission_durable_ilm_manifest_for_test(0)
             .await
             .expect("paginated source receipts should produce a manifest");
+        eprintln!("receipt fixture: manifest {:.3}s", stage_started.elapsed().as_secs_f64());
+        stage_started = std::time::Instant::now();
 
         let target_receipts = store
             .decommission_durable_ilm_receipt_paths_for_test(0)
             .await
             .expect("paginated target receipts should list");
+        eprintln!("receipt fixture: list {:.3}s", stage_started.elapsed().as_secs_f64());
+        stage_started = std::time::Instant::now();
         assert_eq!(target_receipts.len(), RECEIPT_COUNT);
         let (target_pool_idx, second_page_path) = target_receipts
             .get(1000)
@@ -12050,6 +12057,8 @@ mod tests {
             .await
             .expect_err("a missing second page receipt must block completion")
             .to_string();
+        eprintln!("receipt fixture: missing {:.3}s", stage_started.elapsed().as_secs_f64());
+        stage_started = std::time::Instant::now();
         assert!(missing.contains(&second_page_path));
         assert!(
             !store.pool_meta.read().await.pools[0]
@@ -12076,6 +12085,7 @@ mod tests {
             .await
             .expect_err("a corrupt second page receipt must block completion")
             .to_string();
+        eprintln!("receipt fixture: corrupt {:.3}s", stage_started.elapsed().as_secs_f64());
         assert!(corrupt.contains(&second_page_path));
         assert!(corrupt.contains("invalid"));
         assert!(

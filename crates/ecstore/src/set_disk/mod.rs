@@ -912,6 +912,8 @@ pub(crate) use ops::heal::AbsenceProofRequest;
 #[cfg(test)]
 pub(crate) use ops::heal::DanglingDeleteFailure;
 pub(crate) use ops::heal::HealedObjectAbsence;
+#[cfg(test)]
+pub(crate) use ops::heal::ReadRepairPauseScope;
 
 #[cfg(test)]
 pub(crate) use ops::hermetic_set_disks_isolated;

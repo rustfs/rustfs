@@ -3318,9 +3318,17 @@ pub mod test_support {
     use crate::store::init_local_disks_with_instance_ctx;
 
     pub async fn isolated_store_over_temp_disks() -> (Vec<tempfile::TempDir>, Arc<ECStore>) {
-        let mut dirs = Vec::with_capacity(4);
-        let mut endpoints = Vec::with_capacity(4);
-        for disk_idx in 0..4 {
+        isolated_store_over_temp_disks_with_count(4).await
+    }
+
+    pub async fn isolated_store_over_temp_disks_with_count(disk_count: usize) -> (Vec<tempfile::TempDir>, Arc<ECStore>) {
+        assert!(
+            matches!(disk_count, 4 | 16),
+            "isolated store fixture requires a registered logical set geometry"
+        );
+        let mut dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        for disk_idx in 0..disk_count {
             let dir = tempfile::tempdir().expect("tempdir should be created");
             let mut endpoint =
                 Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
@@ -3333,7 +3341,7 @@ pub mod test_support {
         let endpoint_pools = EndpointServerPools(vec![PoolEndpoints {
             legacy: false,
             set_count: 1,
-            drives_per_set: 4,
+            drives_per_set: disk_count,
             endpoints: Endpoints::from(endpoints),
             cmd_line: "metadata-sys-cache-test".to_string(),
             platform: "test".to_string(),

@@ -40,9 +40,6 @@ allow-git = [
     # dependencies while the engine crates move off s3s (rustfs/backlog#2745).
     # owner: rustfs-maintainers  review: 2027-01
     "https://github.com/rustfs/gateway",
-    # Official signer pinned to the reviewed SigV4a fix in smithy-rs#4958.
-    # owner: rustfs-maintainers  review: 2026-10
-    "https://github.com/smithy-lang/smithy-rs",
     # Upstream OIDC/OAuth2 crypto migrations, pinned to reviewed PR commits.
     # owner: rustfs-maintainers  review: 2026-10
     "https://github.com/ramosbugs/openidconnect-rs",

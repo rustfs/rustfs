@@ -14,12 +14,16 @@
 
 //! Explicit ECStore public facades for outer crate compatibility boundaries.
 
-#[cfg(feature = "diagnostic-read-version-caller")]
+#[cfg(any(feature = "diagnostic-read-version-caller", feature = "diagnostic-local-batch"))]
 pub mod diagnostic {
+    #[cfg(feature = "diagnostic-read-version-caller")]
     pub use crate::cluster::rpc::runtime_sources::{
         current_read_version_entry_source, observe_read_version_context_boundary, with_captured_read_version_context,
         with_read_version_entry, with_read_version_spawn_context,
     };
+    #[cfg(feature = "diagnostic-local-batch")]
+    pub use crate::diagnostics::batch_read_diagnostics::{current_request_id, in_request_context, request_context};
+    #[cfg(feature = "diagnostic-read-version-caller")]
     pub use rustfs_io_metrics::internode_metrics::{ReadVersionContextBoundary, ReadVersionEntrySource};
 }
 
@@ -141,6 +145,12 @@ pub mod bucket {
 
         pub mod rule {
             pub use crate::bucket::lifecycle::rule::{Filter, NoncurrentVersionTransitionOps, TransitionOps};
+        }
+
+        pub mod tier_free_version_recovery {
+            pub use crate::bucket::lifecycle::tier_free_version_recovery::{
+                TierCleanupRetryReport, TierCleanupRetryStatus, retry_tier_free_version_cleanup,
+            };
         }
 
         pub mod tier_delete_journal {

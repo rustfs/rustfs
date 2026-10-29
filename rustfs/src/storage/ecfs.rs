@@ -23,7 +23,7 @@ use super::{
 };
 use super::{persisted_from_s3s, persisted_to_s3s, tagging_from_s3s, tagging_to_s3s};
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiErrorDiagnostic};
 use crate::storage::access::{apply_bucket_generation_guard, bucket_config_mutation_incarnation, has_bypass_governance_header};
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
@@ -64,6 +64,32 @@ const LOG_COMPONENT_STORAGE: &str = "storage";
 const LOG_SUBSYSTEM_OBJECT: &str = "object";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
 const LOG_SUBSYSTEM_TAGGING: &str = "tagging";
+const EVENT_OBJECT_INTERNAL_ERROR: &str = "object_internal_error";
+
+fn log_object_internal_error(operation: &'static str, request_id: Option<&str>, error: &S3Error) {
+    if error.code() != &S3ErrorCode::InternalError {
+        return;
+    }
+    // Generated S3 adapters serialize handler errors without retaining their
+    // typed sources in logs. Keep only bounded classifications at this boundary.
+    let diagnostic = ApiErrorDiagnostic::from_error(error);
+    error!(
+        event = EVENT_OBJECT_INTERNAL_ERROR,
+        component = LOG_COMPONENT_STORAGE,
+        subsystem = LOG_SUBSYSTEM_OBJECT,
+        result = "error",
+        operation,
+        request_id = request_id.unwrap_or("unavailable"),
+        storage_error_code = ?diagnostic.storage_code,
+        io_error_kind = ?diagnostic.io_kind,
+        io_os_error = diagnostic.io_os_error,
+        rpc_error_code = ?diagnostic.rpc_code,
+        pool_metadata_reason = diagnostic.pool_metadata.map(|context| context.reason),
+        pool_metadata_phase = diagnostic.pool_metadata.map(|context| context.phase),
+        source_chain_truncated = diagnostic.truncated,
+        "Object request returned an internal error"
+    );
+}
 
 use crate::app::storage_api::object_usecase::bucket::replication::{
     OperatorRuleContract, ReplicateDecision, get_read_proxy_targets, must_replicate_metadata, schedule_metadata_replication,
@@ -657,8 +683,16 @@ impl S3 for FS {
     #[instrument(level = "debug", skip(self, req))]
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         crate::hp_guard!("S3::delete_object");
+        let request_id = req
+            .extensions
+            .get::<super::request_context::RequestContext>()
+            .map(|ctx| ctx.request_id.clone());
         let usecase = s3_api::object_usecase_for(self);
-        Box::pin(usecase.execute_delete_object(req)).await
+        let result = Box::pin(usecase.execute_delete_object(req)).await;
+        if let Err(error) = &result {
+            log_object_internal_error("DeleteObject", request_id.as_deref(), error);
+        }
+        result
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1030,8 +1064,16 @@ impl S3 for FS {
     )]
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         crate::hp_guard!("S3::get_object");
+        let request_id = req
+            .extensions
+            .get::<super::request_context::RequestContext>()
+            .map(|ctx| ctx.request_id.clone());
         let usecase = s3_api::object_usecase_for(self);
-        usecase.execute_get_object(req).await
+        let result = usecase.execute_get_object(req).await;
+        if let Err(error) = &result {
+            log_object_internal_error("GetObject", request_id.as_deref(), error);
+        }
+        result
     }
 
     async fn get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {
@@ -2186,6 +2228,73 @@ mod tests {
     use s3s::dto::{DeleteBucketReplicationInput, PutBucketReplicationInput, ReplicationConfiguration};
     use s3s::{S3, S3Error, S3ErrorCode, S3Request};
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn object_internal_error_logs_only_correlated_bounded_classifications() {
+        #[derive(Clone, Default)]
+        struct Writer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Writer {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let writer = Writer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(writer.clone())
+            .finish();
+        let mut status = tonic::Status::internal("secret source message");
+        status
+            .metadata_mut()
+            .insert("authorization", "secret-token".parse().expect("metadata"));
+        let error: S3Error = crate::error::ApiError::from(crate::storage::StorageError::from(status)).into();
+        let original_code = error.code().clone();
+        let original_status = error.status_code();
+        let original_message = error.message().map(str::to_owned);
+        tracing::subscriber::with_default(subscriber, || {
+            super::log_object_internal_error("GetObject", Some("server-owned-request"), &error);
+            let mut opaque = S3Error::with_message(S3ErrorCode::InternalError, "secret outer message");
+            opaque.set_source(Box::new(std::io::Error::other("secret inner message")));
+            super::log_object_internal_error("DeleteObject", None, &opaque);
+            let unavailable: S3Error = crate::error::ApiError::from(crate::storage::StorageError::from(
+                tonic::Status::unavailable("secret transport message"),
+            ))
+            .into();
+            assert_eq!(unavailable.code(), &S3ErrorCode::ServiceUnavailable);
+            assert_eq!(unavailable.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+            super::log_object_internal_error("GetObject", None, &unavailable);
+        });
+        let output = String::from_utf8(writer.0.lock().expect("log buffer").clone()).expect("UTF8 log");
+        assert!(!output.contains("secret"));
+        assert!(!output.contains("authorization"));
+        let rows = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON log"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row["fields"]["event"], "object_internal_error");
+            assert_eq!(row["fields"]["source_chain_truncated"], false);
+        }
+        assert_eq!(rows[0]["fields"]["request_id"], "server-owned-request");
+        assert_eq!(rows[0]["fields"]["rpc_error_code"], "Some(Internal)");
+        assert_eq!(rows[1]["fields"]["request_id"], "unavailable");
+        assert_eq!(rows[1]["fields"]["io_error_kind"], "Some(Other)");
+        assert_eq!(error.code(), &original_code);
+        assert_eq!(error.status_code(), original_status);
+        assert_eq!(error.message(), original_message.as_deref());
+    }
 
     #[test]
     fn website_config_rejects_missing_index_and_invalid_redirect_rules() {
