@@ -15,11 +15,12 @@
 
 use crate::admin::runtime_sources::object_store_from_extensions;
 use crate::admin::storage_api::runtime_sources::TierConfigMgr;
+use crate::admin::storage_api::s3;
 use crate::admin::storage_api::tier::{
     AdminError, ClusterTierDailyStats, DailyAllTierStats, ECStore, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE,
     ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CONFIG, ERR_TIER_INVALID_CREDENTIALS,
     ERR_TIER_MISSING_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_NOT_FOUND, ERR_TIER_RESERVED_NAME, TierConfig,
-    TierConfigUpdateError, TierCreds, TierType,
+    TierConfigUpdateError, TierCreds, TierType, retry_tier_free_version_cleanup,
 };
 use crate::{
     admin::runtime_sources::{current_daily_tier_stats, current_notification_system, current_tier_config_handle},
@@ -277,6 +278,18 @@ pub fn register_tier_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tier}").as_str(),
         AdminOperation(&VerifyTier {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tier}/deletion-check").as_str(),
+        AdminOperation(&CheckTierDeletion {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tier}/cleanup-retry").as_str(),
+        AdminOperation(&RetryTierCleanup {}),
     )?;
 
     r.insert(
@@ -654,6 +667,53 @@ impl Operation for RemoveTier {
         header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
+}
+
+pub struct CheckTierDeletion {}
+
+#[async_trait::async_trait]
+impl Operation for CheckTierDeletion {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        if req.credentials.is_none() {
+            return Err(s3::error(S3ErrorCode::InvalidRequest, "authentication required"));
+        }
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
+        let tier = resolve_tier_name(&req.uri, &params)?;
+        let store = object_store_from_extensions(&req.extensions)
+            .ok_or_else(|| s3::error(S3ErrorCode::InternalError, "object store is not initialized"))?;
+        let report = TierConfigMgr::deletion_check(&current_tier_config_handle(), store, &tier)
+            .await
+            .map_err(|error| tier_admin_custom_error_response(&error))?;
+        tier_diagnostic_response(StatusCode::OK, &report)
+    }
+}
+
+pub struct RetryTierCleanup {}
+
+#[async_trait::async_trait]
+impl Operation for RetryTierCleanup {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        if req.credentials.is_none() {
+            return Err(s3::error(S3ErrorCode::InvalidRequest, "authentication required"));
+        }
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
+        let tier = resolve_tier_name(&req.uri, &params)?;
+        let store = object_store_from_extensions(&req.extensions)
+            .ok_or_else(|| s3::error(S3ErrorCode::InternalError, "object store is not initialized"))?;
+        let report = retry_tier_free_version_cleanup(store, &tier)
+            .await
+            .map_err(|error| tier_admin_custom_error_response(&error))?;
+        tier_diagnostic_response(StatusCode::ACCEPTED, &report)
+    }
+}
+
+fn tier_diagnostic_response<T: serde::Serialize>(status: StatusCode, report: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let data =
+        serde_json::to_vec(report).map_err(|_| s3::error(S3ErrorCode::InternalError, "failed to encode tier diagnostic"))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
+    headers.insert(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
+    Ok(S3Response::with_headers((status, Body::from(data)), headers))
 }
 
 pub struct VerifyTier {}
@@ -1369,6 +1429,44 @@ mod tests {
         assert_eq!(save.message(), Some("tier save failed"));
     }
 
+    #[tokio::test]
+    async fn tier_deletion_diagnostics_require_credentials_before_storage_access() {
+        let mut router = Router::new();
+        router.insert("/{tier}", ()).expect("test route should insert");
+        for operation in [
+            &CheckTierDeletion {} as &dyn Operation,
+            &RetryTierCleanup {} as &dyn Operation,
+        ] {
+            let request = S3Request {
+                input: Body::empty(),
+                method: Method::POST,
+                uri: Uri::from_static("/rustfs/admin/v3/tier/WARM/cleanup-retry"),
+                headers: HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            let error = operation
+                .call(request, router.at("/WARM").expect("test params").params)
+                .await
+                .expect_err("anonymous requests must not reach storage");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert_eq!(error.message(), Some("authentication required"));
+        }
+    }
+
+    #[test]
+    fn tier_deletion_routes_register_with_existing_tier_routes() {
+        let mut router = S3Router::default();
+        register_tier_route(&mut router).expect("diagnostics must coexist with legacy verify, edit and remove routes");
+        assert!(router.contains_route(Method::GET, &format!("{ADMIN_PREFIX}/v3/tier/WARM/deletion-check")));
+        assert!(router.contains_route(Method::POST, &format!("{ADMIN_PREFIX}/v3/tier/WARM/cleanup-retry")));
+        assert!(router.contains_route(Method::GET, &format!("{ADMIN_PREFIX}/v3/tier/WARM")));
+        assert!(router.contains_route(Method::DELETE, &format!("{ADMIN_PREFIX}/v3/tier/WARM")));
+    }
+
     #[test]
     fn tier_backend_errors_use_minio_wire_contract() {
         let in_use = tier_backend_error_response(&ERR_TIER_BACKEND_IN_USE)
@@ -1819,6 +1917,8 @@ mod tests {
             ("ListTiers", "ListTierAction"),
             ("RemoveTier", "SetTierAction"),
             ("VerifyTier", "ListTierAction"),
+            ("CheckTierDeletion", "ListTierAction"),
+            ("RetryTierCleanup", "SetTierAction"),
             ("GetTierInfo", "ListTierAction"),
             ("ClearTier", "SetTierAction"),
         ] {
