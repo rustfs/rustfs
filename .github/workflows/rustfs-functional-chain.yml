@@ -20,13 +20,91 @@ on:
   workflow_dispatch:
     inputs:
       build_run_id:
-        description: Successful nightly build run on main
+        description: Successful nightly or validation package run; empty for package-only build
         type: string
-        required: true
+        required: false
+        default: ''
       build_run_attempt:
         description: Exact successful build attempt
         type: string
-        required: true
+        required: false
+        default: ''
+      validation_package_sha:
+        description: Exact source SHA for an isolated package-only build
+        type: string
+        required: false
+        default: ''
+      validation_case:
+        description: Canonical case ID, environment.inspect for read-only resources, or empty for functional chain
+        type: string
+        required: false
+        default: ''
+      i05_diagnostic_branch:
+        description: I05 source-plan runs both H1/H2 controllers with exact native evidence; subsets remain diagnostic
+        type: choice
+        options: [source-plan, timeout, queued-successor]
+        required: false
+        default: source-plan
+      auto_testing_sha:
+        description: Exact auto-testing commit for a validation case
+        type: string
+        required: false
+        default: ''
+      validation_retain_evidence_run_id:
+        description: Upload existing persistent evidence from one interrupted validation run without fleet access
+        type: string
+        required: false
+        default: ''
+      validation_retain_evidence_run_attempt:
+        description: Exact interrupted run attempt to retain
+        type: string
+        required: false
+        default: '1'
+      validation_runner_inspect_only:
+        description: Inspect GitHub runner registration and queued jobs on a hosted runner without fleet access
+        type: boolean
+        required: false
+        default: false
+      validation_tools_only:
+        description: Build candidate-bound validation tools without running a fleet case
+        type: boolean
+        required: false
+        default: false
+      validation_native_tools:
+        description: Include exact-source native regressions in a tools-only build
+        type: boolean
+        required: false
+        default: false
+      validation_shared_tools:
+        description: Include the controlled C10 shared-reference encoder in a tools-only build
+        type: boolean
+        required: false
+        default: false
+      validation_manager_tools:
+        description: Include exact checkpoint/MRF/incarnation regressions in a tools-only build
+        type: boolean
+        required: false
+        default: false
+      validation_cleanup_run_id:
+        description: Failed validation run whose supported retained environment needs evidence-based finalization
+        type: string
+        required: false
+        default: ''
+      validation_cleanup_retained_evidence:
+        description: Recover from verified persistent runner-local evidence when the failed run uploaded no artifact
+        type: boolean
+        required: false
+        default: false
+      validation_tools_run_id:
+        description: Successful tool build run; required by Heal physical metadata checks
+        type: string
+        required: false
+        default: ''
+      validation_tools_run_attempt:
+        description: Exact tool build attempt
+        type: string
+        required: false
+        default: '1'
   workflow_run:
     workflows: ["Nightly GNU Build"]
     types: [completed]
@@ -36,12 +114,103 @@ permissions:
   actions: read
 
 concurrency:
-  group: rustfs-functional-chain-runs
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_runner_inspect_only && 'rustfs-functional-validation-runner-inspection' || github.event_name == 'workflow_dispatch' && inputs.validation_package_sha != '' && format('rustfs-functional-validation-package-{0}', inputs.validation_package_sha) || github.event_name == 'workflow_dispatch' && inputs.validation_tools_only && 'rustfs-functional-validation-tools' || 'rustfs-functional-chain-runs' }}
   cancel-in-progress: false
 
 jobs:
+  validation-runner-inspection:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_runner_inspect_only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - name: Inspect shared runner registration and queue without fleet access
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          RUNNER_INSPECTION_INPUTS: ${{ toJSON(inputs) }}
+        run: >-
+          python3 -B scripts/inspect_validation_runner.py
+          --output "${RUNNER_TEMP}/validation-runner-inspection/report.json"
+      - name: Upload read-only runner inspection including incomplete reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: validation-runner-inspection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/validation-runner-inspection/report.json
+          if-no-files-found: error
+  validation-evidence-retention:
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id != '' }}
+    # The original interrupted evidence exists only on this long-lived runner.
+    runs-on: smoke-testing
+    timeout-minutes: 15
+    concurrency:
+      group: rustfs-shared-functional-tests-v2
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - name: Verify existing interrupted evidence without changing it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_RETAIN_INPUTS: ${{ toJSON(inputs) }}
+        run: >-
+          python3 -B scripts/retain_validation_evidence.py
+          --report "${RUNNER_TEMP}/validation-evidence-retention/report.json"
+      - name: Upload admitted original evidence under collection provenance
+        if: ${{ env.VALIDATION_RETAIN_ROOT != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustfs-validation-retained-${{ env.VALIDATION_RETAIN_SOURCE_RUN }}-${{ env.VALIDATION_RETAIN_SOURCE_ATTEMPT }}-by-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.VALIDATION_RETAIN_ROOT }}
+          if-no-files-found: error
+          include-hidden-files: true
+      - name: Upload retention receipt including incomplete reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: validation-evidence-retention-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/validation-evidence-retention/report.json
+          if-no-files-found: error
+  validation-package-request:
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id == '' && inputs.validation_package_sha != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate exclusive package-only request
+        env:
+          PACKAGE_INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          value = json.loads(os.environ["PACKAGE_INPUTS"])
+          if re.fullmatch(r"[0-9a-f]{40}", value["validation_package_sha"]) is None:
+              raise ValueError("package build requires an exact source SHA")
+          exclusive = ("validation_retain_evidence_run_id", "validation_runner_inspect_only", "build_run_id", "build_run_attempt", "validation_case", "auto_testing_sha",
+                       "validation_tools_only", "validation_native_tools", "validation_shared_tools",
+                       "validation_manager_tools", "validation_cleanup_run_id", "validation_cleanup_retained_evidence", "validation_tools_run_id")
+          if any(value.get(name) for name in exclusive):
+              raise ValueError("package-only build cannot select existing candidate, tools, fleet or recovery execution")
+          PY
+
+  validation-package:
+    needs: validation-package-request
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id == '' && inputs.validation_package_sha != '' }}
+    uses: ./.github/workflows/rustfs-validation-package.yml
+    with:
+      source_sha: ${{ inputs.validation_package_sha }}
+    secrets:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+
   prepare:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'schedule' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id == '' && inputs.validation_package_sha == '' && inputs.validation_case == '' && !inputs.validation_tools_only && !inputs.validation_native_tools && !inputs.validation_shared_tools && !inputs.validation_manager_tools && !inputs.validation_cleanup_retained_evidence && inputs.validation_cleanup_run_id == '') || github.event.workflow_run.event == 'schedule' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -88,6 +257,411 @@ jobs:
           else
             echo "performance_ready=offline" >> "$GITHUB_OUTPUT"
           fi
+
+  validation:
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id == '' && inputs.validation_package_sha == '' && (inputs.validation_case != '' || inputs.validation_tools_only || inputs.validation_native_tools || inputs.validation_shared_tools || inputs.validation_manager_tools || inputs.validation_cleanup_run_id != '' || inputs.validation_cleanup_retained_evidence) }}
+    runs-on: ${{ inputs.validation_tools_only && 'ubuntu-latest' || 'smoke-testing' }}
+    timeout-minutes: 90
+    outputs:
+      source_sha: ${{ steps.candidate.outputs.source_sha }}
+    concurrency:
+      group: ${{ inputs.validation_tools_only && 'rustfs-validation-tools-resolver' || 'rustfs-shared-functional-tests-v2' }}
+      cancel-in-progress: false
+    env:
+      RUSTFS_ACCESS_KEY: ${{ !inputs.validation_tools_only && secrets.RUSTFS_ACCESS_KEY || '' }}
+      RUSTFS_SECRET_KEY: ${{ !inputs.validation_tools_only && secrets.RUSTFS_SECRET_KEY || '' }}
+      RUSTFS_API_ENDPOINT: ${{ !inputs.validation_tools_only && (secrets.RUSTFS_API_ENDPOINT || vars.RUSTFS_API_ENDPOINT || vars.RUSTFS_RC_ENDPOINT) || '' }}
+      RUSTFS_NODES: ${{ !inputs.validation_tools_only && (secrets.RUSTFS_NODES || vars.RUSTFS_NODES) || '' }}
+      RUSTFS_SSH_USER: ${{ !inputs.validation_tools_only && (secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER) || '' }}
+    steps:
+      - name: Checkout candidate resolver
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Initialize validation evidence
+        env:
+          VALIDATION_TOOLS_ONLY: ${{ inputs.validation_tools_only }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B scripts/initialize_validation_evidence.py
+
+      - name: Resolve immutable candidate
+        id: candidate
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          BUILD_RUN_ATTEMPT: ${{ inputs.build_run_attempt }}
+          AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+          CLEANUP_RUN_ID: ${{ inputs.validation_cleanup_run_id }}
+          CLEANUP_RETAINED_EVIDENCE: ${{ inputs.validation_cleanup_retained_evidence }}
+          SELECTED_CASE: ${{ inputs.validation_case }}
+          TOOLS_ONLY: ${{ inputs.validation_tools_only }}
+          NATIVE_TOOLS: ${{ inputs.validation_native_tools }}
+          SHARED_TOOLS: ${{ inputs.validation_shared_tools }}
+          MANAGER_TOOLS: ${{ inputs.validation_manager_tools }}
+          I05_DIAGNOSTIC_BRANCH: ${{ inputs.i05_diagnostic_branch }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          from scripts.resolve_functional_candidate import resolve
+
+          revision = os.environ["AUTO_TESTING_SHA"]
+          cleanup = os.environ["CLEANUP_RUN_ID"]
+          if os.environ["CLEANUP_RETAINED_EVIDENCE"] == "true" and not cleanup:
+              raise ValueError("persistent recovery input requires one exact cleanup run")
+          if os.environ["TOOLS_ONLY"] == "true" and (cleanup or os.environ["SELECTED_CASE"]):
+              raise ValueError("tools-only execution cannot select a fleet case or cleanup")
+          if os.environ["NATIVE_TOOLS"] == "true" and (os.environ["TOOLS_ONLY"] != "true" or cleanup or os.environ["SELECTED_CASE"]):
+              raise ValueError("native regressions require tools-only execution, without a fleet case or cleanup")
+          if os.environ["SHARED_TOOLS"] == "true" and (os.environ["TOOLS_ONLY"] != "true" or cleanup or os.environ["SELECTED_CASE"]):
+              raise ValueError("shared fixture builds require tools-only execution, without a fleet case or cleanup")
+          if os.environ["MANAGER_TOOLS"] == "true" and (os.environ["TOOLS_ONLY"] != "true" or cleanup or os.environ["SELECTED_CASE"]):
+              raise ValueError("manager regressions require tools-only execution, without a fleet case or cleanup")
+          if cleanup and (not cleanup.isdigit() or int(cleanup) <= 0 or os.environ["SELECTED_CASE"] or os.environ["TOOLS_ONLY"] == "true"):
+              raise ValueError("cleanup requires one exact failed run and is exclusive with case/tool execution")
+          diagnostic_branch = os.environ["I05_DIAGNOSTIC_BRANCH"] or "source-plan"
+          if diagnostic_branch not in {"source-plan", "timeout", "queued-successor"}:
+              raise ValueError("I05 diagnostic branch is not registered")
+          if diagnostic_branch == "queued-successor" and os.environ["SELECTED_CASE"] != "heal.lock-timeout-and-caller-abort":
+              raise ValueError("queued-successor is available only for the I05 diagnostic case")
+          if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+              raise ValueError("validation requires an exact auto-testing commit SHA")
+          candidate = resolve(int(os.environ["BUILD_RUN_ID"]), int(os.environ["BUILD_RUN_ATTEMPT"]), allow_validation=True)
+          manifest = candidate["manifest"]
+          root = Path(os.environ["VALIDATION_ROOT"])
+          (root / "candidate-source.json").write_text(json.dumps(candidate, sort_keys=True) + "\n")
+          (root / "candidate.json").write_text(json.dumps({
+              "package_url": manifest["package_url"],
+              "package_sha256": manifest["package_sha256"],
+              "source_sha": manifest["source_sha"],
+          }, sort_keys=True) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("source_sha=" + manifest["source_sha"] + "\n")
+          PY
+
+      - name: Checkout exact auto-testing revision
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: ${{ inputs.auto_testing_sha }}
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          path: auto-testing
+          persist-credentials: false
+
+      - name: Prepare validation Python runtime
+        if: ${{ !inputs.validation_tools_only && (startsWith(inputs.validation_case, 'ilm.') || startsWith(inputs.validation_case, 'pool.') || startsWith(inputs.validation_case, 'bucket-replication.') || startsWith(inputs.validation_case, 'site-replication.') || startsWith(inputs.validation_case, 'heal.')) }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install validation Python client
+        if: ${{ !inputs.validation_tools_only && (startsWith(inputs.validation_case, 'ilm.') || startsWith(inputs.validation_case, 'pool.') || startsWith(inputs.validation_case, 'bucket-replication.') || startsWith(inputs.validation_case, 'site-replication.') || startsWith(inputs.validation_case, 'heal.')) }}
+        run: |
+          set -euo pipefail
+          validation_python="${RUNNER_TEMP}/rustfs-validation-python-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "${validation_python}"
+          python3 -m venv "${validation_python}"
+          "${validation_python}/bin/python" -m pip install \
+            -r auto-testing/scripts/validation_ilm/requirements.txt
+          printf '%s\n' "${validation_python}/bin" >> "${GITHUB_PATH}"
+
+      - name: Validate Heal tool build identity
+        if: ${{ !inputs.validation_tools_only && startsWith(inputs.validation_case, 'heal.') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOOL_RUN_ID: ${{ inputs.validation_tools_run_id }}
+          TOOL_RUN_ATTEMPT: ${{ inputs.validation_tools_run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "${TOOL_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${TOOL_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${TOOL_RUN_ID}/attempts/${TOOL_RUN_ATTEMPT}" \
+            > "${VALIDATION_ROOT}/tool-run.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          value = json.loads((Path(os.environ["VALIDATION_ROOT"]) / "tool-run.json").read_text())
+          if (value.get("conclusion") != "success" or value.get("status") != "completed"
+                  or value.get("run_attempt") != int(os.environ["TOOL_RUN_ATTEMPT"])
+                  or value.get("path") not in {".github/workflows/rustfs-functional-chain.yml", ".github/workflows/rustfs-validation-tools.yml"}):
+              raise ValueError("Heal tool run is not an exact successful validation build attempt")
+          PY
+
+      - name: Download pinned Heal metadata inspector
+        if: ${{ !inputs.validation_tools_only && startsWith(inputs.validation_case, 'heal.') }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.validation_tools_run_id }}
+          name: rustfs-validation-tools-${{ inputs.validation_tools_run_id }}-${{ inputs.validation_tools_run_attempt }}
+          path: ${{ runner.temp }}/rustfs-validation-tools-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify Heal metadata inspector
+        if: ${{ !inputs.validation_tools_only && startsWith(inputs.validation_case, 'heal.') }}
+        run: |
+          set -euo pipefail
+          TOOL_DIRECTORY="${RUNNER_TEMP}/rustfs-validation-tools-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python3 -B auto-testing/scripts/validation_heal/inspector.py \
+            --directory "${TOOL_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
+            > "${VALIDATION_ROOT}/tool-manifest.json"
+          printf 'VALIDATION_HEAL_TOOL_DIRECTORY=%s\n' "${TOOL_DIRECTORY}" >> "${GITHUB_ENV}"
+
+      - name: Select exact-source race native evidence
+        id: race_native
+        if: ${{ inputs.validation_case == 'heal.race-unversioned-overwrite' || inputs.validation_case == 'heal.race-versioned-put' || inputs.validation_case == 'heal.race-version-delete' || inputs.validation_case == 'heal.race-markers-and-batch-delete' || inputs.validation_case == 'heal.race-multipart-complete-abort' || inputs.validation_case == 'heal.admin-nolock-safety' || inputs.validation_case == 'heal.race-copy-and-metadata-update' }}
+        env:
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.source_sha }}
+          VALIDATION_CASE_ID: ${{ inputs.validation_case }}
+        run: |
+          set -euo pipefail
+          required=false
+          if [ -f auto-testing/scripts/validation_heal/race_native.py ]; then
+            status=0
+            python3 -B auto-testing/scripts/validation_heal/race_native.py supports \
+              --commit "${CANDIDATE_SHA}" --case-id "${VALIDATION_CASE_ID}" || status=$?
+            if [ "${status}" -eq 0 ]; then
+              required=true
+            elif [ "${status}" -ne 2 ]; then
+              exit "${status}"
+            fi
+          fi
+          reviewed=false
+          case "${CANDIDATE_SHA}:${VALIDATION_CASE_ID}" in
+            6afdec9fe1b0b88007f2e5b445c19bf73d51d3ca:heal.race-unversioned-overwrite | \
+            bd0671ba781d8ebf509f4f03533228dfb44496f1:heal.race-unversioned-overwrite | \
+            bd0671ba781d8ebf509f4f03533228dfb44496f1:heal.race-versioned-put | \
+            bd0671ba781d8ebf509f4f03533228dfb44496f1:heal.race-version-delete | \
+            8380466f3a27c3c3ef4115084178a0ab99a78f32:heal.race-unversioned-overwrite | \
+            8380466f3a27c3c3ef4115084178a0ab99a78f32:heal.race-versioned-put | \
+            8380466f3a27c3c3ef4115084178a0ab99a78f32:heal.race-version-delete | \
+            8380466f3a27c3c3ef4115084178a0ab99a78f32:heal.race-markers-and-batch-delete | \
+            757b751482bb970bc321e92059690a7698554358:heal.admin-nolock-safety | \
+            757b751482bb970bc321e92059690a7698554358:heal.race-multipart-complete-abort | \
+            757b751482bb970bc321e92059690a7698554358:heal.race-copy-and-metadata-update) reviewed=true ;;
+          esac
+          if [ "${reviewed}" = true ] && [ "${required}" != true ]; then
+            printf 'Race candidate requires its reviewed native collector before fleet execution\n' >&2
+            exit 1
+          fi
+          printf 'required=%s\n' "${required}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download pinned native storage evidence
+        if: ${{ inputs.validation_case == 'heal.conflicting-subquorum-authority' || inputs.validation_case == 'heal.bucket-incarnation-recreation' || steps.race_native.outputs.required == 'true' || (inputs.validation_case == 'heal.lock-timeout-and-caller-abort' && inputs.i05_diagnostic_branch != 'timeout') || (inputs.validation_case == 'heal.checkpoint-and-mrf-corruption' && steps.candidate.outputs.source_sha == '1aa9be87d18cf941e5020f19e8622c26ba4b10ac') }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.validation_tools_run_id }}
+          name: rustfs-validation-native-${{ inputs.validation_tools_run_id }}-${{ inputs.validation_tools_run_attempt }}
+          path: ${{ runner.temp }}/rustfs-validation-native-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify C07 native source and exact test evidence
+        if: ${{ inputs.validation_case == 'heal.conflicting-subquorum-authority' }}
+        run: |
+          set -euo pipefail
+          NATIVE_DIRECTORY="${RUNNER_TEMP}/rustfs-validation-native-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cp "${VALIDATION_ROOT}/tool-run.json" "${NATIVE_DIRECTORY}/tool-run.json"
+          python3 -B auto-testing/scripts/validation_heal/authority.py \
+            --directory "${NATIVE_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
+            > "${VALIDATION_ROOT}/native-authority-manifest.json"
+          printf 'VALIDATION_HEAL_NATIVE_DIRECTORY=%s\n' "${NATIVE_DIRECTORY}" >> "${GITHUB_ENV}"
+
+      - name: Verify C11 physical storage and exact final-rename barrier
+        if: ${{ inputs.validation_case == 'heal.bucket-incarnation-recreation' }}
+        run: |
+          set -euo pipefail
+          NATIVE_DIRECTORY="${RUNNER_TEMP}/rustfs-validation-native-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cp "${VALIDATION_ROOT}/tool-run.json" "${NATIVE_DIRECTORY}/tool-run.json"
+          python3 -B auto-testing/scripts/validation_heal/incarnation_native.py \
+            --directory "${NATIVE_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
+            --testing-commit "${{ inputs.auto_testing_sha }}" \
+            > "${VALIDATION_ROOT}/native-incarnation-manifest.json"
+          printf 'VALIDATION_HEAL_NATIVE_DIRECTORY=%s\n' "${NATIVE_DIRECTORY}" >> "${GITHUB_ENV}"
+
+      - name: Verify exact-source race native and runtime evidence
+        if: ${{ steps.race_native.outputs.required == 'true' }}
+        env:
+          AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+          VALIDATION_CASE_ID: ${{ inputs.validation_case }}
+        run: |
+          set -euo pipefail
+          NATIVE_DIRECTORY="${RUNNER_TEMP}/rustfs-validation-native-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cp "${VALIDATION_ROOT}/tool-run.json" "${NATIVE_DIRECTORY}/tool-run.json"
+          python3 -B auto-testing/scripts/validation_heal/race_native_evidence.py \
+            --directory "${NATIVE_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
+            --testing-commit "${AUTO_TESTING_SHA}" --case-id "${VALIDATION_CASE_ID}" \
+            > "${VALIDATION_ROOT}/native-race-manifest.json"
+          runtime_driver=race.py
+          if [ "${VALIDATION_CASE_ID}" = 'heal.admin-nolock-safety' ]; then
+            runtime_driver=nolock.py
+          fi
+          VALIDATION_HEAL_NATIVE_DIRECTORY="${NATIVE_DIRECTORY}" \
+            python3 -B "auto-testing/scripts/validation_heal/${runtime_driver}" preflight \
+              --candidate "${VALIDATION_ROOT}/candidate.json" --testing-commit "${AUTO_TESTING_SHA}" \
+              --case-id "${VALIDATION_CASE_ID}" \
+              > "${VALIDATION_ROOT}/native-race-runtime-preflight.json"
+          printf 'VALIDATION_HEAL_NATIVE_DIRECTORY=%s\n' "${NATIVE_DIRECTORY}" >> "${GITHUB_ENV}"
+
+      - name: Verify I05 source-plan or queued-successor native prerequisites
+        if: ${{ inputs.validation_case == 'heal.lock-timeout-and-caller-abort' && inputs.i05_diagnostic_branch != 'timeout' }}
+        env:
+          AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+          I05_DIAGNOSTIC_BRANCH: ${{ inputs.i05_diagnostic_branch }}
+        run: |
+          set -euo pipefail
+          NATIVE_DIRECTORY="${RUNNER_TEMP}/rustfs-validation-native-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cp "${VALIDATION_ROOT}/tool-run.json" "${NATIVE_DIRECTORY}/tool-run.json"
+          if [ "${I05_DIAGNOSTIC_BRANCH}" = 'queued-successor' ]; then
+            python3 -B auto-testing/scripts/validation_heal/race_native_evidence.py \
+              --directory "${NATIVE_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
+              --testing-commit "${AUTO_TESTING_SHA}" --case-id heal.lock-timeout-and-caller-abort \
+              > "${VALIDATION_ROOT}/native-i05-prerequisite.json"
+          else
+            python3 -B auto-testing/scripts/validation_heal/lock_source.py \
+              --directory "${NATIVE_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
+              --testing-commit "${AUTO_TESTING_SHA}" \
+              > "${VALIDATION_ROOT}/native-i05-source-prerequisites.json"
+          fi
+          printf 'VALIDATION_HEAL_NATIVE_DIRECTORY=%s\n' "${NATIVE_DIRECTORY}" >> "${GITHUB_ENV}"
+
+      - name: Bind F07 exact-candidate directory fsync evidence
+        if: ${{ inputs.validation_case == 'heal.checkpoint-and-mrf-corruption' && steps.candidate.outputs.source_sha == '1aa9be87d18cf941e5020f19e8622c26ba4b10ac' }}
+        run: |
+          set -euo pipefail
+          NATIVE_DIRECTORY="${RUNNER_TEMP}/rustfs-validation-native-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cp "${VALIDATION_ROOT}/tool-run.json" "${NATIVE_DIRECTORY}/tool-run.json"
+          printf 'VALIDATION_HEAL_NATIVE_DIRECTORY=%s\n' "${NATIVE_DIRECTORY}" >> "${GITHUB_ENV}"
+
+      - name: Download pinned manager persistence and incarnation evidence
+        if: ${{ inputs.validation_case == 'heal.checkpoint-and-mrf-corruption' || inputs.validation_case == 'heal.bucket-incarnation-recreation' || inputs.validation_case == 'heal.outcome-counters-and-error-truth' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.validation_tools_run_id }}
+          name: rustfs-validation-manager-native-${{ inputs.validation_tools_run_id }}-${{ inputs.validation_tools_run_attempt }}
+          path: ${{ runner.temp }}/rustfs-validation-manager-native-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify exact manager native prerequisites before fleet mutation
+        if: ${{ inputs.validation_case == 'heal.checkpoint-and-mrf-corruption' || inputs.validation_case == 'heal.bucket-incarnation-recreation' || inputs.validation_case == 'heal.outcome-counters-and-error-truth' }}
+        env:
+          VALIDATION_CASE: ${{ inputs.validation_case }}
+        run: |
+          set -euo pipefail
+          MANAGER_DIRECTORY="${RUNNER_TEMP}/rustfs-validation-manager-native-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cp "${VALIDATION_ROOT}/tool-run.json" "${MANAGER_DIRECTORY}/tool-run.json"
+          python3 -B auto-testing/scripts/validation_heal/manager_fixture.py \
+            --directory "${MANAGER_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
+            --case-id "${VALIDATION_CASE}" > "${VALIDATION_ROOT}/manager-prerequisite-manifest.json"
+          printf 'VALIDATION_HEAL_MANAGER_DIRECTORY=%s\n' "${MANAGER_DIRECTORY}" >> "${GITHUB_ENV}"
+
+      - name: Download pinned C10 shared-reference encoder
+        if: ${{ inputs.validation_case == 'heal.dangling-and-orphan-safety' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.validation_tools_run_id }}
+          name: rustfs-validation-shared-${{ inputs.validation_tools_run_id }}-${{ inputs.validation_tools_run_attempt }}
+          path: ${{ runner.temp }}/rustfs-validation-shared-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify C10 exact-source codec and original tests
+        if: ${{ inputs.validation_case == 'heal.dangling-and-orphan-safety' }}
+        run: |
+          set -euo pipefail
+          SHARED_DIRECTORY="${RUNNER_TEMP}/rustfs-validation-shared-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cp "${VALIDATION_ROOT}/tool-run.json" "${SHARED_DIRECTORY}/tool-run.json"
+          python3 -B auto-testing/scripts/validation_heal/shared_fixture.py \
+            --directory "${SHARED_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
+            > "${VALIDATION_ROOT}/shared-fixture-manifest.json"
+          printf 'VALIDATION_HEAL_SHARED_DIRECTORY=%s\n' "${SHARED_DIRECTORY}" >> "${GITHUB_ENV}"
+
+      - name: Run selected canonical validation case
+        if: ${{ !inputs.validation_tools_only && inputs.validation_cleanup_run_id == '' && inputs.validation_case != 'environment.inspect' }}
+        env:
+          VALIDATION_CASE: ${{ inputs.validation_case }}
+          AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+          I05_DIAGNOSTIC_BRANCH: ${{ inputs.i05_diagnostic_branch }}
+        run: |
+          set -euo pipefail
+          test "$(git -C auto-testing rev-parse HEAD)" = "${AUTO_TESTING_SHA}"
+          ./auto-testing/scripts/run_validation_case.sh \
+            "${VALIDATION_CASE}" "${VALIDATION_ROOT}/candidate.json" \
+            "${AUTO_TESTING_SHA}" "${VALIDATION_ROOT}/run"
+
+      - name: Inspect current Heal fleet resources without mutation
+        if: ${{ !inputs.validation_tools_only && inputs.validation_case == 'environment.inspect' }}
+        env:
+          AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C auto-testing rev-parse HEAD)" = "${AUTO_TESTING_SHA}"
+          python3 -B auto-testing/scripts/validation_heal/environment.py \
+            --candidate "${VALIDATION_ROOT}/candidate.json" \
+            --testing-commit "${AUTO_TESTING_SHA}" --evidence "${VALIDATION_ROOT}/environment"
+
+      - name: Audit and finalize retained validation environment
+        if: ${{ inputs.validation_cleanup_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAILED_RUN_ID: ${{ inputs.validation_cleanup_run_id }}
+          AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+          CLEANUP_RETAINED_EVIDENCE: ${{ inputs.validation_cleanup_retained_evidence }}
+        run: |
+          set -euo pipefail
+          test "$(git -C auto-testing rev-parse HEAD)" = "${AUTO_TESTING_SHA}"
+          gh run view "${FAILED_RUN_ID}" --repo "${GITHUB_REPOSITORY}" \
+            --json status,conclusion,headBranch,workflowName > "${VALIDATION_ROOT}/failed-run.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          run = json.loads((Path(os.environ["VALIDATION_ROOT"]) / "failed-run.json").read_text())
+          if (run["status"] != "completed" or run["conclusion"] not in {"failure", "cancelled"}
+              or run["workflowName"] != "RustFS Functional Chain" or run["headBranch"] != os.environ["GITHUB_REF_NAME"]):
+              raise ValueError("cleanup source must be a completed failed or cancelled Functional Chain run")
+          PY
+          if [ "${CLEANUP_RETAINED_EVIDENCE}" = true ]; then
+            python3 -B scripts/prepare_retained_validation_recovery.py \
+              --report "${VALIDATION_ROOT}/retained-recovery-input.json"
+          else
+            gh run download "${FAILED_RUN_ID}" --repo "${GITHUB_REPOSITORY}" \
+              --pattern "rustfs-validation-${FAILED_RUN_ID}-*" --dir "${VALIDATION_ROOT}/failed-artifact"
+          fi
+          python3 -B auto-testing/scripts/validation_heal/recover_environment.py \
+            --failed-run-id "${FAILED_RUN_ID}" --artifact "${VALIDATION_ROOT}/failed-artifact" \
+            --candidate "${VALIDATION_ROOT}/candidate.json" --evidence "${VALIDATION_ROOT}/recovery"
+
+      - name: Show validation report
+        if: ${{ always() }}
+        run: |
+          if [ -f "${VALIDATION_ROOT}/run/report.md" ]; then
+            cat "${VALIDATION_ROOT}/run/report.md" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload validation evidence
+        if: ${{ always() && env.VALIDATION_ROOT != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustfs-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.VALIDATION_ROOT }}
+          if-no-files-found: error
+
+  validation-tools:
+    needs: [validation]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_package_sha == '' && inputs.validation_tools_only }}
+    uses: ./.github/workflows/rustfs-validation-tools.yml
+    with:
+      candidate_sha: ${{ needs.validation.outputs.source_sha }}
+      auto_testing_sha: ${{ inputs.auto_testing_sha }}
+      build_native_heal: ${{ inputs.validation_native_tools }}
+      build_shared_heal: ${{ inputs.validation_shared_tools }}
+      build_manager_native: ${{ inputs.validation_manager_tools }}
+    secrets: inherit
 
   upgrade:
     needs: [prepare]
