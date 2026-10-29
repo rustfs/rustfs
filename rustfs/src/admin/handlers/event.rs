@@ -34,18 +34,17 @@ use crate::app::storage_api::bucket::metadata_sys::get_notification_config;
 use crate::server::{
     ADMIN_PREFIX, is_notify_module_enabled, refresh_notify_module_enabled, refresh_persisted_module_switches_from_store,
 };
-use crate::storage::storage_api::persisted_to_s3s;
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::server_config::Config;
 use rustfs_config::{EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_gateway_types::persistence::PersistedNotificationConfiguration;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_targets::catalog::builtin::builtin_notify_target_admin_descriptors;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use tracing::{error, info, warn};
@@ -278,55 +277,49 @@ fn subscription_target_arn(params: &Params<'_, '_>, region: &str) -> S3Result<St
 
 fn collect_target_subscriptions(
     bucket: &str,
-    config: s3s::dto::NotificationConfiguration,
+    config: &PersistedNotificationConfiguration,
     target_arn: &str,
-) -> S3Result<Vec<TargetSubscription>> {
-    let value = serde_json::to_value(config).map_err(|e| {
-        S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize notification config: {e}"))
-    })?;
-    let mut subscriptions = Vec::new();
-    for key in [
-        "queue_configurations",
-        "topic_configurations",
-        "lambda_function_configurations",
-    ] {
-        if let Some(entries) = value.get(key).and_then(Value::as_array) {
-            for entry in entries {
-                let arn = ["queue_arn", "topic_arn", "lambda_function_arn"]
-                    .iter()
-                    .find_map(|field| entry.get(field).and_then(Value::as_str));
-                if arn != Some(target_arn) {
-                    continue;
-                }
-                let filters = entry
-                    .get("filter")
-                    .and_then(|v| v.get("key"))
-                    .and_then(|v| v.get("filter_rules"))
-                    .and_then(Value::as_array);
-                let filter_value = |name: &str| {
-                    filters.and_then(|rules| {
-                        rules.iter().find_map(|rule| {
-                            (rule.get("name").and_then(Value::as_str) == Some(name))
-                                .then(|| rule.get("value").and_then(Value::as_str).map(str::to_string))
-                                .flatten()
-                        })
-                    })
-                };
-                subscriptions.push(TargetSubscription {
-                    bucket: bucket.to_string(),
-                    id: entry.get("id").and_then(Value::as_str).map(str::to_string),
-                    events: entry
-                        .get("events")
-                        .and_then(Value::as_array)
-                        .map(|events| events.iter().filter_map(Value::as_str).map(str::to_string).collect())
-                        .unwrap_or_default(),
-                    prefix: filter_value("Prefix").or_else(|| filter_value("prefix")),
-                    suffix: filter_value("Suffix").or_else(|| filter_value("suffix")),
-                });
+) -> Vec<TargetSubscription> {
+    // Queue, topic, then lambda: the order the subscriptions route has always reported.
+    let queues = config
+        .queue_configurations
+        .iter()
+        .flatten()
+        .map(|c| (c.id.as_deref(), c.queue_arn.as_str(), &c.events, c.filter.as_ref()));
+    let topics = config
+        .topic_configurations
+        .iter()
+        .flatten()
+        .map(|c| (c.id.as_deref(), c.topic_arn.as_str(), &c.events, c.filter.as_ref()));
+    let lambdas = config
+        .lambda_function_configurations
+        .iter()
+        .flatten()
+        .map(|c| (c.id.as_deref(), c.lambda_function_arn.as_str(), &c.events, c.filter.as_ref()));
+
+    queues
+        .chain(topics)
+        .chain(lambdas)
+        .filter(|(_, arn, _, _)| *arn == target_arn)
+        .map(|(id, _, events, filter)| {
+            let rules = filter.and_then(|f| f.key.as_ref()).and_then(|k| k.filter_rules.as_deref());
+            // A matching rule without a value does not end the search, so a later rule can supply it.
+            let filter_value = |name: &str| {
+                rules.and_then(|rules| {
+                    rules
+                        .iter()
+                        .find_map(|rule| (rule.name.as_deref() == Some(name)).then(|| rule.value.clone()).flatten())
+                })
+            };
+            TargetSubscription {
+                bucket: bucket.to_string(),
+                id: id.map(str::to_string),
+                events: events.clone(),
+                prefix: filter_value("Prefix").or_else(|| filter_value("prefix")),
+                suffix: filter_value("Suffix").or_else(|| filter_value("suffix")),
             }
-        }
-    }
-    Ok(subscriptions)
+        })
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -350,7 +343,7 @@ impl Operation for ListTargetSubscriptions {
             else {
                 continue;
             };
-            subscriptions.extend(collect_target_subscriptions(&bucket.name, persisted_to_s3s(&config)?, &target_arn)?);
+            subscriptions.extend(collect_target_subscriptions(&bucket.name, &config, &target_arn));
         }
         let data = serde_json::to_vec(&subscriptions)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize subscriptions: {e}")))?;
@@ -685,6 +678,7 @@ mod tests {
     use rustfs_config::server_config::{KV, KVS};
     use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY};
     use rustfs_targets::arn::TargetID;
+    use serde_json::Value;
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use temp_env::{with_var, with_vars};
@@ -1215,36 +1209,59 @@ mod tests {
 
     #[test]
     fn target_subscriptions_match_all_config_kinds_without_crossing_target_identity() {
-        let config: s3s::dto::NotificationConfiguration = serde_json::from_value(serde_json::json!({
-            "queue_configurations": [
-                {
-                    "id": "uploads",
-                    "queue_arn": "arn:rustfs:sqs:eu-west-1:primary:webhook",
-                    "events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
-                    "filter": { "key": { "filter_rules": [
-                        { "name": "prefix", "value": "photos/" },
-                        { "name": "suffix", "value": ".jpg" }
-                    ] } }
+        use rustfs_gateway_types::persistence::{
+            PersistedFilterRule, PersistedLambdaFunctionConfiguration, PersistedNotificationConfigurationFilter,
+            PersistedQueueConfiguration, PersistedS3KeyFilter, PersistedTopicConfiguration,
+        };
+        let events = |names: &[&str]| names.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        let queue = |id: &str, arn: &str, names: &[&str]| PersistedQueueConfiguration {
+            events: events(names),
+            filter: None,
+            id: Some(id.to_string()),
+            queue_arn: arn.to_string(),
+        };
+        let rule = |name: &str, value: &str| PersistedFilterRule {
+            name: Some(name.to_string()),
+            value: Some(value.to_string()),
+        };
+        let config = PersistedNotificationConfiguration {
+            queue_configurations: Some(vec![
+                PersistedQueueConfiguration {
+                    filter: Some(PersistedNotificationConfigurationFilter {
+                        key: Some(PersistedS3KeyFilter {
+                            filter_rules: Some(vec![rule("prefix", "photos/"), rule("suffix", ".jpg")]),
+                        }),
+                    }),
+                    ..queue(
+                        "uploads",
+                        "arn:rustfs:sqs:eu-west-1:primary:webhook",
+                        &["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
+                    )
                 },
-                { "id": "other-service", "queue_arn": "arn:rustfs:sqs:eu-west-1:primary:kafka", "events": ["s3:ObjectCreated:*"] },
-                { "id": "other-target", "queue_arn": "arn:rustfs:sqs:eu-west-1:secondary:webhook", "events": ["s3:ObjectCreated:*"] },
-                { "id": "other-region", "queue_arn": "arn:rustfs:sqs:us-east-1:primary:webhook", "events": ["s3:ObjectCreated:*"] }
-            ],
-            "topic_configurations": [
-                { "id": "topic", "topic_arn": "arn:rustfs:sqs:eu-west-1:primary:webhook", "events": ["s3:ObjectCreated:Put"] }
-            ],
-            "lambda_function_configurations": [
-                { "lambda_function_arn": "arn:rustfs:sqs:eu-west-1:primary:webhook", "events": ["s3:ObjectRemoved:Delete"] }
-            ]
-        }))
-        .expect("notification DTO should deserialize");
+                queue("other-service", "arn:rustfs:sqs:eu-west-1:primary:kafka", &["s3:ObjectCreated:*"]),
+                queue("other-target", "arn:rustfs:sqs:eu-west-1:secondary:webhook", &["s3:ObjectCreated:*"]),
+                queue("other-region", "arn:rustfs:sqs:us-east-1:primary:webhook", &["s3:ObjectCreated:*"]),
+            ]),
+            topic_configurations: Some(vec![PersistedTopicConfiguration {
+                events: events(&["s3:ObjectCreated:Put"]),
+                filter: None,
+                id: Some("topic".to_string()),
+                topic_arn: "arn:rustfs:sqs:eu-west-1:primary:webhook".to_string(),
+            }]),
+            lambda_function_configurations: Some(vec![PersistedLambdaFunctionConfiguration {
+                events: events(&["s3:ObjectRemoved:Delete"]),
+                filter: None,
+                id: None,
+                lambda_function_arn: "arn:rustfs:sqs:eu-west-1:primary:webhook".to_string(),
+            }]),
+            ..Default::default()
+        };
         let router = subscription_router();
         for target_type in ["webhook", "notify_webhook"] {
             let path = format!("/v3/target/{target_type}/primary/subscriptions");
             let params = router.at(&path).expect("subscription route should match").params;
             let arn = subscription_target_arn(&params, "eu-west-1").expect("webhook ARN should resolve");
-            let subscriptions =
-                collect_target_subscriptions("photos", config.clone(), &arn).expect("subscriptions should collect");
+            let subscriptions = collect_target_subscriptions("photos", &config, &arn);
             assert_eq!(
                 serde_json::to_value(subscriptions).expect("subscriptions should serialize"),
                 serde_json::json!([
@@ -1253,21 +1270,50 @@ mod tests {
                     { "bucket": "photos", "id": null, "events": ["s3:ObjectRemoved:Delete"], "prefix": null, "suffix": null }
                 ])
             );
-            assert!(
-                collect_target_subscriptions("photos", config.clone(), "arn:rustfs:sqs:eu-west-1:unused:webhook")
-                    .expect("unmatched subscriptions should collect")
-                    .is_empty()
-            );
+            assert!(collect_target_subscriptions("photos", &config, "arn:rustfs:sqs:eu-west-1:unused:webhook").is_empty());
         }
         assert!(
             collect_target_subscriptions(
                 "empty",
-                s3s::dto::NotificationConfiguration::default(),
+                &PersistedNotificationConfiguration::default(),
                 "arn:rustfs:sqs::primary:webhook"
             )
-            .expect("empty configuration should collect")
             .is_empty()
         );
+    }
+
+    #[test]
+    fn target_subscription_filters_prefer_capitalized_rules_and_skip_rules_without_values() {
+        use rustfs_gateway_types::persistence::{
+            PersistedFilterRule, PersistedNotificationConfigurationFilter, PersistedQueueConfiguration, PersistedS3KeyFilter,
+        };
+        let rule = |name: &str, value: Option<&str>| PersistedFilterRule {
+            name: Some(name.to_string()),
+            value: value.map(str::to_string),
+        };
+        let arn = "arn:rustfs:sqs:eu-west-1:primary:webhook";
+        let config = PersistedNotificationConfiguration {
+            queue_configurations: Some(vec![PersistedQueueConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_string()],
+                filter: Some(PersistedNotificationConfigurationFilter {
+                    key: Some(PersistedS3KeyFilter {
+                        filter_rules: Some(vec![
+                            rule("prefix", Some("lower/")),
+                            rule("Prefix", None),
+                            rule("Prefix", Some("upper/")),
+                            rule("suffix", None),
+                        ]),
+                    }),
+                }),
+                id: None,
+                queue_arn: arn.to_string(),
+            }]),
+            ..Default::default()
+        };
+        let subscriptions = collect_target_subscriptions("photos", &config, arn);
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].prefix.as_deref(), Some("upper/"));
+        assert_eq!(subscriptions[0].suffix, None);
     }
 
     #[tokio::test]
