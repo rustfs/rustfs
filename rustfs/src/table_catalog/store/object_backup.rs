@@ -316,6 +316,23 @@ where
                 "catalog restore would replace existing catalog objects; set allow-replace".to_string(),
             ));
         }
+        if !allow_replace {
+            for object in &backup.objects {
+                let Some(existing) = self
+                    .backend
+                    .read_object_limited(&object.bucket, &object.object, OBJECT_CATALOG_BACKUP_OBJECT_MAX_SIZE)
+                    .await?
+                else {
+                    continue;
+                };
+                if existing.data.len() as u64 != object.size_bytes || backup_sha256(&existing.data) != object.sha256 {
+                    return Err(TableCatalogStoreError::Conflict(format!(
+                        "catalog restore target object changed: {}/{}",
+                        object.bucket, object.object
+                    )));
+                }
+            }
+        }
         for object in &backup.objects {
             if backup_sha256(&object.data) != object.sha256 || object.data.len() as u64 != object.size_bytes {
                 return Err(TableCatalogStoreError::Invalid(format!(

@@ -4965,7 +4965,7 @@ async fn object_catalog_backup_restores_into_an_isolated_backend() {
         }
     }
 
-    let target_store = ObjectTableCatalogStore::new(target_backend);
+    let target_store = ObjectTableCatalogStore::new(target_backend.clone());
     let restored = target_store
         .restore_object_catalog_backup(bucket, &backup.backup_id, None, false)
         .await
@@ -4991,6 +4991,22 @@ async fn object_catalog_backup_restores_into_an_isolated_backend() {
         .await
         .unwrap();
     assert_eq!(repeated.status, TableCatalogRestoreStatus::Restored);
+
+    let target_entry_path = TableCatalogObjectPaths::default().table_bucket_entry_path(bucket);
+    target_backend
+        .seed_object(RUSTFS_META_BUCKET, &target_entry_path, b"changed-target".to_vec())
+        .await;
+    let error = target_store
+        .restore_object_catalog_backup(bucket, &backup.backup_id, None, false)
+        .await
+        .expect_err("restore must reject a changed target object without allow-replace");
+    assert!(matches!(error, TableCatalogStoreError::Conflict(message) if message.contains("target object changed")));
+    let target_object = target_backend
+        .read_object(RUSTFS_META_BUCKET, &target_entry_path)
+        .await
+        .unwrap()
+        .expect("changed target object should remain present");
+    assert_eq!(target_object.data, b"changed-target");
 }
 
 #[tokio::test]
