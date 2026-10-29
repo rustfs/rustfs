@@ -20,7 +20,7 @@ use datafusion::sql::{
     sqlparser::ast::{
         AccessExpr, Expr, GroupByExpr, Ident, JsonPath, JsonPathElem, ObjectNamePart, OrderBy, OrderByKind, Query, Select,
         SelectFlavor, SelectItem, SetExpr, Statement, Subscript, TableAlias, TableFactor, Value, Visit, VisitMut, Visitor,
-        VisitorMut, visit_expressions,
+        VisitorMut,
     },
 };
 use rustfs_s3select_api::{
@@ -160,9 +160,9 @@ pub(crate) fn prepare_s3_select_statement(statement: &mut Statement) -> QueryRes
 /// Names an unaliased path projection after its last key, as AWS does
 /// (`s.obj0.id` -> `id`), instead of DataFusion's `s.obj0[id]`. Names that
 /// could collide with another output name keep DataFusion's name. Wildcard
-/// columns and computed output names are unknown here, so either disables
-/// aliasing; ORDER BY columns count because DataFusion adds missing sort
-/// columns to the projection.
+/// columns, computed expressions, and retained paths have unknown output names
+/// here, so they disable aliasing. Unprojected ORDER BY expressions also disable
+/// aliasing because DataFusion adds their input columns to the projection.
 fn alias_path_projections(select: &mut Select, order_by: Option<&OrderBy>) {
     if select
         .projection
@@ -185,6 +185,7 @@ fn alias_path_projections(select: &mut Select, order_by: Option<&OrderBy>) {
         .iter()
         .map(|item| {
             let ident = match item {
+                SelectItem::UnnamedExpr(Expr::Nested(_)) => None,
                 SelectItem::UnnamedExpr(expr) => column_name(expr),
                 SelectItem::ExprWithAlias { alias, .. } => Some(alias),
                 _ => None,
@@ -210,16 +211,16 @@ fn alias_path_projections(select: &mut Select, order_by: Option<&OrderBy>) {
                 .iter()
                 .any(|item| matches!(item, SelectItem::UnnamedExpr(projected) if projected == expr))
         };
-        for sort_expr in sort_exprs.iter().filter(|sort_expr| !projected(&sort_expr.expr)) {
-            let _ = visit_expressions(&sort_expr.expr, |expr| {
-                if let Some(ident) = column_name(expr) {
-                    *counts.entry(normalizer.normalize(ident.clone())).or_default() += 1;
-                }
-                ControlFlow::<()>::Continue(())
-            });
+        if sort_exprs.iter().any(|sort_expr| !projected(&sort_expr.expr)) {
+            return;
         }
     }
-    for (item, name) in select.projection.iter_mut().zip(&names) {
+    // Retained paths have generated names that cannot be inferred from their last key.
+    // Keep the whole projection unchanged so a sibling alias cannot collide with them.
+    if names.iter().flatten().any(|name| counts.get(name) != Some(&1)) {
+        return;
+    }
+    for item in &mut select.projection {
         let SelectItem::UnnamedExpr(expr) = item else {
             continue;
         };
@@ -230,8 +231,7 @@ fn alias_path_projections(select: &mut Select, order_by: Option<&OrderBy>) {
             Some((first, rest)) if normalizer.normalize(first.clone()) == qualifier => rest,
             _ => parts.as_slice(),
         };
-        let unique = name.as_deref().is_some_and(|name| counts.get(name) == Some(&1));
-        if path.len() < 2 || !unique {
+        if path.len() < 2 {
             continue;
         }
         let alias = path[path.len() - 1].clone();

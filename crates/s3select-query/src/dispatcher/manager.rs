@@ -1840,6 +1840,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn path_aliases_do_not_collide_with_retained_path_names() {
+        const DATA: &[u8] = br#"{"id":"top","obj0":{"id":"a"},"obj1":{"id":"b"},"obj2":{"s.obj0[id]":"c","obj0":"d"}}"#;
+        for (sql, expected) in [
+            (
+                "SELECT s.obj0.id, s.obj1.id, s.obj2.\"s.obj0[id]\" FROM S3Object s",
+                vec!["s.obj0[id]", "s.obj1[id]", "s.obj2[s.obj0[id]]"],
+            ),
+            (
+                "SELECT s.obj2.\"s.obj0[id]\", s.obj1.id, s.obj0.id FROM S3Object s",
+                vec!["s.obj2[s.obj0[id]]", "s.obj1[id]", "s.obj0[id]"],
+            ),
+            (
+                "SELECT (s.obj0.id), s.obj2.\"s.obj0[id]\" FROM S3Object s",
+                vec!["s.obj0[id]", "s.obj2[s.obj0[id]]"],
+            ),
+            (
+                "SELECT s.obj0.id, s.obj2.\"s.obj0[id]\" FROM S3Object s ORDER BY s.id",
+                vec!["s.obj0[id]", "s.obj2[s.obj0[id]]"],
+            ),
+            ("SELECT s.obj2.obj0 FROM S3Object s ORDER BY s.obj0.id", vec!["s.obj2[obj0]"]),
+            ("SELECT s.obj2.obj0 FROM S3Object s ORDER BY (s.obj0.id)", vec!["s.obj2[obj0]"]),
+        ] {
+            let schema = json_lines_plan_schema(DATA, sql).await;
+            assert_eq!(field_names(schema.fields()), expected, "{sql}");
+        }
+    }
+
+    #[tokio::test]
     async fn csv_query_uses_custom_record_delimiter_across_file_partitions() {
         const ROW_COUNT: usize = 200_000;
 
