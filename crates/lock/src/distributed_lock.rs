@@ -890,7 +890,6 @@ impl DistributedLock {
         let start = tokio::time::Instant::now();
         let mut attempt = 1;
         let mut last_result: Option<LockAcquireQuorumResult> = None;
-        let mut preserve_quorum_on_attempt_timeout = false;
 
         loop {
             let elapsed = start.elapsed();
@@ -908,20 +907,19 @@ impl DistributedLock {
                 return Ok(result);
             }
 
-            // A shortened final retry may expire without establishing whether
-            // the previously observed quorum failure has recovered.
-            if !preserve_quorum_on_attempt_timeout || !result.attempt_timed_out {
-                last_result = Some(result);
-                preserve_quorum_on_attempt_timeout = false;
-            }
+            // A final retry can time out without establishing whether the
+            // previously observed quorum failure has recovered.
             let remaining = request.acquire_timeout.saturating_sub(start.elapsed());
+            let preserve_quorum_failure = result.attempt_timed_out
+                && remaining.is_zero()
+                && last_result.as_ref().is_some_and(|result| result.quorum_impossible);
+            if !preserve_quorum_failure {
+                last_result = Some(result);
+            }
             if remaining.is_zero() {
                 break;
             }
             let backoff = Self::lock_acquire_retry_backoff(attempt, &mut rand::rng());
-            if backoff >= remaining && last_result.as_ref().is_some_and(|result| result.quorum_impossible) {
-                preserve_quorum_on_attempt_timeout = true;
-            }
             // Keep time for another acquire attempt instead of abandoning the
             // caller's remaining budget when the jittered backoff grows large.
             tokio::time::sleep(backoff.min(remaining / 2)).await;
@@ -2296,6 +2294,22 @@ mod tests {
         assert!(
             matches!(result, Err(LockError::QuorumNotReached { required: 3, .. })),
             "a late inconclusive retry must not hide an observed quorum failure: {result:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acquire_guard_preserves_quorum_failure_when_retry_backoff_fits_but_attempt_times_out() {
+        let clients = clients_with_initial_quorum_loss(&[AcquirePlan::Success {
+            delay: Duration::from_secs(1),
+        }]);
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_millis(500));
+
+        let result = lock.acquire_guard(&request).await;
+        assert!(
+            matches!(result, Err(LockError::QuorumNotReached { required: 3, .. })),
+            "an inconclusive final attempt must not hide an observed quorum failure: {result:?}"
         );
     }
 
