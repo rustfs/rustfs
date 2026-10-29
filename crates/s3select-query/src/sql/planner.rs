@@ -15,12 +15,16 @@
 use std::{collections::HashMap, convert::Infallible, ops::ControlFlow};
 
 use async_trait::async_trait;
-use datafusion::sql::{
-    planner::{IdentNormalizer, SqlToRel},
-    sqlparser::ast::{
-        AccessExpr, Expr, GroupByExpr, Ident, JsonPath, JsonPathElem, ObjectNamePart, OrderBy, OrderByKind, Query, Select,
-        SelectFlavor, SelectItem, SetExpr, Statement, Subscript, TableAlias, TableFactor, Value, Visit, VisitMut, Visitor,
-        VisitorMut,
+use datafusion::{
+    common::{Column, Result as DFResult},
+    logical_expr::{Expr as LogicalExpr, LogicalPlan, LogicalPlanBuilder},
+    sql::{
+        planner::{IdentNormalizer, SqlToRel},
+        sqlparser::ast::{
+            AccessExpr, Expr, GroupByExpr, Ident, JsonPath, JsonPathElem, ObjectNamePart, OrderBy, OrderByKind, Query, Select,
+            SelectFlavor, SelectItem, SetExpr, Statement, Subscript, TableAlias, TableFactor, Value, Visit, VisitMut, Visitor,
+            VisitorMut,
+        },
     },
 };
 use rustfs_s3select_api::{
@@ -76,7 +80,9 @@ impl<'a, S: ContextProviderExtension + Send + Sync + 'a> SqlPlanner<'a, S> {
     }
 
     async fn df_prepared_sql_to_plan(&self, stmt: Statement, _session: &SessionCtx) -> QueryResult<Plan> {
+        let keys = path_projection_keys(&stmt);
         let df_plan = self.df_planner.sql_statement_to_plan(stmt).map_err(classify_planner_error)?;
+        let df_plan = name_path_projections(df_plan, &keys)?;
         Ok(Plan::Query(QueryPlan {
             df_plan,
             is_tag_scan: false,
@@ -163,23 +169,16 @@ pub(crate) fn prepare_s3_select_statement(statement: &mut Statement) -> QueryRes
 /// columns, computed expressions, and retained paths have unknown output names
 /// here, so they disable aliasing. Unprojected ORDER BY expressions also disable
 /// aliasing because DataFusion adds their input columns to the projection.
+/// GROUP BY can refer to these aliases; [`name_path_projections`] names the
+/// paths left here once the planned output names are known.
 fn alias_path_projections(select: &mut Select, order_by: Option<&OrderBy>) {
-    if select
-        .projection
-        .iter()
-        .any(|item| matches!(item, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)))
-    {
+    if has_wildcard(select) || sorts_by_unprojected_expr(select, order_by) {
         return;
     }
-    let normalizer = IdentNormalizer::default();
-    let qualifier = match select.from.first().map(|table| &table.relation) {
-        Some(TableFactor::Table { alias: Some(alias), .. }) => normalizer.normalize(alias.name.clone()),
-        Some(TableFactor::Table { name, .. }) => match name.0.first() {
-            Some(ObjectNamePart::Identifier(table_name)) => normalizer.normalize(table_name.clone()),
-            _ => return,
-        },
-        _ => return,
+    let Some(qualifier) = source_qualifier(select) else {
+        return;
     };
+    let normalizer = IdentNormalizer::default();
     let names: Vec<Option<String>> = select
         .projection
         .iter()
@@ -200,21 +199,6 @@ fn alias_path_projections(select: &mut Select, order_by: Option<&OrderBy>) {
     for name in names.iter().flatten() {
         *counts.entry(name.clone()).or_default() += 1;
     }
-    if let Some(OrderBy {
-        kind: OrderByKind::Expressions(sort_exprs),
-        ..
-    }) = order_by
-    {
-        let projected = |expr: &Expr| {
-            select
-                .projection
-                .iter()
-                .any(|item| matches!(item, SelectItem::UnnamedExpr(projected) if projected == expr))
-        };
-        if sort_exprs.iter().any(|sort_expr| !projected(&sort_expr.expr)) {
-            return;
-        }
-    }
     // Retained paths have generated names that cannot be inferred from their last key.
     // Keep the whole projection unchanged so a sibling alias cannot collide with them.
     if names.iter().flatten().any(|name| counts.get(name) != Some(&1)) {
@@ -224,17 +208,9 @@ fn alias_path_projections(select: &mut Select, order_by: Option<&OrderBy>) {
         let SelectItem::UnnamedExpr(expr) = item else {
             continue;
         };
-        let Expr::CompoundIdentifier(parts) = expr else {
+        let Some(alias) = path_key(expr, &qualifier).cloned() else {
             continue;
         };
-        let path = match parts.split_first() {
-            Some((first, rest)) if normalizer.normalize(first.clone()) == qualifier => rest,
-            _ => parts.as_slice(),
-        };
-        if path.len() < 2 {
-            continue;
-        }
-        let alias = path[path.len() - 1].clone();
         let expr = std::mem::replace(expr, Expr::Identifier(Ident::new("")));
         *item = SelectItem::ExprWithAlias { expr, alias };
     }
@@ -248,6 +224,134 @@ fn column_name(expr: &Expr) -> Option<&Ident> {
         Expr::Nested(inner) => column_name(inner),
         _ => None,
     }
+}
+
+fn has_wildcard(select: &Select) -> bool {
+    select
+        .projection
+        .iter()
+        .any(|item| matches!(item, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)))
+}
+
+fn sorts_by_unprojected_expr(select: &Select, order_by: Option<&OrderBy>) -> bool {
+    let Some(OrderBy {
+        kind: OrderByKind::Expressions(sort_exprs),
+        ..
+    }) = order_by
+    else {
+        return false;
+    };
+    sort_exprs.iter().any(|sort_expr| {
+        !select
+            .projection
+            .iter()
+            .any(|item| matches!(item, SelectItem::UnnamedExpr(projected) if *projected == sort_expr.expr))
+    })
+}
+
+/// The normalized table alias, or table name, that may prefix a path.
+fn source_qualifier(select: &Select) -> Option<String> {
+    let normalizer = IdentNormalizer::default();
+    match &select.from.first()?.relation {
+        TableFactor::Table { alias: Some(alias), .. } => Some(normalizer.normalize(alias.name.clone())),
+        TableFactor::Table { name, .. } => match name.0.first() {
+            Some(ObjectNamePart::Identifier(table_name)) => Some(normalizer.normalize(table_name.clone())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The last key of a path of at least two keys after the source qualifier
+/// (`s.obj0.id` -> `id`), the name AWS gives the projection.
+fn path_key<'a>(expr: &'a Expr, qualifier: &str) -> Option<&'a Ident> {
+    let parts = match expr {
+        Expr::CompoundIdentifier(parts) => parts,
+        Expr::Nested(inner) => return path_key(inner, qualifier),
+        _ => return None,
+    };
+    let path = match parts.split_first() {
+        Some((first, rest)) if IdentNormalizer::default().normalize(first.clone()) == qualifier => rest,
+        _ => parts.as_slice(),
+    };
+    match path {
+        [_, _, ..] => path.last(),
+        _ => None,
+    }
+}
+
+/// The normalized key of each path projection left unaliased by
+/// [`alias_path_projections`]. Empty when a wildcard hides the output
+/// positions, or when an ORDER BY expression is not projected.
+fn path_projection_keys(statement: &Statement) -> Vec<Option<String>> {
+    let Statement::Query(query) = statement else {
+        return Vec::new();
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Vec::new();
+    };
+    if has_wildcard(select) || sorts_by_unprojected_expr(select, query.order_by.as_ref()) {
+        return Vec::new();
+    }
+    let Some(qualifier) = source_qualifier(select) else {
+        return Vec::new();
+    };
+    let normalizer = IdentNormalizer::default();
+    select
+        .projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(expr) => path_key(expr, &qualifier).map(|key| normalizer.normalize(key.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Renames each path projection to its key from [`path_projection_keys`]
+/// unless another output column keeps or receives that name. Names come from
+/// the planned schema, so computed, aliased and retained columns all count.
+fn name_path_projections(plan: LogicalPlan, keys: &[Option<String>]) -> DFResult<LogicalPlan> {
+    let schema = plan.schema();
+    if keys.len() != schema.fields().len() {
+        return Ok(plan);
+    }
+    let mut renames: Vec<Option<&str>> = keys
+        .iter()
+        .zip(schema.fields())
+        .map(|(key, field)| key.as_deref().filter(|key| key != field.name()))
+        .collect();
+    // Dropping a rename brings back the generated name, which can collide with another rename.
+    loop {
+        let mut counts = HashMap::<&str, usize>::new();
+        for (rename, field) in renames.iter().zip(schema.fields()) {
+            *counts.entry(rename.unwrap_or(field.name())).or_default() += 1;
+        }
+        let mut dropped = false;
+        for rename in &mut renames {
+            if rename.is_some_and(|name| counts[name] > 1) {
+                *rename = None;
+                dropped = true;
+            }
+        }
+        if !dropped {
+            break;
+        }
+    }
+    if renames.iter().all(Option::is_none) {
+        return Ok(plan);
+    }
+    let columns: Vec<_> = schema
+        .iter()
+        .zip(renames)
+        .map(|(column, rename)| {
+            let column = LogicalExpr::Column(Column::from(column));
+            match rename {
+                Some(name) => column.alias(name),
+                None => column,
+            }
+        })
+        .collect();
+    LogicalPlanBuilder::from(plan).project(columns)?.build()
 }
 
 struct PartiQlSubscriptNormalizer;
@@ -471,7 +575,7 @@ impl Visitor for SubqueryDetector {
 
 #[cfg(test)]
 mod tests {
-    use super::prepare_s3_select_statement;
+    use super::{path_projection_keys, prepare_s3_select_statement};
     use crate::sql::parser::ExtParser;
     use datafusion::sql::sqlparser::ast::{AccessExpr, Expr, Statement, Visit, Visitor};
     use rustfs_s3select_api::{
@@ -739,6 +843,37 @@ mod tests {
             "SELECT s.obj0.id, COUNT(*) FROM S3Object AS s GROUP BY s.obj0.id",
         ] {
             assert_eq!(prepared(sql), sql);
+        }
+    }
+
+    #[test]
+    fn path_projection_keys_cover_paths_left_unaliased() {
+        let keys = |sql: &str| {
+            let mut statement = parse_statement(sql);
+            prepare_s3_select_statement(&mut statement).expect("statement should be supported");
+            path_projection_keys(&statement)
+        };
+        let key = |key: &str| Some(key.to_owned());
+        for (sql, expected) in [
+            ("SELECT s.obj0.id FROM S3Object AS s", vec![None]),
+            ("SELECT s.obj0.id, s.obj1.id FROM S3Object AS s", vec![key("id"), key("id")]),
+            (
+                "SELECT s.a.b.c, s.x.\"Y\", s.obj0.ID, lower(s.id) FROM S3Object AS s",
+                vec![key("c"), key("Y"), key("id"), None],
+            ),
+            ("SELECT obj0.id, COUNT(*) FROM S3Object GROUP BY obj0.id", vec![key("id"), None]),
+            ("SELECT (s.obj0.id), ((s.obj1.id)) FROM S3Object AS s", vec![key("id"), key("id")]),
+            (
+                "SELECT s.id, s.tags[1], s.obj0.id AS x, (s.id) FROM S3Object AS s",
+                vec![None, None, None, None],
+            ),
+            ("SELECT S3Object.id, lower(id) FROM S3Object", vec![None, None]),
+            ("SELECT *, s.obj0.id FROM S3Object AS s", vec![]),
+            ("SELECT s.*, s.obj0.id FROM S3Object AS s", vec![]),
+            ("SELECT s.obj0.id FROM S3Object AS s ORDER BY s.id", vec![]),
+            ("SELECT s.obj0.id FROM S3Object AS s ORDER BY upper(id)", vec![]),
+        ] {
+            assert_eq!(keys(sql), expected, "{sql}");
         }
     }
 
