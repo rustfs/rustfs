@@ -11328,10 +11328,39 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
     let n = requests.len();
     let metrics = rustfs_io_metrics::LocalBatchReadMetrics::capture();
     let submitted = metrics.as_ref().map(|_| std::time::Instant::now());
+    #[cfg(feature = "diagnostic-local-batch")]
+    let diagnostic = crate::diagnostics::batch_read_diagnostics::Sample::capture();
     tokio::task::spawn_blocking(move || {
         use rustfs_io_metrics::LocalBatchReadStage;
         use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
+        // The disabled build expands directly to the original operation.
+        macro_rules! diagnostic_stage {
+            ($stage:ident, $index:expr, $operation:expr) => {{
+                #[cfg(feature = "diagnostic-local-batch")]
+                {
+                    crate::diagnostics::batch_read_diagnostics::measure(
+                        diagnostic.as_ref(),
+                        crate::diagnostics::batch_read_diagnostics::Stage::$stage,
+                        $index,
+                        $operation,
+                    )
+                }
+                #[cfg(not(feature = "diagnostic-local-batch"))]
+                {
+                    $operation()
+                }
+            }};
+        }
+        #[cfg(feature = "diagnostic-local-batch")]
+        let _dispatch = diagnostic
+            .as_ref()
+            .map(|sample| tracing::dispatcher::set_default(sample.dispatch()));
+        #[cfg(feature = "diagnostic-local-batch")]
+        let execution = diagnostic.as_ref().map(|sample| {
+            sample.worker_started();
+            sample.start()
+        });
         let execution_started = metrics.as_ref().map(|_| std::time::Instant::now());
         if let (Some(metrics), Some(submitted)) = (&metrics, submitted) {
             metrics.record_stage(LocalBatchReadStage::QueueWait, true, submitted.elapsed());
@@ -11339,47 +11368,70 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
         }
         let mut results = Vec::with_capacity(n);
         for (file_path, offset, length) in requests {
-            let mut bytes_read = 0;
+            #[cfg(feature = "diagnostic-local-batch")]
+            let _index = results.len();
+            let mut total = 0usize;
             let r = (|| -> Result<Bytes> {
                 let end = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
                 let end = u64::try_from(end).map_err(|_| DiskError::FileCorrupt)?;
                 // Bind validation and reads to one descriptor. Nonblocking open
                 // lets corrupt non-regular entries fail without waiting on a FIFO.
-                let file = measure_local_batch_stage(metrics.as_deref(), LocalBatchReadStage::Open, || {
-                    std::fs::OpenOptions::new()
+                let file = diagnostic_stage!(Open, _index, || measure_local_batch_stage(
+                    metrics.as_deref(),
+                    LocalBatchReadStage::Open,
+                    || std::fs::OpenOptions::new()
                         .read(true)
                         .custom_flags(libc::O_NONBLOCK)
                         .open(&file_path)
-                        .map_err(DiskError::from)
-                })?;
-                let meta = measure_local_batch_stage(metrics.as_deref(), LocalBatchReadStage::Metadata, || {
-                    file.metadata().map_err(DiskError::from)
-                })?;
+                        .map_err(DiskError::from),
+                ))?;
+                let meta = diagnostic_stage!(Metadata, _index, || measure_local_batch_stage(
+                    metrics.as_deref(),
+                    LocalBatchReadStage::Metadata,
+                    || file.metadata().map_err(DiskError::from),
+                ))?;
                 if !meta.is_file() || meta.len() < end {
                     return Err(DiskError::FileCorrupt);
                 }
 
-                let mut buf = vec![0u8; length];
+                let mut buf = diagnostic_stage!(Allocation, _index, || Ok::<_, DiskError>(vec![0u8; length]))?;
                 if length > 0 {
-                    measure_local_batch_stage(metrics.as_deref(), LocalBatchReadStage::Read, || {
-                        while bytes_read < length {
-                            let nbytes = file
-                                .read_at(&mut buf[bytes_read..], u64::try_from(offset + bytes_read).unwrap_or(u64::MAX))
-                                .map_err(DiskError::from)?;
-                            if nbytes == 0 {
-                                return Err(DiskError::FileCorrupt);
+                    diagnostic_stage!(Read, _index, || measure_local_batch_stage(
+                        metrics.as_deref(),
+                        LocalBatchReadStage::Read,
+                        || {
+                            while total < length {
+                                let nbytes = file
+                                    .read_at(&mut buf[total..], u64::try_from(offset + total).unwrap_or(u64::MAX))
+                                    .map_err(DiskError::from)?;
+                                if nbytes == 0 {
+                                    return Err(DiskError::FileCorrupt);
+                                }
+                                total += nbytes;
                             }
-                            bytes_read += nbytes;
+                            Ok::<_, DiskError>(())
                         }
-                        Ok(())
-                    })?;
+                    ))?;
                 }
                 Ok(Bytes::from(buf))
             })();
+            #[cfg(feature = "diagnostic-local-batch")]
+            if let Some(sample) = &diagnostic {
+                sample.shard_result(_index, length, total, r.is_ok());
+            }
             if let Some(metrics) = &metrics {
-                metrics.record_shard(r.is_ok(), length, bytes_read);
+                metrics.record_shard(r.is_ok(), length, total);
             }
             results.push(r);
+        }
+        #[cfg(feature = "diagnostic-local-batch")]
+        if let (Some(sample), Some(started)) = (&diagnostic, execution) {
+            sample.finish(
+                crate::diagnostics::batch_read_diagnostics::Stage::Execution,
+                None,
+                started,
+                results.iter().all(Result::is_ok),
+            );
         }
         if let (Some(metrics), Some(started)) = (&metrics, execution_started) {
             metrics.record_stage(LocalBatchReadStage::Execution, results.iter().all(Result::is_ok), started.elapsed());

@@ -3625,7 +3625,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let read_policy = crate::set_disk::get_object_read_policy();
         let erasure_cache = Arc::clone(&self.erasure_cache);
         let (fi, files, disks) = snapshot.into_owned();
-        tokio::spawn(async move {
+        let producer = async move {
             let _guard = read_lock_guard;
             let mut writer = GetObjectDownstreamWriter::new(wd);
             // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
@@ -3708,7 +3708,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 }
             };
             let _ = producer_terminal_tx.send(producer_result.map(|_| ()));
-        });
+        };
+        #[cfg(feature = "diagnostic-local-batch")]
+        let producer = crate::diagnostics::batch_read_diagnostics::with_captured_request_context(producer);
+        tokio::spawn(producer);
 
         Ok(reader)
     }
