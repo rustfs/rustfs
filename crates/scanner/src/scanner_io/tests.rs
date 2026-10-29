@@ -46,7 +46,9 @@ use uuid::Uuid;
 
 mod checkpoint_coverage_identity;
 mod collector_lifecycle;
+mod expiry_lock;
 mod listing_window_scope;
+mod node_admission;
 mod partial_bucket_carry;
 mod per_bucket_certification;
 mod scoped_entry_fallback;
@@ -1770,6 +1772,7 @@ async fn scanner_item_object_lock_uses_cached_config() {
         lifecycle: None,
         object_lock: Some(cached.clone()),
         replication: None,
+        heal_scope: None,
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
@@ -4519,6 +4522,7 @@ async fn get_size_treats_missing_metadata_as_skip_file() {
         lifecycle: None,
         object_lock: None,
         replication: None,
+        heal_scope: None,
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
@@ -4574,6 +4578,7 @@ async fn get_size_marks_corrupt_metadata_for_heal() {
         lifecycle: None,
         object_lock: None,
         replication: None,
+        heal_scope: None,
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
@@ -4656,6 +4661,7 @@ async fn get_size_counts_delete_markers_separately_from_versions() {
         lifecycle: None,
         object_lock: None,
         replication: None,
+        heal_scope: None,
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,

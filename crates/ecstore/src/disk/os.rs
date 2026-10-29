@@ -333,6 +333,8 @@ pub(crate) mod prepared_publication_test_hooks {
         PreparedRename,
         Rename,
         Remove,
+        MetadataReadAfterOpen,
+        MetadataReadAfterRead,
         #[cfg(test)]
         Rollback,
         #[cfg(test)]
@@ -457,6 +459,8 @@ pub enum LocalPublicationStage {
     PreparedRename,
     Rename,
     Remove,
+    MetadataReadAfterOpen,
+    MetadataReadAfterRead,
 }
 
 #[cfg(all(feature = "test-util", not(windows)))]
@@ -469,6 +473,8 @@ impl LocalPublicationPause {
             LocalPublicationStage::PreparedRename => prepared_publication_test_hooks::Stage::PreparedRename,
             LocalPublicationStage::Rename => prepared_publication_test_hooks::Stage::Rename,
             LocalPublicationStage::Remove => prepared_publication_test_hooks::Stage::Remove,
+            LocalPublicationStage::MetadataReadAfterOpen => prepared_publication_test_hooks::Stage::MetadataReadAfterOpen,
+            LocalPublicationStage::MetadataReadAfterRead => prepared_publication_test_hooks::Stage::MetadataReadAfterRead,
         };
         let (entered_tx, entered) = oneshot::channel();
         let (release, release_rx) = std::sync::mpsc::channel::<()>();
@@ -4703,6 +4709,27 @@ impl PublicationRoot {
         return self.open_relative(path, rustix::fs::OFlags::RDONLY, rustix::fs::Mode::empty());
         #[cfg(not(target_os = "linux"))]
         std::fs::File::open(path)
+    }
+
+    pub(crate) fn check_writable(&self, path: &Path) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        let directory = self.open_directory(path)?;
+        #[cfg(target_os = "linux")]
+        let probe_directory = {
+            use std::os::fd::AsRawFd;
+            PathBuf::from(format!("/proc/self/fd/{}/.", directory.as_raw_fd()))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let probe_directory = path;
+
+        // Keep the Linux parent handle pinned through deletion, including when
+        // a startup timeout detaches the blocking task.
+        let mut probe = tempfile::Builder::new()
+            .prefix(".rustfs-write-check-")
+            .tempfile_in(probe_directory)?;
+        let write_result = std::io::Write::write_all(probe.as_file_mut(), b"rustfs");
+        let delete_result = probe.close();
+        write_result.and(delete_result)
     }
 
     pub(crate) fn create_truncate(&self, path: &Path) -> io::Result<std::fs::File> {

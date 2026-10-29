@@ -38,6 +38,13 @@ pub(super) fn tier_stats_template(tier_names: &[String]) -> HashMap<String, Tier
     tier_stats
 }
 
+fn ensure_scanner_node_operation_active(cancellation: Option<&CancellationToken>) -> Result<()> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(StorageError::other("Scanner operation cancelled"));
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl ScannerIODisk for Disk {
     async fn get_size(&self, item: ScannerItem) -> Result<SizeSummary> {
@@ -45,14 +52,18 @@ impl ScannerIODisk for Disk {
     }
 
     async fn get_size_with_tier_names(&self, mut item: ScannerItem, tier_names: &[String]) -> Result<SizeSummary> {
+        let cancellation = crate::workload_admission::scanner_node_operation_cancellation();
         let done_object = Metrics::time(Metric::ScanObject);
 
         if !is_xl_meta_path(&item.path) {
             return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
         }
 
+        ensure_scanner_node_operation_active(cancellation.as_ref())?;
         let metadata_object_path = item.object_path();
-        let data = match self.read_metadata(&item.bucket, &metadata_object_path).await {
+        let metadata_result = self.read_metadata(&item.bucket, &metadata_object_path).await;
+        ensure_scanner_node_operation_active(cancellation.as_ref())?;
+        let data = match metadata_result {
             Ok(data) => data,
             Err(e) if DiskError::is_err_object_not_found(&e) || DiskError::is_err_version_not_found(&e) => {
                 return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
@@ -86,7 +97,10 @@ impl ScannerIODisk for Disk {
         // (which used to query it a second time). On failure keep the
         // historical fallback: default configuration (versioned = false) plus
         // the warn that `apply_actions` used to emit.
-        let versioning_config = match BucketVersioningSys::get(&item.bucket).await {
+        ensure_scanner_node_operation_active(cancellation.as_ref())?;
+        let versioning_result = BucketVersioningSys::get(&item.bucket).await;
+        ensure_scanner_node_operation_active(cancellation.as_ref())?;
+        let versioning_config = match versioning_result {
             Ok(versioning_config) => versioning_config,
             Err(_) => {
                 warn!(
@@ -122,7 +136,9 @@ impl ScannerIODisk for Disk {
             ..Default::default()
         };
 
+        ensure_scanner_node_operation_active(cancellation.as_ref())?;
         let lock_config = object_lock_config_for_scanner_item(&item).await;
+        ensure_scanner_node_operation_active(cancellation.as_ref())?;
 
         // Count every version this object contributes to the scan, independent
         // of any lifecycle configuration, so scan-coverage metrics stay honest
@@ -130,17 +146,35 @@ impl ScannerIODisk for Disk {
         // `object_infos`.
         global_metrics().record_scanner_versions_scanned(object_infos.len() as u64);
 
-        item.apply_actions(object_infos, lock_config, versioning_config, tier_names, &mut size_summary)
-            .await;
+        // A caller-provided item or persisted usage cache cannot choose another set.
+        item.heal_scope = crate::scanner_folder::scanner_disk_heal_scope(self);
+        #[cfg(test)]
+        let _ = crate::scanner_folder::observe_test_size_dispatch_boundary("apply_actions");
+        item.apply_actions_cancellable(
+            object_infos,
+            lock_config,
+            versioning_config,
+            tier_names,
+            &mut size_summary,
+            cancellation.as_ref(),
+        )
+        .await;
+        ensure_scanner_node_operation_active(cancellation.as_ref())?;
 
         if !free_version_infos.is_empty() {
             for oi in free_version_infos {
+                ensure_scanner_node_operation_active(cancellation.as_ref())?;
                 if ScannerItem::tier_is_known(&oi, tier_names) {
-                    enqueue_runtime_free_version(oi).await;
+                    #[cfg(test)]
+                    if crate::scanner_folder::observe_test_size_dispatch_boundary("free_version_dispatch") {
+                        continue;
+                    }
+                    enqueue_runtime_free_version(oi, cancellation.as_ref()).await;
                 }
             }
         }
 
+        ensure_scanner_node_operation_active(cancellation.as_ref())?;
         done_object();
 
         Ok(size_summary)

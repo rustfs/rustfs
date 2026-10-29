@@ -49,6 +49,7 @@ script-tests: ## Run shell script tests
 	./scripts/test_manual_transition_runbooks.sh
 	./scripts/test_fuzz_runner.sh
 	./scripts/test_python_bin.sh
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_check_doc_paths.py
 	./scripts/check_embedded_secrets.sh --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_binary.py
@@ -64,6 +65,8 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_nightly_candidate.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_functional_chain.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_functional_chain_health.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_inspect_validation_runner.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_retain_validation_evidence.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_timing_report.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_report_compat.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_runner_tools.py

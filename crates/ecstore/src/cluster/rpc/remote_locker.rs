@@ -1074,7 +1074,6 @@ impl RemoteClient {
 #[async_trait]
 impl LockClient for RemoteClient {
     async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse> {
-        info!("remote acquire_exclusive for {}", request.resource);
         let admission = match self.admit_lock_request("lock") {
             Some(admission) => admission,
             None => return Ok(Self::rpc_backoff_failure_response(request)),

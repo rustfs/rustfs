@@ -60,6 +60,28 @@ Tier-delete journal recovery starts immediately and remains enabled independentl
 
 Recovery passes that observe retained entries, failed pages, continuation markers, or exhausted budgets keep the original 60-second retry cadence. Foreground dispatch still queues committed work directly; the idle wait before the next scan of unnotified new durable work can grow from 60 seconds to five minutes. In-flight recovery, listing and processing time are additional; this cap bounds idle delay rather than end-to-end cleanup latency. This scheduling does not change dispatch ownership, exact-version validation, or remote-delete authorization. An empty-queue backoff therefore reduces background listing traffic while preserving durable crash recovery; it is independent of diagnosing multipart session errors.
 
+## Diagnosing a blocked tier deletion
+
+Deleting every visible object in a versioned bucket does not prove that a tier is unused. Historical versions, lifecycle references, hidden free versions, and persisted deletion/transition records can still own remote data. Tier deletion remains synchronous and checks these references again under its existing mutation protocol. The legacy `XMinioAdminTierBackendInUse` response remains unchanged, including when `force=true` cannot bypass a durable owner.
+
+`GET /rustfs/admin/v3/tier/{tier}/deletion-check` requires `admin:ListTier` and returns a read-only, bounded observation. It never probes the remote backend or schedules cleanup. `reasons[].kind` is one of:
+
+| Reason | Next action |
+|--------|-------------|
+| `LIFECYCLE_REFERENCE` | Remove or change lifecycle rules referencing the tier, including rules for noncurrent versions. |
+| `LIVE_TRANSITIONED_VERSION` | Inspect and delete the intended historical versions and delete markers, observing retention requirements. |
+| `CLEANUP_PENDING` | Retain the tier configuration while the existing free-version or deletion-journal recovery completes. |
+| `TRANSITION_PENDING` | Inspect the retained transition transaction and its existing recovery procedure. |
+| `PROOF_INCOMPLETE` | Restore local metadata/topology readability or retry the bounded check. This is not evidence that the tier is unused. |
+
+The check stops after the first observed blocker and reports `scanStatus: "stopped_after_blocker"`, `proofComplete: false`. Other reasons may also exist. A complete scan is advisory: concurrent writes and remote backend state can still prevent the subsequent DELETE. Responses include `remote.state: "not_checked"` and contain no object inventory or credential material.
+
+`POST /rustfs/admin/v3/tier/{tier}/cleanup-retry` requires `admin:SetTier` and performs a bounded pass through the existing free-version recovery reader and expiry queue. It runs on the receiving node, so it does not depend on reaching the background recovery leader. Concurrent retry passes for the same backend identity share a distributed lock. HTTP 202 reports queue acceptance or `status: "busy"`; neither result means the tier was deleted. Lock contention or unavailable lock quorum can both produce `busy`.
+
+The pass has a 10-second work deadline, followed by at most five seconds to stop its active walk, and scans at most 100 buckets / 10,000 objects with up to 1,000 matching free versions enqueued. `enqueued`, `failed`, and `scanTruncated` describe this pass only. Zero enqueues do not prove that there is no remaining cleanup. A full queue, cancellation, or remote cleanup failure leaves the durable owner available to existing recovery. Background recovery keeps its own cursor and continues independently; repeated manual passes start at the namespace beginning. Persisted deletion journals and transition transactions retain their existing recovery cadence and procedures.
+
+After cleanup, rerun the check and explicitly retry tier deletion. A retry request never creates a persistent task to delete the tier configuration automatically.
+
 ## Metadata key conventions
 
 Internal metadata is stored under both `x-rustfs-internal-<suffix>` and `x-minio-internal-<suffix>` for MinIO interoperability. `get_bytes` prefers the RustFS key and falls back to the MinIO key.

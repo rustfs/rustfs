@@ -1038,6 +1038,7 @@ impl DefaultObjectUsecase {
 
         // Validate object key
         validate_object_key(&key, "DELETE")?;
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
 
         let replica = req
             .headers
