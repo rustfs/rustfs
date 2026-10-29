@@ -599,7 +599,17 @@ pub(crate) async fn initialize_local_disk_maps(
                 continue;
             }
 
-            let disk = new_disk(ep, opt).await?;
+            let disk = match new_disk(ep, opt).await {
+                Ok(disk) => disk,
+                Err(crate::disk::error::DiskError::FileAccessDenied) => {
+                    // LocalDisk already logged the filesystem cause and repair
+                    // hint. Keep this slot unavailable so ECStore initialization
+                    // can apply its existing fatal-error and quorum rules.
+                    global_local_disk_map.insert(ep.to_string(), None);
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
             if let crate::disk::Disk::Local(wrapper) = disk.as_ref() {
                 wrapper.get_disk().bind_multipart_proof_authority(&multipart_authority)?;
             }

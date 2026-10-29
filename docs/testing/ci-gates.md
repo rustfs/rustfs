@@ -1,7 +1,6 @@
 # CI gate matrix
 
-**Use this when:** a check is red and you need to know whether it blocks the merge, which workflow and job produced it, and how to reproduce it locally.
-**Source of truth:** the live `main` ruleset (command below) for required status; `.github/workflows/<file>.yml` for triggers, `paths`, `timeout-minutes`, and cron; `.config/nextest.toml` for e2e profile filters; `.github/scheduled-validations.json` for the freshness-watchdog list; `.github/workflows/README.md` for runner placement and billing.
+**Use this when:** a check is red and you need to know whether it blocks the merge, which workflow and job produced it, and how to reproduce it locally. **Source of truth:** the live `main` ruleset (command below) for required status; `.github/workflows/<file>.yml` for triggers, `paths`, `timeout-minutes`, and cron; `.config/nextest.toml` for e2e profile filters; `.github/scheduled-validations.json` for the freshness-watchdog list; `.github/workflows/README.md` for runner placement and billing.
 
 A job blocks a merge when its exact check name is required by the live `main` ruleset, or when its result is required by the `Test and Lint` aggregate. A workflow name, a `merge_group` trigger, or an unrelated red PR check does not make a job required by itself.
 
@@ -21,7 +20,7 @@ PRs changing only Rust sources under `crates/e2e_test/src/` and known E2E select
 
 Alternate-feature unit tests and Clippy for rio-v2, Swift, SFTP, and HTTP/3 run on merge groups and on scheduled (nightly) or manual validation. PRs and main pushes run the default workspace and retain ILM, S3, real io_uring, and Connect security boundaries in their applicable scopes. The aggregate requires the alternate-feature jobs to be skipped on PRs and main pushes and successful on merge-group, scheduled, and manual events. This avoids repeating four feature builds on every PR revision and on every merge; feature-specific regressions are detected by the nightly run when the merge queue is not used. For changes to these features, dispatch `ci.yml` against the candidate branch before merging when that signal is needed, including PRs targeting `gateway/integration`, which has no automatic push trigger in this workflow. Scheduled results supplement the main baseline and do not replace it.
 
-Workspace Clippy runs on every event, pull requests included, ahead of the workspace tests in the same job. `cache-warm.yml` warms Clippy's check artifacts under `ci-dev` with the same invocation, so a pull request re-checks only the crates its diff touches. `make pre-commit` does not run Clippy; run `cargo clippy --all-targets -- -D warnings` locally before pushing.
+Workspace Clippy runs on every event with a selected workspace Rust job, pull requests included, ahead of the workspace tests in the same job. `cache-warm.yml` warms Clippy's check artifacts under `ci-dev` with the same invocation to reuse compatible dependency artifacts. `make pre-commit` does not run Clippy. Select local Clippy targets, features, and documentation exemptions from the root `AGENTS.md` verification tier; the workspace command below reproduces the CI lane and is not a universal pre-push requirement.
 
 Serial ILM tests run at the end of `test-and-lint` for the `full` scope, reusing the workspace's Cargo package and feature selection. The existing ignored-test filter and `-j1` remain; `--profile default` keeps the no-retry execution and preserves the separate core CI JUnit report. Any ILM failure fails the workspace job and required aggregate. Logs remain in the `ilm-integration` artifact. There is no separate ILM runner or cache restore.
 
@@ -76,13 +75,7 @@ e2e filters live in `.config/nextest.toml`; extend a profile instead of adding a
 
 Architecture migration rules run once in the required Quick Checks job. Migration proofs reuse the successful workspace run: `scripts/check_migration_gate_count.sh evidence <core-listing.json> <junit.xml>` checks the unchanged name selection and committed floor, and requires exactly one successful execution without retries for each proof. Missing, filtered, skipped, failed, or duplicate evidence fails the gate. Local `check` and `run` modes remain available. Upgrade compatibility builds one current server and shares its binary and provenance sidecar with one test runner. That runner verifies the pinned previous release checksum once, reuses the compiled harness, and executes every existing upgrade case in a separate process. Failed cases do not stop the remaining cases; any failure fails the job. Logs and G09 evidence retain per-case subdirectories in the aggregate artifacts. `scripts/test_upgrade_workflow.py` checks case membership and failure propagation.
 
-Scanner usage and heal rebuild coverage are intentionally split by risk and
-cost. `data_usage_test` runs in the PR `e2e-smoke` lane so changes that affect
-authoritative scanner usage publication, quota-visible usage, or admin usage
-snapshots get an end-to-end signal before merge review. `heal_erasure_disk_rebuild_test`
-runs in `e2e-full` so core erasure heal rebuild regressions are caught no later
-than the merge queue or `main` push lane; it also remains in `e2e-nightly` with
-the serialized cluster fault-domain suites for scheduled soak signal.
+Scanner usage and heal rebuild coverage are intentionally split by risk and cost. `data_usage_test` runs in the PR `e2e-smoke` lane so changes that affect authoritative scanner usage publication, quota-visible usage, or admin usage snapshots get an end-to-end signal before merge review. `heal_erasure_disk_rebuild_test` runs in `e2e-full` so core erasure heal rebuild regressions are caught no later than the merge queue or `main` push lane; it also remains in `e2e-nightly` with the serialized cluster fault-domain suites for scheduled soak signal.
 
 ## Scheduled validation
 
@@ -148,154 +141,42 @@ The checked-in MinIO corpus is pinned by file SHA256 and its documented source r
 Run `python3 scripts/check_test_wiring.py --self-test` to exercise the negative cases: removed/ignored/filtered tests, malformed listing, absent fixtures, and wrong fixture hashes. Do not update hashes merely to silence the guard; a fixture change needs source/provenance and compatibility review.
 ## Scanner/Heal Evidence Receipts
 
-The existing `scripts/check_test_wiring.py` also validates Scanner/Heal case
-evidence registered in `.config/scanner-heal-required-tests.json`. It records
-already-built binaries and checks existing nextest output; it does not build,
-run tests, deploy servers, inject faults, or start another CI lane.
+The existing `scripts/check_test_wiring.py` also validates Scanner/Heal case evidence registered in `.config/scanner-heal-required-tests.json`. It records already-built binaries and checks existing nextest output; it does not build, run tests, deploy servers, inject faults, or start another CI lane.
 
-The registered cases are emitted by existing E2E tests. The original
-`background-target-restart` / `background-target-crash` cases run in
-`e2e-nightly` on a four-node, one-drive-per-node topology. The
-`ec84-target-drive-restart` case runs in `e2e-distributed` on a three-node,
-four-drive EC8+4 topology. When `RUSTFS_SCANNER_HEAL_RUN_DIR` is set, the
-producer checks the actual server and test-executable hashes against `run.json`,
-pins the same server binary for all node starts, and writes its oracle only
-after the real assertions pass. The artifact contains the actual pre/post target
-PIDs, per-node S3 listings, expected and downloaded complete-body hashes/lengths,
-and target-disk `VersionShardCensus` fingerprints. Existing baseline objects
-must match their pre-fault physical manifests; the object created during the
-outage has no pre-fault target shard and is checked for complete physical parts
-and exact S3 content.
+The registered cases are emitted by existing E2E tests. The original `background-target-restart` / `background-target-crash` cases run in `e2e-nightly` on a four-node, one-drive-per-node topology. The `ec84-target-drive-restart` case runs in `e2e-distributed` on a three-node, four-drive EC8+4 topology. When `RUSTFS_SCANNER_HEAL_RUN_DIR` is set, the producer checks the actual server and test-executable hashes against `run.json`, pins the same server binary for all node starts, and writes its oracle only after the real assertions pass. The artifact contains the actual pre/post target PIDs, per-node S3 listings, expected and downloaded complete-body hashes/lengths, and target-disk `VersionShardCensus` fingerprints. Existing baseline objects must match their pre-fault physical manifests; the object created during the outage has no pre-fault target shard and is checked for complete physical parts and exact S3 content.
 
-These cases are still restart-focused evidence slices. They are not power-loss
-validation, an all-version inventory, or proof of scanner enumeration, exact MRF
-disposition, legacy migration, multi-pool/multi-set release coverage, or
-rollback.
-The schema 2 registry separates the implemented single-set restart lane from
-structured release lanes for authority coverage, checkpoint/crash, status and
-outcome, MRF responsibility, mixed-version rollback, scheduler pressure,
-maintenance producers, and EC8+4 multi-set coverage. All G01-G14/P1-P4 and
-R-E/R-D/R-L release requirements stay `pending` until their actual
-feature-specific oracles, measurements and required topologies exist. Missing
-cases cannot be supplied by synthetic W20 results. W20's bounded JSON and
-file-hash helpers are reused; its ABBA performance contracts remain in
-`docs/operations/scanner-benchmark-runbook.md`.
-Measured ABBA manifests must also carry the runbook's `release_evidence`
-contract. The runner rejects reports that cannot bind the exact 3x4 EC8+4
-topology, multi-pool/multi-set shape, distributed same-window metrics endpoints,
-restart/crash modes, mixed-version reader/writer/rollback participation, and
-allocation/flamegraph/RSS/save-frequency profile artifact plan. Synthetic runs
-and manifests missing that contract remain harness-only evidence.
+These cases are still restart-focused evidence slices. They are not power-loss validation, an all-version inventory, or proof of scanner enumeration, exact MRF disposition, legacy migration, multi-pool/multi-set release coverage, or rollback. The schema 2 registry separates the implemented single-set restart lane from structured release lanes for authority coverage, checkpoint/crash, status and outcome, MRF responsibility, mixed-version rollback, scheduler pressure, maintenance producers, and EC8+4 multi-set coverage. All G01-G14/P1-P4 and R-E/R-D/R-L release requirements stay `pending` until their actual feature-specific oracles, measurements and required topologies exist. Missing cases cannot be supplied by synthetic W20 results. W20's bounded JSON and file-hash helpers are reused; its ABBA performance contracts remain in `docs/operations/scanner-benchmark-runbook.md`. Measured ABBA manifests must also carry the runbook's `release_evidence` contract. The runner rejects reports that cannot bind the exact 3x4 EC8+4 topology, multi-pool/multi-set shape, distributed same-window metrics endpoints, restart/crash modes, mixed-version reader/writer/rollback participation, and allocation/flamegraph/RSS/save-frequency profile artifact plan. Synthetic runs and manifests missing that contract remain harness-only evidence.
 
 ### Recording One Case
 
-Use a committed source tree, independently built current binaries, sufficient
-free disk space, and a task-owned artifact directory that does not yet exist.
-Set `SERVER_BINARY` and `TEST_BINARY` to those exact executable paths. The begin
-command requires the server's embedded `--version` commit to match the clean
-checkout and its embedded Git status to be clean. The E2E crate's build script
-embeds its build-time Git revision/dirty state, lockfile Git blob, enabled crate
-features, target, profile and encoded Rust flags. It tracks the crate/dependency
-trees, Cargo inputs and Git HEAD/ref/index, including `common.rs` restart logic.
-The producer checks this compiled identity against the receipt; it does not
-copy a current source revision into an older test binary's identity. The E2E
-uses its existing temporary cluster directories and cleanup. `CARGO_TARGET_DIR`
-controls compilation output; nextest's default report store remains the
-workspace's `target/nextest`. Prefer the registry-aware runner for concrete
-cases:
+Use a committed source tree, independently built current binaries, sufficient free disk space, and a task-owned artifact directory that does not yet exist. Set `SERVER_BINARY` and `TEST_BINARY` to those exact executable paths. The begin command requires the server's embedded `--version` commit to match the clean checkout and its embedded Git status to be clean. The E2E crate's build script embeds its build-time Git revision/dirty state, lockfile Git blob, enabled crate features, target, profile and encoded Rust flags. It tracks the crate/dependency trees, Cargo inputs and Git HEAD/ref/index, including `common.rs` restart logic. The producer checks this compiled identity against the receipt; it does not copy a current source revision into an older test binary's identity. The E2E uses its existing temporary cluster directories and cleanup. `CARGO_TARGET_DIR` controls compilation output; nextest's default report store remains the workspace's `target/nextest`. Prefer the registry-aware runner for concrete cases:
 
 ```bash
 scripts/run_scanner_heal_evidence_case.sh --case background-target-restart
 scripts/run_scanner_heal_evidence_case.sh --case ec84-target-drive-restart
 ```
 
-Set `RUSTFS_E2E_EXPECTED_FEATURES` to the actual intended e2e crate feature set,
-including `default` for a default-feature build, comma-separated for extra
-features, or empty for `--no-default-features`. It is mandatory when beginning
-a run. Crate features are distinct from the spawned server's build features.
+Set `RUSTFS_E2E_EXPECTED_FEATURES` to the actual intended e2e crate feature set, including `default` for a default-feature build, comma-separated for extra features, or empty for `--no-default-features`. It is mandatory when beginning a run. Crate features are distinct from the spawned server's build features.
 
-Do not replace a nonzero command exit with zero. Missing JUnit or an oracle
-emission failure also fails acceptance. Each retry needs a new run directory;
-the producer refuses to overwrite an existing oracle. Keep failed-run logs and
-artifacts. The receipt pins source revision, actual binary hashes, run identity,
-start/finish times, and the artifact hashes. `listing.json`, `junit.xml`, and
-each oracle are limited to 1 MiB; object evidence has the fixture's 9..65 object
-bound. Credentials are not included in the receipt.
+Do not replace a nonzero command exit with zero. Missing JUnit or an oracle emission failure also fails acceptance. Each retry needs a new run directory; the producer refuses to overwrite an existing oracle. Keep failed-run logs and artifacts. The receipt pins source revision, actual binary hashes, run identity, start/finish times, and the artifact hashes. `listing.json`, `junit.xml`, and each oracle are limited to 1 MiB; object evidence has the fixture's 9..65 object bound. Credentials are not included in the receipt.
 
-The checker binds nextest's flattened suite `binary-id`/`binary-path` to the
-actual test executable and requires the JUnit testcase's embedded execution
-timestamp to fall inside the receipt window (with millisecond precision).
-Copying an old JUnit file and refreshing its mtime does not make it new evidence.
-Schema versions, topology counts, PIDs, EC geometry and shard indices require
-actual integers: booleans and fractional values are rejected, and an index must
-fit the physical data-plus-parity geometry.
+The checker binds nextest's flattened suite `binary-id`/`binary-path` to the actual test executable and requires the JUnit testcase's embedded execution timestamp to fall inside the receipt window (with millisecond precision). Copying an old JUnit file and refreshing its mtime does not make it new evidence. Schema versions, topology counts, PIDs, EC geometry and shard indices require actual integers: booleans and fractional values are rejected, and an index must fit the physical data-plus-parity geometry.
 
-The checker rejects unselected/ignored tests, zero/duplicate JUnit cases,
-failures, skipped tests, retry/flaky records, stale or changed artifacts,
-different builds or run IDs, unchanged process IDs, wrong topology, missing
-shard parts, and mismatched S3 content/listings. The raw oracle JSON is emitted
-by the real E2E producer, not accepted from an adapter copying expectations.
+The checker rejects unselected/ignored tests, zero/duplicate JUnit cases, failures, skipped tests, retry/flaky records, stale or changed artifacts, different builds or run IDs, unchanged process IDs, wrong topology, missing shard parts, and mismatched S3 content/listings. The raw oracle JSON is emitted by the real E2E producer, not accepted from an adapter copying expectations.
 
-`--check-scanner-heal "$RUN_DIR" release` checks available case evidence and
-returns nonzero for every pending release requirement. A focused case pass
-does not approve release. In particular, R-E requires fixed-budget real
-restarts without an unbudgeted final sweep, R-D requires the full
-manager/event/ledger disposition chain, and R-L requires source-conflict and
-crash/retirement evidence. Reader-only or unit fixtures cannot substitute for
-these. The external `rustfs/auto-testing` functional workflows propagate suite
-failures. Their workflow status does not establish this registry's required
-case coverage, build provenance, or object-level oracles.
+`--check-scanner-heal "$RUN_DIR" release` checks available case evidence and returns nonzero for every pending release requirement. A focused case pass does not approve release. In particular, R-E requires fixed-budget real restarts without an unbudgeted final sweep, R-D requires the full manager/event/ledger disposition chain, and R-L requires source-conflict and crash/retirement evidence. Reader-only or unit fixtures cannot substitute for these. The external `rustfs/auto-testing` functional workflows propagate suite failures. Their workflow status does not establish this registry's required case coverage, build provenance, or object-level oracles.
 
-For automation, `--check-scanner-heal-release "$RUN_DIR"` emits one compact
-JSON decision and exits nonzero while blocked. `verified_cases` contains only
-cases that pass the complete receipt, build provenance, nextest/JUnit and real
-oracle checks; `rejected_cases` names registered cases that do not, and
-`pending_gates` names the unimplemented release requirements and
-`pending_lanes` names the structured release lanes that still need real
-evidence. Schema 1 is deliberately marked `release_schema_capable: false`
-because it models only the single-version, unversioned-object restart/crash
-cases. Schema 2 can describe the wider release matrix, but approval still
-requires every registered case to verify and every required gate to leave
-`pending` only after a future checker can bind it to real feature-specific
-evidence. The current checker hard-rejects missing structured requirements and
-pending gates mapped to an implemented lane, so clearing pending text cannot
-become approval. A focused run, synthetic harness, compile-only result,
-skipped/retried test, ordinary CI success, or unregistered mixed-version,
-rollback, EC8+4 or performance claim therefore cannot become a release approval.
-For high-risk rollback gates, `evidence_fields` records the specific proof
-fields that a future real-evidence checker must bind before a pending gate can
-move out of the blocked set. G03 keeps scoped ACK tied to durable root
-publication, ACK request identity, participating peer capability snapshots, and
-mixed-peer fallback oracles; G09 keeps mixed-version reader, writer, and rollback
-payload evidence explicit. These fields are part of the release contract, not
-evidence by themselves.
+For automation, `--check-scanner-heal-release "$RUN_DIR"` emits one compact JSON decision and exits nonzero while blocked. `verified_cases` contains only cases that pass the complete receipt, build provenance, nextest/JUnit and real oracle checks; `rejected_cases` names registered cases that do not, and `pending_gates` names the unimplemented release requirements and `pending_lanes` names the structured release lanes that still need real evidence. Schema 1 is deliberately marked `release_schema_capable: false` because it models only the single-version, unversioned-object restart/crash cases. Schema 2 can describe the wider release matrix, but approval still requires every registered case to verify and every required gate to leave `pending` only after a future checker can bind it to real feature-specific evidence. The current checker hard-rejects missing structured requirements and pending gates mapped to an implemented lane, so clearing pending text cannot become approval. A focused run, synthetic harness, compile-only result, skipped/retried test, ordinary CI success, or unregistered mixed-version, rollback, EC8+4 or performance claim therefore cannot become a release approval. For high-risk rollback gates, `evidence_fields` records the specific proof fields that a future real-evidence checker must bind before a pending gate can move out of the blocked set. G03 keeps scoped ACK tied to durable root publication, ACK request identity, participating peer capability snapshots, and mixed-peer fallback oracles; G09 keeps mixed-version reader, writer, and rollback payload evidence explicit. These fields are part of the release contract, not evidence by themselves.
 
-The upgrade compatibility E2E can emit raw G09 JSON artifacts when
-`RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR` points at a fresh, task-owned directory.
-The rolling mixed-version test writes `G09-mixed_version_reader_evidence.json`
-and `G09-mixed_version_writer_evidence.json` after the old/new reader and writer
-assertions pass. The bucket-metadata rollback test writes
-`G09-rollback_payload_evidence.json` after the current -> previous -> current
-round trip has read back the known bucket configuration and objects. These
-artifacts are measured inputs for a later release bundle; the bundle must still
-record their relative paths, hashes, command provenance, timestamps, roles,
-participating revisions, and case lists before
-`--check-scanner-heal-release-bundle` can validate them.
+The upgrade compatibility E2E can emit raw G09 JSON artifacts when `RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR` points at a fresh, task-owned directory. The rolling mixed-version test writes `G09-mixed_version_reader_evidence.json` and `G09-mixed_version_writer_evidence.json` after the old/new reader and writer assertions pass. The bucket-metadata rollback test writes `G09-rollback_payload_evidence.json` after the current -> previous -> current round trip has read back the known bucket configuration and objects. These artifacts are measured inputs for a later release bundle; the bundle must still record their relative paths, hashes, command provenance, timestamps, roles, participating revisions, and case lists before `--check-scanner-heal-release-bundle` can validate them.
 
-For a release-candidate or PR-head Linux x86_64 host, run the full raw G09
-artifact pass with:
+For a release-candidate or PR-head Linux x86_64 host, run the full raw G09 artifact pass with:
 
 ```bash
 scripts/run_scanner_heal_g09_upgrade_evidence.sh
 ```
 
-The script mirrors the pinned previous-release asset used by the upgrade
-workflow, builds the current checkout, runs the mixed-version and rollback E2E
-lanes, and fails unless all three raw G09 artifacts are measured, revision-bound,
-and role-bound. Use `--source-binary` for a custom previous-release binary on
-another platform, or `--test mixed-version|rollback` while narrowing a failure.
-It performs a free-space preflight before building so a saturated validation
-host fails before producing partial evidence.
+The script mirrors the pinned previous-release asset used by the upgrade workflow, builds the current checkout, runs the mixed-version and rollback E2E lanes, and fails unless all three raw G09 artifacts are measured, revision-bound, and role-bound. Use `--source-binary` for a custom previous-release binary on another platform, or `--test mixed-version|rollback` while narrowing a failure. It performs a free-space preflight before building so a saturated validation host fails before producing partial evidence.
 
 Operator-collected G01 root/quota authority evidence can be packaged with:
 
@@ -306,11 +187,7 @@ scripts/run_scanner_heal_authority_evidence.py \
   --out-dir /path/to/authority-descriptor
 ```
 
-The producer rejects fixture, dry-run, synthetic, stale-revision, incomplete
-root authority, and incomplete quota authority inputs before writing
-`release-bundle-authority.json`. The descriptor validates only G01; it still
-needs the full bundle assembler and the remaining release lanes before a release
-can be approved.
+The producer rejects fixture, dry-run, synthetic, stale-revision, incomplete root authority, and incomplete quota authority inputs before writing `release-bundle-authority.json`. The descriptor validates only G01; it still needs the full bundle assembler and the remaining release lanes before a release can be approved.
 
 Operator-collected G03 scoped ACK evidence can be packaged with:
 
@@ -320,24 +197,15 @@ scripts/python_bin.sh scripts/run_scanner_heal_scoped_ack_evidence.py \
   --out-dir /path/to/scoped-ack-descriptor
 ```
 
-The producer requires durable root publication, exact request identity,
-participating peer capability, mixed-peer fallback, and mixed-version
-provenance before writing `release-bundle-scoped-ack.json`.
+The producer requires durable root publication, exact request identity, participating peer capability, mixed-peer fallback, and mixed-version provenance before writing `release-bundle-scoped-ack.json`.
 
-The W16 recovery-intent and quota-authority lanes can emit raw G04/G12 JSON
-artifacts with:
+The W16 recovery-intent and quota-authority lanes can emit raw G04/G12 JSON artifacts with:
 
 ```bash
 scripts/run_scanner_heal_w16_recovery_evidence.sh
 ```
 
-The runner builds the current checkout, runs the scanner recovery-intent and
-disabled-startup crash-boundary tests, runs the scanner quota reset-preservation
-tests, and runs the distributed hard-quota admission E2E. A full run writes
-`release-bundle-w16.json` and validates the G04 and G12 gates with
-`--check-scanner-heal-release-bundle-gate`. Use `--test g04|g12` while narrowing
-a failure; a single gate descriptor still does not approve the complete release
-bundle.
+The runner builds the current checkout, runs the scanner recovery-intent and disabled-startup crash-boundary tests, runs the scanner quota reset-preservation tests, and runs the distributed hard-quota admission E2E. A full run writes `release-bundle-w16.json` and validates the G04 and G12 gates with `--check-scanner-heal-release-bundle-gate`. Use `--test g04|g12` while narrowing a failure; a single gate descriptor still does not approve the complete release bundle.
 
 The W13 durable MRF replay lanes can emit raw G07/G08/P4 JSON artifacts with:
 
@@ -345,26 +213,16 @@ The W13 durable MRF replay lanes can emit raw G07/G08/P4 JSON artifacts with:
 scripts/run_scanner_heal_w13_mrf_evidence.sh
 ```
 
-The runner builds the current checkout, runs the ignored MRF evidence test, and
-writes `release-bundle-w13.json` for `--check-scanner-heal-release-bundle-gate`.
-Use `--test g07|g08|p4` while narrowing a failure. G08 disk-full evidence must
-run against a real fillable filesystem: on Linux as root the runner mounts a
-small tmpfs automatically, otherwise pass `--enospc-root` pointing at a
-pre-mounted small filesystem. P4 is release evidence only when it completes the
-default two-hour soak; `--allow-short-soak` is diagnostic and skips P4 bundle
-gate validation.
+The runner builds the current checkout, runs the ignored MRF evidence test, and writes `release-bundle-w13.json` for `--check-scanner-heal-release-bundle-gate`. Use `--test g07|g08|p4` while narrowing a failure. G08 disk-full evidence must run against a real fillable filesystem: on Linux as root the runner mounts a small tmpfs automatically, otherwise pass `--enospc-root` pointing at a pre-mounted small filesystem. P4 is release evidence only when it completes the default two-hour soak; `--allow-short-soak` is diagnostic and skips P4 bundle gate validation.
 
-Already collected W13 raw MRF artifacts can be re-packaged and checked without
-rerunning the Rust test with:
+Already collected W13 raw MRF artifacts can be re-packaged and checked without rerunning the Rust test with:
 
 ```bash
 scripts/python_bin.sh scripts/run_scanner_heal_mrf_evidence.py \
   --run-dir /path/to/scanner-heal-w13-evidence-run
 ```
 
-The producer rejects fixture, dry-run, synthetic, stale-revision, incomplete
-MRF responsibility, missing disk-full ENOSPC observations, and short P4 cleanup
-soaks before writing `release-bundle-w13.json`.
+The producer rejects fixture, dry-run, synthetic, stale-revision, incomplete MRF responsibility, missing disk-full ENOSPC observations, and short P4 cleanup soaks before writing `release-bundle-w13.json`.
 
 Legacy rollback evidence for R-L is assembled from a measured proof JSON:
 
@@ -374,36 +232,28 @@ scripts/python_bin.sh scripts/run_scanner_heal_legacy_rollback_evidence.py \
   --out-dir /path/to/legacy-rollback-descriptor
 ```
 
-When the real release lanes have produced their dedicated artifacts, validate
-the complete hard-gate bundle with:
+When the real release lanes have produced their dedicated artifacts, validate the complete hard-gate bundle with:
 
 ```bash
 scripts/python_bin.sh scripts/check_test_wiring.py \
   --check-scanner-heal-release-bundle /path/to/release-evidence.json
 ```
 
-For a single Linux handoff checklist that keeps the measured runners in a
-stable order, generate the Scanner/Heal Linux evidence plan:
+For a single Linux handoff checklist that keeps the measured runners in a stable order, generate the Scanner/Heal Linux evidence plan:
 
 ```bash
 scripts/python_bin.sh scripts/run_scanner_heal_linux_evidence_plan.py \
   --write-plan --out-dir /path/to/plan-dir
 ```
 
-The plan is only an execution manifest. Its `evidence_type` is `plan_only`, and
-it cannot satisfy any Gxx/Wxx/Rxx gate. Use `--run-preflight` only for the
-lightweight registry and runner self-tests before starting a long Linux run.
-After or during a Linux run, check which planned artifacts are still missing
-without approving the release bundle:
+The plan is only an execution manifest. Its `evidence_type` is `plan_only`, and it cannot satisfy any Gxx/Wxx/Rxx gate. Use `--run-preflight` only for the lightweight registry and runner self-tests before starting a long Linux run. After or during a Linux run, check which planned artifacts are still missing without approving the release bundle:
 
 ```bash
 scripts/python_bin.sh scripts/run_scanner_heal_linux_evidence_plan.py \
   --status-root /path/to/run-root --format json
 ```
 
-The status command exits nonzero while evidence is missing or malformed and
-keeps `release_approved: false`; use its `pending_gates` and `next_step` fields
-for issue writeback and failure triage.
+The status command exits nonzero while evidence is missing or malformed and keeps `release_approved: false`; use its `pending_gates` and `next_step` fields for issue writeback and failure triage.
 
 Lane descriptors can be assembled into that bundle with:
 
@@ -415,71 +265,19 @@ scripts/python_bin.sh scripts/check_test_wiring.py \
   /path/to/assembled-release-bundle
 ```
 
-The final argument is the new output directory. Every preceding argument is a
-measured descriptor, and each descriptor gate must keep its own passing status,
-lane identity, measured evidence type, complete required fields, relative
-artifact paths, and matching SHA256 hashes. The assembler may verify only the
-lanes already present; a partial assembled bundle remains blocked until all
-release gates are supplied.
+The final argument is the new output directory. Every preceding argument is a measured descriptor, and each descriptor gate must keep its own passing status, lane identity, measured evidence type, complete required fields, relative artifact paths, and matching SHA256 hashes. The assembler may verify only the lanes already present; a partial assembled bundle remains blocked until all release gates are supplied.
 
-The bundle checker is intentionally stricter than the case checker. It requires
-schema 2 registry metadata, `evidence: measured`, the current checkout revision,
-all G01-G14/P1-P4/R-E/R-D/R-L gates, per-gate `status: pass`, lane identity,
-relative artifact paths, matching SHA256 hashes, and non-empty summaries. It
-also binds each evidence field to its own run provenance: `source_revision`,
-`run_id`, `measurement_window_id`, timezone-qualified `started_at` and
-`finished_at`, command arguments, and artifact format. The field
-`source_revision` must match the bundle revision, and measured performance
-duration cannot exceed the recorded run window.
-When an evidence or profile artifact declares a JSON format, the checker also
-opens that artifact and requires its payload to repeat the same measured
-`source_revision`, `run_id`, `measurement_window_id`, gate and field identity;
-profile sub-artifacts must additionally name their artifact kind. Updating only
-the outer bundle hash cannot turn a stale JSON summary into current release
-evidence.
+The bundle checker is intentionally stricter than the case checker. It requires schema 2 registry metadata, `evidence: measured`, the current checkout revision, all G01-G14/P1-P4/R-E/R-D/R-L gates, per-gate `status: pass`, lane identity, relative artifact paths, matching SHA256 hashes, and non-empty summaries. It also binds each evidence field to its own run provenance: `source_revision`, `run_id`, `measurement_window_id`, timezone-qualified `started_at` and `finished_at`, command arguments, and artifact format. The field `source_revision` must match the bundle revision, and measured performance duration cannot exceed the recorded run window. When an evidence or profile artifact declares a JSON format, the checker also opens that artifact and requires its payload to repeat the same measured `source_revision`, `run_id`, `measurement_window_id`, gate and field identity; profile sub-artifacts must additionally name their artifact kind. Updating only the outer bundle hash cannot turn a stale JSON summary into current release evidence.
 
-The hard evidence shape remains claim-specific: mixed-version gates must name at
-least two participating versions, crash/durable replay gates must include
-crash-boundary evidence, G14 must record EC8+4 with at least three nodes and four
-drives per node plus multi-set and multi-pool evidence, performance gates need
-measured durations, P3's pressure run needs at least two hours, and P1 needs a
-symbolized profile summary with resolved samples. Every G14 field and every
-performance gate's fields must also share one `measurement_window_id`, so EC8+4,
-multi-set/multi-pool, ABBA, throughput, and profiling artifacts cannot be
-stitched together from unrelated runs. P1 `profile_evidence` must bind every
-required profile artifact kind (`allocation-profile`, `flamegraph`,
-`rss-samples`, and `save-frequency`) with a relative path, artifact format,
-non-empty file, matching SHA256, and descriptor-level `source_revision`,
-`run_id`, and `measurement_window_id` values that match the parent profile
-evidence. JSON profile artifact wrappers must also carry a bundled raw profile
-path with matching raw SHA256 and byte count plus the relevant allocation, RSS,
-sample, or save-frequency cost counters. Missing, synthetic, stale, tampered,
-undersized, cross-run, or topology-mismatched evidence returns a compact blocked
-or invalid JSON result and a nonzero exit.
+The hard evidence shape remains claim-specific: mixed-version gates must name at least two participating versions, crash/durable replay gates must include crash-boundary evidence, G14 must record EC8+4 with at least three nodes and four drives per node plus multi-set and multi-pool evidence, performance gates need measured durations, P3's pressure run needs at least two hours, and P1 needs a symbolized profile summary with resolved samples. Every G14 field and every performance gate's fields must also share one `measurement_window_id`, so EC8+4, multi-set/multi-pool, ABBA, throughput, and profiling artifacts cannot be stitched together from unrelated runs. P1 `profile_evidence` must bind every required profile artifact kind (`allocation-profile`, `flamegraph`, `rss-samples`, and `save-frequency`) with a relative path, artifact format, non-empty file, matching SHA256, and descriptor-level `source_revision`, `run_id`, and `measurement_window_id` values that match the parent profile evidence. JSON profile artifact wrappers must also carry a bundled raw profile path with matching raw SHA256 and byte count plus the relevant allocation, RSS, sample, or save-frequency cost counters. Missing, synthetic, stale, tampered, undersized, cross-run, or topology-mismatched evidence returns a compact blocked or invalid JSON result and a nonzero exit.
 
-The status-and-outcome raw collector normalizes live observations into the three
-measured raw JSON artifacts for G05, G06, and R-D. The descriptor producer then
-consumes those artifacts. The inputs must all carry schema 1, measured evidence,
-matching `source_revision`, a shared `run_id`, a shared
-`measurement_window_id`, matching `started_at`/`finished_at` timestamps, and
-non-empty command provenance. The collector and producer reject synthetic input,
-missing required cases, and command-line run/window/time overrides that would
-relabel raw artifacts from another status-and-outcome run.
+The status-and-outcome raw collector normalizes live observations into the three measured raw JSON artifacts for G05, G06, and R-D. The descriptor producer then consumes those artifacts. The inputs must all carry schema 1, measured evidence, matching `source_revision`, a shared `run_id`, a shared `measurement_window_id`, matching `started_at`/`finished_at` timestamps, and non-empty command provenance. The collector and producer reject synthetic input, missing required cases, and command-line run/window/time overrides that would relabel raw artifacts from another status-and-outcome run.
 
-The scheduler-pressure lane must also carry the numbers needed to close W09,
-W10, and W11: bounded deferred item/byte/age limits, zero duplicate tasks,
-pressure pacing engagement, recovery and lock-hold timings, fixed offered load,
-foreground p95/p99 latency, throughput, error count, attempt-cost samples, and
-completed heal object counts.
+The scheduler-pressure lane must also carry the numbers needed to close W09, W10, and W11: bounded deferred item/byte/age limits, zero duplicate tasks, pressure pacing engagement, recovery and lock-hold timings, fixed offered load, foreground p95/p99 latency, throughput, error count, attempt-cost samples, and completed heal object counts.
 
-This command validates the evidence package; it does not create evidence. A
-handwritten JSON file, a synthetic harness pass, a single focused case, or a
-local unit fixture still cannot satisfy the distributed, mixed-version,
-crash-restart, durable MRF replay, EC8+4, ABBA, or profiling gates.
+This command validates the evidence package; it does not create evidence. A handwritten JSON file, a synthetic harness pass, a single focused case, or a local unit fixture still cannot satisfy the distributed, mixed-version, crash-restart, durable MRF replay, EC8+4, ABBA, or profiling gates.
 
-Run parser/receipt regressions with
-`scripts/python_bin.sh scripts/check_test_wiring.py --self-test`. Those fixtures
-validate the checker only and produce no runtime or performance evidence.
+Run parser/receipt regressions with `scripts/python_bin.sh scripts/check_test_wiring.py --self-test`. Those fixtures validate the checker only and produce no runtime or performance evidence.
 
 For local bundle-shape dry runs, generate a task-owned fixture directory with:
 
@@ -488,8 +286,4 @@ scripts/python_bin.sh scripts/check_test_wiring.py \
   --write-scanner-heal-release-bundle-fixture /path/to/fixture-dir
 ```
 
-The generated file is marked `fixture_only` and is intentionally rejected by the
-release bundle checker. Use it to rehearse field names, artifact paths, hashes,
-profile artifact membership, mixed-version roles, and same-window provenance
-before copying the shape into a real measured bundle. It is not ABBA, profile,
-mixed-version, crash-restart, or release approval evidence.
+The generated file is marked `fixture_only` and is intentionally rejected by the release bundle checker. Use it to rehearse field names, artifact paths, hashes, profile artifact membership, mixed-version roles, and same-window provenance before copying the shape into a real measured bundle. It is not ABBA, profile, mixed-version, crash-restart, or release approval evidence.

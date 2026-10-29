@@ -383,7 +383,7 @@ impl Operation for TraceHandler {
             .map_err(|_| s3_error!(InvalidRequest, "invalid trace parameters"))?;
         let filter = TraceStreamFilter::from_request(&req.uri, &opts)?;
 
-        let node_name = sysinfo::System::host_name().unwrap_or_else(|| "rustfs".to_string());
+        let node_name = sysinfo::System::host_name().unwrap_or_else(|_| "rustfs".to_string());
         let mut subscription = subscribe_trace_events();
         let (tx, rx) = mpsc::channel::<Result<Bytes, StdError>>(64);
 

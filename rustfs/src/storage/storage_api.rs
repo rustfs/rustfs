@@ -28,13 +28,18 @@ pub(crate) mod ecstore_integrity {
     };
 }
 
-#[cfg(feature = "diagnostic-read-version-caller")]
+#[cfg(any(feature = "diagnostic-read-version-caller", feature = "diagnostic-local-batch"))]
 pub(crate) mod ecstore_diagnostic {
+    #[cfg(all(test, feature = "diagnostic-local-batch"))]
+    pub(crate) use rustfs_ecstore::api::diagnostic::current_request_id;
+    #[cfg(feature = "diagnostic-read-version-caller")]
     pub(crate) use rustfs_ecstore::api::diagnostic::{
         ReadVersionContextBoundary, ReadVersionEntrySource, with_captured_read_version_context, with_read_version_spawn_context,
     };
-    #[cfg(test)]
+    #[cfg(all(test, feature = "diagnostic-read-version-caller"))]
     pub(crate) use rustfs_ecstore::api::diagnostic::{current_read_version_entry_source, with_read_version_entry};
+    #[cfg(feature = "diagnostic-local-batch")]
+    pub(crate) use rustfs_ecstore::api::diagnostic::{in_request_context, request_context};
 }
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
