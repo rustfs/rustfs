@@ -3129,6 +3129,9 @@ fn should_fail_after_delete_commit(_root: &Path, _path: &str) -> bool {
 }
 
 fn log_startup_disk_io_error(stage: &str, path: &Path, err: &IoError) {
+    if err.kind() == ErrorKind::PermissionDenied {
+        log_startup_disk_permission_error(stage, path);
+    }
     warn!(
         event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
         component = LOG_COMPONENT_ECSTORE,
@@ -3143,10 +3146,50 @@ fn log_startup_disk_io_error(stage: &str, path: &Path, err: &IoError) {
     );
 }
 
+fn log_startup_disk_permission_error(stage: &str, path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).ok();
+        error!(
+            event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+            state = "permission_denied",
+            stage,
+            path = %path.display(),
+            runtime_uid = rustix::process::geteuid().as_raw(),
+            runtime_gid = rustix::process::getegid().as_raw(),
+            path_owner_uid = metadata.as_ref().map(MetadataExt::uid),
+            path_owner_gid = metadata.as_ref().map(MetadataExt::gid),
+            remediation = "Stop RustFS and grant the runtime UID/GID access to the data directory and existing contents. For container upgrades from root to the default user, review ownership and run chown -R 10001:10001 <data-directory> on the host; account for ACLs and user-namespace mappings",
+            "Disk local startup permission denied"
+        );
+    }
+    #[cfg(not(unix))]
+    error!(
+        event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+        state = "permission_denied",
+        stage,
+        path = %path.display(),
+        remediation = "Grant the RustFS service account write and delete access to the data directory and existing contents",
+        "Disk local startup permission denied"
+    );
+}
+
 fn log_startup_disk_error(stage: &str, path: &Path, err: &DiskError) {
     if let DiskError::Io(io_err) = err {
         log_startup_disk_io_error(stage, path, io_err);
         return;
+    }
+
+    if matches!(
+        err,
+        DiskError::DiskAccessDenied | DiskError::FileAccessDenied | DiskError::VolumeAccessDenied
+    ) {
+        log_startup_disk_permission_error(stage, path);
     }
 
     warn!(
@@ -6114,6 +6157,8 @@ impl LocalDisk {
         #[cfg(not(target_os = "linux"))]
         let io_root = Self::open_mount_lease(&root)?;
 
+        Self::check_startup_writable(&publication_root, &root).await?;
+
         ensure_data_usage_layout(&io_root)
             .await
             .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))
@@ -6307,6 +6352,21 @@ impl LocalDisk {
         disk.make_meta_volumes().await.inspect_err(|err| {
             log_startup_disk_error("make_meta_volumes", &disk.root, err);
         })?;
+
+        // Existing directories may be readable but owned by the UID of an old
+        // container. mkdir_all alone does not establish that they are writable.
+        for directory in [
+            RUSTFS_META_BUCKET,
+            ".rustfs.sys/buckets",
+            RUSTFS_META_MULTIPART_BUCKET,
+            ".rustfs.sys/config",
+            RUSTFS_META_TMP_BUCKET,
+            RUSTFS_META_TMP_DELETED_BUCKET,
+            ".rustfs.sys/datausage",
+            ".rustfs.sys/datausage/state",
+        ] {
+            Self::check_startup_writable(&disk.publication_root, &disk.root.join(directory)).await?;
+        }
 
         let (exit_tx, exit_rx) = tokio::sync::broadcast::channel(1);
         disk.exit_signal = Some(exit_tx);
@@ -6666,6 +6726,28 @@ impl LocalDisk {
         let md = fs::metadata(&self.io_format_path).await.map_err(to_unformatted_disk_error)?;
         Ok(md)
     }
+    async fn check_startup_writable(publication_root: &os::PublicationRoot, path: &Path) -> Result<()> {
+        let root = publication_root.clone();
+        let probe_path = path.to_path_buf();
+        let probe = tokio::task::spawn_blocking(move || root.check_writable(&probe_path));
+        match timeout(crate::disk::disk_store::get_max_timeout_duration(), probe).await {
+            Ok(result) => result
+                .map_err(DiskError::other)?
+                .inspect_err(|err| log_startup_disk_io_error("check_writable", path, err))
+                .map_err(|err| {
+                    if err.kind() == ErrorKind::PermissionDenied {
+                        DiskError::FileAccessDenied
+                    } else {
+                        DiskError::from(err)
+                    }
+                }),
+            Err(_) => {
+                log_startup_disk_error("check_writable", path, &DiskError::Timeout);
+                Err(DiskError::Timeout)
+            }
+        }
+    }
+
     async fn make_meta_volumes(&self) -> Result<()> {
         let buckets = format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}");
         let multipart = format!("{}/{}", RUSTFS_META_BUCKET, "multipart");
@@ -13810,6 +13892,239 @@ mod test {
                 buffer: Arc::clone(&self.buffer),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn startup_writability_preserves_existing_data_and_removes_probes() {
+        let dir = tempfile::tempdir().expect("create disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("initialize writable disk");
+        let metadata = dir.path().join(".rustfs.sys/config/existing");
+        fs::write(&metadata, b"existing metadata")
+            .await
+            .expect("write existing metadata");
+        drop(disk);
+
+        LocalDisk::new(&endpoint, true).await.expect("reopen writable disk");
+        assert_eq!(fs::read(metadata).await.expect("read preserved metadata"), b"existing metadata");
+        for directory in [
+            "",
+            RUSTFS_META_BUCKET,
+            ".rustfs.sys/buckets",
+            RUSTFS_META_MULTIPART_BUCKET,
+            ".rustfs.sys/config",
+            RUSTFS_META_TMP_BUCKET,
+            RUSTFS_META_TMP_DELETED_BUCKET,
+            ".rustfs.sys/datausage",
+            ".rustfs.sys/datausage/state",
+        ] {
+            for entry in std::fs::read_dir(dir.path().join(directory)).expect("list probed directory") {
+                assert!(
+                    !entry
+                        .expect("read directory entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".rustfs-write-check-"),
+                    "startup probes must be deleted"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_writability_rejects_unwritable_paths() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::process::CommandExt;
+
+        const CHILD_ROOT: &str = "RUSTFS_TEST_STARTUP_WRITABILITY_ROOT";
+        const CHILD_BLOCKED: &str = "RUSTFS_TEST_STARTUP_WRITABILITY_BLOCKED";
+        const CHILD_HEALTHY: &str = "RUSTFS_TEST_STARTUP_WRITABILITY_HEALTHY";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let logs = CapturedLogs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(logs.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            assert_eq!(
+                std::fs::read(root.join(".rustfs.sys/config/existing")).expect("old metadata must remain readable"),
+                b"existing metadata"
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("create runtime");
+            let endpoint = Endpoint::try_from(root.to_str().expect("UTF-8 disk path")).expect("parse endpoint");
+            let result = runtime.block_on(LocalDisk::new(&endpoint, false));
+            assert!(
+                matches!(result, Err(DiskError::FileAccessDenied)),
+                "unwritable disk must not initialize: {result:?}"
+            );
+            crate::store::init_format::check_disk_fatal_errs(&[Some(DiskError::FileAccessDenied)])
+                .expect_err("a deployment with no writable disks must fail startup");
+            runtime.block_on(async {
+                use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+
+                let healthy_root = std::env::var(CHILD_HEALTHY).expect("healthy disk directory");
+                let mut bad = endpoint.clone();
+                bad.set_pool_index(0);
+                bad.set_set_index(0);
+                bad.set_disk_index(0);
+                let mut healthy = Endpoint::try_from(healthy_root.as_str()).expect("parse healthy endpoint");
+                healthy.set_pool_index(0);
+                healthy.set_set_index(0);
+                healthy.set_disk_index(1);
+                let endpoints = Endpoints::from(vec![bad, healthy]);
+                let pools = EndpointServerPools(vec![PoolEndpoints {
+                    legacy: false,
+                    set_count: 1,
+                    drives_per_set: 2,
+                    endpoints: endpoints.clone(),
+                    cmd_line: "startup-writability".into(),
+                    platform: "test".into(),
+                }]);
+                let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                let options = crate::disk::DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                };
+                runtime_sources::initialize_local_disk_maps(&ctx, pools, &options)
+                    .await
+                    .expect("an unwritable disk must not abort early registry setup");
+                let entries = ctx.local_disk_map();
+                let entries = entries.read().await;
+                assert!(
+                    entries
+                        .get(&endpoint.to_string())
+                        .expect("bad disk slot must remain registered")
+                        .is_none()
+                );
+                assert_eq!(entries.values().filter(|disk| disk.is_some()).count(), 1);
+                let slots = ctx.local_disk_set_drives();
+                let slots = slots.read().await;
+                assert!(slots[0][0][0].is_none());
+                assert!(slots[0][0][1].is_some());
+                drop(slots);
+                drop(entries);
+                let (disks, errors) = crate::store::init_format::init_disks(&endpoints, &options).await;
+                assert!(disks[0].is_none());
+                assert!(disks[1].is_some());
+                assert_eq!(errors[0], Some(DiskError::FileAccessDenied));
+                assert!(errors[1].is_none());
+                crate::store::init_format::check_disk_fatal_errs(&errors)
+                    .expect("mixed disk availability must reach the existing quorum decision");
+            });
+            let output = logs.contents();
+            for expected in [
+                "permission_denied",
+                "PermissionDenied",
+                "raw_os_error",
+                "runtime_uid",
+                "runtime_gid",
+                "path_owner_uid",
+                "path_owner_gid",
+                "chown -R 10001:10001",
+                &std::env::var(CHILD_BLOCKED).expect("blocked directory"),
+            ] {
+                assert!(output.contains(expected), "missing diagnostic {expected:?}: {output}");
+            }
+            let blocked = std::env::var(CHILD_BLOCKED).expect("blocked directory");
+            let owner = std::fs::metadata(blocked).expect("read blocked directory ownership");
+            for expected in [
+                format!("runtime_uid={}", rustix::process::geteuid().as_raw()),
+                format!("runtime_gid={}", rustix::process::getegid().as_raw()),
+                format!("path_owner_uid={}", owner.uid()),
+                format!("path_owner_gid={}", owner.gid()),
+            ] {
+                assert!(output.contains(&expected), "incorrect ownership diagnostic {expected:?}: {output}");
+            }
+            return;
+        }
+
+        let runtime = tokio::runtime::Runtime::new().expect("create fixture runtime");
+        for blocked in ["", ".rustfs.sys/config", ".rustfs.sys/datausage/state"] {
+            let dir = tempfile::tempdir().expect("create disk directory");
+            let healthy_dir = tempfile::tempdir().expect("create healthy disk directory");
+            let root = dir.path().canonicalize().expect("resolve fixture directory");
+            let endpoint = Endpoint::try_from(root.to_str().expect("UTF-8 disk path")).expect("parse endpoint");
+            runtime
+                .block_on(LocalDisk::new(&endpoint, false))
+                .expect("initialize old disk layout");
+            std::fs::write(root.join(".rustfs.sys/config/existing"), b"existing metadata").expect("write readable old metadata");
+            std::fs::set_permissions(root.join(".rustfs.sys/config/existing"), std::fs::Permissions::from_mode(0o644))
+                .expect("allow old metadata reads by the upgraded identity");
+            // Root CI still exercises real EACCES by running the child as an
+            // unprivileged user against root-owned directories.
+            let root_test = rustix::process::geteuid().is_root();
+            if root_test {
+                std::fs::set_permissions(healthy_dir.path(), std::fs::Permissions::from_mode(0o777))
+                    .expect("allow the upgraded identity to initialize the healthy disk");
+                for directory in [
+                    "",
+                    RUSTFS_META_BUCKET,
+                    ".rustfs.sys/buckets",
+                    RUSTFS_META_MULTIPART_BUCKET,
+                    ".rustfs.sys/config",
+                    RUSTFS_META_TMP_BUCKET,
+                    RUSTFS_META_TMP_DELETED_BUCKET,
+                    ".rustfs.sys/datausage",
+                    ".rustfs.sys/datausage/state",
+                ] {
+                    std::fs::set_permissions(root.join(directory), std::fs::Permissions::from_mode(0o777))
+                        .expect("make unblocked fixture paths accessible to child");
+                }
+            }
+            let blocked_path = if blocked.is_empty() {
+                root.clone()
+            } else {
+                root.join(blocked)
+            };
+            std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o555)).expect("deny directory writes");
+            let mut child = std::process::Command::new(std::env::current_exe().expect("find test executable"));
+            child
+                .args([
+                    "--exact",
+                    "disk::local::test::startup_writability_rejects_unwritable_paths",
+                    "--nocapture",
+                ])
+                .env(CHILD_ROOT, &root)
+                .env(CHILD_HEALTHY, healthy_dir.path())
+                .env(CHILD_BLOCKED, &blocked_path);
+            if root_test {
+                child.gid(65534).uid(65534);
+            }
+            let output = child.output().expect("run unprivileged startup regression");
+            std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o755)).expect("restore fixture permissions");
+            assert!(
+                output.status.success(),
+                "blocked path {blocked_path:?}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            runtime
+                .block_on(LocalDisk::new(&endpoint, false))
+                .expect("restoring permissions must allow startup again");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn startup_writability_rejects_symlinked_internal_directory() {
+        let dir = tempfile::tempdir().expect("create disk directory");
+        let outside = tempfile::tempdir().expect("create outside directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse endpoint");
+        LocalDisk::new(&endpoint, false).await.expect("initialize disk");
+        let config = dir.path().join(".rustfs.sys/config");
+        std::fs::remove_dir(&config).expect("remove empty config directory");
+        std::os::unix::fs::symlink(outside.path(), &config).expect("replace config directory with symlink");
+        assert!(
+            LocalDisk::new(&endpoint, false).await.is_err(),
+            "probe must not follow an internal symlink"
+        );
+        assert_eq!(std::fs::read_dir(outside.path()).expect("list outside directory").count(), 0);
     }
 
     pub(super) fn test_file_info(name: &str, version_id: Uuid, data_dir: Option<Uuid>, data: Option<Bytes>) -> FileInfo {
