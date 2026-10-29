@@ -13,7 +13,7 @@
 # limitations under the License.
 
 name: Quick Checks
-description: Run the shared compile-free RustFS quality checks.
+description: Run the shared RustFS quality checks.
 
 runs:
   using: composite
@@ -24,6 +24,7 @@ runs:
         tool: |
           ripgrep@15.2.0
           shellcheck@0.11.0
+          cargo-nextest@0.9.138
 
     - name: Install actionlint
       shell: bash

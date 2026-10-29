@@ -214,6 +214,36 @@ class ExecutionEvidenceTests(unittest.TestCase):
             self.verify(report=junit([("crate-a", "one", None), ("crate-b", "two", None),
                                       ("unknown-binary", "unknown-case", "skipped")]))
 
+    def test_setup_scripts_must_pass_without_counting_as_selected_tests(self):
+        cases = [("crate-a", "one", None), ("crate-b", "two", None)]
+        script = ("@setup-script:prepare", "prepare", None)
+        self.assertEqual(self.verify(report=junit([*cases, script])), 2)
+        for outcome in ("skipped", "failure", "error"):
+            with self.subTest(outcome=outcome), self.assertRaises(ValueError):
+                self.verify(report=junit([*cases, (*script[:2], outcome)]))
+        with self.assertRaisesRegex(ValueError, "missing"):
+            self.verify(report=junit([cases[0], script]))
+
+    def test_malformed_or_duplicate_setup_script_evidence_is_rejected(self):
+        cases = [("crate-a", "one", None), ("crate-b", "two", None)]
+        script = ("@setup-script:prepare", "prepare", None)
+        for extra in ([script, script], [("@setup-script:", "", None)],
+                      [(script[0], "wrong-name", None)]):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                self.verify(report=junit([*cases, *extra]))
+        report = junit([*cases, script])
+        report.append(copy.deepcopy(report[-1]))
+        with self.assertRaises(ValueError):
+            self.verify(report=report)
+        report = junit(cases)
+        ET.SubElement(report, "testsuite", name=script[0], failures="0", errors="0")
+        with self.assertRaises(ValueError):
+            self.verify(report=report)
+        report = junit([*cases, script])
+        report[-1].find("testcase").set("classname", "wrong-suite")
+        with self.assertRaisesRegex(ValueError, "misplaced"):
+            self.verify(report=report)
+
     def test_empty_unlisted_or_failed_top_level_report_is_rejected(self):
         with self.assertRaises(ValueError):
             self.verify(listing_value={"rust-suites": {}})
@@ -243,6 +273,59 @@ class ExecutionEvidenceTests(unittest.TestCase):
         duplicate_report = junit([("e2e", name, None) for name in names] + [("other-binary", names[0], None)])
         with self.assertRaises(ValueError):
             self.verify(duplicate_name, duplicate_report, core=True)
+
+
+class NextestSetupScriptTests(unittest.TestCase):
+    def test_real_nextest_setup_script_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / ".config").mkdir()
+            (root / "Cargo.toml").write_text(
+                '[package]\nname = "evidence-fixture"\nversion = "0.1.0"\nedition = "2021"\n[workspace]\n'
+            )
+            (root / "rust-toolchain.toml").write_text((artifact.ROOT / "rust-toolchain.toml").read_text())
+            (root / "src/lib.rs").write_text(
+                '#[test]\nfn setup_is_applied() {\n'
+                '    assert_eq!(std::env::var("EVIDENCE_SETUP").unwrap(), "ready");\n}\n'
+            )
+            config = root / ".config/nextest.toml"
+            config.write_text(
+                'experimental = ["setup-scripts"]\n'
+                '[scripts.setup.prepare]\ncommand = ["sh", "prepare.sh"]\n'
+                '[[profile.default.scripts]]\nfilter = "all()"\nsetup = "prepare"\n'
+                '[profile.ci.junit]\npath = "junit.xml"\n'
+            )
+            script = root / "prepare.sh"
+            script.write_text('echo EVIDENCE_SETUP=ready >> "$NEXTEST_ENV"\n')
+            environment = {**os.environ, "CARGO_TARGET_DIR": str(root / "target"), "CARGO_NET_OFFLINE": "true"}
+
+            def nextest(*arguments):
+                return subprocess.run(["cargo", "nextest", *arguments], cwd=root, env=environment,
+                                      capture_output=True, text=True, timeout=120)
+
+            listed = nextest("list", "--profile", "ci", "--message-format", "json")
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            listing_file = root / "listing.json"
+            listing_file.write_text(listed.stdout)
+            report = root / "target/nextest/ci/junit.xml"
+            executed = nextest("run", "--profile", "ci", "--no-tests", "fail")
+            self.assertEqual(executed.returncode, 0, executed.stderr)
+            suites = ET.parse(report).getroot().findall("testsuite")
+            self.assertIn("@setup-script:prepare", [suite.get("name") for suite in suites])
+            verified = subprocess.run(
+                [sys.executable, str(artifact.ROOT / "scripts/ci_test_artifact.py"), "evidence",
+                 str(listing_file), str(report)], capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+            self.assertIn("Verified 1 test executions", verified.stdout)
+
+            report.unlink()
+            script.write_text('exit 1\n')
+            failed = nextest("run", "--profile", "ci", "--no-tests", "fail")
+            self.assertNotEqual(failed.returncode, 0)
+            with self.assertRaisesRegex(ValueError, "successful nextest run"):
+                artifact.verify_execution(listing_file, report)
 
 
 if __name__ == "__main__":

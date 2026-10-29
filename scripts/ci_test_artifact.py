@@ -139,18 +139,28 @@ def verify_execution(listing, junit, core=False):
     if report.tag != "testsuites" or report.get("failures") != "0" or report.get("errors") != "0":
         raise ValueError("test report must be a successful nextest run")
     actual = set()
+    seen = set()
     for suite in report.findall("testsuite"):
-        for case in suite.findall("testcase"):
-            key = (suite.get("name"), case.get("name"))
+        name = suite.get("name", "")
+        setup_id = name.removeprefix("@setup-script:") if name.startswith("@setup-script:") else None
+        cases = suite.findall("testcase")
+        # Nextest reports each setup script as a one-case suite outside the
+        # Rust test inventory. Validate its result without counting it as a test.
+        if setup_id is not None and (not setup_id or len(cases) != 1 or cases[0].get("name") != setup_id):
+            raise ValueError("invalid setup-script execution")
+        for case in cases:
+            key = (name, case.get("name"))
             # Ignored tests may be emitted as skipped; selected tests may not.
             if key in known - expected and case.find("skipped") is not None:
                 continue
-            if key in actual or case.get("classname") != key[0]:
+            if key in seen or case.get("classname") != key[0]:
                 raise ValueError("duplicate or misplaced test execution")
             if (case.get("status", "passed") != "passed" or case.find("skipped") is not None
                     or case.find("failure") is not None or case.find("error") is not None):
                 raise ValueError("selected test did not pass")
-            actual.add(key)
+            seen.add(key)
+            if setup_id is None:
+                actual.add(key)
     if actual != expected:
         raise ValueError(f"test execution differs from plan: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}")
     return len(actual)
