@@ -635,6 +635,22 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             evidence.aggregate(self.chain, self.directory, self.needs)
 
+    def test_summarize_marks_a_preflight_allowed_skipped_lane(self):
+        needs = {**self.needs, "performance": {"result": "skipped"}}
+        (self.directory / "performance.json").unlink()
+        result = evidence.summarize(self.chain, self.directory, needs, ["performance"])
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["skipped_lanes"], ["performance"])
+        reportable = {**result, "chain": {**self.chain, "testing_sha": "d" * 40,
+                                          "candidate": {"workflow_sha": "b" * 40,
+                                                        "manifest": {"build_run_id": 1, "build_run_attempt": 1,
+                                                                     "source_ref": "main", "source_sha": "a" * 40,
+                                                                     "package_sha256": "e" * 64}}}}
+        self.assertIn("Preflight-skipped lanes", evidence.render_summary(reportable))
+        denied = evidence.summarize(self.chain, self.directory, needs)
+        self.assertFalse(denied["complete"])
+        self.assertIn("without preflight permission", denied["error"])
+
     def test_partial_rerun_missing_artifact_and_zero_test_fail(self):
         path = self.directory / "s3.json"
         original = json.loads(path.read_text())
@@ -837,6 +853,10 @@ class EnvelopeTests(unittest.TestCase):
         self.assertIn("Probe performance fleet runner", prepare)
         self.assertIn("check_functional_runners.py pf-testing", prepare)
         self.assertIn("performance_ready: ${{ steps.perf_probe.outputs.performance_ready }}", prepare)
+        # TEMPORARY: the pf-testing environment is broken and the probe is
+        # disabled in the workflow, so prepare must force the lane offline.
+        # Remove this assertion together with the probe restore.
+        self.assertIn('echo "performance_ready=offline" >> "$GITHUB_OUTPUT"', prepare)
 
     def test_every_lane_retains_failed_evidence_and_identifies_its_own_attempt(self):
         paths = list((candidate.ROOT / ".github/workflows").glob("rustfs-*-test.yml"))

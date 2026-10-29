@@ -156,7 +156,7 @@ def record(chain, suite, report, output):
         raise error
 
 
-def summarize(chain, directory, needs):
+def summarize(chain, directory, needs, allow_skipped=()):
     """Retain failed/missing lanes without granting complete-success evidence."""
     lanes = []
     for suite in SUITES:
@@ -174,10 +174,13 @@ def summarize(chain, directory, needs):
               "complete": False, "error": None, "completed_at": datetime.now(timezone.utc).isoformat()}
     try:
         require(chain is not None, "candidate preparation did not complete")
-        aggregate(chain, directory, {suite: value for suite, value in needs.items() if suite != "prepare"})
+        aggregate(chain, directory, {suite: value for suite, value in needs.items() if suite != "prepare"}, allow_skipped)
         result["complete"] = True
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         result["error"] = str(error)
+    skipped = sorted(name for name, value in needs.items() if value.get("result") == "skipped")
+    if skipped:
+        result["skipped_lanes"] = skipped
     return result
 
 
@@ -185,6 +188,8 @@ def render_summary(result):
     lines = ["# RustFS functional chain report", "",
              "- All required suites passed with verified evidence: " + str(result["complete"]).lower(),
              "- Preparation: " + result["needs"].get("prepare", {}).get("result", "missing")]
+    if result.get("skipped_lanes"):
+        lines.append("- Preflight-skipped lanes (allowed by the chain driver): " + ", ".join(result["skipped_lanes"]))
     if result["chain"]:
         chain = result["chain"]
         manifest = chain["candidate"]["manifest"]
@@ -244,7 +249,7 @@ def main():
     args = parser.parse_args()
     if args.mode == "summarize":
         chain = current_chain() if os.environ.get("CHAIN_MANIFEST") else None
-        result = summarize(chain, args.directory, json.loads(os.environ["CHAIN_NEEDS"]))
+        result = summarize(chain, args.directory, json.loads(os.environ["CHAIN_NEEDS"]), args.allow_skipped.split(","))
         args.output.write_text(json.dumps(result, sort_keys=True) + "\n")
         args.output.with_suffix(".md").write_text(render_summary(result))
         if os.environ.get("GITHUB_STEP_SUMMARY"):

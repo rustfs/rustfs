@@ -36,6 +36,24 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(result["workflow_sha"], "a" * 40)
         self.assertEqual(result["candidate"]["workflow_sha"], "c" * 40)
 
+    def test_complete_evidence_with_skipped_performance_is_accepted(self):
+        skipped = copy.deepcopy(self.summary)
+        skipped["skipped_lanes"] = ["performance"]
+        skipped["suites"] = [record for record in skipped["suites"] if record["suite"] != "performance"]
+        result = self.validate(skipped)
+        self.assertEqual(result["run_id"], 123)
+
+    def test_complete_evidence_with_a_functional_lane_skipped_is_rejected(self):
+        skipped = copy.deepcopy(self.summary)
+        skipped["skipped_lanes"] = ["performance", "heal"]
+        skipped["suites"] = [record for record in skipped["suites"] if record["suite"] not in ("performance", "heal")]
+        with self.assertRaises(ValueError):
+            self.validate(skipped)
+        missing = copy.deepcopy(self.summary)
+        missing["suites"] = [record for record in missing["suites"] if record["suite"] != "heal"]
+        with self.assertRaises(ValueError):
+            self.validate(missing)
+
     def test_substituted_producer_pin_attempt_or_empty_suite_fails(self):
         with self.assertRaises(ValueError):
             self.validate(candidate={**self.candidate, "workflow_sha": "e" * 40})

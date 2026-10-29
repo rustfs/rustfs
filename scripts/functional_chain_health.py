@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import subprocess
 
-from functional_chain_evidence import validate_records
+from functional_chain_evidence import SUITES, validate_records
 from resolve_functional_candidate import REPOSITORY, api, read_json_artifact, require, resolve, sha
 
 WORKFLOW = "rustfs-functional-chain.yml"
@@ -28,7 +28,15 @@ def validate_summary(summary, run):
     chain = summary["chain"]
     require(chain["run_id"] == run["id"] and chain["attempt"] == run["run_attempt"] and chain["workflow_sha"] == run["head_sha"], "complete evidence belongs to another run attempt")
     require(sha(chain["testing_sha"]), "missing test-script pin")
-    validate_records(chain, summary["suites"])
+    # The chain skips the performance lane only when its preflight probe
+    # reports the pf-testing fleet offline (aggregate --allow-skipped), so a
+    # complete chain during such an outage carries 11 suites. Accept exactly
+    # that designed skip; any other missing lane stays invalid.
+    skipped = summary.get("skipped_lanes", [])
+    require(isinstance(skipped, list) and set(skipped) <= {"performance"},
+            "complete evidence skipped a lane the chain driver never allows")
+    expected_suites = [suite for suite in SUITES if suite not in skipped]
+    validate_records(chain, summary["suites"], expected_suites)
     candidate = chain["candidate"]
     manifest = candidate["manifest"]
     require(resolve(manifest["build_run_id"], manifest["build_run_attempt"]) == candidate, "producer candidate identity changed")
