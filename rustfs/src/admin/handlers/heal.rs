@@ -2293,33 +2293,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_nested_heal_routes_still_require_authentication() {
-        use s3s::route::S3Route;
-
         let mut router = super::S3Router::new(false);
         super::register_heal_route(&mut router).expect("register production Heal routes");
         for prefix in ["/rustfs/admin", "/minio/admin"] {
             for object in ["dir/object.bin", "dir%2Fobject.bin", "literal%252Fslash"] {
-                let mut req = s3s::S3Request {
-                    input: s3s::Body::empty(),
-                    method: http::Method::POST,
-                    uri: format!("{prefix}/v3/heal/test-bucket/{object}").parse().expect("Heal URI"),
-                    headers: http::HeaderMap::new(),
-                    extensions: http::Extensions::new(),
-                    credentials: None,
-                    region: None,
-                    service: None,
-                    trailing_headers: None,
-                };
+                let uri: http::Uri = format!("{prefix}/v3/heal/test-bucket/{object}").parse().expect("Heal URI");
                 let err = router
-                    .check_access(&mut req)
+                    .check_unsigned_access(http::Method::POST, uri.clone())
                     .await
                     .expect_err("router must require a signature");
-                assert_eq!(err.code(), &S3ErrorCode::AccessDenied.into());
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
                 let err = router
-                    .call(req)
+                    .call_unsigned(http::Method::POST, uri)
                     .await
                     .expect_err("handler must independently require authentication");
-                assert_eq!(err.code(), &S3ErrorCode::InvalidRequest.into());
+                assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
                 assert!(err.to_string().contains("authentication required"));
             }
         }
@@ -2327,34 +2315,22 @@ mod tests {
 
     #[tokio::test]
     async fn replacement_recovery_diagnostics_require_authentication() {
-        use s3s::route::S3Route;
-
         let mut router = super::S3Router::new(false);
         super::register_heal_route(&mut router).expect("register production Heal routes");
         for prefix in ["/rustfs/admin", "/minio/admin"] {
             let path = format!("{prefix}/v4/heal/replacement-recovery");
             assert!(router.contains_compatible_route(http::Method::GET, &path));
-            let mut req = s3s::S3Request {
-                input: s3s::Body::empty(),
-                method: http::Method::GET,
-                uri: path.parse().expect("replacement diagnostics URI"),
-                headers: http::HeaderMap::new(),
-                extensions: http::Extensions::new(),
-                credentials: None,
-                region: None,
-                service: None,
-                trailing_headers: None,
-            };
+            let uri: http::Uri = path.parse().expect("replacement diagnostics URI");
             let err = router
-                .check_access(&mut req)
+                .check_unsigned_access(http::Method::GET, uri.clone())
                 .await
                 .expect_err("diagnostics router must require a signature");
-            assert_eq!(err.code(), &S3ErrorCode::AccessDenied.into());
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
             let err = router
-                .call(req)
+                .call_unsigned(http::Method::GET, uri)
                 .await
                 .expect_err("diagnostics handler must authenticate before inspecting local records");
-            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest.into());
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
             assert!(err.to_string().contains("authentication required"));
         }
     }

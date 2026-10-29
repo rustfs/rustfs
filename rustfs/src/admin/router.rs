@@ -3233,6 +3233,51 @@ impl<T: Operation> S3Router<T> {
     pub(crate) fn registered_routes(&self) -> &[String] {
         &self.registered_routes
     }
+
+    /// Runs an unsigned request (no presented credentials, no headers, empty
+    /// body) through this router's `check_access` gate, so handler tests can
+    /// pin the router's authentication with owned types only.
+    pub(crate) async fn check_unsigned_access(&self, method: Method, uri: Uri) -> rustfs_s3_types::S3Result<()> {
+        let mut req = unsigned_legacy_request(method, uri);
+        S3Route::check_access(self, &mut req)
+            .await
+            .map_err(rustfs_s3_types::S3Error::from)
+    }
+
+    /// Dispatches an unsigned request (no presented credentials, no headers,
+    /// empty body) through this router's `call`, returning the owned admin
+    /// response. Every dispatched response carries a status, so a missing one
+    /// fails the test.
+    pub(crate) async fn call_unsigned(
+        &self,
+        method: Method,
+        uri: Uri,
+    ) -> rustfs_s3_types::S3Result<crate::admin::operation::AdminResponse> {
+        let resp = S3Route::call(self, unsigned_legacy_request(method, uri))
+            .await
+            .map_err(rustfs_s3_types::S3Error::from)?;
+        let status = resp.status.expect("a dispatched admin response carries a status");
+        Ok(crate::admin::operation::AdminResponse::with_headers(
+            status,
+            resp.output.into(),
+            resp.headers,
+        ))
+    }
+}
+
+#[cfg(test)]
+fn unsigned_legacy_request(method: Method, uri: Uri) -> S3Request<Body> {
+    S3Request {
+        input: Body::empty(),
+        method,
+        uri,
+        headers: HeaderMap::new(),
+        extensions: Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
 }
 
 impl<T: Operation> Default for S3Router<T> {

@@ -91,56 +91,42 @@ impl Operation for HealthCheckHandler {
 mod tests {
     use super::*;
     use http_body_util::BodyExt as _;
-    use s3s::route::S3Route as _;
     use serial_test::serial;
     use temp_env::with_var;
 
-    fn health_request(method: Method) -> s3s::S3Request<s3s::Body> {
-        s3s::S3Request {
-            input: s3s::Body::empty(),
-            method,
-            uri: HEALTH_PREFIX.parse().expect("health URI"),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
-    }
-
-    async fn call_real_health_handler(method: Method) -> s3s::S3Response<s3s::Body> {
+    async fn call_real_health_handler(method: Method) -> (StatusCode, HeaderMap, Body) {
         let mut router = S3Router::new(false);
         router
             .insert(method.clone(), HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))
             .expect("health route should register");
         router
-            .call(health_request(method))
+            .call_unsigned(method, HEALTH_PREFIX.parse().expect("health URI"))
             .await
             .expect("health handler should return a response")
+            .into_parts()
     }
 
     #[tokio::test]
     async fn real_health_handler_get_and_head_preserve_wire_branches() {
-        let get = call_real_health_handler(Method::GET).await;
-        assert_eq!(get.status, Some(StatusCode::OK));
+        let (get_status, get_headers, get_body) = call_real_health_handler(Method::GET).await;
+        assert_eq!(get_status, StatusCode::OK);
         assert_eq!(
-            get.headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+            get_headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()),
             Some("application/json")
         );
         let payload: serde_json::Value =
-            serde_json::from_slice(&get.output.collect().await.expect("GET body should read").to_bytes())
+            serde_json::from_slice(&get_body.collect().await.expect("GET body should read").to_bytes())
                 .expect("GET health response should be JSON");
         assert_eq!(payload["status"], "ok");
 
-        let head = call_real_health_handler(Method::HEAD).await;
-        assert_eq!(head.status, Some(StatusCode::OK));
+        let (head_status, head_headers, head_body) = call_real_health_handler(Method::HEAD).await;
+        assert_eq!(head_status, StatusCode::OK);
         assert_eq!(
-            head.headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+            head_headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()),
             Some("application/json")
         );
         assert!(
-            head.output
+            head_body
                 .collect()
                 .await
                 .expect("HEAD body should read")
@@ -151,18 +137,12 @@ mod tests {
 
     #[tokio::test]
     async fn real_health_handler_rejects_unsupported_methods_with_allow_header() {
-        let response = call_real_health_handler(Method::POST).await;
+        let (status, headers, body) = call_real_health_handler(Method::POST).await;
 
-        assert_eq!(response.status, Some(StatusCode::METHOD_NOT_ALLOWED));
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(headers.get(http::header::ALLOW).and_then(|value| value.to_str().ok()), Some("GET, HEAD"));
         assert_eq!(
-            response
-                .headers
-                .get(http::header::ALLOW)
-                .and_then(|value| value.to_str().ok()),
-            Some("GET, HEAD")
-        );
-        assert_eq!(
-            response.output.collect().await.expect("error body should read").to_bytes(),
+            body.collect().await.expect("error body should read").to_bytes(),
             bytes::Bytes::from_static(b"Method Not Allowed")
         );
     }

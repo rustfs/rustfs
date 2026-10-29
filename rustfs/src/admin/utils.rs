@@ -165,9 +165,10 @@ mod tests {
         let payload = b"{\"ok\":true}".to_vec();
         let encrypted = encrypt_data(b"secret", &payload).expect("encrypt payload");
 
-        let decoded = read_compatible_admin_body(s3s::Body::from(encrypted), 1024, "/minio/admin/v3/list-users", "secret")
-            .await
-            .expect("decode payload");
+        let decoded =
+            read_compatible_admin_body(rustfs_s3_types::Body::from(encrypted), 1024, "/minio/admin/v3/list-users", "secret")
+                .await
+                .expect("decode payload");
 
         assert_eq!(decoded, payload);
     }
@@ -191,12 +192,17 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("failed to read request body: length limit exceeded"));
 
-        let legacy_body = s3s::Body::http_body(http_body_util::Full::new(bytes::Bytes::from_static(b"nine bytes!")));
-        let legacy_err = read_compatible_admin_body(legacy_body, 8, "/rustfs/admin/v3/list-users", "secret")
+        // A streaming body has no exact length up front, so the limit trips
+        // while frames accumulate rather than on the size hint.
+        let streaming_body = rustfs_s3_types::Body::from_stream(futures_util::stream::iter([
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"nine ")),
+            Ok(bytes::Bytes::from_static(b"bytes!")),
+        ]));
+        let streaming_err = read_compatible_admin_body(streaming_body, 8, "/rustfs/admin/v3/list-users", "secret")
             .await
-            .expect_err("legacy streaming bodies retain the same limit error");
-        assert_eq!(legacy_err.code(), err.code());
-        assert_eq!(legacy_err.message(), err.message());
+            .expect_err("streaming bodies retain the same limit error");
+        assert_eq!(streaming_err.code(), err.code());
+        assert_eq!(streaming_err.message(), err.message());
 
         let exact =
             read_compatible_admin_body(rustfs_s3_types::Body::from("12345678"), 8, "/rustfs/admin/v3/list-users", "secret")

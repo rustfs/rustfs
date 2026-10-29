@@ -1299,9 +1299,9 @@ mod pools_handler_tests {
 
         let err = decommission_start_api_error(err);
 
-        assert_eq!(err.code, s3s::S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.code, rustfs_s3_types::S3ErrorCode::ServiceUnavailable.into());
         assert!(err.message.contains("data movement gate (decommission activation)"), "{}", err.message);
-        let err = s3s::S3Error::from(contextualize_admin_pool_api_error(err, "start decommission", "pools [0]"));
+        let err = rustfs_s3_types::S3Error::from(contextualize_admin_pool_api_error(err, "start decommission", "pools [0]"));
         assert_eq!(
             err.headers().and_then(|headers| headers.get(http::header::RETRY_AFTER)),
             Some(&http::HeaderValue::from_static("1")),
@@ -1313,8 +1313,8 @@ mod pools_handler_tests {
     fn test_decommission_start_api_error_reports_a_refused_preflight_heal_as_retryable() {
         let err = decommission_start_api_error(crate::storage_api::error::StorageError::SlowDown);
 
-        assert_eq!(err.code, s3s::S3ErrorCode::ServiceUnavailable);
-        let err = s3s::S3Error::from(contextualize_admin_pool_api_error(err, "start decommission", "pools [0]"));
+        assert_eq!(err.code, rustfs_s3_types::S3ErrorCode::ServiceUnavailable.into());
+        let err = rustfs_s3_types::S3Error::from(contextualize_admin_pool_api_error(err, "start decommission", "pools [0]"));
         assert_eq!(err.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
     }
 
