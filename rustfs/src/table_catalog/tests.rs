@@ -4908,6 +4908,38 @@ async fn object_catalog_backup_is_idempotent_and_restorable() {
     );
 
     let table_entry_path = TableCatalogObjectPaths::default().table_entry_path(bucket, &namespace, &table);
+    backend.fail_next_put(RUSTFS_META_BUCKET, &table_entry_path).await;
+    let interrupted_visibility = store
+        .restore_object_catalog_backup(bucket, &first.backup_id, None, true)
+        .await
+        .expect_err("restore should fail before publishing the table entry");
+    assert!(
+        matches!(interrupted_visibility, TableCatalogStoreError::Internal(message) if message.contains("injected put failure"))
+    );
+    assert!(
+        store
+            .load_table(bucket, &namespace.public_name(), &table.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    store
+        .restore_object_catalog_backup(bucket, &first.backup_id, None, true)
+        .await
+        .expect("retrying after a pre-publication interruption should converge");
+    assert!(
+        store
+            .load_table(bucket, &namespace.public_name(), &table.as_str())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    store
+        .drop_table(bucket, &namespace.public_name(), &table.as_str())
+        .await
+        .unwrap();
+    store.drop_namespace(bucket, &namespace.public_name()).await.unwrap();
+
     backend.fail_after_next_put(RUSTFS_META_BUCKET, &table_entry_path).await;
     let interrupted = store
         .restore_object_catalog_backup(bucket, &first.backup_id, None, true)
