@@ -919,7 +919,10 @@ class WorkflowTimeoutTests(unittest.TestCase):
             with self.subTest(suite=suite):
                 source = (candidate.ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text()
                 job = yaml_block(source.splitlines(), job_id, 2)
-                job_timeout = 360 if suite == "pool-expand" else 60
+                # heal: a progressing heal outran the shared 45-minute step
+                # cap (chain 40796474356), so it gets a 90-minute run budget
+                # and a 120-minute job budget for setup, report and cleanup.
+                job_timeout = 360 if suite == "pool-expand" else 120 if suite == "heal" else 60
                 self.assertIn(f"    timeout-minutes: {job_timeout}", job)
                 steps = named_steps(job)
                 primary = [step for step in steps.values() if any(
@@ -933,6 +936,8 @@ class WorkflowTimeoutTests(unittest.TestCase):
                         self.assertIsNotNone(timeout_input, event)
                         self.assertIn("        default: '240'", timeout_input)
                         self.assertIn("        required: false", timeout_input)
+                elif suite == "heal":
+                    self.assertIn("        timeout-minutes: 90", primary[0])
                 else:
                     self.assertIn("        timeout-minutes: 45", primary[0])
                 cleanup = "Cleanup environment"

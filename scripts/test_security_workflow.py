@@ -540,10 +540,10 @@ class FaultToleranceWorkflowContractTests(unittest.TestCase):
             "GITHUB_RUN_ID": "314159",
         }
 
-    def write_result(self, *, seen: int = 44, complete: bool = True,
+    def write_result(self, *, seen: int = 54, complete: bool = True,
                      duplicate: bool = False, testing_sha: str | None = None,
                      unrelated_seen: bool = False, missing_verdict: bool = False) -> None:
-        expected = [f"CASE-{index:02d}" for index in range(44)]
+        expected = [f"CASE-{index:02d}" for index in range(54)]
         seen_cases = expected[:seen]
         if unrelated_seen:
             seen_cases = [f"OTHER-{index:02d}" for index in range(seen)]
@@ -555,14 +555,14 @@ class FaultToleranceWorkflowContractTests(unittest.TestCase):
         payload = {
             "schema_version": 1,
             "auto_testing_sha": testing_sha or self.TESTING_SHA,
-            "selected_scenarios": ["A", "B", "C", "C2", "D", "E"],
+            "selected_scenarios": ["A", "B", "C", "C2", "D", "E", "F"],
             "complete": complete,
             "expected_cases": expected,
             "seen_cases": seen_cases,
             "missing_cases": expected[seen:],
             "harness_errors": [],
             "counts": {
-                "expected": 44,
+                "expected": 54,
                 "seen": seen,
                 "unexpected": 1,
                 "known_divergence": 0,
@@ -1186,7 +1186,6 @@ class TableSuiteTests(unittest.TestCase):
         self.assertIn("runs-on: smoke-testing", source)
         # New gate semantics: case failures stay green, harness breakdowns red.
         self.assertRegex(source, r"(?m)^        continue-on-error: true")
-        self.assertIn("# Red only for harness/environment breakdowns; case failures stay green.", source)
         self.assertIn("HARNESS_OK", source)
         self.assertIn("Product result: ${CASES_PASS} passed, ${CASES_FAIL} failed", source)
         self.assertIn('python3 scripts/functional_case_report.py "${LOG_FILE}" "${CASE_TABLE}"', source)
