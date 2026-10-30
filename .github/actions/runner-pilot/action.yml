@@ -1,0 +1,107 @@
+name: Runner capability and build pilot
+description: Inspect an existing runner and measure isolated fixed-source cold/warm builds
+inputs:
+  workload:
+    description: probe, server or workspace-tests
+    required: true
+  source-sha:
+    description: Exact merged main commit for builds
+    default: ""
+  toolchain:
+    description: Exact Rust version for builds
+    default: ""
+  scratch-root:
+    description: Existing absolute scratch root
+    default: ""
+  build-jobs:
+    description: Cargo concurrency
+    default: "2"
+  local-ssd:
+    description: Require operator storage attestation
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: Validate pilot input and inspect existing capabilities
+      shell: bash
+      env:
+        PILOT_WORKLOAD: ${{ inputs.workload }}
+        PILOT_SHA: ${{ inputs.source-sha }}
+        PILOT_TOOLCHAIN: ${{ inputs.toolchain }}
+        PILOT_SCRATCH: ${{ inputs.scratch-root }}
+        PILOT_JOBS: ${{ inputs.build-jobs }}
+        PILOT_SSD: ${{ inputs.local-ssd }}
+      run: |
+        [[ "$PILOT_WORKLOAD" =~ ^(probe|server|workspace-tests)$ ]]
+        [[ "$PILOT_JOBS" =~ ^([1-9]|1[0-6])$ ]]
+        if [[ "$PILOT_WORKLOAD" != probe ]]; then
+          [[ "$PILOT_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$PILOT_TOOLCHAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+        fi
+        scratch="${PILOT_SCRATCH:-$RUNNER_TEMP}"
+        [[ "$scratch" == /* && -d "$scratch" ]]
+        minimum_disk=1
+        minimum_memory=0
+        if [[ "$PILOT_WORKLOAD" == server ]]; then minimum_disk=24; minimum_memory=8; fi
+        if [[ "$PILOT_WORKLOAD" == workspace-tests ]]; then minimum_disk=90; minimum_memory=16; fi
+        extra=()
+        if [[ "$PILOT_SSD" == true ]]; then extra+=(--local-ssd-attestation /etc/rustfs-runner/storage.json); fi
+        python3 scripts/ci/runner_pilot.py --root "$scratch" \
+          --output "$RUNNER_TEMP/runner-pilot-evidence" \
+          --min-free-gib "$minimum_disk" --min-memory-gib "$minimum_memory" --architecture x86_64 "${extra[@]}"
+    - name: Checkout the trusted baseline history
+      if: inputs.workload != 'probe'
+      uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+      with:
+        ref: main
+        path: .runner-pilot-source
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Bind the build to a merged main commit
+      if: inputs.workload != 'probe'
+      shell: bash
+      env:
+        PILOT_SHA: ${{ inputs.source-sha }}
+      run: |
+        git -C .runner-pilot-source merge-base --is-ancestor "$PILOT_SHA" HEAD
+        git -C .runner-pilot-source checkout --detach "$PILOT_SHA"
+    - name: Install build dependencies
+      if: inputs.workload != 'probe'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential pkg-config libssl-dev cmake clang time
+    - name: Install the fixed protobuf compiler
+      if: inputs.workload != 'probe'
+      uses: rustfs/setup-protoc@a3705324d8f9bf5b6c3573fb6cf8ae421db55dd6 # v3.0.1
+      with:
+        version: "35.1"
+        repo-token: ${{ github.token }}
+    - name: Install the fixed flatbuffer compiler
+      if: inputs.workload != 'probe'
+      uses: Nugine/setup-flatc@698800de72a96bfb22cf60431dc21a2ff9a7e07b # v1
+      with:
+        version: "25.12.19"
+    - name: Install the requested exact Rust toolchain
+      if: inputs.workload != 'probe'
+      uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      with:
+        toolchain: ${{ inputs.toolchain }}
+    - name: Measure cold and warm builds without shared target caches
+      if: inputs.workload != 'probe'
+      shell: bash
+      env:
+        PILOT_WORKLOAD: ${{ inputs.workload }}
+        PILOT_SHA: ${{ inputs.source-sha }}
+        PILOT_TOOLCHAIN: ${{ inputs.toolchain }}
+        PILOT_SCRATCH: ${{ inputs.scratch-root }}
+        PILOT_JOBS: ${{ inputs.build-jobs }}
+        PILOT_SSD: ${{ inputs.local-ssd }}
+      run: |
+        extra=()
+        if [[ "$PILOT_SSD" == true ]]; then extra+=(--local-ssd-attestation /etc/rustfs-runner/storage.json); fi
+        python3 scripts/ci/runner_pilot.py --root "${PILOT_SCRATCH:-$RUNNER_TEMP}" \
+          --output "$RUNNER_TEMP/runner-pilot-evidence" \
+          --source .runner-pilot-source --source-sha "$PILOT_SHA" \
+          --toolchain "$PILOT_TOOLCHAIN" --benchmark "$PILOT_WORKLOAD" \
+          --jobs "$PILOT_JOBS" --timeout-seconds 3600 "${extra[@]}"

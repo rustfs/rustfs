@@ -89,6 +89,13 @@ jobs:
           aws --version
           python3 --version
 
+      - name: Admit clean shared environment
+        id: environment
+        timeout-minutes: 5
+        env:
+          FUNCTIONAL_ENVIRONMENT_RECEIPT: ${{ runner.temp }}/environment-table.json
+        run: python3 scripts/functional_environment.py enter --suite table
+
       - name: Cleanup environment (before)
         timeout-minutes: 5
         continue-on-error: true
@@ -162,10 +169,8 @@ jobs:
             RESULT=success
           fi
 
-          # Product gate: failing cases keep the run green — they are reported
-          # below and tracked in rustfs/backlog. Only harness/environment
-          # breakdowns (the suite never reached case level, or a wholesale
-          # failure with zero passes) turn the workflow red.
+          # Report harness completion here; the final verdict checks every
+          # case result after diagnostics and cleanup have been retained.
           CASES_TOTAL="$(grep -cE '^\| [A-Z][A-Z0-9]*-[0-9]+ .*\| (PASS|FAIL|UNSUPPORTED|RUNNING) \|' "${CASE_TABLE}" 2>/dev/null || true)"
           CASES_FAIL="$(grep -cE '^\| [A-Z][A-Z0-9]*-[0-9]+ .*\| FAIL \|' "${CASE_TABLE}" 2>/dev/null || true)"
           CASES_TOTAL=$(( ${CASES_TOTAL:-0} + 0 )); CASES_FAIL=$(( ${CASES_FAIL:-0} + 0 ))
@@ -203,7 +208,7 @@ jobs:
             fi
           } | tee "${REPORT_FILE}"
           cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
-          # Red only for harness/environment breakdowns; case failures stay green.
+          # Preserve the harness verdict separately from the final case verdict.
           [ "${HARNESS_OK}" = "1" ]
 
       - name: Upload functional report to dashboard
@@ -292,11 +297,12 @@ jobs:
           retention-days: 30
 
       - name: Cleanup environment (after)
+        id: environment_cleanup
         timeout-minutes: 5
-        if: always()
-        continue-on-error: true
+        if: ${{ always() && steps.environment.outcome == 'success' }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
+          cleanup_status=0
           for node in ${RUSTFS_NODES}; do
             ssh -o BatchMode=yes -o ConnectTimeout=10 "${RUSTFS_SSH_USER}@${node}" '
               set -euo pipefail
@@ -307,26 +313,25 @@ jobs:
               fi
               for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
               ${SUDO} rm -f /etc/default/rustfs
-            ' || echo "cleanup failed on ${node} (continuing)"
+            ' || cleanup_status=$?
           done
+          exit "${cleanup_status}"
 
-      - name: "Continue functional chain (next: Performance)"
-        # Only chain-triggered runs forward to the next suite; standalone
-        # workflow_dispatch runs stop after their own cleanup.
-        if: ${{ always() && github.event_name == 'repository_dispatch' }}
-        continue-on-error: true
+      - name: Release environment only after successful cleanup
+        if: ${{ always() && steps.environment.outcome == 'success' }}
+        timeout-minutes: 5
         env:
-          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "PF_TESTING_GH_TOKEN is not configured; cannot dispatch the next suite" >&2
-            exit 1
-          fi
-          echo "Dispatching next functional suite: Performance"
-          gh api --method POST repos/rustfs/rustfs/dispatches \
-            -f event_type='rustfs-chain-performance' \
-            -F 'client_payload[from_suite]=table'
+          FUNCTIONAL_ENVIRONMENT_RECEIPT: ${{ runner.temp }}/environment-table.json
+          CLEANUP_OUTCOME: ${{ steps.environment_cleanup.outcome }}
+        run: python3 scripts/functional_environment.py finish --suite table --cleanup-outcome "$CLEANUP_OUTCOME"
+
+      - name: Retain environment ownership and cleanup receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: functional-environment-table-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/environment-table.json
+          if-no-files-found: error
 
       - name: Notify on failure
         if: failure()
@@ -358,3 +363,13 @@ jobs:
           name: functional-chain-table-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/chain-table-${{ github.run_id }}-${{ github.run_attempt }}/table.json
           if-no-files-found: error
+
+      - name: Enforce suite and report result
+        if: ${{ always() }}
+        env:
+          SUITE_OUTCOME: ${{ steps.test.outcome }}
+          REPORT_OUTCOME: ${{ steps.chain_report.outcome }}
+        run: |
+          test "$SUITE_OUTCOME" = success
+          test "$REPORT_OUTCOME" = success
+          python3 scripts/functional_chain_evidence.py verify-report --suite table --report "${FUNCTIONAL_ARTIFACTS_DIR}/cases.md"
