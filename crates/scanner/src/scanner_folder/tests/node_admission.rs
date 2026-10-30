@@ -497,6 +497,7 @@ async fn scanner_node_admission_mid_walk_shrink_preserves_partial_and_resumes_al
         panic!("deferral below root cannot certify completion: {partial:?}");
     };
     assert!(!partial.info.snapshot_complete);
+    assert!(partial.info.scan_resource_deferred);
     assert_eq!(
         partial
             .size_recursive("bucket")
@@ -610,6 +611,7 @@ async fn check_early_admission_deferral(node_open: bool, physical_limit: u32) {
         panic!("resource pressure is a partial census, not a disk error: {result:?}");
     };
     assert!(!partial.info.snapshot_complete);
+    assert!(partial.info.scan_resource_deferred);
     let totals = partial.size_recursive("bucket").expect("old tree retained");
     assert_eq!((totals.objects, totals.size), (7, 19));
     assert_eq!(gate.completed(), Some(0));

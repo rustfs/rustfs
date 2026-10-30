@@ -474,14 +474,17 @@ fn scan_cycle_partial_reason(reason: Option<ScannerCycleBudgetReason>) -> ScanCy
     match reason {
         Some(ScannerCycleBudgetReason::Runtime) => ScanCyclePartialReason::Runtime,
         Some(ScannerCycleBudgetReason::Objects) => ScanCyclePartialReason::Objects,
-        Some(ScannerCycleBudgetReason::Directories) => ScanCyclePartialReason::Directories,
+        // Raw enumeration is directory work; the reason set is a stable metric label.
+        Some(ScannerCycleBudgetReason::Directories | ScannerCycleBudgetReason::Entries) => ScanCyclePartialReason::Directories,
         None => ScanCyclePartialReason::Unknown,
     }
 }
 
 fn scan_cycle_partial_source(reason: Option<ScannerCycleBudgetReason>) -> Option<ScannerWorkSource> {
     match reason {
-        Some(ScannerCycleBudgetReason::Objects | ScannerCycleBudgetReason::Directories) => Some(ScannerWorkSource::Usage),
+        Some(ScannerCycleBudgetReason::Objects | ScannerCycleBudgetReason::Directories | ScannerCycleBudgetReason::Entries) => {
+            Some(ScannerWorkSource::Usage)
+        }
         Some(ScannerCycleBudgetReason::Runtime) | None => None,
     }
 }
