@@ -2092,7 +2092,8 @@ impl DefaultObjectUsecase {
             let put_admission = put_admission;
             let table_publication_guard = origin.take_table_publication_guard();
             let table_data_plane_publication_guards = origin.table_data_plane_publication_guards();
-            async move {
+            // Keep the large commit future off the request stack when propagating task-local context.
+            Box::pin(async move {
                 let _table_publication_guard = table_publication_guard;
                 let _table_data_plane_publication_guards = table_data_plane_publication_guards;
                 let _put_admission = put_admission;
@@ -2253,7 +2254,7 @@ impl DefaultObjectUsecase {
                 rustfs_io_metrics::record_put_object_stage_duration_from("app_capacity_update", capacity_update_stage_start);
 
                 Ok::<_, S3Error>(PutObjectCommitResult { obj_info, put_versioned })
-            }
+            })
         };
         #[cfg(feature = "diagnostic-read-version-caller")]
         let put_commit_future = crate::app::storage_api::diagnostic::with_read_version_spawn_context(
