@@ -41,6 +41,17 @@ The tool requires that assertion to match the observed filesystem, mount and ima
 
 Before admitting PR work, the infrastructure owner must execute two separate jobs and demonstrate that the second cannot read a marker or credential fixture left by the first. Repeat for cancellation and abnormal termination, retaining controller events and worker identities. Never put publication credentials in this pool. The monthly `scripts/ci/check_runner_ephemerality.sh` audit remains independent. No deployment or isolation result is implied by the fixtures in this repository.
 
+## Local controller rehearsal
+
+When the infrastructure control plane is unavailable, a local process rehearsal can exercise the controller protocol without Docker or Kubernetes:
+
+```bash
+python3 scripts/ci/runner_pilot.py --root /tmp \
+  --output /tmp/runner-isolation-evidence --isolation-rehearsal
+```
+
+Use a new evidence directory for each attempt. The rehearsal starts real processes with an isolated temporary home and synthetic credential/data fixtures, covers ordinary completion, cancellation and abnormal termination, removes the owned worker directory, then starts a successor that checks for residual paths. Incomplete cleanup prevents successor admission and retains a failed receipt. This is explicitly a local process simulation: it does not prove concurrent tenant isolation, ARC pod destruction, image provenance or physical SSD locality. The receipt cannot be used to authorize production runner placement.
+
 ## Artifact consumers and rollout decision
 
 Run the existing artifact identity/ABI verifier before a real consumer trial. A matching architecture and glibc version alone is insufficient: execute the exact selected test set, verify required dynamic libraries and Docker/privilege requirements, and retain the archive's result contract. Rust fixtures can embed absolute build-time paths. Preserve the producer workspace path and required fixture files, or explicitly establish a supported relocation strategy before using a different runner layout. Required consumers keep their current runner until that acceptance is complete.

@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import selectors
 import shutil
 import signal
 import subprocess
@@ -224,6 +225,82 @@ def benchmark(source, root, output, sha, toolchain, workload, jobs, timeout, *, 
     return report
 
 
+def isolation_rehearsal(root, output, *, remove_tree=shutil.rmtree):
+    """Exercise a local worker controller with real processes and synthetic data.
+
+    This proves the controller's cleanup protocol, not a container boundary,
+    physical SSD locality, ARC deployment or cloud worker destruction.
+    """
+    report = {"schema": 1, "kind": "local-process-simulation", "passed": False, "cases": [],
+              "storage_locality_verified": False, "worker_destruction_verified": False}
+    output.mkdir(parents=True, exist_ok=True)
+    receipt = output / "isolation.json"
+    if receipt.exists():
+        raise ValueError("retain the original isolation receipt; choose a new output directory")
+    worker = """
+import os, sys
+from pathlib import Path
+home = Path(os.environ['HOME'])
+(home / 'credential-fixture').write_text('synthetic-credential-not-a-secret')
+(Path.cwd() / 'workspace-fixture').write_text('first-worker-data')
+print('ready', flush=True)
+sys.stdin.readline()
+"""
+    try:
+        for mode in ("normal", "cancelled", "crashed"):
+            directory = Path(tempfile.mkdtemp(prefix="rustfs-local-worker-", dir=root))
+            home = directory / "home"
+            home.mkdir(mode=0o700)
+            process = None
+            case = {"termination": mode, "passed": False, "next_worker_started": False}
+            report["cases"].append(case)
+            try:
+                # Deliberately exclude the caller's credentials and home.
+                environment = {"HOME": str(home), "PATH": os.environ.get("PATH", "")}
+                process = subprocess.Popen([sys.executable, "-I", "-u", "-c", worker], cwd=directory,
+                                           env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                           stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+                with selectors.DefaultSelector() as ready:
+                    ready.register(process.stdout, selectors.EVENT_READ)
+                    if not ready.select(timeout=10) or process.stdout.readline().strip() != "ready":
+                        raise ValueError("local worker did not reach the fixture boundary")
+                if mode == "normal":
+                    process.communicate(input="finish\n", timeout=10)
+                    expected = 0
+                else:
+                    signum = signal.SIGTERM if mode == "cancelled" else signal.SIGKILL
+                    os.killpg(process.pid, signum)
+                    process.communicate(timeout=10)
+                    expected = -signum
+                case["exit_code"] = process.returncode
+                if process.returncode != expected:
+                    raise ValueError("local worker did not terminate by the requested path")
+                remove_tree(directory)
+                if directory.exists():
+                    raise ValueError("cleanup incomplete; refusing the next worker")
+                with tempfile.TemporaryDirectory(prefix="rustfs-next-worker-", dir=root) as successor:
+                    case["next_worker_started"] = True
+                    result = subprocess.run([sys.executable, "-I", "-c",
+                        "import pathlib,sys; sys.exit(any(pathlib.Path(p).exists() for p in sys.argv[1:]))",
+                        str(directory), str(home / "credential-fixture"), str(directory / "workspace-fixture")],
+                        cwd=successor, env={"HOME": successor, "PATH": environment["PATH"]}, timeout=10)
+                    if result.returncode:
+                        raise ValueError("a later worker can observe previous task data")
+                case["passed"] = True
+            finally:
+                if process is not None:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.communicate(timeout=10)
+                # Only this rehearsal's directory is owned by this controller.
+                if directory.exists():
+                    shutil.rmtree(directory)
+        report["passed"] = True
+        return report
+    finally:
+        receipt.write_text(json.dumps(report, indent=2) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True, help="existing scratch directory on the disk under test")
@@ -235,6 +312,7 @@ def main():
     parser.add_argument("--require-io-uring", action="store_true")
     parser.add_argument("--local-ssd-attestation", type=Path)
     parser.add_argument("--benchmark", choices=("server", "workspace-tests"))
+    parser.add_argument("--isolation-rehearsal", action="store_true", help="local process simulation; no infrastructure claim")
     parser.add_argument("--source", type=Path, default=Path.cwd())
     parser.add_argument("--source-sha")
     parser.add_argument("--toolchain")
@@ -246,6 +324,15 @@ def main():
         parser.error("resource requirements are outside the bounded pilot limits")
     if args.benchmark and not (args.source_sha and args.toolchain):
         parser.error("--benchmark requires --source-sha and --toolchain")
+    def cancel(_signum, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, cancel)
+    if args.isolation_rehearsal:
+        if args.benchmark or args.local_ssd_attestation or args.require_docker or args.require_io_uring:
+            parser.error("local isolation simulation cannot certify runner capabilities or a build")
+        result = isolation_rehearsal(args.root.resolve(), args.output.resolve())
+        print("Local process simulation passed; ARC and physical storage remain unverified")
+        return 0 if result["passed"] else 1
     args.output.mkdir(parents=True, exist_ok=True)
     report = inspect(args.root)
     failures = preflight(report, min_free_gib=args.min_free_gib, min_memory_gib=args.min_memory_gib,
@@ -261,9 +348,6 @@ def main():
         print("Runner preflight failed: " + "; ".join(failures), file=sys.stderr)
         return 1
     if args.benchmark:
-        def cancel(_signum, _frame):
-            raise KeyboardInterrupt
-        signal.signal(signal.SIGTERM, cancel)
         result = benchmark(args.source.resolve(), args.root.resolve(), args.output.resolve(), args.source_sha,
                            args.toolchain, args.benchmark, args.jobs, args.timeout_seconds)
         return 0 if result["passed"] else 1

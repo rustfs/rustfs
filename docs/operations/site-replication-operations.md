@@ -289,6 +289,16 @@ receiving site. If a group ended up disabled on one site only, re-enable it
 there explicitly with `mc admin group enable`; a snapshot or repair will not
 do it.
 
+The managed `site-replicator-0` service account carries an embedded policy
+that the server owns. It names `s3:ForceDeleteObject` explicitly because a
+replicated force-delete (Console folder delete, `x-rustfs-force-delete: true`)
+is authorized on the peer like any other force-delete and `s3:*` does not
+grant that action. The reconcile tick refreshes an account whose stored policy
+predates the grant; do not edit the policy by hand, the next repair rewrites
+it. A bucket-replication target configured with its own credentials needs the
+same `s3:ForceDeleteObject` grant on the target side, or its force-deletes are
+rejected and counted as replication failures.
+
 Treat IAM divergence as a security incident: a user deleted on one site can
 remain usable on an unreachable peer until replay or repair completes. A peer
 whose IAM entry is escalated does not receive scheduled snapshots either -

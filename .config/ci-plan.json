@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "rollout": "shadow",
+  "rollout": "enforced",
   "core_packages": ["rustfs", "rustfs-ecstore", "rustfs-filemeta", "rustfs-iam", "rustfs-policy"],
   "connect_packages": [
     "rustfs-credentials", "rustfs-config", "rustfs-common", "rustfs-crypto",

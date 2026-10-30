@@ -18,7 +18,7 @@ python3 scripts/validation_registry.py check
 
 Shared functional suites run serially, and an earlier test failure does not stop later selected suites from gathering results. Performance uses an isolated fleet and can run concurrently. The final aggregate rejects required failures, cancellation, unexpected skips, missing or foreign evidence, and execution outside the selected plan. A successful subset remains subset evidence; it cannot satisfy full-chain health.
 
-The old `repository_dispatch` relay is retired. Each individual workflow remains a manual debugging entrypoint and stops after its own suite. Package-only builds, tools, read-only runner/fleet inspection, and interrupted evidence recovery remain separate driver modes. Their success does not represent suite completion. No workflow is enabled automatically by registration or monitoring.
+The old `repository_dispatch` relay is retired. Each individual workflow remains a manual debugging entrypoint and stops after its own suite. Package-only builds, tools, read-only runner/fleet inspection, and interrupted evidence recovery remain separate driver modes. The read-only and recovery validators accept the workflow's default `validation_plan=nightly`, but reject a different cadence or an explicit suite selection combined with those modes. Their success does not represent suite completion. No workflow is enabled automatically by registration or monitoring.
 
 ## Shared environment ownership
 

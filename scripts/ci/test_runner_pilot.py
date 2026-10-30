@@ -34,6 +34,26 @@ class PilotTests(unittest.TestCase):
         failures = pilot.preflight(broken, min_free_gib=101, min_memory_gib=8, architecture="x86_64", docker=True, uring=True)
         self.assertEqual(len(failures), 5)
 
+    def test_real_local_workers_clean_normal_cancelled_and_crashed_tasks(self):
+        report = pilot.isolation_rehearsal(self.scratch, self.output)
+        self.assertTrue(report['passed'])
+        self.assertEqual([case['termination'] for case in report['cases']], ['normal', 'cancelled', 'crashed'])
+        self.assertTrue(all(case['passed'] and case['next_worker_started'] for case in report['cases']))
+        self.assertEqual(list(self.scratch.iterdir()), [])
+        self.assertFalse(report['worker_destruction_verified'])
+        self.assertFalse(report['storage_locality_verified'])
+        with self.assertRaisesRegex(ValueError, 'retain the original'):
+            pilot.isolation_rehearsal(self.scratch, self.output)
+
+    def test_incomplete_local_cleanup_blocks_next_worker_and_preserves_failure(self):
+        with self.assertRaisesRegex(ValueError, 'refusing the next worker'):
+            pilot.isolation_rehearsal(self.scratch, self.output, remove_tree=lambda _: None)
+        report = json.loads((self.output / 'isolation.json').read_text())
+        self.assertFalse(report['passed'])
+        self.assertEqual(len(report['cases']), 1)
+        self.assertFalse(report['cases'][0]['next_worker_started'])
+        self.assertEqual(list(self.scratch.iterdir()), [])
+
     def test_memory_limit_obeys_container_limit(self):
         values = {"/proc/meminfo": "MemTotal:       67108864 kB",
                   "/sys/fs/cgroup/memory.max": str(8 * 1024 ** 3)}

@@ -116,6 +116,12 @@ pub enum EventName {
     // Splitting these per-operation would need `mask()` widened first.
     IamIdentityCredentialChanged,
     IamIdentityAuthChallenge,
+
+    // Audit-only S3 API operations that have no bucket notification event, such as
+    // `UploadPart` and the bucket configuration writes. One coarse variant covers
+    // all of them for the same mask-budget reason as the IAM block above: the
+    // specific operation lives in `AuditEntry::api.name`. It must stay last.
+    AuditS3Operation,
 }
 
 // Single event type sequential array for Everything.expand()
@@ -170,7 +176,7 @@ const LAST_SINGLE_TYPE_VALUE: u32 = EventName::IntelligentTiering as u32;
 /// meaningful: `mask()` turns a leaf variant's discriminant `v` into the bit
 /// `1 << (v - 1)`, so the highest discriminant is also the highest bit index in
 /// use. Keep this pointing at whatever variant is declared last.
-const LAST_EVENT_NAME_VALUE: u32 = EventName::IamIdentityAuthChallenge as u32;
+const LAST_EVENT_NAME_VALUE: u32 = EventName::AuditS3Operation as u32;
 
 /// `mask()` returns a `u64`, so discriminants may run from 1 to 64 inclusive.
 ///
@@ -264,6 +270,23 @@ impl EventName {
         }
     }
 
+    /// Parses the string form of the internal events that `parse` rejects.
+    ///
+    /// These events are never valid in a bucket notification configuration, so
+    /// `parse` and the default `Deserialize` stay strict. They do reach the audit
+    /// sink and are persisted by the store targets, which read them back through
+    /// [`deserialize_persisted_event_name`].
+    fn parse_internal(s: &str) -> Option<Self> {
+        match s {
+            "s3:ObjectRemoved:AbortMultipartUpload" => Some(EventName::ObjectRemovedAbortMultipartUpload),
+            "s3:ObjectCreated:CreateMultipartUpload" => Some(EventName::ObjectCreatedCreateMultipartUpload),
+            "s3:ObjectRemoved:DeleteObjects" => Some(EventName::ObjectRemovedDeleteObjects),
+            // Audit-only S3 operations: reach the audit sink, never a notification rule.
+            "audit:S3:Operation" => Some(EventName::AuditS3Operation),
+            _ => None,
+        }
+    }
+
     /// Parses an event string into an EventName with explicit error handling.
     #[inline]
     pub fn try_from_event_str(s: &str) -> Result<Self, ParseEventNameError> {
@@ -336,6 +359,7 @@ impl EventName {
             EventName::KmsServiceStopped => "kms:Service:Stopped",
             EventName::IamIdentityCredentialChanged => "iam:Identity:CredentialChanged",
             EventName::IamIdentityAuthChallenge => "iam:Identity:AuthChallenge",
+            EventName::AuditS3Operation => "audit:S3:Operation",
         }
     }
 
@@ -536,6 +560,20 @@ impl serde::ser::Serialize for EventName {
     }
 }
 
+/// `deserialize_with` function for fields that hold an `EventName` the server itself
+/// persisted, such as queued audit payload metadata. Unlike the default `Deserialize`,
+/// which also backs user-supplied notification XML, it accepts the internal events.
+pub fn deserialize_persisted_event_name<'de, D>(deserializer: D) -> Result<EventName, D::Error>
+where
+    D: serde::de::Deserializer<'de>,
+{
+    let s = <String as serde::Deserialize>::deserialize(deserializer)?;
+    EventName::parse(&s)
+        .ok()
+        .or_else(|| EventName::parse_internal(&s))
+        .ok_or_else(|| serde::de::Error::custom(ParseEventNameError(s)))
+}
+
 impl<'de> serde::de::Deserialize<'de> for EventName {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -728,7 +766,8 @@ mod tests {
             | EventName::KmsServiceStarted
             | EventName::KmsServiceStopped
             | EventName::IamIdentityCredentialChanged
-            | EventName::IamIdentityAuthChallenge => {}
+            | EventName::IamIdentityAuthChallenge
+            | EventName::AuditS3Operation => {}
         }
     }
 
@@ -798,6 +837,7 @@ mod tests {
         EventName::KmsServiceStopped,
         EventName::IamIdentityCredentialChanged,
         EventName::IamIdentityAuthChallenge,
+        EventName::AuditS3Operation,
     ];
 
     /// Every KMS management-plane event.
@@ -886,7 +926,7 @@ mod tests {
     /// only as one element of an array someone may forget to extend.
     #[test]
     fn test_last_variant_still_gets_its_own_bit() {
-        let last = EventName::IamIdentityAuthChallenge;
+        let last = EventName::AuditS3Operation;
         assert_ne!(last.mask(), 0, "the last variant's mask overflowed to zero");
         assert_eq!(
             last.mask(),
@@ -950,6 +990,7 @@ mod tests {
             EventName::ObjectRemovedAbortMultipartUpload,
             EventName::ObjectCreatedCreateMultipartUpload,
             EventName::ObjectRemovedDeleteObjects,
+            EventName::AuditS3Operation,
         ];
 
         for ev in ALL_EVENT_NAMES {
@@ -964,6 +1005,40 @@ mod tests {
             }
             let parsed = EventName::parse(ev.as_str());
             assert_eq!(parsed.as_ref(), Ok(ev), "round-trip failed for {ev} (as_str = {:?})", ev.as_str());
+        }
+    }
+
+    /// Audit entries are persisted by the store targets and read back through
+    /// `deserialize_persisted_event_name`, so every event that can be serialized, other than
+    /// `Everything`, must come back as itself. The default `Deserialize` also backs
+    /// user-supplied notification XML and must keep rejecting the internal events.
+    #[test]
+    fn test_persisted_round_trip_for_every_serializable_variant() {
+        #[derive(serde::Deserialize)]
+        struct Persisted(#[serde(deserialize_with = "deserialize_persisted_event_name")] EventName);
+
+        for ev in ALL_EVENT_NAMES {
+            if *ev == EventName::Everything {
+                continue;
+            }
+            let json = serde_json::to_string(ev).unwrap();
+            let back: Persisted = serde_json::from_str(&json)
+                .unwrap_or_else(|err| panic!("{ev:?} serialized as {json} does not deserialize: {err}"));
+            assert_eq!(back.0, *ev, "persisted round-trip changed {ev:?}");
+        }
+
+        for internal in [
+            EventName::ObjectRemovedAbortMultipartUpload,
+            EventName::ObjectCreatedCreateMultipartUpload,
+            EventName::ObjectRemovedDeleteObjects,
+            EventName::AuditS3Operation,
+        ] {
+            assert!(EventName::parse(internal.as_str()).is_err(), "parse must reject {internal:?}");
+            let json = serde_json::to_string(&internal).unwrap();
+            assert!(
+                serde_json::from_str::<EventName>(&json).is_err(),
+                "default Deserialize must reject {internal:?}"
+            );
         }
     }
 
@@ -1052,6 +1127,23 @@ mod tests {
 
         for ev in ALL_EVENT_NAMES.iter().filter(|ev| !ev.is_iam()) {
             assert!(!ev.as_str().starts_with("iam:"), "{ev} must not claim the IAM namespace");
+        }
+    }
+
+    /// The audit-only S3 operation event must stay out of the `s3:` namespace and out of
+    /// every compound selector, so a bucket notification can never subscribe to it,
+    /// and it must survive the audit queue round trip.
+    #[test]
+    fn test_audit_s3_operation_is_audit_only_and_round_trips() {
+        let ev = EventName::AuditS3Operation;
+        assert!(ev.as_str().starts_with("audit:"), "unexpected name {:?}", ev.as_str());
+        // Notification configuration and the default `Deserialize` reject it; only the
+        // persisted path (queued audit entries) accepts it.
+        assert!(EventName::parse(ev.as_str()).is_err());
+        assert!(serde_json::from_str::<EventName>(&serde_json::to_string(&ev).unwrap()).is_err());
+        assert_eq!(ev.expand(), vec![ev]);
+        for other in ALL_EVENT_NAMES.iter().filter(|other| **other != ev) {
+            assert_eq!(other.mask() & ev.mask(), 0, "{other} shares a mask bit with {ev}");
         }
     }
 

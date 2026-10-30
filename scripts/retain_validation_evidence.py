@@ -101,7 +101,7 @@ def prepare(env, report):
     attempt = inputs.get("validation_retain_evidence_run_attempt", "1")
     require(isinstance(source, str) and re.fullmatch(r"[1-9][0-9]{0,19}", source), "exact source run ID required")
     require(isinstance(attempt, str) and re.fullmatch(r"[1-9][0-9]{0,9}", attempt), "exact source run attempt required")
-    defaults = {"validation_retain_evidence_run_id": source,
+    defaults = {"validation_retain_evidence_run_id": source, "validation_plan": "nightly",
                 "validation_retain_evidence_run_attempt": attempt,
                 "i05_diagnostic_branch": "source-plan", "validation_tools_run_attempt": "1"}
     require(all(value == defaults[key] if key in defaults else value in ("", False, None)

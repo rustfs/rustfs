@@ -197,21 +197,21 @@ jobs:
           jq -e --arg testing_sha "${AUTO_TESTING_SHA}" '
             .schema_version == 1 and
             .auto_testing_sha == $testing_sha and
-            .selected_scenarios == ["A", "B", "C", "C2", "D", "E"] and
+            .selected_scenarios == ["A", "B", "C", "C2", "D", "E", "F"] and
             .complete == true and
-            .counts.expected == 44 and
-            .counts.seen == 44 and
+            .counts.expected == 54 and
+            .counts.seen == 54 and
             .counts.harness_errors == 0 and
-            (.expected_cases | length) == 44 and
-            (.expected_cases | unique | length) == 44 and
-            (.seen_cases | length) == 44 and
-            (.seen_cases | unique | length) == 44 and
+            (.expected_cases | length) == 54 and
+            (.expected_cases | unique | length) == 54 and
+            (.seen_cases | length) == 54 and
+            (.seen_cases | unique | length) == 54 and
             (.seen_cases | sort) == (.expected_cases | sort) and
             (.missing_cases | length) == 0 and
             (.harness_errors | length) == 0 and
-            (.cases | length) == 44 and
+            (.cases | length) == 54 and
             ([.cases[].case_id] | sort) == (.expected_cases | sort) and
-            ([.cases[].case_id] | unique | length) == 44 and
+            ([.cases[].case_id] | unique | length) == 54 and
             all(.cases[]; .verdict == "pass" or .verdict == "known-divergence" or .verdict == "UNEXPECTED") and
             .counts.unexpected == ([.cases[] | select(.verdict == "UNEXPECTED")] | length) and
             .counts.known_divergence == ([.cases[] | select(.verdict == "known-divergence")] | length)
