@@ -2709,6 +2709,7 @@ fn open_direct_writer(
     #[cfg(test)]
     os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::DirectWriteOpen, file_path);
     os::record_native_publication(file_path);
+    #[cfg(test)]
     run_owned_file_before_open(file_path);
 
     let open_result = std::fs::OpenOptions::new()
@@ -15099,7 +15100,7 @@ mod test {
         let path = disk.io_get_object_path(&bucket, "direct-child").expect("direct I/O path");
 
         assert!(
-            open_direct_writer(&path, &DirectIoWriteState::new()).is_err(),
+            open_direct_writer(&path, &DirectIoWriteState::new(), None).is_err(),
             "the actual synchronous O_DIRECT entry must observe the missing bucket parent"
         );
         assert!(
