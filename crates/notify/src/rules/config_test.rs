@@ -259,6 +259,34 @@ mod integration_tests {
         assert!(!targets.is_empty(), "All files should match");
     }
 
+    /// Internal events are never valid in a user-supplied notification configuration,
+    /// even though the audit queue persists and replays them.
+    #[test]
+    fn test_internal_event_names_are_rejected_in_notification_xml() {
+        for event in [
+            "s3:ObjectCreated:CreateMultipartUpload",
+            "s3:ObjectRemoved:AbortMultipartUpload",
+            "s3:ObjectRemoved:DeleteObjects",
+            "audit:S3:Operation",
+        ] {
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<NotificationConfiguration>
+    <QueueConfiguration>
+        <Id>internal</Id>
+        <Queue>arn:rustfs:sqs:ap-northeast-1:primary:webhook</Queue>
+        <Event>{event}</Event>
+    </QueueConfiguration>
+</NotificationConfiguration>"#
+            );
+            let arn_list = vec!["arn:rustfs:sqs:ap-northeast-1:primary:webhook".to_string()];
+            assert!(
+                BucketNotificationConfig::from_xml(Cursor::new(xml.as_bytes()), "ap-northeast-1", &arn_list).is_err(),
+                "{event} must be rejected in notification XML"
+            );
+        }
+    }
+
     /// Test specific event type instead of compound
     #[test]
     fn test_specific_event_type_xml() {

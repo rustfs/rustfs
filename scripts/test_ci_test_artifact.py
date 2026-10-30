@@ -54,7 +54,7 @@ class ArtifactIdentityTests(unittest.TestCase):
                          "configuration": "workspace", "profile": "test", "features": [],
                          "build_environment": {key: "" for key in artifact.BUILD_ENVIRONMENT},
                          "system": "Linux", "machine": "x86_64", "repository": "owner/repo",
-                         "run_id": "123", "run_attempt": "2"}
+                         "run_id": "123"}
         self.digest = hashlib.sha256(self.archive.read_bytes()).hexdigest()
         self.size = self.archive.stat().st_size
         self.record = {"schema": 1, "identity": copy.deepcopy(self.identity),
@@ -76,10 +76,21 @@ class ArtifactIdentityTests(unittest.TestCase):
                      "configuration": "e2e", "profile": "release", "features": ["rio-v2"],
                      "build_environment": {**self.identity["build_environment"], "RUSTFLAGS": "-C opt-level=3"},
                      "system": "Darwin", "machine": "aarch64", "repository": "other/repo",
-                     "run_id": "124", "run_attempt": "3"}
+                     "run_id": "124"}
         for key, value in mutations.items():
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, "identity mismatch"):
                 self.verify(expected={**self.identity, key: value})
+
+    def test_failed_job_rerun_reuses_the_archive_but_another_run_does_not(self):
+        with patch.object(artifact, "source_identity", return_value=self.identity["source"]), \
+                patch.object(artifact, "output", return_value="fixture"), \
+                patch.object(artifact, "file_hash", return_value="d" * 64), \
+                patch.dict(os.environ, {"GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}, clear=True):
+            producer = artifact.identity("workspace")
+            with patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "2"}):
+                self.assertEqual(artifact.identity("workspace"), producer)
+            with patch.dict(os.environ, {"GITHUB_RUN_ID": "124"}):
+                self.assertNotEqual(artifact.identity("workspace"), producer)
 
     def test_modified_truncated_and_empty_archives_are_rejected(self):
         for key, value in (("schema", 2), ("sha256", "f" * 64), ("size_bytes", self.size + 1)):
@@ -183,6 +194,28 @@ class ArtifactIdentityTests(unittest.TestCase):
                 patch.dict(os.environ, {}, clear=True), patch.object(artifact.subprocess, "run") as run:
             self.assertEqual(artifact.main(), 0)
         self.assertEqual(run.call_args.args[0], ["cargo", "test", "--locked", "--workspace", "--exclude", "e2e_test", "--doc"])
+
+    def test_real_lint_rejects_a_warning_even_when_archive_tests_pass(self):
+        (self.root / 'rust-toolchain.toml').write_text((artifact.ROOT / 'rust-toolchain.toml').read_text())
+        (self.root / 'Cargo.toml').write_text('[workspace]\nmembers = ["probe", "e2e_test"]\n')
+        for name in ('probe', 'e2e_test'):
+            package = self.root / name
+            (package / 'src').mkdir(parents=True)
+            (package / 'Cargo.toml').write_text(f'[package]\nname="{name}"\nversion="0.1.0"\nedition="2021"\n')
+            (package / 'src/lib.rs').write_text('')
+        source = self.root / 'probe/src/lib.rs'
+        source.write_text('pub fn answer() -> u8 { let unused = 1; 2 }\n#[test] fn value() { assert_eq!(answer(), 2); }\n')
+        archive = self.root / 'lint-probe.tar.zst'
+        for arguments in (['archive', '--offline', '--archive-file', str(archive)],
+                          ['run', '--color', 'never', '--archive-file', str(archive)]):
+            result = subprocess.run(['cargo', 'nextest', *arguments], cwd=self.root, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('1 passed', result.stderr)
+        with patch.object(artifact, 'ROOT', self.root), patch.dict(os.environ, {'CI_PACKAGES': '["probe"]'}), \
+                patch.object(sys, 'argv', ['ci_test_artifact.py', 'cargo', 'lint', '--configuration', 'workspace']):
+            self.assertEqual(artifact.main(), 1)
+            source.write_text(source.read_text().replace('let unused = 1; ', ''))
+            self.assertEqual(artifact.main(), 0)
 
 
 class ExecutionEvidenceTests(unittest.TestCase):
