@@ -14,8 +14,9 @@ import re
 import subprocess
 
 from resolve_functional_candidate import ROOT, positive, require, sha, validate_manifest
+from validation_registry import load_registry, select_plan, suite_ids, validate_plan
 
-SUITES = ("upgrade", "s3", "kms", "tier", "storage", "heal", "pool", "security", "replication", "fault-tolerance", "table", "performance")
+SUITES = suite_ids()
 MAX_REPORT = 8 * 1024 * 1024
 
 
@@ -128,6 +129,24 @@ def auto_testing_dir():
     return candidates[0]
 
 
+def read_report(suite, report):
+    require(suite in SUITES, "unknown suite")
+    require(report.is_file() and 0 < report.stat().st_size <= MAX_REPORT, "missing, empty or oversized report")
+    data = report.read_bytes()
+    text = data.decode("utf-8")
+    counts = fault_tolerance_counts(text) if suite == "fault-tolerance" else report_counts(text, suite == "performance")
+    return counts, hashlib.sha256(data).hexdigest()
+
+
+def require_passing(counts):
+    require(counts["PASS"] > 0 and not counts["FAIL"] and not counts["RUNNING"], "no passing executions or incomplete/failed cases")
+
+
+def verify_report(suite, report):
+    counts, _ = read_report(suite, report)
+    require_passing(counts)
+
+
 def record(chain, suite, report, output):
     require(suite in SUITES, "unknown suite")
     result = {"schema": 1, "suite": suite, "chain": chain, "valid": False, "counts": {}, "report_sha256": None}
@@ -135,12 +154,8 @@ def record(chain, suite, report, output):
     try:
         private_head = subprocess.check_output(["git", "-C", str(auto_testing_dir()), "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
         require(private_head == chain["testing_sha"], "suite used a different private script revision")
-        require(report.is_file() and 0 < report.stat().st_size <= MAX_REPORT, "missing, empty or oversized report")
-        data = report.read_bytes()
-        result["report_sha256"] = hashlib.sha256(data).hexdigest()
-        text = data.decode("utf-8")
-        result["counts"] = fault_tolerance_counts(text) if suite == "fault-tolerance" else report_counts(text, suite == "performance")
-        require(result["counts"]["PASS"] > 0 and not result["counts"]["FAIL"] and not result["counts"]["RUNNING"], "no passing executions or incomplete/failed cases")
+        result["counts"], result["report_sha256"] = read_report(suite, report)
+        require_passing(result["counts"])
         require(all(os.environ[key] == "success" for key in ("CHAIN_JOB_STATUS", "CHAIN_TEST_OUTCOME", "CHAIN_REPORT_OUTCOME")), "suite, report or job did not succeed")
         result["valid"] = True
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -156,10 +171,11 @@ def record(chain, suite, report, output):
         raise error
 
 
-def summarize(chain, directory, needs):
+def summarize(chain, directory, needs, plan=None, allow_skipped=()):
     """Retain failed/missing lanes without granting complete-success evidence."""
     lanes = []
-    for suite in SUITES:
+    plan = validate_plan(plan) if plan is not None else select_plan(load_registry())
+    for suite in plan["suites"]:
         lane = {"suite": suite, "result": needs.get(suite, {}).get("result", "missing"),
                 "evidence": None, "error": None}
         try:
@@ -170,11 +186,11 @@ def summarize(chain, directory, needs):
         except (OSError, ValueError, AttributeError) as error:
             lane["error"] = str(error)
         lanes.append(lane)
-    result = {"schema": 1, "chain": chain, "needs": needs, "lanes": lanes,
+    result = {"schema": 1, "chain": chain, "plan": plan, "needs": needs, "lanes": lanes,
               "complete": False, "error": None, "completed_at": datetime.now(timezone.utc).isoformat()}
     try:
         require(chain is not None, "candidate preparation did not complete")
-        aggregate(chain, directory, {suite: value for suite, value in needs.items() if suite != "prepare"})
+        aggregate(chain, directory, {suite: value for suite, value in needs.items() if suite != "prepare"}, allow_skipped, plan)
         result["complete"] = True
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         result["error"] = str(error)
@@ -206,25 +222,31 @@ def render_summary(result):
     return "\n".join(lines) + "\n"
 
 
-def aggregate(chain, directory, needs, allow_skipped=()):
+def aggregate(chain, directory, needs, allow_skipped=(), plan=None):
+    plan = validate_plan(plan) if plan is not None else select_plan(load_registry())
+    selected = plan["suites"]
     allowed = {name for name in allow_skipped if name}
-    require(allowed <= set(SUITES), "aggregate allow-list names an unknown lane")
+    require(allowed <= set(plan["optional_suites"]), "aggregate allow-list names a required or unknown lane")
     require(set(needs) == set(SUITES), "aggregate is missing a required lane")
-    skipped = {name for name, value in needs.items() if value.get("result") == "skipped"}
+    require(all(value.get("result") == "skipped" for name, value in needs.items() if name not in selected),
+            "an unselected suite unexpectedly ran")
+    skipped = {name for name in selected if needs[name].get("result") == "skipped"}
     require(skipped <= allowed, "a lane was skipped without preflight permission: " + ", ".join(sorted(skipped - allowed)))
-    require(all(value.get("result") == "success" for name, value in needs.items() if name not in skipped), "a required suite did not succeed")
-    expected = [suite for suite in SUITES if suite not in skipped]
+    require(all(needs[name].get("result") == "success" for name in selected if name not in skipped), "a required suite did not succeed")
+    expected = [suite for suite in selected if suite not in skipped]
     require({path.name for path in directory.iterdir()} == {suite + ".json" for suite in expected}, "missing or unexpected suite evidence")
     records = [json.loads((directory / (suite + ".json")).read_text()) for suite in expected]
     validate_records(chain, records, expected)
-    return {"schema": 1, "chain": chain, "suites": records, "complete": True,
-            "skipped_lanes": sorted(skipped), "completed_at": datetime.now(timezone.utc).isoformat()}
+    return {"schema": 1, "chain": chain, "plan": plan, "suites": records, "complete": True,
+            "skipped_lanes": sorted(skipped),
+            "skip_reasons": {name: "optional fleet unavailable during preflight" for name in sorted(skipped)},
+            "completed_at": datetime.now(timezone.utc).isoformat()}
 
 
 def validate_records(chain, records, expected_suites=SUITES):
     require(isinstance(records, list) and len(records) == len(expected_suites), "missing suite evidence")
     require([record.get("suite") for record in records] == list(expected_suites), "missing, duplicate or reordered suite evidence")
-    for suite, result in zip(SUITES, records):
+    for suite, result in zip(expected_suites, records):
         require(type(result.get("schema")) is int and result["schema"] == 1 and result.get("suite") == suite and result.get("chain") == chain, "suite evidence identity mismatch")
         require(result.get("valid") is True and sha(result.get("report_sha256"), 64), "suite evidence is invalid")
         counts = result.get("counts", {})
@@ -234,7 +256,7 @@ def validate_records(chain, records, expected_suites=SUITES):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("consume", "record", "aggregate", "summarize"))
+    parser.add_argument("mode", choices=("consume", "record", "aggregate", "summarize", "verify-report"))
     parser.add_argument("--suite", choices=SUITES)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--output", type=Path)
@@ -242,9 +264,13 @@ def main():
     parser.add_argument("--allow-skipped", default="",
                         help="comma-separated lanes the preflight deliberately skipped (e.g. performance)")
     args = parser.parse_args()
+    if args.mode == "verify-report":
+        verify_report(args.suite, args.report)
+        return
+    plan = json.loads(os.environ["CHAIN_PLAN"]) if os.environ.get("CHAIN_PLAN") else None
     if args.mode == "summarize":
         chain = current_chain() if os.environ.get("CHAIN_MANIFEST") else None
-        result = summarize(chain, args.directory, json.loads(os.environ["CHAIN_NEEDS"]))
+        result = summarize(chain, args.directory, json.loads(os.environ["CHAIN_NEEDS"]), plan, args.allow_skipped.split(","))
         args.output.write_text(json.dumps(result, sort_keys=True) + "\n")
         args.output.with_suffix(".md").write_text(render_summary(result))
         if os.environ.get("GITHUB_STEP_SUMMARY"):
@@ -259,7 +285,7 @@ def main():
     else:
         needs = json.loads(os.environ["CHAIN_NEEDS"])
         needs.pop("prepare", None)
-        result = aggregate(chain, args.directory, needs, args.allow_skipped.split(","))
+        result = aggregate(chain, args.directory, needs, args.allow_skipped.split(","), plan)
         args.output.write_text(json.dumps(result, sort_keys=True) + "\n")
 
 

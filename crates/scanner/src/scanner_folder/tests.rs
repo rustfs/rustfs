@@ -30,7 +30,9 @@ use std::sync::Mutex;
 pub(super) mod checkpoint_fixture;
 pub(super) mod enumeration_restart;
 mod incremental_enumeration;
+mod listing_completion;
 mod metadata_visits;
+mod node_admission;
 mod usage_updates;
 
 /// Reset the process-global alert cooldown map; test-only.
@@ -337,7 +339,10 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         .await
         .expect("failed to create test directory");
 
-    let endpoint = Endpoint::try_from(temp_dir.to_string_lossy().as_ref()).expect("failed to create endpoint");
+    let mut endpoint = Endpoint::try_from(temp_dir.to_string_lossy().as_ref()).expect("failed to create endpoint");
+    endpoint.set_pool_index(0);
+    endpoint.set_set_index(0);
+    endpoint.set_disk_index(0);
     let disk = new_disk(
         &endpoint,
         &DiskOption {
@@ -364,6 +369,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         failed_object_paths_seen: HashSet::new(),
         resolved_failed_object_paths: HashSet::new(),
         sleeper: SCANNER_SLEEPER.clone(),
+        node_admission: None,
         disks: Vec::new(),
         disks_quorum: 0,
         usage_updates: None,
@@ -394,6 +400,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,
         list_path_raw_options_observer: None,
+        defer_abandoned_entries_until_finished: false,
     };
 
     (scanner, temp_dir)
@@ -762,6 +769,7 @@ fn test_classify_get_size_failure_marks_metadata_heal_object_path() {
         lifecycle: None,
         object_lock: None,
         replication: None,
+        heal_scope: None,
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
@@ -793,6 +801,7 @@ fn test_classify_get_size_failure_records_transient_metadata_error_without_heal(
         lifecycle: None,
         object_lock: None,
         replication: None,
+        heal_scope: None,
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
@@ -849,6 +858,7 @@ async fn test_heal_replication_skips_only_unversioned_data_versions() {
         lifecycle: None,
         object_lock: None,
         replication: Some(Arc::new(ReplicationConfig::new(None, None))),
+        heal_scope: None,
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
@@ -2251,6 +2261,7 @@ async fn test_heal_actions_returns_actual_size_without_inline_heal() {
         lifecycle: None,
         object_lock: None,
         replication: None,
+        heal_scope: None,
         heal_enabled: true,
         heal_bitrot: true,
         debug: false,
@@ -2262,7 +2273,7 @@ async fn test_heal_actions_returns_actual_size_without_inline_heal() {
     };
     let mut size_summary = SizeSummary::default();
 
-    let size = item.heal_actions(&object_info, 123, &mut size_summary).await;
+    let size = item.heal_actions(&object_info, 123, &mut size_summary, None).await;
     assert_eq!(size, 123);
 }
 
@@ -2491,7 +2502,7 @@ async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
     let heal_starts = Arc::new(AtomicUsize::new(0));
     let heal_starts_clone = heal_starts.clone();
-    let healed_versions = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+    let healed_versions = Arc::new(Mutex::new(Vec::new()));
     let healed_versions_clone = healed_versions.clone();
     let (_commands, mut heal_rx) = rustfs_heal_contracts::heal_channel::init_heal_channels()
         .expect("heal channels should initialize once for scanner tests");
@@ -2503,7 +2514,7 @@ async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
                 healed_versions_clone
                     .lock()
                     .expect("heal version capture lock should not be poisoned")
-                    .push(request.object_version_id);
+                    .push((request.object_prefix, request.object_version_id, request.pool_index, request.set_index));
                 let _ = response_tx.send(Ok(rustfs_heal_contracts::heal_channel::HealAdmissionReceipt {
                     result: HealAdmissionResult::Accepted,
                     task_id: request.id,
@@ -2584,8 +2595,89 @@ async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
             .lock()
             .expect("heal version capture lock should not be poisoned")
             .iter()
-            .any(|version| version.as_deref() == Some(orphan_version_text.as_str())),
+            .any(|(_, version, _, _)| version.as_deref() == Some(orphan_version_text.as_str())),
         "sub-quorum orphan version must be submitted as an exact heal candidate"
+    );
+    assert!(
+        healed_versions
+            .lock()
+            .expect("heal scope capture lock should not be poisoned")
+            .iter()
+            .filter(|(object, _, _, _)| object.is_some())
+            .all(|(_, _, pool, set)| (*pool, *set) == (Some(0), Some(0))),
+        "high-priority discovered objects must retain the scanning disk's scope"
+    );
+    let bucket_admission = scanner
+        .send_required_scanner_heal_request(
+            PendingScannerHealKind::Bucket,
+            bucket.to_string(),
+            None,
+            None,
+            build_bucket_heal_request(bucket.to_string(), HealChannelPriority::High),
+        )
+        .await
+        .expect("submit bucket request");
+    assert_eq!(bucket_admission, HealAdmissionResult::Accepted);
+    assert_eq!(
+        healed_versions.lock().expect("read captured bucket scope").last(),
+        Some(&(None, None, None, None)),
+        "bucket healing must retain its cross-pool scope"
+    );
+    scanner.new_cache.info.name = bucket.to_string();
+    scanner.new_cache.info.pending_heals = vec![pending_heal(
+        PendingScannerHealKind::Object,
+        bucket,
+        Some("pending-object"),
+        Some(&orphan_version_text),
+        0,
+        1,
+    )];
+    scanner
+        .retry_pending_scanner_heals()
+        .await
+        .expect("retry persisted object heal");
+    assert_eq!(
+        healed_versions.lock().expect("read retried object scope").last(),
+        Some(&(Some("pending-object".to_string()), Some(orphan_version_text.clone()), Some(0), Some(0))),
+        "persisted retries must bind the current scanning disk"
+    );
+    let unscoped_endpoint = Endpoint::try_from(temp_dir.to_string_lossy().as_ref()).expect("parse uninitialized endpoint");
+    scanner.local_disk = new_disk(
+        &unscoped_endpoint,
+        &DiskOption {
+            cleanup: false,
+            health_check: false,
+        },
+    )
+    .await
+    .expect("open disk without initialized location");
+    let request_count = healed_versions.lock().expect("count admitted requests").len();
+    let deferred = scanner
+        .send_required_scanner_heal_request(
+            PendingScannerHealKind::Object,
+            bucket.to_string(),
+            Some("unscoped-object".to_string()),
+            Some(orphan_version_text.clone()),
+            build_object_heal_request(
+                bucket.to_string(),
+                "unscoped-object".to_string(),
+                Some(orphan_version_text),
+                HealScanMode::Deep,
+                HealChannelPriority::High,
+            ),
+        )
+        .await
+        .expect("defer object with unknown disk location");
+    assert_eq!(deferred, HealAdmissionResult::Full);
+    assert_eq!(healed_versions.lock().expect("count unchanged admissions").len(), request_count);
+    assert!(
+        scanner
+            .new_cache
+            .info
+            .pending_heals
+            .iter()
+            .any(|entry| entry.object.as_deref() == Some("unscoped-object")),
+        "an unscoped high-priority object must remain pending"
     );
     for (path, expected) in expected_metadata {
         assert_eq!(

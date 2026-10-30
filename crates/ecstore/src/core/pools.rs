@@ -11745,6 +11745,61 @@ pub struct PoolSpaceInfo {
     pub used: usize,
 }
 
+/// Read-only observations used by the admin pool diagnostic surface. The HTTP
+/// layer converts these stable values to strings without changing the pool
+/// lifecycle status contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolAvailability {
+    Online,
+    Degraded,
+    Offline,
+    Unknown,
+}
+
+impl PoolAvailability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Degraded => "degraded",
+            Self::Offline => "offline",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolCapacityStatus {
+    Live,
+    Cached,
+    Partial,
+    Unknown,
+}
+
+impl PoolCapacityStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Cached => "cached",
+            Self::Partial => "partial",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolDiagnosticStatus {
+    pub availability: PoolAvailability,
+    pub capacity_status: PoolCapacityStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct PoolAdminDiagnostic {
+    pub id: usize,
+    pub cmd_line: String,
+    pub pool: Option<PoolStatus>,
+    pub diagnostic: PoolDiagnosticStatus,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DecommissionPoolCapacityInfo {
     pool_index: usize,
@@ -11753,6 +11808,7 @@ pub(crate) struct DecommissionPoolCapacityInfo {
     physical_free: usize,
     physical_total: usize,
     physical_used: usize,
+    diagnostic: PoolDiagnosticStatus,
 }
 
 impl DecommissionPoolCapacityInfo {
@@ -11775,6 +11831,10 @@ impl DecommissionPoolCapacityInfo {
             physical_free,
             physical_total,
             physical_used,
+            diagnostic: PoolDiagnosticStatus {
+                availability: PoolAvailability::Unknown,
+                capacity_status: PoolCapacityStatus::Unknown,
+            },
         }
     }
 }
@@ -11794,6 +11854,121 @@ where
     }
     capacities.sort_unstable_by_key(|capacity| capacity.pool_index);
     Ok(capacities)
+}
+
+fn pool_diagnostic_status(
+    disks: &[rustfs_madmin::Disk],
+    pool_index: usize,
+    set_count: usize,
+    set_drive_count: usize,
+    read_quorum: usize,
+) -> PoolDiagnosticStatus {
+    if set_count == 0 || set_drive_count == 0 || read_quorum == 0 || read_quorum > set_drive_count {
+        return PoolDiagnosticStatus {
+            availability: PoolAvailability::Unknown,
+            capacity_status: PoolCapacityStatus::Unknown,
+        };
+    }
+
+    let mut live_capacity = true;
+    let mut cached_capacity = false;
+    let mut partial_capacity = false;
+    let mut online_by_set = vec![0usize; set_count];
+    let mut observed_disks = 0usize;
+    let mut seen_slots = HashSet::new();
+
+    for disk in disks.iter().filter(|disk| disk.pool_index == pool_index as i32) {
+        observed_disks = observed_disks.saturating_add(1);
+        match disk.capacity_observation_source.as_deref() {
+            Some("live_probe") => {}
+            Some("snapshot") => {
+                live_capacity = false;
+                cached_capacity = true;
+            }
+            Some("missing") | None => {
+                live_capacity = false;
+                partial_capacity = true;
+            }
+            Some(_) => {
+                live_capacity = false;
+                partial_capacity = true;
+            }
+        }
+
+        let Some(set_index) = usize::try_from(disk.set_index).ok() else {
+            continue;
+        };
+        let Some(disk_index) = usize::try_from(disk.disk_index).ok() else {
+            continue;
+        };
+        if set_index >= set_count
+            || disk_index >= set_drive_count
+            || !seen_slots.insert((set_index, disk_index))
+            || !disk_is_available_for_pool_diagnostic(disk)
+        {
+            continue;
+        }
+        online_by_set[set_index] = online_by_set[set_index].saturating_add(1);
+    }
+
+    let availability = if online_by_set.iter().any(|&online| online < read_quorum) {
+        PoolAvailability::Offline
+    } else if online_by_set.iter().all(|&online| online == set_drive_count) {
+        PoolAvailability::Online
+    } else {
+        PoolAvailability::Degraded
+    };
+    let capacity_status = if observed_disks == 0 {
+        PoolCapacityStatus::Unknown
+    } else if partial_capacity {
+        PoolCapacityStatus::Partial
+    } else if cached_capacity {
+        PoolCapacityStatus::Cached
+    } else if live_capacity {
+        PoolCapacityStatus::Live
+    } else {
+        PoolCapacityStatus::Unknown
+    };
+
+    PoolDiagnosticStatus {
+        availability,
+        capacity_status,
+    }
+}
+
+fn disk_is_available_for_pool_diagnostic(disk: &rustfs_madmin::Disk) -> bool {
+    let state_ok = disk.state.eq_ignore_ascii_case("ok") || disk.state.eq_ignore_ascii_case(rustfs_madmin::ITEM_ONLINE);
+    let runtime_ok = disk
+        .runtime_state
+        .as_deref()
+        .map(|state| state.eq_ignore_ascii_case(rustfs_madmin::ITEM_ONLINE))
+        .unwrap_or(state_ok);
+    state_ok && runtime_ok
+}
+
+fn pool_diagnostic_metadata_status(err: &Error) -> &'static str {
+    if let Some(failure) = err.pool_metadata_failure() {
+        return match failure.kind {
+            crate::error::PoolMetadataFailure::ReadUnavailable => "stale",
+            crate::error::PoolMetadataFailure::RecoveryRequired
+            | crate::error::PoolMetadataFailure::TransactionUnknown
+            | crate::error::PoolMetadataFailure::FenceLost => "recovery_required",
+        };
+    }
+
+    match err {
+        Error::Timeout
+        | Error::Lock(_)
+        | Error::DiskNotFound
+        | Error::FaultyDisk
+        | Error::FaultyRemoteDisk
+        | Error::RemoteClientUnavailable(_)
+        | Error::RemoteNotInitialized
+        | Error::ErasureReadQuorum
+        | Error::InsufficientReadQuorum(_, _)
+        | Error::NamespaceLockQuorumUnavailable { .. } => "stale",
+        _ => "recovery_required",
+    }
 }
 
 #[cfg(test)]
@@ -15168,6 +15343,70 @@ impl ECStore {
         Ok(snapshot)
     }
 
+    /// Admin-only diagnostic snapshot. A transient metadata read failure is
+    /// reported as stale without publishing the fallback or relaxing any
+    /// mutation/recovery path.
+    pub async fn admin_pool_diagnostic_snapshot(
+        &self,
+        target_pool_index: Option<usize>,
+    ) -> (Vec<PoolAdminDiagnostic>, &'static str) {
+        let fallback = self.pool_meta.read().await.clone();
+        let (pool_meta, mut metadata_status) = match self.pool_status_meta_snapshot().await {
+            Ok(pool_meta) => (pool_meta, "fresh"),
+            Err(err) => (fallback, pool_diagnostic_metadata_status(&err)),
+        };
+        if metadata_status == "stale" && pool_meta.pools.len() != self.pools.len() {
+            metadata_status = "unknown";
+        }
+
+        let backend = rustfs_madmin::StorageInfo {
+            backend: StorageAdminApi::backend_info(self).await,
+            ..Default::default()
+        };
+        let indices = target_pool_index.map_or_else(|| (0..self.pools.len()).collect(), |idx| vec![idx]);
+        let backend = &backend;
+        let samples = futures::future::join_all(indices.into_iter().map(|idx| async move {
+            (
+                idx,
+                self.get_decommission_pool_capacity_info_with_backend(idx, false, backend)
+                    .await,
+            )
+        }))
+        .await;
+
+        let mut diagnostics = Vec::with_capacity(samples.len());
+        for (idx, sample) in samples {
+            let Some(sets) = self.pools.get(idx) else {
+                continue;
+            };
+            let (pool, diagnostic) = match sample {
+                Ok(capacity) => (
+                    pool_meta
+                        .pools
+                        .get(idx)
+                        .cloned()
+                        .map(|pool| apply_decommission_status_space_info(pool, capacity.space)),
+                    capacity.diagnostic,
+                ),
+                Err(_) => (
+                    pool_meta.pools.get(idx).cloned(),
+                    PoolDiagnosticStatus {
+                        availability: PoolAvailability::Unknown,
+                        capacity_status: PoolCapacityStatus::Unknown,
+                    },
+                ),
+            };
+            diagnostics.push(PoolAdminDiagnostic {
+                id: idx,
+                cmd_line: sets.endpoints.cmd_line.clone(),
+                pool,
+                diagnostic,
+            });
+        }
+
+        (diagnostics, metadata_status)
+    }
+
     /// Load and publish under the movement writer, so no movement read sees
     /// the transition mid-operation and no transition interleaves the load.
     async fn publish_pool_status_refresh(&self, _movement_guard: tokio::sync::OwnedRwLockWriteGuard<()>) -> Result<()> {
@@ -15244,6 +15483,7 @@ impl ECStore {
             };
             let (physical_total, physical_free, physical_used) =
                 decommission_physical_pool_capacity(&info.disks, idx, layout, space, owned_physical_used.as_ref());
+            let diagnostic = pool_diagnostic_status(&info.disks, idx, sets.set_count, sets.set_drive_count, layout.data);
 
             Ok(DecommissionPoolCapacityInfo {
                 pool_index: idx,
@@ -15252,6 +15492,7 @@ impl ECStore {
                 physical_free,
                 physical_total,
                 physical_used,
+                diagnostic,
             })
         } else {
             Err(invalid_decommission_pool_index_error(self.pools.len(), idx))
@@ -21844,6 +22085,85 @@ mod tests {
     use crate::storage_api_contracts::multipart::MultipartOperations as _;
     use serde::Serialize;
 
+    fn diagnostic_disk(set_index: i32, disk_index: i32, online: bool) -> rustfs_madmin::Disk {
+        rustfs_madmin::Disk {
+            pool_index: 0,
+            set_index,
+            disk_index,
+            state: if online { "ok" } else { "offline" }.to_string(),
+            runtime_state: Some(if online { "online" } else { "offline" }.to_string()),
+            capacity_observation_source: Some("live_probe".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pool_diagnostic_status_tracks_read_quorum_and_capacity_source() {
+        let online = vec![
+            diagnostic_disk(0, 0, true),
+            diagnostic_disk(0, 1, true),
+            diagnostic_disk(1, 0, true),
+            diagnostic_disk(1, 1, true),
+        ];
+        assert_eq!(
+            pool_diagnostic_status(&online, 0, 2, 2, 1),
+            PoolDiagnosticStatus {
+                availability: PoolAvailability::Online,
+                capacity_status: PoolCapacityStatus::Live,
+            }
+        );
+
+        let mut degraded = online.clone();
+        degraded[0] = diagnostic_disk(0, 0, false);
+        degraded[1].capacity_observation_source = Some("snapshot".to_string());
+        assert_eq!(
+            pool_diagnostic_status(&degraded, 0, 2, 2, 1),
+            PoolDiagnosticStatus {
+                availability: PoolAvailability::Degraded,
+                capacity_status: PoolCapacityStatus::Cached,
+            }
+        );
+
+        degraded[1] = diagnostic_disk(0, 1, false);
+        assert_eq!(pool_diagnostic_status(&degraded, 0, 2, 2, 1).availability, PoolAvailability::Offline);
+        assert_eq!(
+            pool_diagnostic_status(&[], 0, 2, 2, 1),
+            PoolDiagnosticStatus {
+                availability: PoolAvailability::Offline,
+                capacity_status: PoolCapacityStatus::Unknown,
+            }
+        );
+        assert_eq!(pool_diagnostic_status(&online, 0, 0, 2, 1).availability, PoolAvailability::Unknown);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admin_pool_diagnostic_snapshot_lists_an_unavailable_nonfirst_pool() {
+        let (_temp_dirs, store, _other_store) = Box::pin(crate::services::rebalance::test_two_pool_stores(None)).await;
+        for set in &store.pools[1].disk_set {
+            let mut disks = set.disks.write().await;
+            let disk_count = disks.len();
+            *disks = vec![None; disk_count];
+        }
+
+        let (snapshot, metadata_status) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), store.admin_pool_diagnostic_snapshot(None))
+                .await
+                .expect("pool diagnostics should remain bounded");
+
+        assert_eq!(metadata_status, "stale");
+        assert_eq!(snapshot.len(), 2, "configured topology must remain visible");
+        assert_eq!(snapshot[0].id, 0);
+        assert_eq!(snapshot[1].id, 1);
+        assert_eq!(snapshot[1].diagnostic.availability, PoolAvailability::Offline);
+        store
+            .pool_meta_save_gate
+            .lock()
+            .await
+            .ensure_write_safe("ordinary object write")
+            .expect("a failed diagnostic read must not latch the writer gate");
+    }
+
     #[test]
     fn decommission_set_local_usage_cache_classification_is_exact() {
         for object in [
@@ -27978,6 +28298,167 @@ mod tests {
             "{:?}",
             reservation.targets
         );
+    }
+
+    /// One version commits, then every in-place attempt to copy the next one
+    /// times out on the target namespace lock. The entry is deferred, not
+    /// failed, with both source versions retained; the resumed entry finds the
+    /// committed version and moves both with their exact bytes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_defers_target_lookup_lock_timeout_and_retries_without_losing_source() {
+        use tokio::io::AsyncReadExt as _;
+
+        let fixture = NullVersionDecommission::new(NullVersionTop::NewerVersion).await;
+        let object = fixture.object;
+        let injected = Arc::new(AtomicUsize::new(0));
+        let attempted = Arc::new(AtomicUsize::new(0));
+        let fault = DecommissionTestFaultGuard::install_with_error(
+            Arc::new({
+                let injected = Arc::clone(&injected);
+                let attempted = Arc::clone(&attempted);
+                move |stage, _, faulted, _, success| {
+                    let target = stage == "before_target_commit" && faulted == object && success;
+                    let should_inject = target && attempted.fetch_add(1, Ordering::SeqCst) > 0;
+                    if should_inject {
+                        injected.fetch_add(1, Ordering::SeqCst);
+                    }
+                    should_inject
+                }
+            }),
+            Some(Arc::new(|_, bucket, object| {
+                data_movement::data_movement_stage_error_for_test(
+                    "decommission_object",
+                    "prepare_put_object",
+                    bucket,
+                    object,
+                    Error::Lock(rustfs_lock::LockError::timeout(
+                        format!("{bucket}/{object}@latest"),
+                        std::time::Duration::from_secs(5),
+                    )),
+                )
+            })),
+        );
+        let (outcome, _) = fixture.run_entry().await;
+        assert_eq!(injected.load(Ordering::SeqCst), DECOMMISSION_VERSION_COPY_ATTEMPTS);
+        fixture.assert_source_retained().await;
+        assert_eq!(
+            fixture
+                .target_versions()
+                .await
+                .expect("the first version was copied")
+                .versions
+                .len(),
+            1,
+            "one version must commit before the next version times out"
+        );
+        assert!(
+            matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_timeout_deferral(err)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            fixture.store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("active decommission")
+                .items_decommission_failed,
+            0,
+            "a deferred entry must not be counted as a permanent failure"
+        );
+        drop(fault);
+        let (outcome, _) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        fixture.assert_moved().await;
+        let mut reader = fixture.store.pools[1]
+            .get_object_reader(
+                fixture.bucket,
+                fixture.object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(fixture.seeded.versions[0].version_id.expect("newer version").to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the newer version must remain readable");
+        let mut actual = Vec::new();
+        reader.stream.read_to_end(&mut actual).await.expect("read the newer version");
+        assert_eq!(actual, b"written after versioning was enabled");
+    }
+
+    /// A namespace lock still held on the target key, as by a copy whose node
+    /// was killed mid-write, makes target selection fail with a typed
+    /// object-lock timeout. A real held lock, not an injected error, must defer
+    /// the entry rather than fail it; once the lock is released selection
+    /// recovers and the resumed entry moves both versions.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_target_selection_returns_timeout_for_a_held_object_lock() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
+            let fixture = NullVersionDecommission::new(NullVersionTop::NewerVersion).await;
+            let target_set = fixture.store.pools[1].get_disks_by_key(fixture.object);
+            let lock = target_set
+                .new_ns_lock(fixture.bucket, fixture.object)
+                .await
+                .expect("target lock");
+            let guard = lock
+                .get_write_lock(std::time::Duration::from_secs(30))
+                .await
+                .expect("hold target lock");
+            let opts = ObjectOptions {
+                data_movement: true,
+                src_pool_idx: 0,
+                version_id: Some(uuid::Uuid::nil().to_string()),
+                ..Default::default()
+            };
+            let select = || {
+                fixture
+                    .store
+                    .select_data_movement_pool_idx(fixture.bucket, fixture.object, 1, &opts, false)
+            };
+            let result = tokio::time::timeout(get_lock_acquire_timeout() + std::time::Duration::from_secs(15), select())
+                .await
+                .expect("target selection must terminate");
+            match result {
+                Err(Error::Lock(rustfs_lock::LockError::Timeout { resource, .. })) => {
+                    assert!(resource.contains(fixture.bucket) && resource.contains(fixture.object), "{resource}");
+                }
+                other => panic!("expected an object lock timeout, got {other:?}"),
+            }
+
+            let (outcome, _) = fixture.run_entry().await;
+            assert!(
+                matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_timeout_deferral(err)),
+                "{outcome:?}"
+            );
+            assert_eq!(
+                fixture.store.pool_meta.read().await.pools[0]
+                    .decommission
+                    .as_ref()
+                    .expect("active decommission")
+                    .items_decommission_failed,
+                0,
+                "a held target lock must not be counted as a permanent failure"
+            );
+            fixture.assert_source_retained().await;
+            assert!(
+                fixture.target_versions().await.is_none(),
+                "no version may commit while the target lock is held"
+            );
+
+            drop(guard);
+            assert_eq!(
+                select()
+                    .await
+                    .expect("target selection must recover once the lock is released"),
+                1
+            );
+            let (outcome, _) = fixture.run_entry().await;
+            assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+            fixture.assert_moved().await;
+        })
+        .await;
     }
 
     #[test]

@@ -100,14 +100,19 @@ fn trace_protocol_request(operation: &str, bucket: Option<&str>, object: Option<
     );
 }
 
-#[cfg(feature = "webdav")]
+#[cfg(any(feature = "webdav", feature = "sftp"))]
 fn session_list_buckets_request(
     input: ListBucketsInput,
     session_context: &SessionContext,
     request_headers: &HeaderMap,
     secure_transport: bool,
+    credentials: rustfs_credentials::Credentials,
+    is_owner: bool,
 ) -> S3Request<ListBucketsInput> {
-    let credentials = &session_context.principal.user_identity.credentials;
+    let request_credentials = s3s::auth::Credentials {
+        access_key: credentials.access_key.clone(),
+        secret_key: credentials.secret_key.clone().into(),
+    };
     let mut extensions = http::Extensions::default();
     let remote_addr = std::net::SocketAddr::new(session_context.source_ip, 0);
     extensions.insert(Some(RemoteAddr(remote_addr)));
@@ -115,9 +120,8 @@ fn session_list_buckets_request(
     client_info.forwarded_proto = Some(if secure_transport { "https" } else { "http" }.to_string());
     extensions.insert(client_info);
 
-    let is_owner = current_action_credentials().is_some_and(|global_cred| credentials.access_key == global_cred.access_key);
     extensions.insert(ReqInfo {
-        cred: Some(credentials.clone()),
+        cred: Some(credentials),
         is_owner,
         bucket: None,
         object: None,
@@ -126,6 +130,7 @@ fn session_list_buckets_request(
         region: None,
         request_context: Some(RequestContext::fallback()),
         suppress_denial_log: false,
+        suppress_denial_audit: false,
     });
 
     S3Request {
@@ -134,10 +139,7 @@ fn session_list_buckets_request(
         uri: http::Uri::from_static("/"),
         headers: request_headers.clone(),
         extensions,
-        credentials: Some(s3s::auth::Credentials {
-            access_key: credentials.access_key.clone(),
-            secret_key: credentials.secret_key.clone().into(),
-        }),
+        credentials: Some(request_credentials),
         region: None,
         service: None,
         trailing_headers: None,
@@ -323,6 +325,7 @@ impl ProtocolStorageClient {
             region: None,
             request_context: Some(RequestContext::fallback()),
             suppress_denial_log: false,
+            suppress_denial_audit: false,
         });
 
         let req = S3Request {
@@ -633,7 +636,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         }
     }
 
-    #[cfg(feature = "webdav")]
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
     async fn list_buckets_for_session(
         &self,
         session_context: &SessionContext,
@@ -652,7 +655,23 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let input = ListBucketsInput::builder().build().map_err(|e| {
             s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build ListBucketsInput: {}", e))
         })?;
-        let request = session_list_buckets_request(input, session_context, request_headers, secure_transport);
+        let context = self.fs.server_ctx().installed_app_context().ok_or_else(|| {
+            s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, "protocol server application context is not initialized")
+        })?;
+        // The session identity is captured at login. Re-check the key as
+        // authorize_protocol_request does for every other operation, so a key
+        // disabled or expired since then stops listing buckets. An invalid key
+        // is an access denial, as in authorize_operation.
+        let (credentials, is_owner) =
+            crate::auth::check_key_valid_with_context("", session_context.access_key(), Some(context.as_ref()))
+                .await
+                .map_err(|e| match e.code() {
+                    s3s::S3ErrorCode::InvalidAccessKeyId => s3s::S3Error::new(s3s::S3ErrorCode::AccessDenied),
+                    _ => e,
+                })?;
+        let mut request =
+            session_list_buckets_request(input, session_context, request_headers, secure_transport, credentials, is_owner);
+        request.extensions.insert(self.fs.server_ctx().clone());
         self.fs.list_buckets(request).await.map(|response| response.output)
     }
 
@@ -667,11 +686,9 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
     ) -> Result<Option<SessionCapacityView>, Self::Error> {
         // List buckets under the session's own authorization so the view
         // never covers buckets the caller cannot see.
-        let input = ListBucketsInput::builder().build().map_err(|e| {
-            s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build ListBucketsInput: {}", e))
-        })?;
-        let request = session_list_buckets_request(input, session_context, request_headers, secure_transport);
-        let listing = self.fs.list_buckets(request).await?.output;
+        let listing = self
+            .list_buckets_for_session(session_context, request_headers, secure_transport)
+            .await?;
 
         let store = current_object_store_handle();
         let listed = listing.buckets.unwrap_or_default();
@@ -1130,7 +1147,7 @@ mod tests {
         assert!(copied.is_service_account());
     }
 
-    #[cfg(feature = "webdav")]
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
     #[test]
     fn request_extensions_preserve_authenticated_identity_and_source_ip() {
         use std::collections::HashMap;
@@ -1149,14 +1166,26 @@ mod tests {
         let source_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
 
         let identity = rustfs_policy::auth::UserIdentity {
-            credentials: credentials.clone(),
+            credentials: rustfs_credentials::Credentials {
+                secret_key: "stale-secret".to_string(),
+                groups: None,
+                claims: None,
+                ..credentials.clone()
+            },
             ..Default::default()
         };
         let principal = rustfs_protocols::common::ProtocolPrincipal::new(std::sync::Arc::new(identity));
         let session_context = SessionContext::new(principal, rustfs_protocols::Protocol::WebDav, source_ip);
         let mut headers = HeaderMap::new();
         headers.insert("user-agent", http::HeaderValue::from_static("webdav-client"));
-        let request = session_list_buckets_request(ListBucketsInput::default(), &session_context, &headers, true);
+        let request = session_list_buckets_request(
+            ListBucketsInput::default(),
+            &session_context,
+            &headers,
+            true,
+            credentials.clone(),
+            true,
+        );
         let request_info = request.extensions.get::<ReqInfo>().expect("request info should be present");
         let copied = request_info.cred.as_ref().expect("credentials should be present");
         let remote_addr = request
@@ -1172,12 +1201,18 @@ mod tests {
         assert_eq!(copied.parent_user, credentials.parent_user);
         assert_eq!(copied.groups, credentials.groups);
         assert_eq!(copied.claims, Some(claims));
+        assert!(request_info.is_owner, "ownership comes from the server's credential validation");
+        let request_credentials = request.credentials.as_ref().expect("request credentials");
+        assert_eq!(request_credentials.access_key, credentials.access_key);
+        assert_eq!(request_credentials.secret_key.expose(), credentials.secret_key);
         assert_eq!(remote_addr.0.ip(), source_ip);
         assert_eq!(client_info.real_ip, source_ip);
         assert_eq!(client_info.forwarded_proto.as_deref(), Some("https"));
         assert_eq!(request.headers.get("user-agent").expect("user agent"), "webdav-client");
 
-        let insecure_request = session_list_buckets_request(ListBucketsInput::default(), &session_context, &headers, false);
+        let insecure_request =
+            session_list_buckets_request(ListBucketsInput::default(), &session_context, &headers, false, credentials, false);
+        assert!(!insecure_request.extensions.get::<ReqInfo>().expect("request info").is_owner);
         let insecure_client_info = insecure_request
             .extensions
             .get::<ClientInfo>()

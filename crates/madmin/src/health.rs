@@ -64,7 +64,18 @@ pub struct Cpus {
 }
 
 pub fn get_cpus() -> Cpus {
-    let mut sys = System::new_all();
+    let mut sys = match System::new_all() {
+        Ok(sys) => sys,
+        Err(error) => {
+            return Cpus {
+                node_common: NodeCommon {
+                    error: Some(error.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+        }
+    };
     sys.refresh_cpu_all();
     let cores = available_parallelism_count();
 
@@ -254,7 +265,18 @@ pub struct MemInfo {
 }
 
 pub fn get_mem_info(addr: &str) -> MemInfo {
-    let mut sys = System::new_all();
+    let mut sys = match System::new_all() {
+        Ok(sys) => sys,
+        Err(error) => {
+            return MemInfo {
+                node_common: NodeCommon {
+                    addr: addr.to_string(),
+                    error: Some(error.to_string()),
+                },
+                ..Default::default()
+            };
+        }
+    };
     sys.refresh_memory();
 
     let total = sys.total_memory();
@@ -279,7 +301,9 @@ pub fn get_mem_info(addr: &str) -> MemInfo {
 }
 
 pub fn collect_mem_stats() -> crate::MemStats {
-    let mut sys = System::new_all();
+    let Ok(mut sys) = System::new_all() else {
+        return crate::MemStats::default();
+    };
     sys.refresh_memory();
 
     let process_memory = sys
