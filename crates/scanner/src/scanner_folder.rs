@@ -35,7 +35,7 @@ use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetReason};
 use crate::scanner_io::{
     SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _, is_scanner_metadata_corrupt_error, is_scanner_metadata_transient_error,
 };
-use crate::sleeper::DynamicSleeper;
+use crate::sleeper::{DynamicSleeper, PacingDebt};
 use crate::storage_api::owner::{
     EcstoreBucketLifecycleConfiguration as BucketLifecycleConfiguration, EcstoreEventArgs,
     EcstoreLifecycleRuleFilter as LifecycleRuleFilter, EcstoreObjectLockConfiguration as ObjectLockConfiguration,
@@ -796,6 +796,7 @@ pub struct FolderScanner {
     resolved_failed_object_paths: HashSet<String>,
 
     sleeper: DynamicSleeper,
+    pacing_debt: PacingDebt,
     node_admission: Option<Arc<rustfs_concurrency::adaptive::NodeAdmission>>,
     // should_heal: Arc<dyn Fn() -> bool + Send + Sync>,
     disks: Vec<Arc<Disk>>,
@@ -1909,7 +1910,7 @@ impl FolderScanner {
                 // A candidate may be object payload rather than a namespace.
                 wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, 0)).await?;
             } else {
-                wait_for_scanner_io(&ctx, self.sleeper.sleep_folder()).await?;
+                wait_for_scanner_io(&ctx, self.sleeper.sleep_folder_paced(&mut self.pacing_debt)).await?;
             }
 
             let mut queued_folders: Vec<QueuedFolder> = Vec::new();
@@ -2260,7 +2261,7 @@ impl FolderScanner {
                     continue;
                 }
 
-                let timer = self.sleeper.timer();
+                let work_started = tokio::time::Instant::now();
 
                 let heal_enabled = this_hash.mod_alt(
                     self.old_cache.info.next_cycle as u32 / folder.object_heal_prob_div,
@@ -2429,7 +2430,8 @@ impl FolderScanner {
                             }
                         }
 
-                        timer.sleep().await;
+                        wait_for_scanner_io(&ctx, self.sleeper.pace_object(&mut self.pacing_debt, work_started.elapsed()))
+                            .await?;
                         continue;
                     }
                 };
@@ -2452,7 +2454,7 @@ impl FolderScanner {
                 self.checkpoint_objects = self.checkpoint_objects.saturating_add(1);
                 self.maybe_send_checkpoint(&folder, &this_hash, into);
 
-                timer.sleep().await;
+                wait_for_scanner_io(&ctx, self.sleeper.pace_object(&mut self.pacing_debt, work_started.elapsed())).await?;
 
                 if ctx.is_cancelled() {
                     return Err(ScannerError::Other("Operation cancelled".to_string()));
@@ -3175,6 +3177,9 @@ impl FolderScanner {
             updates.cache.replace_hashed(&this_hash, &folder.parent, &flat);
         }
 
+        if folder.parent.is_none() {
+            wait_for_scanner_io(&ctx, self.sleeper.flush_pacing(&mut self.pacing_debt)).await?;
+        }
         self.finish_size_reconciliation_batch();
         done_folder();
         let scanned_objects = u64::try_from(into.objects).unwrap_or(u64::MAX);
@@ -3297,6 +3302,7 @@ pub(crate) async fn scan_data_folder_scoped(
         failed_object_paths_seen: HashSet::new(),
         resolved_failed_object_paths: HashSet::new(),
         sleeper,
+        pacing_debt: PacingDebt::default(),
         node_admission: crate::workload_admission::scanner_node_admission(),
         disks,
         disks_quorum,

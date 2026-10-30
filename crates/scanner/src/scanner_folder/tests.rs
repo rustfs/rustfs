@@ -18,6 +18,7 @@ use super::*;
 
 pub(super) mod erasure_probe;
 mod mrf_ownership;
+mod pacing;
 use crate::storage_api::VersionPurgeStatusType;
 use crate::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, TierStats, new_disk, storageclass};
 use rustfs_filemeta::{FileInfo, FileMeta, MetadataResolutionParams};
@@ -371,6 +372,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         failed_object_paths_seen: HashSet::new(),
         resolved_failed_object_paths: HashSet::new(),
         sleeper: SCANNER_SLEEPER.clone(),
+        pacing_debt: PacingDebt::default(),
         node_admission: None,
         disks: Vec::new(),
         disks_quorum: 0,
