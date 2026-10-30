@@ -426,14 +426,18 @@ impl InferredObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatcher::json_lines_schema;
     use datafusion::arrow::json::reader::infer_json_schema as arrow_infer_json_schema;
 
     const TEST_SCHEMA_LIMIT: usize = 4 * 1024 * 1024;
 
     fn assert_matches_arrow(input: &[u8]) -> Schema {
         let records = input.iter().filter(|byte| **byte == b'\n').count();
-        let (expected, expected_records) = arrow_infer_json_schema(io::BufReader::new(input), Some(records))
+        let (_, expected_records) = arrow_infer_json_schema(io::BufReader::new(input), Some(records))
             .expect("Arrow should infer the compatibility fixture");
+        // Arrow's types in source key order, which is what JSON LINES uses.
+        let expected = json_lines_schema::infer_schema(input, records)
+            .expect("JSON LINES inference should accept the compatibility fixture");
         let (actual, actual_records, _) = infer_schema(input, records, &AtomicBool::new(false), TEST_SCHEMA_LIMIT)
             .expect("streaming inference should accept the compatibility fixture");
         assert_eq!(actual_records, expected_records);

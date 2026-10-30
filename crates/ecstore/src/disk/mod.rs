@@ -401,6 +401,39 @@ impl Disk {
         }
     }
 
+    pub(crate) async fn try_publish_prepared_delete_local(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<Option<(DeleteRecoveryJournal, bool, bool)>> {
+        match self {
+            Self::Local(disk) => {
+                disk.try_publish_prepared_delete_local(volume, object, transaction, namespace_owner)
+                    .await
+            }
+            Self::Remote(_) => Ok(None),
+        }
+    }
+
+    pub(crate) async fn try_finish_and_finalize_prepared_delete_local(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        journal: &DeleteRecoveryJournal,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<bool> {
+        match self {
+            Self::Local(disk) => {
+                disk.try_finish_and_finalize_prepared_delete_local(volume, object, transaction, journal, namespace_owner)
+                    .await
+            }
+            Self::Remote(_) => Ok(false),
+        }
+    }
+
     pub(crate) async fn delete_version_recoverable_with_namespace_owner(
         &self,
         volume: &str,

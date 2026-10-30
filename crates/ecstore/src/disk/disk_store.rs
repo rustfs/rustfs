@@ -2398,6 +2398,51 @@ impl LocalDiskWrapper {
         .await
     }
 
+    pub(crate) async fn try_publish_prepared_delete_local(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: uuid::Uuid,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<Option<(crate::disk::DeleteRecoveryJournal, bool, bool)>> {
+        self.track_disk_health_mutation(
+            "settle_delete_transaction",
+            DiskMetricMutation::Delete,
+            || {
+                Box::pin(async {
+                    self.disk
+                        .try_publish_prepared_delete_local(volume, object, transaction, namespace_owner)
+                        .await
+                })
+            },
+            crate::disk::get_delete_recovery_timeout()?,
+        )
+        .await
+    }
+
+    pub(crate) async fn try_finish_and_finalize_prepared_delete_local(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: uuid::Uuid,
+        journal: &crate::disk::DeleteRecoveryJournal,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<bool> {
+        self.track_disk_health_mutation(
+            "settle_delete_transaction",
+            DiskMetricMutation::Delete,
+            || {
+                Box::pin(async {
+                    self.disk
+                        .try_finish_and_finalize_prepared_delete_local(volume, object, transaction, journal, namespace_owner)
+                        .await
+                })
+            },
+            crate::disk::get_delete_recovery_timeout()?,
+        )
+        .await
+    }
+
     /// Track disk health for an operation.
     /// This method should wrap disk operations to ensure health checking.
     pub async fn track_disk_health<T, F, Fut>(&self, operation: F, timeout_duration: Duration) -> Result<T>

@@ -75,8 +75,8 @@ use crate::disk::{
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
     format::FormatV3,
     fs::{
-        O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, cached_access, invalidate_bucket_cache, lstat, lstat_std,
-        remove, remove_all_std, remove_std, rename,
+        O_APPEND, O_CREATE, O_RDONLY, O_WRONLY, access, cached_access, invalidate_bucket_cache, lstat, lstat_std, remove,
+        remove_all_std, remove_std, rename,
     },
     is_quota_mutation_fence_path, os,
     os::{check_path_length, is_dir_not_empty_error, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
@@ -3016,6 +3016,51 @@ fn has_inline_commit_test_failpoints(dst_path: &str) -> bool {
             == Some(dst_path)
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn has_rename_data_test_failpoints(dst_path: &str) -> bool {
+    has_inline_commit_test_failpoints(dst_path)
+        || INLINE_PREPARATION_BEFORE_BACKUP
+            .lock()
+            .expect("test preparation hook lock should not be poisoned")
+            .contains_key(dst_path)
+        || !RENAME_DATA_AFTER_FIRST_PUBLICATION
+            .lock()
+            .expect("test publication hook lock should not be poisoned")
+            .is_empty()
+        || RENAME_DATA_FAIL_BEFORE_OLD_METADATA_BACKUP
+            .lock()
+            .expect("test failpoint lock should not be poisoned")
+            .as_deref()
+            == Some(dst_path)
+        || RENAME_DATA_FAIL_AFTER_METADATA_COMMIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|target| target == dst_path)
+        || RENAME_DATA_FAIL_COMMIT_RENAME
+            .lock()
+            .expect("test failpoint lock should not be poisoned")
+            .as_deref()
+            == Some(dst_path)
+        || os::has_dir_fsync_test_failures()
+        || os::file_sync_probe::is_active()
+}
+
+#[cfg(all(not(test), feature = "test-util", target_os = "linux"))]
+pub(super) fn has_rename_data_test_failpoints(dst_path: &str) -> bool {
+    RENAME_DATA_FAIL_AFTER_METADATA_COMMIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|target| target == dst_path)
+        || os::has_dir_fsync_test_failures()
+}
+
+#[cfg(any(not(any(test, feature = "test-util")), not(target_os = "linux")))]
+pub(super) fn has_rename_data_test_failpoints(_dst_path: &str) -> bool {
+    false
+}
+
 #[cfg(test)]
 fn run_inline_preparation_before_backup(dst_path: &str) {
     let hook = INLINE_PREPARATION_BEFORE_BACKUP
@@ -3085,6 +3130,43 @@ fn should_fail_after_delete_data_staged(path: &str) -> bool {
     } else {
         false
     }
+}
+
+#[cfg(test)]
+pub(crate) fn has_delete_version_test_failpoints() -> bool {
+    #[cfg(not(windows))]
+    if os::prepared_publication_test_hooks::has_any_hooks() {
+        return true;
+    }
+    #[cfg(feature = "e2e-test-hooks")]
+    if std::env::var_os("RUSTFS_DELETE_RECOVERY_BARRIER_DIR").is_some() {
+        return true;
+    }
+    !OWNED_FILE_BEFORE_OPEN
+        .lock()
+        .expect("test file write hook lock should not be poisoned")
+        .is_empty()
+        || !DELETE_VERSION_FAIL_AFTER_DATA_STAGED
+            .lock()
+            .expect("test failpoint lock should not be poisoned")
+            .is_empty()
+        || !DELETE_VERSION_FAIL_AFTER_COMMIT
+            .lock()
+            .expect("test failpoint lock should not be poisoned")
+            .is_empty()
+}
+
+#[cfg(not(test))]
+pub(crate) fn has_delete_version_test_failpoints() -> bool {
+    #[cfg(all(feature = "test-util", not(windows)))]
+    if os::prepared_publication_test_hooks::has_any_hooks() {
+        return true;
+    }
+    #[cfg(feature = "e2e-test-hooks")]
+    if std::env::var_os("RUSTFS_DELETE_RECOVERY_BARRIER_DIR").is_some() {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -3930,6 +4012,283 @@ fn reclaim_stream_file_cache(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn reclaim_std_file_cache(file: &std::fs::File, reclaim_len: usize, reclaim_on_shutdown: bool) {
+    use core::num::NonZeroU64;
+    use rustix::fs::{Advice, fadvise};
+
+    if !reclaim_on_shutdown || reclaim_len == 0 {
+        return;
+    }
+    let started = std::time::Instant::now();
+    if let Some(len) = u64::try_from(reclaim_len).ok().and_then(NonZeroU64::new) {
+        if let Err(err) = fadvise(file, 0, Some(len), Advice::DontNeed) {
+            record_file_cache_reclaim_error("write");
+            debug!(error = ?err, reclaim_len, "failed to reclaim file cache after write");
+        } else {
+            record_file_cache_reclaim_success("write", reclaim_len, started);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reclaim_std_file_cache(_file: &std::fs::File, _reclaim_len: usize, _reclaim_on_shutdown: bool) {}
+
+static PRESYNCED_TMP_DATA_DIRS: std::sync::LazyLock<ParkingLotMutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| ParkingLotMutex::new(HashSet::new()));
+
+fn mark_presynced_tmp_data_dir(dir: PathBuf) {
+    let mut set = PRESYNCED_TMP_DATA_DIRS.lock();
+    if set.len() >= 4096 {
+        set.clear();
+    }
+    set.insert(dir);
+}
+
+fn unmark_presynced_tmp_data_dir(dir: &Path) {
+    PRESYNCED_TMP_DATA_DIRS.lock().remove(dir);
+}
+
+#[cfg(target_os = "linux")]
+pub(in crate::disk) fn take_presynced_tmp_data_dir(dir: &Path) -> bool {
+    PRESYNCED_TMP_DATA_DIRS.lock().remove(dir)
+}
+
+fn open_lazy_local_file_std(file_path: &Path, volume_dir: &Path, _reclaim_on_shutdown: bool) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = file_path.parent()
+        && (volume_dir.as_os_str().is_empty() || !volume_dir.starts_with(parent))
+        && let Err(err) = super::fs::create_dir_all_std(parent)
+        && err.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err(to_file_error(err));
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(file_path)
+        .map_err(to_file_error)?;
+    #[cfg(target_os = "macos")]
+    if _reclaim_on_shutdown {
+        let _ = set_std_fd_nocache(&file);
+    }
+    Ok(file)
+}
+
+struct LazyLocalFileWriter {
+    file_path: PathBuf,
+    volume_dir: PathBuf,
+    reclaim_len: usize,
+    reclaim_on_shutdown: bool,
+    sync_on_close: bool,
+    bytes_written: usize,
+    state: LazyLocalFileWriterState,
+}
+
+enum LazyLocalFileWriterState {
+    Unopened,
+    Writing(tokio::task::JoinHandle<std::io::Result<(Option<std::fs::File>, usize)>>),
+    Open(std::fs::File),
+    Closing(tokio::task::JoinHandle<std::io::Result<()>>),
+    Closed,
+}
+
+impl LazyLocalFileWriter {
+    fn new(file_path: PathBuf, volume_dir: PathBuf, reclaim_len: usize, reclaim_on_shutdown: bool, sync_on_close: bool) -> Self {
+        Self {
+            file_path,
+            volume_dir,
+            reclaim_len,
+            reclaim_on_shutdown,
+            sync_on_close,
+            bytes_written: 0,
+            state: LazyLocalFileWriterState::Unopened,
+        }
+    }
+
+    fn start_write_payload(&mut self, payload: Vec<u8>) {
+        let len = payload.len();
+        let close_after = self.reclaim_len > 0 && self.bytes_written.saturating_add(len) >= self.reclaim_len;
+        let reclaim_len = self.bytes_written.saturating_add(len).max(self.reclaim_len);
+        let reclaim_on_shutdown = self.reclaim_on_shutdown;
+        let sync_on_close = self.sync_on_close;
+        match std::mem::replace(&mut self.state, LazyLocalFileWriterState::Closed) {
+            LazyLocalFileWriterState::Unopened => {
+                let file_path = self.file_path.clone();
+                let volume_dir = self.volume_dir.clone();
+                self.state = LazyLocalFileWriterState::Writing(tokio::task::spawn_blocking(move || {
+                    let mut file = open_lazy_local_file_std(&file_path, &volume_dir, reclaim_on_shutdown)?;
+                    std::io::Write::write_all(&mut file, &payload).map_err(to_file_error)?;
+                    if close_after {
+                        if sync_on_close {
+                            file.sync_data().map_err(to_file_error)?;
+                        }
+                        reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
+                        drop(file);
+                        if sync_on_close && let Some(parent) = file_path.parent() {
+                            mark_presynced_tmp_data_dir(parent.to_path_buf());
+                        }
+                        Ok((None, len))
+                    } else {
+                        Ok((Some(file), len))
+                    }
+                }));
+            }
+            LazyLocalFileWriterState::Open(mut file) => {
+                let file_path = self.file_path.clone();
+                self.state = LazyLocalFileWriterState::Writing(tokio::task::spawn_blocking(move || {
+                    std::io::Write::write_all(&mut file, &payload).map_err(to_file_error)?;
+                    if close_after {
+                        if sync_on_close {
+                            file.sync_data().map_err(to_file_error)?;
+                        }
+                        reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
+                        drop(file);
+                        if sync_on_close && let Some(parent) = file_path.parent() {
+                            mark_presynced_tmp_data_dir(parent.to_path_buf());
+                        }
+                        Ok((None, len))
+                    } else {
+                        Ok((Some(file), len))
+                    }
+                }));
+            }
+            other => self.state = other,
+        }
+    }
+
+    fn poll_in_flight_write(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<usize>> {
+        let LazyLocalFileWriterState::Writing(fut) = &mut self.state else {
+            return std::task::Poll::Ready(Ok(0));
+        };
+        match std::pin::Pin::new(fut).poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(Err(join_err)) => {
+                self.state = LazyLocalFileWriterState::Closed;
+                std::task::Poll::Ready(Err(std::io::Error::other(join_err)))
+            }
+            std::task::Poll::Ready(Ok(Err(err))) => {
+                self.state = LazyLocalFileWriterState::Closed;
+                std::task::Poll::Ready(Err(err))
+            }
+            std::task::Poll::Ready(Ok(Ok((maybe_file, written)))) => {
+                self.bytes_written = self.bytes_written.saturating_add(written);
+                self.state = maybe_file.map_or(LazyLocalFileWriterState::Closed, LazyLocalFileWriterState::Open);
+                std::task::Poll::Ready(Ok(written))
+            }
+        }
+    }
+}
+
+impl AsyncWrite for LazyLocalFileWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if matches!(self.state, LazyLocalFileWriterState::Writing(_)) {
+            return self.poll_in_flight_write(cx);
+        }
+        if buf.is_empty() {
+            return std::task::Poll::Ready(Ok(0));
+        }
+        if matches!(self.state, LazyLocalFileWriterState::Closed | LazyLocalFileWriterState::Closing(_)) {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "local file writer is already closed",
+            )));
+        }
+        self.start_write_payload(buf.to_vec());
+        self.poll_in_flight_write(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if matches!(self.state, LazyLocalFileWriterState::Writing(_)) {
+            return self.poll_in_flight_write(cx);
+        }
+        let total_len: usize = bufs.iter().map(|b| b.len()).sum();
+        if total_len == 0 {
+            return std::task::Poll::Ready(Ok(0));
+        }
+        if matches!(self.state, LazyLocalFileWriterState::Closed | LazyLocalFileWriterState::Closing(_)) {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "local file writer is already closed",
+            )));
+        }
+        let mut payload = Vec::with_capacity(total_len);
+        for slice in bufs {
+            payload.extend_from_slice(slice);
+        }
+        self.start_write_payload(payload);
+        self.poll_in_flight_write(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        if matches!(self.state, LazyLocalFileWriterState::Writing(_)) {
+            std::task::ready!(self.poll_in_flight_write(cx))?;
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if matches!(self.state, LazyLocalFileWriterState::Writing(_)) {
+            std::task::ready!(self.poll_in_flight_write(cx))?;
+        }
+        if !matches!(self.state, LazyLocalFileWriterState::Closing(_)) {
+            match std::mem::replace(&mut self.state, LazyLocalFileWriterState::Closed) {
+                LazyLocalFileWriterState::Closed => return std::task::Poll::Ready(Ok(())),
+                LazyLocalFileWriterState::Unopened => {
+                    let file_path = self.file_path.clone();
+                    let volume_dir = self.volume_dir.clone();
+                    let reclaim_on_shutdown = self.reclaim_on_shutdown;
+                    self.state = LazyLocalFileWriterState::Closing(tokio::task::spawn_blocking(move || {
+                        open_lazy_local_file_std(&file_path, &volume_dir, reclaim_on_shutdown).map(drop)
+                    }));
+                }
+                LazyLocalFileWriterState::Open(file) => {
+                    let file_path = self.file_path.clone();
+                    let reclaim_len = self.bytes_written.max(self.reclaim_len);
+                    let reclaim_on_shutdown = self.reclaim_on_shutdown;
+                    let sync_on_close = self.sync_on_close;
+                    self.state = LazyLocalFileWriterState::Closing(tokio::task::spawn_blocking(move || {
+                        if sync_on_close {
+                            file.sync_data().map_err(to_file_error)?;
+                        }
+                        reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
+                        drop(file);
+                        if sync_on_close && let Some(parent) = file_path.parent() {
+                            mark_presynced_tmp_data_dir(parent.to_path_buf());
+                        }
+                        Ok(())
+                    }));
+                }
+                other => {
+                    self.state = other;
+                }
+            }
+        }
+        let LazyLocalFileWriterState::Closing(fut) = &mut self.state else {
+            return std::task::Poll::Ready(Ok(()));
+        };
+        let res = std::task::ready!(std::pin::Pin::new(fut).poll(cx));
+        self.state = LazyLocalFileWriterState::Closed;
+        std::task::Poll::Ready(res.unwrap_or_else(|join_err| Err(std::io::Error::other(join_err))))
+    }
+}
+
+#[cfg(test)]
 impl FileCacheReclaimWriter {
     fn new(inner: File, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
         #[cfg(target_os = "macos")]
@@ -3961,6 +4320,7 @@ impl FileCacheReclaimWriter {
     }
 }
 
+#[cfg(test)]
 impl AsyncWrite for FileCacheReclaimWriter {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
@@ -4058,6 +4418,7 @@ fn should_reclaim_file_cache_after_read(length: usize) -> bool {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WriteMode {
     Truncate { size_hint: i64 },
+    TruncateSync { size_hint: i64 },
     Append,
 }
 
@@ -4284,7 +4645,8 @@ impl StdBackend {
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create(true);
             let (reclaim_len, reclaim_on_shutdown) = match mode {
-                WriteMode::Truncate { size_hint } => {
+                // Leaving the data directory unmarked keeps commit's full file sync.
+                WriteMode::Truncate { size_hint } | WriteMode::TruncateSync { size_hint } => {
                     options.truncate(true);
                     (size_hint.max(0) as usize, should_reclaim_file_cache_after_write(size_hint))
                 }
@@ -4930,13 +5292,16 @@ impl LocalIoBackend for StdBackend {
     async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter> {
         self.invalidate_cached_fd(volume, path).await;
         match mode {
-            WriteMode::Truncate { size_hint } => {
+            WriteMode::Truncate { size_hint } | WriteMode::TruncateSync { size_hint } => {
+                let sync_on_close = matches!(mode, WriteMode::TruncateSync { .. });
                 let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
                 let file_path = local_disk_object_path(self.io_root(), volume, path)?;
                 check_path_length(file_path.to_string_lossy().as_ref())?;
-
                 if let Some(parent) = file_path.parent() {
-                    os::make_dir_all(parent, &volume_dir).await?;
+                    check_path_length(parent.to_string_lossy().as_ref())?;
+                    if volume == RUSTFS_META_TMP_BUCKET {
+                        unmark_presynced_tmp_data_dir(parent);
+                    }
                 }
 
                 // O_DIRECT streaming write (Linux, opt-in): shard bytes stream
@@ -4947,6 +5312,9 @@ impl LocalIoBackend for StdBackend {
                 // EINVAL (which would masquerade as a missing shard).
                 #[cfg(target_os = "linux")]
                 if is_direct_io_write_enabled() && self.direct_io_write.supported.load(Ordering::Relaxed) {
+                    if let Some(parent) = file_path.parent() {
+                        os::make_dir_all(parent, &volume_dir).await?;
+                    }
                     let write_state = self.direct_io_write.clone();
                     let direct_path = file_path.clone();
                     let resource_unit = current_resource_unit();
@@ -4966,14 +5334,14 @@ impl LocalIoBackend for StdBackend {
                     return self.open_resource_writer(file_path, mode, resources).await;
                 }
 
-                // O_TRUNC: if a file already exists at this path, stale trailing bytes past
-                // the new content would otherwise survive and mismatch the metadata size.
-                let f = super::fs::open_file(&file_path, O_CREATE | O_WRONLY | O_TRUNC)
-                    .await
-                    .map_err(to_file_error)?;
                 let reclaim_on_shutdown = should_reclaim_file_cache_after_write(size_hint);
-
-                Ok(Box::new(FileCacheReclaimWriter::new(f, size_hint.max(0) as usize, reclaim_on_shutdown)))
+                Ok(Box::new(LazyLocalFileWriter::new(
+                    file_path,
+                    volume_dir,
+                    size_hint.max(0) as usize,
+                    reclaim_on_shutdown,
+                    sync_on_close,
+                )))
             }
             WriteMode::Append => {
                 let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
@@ -7691,6 +8059,9 @@ impl LocalDisk {
         fi: FileInfo,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
+        if volume == RUSTFS_META_BUCKET {
+            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+        }
         if volume == RUSTFS_META_MULTIPART_BUCKET {
             crate::disk::multipart_source::native_source_protocol(&fi)?;
         }
@@ -7937,6 +8308,9 @@ impl LocalDisk {
         mut fi: FileInfo,
         mutation: DeleteVersionMutation,
     ) -> Result<()> {
+        if volume == RUSTFS_META_BUCKET {
+            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+        }
         pool_meta_native::reject_noncanonical_object(&self.root, volume, path)?;
         let DeleteVersionMutation {
             force_del_marker,
@@ -8008,6 +8382,13 @@ impl LocalDisk {
         }
 
         let rollback_dir = opts.old_data_dir;
+        if let Some(rollback_dir) = rollback_dir
+            && let Some(()) = self
+                .try_fused_recoverable_delete_version(volume, path, &fi, &opts, rollback_dir, namespace_owner.clone())
+                .await?
+        {
+            return Ok(());
+        }
         let buf = match self.read_all_data(volume, &volume_dir, &xl_path).await {
             Ok(res) => res,
             Err(err) => {
@@ -8533,6 +8914,9 @@ impl LocalDisk {
         opt: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
+        if volume == RUSTFS_META_BUCKET {
+            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+        }
         multipart_staging::reject_native_control_write(&self.root, self.io_root(), volume, path)?;
         let mut source_owner = self.acquire_multipart_delete_owner(volume, path, namespace_owner).await?;
         let namespace_owner = source_owner.namespace_owner();
@@ -10151,6 +10535,9 @@ impl LocalDisk {
     // write_all_private with check_path_length
     #[tracing::instrument(level = "trace", skip_all)]
     async fn write_all_private(&self, volume: &str, path: &str, buf: Bytes, sync: SyncMode, skip_parent: &Path) -> Result<()> {
+        if volume == RUSTFS_META_BUCKET {
+            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+        }
         let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
@@ -12110,20 +12497,32 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
                     return Err(DiskError::FileCorrupt);
                 }
 
-                let mut buf = diagnostic_stage!(Allocation, _index, || Ok::<_, DiskError>(vec![0u8; length]))?;
+                let mut buf = diagnostic_stage!(Allocation, _index, || Ok::<_, DiskError>(Vec::with_capacity(length)))?;
                 if length > 0 {
                     diagnostic_stage!(Read, _index, || measure_local_batch_stage(
                         metrics.as_deref(),
                         LocalBatchReadStage::Read,
                         || {
-                            while total < length {
-                                let nbytes = file
-                                    .read_at(&mut buf[total..], u64::try_from(offset + total).unwrap_or(u64::MAX))
+                            if offset == 0 {
+                                use std::io::Read as _;
+                                total = (&file)
+                                    .take(u64::try_from(length).unwrap_or(u64::MAX))
+                                    .read_to_end(&mut buf)
                                     .map_err(DiskError::from)?;
-                                if nbytes == 0 {
+                                if total < length {
                                     return Err(DiskError::FileCorrupt);
                                 }
-                                total += nbytes;
+                            } else {
+                                buf.resize(length, 0);
+                                while total < length {
+                                    let nbytes = file
+                                        .read_at(&mut buf[total..], u64::try_from(offset + total).unwrap_or(u64::MAX))
+                                        .map_err(DiskError::from)?;
+                                    if nbytes == 0 {
+                                        return Err(DiskError::FileCorrupt);
+                                    }
+                                    total += nbytes;
+                                }
                             }
                             Ok::<_, DiskError>(())
                         }
@@ -13383,9 +13782,23 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        self.io_backend
-            .open_write(volume, path, WriteMode::Truncate { size_hint: _file_size })
-            .await
+        #[cfg(test)]
+        let probe_active = os::file_sync_probe::is_active();
+        #[cfg(not(test))]
+        let probe_active = false;
+        let sync_on_close = cfg!(target_os = "linux")
+            && volume == RUSTFS_META_TMP_BUCKET
+            && !origvolume.is_empty()
+            && path.ends_with("/part.1")
+            && effective_durability(origvolume).syncs_data_shards()
+            && !os::file_fdatasync_group_commit_enabled()
+            && !probe_active;
+        let mode = if sync_on_close {
+            WriteMode::TruncateSync { size_hint: _file_size }
+        } else {
+            WriteMode::Truncate { size_hint: _file_size }
+        };
+        self.io_backend.open_write(volume, path, mode).await
     }
 
     async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
@@ -13956,16 +14369,70 @@ impl DiskAPI for LocalDisk {
 
             check_path_length(file_path.to_string_lossy().as_ref())?;
 
-            let buf = self
-                .read_all(volume, format!("{}/{}", path, STORAGE_FORMAT_FILE).as_str())
-                .await
-                .map_err(|e| {
-                    if e == DiskError::FileNotFound && fi.version_id.is_some() {
-                        DiskError::FileVersionNotFound
-                    } else {
-                        e
+            let xl_rel_path = format!("{path}/{STORAGE_FORMAT_FILE}");
+            if self.multipart_source_admission(volume, &xl_rel_path, true, false)?.is_none()
+                && !crash_inject::is_armed(CrashPoint::MetaWriteAfterTmpBeforeRename, &xl_rel_path)
+                && !has_delete_version_test_failpoints()
+                && !has_rename_data_test_failpoints(&xl_rel_path)
+            {
+                multipart_staging::reject_reserved_anchor(&xl_rel_path)?;
+                let volume_dir = self.io_get_bucket_path(volume)?;
+                let xl_file_path = self.io_get_object_path(volume, &xl_rel_path)?;
+                check_path_length(xl_file_path.to_string_lossy().as_ref())?;
+                let tmp_file_path = self.io_get_object_path(RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
+                let sync = !opts.no_persistence && effective_durability(volume).syncs_commit_metadata();
+                let replace_user_metadata = opts.replace_user_metadata;
+                let has_version_id = fi.version_id.is_some();
+                let publication_root = self.publication_root.clone();
+                let lease = os::acquire_namespace_mutation_lease_with_owner(&xl_file_path, namespace_owner).await;
+                return os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<Result<()>> {
+                    let buf = match std::fs::read(&xl_file_path) {
+                        Ok(buf) => buf,
+                        Err(err) if err.kind() == ErrorKind::NotFound && has_version_id => {
+                            return Ok(Err(DiskError::FileVersionNotFound));
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    if !FileMeta::is_xl2_v1_format(&buf) {
+                        return Ok(Err(DiskError::FileVersionNotFound));
                     }
-                })?;
+                    let wbuf = match FileMeta::load(&buf).and_then(|mut xl_meta| {
+                        xl_meta.update_object_version_with_opts(fi, replace_user_metadata)?;
+                        xl_meta.marshal_msg()
+                    }) {
+                        Ok(wbuf) => wbuf,
+                        Err(err) => return Ok(Err(err.into())),
+                    };
+                    if let Some(parent) = tmp_file_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let mut tmp_file = std::fs::File::create(&tmp_file_path)?;
+                    std::io::Write::write_all(&mut tmp_file, &wbuf)?;
+                    if sync && !wbuf.is_empty() {
+                        tmp_file.sync_data()?;
+                    }
+                    drop(tmp_file);
+                    os::rename_all_with_precondition_and_parent_sync_std(
+                        &tmp_file_path,
+                        &xl_file_path,
+                        &volume_dir,
+                        &publication_root,
+                        None,
+                        sync,
+                    )?;
+                    Ok(Ok(()))
+                })
+                .await
+                .map_err(to_file_error)?;
+            }
+
+            let buf = self.read_all(volume, xl_rel_path.as_str()).await.map_err(|e| {
+                if e == DiskError::FileNotFound && fi.version_id.is_some() {
+                    DiskError::FileVersionNotFound
+                } else {
+                    e
+                }
+            })?;
 
             if !FileMeta::is_xl2_v1_format(buf.as_ref()) {
                 return Err(DiskError::FileVersionNotFound);
@@ -13980,7 +14447,7 @@ impl DiskAPI for LocalDisk {
             return self
                 .write_all_meta_with_namespace_owner(
                     volume,
-                    format!("{path}/{STORAGE_FORMAT_FILE}").as_str(),
+                    xl_rel_path.as_str(),
                     wbuf.into(),
                     !opts.no_persistence,
                     namespace_owner,
@@ -18065,6 +18532,54 @@ mod test {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit, file_fdatasync_group_commit)]
+    #[allow(clippy::await_holding_lock)]
+    async fn rename_data_inline_new_version_fsync_failure_preserves_previous_metadata() {
+        let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(false);
+        let _file_group_commit = os::set_file_fdatasync_group_commit_for_test(false);
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "inline-version-fsync-failure";
+        let object = "dir/object";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let old_version = Uuid::new_v4();
+        let old_fi = test_file_info(object, old_version, None, Some(Bytes::from_static(b"previous-inline-version")));
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, "old-inline-stage", old_fi, bucket, object)
+            .await
+            .expect("previous inline version should commit");
+        let dst_meta = disk
+            .get_object_path(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+            .expect("metadata path should resolve");
+        let previous = fs::read(&dst_meta).await.expect("previous metadata should be readable");
+        let destination_dir = dst_meta.parent().expect("metadata should have a parent").to_path_buf();
+        // Arm the failure after the fused-path selection so the test exercises
+        // its normal admission path instead of the failpoint fallback.
+        set_inline_before_file_sync_admission(object, move || {
+            os::fsync_dir_recorder::set_failure(&destination_dir, io::ErrorKind::PermissionDenied);
+        });
+
+        let new_version = Uuid::new_v4();
+        let new_fi = test_file_info(object, new_version, None, Some(Bytes::from_static(b"incoming-inline-version")));
+        let err = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, "new-inline-stage", new_fi, bucket, object)
+            .await
+            .expect_err("directory fsync failure must reject the new version");
+        assert!(matches!(err, DiskError::Io(ref err) if err.kind() == io::ErrorKind::PermissionDenied));
+        let restored = fs::read(&dst_meta)
+            .await
+            .expect("previous metadata must survive the failed commit");
+        assert_eq!(restored, previous, "rollback must restore all previously committed inline versions");
+        let metadata = FileMeta::load(&restored).expect("restored metadata must be valid");
+        assert!(metadata.find_version(Some(old_version)).is_ok());
+        assert!(metadata.find_version(Some(new_version)).is_err());
+    }
+
     // Seed a first PUT of `object` (no prior version) through the non-inline
     // rename_data path and return (disk, tempdir). The object dir and any prefix
     // dirs are created during the commit.
@@ -20291,6 +20806,116 @@ mod test {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit, file_fdatasync_group_commit, file_sync_probe)]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_rename_data_unknown_destination_defers_shard_sync() {
+        let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(false);
+        let _file_group_commit = os::set_file_fdatasync_group_commit_for_test(false);
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        for destination_mode in [DurabilityMode::None, DurabilityMode::Strict] {
+            let bucket = "unknown-destination-shard-bucket";
+            let _bucket_mode = BucketOverrideGuard::set(bucket, destination_mode);
+            let dir = tempfile::tempdir().expect("temp dir should be created");
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+            let object = "dir/object";
+            let tmp_object = "tmp-unknown-destination";
+            let data_dir = Uuid::new_v4();
+            ensure_test_volume(&disk, bucket).await;
+            ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+            let shard_path = format!("{tmp_object}/{data_dir}/part.1");
+            let mut writer = disk
+                .create_file("", RUSTFS_META_TMP_BUCKET, &shard_path, 8)
+                .await
+                .expect("open staged shard writer without a destination");
+            writer.write_all(b"new-data").await.expect("write staged shard");
+            writer.shutdown().await.expect("close staged shard");
+            let staged_dir = disk
+                .get_object_path_for_io(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{data_dir}"))
+                .expect("staged shard directory should resolve");
+            assert!(
+                !PRESYNCED_TMP_DATA_DIRS.lock().contains(&staged_dir),
+                "an unknown destination must defer payload sync until commit"
+            );
+
+            let mut fi = test_file_info(object, Uuid::new_v4(), Some(data_dir), None);
+            fi.size = 8;
+            fi.parts[0].size = 8;
+            fi.parts[0].actual_size = 8;
+            disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, fi, bucket, object)
+                .await
+                .expect("rename_data should apply the destination policy");
+            assert_eq!(
+                os::fsync_dir_recorder::was_fsynced(&staged_dir),
+                destination_mode.syncs_data_shards(),
+                "the commit must apply the destination durability override"
+            );
+            let shard = disk
+                .get_object_path(bucket, &format!("{object}/{data_dir}/part.1"))
+                .expect("committed shard should resolve");
+            assert_eq!(fs::read(shard).await.expect("committed shard should be readable"), b"new-data");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit, file_fdatasync_group_commit, file_sync_probe)]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_rename_data_presynced_shard_keeps_directory_sync() {
+        let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(false);
+        let _file_group_commit = os::set_file_fdatasync_group_commit_for_test(false);
+        for mode in [DurabilityMode::Strict, DurabilityMode::Relaxed] {
+            let _mode = durability_mode_override::set(mode);
+            let dir = tempfile::tempdir().expect("temp dir should be created");
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+            let bucket = "presynced-shard-bucket";
+            let object = "dir/object";
+            let tmp_object = "tmp-presynced-write";
+            let data_dir = Uuid::new_v4();
+            ensure_test_volume(&disk, bucket).await;
+            ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+            let shard_path = format!("{tmp_object}/{data_dir}/part.1");
+            let mut writer = disk
+                .create_file(bucket, RUSTFS_META_TMP_BUCKET, &shard_path, 8)
+                .await
+                .expect("open staged shard writer");
+            writer.write_all(b"new-data").await.expect("write staged shard");
+            writer.shutdown().await.expect("close staged shard");
+            let staged_dir = disk
+                .get_object_path_for_io(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{data_dir}"))
+                .expect("staged shard directory should resolve");
+            assert!(PRESYNCED_TMP_DATA_DIRS.lock().contains(&staged_dir), "the writer must pre-sync the shard");
+            assert!(!os::fsync_dir_recorder::was_fsynced(&staged_dir));
+
+            let mut fi = test_file_info(object, Uuid::new_v4(), Some(data_dir), None);
+            fi.size = 8;
+            fi.parts[0].size = 8;
+            fi.parts[0].actual_size = 8;
+            disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, fi, bucket, object)
+                .await
+                .expect("rename_data should commit");
+            assert!(
+                !PRESYNCED_TMP_DATA_DIRS.lock().contains(&staged_dir),
+                "the fused commit must consume the pre-sync marker"
+            );
+            assert!(
+                os::fsync_dir_recorder::was_fsynced(&staged_dir),
+                "pre-syncing the payload must not skip the shard directory barrier"
+            );
+            let shard = disk
+                .get_object_path(bucket, &format!("{object}/{data_dir}/part.1"))
+                .expect("committed shard should resolve");
+            assert_eq!(fs::read(shard).await.expect("committed shard should be readable"), b"new-data");
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_rename_data_legacy_off_skips_all_fsyncs() {
@@ -20311,17 +20936,20 @@ mod test {
         ensure_test_volume(&disk, bucket).await;
         ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
 
-        let tmp_data_dir = dir
-            .path()
-            .join(RUSTFS_META_TMP_BUCKET)
-            .join(tmp_object)
-            .join(new_data_dir.to_string());
-        fs::create_dir_all(&tmp_data_dir)
+        let shard_path = format!("{tmp_object}/{new_data_dir}/part.1");
+        let mut writer = disk
+            .create_file("", RUSTFS_META_TMP_BUCKET, &shard_path, 8)
             .await
-            .expect("new tmp data dir should be created");
-        fs::write(tmp_data_dir.join("part.1"), b"new-data")
-            .await
-            .expect("new tmp data should be written");
+            .expect("open staged shard writer");
+        writer.write_all(b"new-data").await.expect("write staged shard");
+        writer.shutdown().await.expect("close staged shard");
+        let resolved_tmp_data_dir = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{new_data_dir}"))
+            .expect("tmp data dir path should resolve");
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&resolved_tmp_data_dir),
+            "the staged writer must not sync before the destination policy is known"
+        );
 
         let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
         disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)

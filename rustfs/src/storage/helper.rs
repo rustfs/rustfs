@@ -22,12 +22,13 @@ use hashbrown::HashMap;
 use http::StatusCode;
 use metrics::counter;
 use rustfs_audit::{
-    ObjectVersion,
+    ApiDetails, AuditEntry, ObjectVersion,
     entity::{ApiDetailsBuilder, AuditEntryBuilder},
     global::AuditLogger,
 };
 use rustfs_io_metrics::record_s3_op;
 use rustfs_notify::EventArgsBuilder;
+use rustfs_policy::policy::action::Action;
 use rustfs_s3_ops::{S3Operation, operation_matches_event_name};
 use rustfs_s3_types::EventName;
 use rustfs_targets::{
@@ -39,6 +40,9 @@ use s3s::{S3Request, S3Response, S3Result};
 use serde_json::Value;
 use std::future::Future;
 use tokio::runtime::{Builder, Handle};
+
+/// Request type seen by the denial auditor, so `denial_audit` stays off the direct s3s surface.
+pub(crate) type DenialRequest<T> = S3Request<T>;
 use tracing::{Instrument, info_span, warn};
 
 #[cfg(feature = "diagnostic-read-version-caller")]
@@ -95,6 +99,42 @@ pub(crate) fn build_event_resp_elements<T>(response: &S3Response<T>, request_id:
     let mut resp_elements = extract_resp_elements(response);
     resp_elements.insert(AMZ_REQUEST_ID.to_string(), request_id.to_string());
     resp_elements
+}
+
+/// Builds the audit entry shared by every request-scoped audit source: caller identity,
+/// client address and the request line, without any outcome.
+fn request_audit_builder<T>(
+    req: &S3Request<T>,
+    req_info: Option<&ReqInfo>,
+    event: EventName,
+    trigger: &str,
+    api: ApiDetails,
+    request_id: &str,
+) -> AuditEntryBuilder {
+    let remote_host = req
+        .extensions
+        .get::<ClientInfo>()
+        .map(|info| info.real_ip.to_string())
+        .or_else(|| {
+            req.extensions
+                .get::<Option<RemoteAddr>>()
+                .and_then(|addr| addr.map(|addr| addr.0.ip().to_string()))
+        })
+        .unwrap_or_default();
+    let mut builder = AuditEntryBuilder::new("1.0", event, trigger, api)
+        .remote_host(remote_host)
+        .user_agent(get_request_user_agent(&req.headers))
+        .req_host(get_request_host(&req.headers))
+        .req_path(req.uri.path().to_string())
+        .req_query(extract_req_params(req))
+        .request_id(request_id);
+    if let Some(cred) = req_info
+        .and_then(|info| info.cred.as_ref())
+        .filter(|cred| !cred.access_key.is_empty())
+    {
+        builder = builder.access_key(&cred.access_key);
+    }
+    builder
 }
 
 /// A unified helper structure for building and distributing audit logs and event notifications via RAII mode at the end of an S3 operation scope.
@@ -205,34 +245,8 @@ impl OperationHelper {
         let request_context = request_context.unwrap_or_else(|| RequestContext::from_external_headers(&req.headers));
         let request_id = request_context.request_id.clone();
 
-        let audit_builder = if audit_enabled {
-            let remote_host = req
-                .extensions
-                .get::<ClientInfo>()
-                .map(|info| info.real_ip.to_string())
-                .or_else(|| {
-                    req.extensions
-                        .get::<Option<RemoteAddr>>()
-                        .and_then(|addr| addr.map(|addr| addr.0.ip().to_string()))
-                })
-                .unwrap_or_default();
-            let mut builder = AuditEntryBuilder::new("1.0", event, trigger, api_builder.clone().build())
-                .remote_host(remote_host)
-                .user_agent(get_request_user_agent(&req.headers))
-                .req_host(get_request_host(&req.headers))
-                .req_path(req.uri.path().to_string())
-                .req_query(extract_req_params(req))
-                .request_id(&request_id);
-            if let Some(cred) = req_info
-                .and_then(|info| info.cred.as_ref())
-                .filter(|cred| !cred.access_key.is_empty())
-            {
-                builder = builder.access_key(&cred.access_key);
-            }
-            Some(builder)
-        } else {
-            None
-        };
+        let audit_builder =
+            audit_enabled.then(|| request_audit_builder(req, req_info, event, trigger, api_builder.clone().build(), &request_id));
 
         let event_object = ObjectInfo {
             bucket: bucket.clone(),
@@ -438,6 +452,73 @@ impl OperationHelper {
             }
         }
     }
+}
+
+/// What an authorization denial entry describes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DenialScope {
+    /// One refused request for the request's own bucket and object.
+    Request,
+    /// A bulk request (DeleteObjects) in which this many keys were refused; no single object applies.
+    Keys(u64),
+}
+
+/// Builds the audit entry for a request the authorization layer refused.
+///
+/// The entry carries the action that was denied and the internal denial reason, so an
+/// audit consumer can tell a refused request from a handler that never ran.
+pub(crate) fn authorization_denial_entry<T>(
+    req: &S3Request<T>,
+    action: &Action,
+    reason: &'static str,
+    scope: DenialScope,
+) -> AuditEntry {
+    let req_info = req.extensions.get::<ReqInfo>();
+    let path = req.uri.path().trim_start_matches('/');
+    let mut segs = path.splitn(2, '/');
+    let path_bucket = segs.next().unwrap_or("");
+    let path_object = segs.next().unwrap_or("");
+    let bucket = req_info
+        .and_then(|info| info.bucket.as_deref())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(path_bucket);
+    let object = match scope {
+        DenialScope::Request => req_info
+            .and_then(|info| info.object.as_deref())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(path_object),
+        DenialScope::Keys(_) => "",
+    };
+
+    let action_name: &str = action.into();
+    let mut api = ApiDetailsBuilder::new()
+        .name(action_name)
+        .status("failure")
+        .status_code(StatusCode::FORBIDDEN.as_u16() as i32);
+    if !bucket.is_empty() {
+        api = api.bucket(bucket);
+    }
+    if !object.is_empty() {
+        api = api.object(object);
+    }
+
+    let request_context = request_context_from_req(req).unwrap_or_else(|| RequestContext::from_external_headers(&req.headers));
+    let mut tags = HashMap::new();
+    tags.insert("denialReason".to_string(), Value::String(reason.to_string()));
+    if let DenialScope::Keys(denied) = scope {
+        tags.insert("deniedKeys".to_string(), Value::from(denied));
+    }
+    request_audit_builder(
+        req,
+        req_info,
+        EventName::AuditS3Operation,
+        action_name,
+        api.build(),
+        &request_context.request_id,
+    )
+    .error("Access Denied")
+    .tags(tags)
+    .build()
 }
 
 /// Runs `handler` on `req` and records the outcome as an audit-only entry for `op`.
