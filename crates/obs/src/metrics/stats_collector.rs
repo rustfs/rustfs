@@ -762,7 +762,7 @@ pub async fn collect_disk_stats() -> Vec<DiskStats> {
 fn build_system_cpu_stats(system: &System, server: &str) -> CpuStats {
     let cpu_usage = system.global_cpu_usage() as f64;
     let cpu_count = system.cpus().len().max(1) as f64;
-    let load_avg = System::load_average().one;
+    let load_avg = System::load_average().map_or(0.0, |load| load.one);
 
     CpuStats {
         server: server.to_string(),
@@ -796,7 +796,19 @@ fn build_system_memory_stats(system: &System, server: &str) -> MemoryStats {
 
 /// Collect system CPU and memory statistics from a shared sysinfo snapshot.
 pub fn collect_system_cpu_and_memory_stats() -> (CpuStats, MemoryStats) {
-    let mut system = System::new_all();
+    let Ok(mut system) = System::new_all() else {
+        let server = current_local_node_identity();
+        return (
+            CpuStats {
+                server: server.clone(),
+                ..Default::default()
+            },
+            MemoryStats {
+                server,
+                ..Default::default()
+            },
+        );
+    };
     collect_system_cpu_and_memory_stats_with(&mut system)
 }
 
@@ -1040,7 +1052,7 @@ pub fn collect_host_network_stats_with(networks: &Networks) -> HostNetworkStats 
         let transmitted = data.transmitted();
         total_received += received;
         total_transmitted += transmitted;
-        per_interface.push((interface_name.to_string(), received, transmitted));
+        per_interface.push((interface_name.to_string_lossy().into_owned(), received, transmitted));
     }
 
     HostNetworkStats {
@@ -1652,6 +1664,7 @@ pub(crate) async fn collect_scanner_runtime_metric_stats() -> Option<ScannerRunt
         last_cycle_bucket_drive_results: scanner_bucket_drive_result_stats(&runtime_details.last_cycle_bucket_drive_results),
         active_bucket_drive_scans: scanner_active_bucket_drive_stats(&runtime_details.active_bucket_drive_scans),
         stats: ScannerStats {
+            startup: metrics.startup,
             bucket_scans_finished,
             bucket_scans_started,
             bucket_scans_failed,
@@ -1777,6 +1790,29 @@ pub async fn collect_compression_cluster_stats() -> Option<CompressionClusterSta
 }
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn scanner_startup_snapshot_reaches_the_real_stats_mapping() {
+        use rustfs_scanner_metrics::startup::ScannerStartupPhase;
+        let metrics = rustfs_scanner_metrics::metrics::global_metrics();
+        let token = metrics.startup().begin();
+        metrics
+            .startup()
+            .record_wait(token, tokio::time::Instant::now() + std::time::Duration::from_secs(300));
+        let mapped = super::collect_scanner_runtime_metric_stats().await.expect("scanner stats");
+        assert_eq!(mapped.stats.startup.phase, ScannerStartupPhase::Waiting);
+        assert!(mapped.stats.startup.runtime_active);
+        assert!(mapped.stats.startup.planned_attempt_at_unix_secs.is_some());
+        assert!(mapped.stats.startup.wait_remaining_seconds > 0);
+        assert!(mapped.stats.startup.first_attempt_at_unix_secs.is_none());
+        metrics.startup().finish(token);
+        let stopped = super::collect_scanner_runtime_metric_stats()
+            .await
+            .expect("stopped scanner stats");
+        assert_eq!(stopped.stats.startup.phase, ScannerStartupPhase::Stopped);
+        assert!(!stopped.stats.startup.runtime_active);
+        assert!(stopped.stats.startup.planned_attempt_at_unix_secs.is_none());
+    }
+
     use super::*;
     use rustfs_scanner_metrics::metrics::ScannerSourceWorkSnapshot;
     use std::io::{Read, Write};
@@ -1941,9 +1977,9 @@ mod tests {
         let previous = rustfs_common::get_global_local_node_name().await;
         rustfs_common::set_global_local_node_name("node1:9000").await;
 
-        let mut system = System::new_all();
+        let mut system = System::new_all().expect("initialize system snapshot");
         let (cpu, memory) = collect_system_cpu_and_memory_stats_with(&mut system);
-        let host_network = collect_host_network_stats_with(&Networks::new());
+        let host_network = collect_host_network_stats_with(&Networks::new().expect("initialize network snapshot"));
         let process_bundle =
             process_metric_bundle_from_snapshots(ProcessResourceSnapshot::default(), ProcessSystemSnapshot::default());
 
@@ -2448,11 +2484,11 @@ mod tests {
 
     #[test]
     fn host_network_stats_require_a_persistent_networks_snapshot() -> std::io::Result<()> {
-        if !sysinfo::IS_SUPPORTED_SYSTEM {
-            return Ok(());
-        }
-
-        let mut persistent_networks = Networks::new();
+        let mut persistent_networks = match Networks::new() {
+            Ok(networks) => networks,
+            Err(sysinfo::Error::Unsupported) => return Ok(()),
+            Err(error) => return Err(std::io::Error::other(error)),
+        };
         persistent_networks.refresh(true);
         let initial_stats = collect_host_network_stats_with(&persistent_networks);
         assert_eq!(
@@ -2476,7 +2512,8 @@ mod tests {
             "a persistent Networks instance should report non-zero loopback deltas after traffic"
         );
 
-        let recreated_stats = collect_host_network_stats_with(&Networks::new_with_refreshed_list());
+        let recreated_stats =
+            collect_host_network_stats_with(&Networks::new_with_refreshed_list().map_err(std::io::Error::other)?);
         assert_eq!(
             recreated_stats.total_received + recreated_stats.total_transmitted,
             0,

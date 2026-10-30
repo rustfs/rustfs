@@ -182,6 +182,18 @@ requires a compatibility window and a dedicated cleanup entry.
 | `.scanner-cycle.lock` | scanner runtime lock | Serializes cycle-level work. A missing lock object is not itself usage evidence. |
 | `.scanner-pause-backlog.json` | scanner pause and catch-up ledger | Tracks dirty usage, discovered lifecycle work, and full-scan catch-up while authoritative publication is fenced by data movement. It never grants publication admission. |
 
+The authoritative snapshot may include an optional `bucket_incarnation` in each
+bucket usage entry. The coordinator writes it only when every contributing set
+reports the same non-nil bucket UUID. Missing or conflicting identities leave
+that entry uncertified; they do not reject the usage publication or change quota
+admission. Veeam SOSAPI capacity reads require this proof to match the bucket
+incarnation read from authoritative storage. An old snapshot, a mixed-version
+writer that omits the field, a pending target bucket, or an unavailable identity
+therefore yields a retryable capacity error until a compatible scanner publishes
+a certified entry. The optional field is omitted when unavailable so older
+snapshot readers continue to see the original shape. This proof identifies the
+bucket generation; it does not make scanner usage a real-time quota ledger.
+
 ## Observed Snapshots
 
 Observed snapshots are a diagnostic and availability layer. They may be served
@@ -325,8 +337,44 @@ worker finishing does not certify its namespace coverage.
 | `bucket_result_rejected` | A bucket result did not match the cycle's frozen tier-registry generation and was not applied. |
 | `set_cache_publish_skipped` | `completed_buckets` counts distinct bucket roots successfully applied to this set cache and `carried_buckets` the partial walks covered by a certified value. Use `first_incomplete_bucket` with pool/set/cycle to locate one actual gap in this set. Inspect `unprocessed_buckets` and budget/cancellation state, then correlate that bucket's worker events. |
 | `set_scan_completed` | Set workers have finished. `coverage_complete` reports the structural coverage gate, not durable publication. This event alone does not prove a complete set snapshot. |
-| `incomplete_coverage` | The cycle did not obtain complete structural coverage. This does not identify a hot bucket or prove that ordinary writes caused the gap. |
+| `incomplete_coverage` | A Partial cycle did not match either of the more specific partial-cause labels. It does not identify which completeness or publication check failed, or prove that a bucket or drive was missed. |
 | `publication_proof_pending` | Publication is waiting for a retryable proof. Use cycle/stage, `pending_duration`, the preceding `publication_proof_started` kind, and the peer/purpose in the error. This event does not assert that the walk was Complete. |
+
+`bucket_sweep_incomplete`, `partial_saved_not_published`,
+`set_cache_publish_skipped`, and `set_scan_completed` are debug events. Their
+absence cannot exclude those paths when debug logging was not collected.
+
+`metrics.last_cycle_bucket_drive_scans` is the local process's change in
+`scan_bucket_drive` timed completions during the cycle. It includes successful,
+partial, namespace-not-found, and non-cancelled error returns; a cancelled
+scan can emit a partial result without incrementing this count. The leader's
+remote progress adds object and directory counts, but not remote bucket-drive
+completions. The count can also include concurrent local scan work. It is not a
+cluster-wide success count or a coverage denominator, so comparing it with
+bucket count multiplied by set or drive count cannot identify missing drives.
+See `Metrics::scan_cycle_work_since` in [scanner metrics](../../crates/scanner-metrics/src/metrics.rs)
+and `ScannerIODisk::nsscanner_disk` in [the disk scanner](../../crates/scanner/src/scanner_io/io_disk.rs).
+
+For a Partial cycle, compare the same leader process's `metrics.usage_candidates`
+in `/rustfs/admin/v3/scanner/status` before and after the cycle, when available.
+The corresponding `rustfs_scanner_usage_candidates_total` counters require an
+enabled exporter; other scanner metrics endpoints can expose a different schema.
+For `kind=completed`, the `outcome` names the first candidate-construction check
+that returned no candidate, or `accepted`; acceptance does not prove durable
+publication. Counters are process-lifetime, not per-cycle or per-bucket, and
+reset on restart. Correlate their deltas with the same cycle and leader epoch in
+logs; concurrent candidate construction and non-atomic sampling can make
+attribution uncertain. An unavailable field or counter is not zero.
+
+The scanner metrics `rustfs_scanner_bucket_drive_result_total` and
+`rustfs_scanner_cycle_bucket_drive_result` expose local results by server, bucket, drive and
+`result` (`success`, `partial`, or `error`); the latter also has `cycle_scope`
+(`current` or `last`). `rustfs_scanner_active_bucket_drive_scans` shows work
+active at the sample time. These are observations, not per-drive terminal acknowledgements:
+the local result table is capped and evicts old keys, the cycle labels do not
+carry a cycle or epoch, and retries can repeat work. A missing row does not
+prove that a terminal was never received. Match observations to the relevant
+node and cycle before comparing them with set-cache and publication logs.
 
 For a report such as 52 completed buckets out of 53, first identify whether
 the missing bucket was Partial, failed, never admitted, or rejected at merge.

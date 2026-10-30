@@ -1417,27 +1417,46 @@ impl DataUsageCache {
         Some((flattened, visited.len()))
     }
 
-    fn flatten_with_guard(&self, root: &DataUsageEntry, visited: &mut HashSet<String>, depth: usize) -> DataUsageEntry {
-        let mut root = clone_cache_value(root);
+    fn flatten_with_guard<'a>(
+        &'a self,
+        root: &'a DataUsageEntry,
+        visited: &mut HashSet<&'a str>,
+        depth: usize,
+    ) -> DataUsageEntry {
+        // A summary never owns child links. Cloning and clearing the set
+        // retains its allocation in every completed subtree and update.
+        let mut flat = DataUsageEntry {
+            children: HashSet::new(),
+            size: root.size,
+            objects: root.objects,
+            versions: root.versions,
+            delete_markers: root.delete_markers,
+            obj_sizes: root.obj_sizes.clone(),
+            obj_versions: root.obj_versions.clone(),
+            replication_stats: root.replication_stats.clone(),
+            compacted: root.compacted,
+            failed_objects: root.failed_objects,
+            all_tier_stats: root.all_tier_stats.clone(),
+            unknown_tier_stats: root.unknown_tier_stats.clone(),
+            tier_accounting_proof: root.tier_accounting_proof,
+        };
         if depth >= MAX_DATA_USAGE_CACHE_DEPTH {
-            root.children.clear();
-            return root;
+            return flat;
         }
 
-        for id in clone_cache_value(&root.children).iter() {
-            if !visited.insert(clone_cache_value(id)) {
+        for id in &root.children {
+            if !visited.insert(id.as_str()) {
                 continue;
             }
             if let Some(e) = self.cache.get(id) {
-                let mut e = clone_cache_value(e);
-                if !e.children.is_empty() {
-                    e = self.flatten_with_guard(&e, visited, depth + 1);
+                if e.children.is_empty() {
+                    flat.merge(e);
+                } else {
+                    flat.merge(&self.flatten_with_guard(e, visited, depth + 1));
                 }
-                root.merge(&e);
             }
         }
-        root.children.clear();
-        root
+        flat
     }
 
     pub fn copy_with_children(&mut self, src: &DataUsageCache, hash: &DataUsageHash, parent: &Option<DataUsageHash>) {
@@ -1480,38 +1499,31 @@ impl DataUsageCache {
     }
 
     pub fn delete_recursive(&mut self, hash: &DataUsageHash) {
-        let mut visited = HashSet::new();
-        self.delete_recursive_guard(hash, &mut visited, 0);
+        self.delete_recursive_guard(&hash.0, 0);
     }
 
-    fn delete_recursive_guard(&mut self, hash: &DataUsageHash, visited: &mut HashSet<String>, depth: usize) {
-        if !visited.insert(clone_cache_value(&hash.0)) {
+    fn delete_recursive_guard(&mut self, path: &str, depth: usize) {
+        // Removal transfers child ownership and makes cyclic/shared references
+        // no-ops, without cloning paths or maintaining a second visited set.
+        let Some(children) = self.cache.remove(path).map(|entry| entry.children) else {
             return;
-        }
-
-        let mut need_remove = Vec::new();
-        if let Some(v) = self.cache.get(&clone_cache_value(&hash.0)) {
-            for child in v.children.iter() {
-                need_remove.push(clone_cache_value(child));
-            }
-        }
-        self.cache.remove(&clone_cache_value(&hash.0));
+        };
         if depth >= MAX_DATA_USAGE_CACHE_DEPTH {
             return;
         }
-        for child in need_remove {
-            self.delete_recursive_guard(&DataUsageHash(child), visited, depth + 1);
+        for child in children {
+            self.delete_recursive_guard(&child, depth + 1);
         }
     }
 
     pub fn size_recursive(&self, path: &str) -> Option<DataUsageEntry> {
-        match self.find(path) {
-            Some(root) => {
+        match self.cache.get_key_value(&hash_path(path).key()) {
+            Some((key, root)) => {
                 if root.children.is_empty() {
                     return Some(clone_cache_value(root));
                 }
                 let mut visited = HashSet::new();
-                visited.insert(clone_cache_value(&hash_path(path).0));
+                visited.insert(key.as_str());
                 let mut flat = self.flatten_with_guard(root, &mut visited, 0);
                 if flat.replication_stats.as_ref().is_some_and(|stats| stats.is_empty()) {
                     flat.replication_stats = None;
@@ -1566,7 +1578,7 @@ impl DataUsageCache {
     }
 
     pub fn reduce_children_of(&mut self, path: &DataUsageHash, limit: usize, compact_self: bool) {
-        let Some(e) = self.cache.get(&clone_cache_value(&path.0)).map(clone_cache_value) else {
+        let Some(e) = self.cache.get(&path.0) else {
             return;
         };
 
@@ -1618,12 +1630,13 @@ impl DataUsageCache {
     }
 
     pub fn total_children_rec(&self, path: &str) -> usize {
+        let root = hash_path(path);
         let mut visited = HashSet::new();
-        visited.insert(clone_cache_value(&hash_path(path).0));
+        visited.insert(root.0.as_str());
         self.total_children_rec_guard(path, &mut visited, 0)
     }
 
-    fn total_children_rec_guard(&self, path: &str, visited: &mut HashSet<String>, depth: usize) -> usize {
+    fn total_children_rec_guard<'a>(&'a self, path: &str, visited: &mut HashSet<&'a str>, depth: usize) -> usize {
         let Some(root) = self.find(path) else {
             return 0;
         };
@@ -1633,7 +1646,7 @@ impl DataUsageCache {
 
         let mut n = 0;
         for ch in root.children.iter() {
-            if visited.insert(clone_cache_value(ch)) {
+            if visited.insert(ch.as_str()) {
                 n += 1 + self.total_children_rec_guard(ch, visited, depth + 1);
             }
         }

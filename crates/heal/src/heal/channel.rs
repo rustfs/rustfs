@@ -201,6 +201,20 @@ impl HealChannelProcessor {
             .map_err(Error::other)
     }
 
+    /// Query a local automatic task; other tokens require coordinator routing.
+    pub async fn execute_local_automatic_query(
+        &self,
+        heal_path: &str,
+        client_token: &str,
+        since_seq: Option<u64>,
+    ) -> Result<Option<HealChannelResponse>> {
+        self.heal_manager
+            .get_local_automatic_task_report(heal_path, client_token, since_seq)
+            .await?
+            .map(|report| Self::query_report_response(client_token.to_owned(), Ok(report)))
+            .transpose()
+    }
+
     /// Execute cancellation directly against the manager.
     pub async fn execute_cancel_request(&self, heal_path: String, client_token: String) -> Result<HealChannelResponse> {
         let (response_tx, response_rx) = oneshot::channel();
@@ -524,6 +538,13 @@ impl HealChannelProcessor {
                 .await
         };
 
+        let response = Self::query_report_response(client_token, report)?;
+        let _ = response_tx.send(Ok(response.clone()));
+        self.publish_response(response);
+        Ok(())
+    }
+
+    fn query_report_response(client_token: String, report: Result<HealTaskReport>) -> Result<HealChannelResponse> {
         let outcome = report.as_ref().ok().and_then(|report| report.outcome.clone());
         let settings = report
             .as_ref()
@@ -642,27 +663,21 @@ impl HealChannelProcessor {
                 0,
             ),
             Err(crate::Error::InvalidClientToken) => {
-                let response = HealChannelResponse {
+                return Ok(HealChannelResponse {
                     request_id: client_token,
                     success: false,
                     data: None,
                     error: Some("invalid heal client token".to_string()),
-                };
-                let _ = response_tx.send(Ok(response.clone()));
-                self.publish_response(response);
-                return Ok(());
+                });
             }
             Err(err) => {
                 let error_text = err.to_string();
-                let response = HealChannelResponse {
+                return Ok(HealChannelResponse {
                     request_id: client_token,
                     success: false,
                     data: None,
                     error: Some(error_text),
-                };
-                let _ = response_tx.send(Ok(response.clone()));
-                self.publish_response(response);
-                return Ok(());
+                });
             }
         };
 
@@ -679,17 +694,12 @@ impl HealChannelProcessor {
             },
         )?;
 
-        let response = HealChannelResponse {
+        Ok(HealChannelResponse {
             request_id: client_token,
             success: true,
             data: Some(data),
             error: detail,
-        };
-
-        let _ = response_tx.send(Ok(response.clone()));
-        self.publish_response(response);
-
-        Ok(())
+        })
     }
 
     /// Process cancel request

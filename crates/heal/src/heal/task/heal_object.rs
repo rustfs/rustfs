@@ -220,6 +220,11 @@ impl HealTask {
         let mut expected_identity =
             self.outcome_identity(bucket, object, version_id, self.options.pool_index, self.options.set_index);
         expected_identity.bucket_incarnation_id = self.outcome_bucket_incarnation_id(bucket, self.options.dry_run).await?;
+        if matches!(self.heal_type, HealType::Object { .. }) {
+            expected_identity.bucket_incarnation_id = *self
+                .single_object_incarnation
+                .get_or_init(|| expected_identity.bucket_incarnation_id);
+        }
 
         let heal_fut = self.storage.heal_object_with_receipt(bucket, object, version_id, &heal_opts);
         let heal_result = if self.source == HealRequestSource::ReadRepair {
@@ -489,9 +494,13 @@ impl HealTask {
             ))
             .await?;
         if let Some(error) = storage_result.error {
-            return Err(Error::TaskExecutionFailed {
-                message: format!("Failed to recreate missing object {bucket}/{object}: {error}"),
-            });
+            if error.is_dangling_delete_grace() {
+                // Preserve the existing MRF grace retry ownership.
+                return Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to recreate missing object {bucket}/{object}: {error}"),
+                });
+            }
+            return Err(error);
         }
 
         let object_size = storage_result.item.object_size as u64;
@@ -526,7 +535,7 @@ impl HealTask {
                 }
             } else {
                 Error::TaskExecutionFailed {
-                    message: format!("Missing exact storage proof for durable MRF repair {bucket}/{object}"),
+                    message: format!("{}{bucket}/{object}", crate::error::MRF_MISSING_PROOF_PREFIX),
                 }
             });
         }

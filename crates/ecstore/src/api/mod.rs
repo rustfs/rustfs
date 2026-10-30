@@ -14,12 +14,16 @@
 
 //! Explicit ECStore public facades for outer crate compatibility boundaries.
 
-#[cfg(feature = "diagnostic-read-version-caller")]
+#[cfg(any(feature = "diagnostic-read-version-caller", feature = "diagnostic-local-batch"))]
 pub mod diagnostic {
+    #[cfg(feature = "diagnostic-read-version-caller")]
     pub use crate::cluster::rpc::runtime_sources::{
         current_read_version_entry_source, observe_read_version_context_boundary, with_captured_read_version_context,
         with_read_version_entry, with_read_version_spawn_context,
     };
+    #[cfg(feature = "diagnostic-local-batch")]
+    pub use crate::diagnostics::batch_read_diagnostics::{current_request_id, in_request_context, request_context};
+    #[cfg(feature = "diagnostic-read-version-caller")]
     pub use rustfs_io_metrics::internode_metrics::{ReadVersionContextBoundary, ReadVersionEntrySource};
 }
 
@@ -141,6 +145,12 @@ pub mod bucket {
             pub use crate::bucket::lifecycle::rule::{Filter, NoncurrentVersionTransitionOps, TransitionOps};
         }
 
+        pub mod tier_free_version_recovery {
+            pub use crate::bucket::lifecycle::tier_free_version_recovery::{
+                TierCleanupRetryReport, TierCleanupRetryStatus, retry_tier_free_version_cleanup,
+            };
+        }
+
         pub mod tier_delete_journal {
             #[cfg(feature = "test-util")]
             pub use crate::bucket::lifecycle::tier_delete_journal::recover_tier_delete_journal_entries;
@@ -252,7 +262,7 @@ pub mod bucket {
     pub mod quota {
         pub use crate::bucket::quota::{
             BucketQuota, QUOTA_RESERVATION_PROTOCOL_V1, QUOTA_RESERVATION_PROTOCOL_V2, QuotaCheckResult, QuotaError,
-            QuotaMigrationSkipReason, QuotaOperation, QuotaProtocolMigration,
+            QuotaMigrationSkipReason, QuotaOperation, QuotaProtocolMigration, QuotaType,
         };
 
         pub mod checker {
@@ -341,9 +351,9 @@ pub mod cache {
 
 pub mod capacity {
     pub use crate::core::pools::{
-        DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolMeta, PoolStatus, get_total_usable_capacity,
-        get_total_usable_capacity_free, is_pool_activation_fleet_proof_error, path2_bucket_object,
-        path2_bucket_object_with_base_path,
+        DecommissionUnresolvedEntry, PoolAdminDiagnostic, PoolAvailability, PoolCapacityStatus, PoolDecommissionInfo,
+        PoolDiagnosticStatus, PoolMeta, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
+        is_pool_activation_fleet_proof_error, path2_bucket_object, path2_bucket_object_with_base_path,
     };
     pub use crate::store::utils::is_reserved_or_invalid_bucket;
 }
@@ -371,15 +381,24 @@ pub mod compression {
 
 pub mod config {
     pub mod com {
+        /// Preserve empty existing objects so callers can distinguish corruption from absence.
+        pub async fn read_config_preserve_empty_with_metadata_opts(
+            api: std::sync::Arc<crate::store::ECStore>,
+            file: &str,
+            opts: &crate::object_api::ObjectOptions,
+        ) -> crate::error::Result<(Vec<u8>, crate::object_api::ObjectInfo)> {
+            crate::config::com::read_config_preserve_empty_with_metadata_opts(api, file, opts).await
+        }
+
         pub use crate::config::com::{
             COMMA_SEPARATED_LISTS, CONFIG_PREFIX, ENV_CONFIG_RECOVER_ON_CORRUPTION, STORAGE_CLASS_SUB_SYS,
             ServerConfigCorruptError, ServerConfigSaveResult, ServerConfigSnapshot, delete_config, delete_config_no_lock,
             is_server_config_corrupt_error, lookup_configs, read_config, read_config_no_lock, read_config_with_metadata,
             read_config_without_migrate, read_config_without_migrate_no_lock, read_existing_server_config_no_lock,
-            read_server_config_snapshot, save_config, save_config_no_lock, save_config_with_opts, save_config_with_opts_quiet,
-            save_server_config, save_server_config_no_lock, save_server_config_snapshot,
-            save_server_config_snapshot_with_generation, server_config_path, try_migrate_server_config,
-            with_config_object_read_lock, with_config_object_write_lock, with_server_config_read_lock,
+            read_server_config_snapshot, read_server_config_with_generation, save_config, save_config_no_lock,
+            save_config_with_opts, save_config_with_opts_quiet, save_server_config, save_server_config_no_lock,
+            save_server_config_snapshot, save_server_config_snapshot_with_generation, server_config_path,
+            try_migrate_server_config, with_config_object_read_lock, with_config_object_write_lock, with_server_config_read_lock,
             with_server_config_write_lock,
         };
     }
@@ -416,9 +435,10 @@ pub mod data_usage {
         DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, compute_bucket_usage,
         init_compression_total_memory_from_backend, invalidate_admin_data_usage_snapshot_cache,
         invalidate_data_usage_snapshot_cache, live_bucket_usage_computations, load_admin_data_usage_from_backend_cached,
-        load_compression_total_from_memory, load_data_usage_from_backend, load_data_usage_from_backend_cached, quota_object_size,
-        record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
-        record_bucket_object_write_memory, record_bucket_object_write_unknown_previous_memory, record_compression_total_memory,
+        load_bucket_usage_from_backend_cached, load_compression_total_from_memory, load_data_usage_from_backend,
+        load_data_usage_from_backend_cached, quota_object_size, record_bucket_delete_marker_memory,
+        record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
+        record_bucket_object_write_unknown_previous_memory, record_compression_total_memory,
         refresh_bucket_usage_from_object_layer, refresh_versioned_bucket_usage_from_object_layer,
         remove_bucket_usage_from_backend, replace_bucket_usage_memory_from_info, store_compression_total_in_backend,
         store_data_usage_in_backend,
@@ -432,6 +452,16 @@ pub mod disk {
     pub use crate::disk::background_memory::BackgroundEncodeBuffer;
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
     pub use crate::disk::local::{ReplacementExecutionLease, ScanGuard};
+    #[cfg(feature = "test-util")]
+    pub use crate::disk::local::{local_durability_modes, set_local_rename_data_fail_after_metadata_commit};
+    pub use crate::disk::multipart_source::{
+        MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartAbortCertificate, MultipartAbortProof, MultipartAbortProofKind,
+        MultipartAbortRound, MultipartSourceOperation, MultipartSourcePhase, MultipartSourceRequest, MultipartSourceResponse,
+        MultipartSourceSnapshot, PublicationIdentity, SourceGeneration, SourceGeometry, SourceLineage, capture_source_condition,
+        require_source_condition, strip_native_controls,
+    };
+    #[cfg(all(feature = "test-util", unix))]
+    pub use crate::disk::os::set_local_dir_fsync_failure;
     #[cfg(all(feature = "test-util", not(windows)))]
     pub use crate::disk::os::{LocalPublicationPause, LocalPublicationStage};
     pub use crate::disk::{
@@ -441,9 +471,12 @@ pub mod disk {
         DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DeleteRecoveryState,
         Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, DiskStore, FileInfoVersions, FileReader, FileWriter,
         GuardedDeleteVersionsPayload, GuardedFileInfoVersions, HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize,
-        PartTransactionAction, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp,
-        ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-        is_quota_mutation_fence_path, new_disk, validate_batch_read_version_item_count,
+        POOL_META_NATIVE_CAS_METADATA_SUFFIX, PartTransactionAction, PoolMetaNativeBackup, PoolMetaNativeInspection,
+        PoolMetaNativeObject, PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse,
+        QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
+        ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, SnapshotLeaseToken,
+        UpdateMetadataOpts, VolumeInfo, WalkDirOptions, is_quota_mutation_fence_path, new_disk,
+        validate_batch_read_version_item_count,
     };
     pub use crate::disk::{
         BackgroundMemoryBudget, PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler,
@@ -520,13 +553,16 @@ pub mod metrics {
 pub mod notification {
     pub use crate::services::notification_sys::{
         ClusterTierDailyStats, CrossPoolFenceFleetProofToken, IlmRecoveryExportFleetProofToken,
-        LegacyTransitionStateReconcileFleetProofToken, NotificationPeerErr, NotificationSys, ScannerPublicationLeaseGrant,
-        acquire_cross_pool_fence_fleet_proof, acquire_ilm_recovery_export_fleet_proof,
-        acquire_legacy_transition_state_reconcile_fleet_proof, configured_fleet_topology_fingerprint,
-        cross_pool_fence_fleet_proof_matches, get_global_notification_sys, ilm_recovery_export_fleet_proof_matches,
-        ilm_recovery_export_local_process_epoch, ilm_recovery_export_member_epochs_sha256,
-        ilm_recovery_export_topology_generation, legacy_transition_state_reconcile_fleet_proof_matches,
-        new_global_notification_sys, scanner_peer_transport_error_message_is_retryable, start_remote_version_state_fleet_probe,
+        LegacyTransitionStateReconcileFleetProofToken, MrfLifecycleWriterFleetProofToken, NotificationPeerErr, NotificationSys,
+        ScannerPublicationLeaseGrant, acquire_cross_pool_fence_fleet_proof, acquire_ilm_recovery_export_fleet_proof,
+        acquire_legacy_transition_state_reconcile_fleet_proof, acquire_mrf_lifecycle_writer_fleet_proof,
+        configured_fleet_topology_fingerprint, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
+        ilm_recovery_export_fleet_proof_matches, ilm_recovery_export_local_process_epoch,
+        ilm_recovery_export_member_epochs_sha256, ilm_recovery_export_topology_generation,
+        legacy_transition_state_reconcile_fleet_proof_matches, mrf_lifecycle_reader_local_process_epoch,
+        mrf_lifecycle_writer_fleet_proof_current, mrf_lifecycle_writer_fleet_proof_matches, new_global_notification_sys,
+        scanner_peer_transport_error_message_is_retryable, start_remote_version_state_fleet_probe,
+        with_mrf_lifecycle_writer_fleet_proof,
     };
     #[cfg(any(test, feature = "test-util"))]
     pub use crate::services::notification_sys::{

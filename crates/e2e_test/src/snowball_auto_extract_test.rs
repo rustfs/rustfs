@@ -262,6 +262,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snowball_auto_extract_rejects_veeam_virtual_members() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server_with_env(vec![], &[("RUSTFS_VEEAM_SOSAPI_ENABLE", "true")])
+            .await?;
+        let client = env.create_s3_client();
+        let bucket = "snowball-veeam-reserved";
+        client.create_bucket().bucket(bucket).send().await?;
+        let prefix = ".system-d26a9498-cb7c-4a87-a44a-8ae204f5ba6c";
+        for (member, destination, use_prefix) in [
+            (format!("{prefix}/system.xml"), format!("{prefix}/system.xml"), false),
+            ("capacity.xml".to_string(), format!("{prefix}/capacity.xml"), true),
+        ] {
+            let mut builder = tokio_tar::Builder::new(Cursor::new(Vec::new()));
+            append_typed_entry(&mut builder, &member, tokio_tar::EntryType::Regular, b"blocked").await?;
+            let archive = builder.into_inner().await?.into_inner();
+            let mut request = client
+                .put_object()
+                .bucket(bucket)
+                .key("fixture.tar")
+                .metadata("Snowball-Auto-Extract", "true")
+                .body(ByteStream::from(archive));
+            if use_prefix {
+                request = request
+                    .metadata("Minio-Snowball-Prefix", prefix)
+                    .metadata("Minio-Snowball-Ignore-Errors", "true");
+            }
+            let error = request.send().await.expect_err("virtual archive members must be rejected");
+            assert_eq!(error.code(), Some("MethodNotAllowed"));
+            let listed = client.list_objects_v2().bucket(bucket).prefix(&destination).send().await?;
+            assert!(listed.contents().is_empty(), "rejected virtual member must not be stored");
+        }
+        let mut builder = tokio_tar::Builder::new(Cursor::new(Vec::new()));
+        append_typed_entry(&mut builder, "ordinary.xml", tokio_tar::EntryType::Regular, b"ordinary").await?;
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("fixture.tar")
+            .metadata("Snowball-Auto-Extract", "true")
+            .metadata("Minio-Snowball-Prefix", prefix)
+            .body(ByteStream::from(builder.into_inner().await?.into_inner()))
+            .send()
+            .await?;
+        let ordinary = client
+            .get_object()
+            .bucket(bucket)
+            .key(format!("{prefix}/ordinary.xml"))
+            .send()
+            .await?;
+        assert_eq!(ordinary.body.collect().await?.into_bytes().as_ref(), b"ordinary");
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn snowball_auto_extract_supports_minio_prefix_and_directory_markers() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
 

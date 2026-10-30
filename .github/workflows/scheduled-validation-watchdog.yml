@@ -16,20 +16,8 @@ name: Scheduled Validation Watchdog
 
 on:
   workflow_run:
-    workflows:
-      - "Security Audit"
-      - "Build and Release"
-      - "Continuous Integration"
-      - "coverage"
-      - "e2e-nightly"
-      - "e2e-distributed"
-      - "e2e-s3tests"
-      - "Fuzz"
-      - "mint"
-      - "minio-interop"
-      - "Nightly GNU Build"
-      - "Performance A/B"
-      - "Runner Hygiene"
+    # The registry filters this broad subscription; names are not duplicated here.
+    workflows: ["*"]
     types: [completed]
 
 permissions:
@@ -38,11 +26,7 @@ permissions:
 jobs:
   alert-on-incomplete-run:
     name: Alert on incomplete scheduled run
-    if: >-
-      github.repository == 'rustfs/rustfs' &&
-      github.event.workflow_run.event == 'schedule' &&
-      github.event.workflow_run.conclusion != 'success' &&
-      github.event.workflow_run.conclusion != 'failure'
+    if: github.repository == 'rustfs/rustfs'
     # Stay on GitHub-hosted runners: this monitor must keep running when the
     # self-hosted sm-standard-* pool is down, which is exactly when the
     # scheduled validations it watches stall.
@@ -56,7 +40,11 @@ jobs:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
+      - name: Select expected completion from registry
+        id: registry
+        run: python3 scripts/validation_registry.py watchdog
       - name: Open or update incomplete-run issue
+        if: steps.registry.outputs.selected == 'true'
         uses: ./.github/actions/schedule-failure-issue
         with:
           github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::cgroup_resources::live::ResourceSample;
+use crate::cgroup_resources::live::{CpuCoreObservation, CpuQuotaSample, ResourceSample};
 use crate::storage_api::startup::background::{BackgroundMemoryBudget, ECStore, PhysicalDiskSample, PhysicalDiskSampler};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
@@ -24,9 +24,11 @@ struct Policy {
     last_window: Option<Instant>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct TimedResources {
     sample: ResourceSample,
+    quota_ancestors: Vec<CpuQuotaSample>,
+    cpu_cores: Option<CpuCoreObservation>,
     began: Instant,
     ended: Instant,
 }
@@ -52,8 +54,8 @@ impl Policy {
             return None;
         };
         let sample = observation.sample;
-        let old = self.previous.replace(observation);
-        if old.is_none_or(|old| {
+        let old = self.previous.replace(observation.clone());
+        if old.as_ref().is_none_or(|old| {
             old.sample.identity != sample.identity
                 || old.sample.cpu_millis != sample.cpu_millis
                 || old.sample.memory_limit != sample.memory_limit
@@ -207,14 +209,20 @@ fn resource_pressure(current: TimedResources, old: Option<TimedResources>) -> Re
     }
     let min_elapsed = min_elapsed.as_micros();
     let max_elapsed = max_elapsed.as_micros();
-    let previous = previous.sample;
+    let previous_sample = previous.sample;
     let mut stable = sample.memory_headroom >= sample.memory_limit / 5;
     let pairs = [
-        (sample.cpu_usage_usec, previous.cpu_usage_usec, u128::from(sample.cpu_millis), 900, 700),
-        (sample.cpu_throttled_usec, previous.cpu_throttled_usec, 1000, 10, 1),
-        (sample.cpu_stall_usec, previous.cpu_stall_usec, 1000, 10, 1),
-        (sample.memory_stall_usec, previous.memory_stall_usec, 1000, 10, 1),
-        (sample.io_stall_usec, previous.io_stall_usec, 1000, 10, 1),
+        (
+            sample.cpu_usage_usec,
+            previous_sample.cpu_usage_usec,
+            u128::from(sample.cpu_millis),
+            900,
+            700,
+        ),
+        (sample.cpu_throttled_usec, previous_sample.cpu_throttled_usec, 1000, 10, 1),
+        (sample.cpu_stall_usec, previous_sample.cpu_stall_usec, 1000, 10, 1),
+        (sample.memory_stall_usec, previous_sample.memory_stall_usec, 1000, 10, 1),
+        (sample.io_stall_usec, previous_sample.io_stall_usec, 1000, 10, 1),
     ];
     let mut known = true;
     for (current, old, capacity, high, low) in pairs {
@@ -230,7 +238,133 @@ fn resource_pressure(current: TimedResources, old: Option<TimedResources>) -> Re
         }
         stable &= usage <= capacity * min_elapsed * low;
     }
+    if current.quota_ancestors.len() != previous.quota_ancestors.len() {
+        known = false;
+    }
+    for ancestor in &current.quota_ancestors {
+        let Some(prior) = previous
+            .quota_ancestors
+            .iter()
+            .find(|prior| prior.identity == ancestor.identity)
+        else {
+            known = false;
+            continue;
+        };
+        if (ancestor.quota, ancestor.period, ancestor.cpu_millis) != (prior.quota, prior.period, prior.cpu_millis) {
+            known = false;
+            continue;
+        }
+        for (current, old, capacity, high, low) in [
+            (ancestor.usage_usec, prior.usage_usec, u128::from(ancestor.cpu_millis), 900, 700),
+            (ancestor.throttled_usec, prior.throttled_usec, 1000, 10, 1),
+        ] {
+            let Some(delta) = current.zip(old).and_then(|(current, old)| current.checked_sub(old)) else {
+                known = false;
+                continue;
+            };
+            let usage = u128::from(delta) * 1_000_000;
+            if usage > capacity * max_elapsed * high {
+                return ResourcePressure::Busy;
+            }
+            stable &= usage <= capacity * min_elapsed * low;
+        }
+    }
+    match (&current.cpu_cores, &previous.cpu_cores) {
+        (Some(current), Some(previous)) => match cpu_core_pressure(current, previous, min_elapsed, max_elapsed) {
+            ResourcePressure::Busy => return ResourcePressure::Busy,
+            ResourcePressure::Unknown => known = false,
+            ResourcePressure::Stable => {}
+        },
+        _ => known = false,
+    }
     if known && stable {
+        ResourcePressure::Stable
+    } else {
+        ResourcePressure::Unknown
+    }
+}
+
+fn cpu_core_pressure(
+    current: &CpuCoreObservation,
+    previous: &CpuCoreObservation,
+    min_elapsed_us: u128,
+    max_elapsed_us: u128,
+) -> ResourcePressure {
+    if current.ticks_per_second == 0
+        || current.ticks_per_second != previous.ticks_per_second
+        || current.cores.is_empty()
+        || current.sysfs_identity != previous.sysfs_identity
+        || current.cpu_root_identity != previous.cpu_root_identity
+        || current.topology != previous.topology
+        || current.threads.is_empty()
+        || current.threads != previous.threads
+        || current.topology.len() != current.cores.len()
+        || previous.topology.len() != previous.cores.len()
+        || current
+            .cores
+            .iter()
+            .zip(&current.topology)
+            .any(|(core, (id, _))| core.id != *id)
+        || previous
+            .cores
+            .iter()
+            .zip(&previous.topology)
+            .any(|(core, (id, _))| core.id != *id)
+    {
+        return ResourcePressure::Unknown;
+    }
+    let ticks = u128::from(current.ticks_per_second);
+    let min_ticks = min_elapsed_us * ticks / 1_000_000;
+    let max_ticks = (max_elapsed_us * ticks).div_ceil(1_000_000);
+    // With fewer ticks, rounding the independent fields cannot establish a
+    // useful low-watermark bound for the whole sampling interval.
+    if min_ticks < 16 {
+        return ResourcePressure::Unknown;
+    }
+    let mut known = current.cores.len() == previous.cores.len();
+    let mut core_busy = std::collections::BTreeMap::<u32, u128>::new();
+    for ((core, prior), (_, topology)) in current.cores.iter().zip(&previous.cores).zip(&current.topology) {
+        if core.id != prior.id {
+            known = false;
+            continue;
+        }
+        let mut total = 0_u128;
+        let mut busy = 0_u128;
+        let mut complete = true;
+        for (index, (&now, &old)) in core.counters.iter().zip(&prior.counters).enumerate() {
+            let Some(delta) = now.checked_sub(old) else {
+                complete = false;
+                break;
+            };
+            total += u128::from(delta);
+            if index != 3 {
+                // iowait is treated as busy; guest and guest_nice are absent
+                // because Linux already includes them in user and nice.
+                busy += u128::from(delta);
+            }
+        }
+        if !complete || total < min_ticks.saturating_sub(8) || total > max_ticks + 8 {
+            known = false;
+            continue;
+        }
+        // Each exported field is rounded to USER_HZ independently at both
+        // cuts; seven non-idle fields give at most seven ticks of uncertainty.
+        if busy.saturating_sub(7) * 100 > max_ticks * 90 {
+            return ResourcePressure::Busy;
+        }
+        let Some(group) = topology.siblings.first() else {
+            known = false;
+            continue;
+        };
+        *core_busy.entry(*group).or_default() += busy + 7;
+    }
+    // The sum of the logical threads' busy upper bounds bounds how long
+    // any sibling could have occupied the shared physical core. Individual
+    // idle fractions cannot safely be averaged across SMT siblings.
+    if core_busy.values().any(|busy| busy * 100 > min_ticks * 70) {
+        known = false;
+    }
+    if known {
         ResourcePressure::Stable
     } else {
         ResourcePressure::Unknown
@@ -277,18 +411,29 @@ pub(crate) fn start(
                 _ = cancel.cancelled() => break,
                 result = tokio::task::spawn_blocking(move || {
                     let began = Instant::now();
-                    let sample = crate::cgroup_resources::live::sample().ok()
-                        .map(|sample| TimedResources { sample, began, ended: Instant::now() });
+                    let sample = crate::cgroup_resources::live::sample_for_admission().ok().map(
+                        |(sample, quota_ancestors, cpu_cores)| TimedResources {
+                            sample,
+                            quota_ancestors,
+                            cpu_cores,
+                            began,
+                            ended: Instant::now(),
+                        },
+                    );
                     (sample, disks.read())
                 }) => result.ok(),
             };
             let foreground = crate::foreground_observation::latest_window();
             let registry = provider.workload_admission_snapshot();
             // Recheck age after every input read, including a delayed provider.
-            let observation =
-                policy.observe(Instant::now(), samples.as_ref().and_then(|(sample, _)| *sample), foreground, &registry);
+            let observation = policy.observe(
+                Instant::now(),
+                samples.as_ref().and_then(|(sample, _)| sample.clone()),
+                foreground,
+                &registry,
+            );
             let memory_limit = observation
-                .and_then(|_| samples.as_ref().and_then(|(sample, _)| *sample))
+                .and_then(|_| samples.as_ref().and_then(|(sample, _)| sample.as_ref()))
                 .map_or(0, |sample| memory_capacity(sample.sample));
             lifetime.1.set_sampled_limit(memory_limit, Duration::from_secs(3));
             let decision = lifetime
@@ -342,8 +487,41 @@ mod tests {
     }
 
     fn timed(at: Instant, sample: ResourceSample) -> TimedResources {
+        static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let origin = *ORIGIN.get_or_init(|| Instant::now() - Duration::from_secs(3600));
+        let ticks = u64::try_from(at.duration_since(origin).as_millis() / 10).expect("fixture tick count");
         TimedResources {
             sample,
+            quota_ancestors: Vec::new(),
+            cpu_cores: Some(CpuCoreObservation {
+                ticks_per_second: 100,
+                cores: (0..4)
+                    .map(|id| {
+                        let mut counters = [0; 8];
+                        counters[3] = ticks;
+                        crate::cgroup_resources::live::CpuCoreSample { id, counters }
+                    })
+                    .collect(),
+                sysfs_identity: (1, 1),
+                cpu_root_identity: (1, 2),
+                topology: (0_u32..4)
+                    .map(|id| {
+                        (
+                            id,
+                            crate::cgroup_resources::live::SiblingObservation {
+                                cpu_identity: (1, u64::from(id) + 3),
+                                topology_identity: (1, u64::from(id) + 7),
+                                siblings: vec![id],
+                            },
+                        )
+                    })
+                    .collect(),
+                threads: vec![crate::cgroup_resources::live::ThreadObservation {
+                    id: 42,
+                    identity: (2, 42),
+                    allowed: vec![0, 1, 2, 3],
+                }],
+            }),
             began: at,
             ended: at,
         }
@@ -443,7 +621,7 @@ mod tests {
         let later = at + SAMPLE_INTERVAL + Duration::from_nanos(1);
         assert!(
             policy
-                .observe(later, Some(sample), Some(window(later, 0, 0)), &queues(Some(0)))
+                .observe(later, Some(sample.clone()), Some(window(later, 0, 0)), &queues(Some(0)))
                 .is_none(),
             "a slow registry read must not refresh an old resource lease"
         );
@@ -452,9 +630,10 @@ mod tests {
             ended: at + Duration::from_millis(21),
             ..sample
         };
+        let wide_end = wide.ended;
         assert!(
             policy
-                .observe(wide.ended, Some(wide), Some(window(wide.ended, 0, 0)), &queues(Some(0)))
+                .observe(wide_end, Some(wide), Some(window(wide_end, 0, 0)), &queues(Some(0)))
                 .is_none()
         );
         let future = timed(later, resources());
@@ -473,7 +652,7 @@ mod tests {
         ] {
             let mut current = timed(at + SAMPLE_INTERVAL, resources());
             current.sample.io_stall_usec = Some(stall);
-            assert_eq!(resource_pressure(current, Some(prior)), expected);
+            assert_eq!(resource_pressure(current, Some(prior.clone())), expected);
         }
         let mut prior = prior;
         prior.ended += Duration::from_millis(20);
@@ -481,13 +660,13 @@ mod tests {
         current.ended += Duration::from_millis(20);
         current.sample.io_stall_usec = Some(1000);
         assert_eq!(
-            resource_pressure(current, Some(prior)),
+            resource_pressure(current.clone(), Some(prior.clone())),
             ResourcePressure::Unknown,
             "uncertainty around the low watermark cannot justify growth"
         );
         current.sample.io_stall_usec = Some(10_001);
         assert_eq!(
-            resource_pressure(current, Some(prior)),
+            resource_pressure(current.clone(), Some(prior.clone())),
             ResourcePressure::Unknown,
             "the upper elapsed bound is not yet definitely busy"
         );
@@ -514,6 +693,207 @@ mod tests {
                 ResourcePressure::Busy
             );
         }
+    }
+
+    #[test]
+    fn busy_shared_parent_is_not_hidden_by_an_idle_leaf() {
+        let at = Instant::now();
+        let mut prior = timed(at, resources());
+        prior.quota_ancestors.push(CpuQuotaSample {
+            identity: (1, 2),
+            quota: 100_000,
+            period: 100_000,
+            cpu_millis: 1000,
+            usage_usec: Some(1_000_000),
+            throttled_usec: Some(0),
+        });
+        let mut current = timed(at + SAMPLE_INTERVAL, resources());
+        current.quota_ancestors = prior.quota_ancestors.clone();
+        current.quota_ancestors[0].usage_usec = Some(1_500_000);
+        assert_eq!(resource_pressure(current.clone(), Some(prior.clone())), ResourcePressure::Stable);
+
+        // The leaf itself stays idle while a sibling consumes the parent's quota.
+        current.quota_ancestors[0].usage_usec = Some(2_000_000);
+        assert_eq!(resource_pressure(current.clone(), Some(prior.clone())), ResourcePressure::Busy);
+        current.quota_ancestors[0].usage_usec = Some(1_100_000);
+        current.quota_ancestors[0].throttled_usec = Some(20_000);
+        assert_eq!(resource_pressure(current.clone(), Some(prior.clone())), ResourcePressure::Busy);
+
+        current.quota_ancestors[0].throttled_usec = Some(0);
+        for usage in [None, Some(999_999)] {
+            current.quota_ancestors[0].usage_usec = usage;
+            assert_eq!(resource_pressure(current.clone(), Some(prior.clone())), ResourcePressure::Unknown);
+        }
+        current.quota_ancestors[0].usage_usec = Some(1_100_000);
+        current.quota_ancestors[0].period = 200_000;
+        assert_eq!(resource_pressure(current.clone(), Some(prior.clone())), ResourcePressure::Unknown);
+        current.quota_ancestors[0].period = 100_000;
+        current.quota_ancestors[0].identity = (1, 3);
+        assert_eq!(resource_pressure(current.clone(), Some(prior.clone())), ResourcePressure::Unknown);
+        current.quota_ancestors.clear();
+        assert_eq!(resource_pressure(current.clone(), Some(prior.clone())), ResourcePressure::Unknown);
+        current.sample.cpu_usage_usec = Some(3_600_001);
+        assert_eq!(resource_pressure(current, Some(prior)), ResourcePressure::Busy);
+    }
+
+    #[test]
+    fn busy_shared_cpu_is_not_hidden_by_an_idle_leaf_or_other_idle_cpus() {
+        let at = Instant::now();
+        let prior = timed(at, resources());
+        let mut current = timed(at + SAMPLE_INTERVAL, resources());
+        assert_eq!(resource_pressure(current.clone(), Some(prior.clone())), ResourcePressure::Stable);
+
+        let core = &mut current.cpu_cores.as_mut().expect("CPU fixture").cores[1];
+        core.counters[3] -= 100;
+        core.counters[0] += 100;
+        assert_eq!(
+            resource_pressure(current.clone(), Some(prior.clone())),
+            ResourcePressure::Busy,
+            "one saturated shared CPU cannot be averaged away by other idle CPUs"
+        );
+        {
+            let core = &mut current.cpu_cores.as_mut().expect("CPU fixture").cores[1];
+            core.counters[0] -= 60;
+            core.counters[3] += 60;
+        }
+        assert_eq!(resource_pressure(current.clone(), Some(prior.clone())), ResourcePressure::Stable);
+        {
+            let core = &mut current.cpu_cores.as_mut().expect("CPU fixture").cores[1];
+            core.counters[0] += 30;
+            core.counters[3] -= 30;
+        }
+        assert_eq!(
+            resource_pressure(current.clone(), Some(prior.clone())),
+            ResourcePressure::Unknown,
+            "tick rounding around the low watermark cannot authorize growth"
+        );
+
+        let mut missing = timed(at + SAMPLE_INTERVAL, resources());
+        missing.cpu_cores.as_mut().expect("CPU fixture").cores.pop();
+        assert_eq!(resource_pressure(missing, Some(prior.clone())), ResourcePressure::Unknown);
+        let mut missing = timed(at + SAMPLE_INTERVAL, resources());
+        missing.cpu_cores = None;
+        assert_eq!(resource_pressure(missing, Some(prior.clone())), ResourcePressure::Unknown);
+        let mut hotplug = timed(at + SAMPLE_INTERVAL, resources());
+        hotplug.cpu_cores.as_mut().expect("CPU fixture").cores[0].id = 9;
+        assert_eq!(resource_pressure(hotplug, Some(prior.clone())), ResourcePressure::Unknown);
+        let mut replaced_topology = timed(at + SAMPLE_INTERVAL, resources());
+        replaced_topology.cpu_cores.as_mut().expect("CPU fixture").topology[0]
+            .1
+            .topology_identity = (1, 100);
+        assert_eq!(
+            resource_pressure(replaced_topology, Some(prior.clone())),
+            ResourcePressure::Unknown,
+            "unchanged CPU IDs and monotonic counters cannot hide a replaced topology"
+        );
+        let mut replaced_thread = timed(at + SAMPLE_INTERVAL, resources());
+        replaced_thread.cpu_cores.as_mut().expect("CPU fixture").threads[0].identity = (2, 43);
+        assert_eq!(resource_pressure(replaced_thread, Some(prior.clone())), ResourcePressure::Unknown);
+        let mut reset = timed(at + SAMPLE_INTERVAL, resources());
+        reset.cpu_cores.as_mut().expect("CPU fixture").cores[0].counters[3] = 0;
+        assert_eq!(resource_pressure(reset, Some(prior.clone())), ResourcePressure::Unknown);
+        let mut old_iowait = prior.clone();
+        old_iowait.cpu_cores.as_mut().expect("CPU fixture").cores[0].counters[4] = 2;
+        assert_eq!(
+            resource_pressure(timed(at + SAMPLE_INTERVAL, resources()), Some(old_iowait)),
+            ResourcePressure::Unknown,
+            "iowait can decrease and must not be treated as idle"
+        );
+        let next = timed(at + SAMPLE_INTERVAL, resources());
+        assert_eq!(
+            cpu_core_pressure(
+                next.cpu_cores.as_ref().expect("CPU fixture"),
+                prior.cpu_cores.as_ref().expect("CPU fixture"),
+                100_000,
+                100_000,
+            ),
+            ResourcePressure::Unknown,
+            "too few USER_HZ ticks cannot establish a stable window"
+        );
+    }
+
+    #[test]
+    fn busy_smt_sibling_outside_affinity_prevents_stable_admission() {
+        let at = Instant::now();
+        let mut prior = timed(at, resources());
+        let mut current = timed(at + SAMPLE_INTERVAL, resources());
+        for observation in [
+            prior.cpu_cores.as_mut().expect("CPU fixture"),
+            current.cpu_cores.as_mut().expect("CPU fixture"),
+        ] {
+            observation.cores.truncate(2);
+            observation.topology.truncate(2);
+            observation.threads[0].allowed = vec![0];
+            for (_, topology) in &mut observation.topology {
+                topology.siblings = vec![0, 1];
+            }
+        }
+        let sibling = &mut current.cpu_cores.as_mut().expect("CPU fixture").cores[1];
+        sibling.counters[3] -= 100;
+        sibling.counters[0] += 100;
+        assert_eq!(
+            resource_pressure(current, Some(prior)),
+            ResourcePressure::Busy,
+            "the monitored SMT sibling cannot be omitted merely because it is outside the affinity mask"
+        );
+    }
+
+    #[test]
+    fn smt_siblings_cannot_each_claim_the_same_idle_time() {
+        let at = Instant::now();
+        let mut prior = timed(at, resources());
+        let mut current = timed(at + SAMPLE_INTERVAL, resources());
+        for observation in [
+            prior.cpu_cores.as_mut().expect("CPU fixture"),
+            current.cpu_cores.as_mut().expect("CPU fixture"),
+        ] {
+            observation.cores.truncate(2);
+            observation.topology.truncate(2);
+            observation.threads[0].allowed = vec![0];
+            for (_, topology) in &mut observation.topology {
+                topology.siblings = vec![0, 1];
+            }
+        }
+        for core in &mut current.cpu_cores.as_mut().expect("CPU fixture").cores {
+            core.counters[3] -= 20;
+            core.counters[0] += 20;
+        }
+        assert_eq!(resource_pressure(current.clone(), Some(prior.clone())), ResourcePressure::Stable);
+        for core in &mut current.cpu_cores.as_mut().expect("CPU fixture").cores {
+            core.counters[3] -= 20;
+            core.counters[0] += 20;
+        }
+        assert_eq!(
+            resource_pressure(current, Some(prior)),
+            ResourcePressure::Unknown,
+            "two 40% siblings do not establish a low-pressure core window"
+        );
+    }
+
+    #[test]
+    fn swapped_thread_affinities_do_not_reuse_a_stable_resource_window() {
+        let at = Instant::now();
+        let mut prior = timed(at, resources());
+        let mut current = timed(at + SAMPLE_INTERVAL, resources());
+        let threads = &mut prior.cpu_cores.as_mut().expect("CPU fixture").threads;
+        threads[0].allowed = vec![0, 1];
+        threads.push(crate::cgroup_resources::live::ThreadObservation {
+            id: 43,
+            identity: (2, 43),
+            allowed: vec![2, 3],
+        });
+        current.cpu_cores.as_mut().expect("CPU fixture").threads = threads.clone();
+        assert_eq!(resource_pressure(current.clone(), Some(prior.clone())), ResourcePressure::Stable);
+        {
+            let later = &mut current.cpu_cores.as_mut().expect("CPU fixture").threads;
+            later[0].allowed = vec![2, 3];
+            later[1].allowed = vec![0, 1];
+        }
+        assert_eq!(
+            resource_pressure(current, Some(prior)),
+            ResourcePressure::Unknown,
+            "equal CPU unions and minimum sizes do not prove the same thread affinities"
+        );
     }
 
     #[test]

@@ -217,6 +217,7 @@ struct Responsibility {
     consecutive_unverified_attempts: u32,
     last_identity_probe_result: Option<&'static str>,
     last_identity_probe_at_ms: Option<u64>,
+    first_unresolved_at_ms: Option<u64>,
 }
 
 impl Responsibility {
@@ -262,6 +263,12 @@ pub(super) struct PartialWriteLifecycleSummary {
     pub oldest_operator_accepted_at_ms: Option<u64>,
 }
 
+pub(super) struct PendingLifecycleTransition {
+    pub intent: MrfIntent,
+    pub record: ResponsibilityCheckpoint,
+    pub next_attempt: Instant,
+}
+
 /// Durable storage responsibilities have no guaranteed rediscovery producer.
 /// Admission, task failure and retry exhaustion cannot release their records.
 #[derive(Default)]
@@ -272,6 +279,8 @@ pub(super) struct PartialWrites {
     identity_probe_order: VecDeque<PartialWriteKey>,
     identity_probe_index: HashSet<PartialWriteKey>,
     retirement_checks: HashMap<(Arc<str>, Uuid), (Instant, bool)>,
+    unresolved_generation_candidate: Option<PartialWriteKey>,
+    pub(super) pending_lifecycle_transition: Option<PendingLifecycleTransition>,
     bytes: usize,
 }
 
@@ -367,6 +376,7 @@ impl PartialWrites {
                 consecutive_unverified_attempts: 0,
                 last_identity_probe_result: None,
                 last_identity_probe_at_ms: None,
+                first_unresolved_at_ms: None,
             },
         );
         self.bytes = next_bytes;
@@ -898,6 +908,36 @@ impl PartialWrites {
         Ok((previous, previous_acceptance))
     }
 
+    pub(super) fn take_unresolved_generation_candidate(&mut self) -> Option<PendingLifecycleTransition> {
+        let key = self.unresolved_generation_candidate.take()?;
+        let entry = self.entries.get(&key)?;
+        if !entry.persisted
+            || entry.source_bucket_incarnation_id.is_some()
+            || !matches!(entry.state, ResponsibilityState::Active {})
+        {
+            return None;
+        }
+        let since_ms = entry.first_unresolved_at_ms?;
+        let next_probe_at_ms = unix_now_ms().saturating_add(
+            u64::try_from(entry.next_attempt.saturating_duration_since(Instant::now()).as_millis()).unwrap_or(u64::MAX),
+        );
+        Some(PendingLifecycleTransition {
+            intent: entry.intent.clone(),
+            record: ResponsibilityCheckpoint {
+                intent_digest: super::intent_digest(&entry.intent)?,
+                responsibility_id: entry.responsibility_id,
+                source_bucket_incarnation_id: None,
+                last_operator_acceptance: entry.last_operator_acceptance.clone(),
+                state: ResponsibilityState::SourceAndCurrentGenerationUnknown {
+                    since_ms,
+                    next_probe_at_ms,
+                    probe_attempts: entry.consecutive_unverified_attempts,
+                },
+            },
+            next_attempt: Instant::now(),
+        })
+    }
+
     pub(super) fn mark_persisted(&mut self) {
         for entry in self.entries.values_mut() {
             entry.persisted = true;
@@ -971,6 +1011,7 @@ impl PartialWrites {
     }
 
     async fn probe_unknown_generation(&mut self, manager: &HealManager, config: &MrfConsumerConfig) -> bool {
+        self.unresolved_generation_candidate = None;
         if config.replay_batch == 0 {
             return false;
         }
@@ -989,7 +1030,7 @@ impl PartialWrites {
                 continue;
             }
             self.identity_probe_index.insert(key.clone());
-            self.identity_probe_order.push_back(key);
+            self.identity_probe_order.push_back(key.clone());
             if !entry.persisted || entry.next_attempt > now {
                 continue;
             }
@@ -1020,7 +1061,8 @@ impl PartialWrites {
                 manager.mrf_bucket_incarnation_id(entry.intent.bucket.as_ref()),
             )
             .await;
-            entry.last_identity_probe_at_ms = Some(unix_now_ms());
+            let observed_at_ms = unix_now_ms();
+            entry.last_identity_probe_at_ms = Some(observed_at_ms);
             match result {
                 Ok(Ok(Some(observed_bucket_incarnation_id))) => {
                     let old_cost = Self::entry_cost(entry);
@@ -1032,7 +1074,13 @@ impl PartialWrites {
                     self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
                     return true;
                 }
-                Ok(Ok(None)) => entry.last_identity_probe_result = Some("unresolved"),
+                Ok(Ok(None)) => {
+                    entry.last_identity_probe_result = Some("unresolved");
+                    if config.lifecycle_v2_writer_enabled && matches!(entry.state, ResponsibilityState::Active {}) {
+                        entry.first_unresolved_at_ms.get_or_insert(observed_at_ms);
+                        self.unresolved_generation_candidate = Some(key);
+                    }
+                }
                 Ok(Err(_)) | Err(_) => entry.last_identity_probe_result = Some("unavailable"),
             }
             return lifecycle_changed;

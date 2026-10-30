@@ -73,14 +73,15 @@ use super::trailer_adapter::trailer_source;
 use crate::app::object::{
     ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, guard_put_object_body_read_timeout,
     put_object_body_read_timeout, reject_non_wildcard_write_if_none_match, reject_oversize_single_upload,
+    reject_veeam_sosapi_mutation,
 };
 use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
     invalidate_object_data_cache_before_mutation,
 };
 use crate::app::object_usecase::{
-    acquire_copy_bucket_lifecycle_locks, apply_quota_admission, build_put_like_object_lock_metadata, map_quota_check_outcome,
-    s3s_body_error_to_io, validate_existing_object_lock_for_write,
+    apply_quota_admission, build_put_like_object_lock_metadata, map_quota_check_outcome, s3s_body_error_to_io,
+    validate_existing_object_lock_for_write,
 };
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
@@ -130,6 +131,36 @@ use tokio_util::io::StreamReader;
 use tracing::{instrument, warn};
 use urlencoding::encode;
 use uuid::Uuid;
+
+fn normalize_copy_source_version_id(version_id: Option<&str>) -> S3Result<Option<String>> {
+    match version_id {
+        Some(v) => {
+            let trimmed = v.trim();
+            if trimmed.eq_ignore_ascii_case("null") {
+                Ok(Some(Uuid::nil().to_string()))
+            } else if Uuid::parse_str(trimmed).is_ok() {
+                Ok(Some(trimmed.to_string()))
+            } else {
+                Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "Invalid version id specified in copy source",
+                ))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+fn format_copy_source_version_id(version_id: Option<Uuid>, src_versioned: bool, src_version_suspended: bool) -> Option<String> {
+    if src_versioned || src_version_suspended {
+        Some(match version_id {
+            Some(vid) if vid != Uuid::nil() => vid.to_string(),
+            _ => "null".to_string(),
+        })
+    } else {
+        None
+    }
+}
 
 #[cfg(test)]
 fn merge_part_encryption_metadata(
@@ -512,6 +543,8 @@ impl DefaultMultipartUsecase {
             bucket, key, upload_id, ..
         } = req.input;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
+
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -580,6 +613,7 @@ impl DefaultMultipartUsecase {
             ..
         } = input;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         reject_non_wildcard_write_if_none_match(if_none_match.as_ref(), &req.headers)?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
@@ -990,6 +1024,7 @@ impl DefaultMultipartUsecase {
             return Err(s3_error!(InvalidStorageClass));
         }
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         let Some(store) = self.object_store() else {
@@ -1213,6 +1248,7 @@ impl DefaultMultipartUsecase {
 
         let part_id = parse_upload_part_number(part_number)?;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         let size = resolve_upload_part_size(content_length, body.as_ref())?;
@@ -1611,6 +1647,7 @@ impl DefaultMultipartUsecase {
             ..
         } = req.input;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         let params = parse_list_parts_params(part_number_marker, max_parts)?;
 
         let Some(store) = self.object_store() else {
@@ -1672,7 +1709,8 @@ impl DefaultMultipartUsecase {
             ..
         } = req.input;
 
-        let (src_bucket, src_key, src_version_id) = match copy_source {
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
+        let (src_bucket, src_key, raw_src_version_id) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Bucket {
@@ -1681,6 +1719,7 @@ impl DefaultMultipartUsecase {
                 version_id,
             } => (src_bucket.to_string(), src_key.to_string(), version_id.map(|v| v.to_string())),
         };
+        let src_version_id = normalize_copy_source_version_id(raw_src_version_id.as_deref())?;
 
         let rs = if let Some(range_str) = copy_source_range {
             Some(parse_copy_source_range(&range_str)?)
@@ -1696,23 +1735,20 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let (source_bucket_lifecycle_guard, destination_bucket_lifecycle_guard_storage) =
-            acquire_copy_bucket_lifecycle_locks(store.as_ref(), &src_bucket, &bucket).await?;
-        let current_source_incarnation_id = store
-            .bucket_incarnation_id_from_disk(&src_bucket)
+        let (
+            source_bucket_lifecycle_guard,
+            current_source_incarnation_id,
+            destination_bucket_lifecycle_guard_storage,
+            current_destination_incarnation_id,
+        ) = store
+            .acquire_copy_bucket_incarnation_fences(
+                &src_bucket,
+                expected_source_incarnation_id,
+                &bucket,
+                expected_destination_incarnation_id,
+            )
             .await
             .map_err(ApiError::from)?;
-        if expected_source_incarnation_id.is_some_and(|expected| expected != current_source_incarnation_id) {
-            return Err(ApiError::from(StorageError::BucketNotFound(src_bucket.clone())).into());
-        }
-        let current_destination_incarnation_id = if src_bucket == bucket {
-            current_source_incarnation_id
-        } else {
-            store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)?
-        };
-        if expected_destination_incarnation_id.is_some_and(|expected| expected != current_destination_incarnation_id) {
-            return Err(ApiError::from(StorageError::BucketNotFound(bucket.clone())).into());
-        }
         let destination_bucket_lifecycle_guard = destination_bucket_lifecycle_guard_storage
             .as_ref()
             .unwrap_or(&source_bucket_lifecycle_guard);
@@ -1731,9 +1767,9 @@ impl DefaultMultipartUsecase {
             ..Default::default()
         };
         if src_bucket != bucket {
-            dst_opts.add_bucket_lifecycle_lock_guard(&source_bucket_lifecycle_guard);
+            source_bucket_lifecycle_guard.attach_to_object_options(&mut dst_opts);
         }
-        dst_opts.add_bucket_lifecycle_lock_guard(destination_bucket_lifecycle_guard);
+        destination_bucket_lifecycle_guard.attach_to_object_options(&mut dst_opts);
 
         let mp_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &dst_opts)
@@ -1754,8 +1790,12 @@ impl DefaultMultipartUsecase {
         }
         .validate_multipart_ssec(&mp_info.user_defined)?;
 
+        let src_versioned = BucketVersioningSys::prefix_enabled(&src_bucket, &src_key).await;
+        let src_version_suspended = BucketVersioningSys::prefix_suspended(&src_bucket, &src_key).await;
         let mut src_opts = copy_src_opts(&src_bucket, &src_key, &req.headers).map_err(ApiError::from)?;
         src_opts.version_id = src_version_id.clone();
+        src_opts.versioned = src_versioned;
+        src_opts.version_suspended = src_version_suspended;
 
         let h = build_ssec_read_headers(
             copy_source_sse_customer_algorithm.as_ref(),
@@ -1799,13 +1839,7 @@ impl DefaultMultipartUsecase {
         // read resolves its material inside the object layer, which carries no request identity.
         authorize_sse_kms_object_read(copy_principal.as_ref(), &src_info.user_defined).await?;
 
-        let resolved_src_version_id = src_info.version_id.map(|version_id| {
-            if version_id == Uuid::nil() {
-                "null".to_string()
-            } else {
-                version_id.to_string()
-            }
-        });
+        let resolved_src_version_id = format_copy_source_version_id(src_info.version_id, src_versioned, src_version_suspended);
 
         if let Some(if_match) = copy_source_if_match {
             if let Some(ref etag) = src_info.etag {
@@ -3980,5 +4014,26 @@ mod tests {
             .expect_err("full foreground write admission should reject before body ingest");
         assert_eq!(err.code(), &S3ErrorCode::SlowDown);
         drop(held);
+    }
+
+    #[test]
+    fn upload_part_copy_normalizes_and_formats_source_version_id() {
+        assert_eq!(normalize_copy_source_version_id(None).expect("missing version id"), None);
+        assert_eq!(
+            normalize_copy_source_version_id(Some(" null ")).expect("null version id"),
+            Some(Uuid::nil().to_string())
+        );
+        let valid = Uuid::new_v4();
+        assert_eq!(
+            normalize_copy_source_version_id(Some(&format!(" {valid} "))).expect("valid uuid"),
+            Some(valid.to_string())
+        );
+        let err = normalize_copy_source_version_id(Some("not-a-uuid")).expect_err("invalid uuid should fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+
+        assert_eq!(format_copy_source_version_id(Some(Uuid::nil()), false, false), None);
+        assert_eq!(format_copy_source_version_id(None, true, false), Some("null".to_string()));
+        assert_eq!(format_copy_source_version_id(Some(Uuid::nil()), false, true), Some("null".to_string()));
+        assert_eq!(format_copy_source_version_id(Some(valid), true, false), Some(valid.to_string()));
     }
 }

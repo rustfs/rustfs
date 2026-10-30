@@ -1,27 +1,1709 @@
-[
-  { "workflow": ".github/workflows/audit.yml", "max_age_hours": 36 },
-  { "workflow": ".github/workflows/build.yml", "max_age_hours": 36 },
-  { "workflow": ".github/workflows/ci.yml", "max_age_hours": 192 },
-  { "workflow": ".github/workflows/coverage.yml", "max_age_hours": 192 },
-  { "workflow": ".github/workflows/e2e-replication-nightly.yml", "max_age_hours": 36 },
-  {
-    "workflow": ".github/workflows/e2e-distributed.yml",
-    "max_age_hours": 36,
-    "never_ran_grace_until": "2026-09-18T00:00:00Z"
+{
+  "schema": 1,
+  "workflow_state_policy": "Observe runtime state; never enable a workflow. Disabled entries remain visible.",
+  "plans": {
+    "nightly": {
+      "cadences": [
+        "nightly"
+      ],
+      "timezone": "UTC"
+    },
+    "weekly": {
+      "cadences": [
+        "nightly",
+        "weekly"
+      ],
+      "timezone": "UTC"
+    },
+    "monthly": {
+      "cadences": [
+        "nightly",
+        "weekly",
+        "monthly"
+      ],
+      "timezone": "UTC"
+    }
   },
-  { "workflow": ".github/workflows/e2e-s3tests.yml", "max_age_hours": 192 },
-  { "workflow": ".github/workflows/fuzz.yml", "max_age_hours": 36 },
-  { "workflow": ".github/workflows/mint.yml", "max_age_hours": 192 },
-  {
-    "workflow": ".github/workflows/minio-interop.yml",
-    "max_age_hours": 36,
-    "never_ran_grace_until": "2026-09-08T00:00:00Z"
-  },
-  { "workflow": ".github/workflows/nightly-gnu.yml", "max_age_hours": 36 },
-  { "workflow": ".github/workflows/performance-ab.yml", "max_age_hours": 36 },
-  {
-    "workflow": ".github/workflows/runner-hygiene.yml",
-    "max_age_hours": 792,
-    "never_ran_grace_until": "2026-09-02T06:37:00Z"
-  }
-]
+  "suites": [
+    {
+      "id": "upgrade",
+      "workflow": ".github/workflows/rustfs-upgrade-test.yml",
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "events": [
+        "workflow_run",
+        "workflow_dispatch"
+      ],
+      "dependencies": [],
+      "environment": "functional-fleet",
+      "resource_lock": "rustfs-shared-functional-tests-v2",
+      "owner": "@overtrue",
+      "required": true,
+      "optional_reason": null,
+      "evidence": "functional-chain-upgrade-{run_id}-{attempt}",
+      "inputs": [
+        "chain_manifest"
+      ]
+    },
+    {
+      "id": "s3",
+      "workflow": ".github/workflows/rustfs-s3-compat-test.yml",
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "events": [
+        "workflow_run",
+        "workflow_dispatch"
+      ],
+      "dependencies": [],
+      "environment": "functional-fleet",
+      "resource_lock": "rustfs-shared-functional-tests-v2",
+      "owner": "@overtrue",
+      "required": true,
+      "optional_reason": null,
+      "evidence": "functional-chain-s3-{run_id}-{attempt}",
+      "inputs": [
+        "chain_manifest"
+      ]
+    },
+    {
+      "id": "kms",
+      "workflow": ".github/workflows/rustfs-kms-test.yml",
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "events": [
+        "workflow_run",
+        "workflow_dispatch"
+      ],
+      "dependencies": [],
+      "environment": "functional-fleet",
+      "resource_lock": "rustfs-shared-functional-tests-v2",
+      "owner": "@overtrue",
+      "required": true,
+      "optional_reason": null,
+      "evidence": "functional-chain-kms-{run_id}-{attempt}",
+      "inputs": [
+        "chain_manifest"
+      ]
+    },
+    {
+      "id": "tier",
+      "workflow": ".github/workflows/rustfs-tier-test.yml",
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "events": [
+        "workflow_run",
+        "workflow_dispatch"
+      ],
+      "dependencies": [],
+      "environment": "functional-fleet",
+      "resource_lock": "rustfs-shared-functional-tests-v2",
+      "owner": "@overtrue",
+      "required": true,
+      "optional_reason": null,
+      "evidence": "functional-chain-tier-{run_id}-{attempt}",
+      "inputs": [
+        "chain_manifest"
+      ]
+    },
+    {
+      "id": "storage",
+      "workflow": ".github/workflows/rustfs-storage-test.yml",
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "events": [
+        "workflow_run",
+        "workflow_dispatch"
+      ],
+      "dependencies": [],
+      "environment": "functional-fleet",
+      "resource_lock": "rustfs-shared-functional-tests-v2",
+      "owner": "@overtrue",
+      "required": true,
+      "optional_reason": null,
+      "evidence": "functional-chain-storage-{run_id}-{attempt}",
+      "inputs": [
+        "chain_manifest"
+      ]
+    },
+    {
+      "id": "heal",
+      "workflow": ".github/workflows/rustfs-heal-test.yml",
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "events": [
+        "workflow_run",
+        "workflow_dispatch"
+      ],
+      "dependencies": [],
+      "environment": "functional-fleet",
+      "resource_lock": "rustfs-shared-functional-tests-v2",
+      "owner": "@overtrue",
+      "required": true,
+      "optional_reason": null,
+      "evidence": "functional-chain-heal-{run_id}-{attempt}",
+      "inputs": [
+        "chain_manifest"
+      ]
+    },
+    {
+      "id": "pool",
+      "workflow": ".github/workflows/rustfs-pool-expand-test.yml",
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "events": [
+        "workflow_run",
+        "workflow_dispatch"
+      ],
+      "dependencies": [],
+      "environment": "functional-fleet",
+      "resource_lock": "rustfs-shared-functional-tests-v2",
+      "owner": "@overtrue",
+      "required": true,
+      "optional_reason": null,
+      "evidence": "functional-chain-pool-{run_id}-{attempt}",
+      "inputs": [
+        "chain_manifest"
+      ]
+    },
+    {
+      "id": "security",
+      "workflow": ".github/workflows/rustfs-security-test.yml",
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "events": [
+        "workflow_run",
+        "workflow_dispatch"
+      ],
+      "dependencies": [],
+      "environment": "functional-fleet",
+      "resource_lock": "rustfs-shared-functional-tests-v2",
+      "owner": "@overtrue",
+      "required": true,
+      "optional_reason": null,
+      "evidence": "functional-chain-security-{run_id}-{attempt}",
+      "inputs": [
+        "chain_manifest"
+      ]
+    },
+    {
+      "id": "replication",
+      "workflow": ".github/workflows/rustfs-replication-test.yml",
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "events": [
+        "workflow_run",
+        "workflow_dispatch"
+      ],
+      "dependencies": [],
+      "environment": "functional-fleet",
+      "resource_lock": "rustfs-shared-functional-tests-v2",
+      "owner": "@overtrue",
+      "required": true,
+      "optional_reason": null,
+      "evidence": "functional-chain-replication-{run_id}-{attempt}",
+      "inputs": [
+        "chain_manifest"
+      ]
+    },
+    {
+      "id": "fault-tolerance",
+      "workflow": ".github/workflows/rustfs-fault-tolerance-test.yml",
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "events": [
+        "workflow_run",
+        "workflow_dispatch"
+      ],
+      "dependencies": [],
+      "environment": "functional-fleet",
+      "resource_lock": "rustfs-shared-functional-tests-v2",
+      "owner": "@overtrue",
+      "required": true,
+      "optional_reason": null,
+      "evidence": "functional-chain-fault-tolerance-{run_id}-{attempt}",
+      "inputs": [
+        "chain_manifest"
+      ]
+    },
+    {
+      "id": "table",
+      "workflow": ".github/workflows/rustfs-table-test.yml",
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "events": [
+        "workflow_run",
+        "workflow_dispatch"
+      ],
+      "dependencies": [],
+      "environment": "functional-fleet",
+      "resource_lock": "rustfs-shared-functional-tests-v2",
+      "owner": "@overtrue",
+      "required": true,
+      "optional_reason": null,
+      "evidence": "functional-chain-table-{run_id}-{attempt}",
+      "inputs": [
+        "chain_manifest"
+      ]
+    },
+    {
+      "id": "performance",
+      "workflow": ".github/workflows/rustfs-performance-test.yml",
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "events": [
+        "workflow_run",
+        "workflow_dispatch"
+      ],
+      "dependencies": [],
+      "environment": "performance-fleet",
+      "resource_lock": "rustfs-performance-suite",
+      "owner": "@overtrue",
+      "required": false,
+      "optional_reason": "Performance may be unavailable only when the full plan explicitly records that decision.",
+      "evidence": "functional-chain-performance-{run_id}-{attempt}",
+      "inputs": [
+        "chain_manifest"
+      ]
+    }
+  ],
+  "workflows": [
+    {
+      "workflow": ".github/workflows/audit.yml",
+      "name": "Security Audit",
+      "roles": [
+        "pr",
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "push",
+        "pull_request",
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "23 3 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "audit.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "scheduled-validation"
+    },
+    {
+      "workflow": ".github/workflows/btf-prototype-reference.yml",
+      "name": "BTF prototype reference",
+      "roles": [
+        "pr",
+        "manual"
+      ],
+      "events": [
+        "pull_request",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "btf-prototype-reference.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/build.yml",
+      "name": "Build and Release",
+      "roles": [
+        "periodic",
+        "manual",
+        "release"
+      ],
+      "events": [
+        "push",
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "13 1 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "build.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "scheduled-validation"
+    },
+    {
+      "workflow": ".github/workflows/cache-warm.yml",
+      "name": "Cache Warm",
+      "roles": [
+        "periodic",
+        "manual",
+        "maintenance"
+      ],
+      "events": [
+        "schedule",
+        "push",
+        "workflow_dispatch"
+      ],
+      "cadence": "hourly",
+      "timezone": "UTC",
+      "schedule": [
+        "41 4,10,16,22 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 12,
+      "result_owner": "cache-warm.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "watchdog",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/ci-resource-accounting.yml",
+      "name": "CI Resource Accounting",
+      "roles": [
+        "manual",
+        "maintenance"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "ci-resource-accounting.yml",
+      "disposition": "new independent entry",
+      "monitor_reason": "Operator-requested measurement has no periodic freshness obligation.",
+      "origin": "added"
+    },
+    {
+      "workflow": ".github/workflows/ci-runner-pilot.yml",
+      "name": "CI Runner Pilot",
+      "roles": [
+        "manual",
+        "maintenance"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "ci-runner-pilot.yml",
+      "disposition": "new independent entry",
+      "monitor_reason": "Operator-requested measurement has no periodic freshness obligation.",
+      "origin": "added"
+    },
+    {
+      "workflow": ".github/workflows/ci.yml",
+      "name": "Continuous Integration",
+      "roles": [
+        "pr",
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "push",
+        "pull_request",
+        "merge_group",
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "11 0 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 192,
+      "result_owner": "ci.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "scheduled-validation"
+    },
+    {
+      "workflow": ".github/workflows/cla.yml",
+      "name": "CLA Check",
+      "roles": [
+        "pr",
+        "collaboration"
+      ],
+      "events": [
+        "pull_request_target",
+        "merge_group",
+        "issue_comment"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "cla.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/connect-diagnostic-schedule-acceptance.yml",
+      "name": "Connect diagnostic scheduler receipt acceptance",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "connect-diagnostic-schedule-acceptance.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/connect-health-service-acceptance.yml",
+      "name": "Connect bounded health service acceptance",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "connect-health-service-acceptance.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/connect-performance-drive-acceptance.yml",
+      "name": "Connect performance.drive service-job acceptance",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "connect-performance-drive-acceptance.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/connect-performance-network-acceptance.yml",
+      "name": "Connect performance.network service-job acceptance",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "connect-performance-network-acceptance.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/connect-profile-cpu-acceptance.yml",
+      "name": "Connect profile.cpu service-job acceptance",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "connect-profile-cpu-acceptance.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/connect-profile-memory-acceptance.yml",
+      "name": "Connect service memory profile acceptance",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "connect-profile-memory-acceptance.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/connect-profile-threads-acceptance.yml",
+      "name": "Connect profile.threads service-job acceptance",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "connect-profile-threads-acceptance.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/connect-top-api-acceptance.yml",
+      "name": "Connect top.api service-job acceptance",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "connect-top-api-acceptance.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/connect-top-disk-acceptance.yml",
+      "name": "Connect top.disk service-job acceptance",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "connect-top-disk-acceptance.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/connect-top-locks-acceptance.yml",
+      "name": "Connect top.locks service-job acceptance",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "connect-top-locks-acceptance.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/connect-top-rpc-acceptance.yml",
+      "name": "Connect top.rpc service-job acceptance",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "connect-top-rpc-acceptance.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/coverage.yml",
+      "name": "coverage",
+      "roles": [
+        "pr",
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "pull_request",
+        "workflow_dispatch",
+        "schedule"
+      ],
+      "cadence": "weekly",
+      "timezone": "UTC",
+      "schedule": [
+        "43 7 * * 0"
+      ],
+      "owner": "@overtrue",
+      "policy": "disabled",
+      "monitor": "workflow",
+      "max_age_hours": 192,
+      "result_owner": "coverage.yml",
+      "disposition": "retained independent entry",
+      "policy_reason": "Preserve operator-disabled state; enabling requires a separate policy decision.",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "scheduled-validation"
+    },
+    {
+      "workflow": ".github/workflows/docker.yml",
+      "name": "Docker Images",
+      "roles": [
+        "manual",
+        "release"
+      ],
+      "events": [
+        "workflow_run",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "docker.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/e2e-distributed.yml",
+      "name": "e2e-distributed",
+      "roles": [
+        "pr",
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "pull_request",
+        "workflow_dispatch",
+        "schedule"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "53 5 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "e2e-distributed.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "scheduled-validation"
+    },
+    {
+      "workflow": ".github/workflows/e2e-replication-nightly.yml",
+      "name": "e2e-nightly",
+      "roles": [
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch",
+        "schedule"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "29 4 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "e2e-replication-nightly.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "scheduled-validation"
+    },
+    {
+      "workflow": ".github/workflows/e2e-s3tests.yml",
+      "name": "e2e-s3tests",
+      "roles": [
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch",
+        "schedule"
+      ],
+      "cadence": "weekly",
+      "timezone": "UTC",
+      "schedule": [
+        "19 2 * * 0"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 192,
+      "result_owner": "e2e-s3tests.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "scheduled-validation"
+    },
+    {
+      "workflow": ".github/workflows/e2e-upgrade.yml",
+      "name": "Upgrade Compatibility",
+      "roles": [
+        "pr",
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "pull_request",
+        "push",
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "weekly",
+      "timezone": "UTC",
+      "schedule": [
+        "17 3 * * 1"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 192,
+      "result_owner": "e2e-upgrade.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "watchdog",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/functional-chain-health.yml",
+      "name": "Functional chain health",
+      "roles": [
+        "periodic",
+        "manual",
+        "health"
+      ],
+      "events": [
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "hourly",
+      "timezone": "UTC",
+      "schedule": [
+        "23 * * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 12,
+      "result_owner": "functional-chain-health.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "watchdog",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/fuzz.yml",
+      "name": "Fuzz",
+      "roles": [
+        "pr",
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "pull_request",
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "17 2 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "disabled",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "fuzz.yml",
+      "disposition": "retained independent entry",
+      "policy_reason": "Preserve operator-disabled state; enabling requires a separate policy decision.",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "scheduled-validation"
+    },
+    {
+      "workflow": ".github/workflows/gateway-integration-sync.yml",
+      "name": "Gateway Integration Sync",
+      "roles": [
+        "periodic",
+        "manual",
+        "maintenance"
+      ],
+      "events": [
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "0 2 * * 1-5"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "gateway-integration-sync.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "independent"
+    },
+    {
+      "workflow": ".github/workflows/helm-package.yml",
+      "name": "Publish helm chart to artifacthub",
+      "roles": [
+        "manual",
+        "release"
+      ],
+      "events": [
+        "workflow_run",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "helm-package.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/issue-translator.yml",
+      "name": "issue-translator",
+      "roles": [
+        "collaboration"
+      ],
+      "events": [
+        "issue_comment",
+        "issues"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "disabled",
+      "monitor": "none",
+      "result_owner": "issue-translator.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "policy_reason": "Preserve operator-disabled state; enabling requires a separate policy decision.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/minio-interop.yml",
+      "name": "minio-interop",
+      "roles": [
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch",
+        "schedule"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "17 3 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "minio-interop.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "scheduled-validation"
+    },
+    {
+      "workflow": ".github/workflows/mint.yml",
+      "name": "mint",
+      "roles": [
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch",
+        "schedule"
+      ],
+      "cadence": "weekly",
+      "timezone": "UTC",
+      "schedule": [
+        "41 6 * * 0"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 192,
+      "result_owner": "mint.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "scheduled-validation"
+    },
+    {
+      "workflow": ".github/workflows/nightly-gnu.yml",
+      "name": "Nightly GNU Build",
+      "roles": [
+        "periodic",
+        "manual",
+        "release"
+      ],
+      "events": [
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "7 0 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "nightly-gnu.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "scheduled-validation"
+    },
+    {
+      "workflow": ".github/workflows/nix-flake-update.yml",
+      "name": "Update Nix Flake",
+      "roles": [
+        "periodic",
+        "manual",
+        "maintenance"
+      ],
+      "events": [
+        "workflow_dispatch",
+        "schedule"
+      ],
+      "cadence": "weekly",
+      "timezone": "UTC",
+      "schedule": [
+        "0 5 * * 0"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 192,
+      "result_owner": "nix-flake-update.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "watchdog",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/nix.yml",
+      "name": "Nix CI",
+      "roles": [
+        "pr",
+        "manual"
+      ],
+      "events": [
+        "push",
+        "pull_request",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "disabled",
+      "monitor": "none",
+      "result_owner": "nix.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "policy_reason": "Preserve operator-disabled state; enabling requires a separate policy decision.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/oidc-keycloak.yml",
+      "name": "OIDC Keycloak Live",
+      "roles": [
+        "pr",
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "pull_request",
+        "push",
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "weekly",
+      "timezone": "UTC",
+      "schedule": [
+        "23 2 * * 1"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 192,
+      "result_owner": "oidc-keycloak.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "independent"
+    },
+    {
+      "workflow": ".github/workflows/on-demand-migration-interop.yml",
+      "name": "on-demand-migration-interop",
+      "roles": [
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch",
+        "schedule"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "23 5 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "on-demand-migration-interop.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "independent"
+    },
+    {
+      "workflow": ".github/workflows/package.yml",
+      "name": "Package DEB/RPM",
+      "roles": [
+        "manual",
+        "release"
+      ],
+      "events": [
+        "workflow_run",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "package.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/runner-hygiene.yml",
+      "name": "Runner Hygiene",
+      "roles": [
+        "periodic",
+        "manual",
+        "maintenance"
+      ],
+      "events": [
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "monthly",
+      "timezone": "UTC",
+      "schedule": [
+        "37 6 1 * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 792,
+      "result_owner": "runner-hygiene.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "scheduled-validation"
+    },
+    {
+      "workflow": ".github/workflows/rustfs-fault-tolerance-matrix.yml",
+      "name": "RustFS Fault-Tolerance Matrix",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "rustfs-fault-tolerance-matrix.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/rustfs-fault-tolerance-test.yml",
+      "name": "RustFS Fault-Tolerance Test",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_call",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "functional-chain",
+      "result_owner": "rustfs-functional-chain.yml",
+      "disposition": "reusable suite and isolated manual entry; repository_dispatch relay retired",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/rustfs-functional-chain.yml",
+      "name": "RustFS Functional Chain",
+      "roles": [
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch",
+        "workflow_run"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "complete-chain",
+      "max_age_hours": 36,
+      "result_owner": "rustfs-functional-chain.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "watchdog",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/rustfs-heal-test.yml",
+      "name": "RustFS Heal Test",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_call",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "functional-chain",
+      "result_owner": "rustfs-functional-chain.yml",
+      "disposition": "reusable suite and isolated manual entry; repository_dispatch relay retired",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/rustfs-kms-test.yml",
+      "name": "RustFS KMS Test",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_call",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "functional-chain",
+      "result_owner": "rustfs-functional-chain.yml",
+      "disposition": "reusable suite and isolated manual entry; repository_dispatch relay retired",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/rustfs-performance-test.yml",
+      "name": "RustFS Performance Test",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_call",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "functional-chain",
+      "result_owner": "rustfs-functional-chain.yml",
+      "disposition": "reusable suite and isolated manual entry; repository_dispatch relay retired",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/rustfs-pool-expand-test.yml",
+      "name": "RustFS Pool Expansion Test",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_call",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "functional-chain",
+      "result_owner": "rustfs-functional-chain.yml",
+      "disposition": "reusable suite and isolated manual entry; repository_dispatch relay retired",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/rustfs-replication-test.yml",
+      "name": "RustFS Replication Test",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_call",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "functional-chain",
+      "result_owner": "rustfs-functional-chain.yml",
+      "disposition": "reusable suite and isolated manual entry; repository_dispatch relay retired",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/rustfs-s3-compat-test.yml",
+      "name": "RustFS S3 Compatibility Test",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_call",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "functional-chain",
+      "result_owner": "rustfs-functional-chain.yml",
+      "disposition": "reusable suite and isolated manual entry; repository_dispatch relay retired",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/rustfs-security-test.yml",
+      "name": "RustFS Security Test",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_call",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "functional-chain",
+      "result_owner": "rustfs-functional-chain.yml",
+      "disposition": "reusable suite and isolated manual entry; repository_dispatch relay retired",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/rustfs-storage-test.yml",
+      "name": "RustFS Storage Engine Test",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_call",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "functional-chain",
+      "result_owner": "rustfs-functional-chain.yml",
+      "disposition": "reusable suite and isolated manual entry; repository_dispatch relay retired",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/rustfs-table-test.yml",
+      "name": "RustFS Table Test",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_call",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "functional-chain",
+      "result_owner": "rustfs-functional-chain.yml",
+      "disposition": "reusable suite and isolated manual entry; repository_dispatch relay retired",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/rustfs-tier-test.yml",
+      "name": "RustFS Tier Test",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_call",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "functional-chain",
+      "result_owner": "rustfs-functional-chain.yml",
+      "disposition": "reusable suite and isolated manual entry; repository_dispatch relay retired",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/rustfs-upgrade-test.yml",
+      "name": "RustFS Upgrade Test",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_call",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "functional-chain",
+      "result_owner": "rustfs-functional-chain.yml",
+      "disposition": "reusable suite and isolated manual entry; repository_dispatch relay retired",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/rustfs-validation-package.yml",
+      "name": "RustFS Validation Package",
+      "roles": [
+        "manual",
+        "validation-support"
+      ],
+      "events": [
+        "workflow_call",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "rustfs-validation-package.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/rustfs-validation-tools.yml",
+      "name": "RustFS Validation Tools",
+      "roles": [
+        "manual",
+        "validation-support"
+      ],
+      "events": [
+        "workflow_call",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "rustfs-validation-tools.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/schedule-failure-alert-drill.yml",
+      "name": "Schedule Failure Alert Drill",
+      "roles": [
+        "manual",
+        "health"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "disabled",
+      "monitor": "none",
+      "result_owner": "schedule-failure-alert-drill.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "policy_reason": "Preserve operator-disabled state; enabling requires a separate policy decision.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/scheduled-validation-freshness.yml",
+      "name": "Scheduled Validation Freshness",
+      "roles": [
+        "periodic",
+        "manual",
+        "health"
+      ],
+      "events": [
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "47 23 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "disabled",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "scheduled-validation-freshness.yml",
+      "disposition": "retained independent entry",
+      "policy_reason": "Preserve operator-disabled state; enabling requires a separate policy decision.",
+      "failure_owner": "watchdog",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/scheduled-validation-watchdog.yml",
+      "name": "Scheduled Validation Watchdog",
+      "roles": [
+        "health"
+      ],
+      "events": [
+        "workflow_run"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "scheduled-validation-watchdog.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/stale.yml",
+      "name": "Mark stale issues",
+      "roles": [
+        "periodic",
+        "collaboration"
+      ],
+      "events": [
+        "schedule"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "30 1 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "disabled",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "stale.yml",
+      "disposition": "retained independent entry",
+      "policy_reason": "Preserve operator-disabled state; enabling requires a separate policy decision.",
+      "failure_owner": "watchdog",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/star-history.yml",
+      "name": "Star History",
+      "roles": [
+        "periodic",
+        "manual",
+        "maintenance"
+      ],
+      "events": [
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "17 3 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "star-history.yml",
+      "disposition": "retained independent entry",
+      "failure_owner": "watchdog",
+      "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/targets-integration.yml",
+      "name": "Targets Integration",
+      "roles": [
+        "pr",
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "pull_request",
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "17 2 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "disabled",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "targets-integration.yml",
+      "disposition": "retained independent entry",
+      "policy_reason": "Preserve operator-disabled state; enabling requires a separate policy decision.",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "independent"
+    },
+    {
+      "workflow": ".github/workflows/windows-filesystem.yml",
+      "name": "Windows Filesystem Tests",
+      "roles": [
+        "pr",
+        "manual"
+      ],
+      "events": [
+        "push",
+        "pull_request",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "windows-filesystem.yml",
+      "disposition": "retained independent entry",
+      "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
+      "origin": "baseline"
+    }
+  ]
+}

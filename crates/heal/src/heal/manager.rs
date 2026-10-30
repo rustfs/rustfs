@@ -435,6 +435,8 @@ fn record_displaced_terminal(
     request: &HealRequest,
 ) -> Arc<CompletedHealStatus> {
     let terminal = Arc::new(CompletedHealStatus {
+        task_id: request.id.clone(),
+        source: request.source,
         outcome: None,
         progress: None,
         retained_bytes: std::sync::OnceLock::new(),
@@ -870,7 +872,10 @@ fn retry_budget_for_result(task: &HealTask, result: &Result<()>, retryable_batch
     if task.retry_attempts >= MAX_RECOVERABLE_HEAL_RETRIES {
         return None;
     }
-    if task.has_batch_failure() && !retryable_batch_failure {
+    // Admin traversals already exhaust their per-object retries. Restarting
+    // the whole traversal under the same token discards those receipts and
+    // reports previously repaired objects as unchanged on the next scan.
+    if task.has_batch_failure() && (task.source == HealRequestSource::Admin || !retryable_batch_failure) {
         return None;
     }
 
@@ -1024,6 +1029,21 @@ fn admin_heal_options_compatible(left: &HealOptions, right: &HealOptions) -> boo
         && left.recursive == right.recursive
         && left.dry_run == right.dry_run
         && left.no_lock == right.no_lock
+}
+
+fn replacement_request_compatible(
+    request: &HealRequest,
+    owner_type: &HealType,
+    owner_options: &HealOptions,
+    owner_source: HealRequestSource,
+) -> bool {
+    request.source == HealRequestSource::AutoHeal
+        && owner_source == HealRequestSource::AutoHeal
+        && matches!(request.heal_type, HealType::ErasureSet { .. })
+        && request.heal_type == *owner_type
+        && request.options.pool_index == owner_options.pool_index
+        && request.options.set_index == owner_options.set_index
+        && admin_heal_options_compatible(&request.options, owner_options)
 }
 
 fn admin_overlap_rejection(
@@ -1258,9 +1278,9 @@ pub struct HealManager {
 /// cascade without re-locking.
 enum TaskStateLookup {
     Active(Arc<HealTask>),
-    Retrying(HealTaskStatus, HealOptions),
+    Retrying(HealTaskStatus, HealOptions, HealRequestSource),
     Completed(Arc<CompletedHealStatus>),
-    Queued(HealOptions),
+    Queued(HealOptions, HealRequestSource),
     /// A durable root heal record that cannot be admitted or quarantined;
     /// it answers status queries with the reason until an operator repairs it.
     Unrunnable(String),
@@ -1485,13 +1505,34 @@ impl HealManager {
         request: HealRequest,
         config: &HealConfig,
         context: &'static str,
+        replacement_targets_frozen: bool,
     ) -> HealAdmissionDecision {
+        let replacement_targets_frozen = replacement_targets_frozen || request.retry_attempts != 0;
         let queue_len = queue.len();
         publish_heal_queue_length(queue);
         let queue_capacity = config.queue_size;
         let per_object_request = request.heal_type.is_per_object();
         let best_effort_reserve = best_effort_queue_reserve(queue_capacity);
         let best_effort_source_reserves = best_effort_source_reserves(queue_capacity);
+
+        // Scanner and retry admission bypass submit_heal_request's duplicate
+        // checks. Keep their target ownership checks ahead of queue capacity.
+        if !request.force_start
+            && request.source == HealRequestSource::AutoHeal
+            && !request.heal_endpoints.is_empty()
+            && let Some(owner_id) = queue
+                .queued_request_id_for_dedup_key(&PriorityHealQueue::make_dedup_key(&request))
+                .map(ToOwned::to_owned)
+        {
+            let mut admission = Self::duplicate_admission_for_request(&request, config);
+            if admission == HealAdmissionResult::Merged
+                && !queue.merge_replacement_targets(&owner_id, &request, true, replacement_targets_frozen)
+            {
+                admission = HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning);
+            }
+            Self::record_admission_metric(request.source, admission, context);
+            return HealAdmissionDecision::new(admission);
+        }
 
         if queue_len >= queue_capacity && !request.force_start {
             if Self::can_displace_queued_work(&request)
@@ -1652,7 +1693,7 @@ impl HealManager {
         let priority = request.priority;
         let source = request.source;
 
-        match queue.push(request) {
+        match queue.push_with_replacement_scope(request, replacement_targets_frozen) {
             QueuePushOutcome::Accepted => {
                 publish_heal_queue_length(queue);
                 Self::record_admission_metric(source, HealAdmissionResult::Accepted, context);
@@ -2504,7 +2545,7 @@ impl HealManager {
             // HS-06: under the minio_error overlap policy an exact duplicate
             // admin start reports the typed AlreadyRunning rejection instead
             // of the silent merge (MinIO's ErrHealAlreadyRunning).
-            let admission = if (request.source == HealRequestSource::Admin
+            let mut admission = if (request.source == HealRequestSource::Admin
                 && config.overlap_policy == HealOverlapPolicy::MinioError)
                 || (duplicate_state != "queued" && mrf_notice_target.as_ref().is_some_and(|target| target.kind.is_durable()))
             {
@@ -2514,6 +2555,44 @@ impl HealManager {
             } else {
                 Self::duplicate_admission_for_request(&request, &config)
             };
+            if matches!(admission, HealAdmissionResult::Merged)
+                && request.source == HealRequestSource::AutoHeal
+                && !request.heal_endpoints.is_empty()
+            {
+                let (owner_recovered, incoming_recovered) = {
+                    // Match queue -> recovery-anchor ordering in the scanner.
+                    let anchors = self
+                        .replacement_recovery_anchors
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    (anchors.contains_key(&merged_task_id), anchors.contains_key(&request.id))
+                };
+                let incoming_frozen = incoming_recovered || request.retry_attempts != 0;
+                let covered = if incoming_frozen && request.id != merged_task_id {
+                    false
+                } else if duplicate_state == "queued" {
+                    queue.merge_replacement_targets(&merged_task_id, &request, !owner_recovered, incoming_frozen)
+                } else {
+                    let owner = active_heals
+                        .get(&merged_task_id)
+                        .map(|task| (&task.heal_type, &task.options, task.source, &task.heal_endpoints))
+                        .or_else(|| {
+                            retrying_heals.get(&merged_task_id).map(|retry| {
+                                let owner = &retry.request;
+                                (&owner.heal_type, &owner.options, owner.source, &owner.heal_endpoints)
+                            })
+                        });
+                    owner.is_some_and(|(heal_type, options, source, endpoints)| {
+                        replacement_request_compatible(&request, heal_type, options, source)
+                            && request.heal_endpoints.iter().all(|endpoint| endpoints.contains(endpoint))
+                    })
+                };
+                if !covered {
+                    // A frozen generation cannot certify newly arriving disks.
+                    // Leave them discoverable by the scanner for the next pass.
+                    admission = HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning);
+                }
+            }
             if matches!(admission, HealAdmissionResult::Merged)
                 && let Some(target) = mrf_notice_target
             {
@@ -2670,7 +2749,14 @@ impl HealManager {
         let request_id = request.id.clone();
         let request_heal_type = request.heal_type.clone();
         let request_source = request.source;
-        let admission_decision = Self::admit_request_to_queue(&mut queue, request, &config, "submit");
+        let recovered_replacement = request.source == HealRequestSource::AutoHeal
+            && !request.heal_endpoints.is_empty()
+            && self
+                .replacement_recovery_anchors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&request.id);
+        let admission_decision = Self::admit_request_to_queue(&mut queue, request, &config, "submit", recovered_replacement);
         let admission = admission_decision.result;
         if durable_handoff_required && !admission.is_admitted() {
             self.root_recovery
@@ -2749,6 +2835,23 @@ impl HealManager {
     /// completed entry. `heal_path` additionally constrains the map matches
     /// the way the `*_for_path` variants always have.
     async fn lookup_task_state(&self, canonical_task_id: &str, heal_path: Option<&str>) -> Result<TaskStateLookup> {
+        let state = self.lookup_memory_task_state(canonical_task_id, heal_path).await;
+        if !matches!(state, TaskStateLookup::NotFound) {
+            return Ok(state);
+        }
+        if let Some(completed) = self.root_recovery.completed(canonical_task_id).await?
+            && heal_path.is_none_or(|path| heal_type_matches_path(&completed.heal_type, path))
+        {
+            return Ok(TaskStateLookup::Completed(Arc::new(completed)));
+        }
+        // A durable record that cannot run still answers with its reason.
+        if let Some(reason) = self.root_recovery.record_issue(canonical_task_id).await {
+            return Ok(TaskStateLookup::Unrunnable(reason));
+        }
+        Ok(TaskStateLookup::NotFound)
+    }
+
+    async fn lookup_memory_task_state(&self, canonical_task_id: &str, heal_path: Option<&str>) -> TaskStateLookup {
         let matches_path = |heal_type: &HealType| heal_path.is_none_or(|path| heal_type_matches_path(heal_type, path));
 
         {
@@ -2757,7 +2860,7 @@ impl HealManager {
                 .get(canonical_task_id)
                 .filter(|task| matches_path(&task.heal_type))
             {
-                return Ok(TaskStateLookup::Active(Arc::clone(task)));
+                return TaskStateLookup::Active(Arc::clone(task));
             }
         }
 
@@ -2767,7 +2870,7 @@ impl HealManager {
                 .get(canonical_task_id)
                 .filter(|retrying| matches_path(&retrying.request.heal_type))
             {
-                return Ok(TaskStateLookup::Retrying(retrying.status(), retrying.request.options.clone()));
+                return TaskStateLookup::Retrying(retrying.status(), retrying.request.options.clone(), retrying.request.source);
             }
         }
 
@@ -2780,7 +2883,7 @@ impl HealManager {
             prune_completed_heal_statuses(&mut completed_heals);
             if let Some(completed) = completed_heals.get(canonical_task_id).filter(|c| matches_path(&c.heal_type)) {
                 if completed_status_is_retrying(&completed.status) {
-                    return Ok(TaskStateLookup::Completed(Arc::clone(completed)));
+                    return TaskStateLookup::Completed(Arc::clone(completed));
                 }
                 terminal_completed = Some(Arc::clone(completed));
             }
@@ -2789,7 +2892,7 @@ impl HealManager {
         {
             let queue = self.heal_queue.lock().await;
             if let Some(request) = queue.request_matching_id_and_path(canonical_task_id, heal_path) {
-                return Ok(TaskStateLookup::Queued(request.options.clone()));
+                return TaskStateLookup::Queued(request.options.clone(), request.source);
             }
         }
 
@@ -2802,22 +2905,10 @@ impl HealManager {
                 .cloned();
         }
 
-        if terminal_completed.is_none()
-            && let Some(completed) = self.root_recovery.completed(canonical_task_id).await?
-            && matches_path(&completed.heal_type)
-        {
-            terminal_completed = Some(Arc::new(completed));
-        }
-
         if let Some(completed) = terminal_completed {
-            return Ok(TaskStateLookup::Completed(completed));
+            return TaskStateLookup::Completed(completed);
         }
-        // A durable root record that can neither run nor be quarantined still
-        // answers status queries with its reason.
-        if let Some(reason) = self.root_recovery.record_issue(canonical_task_id).await {
-            return Ok(TaskStateLookup::Unrunnable(reason));
-        }
-        Ok(TaskStateLookup::NotFound)
+        TaskStateLookup::NotFound
     }
 
     async fn publish_admin_terminal(
@@ -2841,6 +2932,8 @@ impl HealManager {
     ) -> Result<bool> {
         let previous = self.completed_heals.lock().await.get(task_id).cloned();
         let mut completed = CompletedHealStatus {
+            task_id: task_id.to_owned(),
+            source,
             outcome: None,
             progress: None,
             retained_bytes: std::sync::OnceLock::new(),
@@ -2876,9 +2969,9 @@ impl HealManager {
         let canonical_task_id = self.canonical_task_id(task_id).await;
         match self.lookup_task_state(&canonical_task_id, None).await? {
             TaskStateLookup::Active(task) => Ok(task.get_status().await),
-            TaskStateLookup::Retrying(status, _) => Ok(status),
+            TaskStateLookup::Retrying(status, _, _) => Ok(status),
             TaskStateLookup::Completed(completed) => Ok(completed.status.clone()),
-            TaskStateLookup::Queued(_) => Ok(HealTaskStatus::Pending),
+            TaskStateLookup::Queued(_, _) => Ok(HealTaskStatus::Pending),
             TaskStateLookup::Unrunnable(error) => Ok(HealTaskStatus::Failed { error }),
             TaskStateLookup::NotFound => Err(Error::TaskNotFound {
                 task_id: task_id.to_string(),
@@ -2897,9 +2990,9 @@ impl HealManager {
         let canonical_task_id = self.canonical_task_id(task_id).await;
         match self.lookup_task_state(&canonical_task_id, None).await? {
             TaskStateLookup::Active(task) => Ok(active_task_report(&task, since).await),
-            TaskStateLookup::Retrying(status, options) => Ok(empty_task_report_with_options(status, options)),
+            TaskStateLookup::Retrying(status, options, _) => Ok(empty_task_report_with_options(status, options)),
             TaskStateLookup::Completed(completed) => Ok(completed_task_report(&completed, since)),
-            TaskStateLookup::Queued(options) => Ok(empty_task_report_with_options(HealTaskStatus::Pending, options)),
+            TaskStateLookup::Queued(options, _) => Ok(empty_task_report_with_options(HealTaskStatus::Pending, options)),
             TaskStateLookup::Unrunnable(error) => {
                 Ok(empty_task_report_with_options(HealTaskStatus::Failed { error }, HealOptions::default()))
             }
@@ -2913,6 +3006,42 @@ impl HealManager {
         self.get_task_report_for_path_since(heal_path, task_id, None).await
     }
 
+    /// Resolve a node-owned automatic task without granting local control over
+    /// Admin tasks. The source and report come from the same state snapshot.
+    pub async fn get_local_automatic_task_report(
+        &self,
+        heal_path: &str,
+        task_id: &str,
+        since: Option<u64>,
+    ) -> Result<Option<HealTaskReport>> {
+        let canonical_task_id = self.canonical_task_id(task_id).await;
+        if canonical_task_id != task_id {
+            return Ok(None);
+        }
+        let state = self.lookup_memory_task_state(&canonical_task_id, Some(heal_path)).await;
+        let source = match &state {
+            TaskStateLookup::Active(task) => task.source,
+            TaskStateLookup::Retrying(_, _, source) | TaskStateLookup::Queued(_, source) => *source,
+            TaskStateLookup::Completed(completed) if completed.task_id == task_id => completed.source,
+            TaskStateLookup::Completed(_) => return Ok(None),
+            TaskStateLookup::Unrunnable(_) | TaskStateLookup::NotFound => return Ok(None),
+        };
+        if !matches!(
+            source,
+            HealRequestSource::Scanner | HealRequestSource::Mrf | HealRequestSource::AutoHeal | HealRequestSource::ReadRepair
+        ) {
+            return Ok(None);
+        }
+        let report = match state {
+            TaskStateLookup::Active(task) => active_task_report(&task, since).await,
+            TaskStateLookup::Retrying(status, options, _) => empty_task_report_with_options(status, options),
+            TaskStateLookup::Completed(completed) => completed_task_report(&completed, since),
+            TaskStateLookup::Queued(options, _) => empty_task_report_with_options(HealTaskStatus::Pending, options),
+            TaskStateLookup::Unrunnable(_) | TaskStateLookup::NotFound => return Ok(None),
+        };
+        Ok(Some(report))
+    }
+
     /// Incremental variant of [`Self::get_task_report_for_path`] (HS-06).
     pub async fn get_task_report_for_path_since(
         &self,
@@ -2923,9 +3052,9 @@ impl HealManager {
         let canonical_task_id = self.canonical_task_id(task_id).await;
         match self.lookup_task_state(&canonical_task_id, Some(heal_path)).await? {
             TaskStateLookup::Active(task) => Ok(active_task_report(&task, since).await),
-            TaskStateLookup::Retrying(status, options) => Ok(empty_task_report_with_options(status, options)),
+            TaskStateLookup::Retrying(status, options, _) => Ok(empty_task_report_with_options(status, options)),
             TaskStateLookup::Completed(completed) => Ok(completed_task_report(&completed, since)),
-            TaskStateLookup::Queued(options) => Ok(empty_task_report_with_options(HealTaskStatus::Pending, options)),
+            TaskStateLookup::Queued(options, _) => Ok(empty_task_report_with_options(HealTaskStatus::Pending, options)),
             TaskStateLookup::Unrunnable(error) => {
                 Ok(empty_task_report_with_options(HealTaskStatus::Failed { error }, HealOptions::default()))
             }
@@ -2949,9 +3078,9 @@ impl HealManager {
         let canonical_task_id = self.canonical_task_id(task_id).await;
         match self.lookup_task_state(&canonical_task_id, Some(heal_path)).await? {
             TaskStateLookup::Active(task) => Ok(task.get_status().await),
-            TaskStateLookup::Retrying(status, _) => Ok(status),
+            TaskStateLookup::Retrying(status, _, _) => Ok(status),
             TaskStateLookup::Completed(completed) => Ok(completed.status.clone()),
-            TaskStateLookup::Queued(_) => Ok(HealTaskStatus::Pending),
+            TaskStateLookup::Queued(_, _) => Ok(HealTaskStatus::Pending),
             TaskStateLookup::Unrunnable(error) => Ok(HealTaskStatus::Failed { error }),
             TaskStateLookup::NotFound => {
                 if self.path_has_task(heal_path).await {

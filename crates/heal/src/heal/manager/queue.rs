@@ -70,6 +70,8 @@ pub(super) struct PriorityQueueItem {
     pub(super) sequence: u64,
     pub(super) dedup_key: String,
     pub(super) request: HealRequest,
+    /// Execution or durable recovery fixed these targets; grace waits can have zero retries.
+    pub(super) replacement_targets_frozen: bool,
 }
 
 impl Eq for PriorityQueueItem {}
@@ -107,7 +109,9 @@ pub(super) enum QueuePushOutcome {
 
 #[derive(Debug, Clone)]
 pub(super) struct CompletedHealStatus {
+    pub(super) task_id: String,
     pub(super) heal_type: HealType,
+    pub(super) source: HealRequestSource,
     /// Options used to execute the task, retained for token-scoped status.
     pub(super) options: HealOptions,
     pub(super) status: HealTaskStatus,
@@ -135,6 +139,7 @@ impl CompletedHealStatus {
     fn measure_retained_bytes(&self) -> usize {
         let mut bytes = size_of::<Self>();
         let mut add = |amount: usize| bytes = bytes.saturating_add(amount);
+        add(self.task_id.capacity());
         add(self.outcome.as_ref().map_or(0, |outcome| outcome.retained_bytes()));
         match &self.heal_type {
             HealType::Cluster => {}
@@ -256,7 +261,9 @@ impl CompletedHealStatus {
             outcome.finish(Some(crate::heal::outcome::HealAbortReason::Cancelled));
         }
         let mut snapshot = Self {
+            task_id: task.id.clone(),
             heal_type: task.heal_type.clone(),
+            source: task.source,
             options: task.options.clone(),
             status,
             progress: Some(task.get_progress().await),
@@ -316,6 +323,10 @@ impl PriorityHealQueue {
     }
 
     pub(super) fn push(&mut self, request: HealRequest) -> QueuePushOutcome {
+        self.push_with_replacement_scope(request, false)
+    }
+
+    pub(super) fn push_with_replacement_scope(&mut self, request: HealRequest, frozen: bool) -> QueuePushOutcome {
         let key = Self::make_dedup_key(&request);
 
         // Check for duplicates unless the caller explicitly forces admission.
@@ -340,6 +351,7 @@ impl PriorityHealQueue {
             sequence: self.sequence,
             dedup_key: key,
             request,
+            replacement_targets_frozen: frozen,
         });
         if is_best_effort_source(source) {
             self.best_effort_queued += 1;
@@ -678,6 +690,51 @@ impl PriorityHealQueue {
     /// Iterate queued requests (used by the admin overlap check).
     pub(super) fn requests(&self) -> impl Iterator<Item = &HealRequest> {
         self.heap.iter().map(|item| &item.request)
+    }
+
+    pub(super) fn merge_replacement_targets(
+        &mut self,
+        owner_id: &str,
+        request: &HealRequest,
+        allow_expand: bool,
+        incoming_frozen: bool,
+    ) -> bool {
+        let Some(item) = self.heap.iter().find(|item| item.request.id == owner_id) else {
+            return false;
+        };
+        let owner = &item.request;
+        let same_id = request.id == owner.id;
+        let eligible = replacement_request_compatible(request, &owner.heal_type, &owner.options, owner.source)
+            && (!incoming_frozen || same_id);
+        let covered = eligible
+            && request
+                .heal_endpoints
+                .iter()
+                .all(|endpoint| owner.heal_endpoints.contains(endpoint));
+        let mark_frozen = incoming_frozen && same_id && !item.replacement_targets_frozen;
+        let can_expand = eligible
+            && allow_expand
+            && !item.replacement_targets_frozen
+            && !incoming_frozen
+            && owner.retry_attempts == 0
+            && request.retry_attempts == 0
+            && !owner.heal_endpoints.is_empty();
+        if !mark_frozen && (covered || !can_expand) {
+            return covered;
+        }
+
+        // Neither targets nor their frozen flag affect heap ordering.
+        let mut items = std::mem::take(&mut self.heap).into_vec();
+        if let Some(item) = items.iter_mut().find(|item| item.request.id == owner_id) {
+            item.replacement_targets_frozen |= mark_frozen;
+            if !covered && can_expand {
+                item.request.heal_endpoints.extend(request.heal_endpoints.iter().cloned());
+                item.request.heal_endpoints.sort_unstable();
+                item.request.heal_endpoints.dedup();
+            }
+        }
+        self.heap = BinaryHeap::from(items);
+        covered || can_expand
     }
 
     #[cfg(test)]

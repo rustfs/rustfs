@@ -24,6 +24,7 @@ use crate::runtime::instance::InstanceContext;
 use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
 use crate::storage_api_contracts::multipart::{CompletePart, MultipartOperations};
 use crate::storage_api_contracts::object::ObjectIO;
+use crate::storage_api_contracts::object::ObjectOperations as _;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo};
 use tempfile::TempDir;
 use time::OffsetDateTime;

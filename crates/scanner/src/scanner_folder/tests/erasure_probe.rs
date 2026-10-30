@@ -148,11 +148,7 @@ async fn erasure_candidate_finds_late_part_without_scanning_data_children() {
 
 async fn candidate_scanner() -> (FolderScanner, std::path::PathBuf, CachedFolder) {
     let (mut scanner, root) = build_test_scanner().await;
-    for info in [
-        &mut scanner.old_cache.info,
-        &mut scanner.new_cache.info,
-        &mut scanner.update_cache.info,
-    ] {
+    for info in [&mut scanner.old_cache.info, &mut scanner.new_cache.info] {
         info.name = "bucket".into();
     }
     scanner.is_erasure_mode = true;
@@ -354,8 +350,7 @@ fn enable_checkpoint(scanner: &mut FolderScanner) {
     cache.prepare_bucket_checkpoint("bucket", 7, 3, crate::DataUsageCacheSource::new(1, 0), plan, identity);
     cache.replace("bucket", "", DataUsageEntry::default());
     scanner.old_cache = cache.clone();
-    scanner.new_cache = cache.clone();
-    scanner.update_cache = cache;
+    scanner.new_cache = cache;
 }
 
 #[tokio::test]
@@ -462,8 +457,7 @@ async fn erasure_candidate_cancelled_batch_keeps_partial_checkpoint_and_reclassi
     let bytes = serde_json::to_vec(&snapshot).expect("serialize partial checkpoint");
     let reloaded: DataUsageCache = serde_json::from_slice(&bytes).expect("reload partial checkpoint");
     scanner.old_cache = reloaded.clone();
-    scanner.new_cache = reloaded.clone();
-    scanner.update_cache = reloaded;
+    scanner.new_cache = reloaded;
     scanner.raw_enumeration_progress.clear();
     let next_budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, Default::default());
     scanner.budget = next_budget.clone();

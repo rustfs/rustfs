@@ -22,15 +22,41 @@ pub(super) async fn collect_completed_bucket_results(
 ) -> (DataUsageCache, HashSet<String>) {
     let mut cancelled = false;
     let mut completed = HashSet::new();
+    let mut received_roots = 0usize;
+    let mut duplicate_applied_roots = 0usize;
+    let mut rejected_roots = 0usize;
     loop {
         tokio::select! {
             _ = ctx.cancelled(), if !cancelled => cancelled = true,
             result = results.recv() => {
                 let Some(result) = result else {
+                    debug!(
+                        target: "rustfs::scanner::io",
+                        event = EVENT_SCANNER_SET_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_IO,
+                        state = "bucket_root_collector_drained",
+                        collector_cache_pool = cache.info.source.map(|source| source.pool_index),
+                        collector_cache_set = cache.info.source.map(|source| source.set_index),
+                        collector_cache_cycle = cache.info.next_cycle,
+                        collector_cache_leader_epoch = cache.info.leader_epoch,
+                        received_roots,
+                        distinct_applied_roots = completed.len(),
+                        duplicate_applied_roots,
+                        rejected_roots,
+                        cancellation_observed = cancelled,
+                        cancelled_at_drain = ctx.is_cancelled(),
+                        "Scanner bucket root collector drained"
+                    );
                     return (cache, completed);
                 };
+                received_roots = received_roots.saturating_add(1);
                 if let Some(bucket) = apply_bucket_result_to_cache(&mut cache, result, SystemTime::now()) {
-                    completed.insert(bucket);
+                    if !completed.insert(bucket) {
+                        duplicate_applied_roots = duplicate_applied_roots.saturating_add(1);
+                    }
+                } else {
+                    rejected_roots = rejected_roots.saturating_add(1);
                 }
             }
         }
@@ -1827,6 +1853,7 @@ impl ScannerIOCache for SetDisks {
                 pool = source.pool_index,
                 set = source.set_index,
                 cycle = want_cycle,
+                leader_epoch,
                 completed_buckets = completed_count,
                 carried_buckets = carried_buckets.len(),
                 total_buckets = buckets.len(),

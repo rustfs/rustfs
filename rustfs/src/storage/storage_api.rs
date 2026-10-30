@@ -32,13 +32,18 @@ pub(crate) mod ecstore_integrity {
     };
 }
 
-#[cfg(feature = "diagnostic-read-version-caller")]
+#[cfg(any(feature = "diagnostic-read-version-caller", feature = "diagnostic-local-batch"))]
 pub(crate) mod ecstore_diagnostic {
+    #[cfg(all(test, feature = "diagnostic-local-batch"))]
+    pub(crate) use rustfs_ecstore::api::diagnostic::current_request_id;
+    #[cfg(feature = "diagnostic-read-version-caller")]
     pub(crate) use rustfs_ecstore::api::diagnostic::{
         ReadVersionContextBoundary, ReadVersionEntrySource, with_captured_read_version_context, with_read_version_spawn_context,
     };
-    #[cfg(test)]
+    #[cfg(all(test, feature = "diagnostic-read-version-caller"))]
     pub(crate) use rustfs_ecstore::api::diagnostic::{current_read_version_entry_source, with_read_version_entry};
+    #[cfg(feature = "diagnostic-local-batch")]
+    pub(crate) use rustfs_ecstore::api::diagnostic::{in_request_context, request_context};
 }
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
@@ -335,8 +340,8 @@ pub(crate) mod s3_api_consumer {
     pub(crate) mod bucket {
         pub(crate) use super::super::super::s3_api::bucket::{
             ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-            build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params,
-            parse_list_objects_v2_params,
+            build_list_objects_output, build_list_objects_v2_output, encode_list_objects_v2_continuation_token,
+            parse_list_object_versions_params, parse_list_objects_v2_params,
         };
 
         pub(crate) mod contract {
@@ -447,9 +452,11 @@ pub(crate) mod ecstore_bucket {
 
 pub(crate) mod ecstore_capacity {
     pub(crate) use rustfs_ecstore::api::capacity::{
-        DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolMeta, PoolStatus, get_total_usable_capacity,
+        DecommissionUnresolvedEntry, PoolAdminDiagnostic, PoolDecommissionInfo, PoolMeta, PoolStatus, get_total_usable_capacity,
         get_total_usable_capacity_free, is_pool_activation_fleet_proof_error, is_reserved_or_invalid_bucket,
     };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::capacity::{PoolAvailability, PoolCapacityStatus, PoolDiagnosticStatus};
 }
 
 pub(crate) mod ecstore_client {
@@ -481,9 +488,9 @@ pub(crate) mod ecstore_config {
 pub(crate) mod ecstore_data_usage {
     pub(crate) use rustfs_ecstore::api::data_usage::{
         apply_bucket_usage_memory_overlay, get_bucket_usage_memory, init_compression_total_memory_from_backend,
-        load_admin_data_usage_from_backend_cached, load_data_usage_from_backend, lookup_degraded_bucket_usage_baseline,
-        quota_object_size, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
-        record_bucket_object_version_write_memory, record_bucket_object_write_memory,
+        load_admin_data_usage_from_backend_cached, load_bucket_usage_from_backend_cached, load_data_usage_from_backend,
+        lookup_degraded_bucket_usage_baseline, quota_object_size, record_bucket_delete_marker_memory,
+        record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
         record_bucket_object_write_unknown_previous_memory, store_compression_total_in_backend,
     };
     // Test-only observables for the rustfs/backlog#1306 revert detector.
@@ -501,13 +508,19 @@ pub(crate) mod ecstore_disk {
         DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest,
         DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo,
         DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload,
-        GuardedFileInfoVersions, OldCurrentSize, PartTransactionAction, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
-        ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteBackgroundIo, RenameDataResp, SnapshotLeaseToken,
-        UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout, is_quota_mutation_fence_path,
-        validate_batch_read_version_item_count, with_remote_background_io,
+        GuardedFileInfoVersions, MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartSourceOperation, MultipartSourceRequest,
+        MultipartSourceResponse, OldCurrentSize, POOL_META_NATIVE_CAS_METADATA_SUFFIX, PartTransactionAction,
+        PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
+        RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteBackgroundIo,
+        RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout,
+        is_quota_mutation_fence_path, require_source_condition, validate_batch_read_version_item_count,
+        with_remote_background_io,
     };
     #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::disk::{CurrentDeleteGeneration, DiskOption, new_disk, with_background_resource_unit};
+    pub(crate) use rustfs_ecstore::api::disk::{
+        CurrentDeleteGeneration, DiskOption, capture_source_condition, new_disk, strip_native_controls,
+        with_background_resource_unit,
+    };
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
 }
 
@@ -551,7 +564,8 @@ pub(crate) mod ecstore_notification {
     pub(crate) use rustfs_ecstore::api::notification::{
         ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
         configured_fleet_topology_fingerprint, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
-        ilm_recovery_export_local_process_epoch, new_global_notification_sys, start_remote_version_state_fleet_probe,
+        ilm_recovery_export_local_process_epoch, mrf_lifecycle_reader_local_process_epoch, new_global_notification_sys,
+        start_remote_version_state_fleet_probe,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::notification::{
@@ -1339,12 +1353,22 @@ pub(crate) fn ilm_recovery_export_local_process_epoch() -> uuid::Uuid {
     ecstore_notification::ilm_recovery_export_local_process_epoch()
 }
 
+pub(crate) fn mrf_lifecycle_reader_local_process_epoch() -> uuid::Uuid {
+    ecstore_notification::mrf_lifecycle_reader_local_process_epoch()
+}
+
 pub(crate) async fn read_config(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>> {
     ecstore_config::com::read_config(api, file).await
 }
 
 pub(crate) async fn read_config_no_lock(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>> {
     ecstore_config::com::read_config_no_lock(api, file).await
+}
+
+pub(crate) async fn read_server_config_with_generation(
+    api: Arc<ECStore>,
+) -> Result<(rustfs_config::server_config::Config, Option<uuid::Uuid>)> {
+    ecstore_config::com::read_server_config_with_generation(api).await
 }
 
 pub(crate) async fn read_existing_server_config_no_lock(api: Arc<ECStore>) -> Result<rustfs_config::server_config::Config> {

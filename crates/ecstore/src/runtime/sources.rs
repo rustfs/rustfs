@@ -467,6 +467,24 @@ pub(crate) async fn reconcile_local_disk_ids(
 }
 
 pub(crate) async fn quarantine_local_disks(instance_ctx: &InstanceContext, endpoints: &[Endpoint]) -> Result<()> {
+    quarantine_local_disks_preserving_bootstrap_routes(instance_ctx, endpoints, &[]).await
+}
+
+/// Keep an already registered path available to its in-flight format writer.
+/// All runtime voting slots are still cleared; no route is admitted or revived.
+/// Only the format loader's explicit local unformatted observations may use it.
+pub(crate) async fn quarantine_local_disks_preserving_bootstrap_routes(
+    instance_ctx: &InstanceContext,
+    endpoints: &[Endpoint],
+    unformatted_bootstrap_routes: &[Endpoint],
+) -> Result<()> {
+    if unformatted_bootstrap_routes
+        .iter()
+        .any(|route| !route.is_local || !endpoints.contains(route))
+    {
+        return Err(Error::CorruptedFormat);
+    }
+    let bootstrap_routes = unformatted_bootstrap_routes.iter().collect::<HashSet<_>>();
     let slots = endpoints
         .iter()
         .map(|endpoint| {
@@ -481,7 +499,9 @@ pub(crate) async fn quarantine_local_disks(instance_ctx: &InstanceContext, endpo
     let local_disk_map = instance_ctx.local_disk_map();
     let mut local_disks = local_disk_map.write().await;
     for endpoint in endpoints {
-        local_disks.insert(endpoint.to_string(), None);
+        if !bootstrap_routes.contains(endpoint) {
+            local_disks.insert(endpoint.to_string(), None);
+        }
     }
     drop(local_disks);
 
@@ -552,6 +572,7 @@ pub(crate) async fn initialize_local_disk_maps(
     endpoint_pools: EndpointServerPools,
     opt: &DiskOption,
 ) -> Result<()> {
+    let multipart_authority = instance_ctx.bind_multipart_proof_topology(&endpoint_pools)?;
     // Every caller passes the FULL topology, so (re)initialization must replace
     // any previous registration wholesale: appending would leave the pool/set
     // vectors sized for a stale topology and panic on wider disk indices (seen
@@ -578,7 +599,20 @@ pub(crate) async fn initialize_local_disk_maps(
                 continue;
             }
 
-            let disk = new_disk(ep, opt).await?;
+            let disk = match new_disk(ep, opt).await {
+                Ok(disk) => disk,
+                Err(crate::disk::error::DiskError::FileAccessDenied) => {
+                    // LocalDisk already logged the filesystem cause and repair
+                    // hint. Keep this slot unavailable so ECStore initialization
+                    // can apply its existing fatal-error and quorum rules.
+                    global_local_disk_map.insert(ep.to_string(), None);
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
+            if let crate::disk::Disk::Local(wrapper) = disk.as_ref() {
+                wrapper.get_disk().bind_multipart_proof_authority(&multipart_authority)?;
+            }
             let path = disk.endpoint().to_string();
             let pool_idx = usize::try_from(ep.pool_idx).map_err(|err| {
                 crate::error::Error::other(format!("store init failed to convert pool index `{}`: {err}", ep.pool_idx))
@@ -621,7 +655,7 @@ mod tests {
         notify_scanner_dirty_usage_mutation, reconcile_local_disk_ids, replace_local_disk_id, set_local_node_name,
         set_scanner_dirty_usage_mutation_observer,
     };
-    use crate::disk::endpoint::Endpoint;
+    use crate::disk::{DiskAPI, endpoint::Endpoint};
     use rustfs_lock::{LocalClient, LockClient};
     use std::{
         collections::HashMap,
@@ -825,9 +859,11 @@ mod tests {
         super::initialize_local_disk_maps(&instance_ctx, build_pools("narrow", 2), &opt)
             .await
             .expect("narrow topology should initialize");
+        let first_authority = instance_ctx.multipart_proof_verification_context();
         super::initialize_local_disk_maps(&instance_ctx, build_pools("wide", 4), &opt)
             .await
             .expect("re-initializing with a wider topology must not panic or fail");
+        assert!(first_authority.same_authority(&instance_ctx.multipart_proof_verification_context()));
 
         let set_drives = instance_ctx.local_disk_set_drives();
         let set_drives = set_drives.read().await;
@@ -847,5 +883,60 @@ mod tests {
             "only the new topology's disks may remain registered: {:?}",
             disk_map.keys().collect::<Vec<_>>()
         );
+    }
+    #[tokio::test]
+    async fn multipart_invalid_registry_pool_index_has_no_authority_or_registry_effect() {
+        use crate::disk::DiskOption;
+        use crate::layout::endpoints::{EndpointServerPools, PoolEndpoints};
+        let directory = tempfile::tempdir().unwrap();
+        let make_topology = |label: &str, pool_index: usize| {
+            let path = directory.path().join(label);
+            std::fs::create_dir_all(&path).unwrap();
+            let mut endpoint = Endpoint::try_from(path.to_str().unwrap()).unwrap();
+            endpoint.set_pool_index(pool_index);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(0);
+            EndpointServerPools(vec![PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set: 1,
+                endpoints: vec![endpoint].into(),
+                cmd_line: label.into(),
+                platform: "test".into(),
+            }])
+        };
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let valid = make_topology("registered", 0);
+        let options = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+        super::initialize_local_disk_maps(&ctx, valid.clone(), &options)
+            .await
+            .unwrap();
+        let authority = ctx.multipart_proof_verification_context();
+        let before = ctx.local_disk_map().read().await.clone();
+        let invalid = make_topology("invalid", 1);
+        let endpoint = &invalid.0[0].endpoints.as_ref()[0];
+        assert!(
+            super::initialize_local_disk_maps(&ctx, invalid.clone(), &options)
+                .await
+                .is_err()
+        );
+        assert!(authority.same_authority(&ctx.multipart_proof_verification_context()));
+        assert!(authority.validate_endpoint(endpoint).is_err());
+        assert!(
+            !std::path::Path::new(&endpoint.get_file_path()).join(".rustfs.sys").exists(),
+            "invalid registration must fail before disk initialization"
+        );
+        let after = ctx.local_disk_map().read().await.clone();
+        assert_eq!(before.len(), after.len());
+        for (path, disk) in before {
+            assert!(Arc::ptr_eq(disk.as_ref().unwrap(), after.get(&path).unwrap().as_ref().unwrap()));
+        }
+        let drives = ctx.local_disk_set_drives();
+        let drives = drives.read().await;
+        assert_eq!((drives.len(), drives[0].len(), drives[0][0].len()), (1, 1, 1));
+        assert_eq!(drives[0][0][0].as_ref().unwrap().endpoint(), valid.0[0].endpoints.as_ref()[0]);
     }
 }

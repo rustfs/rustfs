@@ -30,6 +30,30 @@ pub(super) fn retry_admission_delay(
     Some(delay)
 }
 
+pub(super) fn running_mainline_pacer(
+    request: &HealRequest,
+    config: &HealConfig,
+    provider: &Option<WorkloadSnapshotProviderRef>,
+) -> Option<Arc<crate::heal::pacing::MainlinePacer>> {
+    let pace_running = request.source == HealRequestSource::Admin
+        || (request.source == HealRequestSource::AutoHeal
+            && matches!(&request.heal_type, HealType::ErasureSet { .. })
+            && !request.heal_endpoints.is_empty());
+    if !pace_running || !config.mainline_throttle_enable {
+        return None;
+    }
+    provider.as_ref().and_then(|provider| {
+        crate::heal::pacing::MainlinePacer::new(
+            provider.clone(),
+            config.mainline_read_utilization_high_percent,
+            config.mainline_write_utilization_high_percent,
+            config.mainline_max_sleep,
+            request.source,
+        )
+        .map(Arc::new)
+    })
+}
+
 impl HealManager {
     /// Start scheduler
     pub(super) async fn start_scheduler(&self) -> Result<()> {
@@ -211,19 +235,7 @@ impl HealManager {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .get(&request.id)
                     .cloned();
-                let mainline_pacer = if request.source == HealRequestSource::Admin && config.mainline_throttle_enable {
-                    workload_provider.as_ref().and_then(|provider| {
-                        crate::heal::pacing::MainlinePacer::new(
-                            provider.clone(),
-                            config.mainline_read_utilization_high_percent,
-                            config.mainline_write_utilization_high_percent,
-                            config.mainline_max_sleep,
-                        )
-                        .map(Arc::new)
-                    })
-                } else {
-                    None
-                };
+                let mainline_pacer = running_mainline_pacer(&request, &config, workload_provider);
                 let task = Arc::new(
                     HealTask::from_replacement_recovery_request(request, storage.clone(), replacement_resume_endpoint)
                         .with_mainline_pacer(mainline_pacer)
@@ -591,7 +603,7 @@ impl HealManager {
                                     return;
                                 }
                                 let admission_decision =
-                                    Self::admit_request_to_queue(&mut queue, retry_request.clone(), &retry_config, "retry");
+                                    Self::admit_request_to_queue(&mut queue, retry_request.clone(), &retry_config, "retry", true);
                                 let admission = admission_decision.result;
                                 let should_notify = matches!(admission, HealAdmissionResult::Accepted)
                                     && retry_config.event_driven_scheduler_enable;

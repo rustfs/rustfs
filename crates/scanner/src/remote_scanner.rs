@@ -22,6 +22,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio::time::{Instant, MissedTickBehavior};
+use tracing::warn;
 use uuid::Uuid;
 
 const NS_SCANNER_MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
@@ -34,6 +35,9 @@ const NS_SCANNER_MAX_RPC_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 const NS_SCANNER_DISCONNECT_GRACE_MAX: Duration = Duration::from_secs(2 * 60);
 const NS_SCANNER_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const NS_SCANNER_FENCE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Consecutive fence polls of a running walk that may fail to read the cycle state before the walk
+/// stops: a transient lock timeout on the state object is not a fence change.
+const NS_SCANNER_FENCE_READ_RETRIES: u32 = 12;
 const NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const NS_SCANNER_DISK_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 const NS_SCANNER_VALIDATED_CYCLE_TTL: Duration = Duration::from_secs(1);
@@ -181,7 +185,7 @@ pub(crate) async fn validate_remote_scanner_request_fence_with_store(
         Ok(buf) => crate::scanner::decode_persisted_scanner_cycle_fence(&buf)?,
         Err(EcstoreError::ConfigNotFound) => (0, 0),
         Err(err) => {
-            return Err(ScannerError::Other(format!("failed to read persisted scanner cycle state: {err}")));
+            return Err(ScannerError::CycleStateUnavailable(err.to_string()));
         }
     };
     if requested_cycle != persisted_cycle || requested_leader_epoch != persisted_leader_epoch {
@@ -230,9 +234,10 @@ async fn watch_remote_scanner_request_fence_with_cache(
         .ok_or_else(|| ScannerError::Other("remote namespace scanner fence poll deadline overflow".to_string()))?;
     let mut poll = tokio::time::interval_at(first_poll, poll_interval);
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut read_failures = 0;
     loop {
         poll.tick().await;
-        validate_remote_scanner_request_fence_cached(
+        match validate_remote_scanner_request_fence_cached(
             requested_cycle,
             requested_leader_epoch,
             store.clone(),
@@ -240,7 +245,23 @@ async fn watch_remote_scanner_request_fence_with_cache(
             refresh,
             cache_ttl,
         )
-        .await?;
+        .await
+        {
+            Ok(()) => read_failures = 0,
+            // Only an unreadable state is retried: a mismatching fence still stops the walk at once.
+            Err(ScannerError::CycleStateUnavailable(err)) if read_failures < NS_SCANNER_FENCE_READ_RETRIES => {
+                read_failures += 1;
+                warn!(
+                    target: "rustfs::scanner::remote",
+                    requested_cycle,
+                    requested_leader_epoch,
+                    read_failures,
+                    error = %err,
+                    "Remote scanner fence poll could not read the cycle state; retrying"
+                );
+            }
+            Err(err) => return Err(err),
+        }
     }
 }
 

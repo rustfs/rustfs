@@ -2193,9 +2193,9 @@ mod tests {
         };
         if let Some((expected_second, expected_replay)) = second_page {
             let first_local = token.local.clone().expect("first local page was fully consumed");
-            assert!(
-                first_local.starts_with(&format!("{}[rustfs_cache:", expected_first[1])),
-                "expected a real opaque cache cursor: {first_local}"
+            assert_eq!(
+                first_local, expected_first[1],
+                "the local cursor is the plain last key, with no cache tag"
             );
             input.continuation_token = Some(cursor);
             let second = execute_source_list(input.clone()).await.expect("second merged page").output;

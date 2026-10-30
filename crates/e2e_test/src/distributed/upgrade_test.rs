@@ -47,6 +47,9 @@ struct UpgradeSeed {
     history_bucket: String,
     history_key: &'static str,
     history_body: Vec<u8>,
+    multipart_upload: String,
+    multipart_etag: String,
+    multipart_body: Vec<u8>,
     versioned_bucket: String,
     versioned_key: &'static str,
     version1: String,
@@ -60,7 +63,7 @@ struct UpgradeSeed {
     iam_secret: &'static str,
 }
 
-fn source_binary() -> TestResult<PathBuf> {
+pub(super) fn source_binary() -> TestResult<PathBuf> {
     let path = std::env::var_os(SOURCE_BINARY_ENV).map(PathBuf::from).ok_or_else(|| {
         format!(
             "{SOURCE_BINARY_ENV} must point to the pinned previous release binary (the e2e-distributed workflow downloads it)"
@@ -241,6 +244,25 @@ async fn seed_history_and_iam(dist: &DistCluster) -> TestResult<UpgradeSeed> {
     let history_body = b"written by the previous 4-node release".to_vec();
     put_object(&root, &history_bucket, history_key, history_body.clone()).await?;
 
+    let multipart_body = vec![0x5a; 4096];
+    let multipart = root
+        .create_multipart_upload()
+        .bucket(&history_bucket)
+        .key("legacy-multipart.bin")
+        .send()
+        .await?;
+    let multipart_upload = multipart.upload_id().ok_or("legacy multipart upload ID missing")?.to_owned();
+    let part = root
+        .upload_part()
+        .bucket(&history_bucket)
+        .key("legacy-multipart.bin")
+        .upload_id(&multipart_upload)
+        .part_number(1)
+        .body(aws_sdk_s3::primitives::ByteStream::from(multipart_body.clone()))
+        .send()
+        .await?;
+    let multipart_etag = part.e_tag().ok_or("legacy multipart part ETag missing")?.to_owned();
+
     let versioned_key = "versioned-history.txt";
     let version1_body = b"version-one-before-upgrade".to_vec();
     let version1 = root
@@ -278,6 +300,9 @@ async fn seed_history_and_iam(dist: &DistCluster) -> TestResult<UpgradeSeed> {
         history_bucket,
         history_key,
         history_body,
+        multipart_upload,
+        multipart_etag,
+        multipart_body,
         versioned_bucket,
         versioned_key,
         version1,
@@ -304,6 +329,21 @@ async fn assert_history_and_iam(dist: &DistCluster, seed: &UpgradeSeed, context:
     )
     .await?;
     assert_object_bytes(&root_a, &seed.history_bucket, seed.history_key, &seed.history_body).await?;
+    // During mixed-version operation this is read-only; mutation resumes only
+    // after the whole fleet is upgraded.
+    for client in [&root_a, &root_b] {
+        let listed = client
+            .list_parts()
+            .bucket(&seed.history_bucket)
+            .key("legacy-multipart.bin")
+            .upload_id(&seed.multipart_upload)
+            .send()
+            .await?;
+        assert_eq!(listed.parts().len(), 1, "{context}: legacy part listing");
+        assert_eq!(listed.parts()[0].part_number(), Some(1));
+        assert_eq!(listed.parts()[0].size(), Some(4096));
+        assert_eq!(listed.parts()[0].e_tag(), Some(seed.multipart_etag.as_str()));
+    }
 
     let v1 = root_b
         .get_object()
@@ -387,17 +427,146 @@ async fn assert_history_and_iam(dist: &DistCluster, seed: &UpgradeSeed, context:
     Ok(())
 }
 
+async fn compare_degraded_legacy_list_parts(dist: &mut DistCluster, seed: &UpgradeSeed, previous: &Path) -> TestResult {
+    let decoded = String::from_utf8(base64_simd::URL_SAFE_NO_PAD.decode_to_vec(seed.multipart_upload.as_bytes())?)?;
+    let (_, upload_dir) = decoded.split_once('.').ok_or("legacy upload ID lacks deployment delimiter")?;
+    let hash = sha256_hex(format!("{}/legacy-multipart.bin", seed.history_bucket).as_bytes());
+    let root = format!("{hash}/{upload_dir}");
+    let mut held = Vec::new();
+    let mut original_files = Vec::new();
+    for (index, node) in dist.cluster.nodes.iter().enumerate() {
+        let path = Path::new(&node.data_dirs[0])
+            .join(crate::storage_api::multipart_fence_acceptance::RUSTFS_META_MULTIPART_BUCKET)
+            .join(&root);
+        let entries = std::fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+        let dirs = entries
+            .into_iter()
+            .map(|entry| entry.path())
+            .filter(|entry| entry.join("part.1").is_file() && entry.join("part.1.meta").is_file())
+            .collect::<Vec<_>>();
+        assert_eq!(dirs.len(), 1, "each configured disk must hold the original part before injection");
+        let source_root = dirs[0].parent().ok_or("part directory has no upload root")?;
+        for path in [
+            source_root.join("xl.meta"),
+            dirs[0].join("part.1"),
+            dirs[0].join("part.1.meta"),
+        ] {
+            original_files.push((path.clone(), std::fs::read(path)?));
+        }
+        if index < 3 {
+            held.push((dirs[0].clone(), dirs[0].with_extension("held-for-mixed-test")));
+        }
+    }
+    dist.cluster.stop_node(3)?;
+    for (original, temporary) in &held {
+        std::fs::rename(original, temporary)?;
+    }
+
+    let clients = dist.clients()?;
+    let current = tokio::time::timeout(
+        CREDENTIAL_TIMEOUT,
+        clients[0]
+            .list_parts()
+            .bucket(&seed.history_bucket)
+            .key("legacy-multipart.bin")
+            .upload_id(&seed.multipart_upload)
+            .send(),
+    )
+    .await?;
+    let legacy = tokio::time::timeout(
+        CREDENTIAL_TIMEOUT,
+        clients[1]
+            .list_parts()
+            .bucket(&seed.history_bucket)
+            .key("legacy-multipart.bin")
+            .upload_id(&seed.multipart_upload)
+            .send(),
+    )
+    .await?;
+    for (original, temporary) in &held {
+        std::fs::rename(temporary, original)?;
+    }
+    // Three online disks retain metadata quorum but have no part directory;
+    // the fourth disk is offline. A legacy empty response is not a proof that
+    // the unavailable participant has no part.
+    let legacy = legacy.expect("previous coordinator should expose its legacy empty-list behavior");
+    assert!(legacy.parts().is_empty());
+    let current = current.expect_err("current coordinator must not infer empty from missing directories and offline disks");
+    assert_eq!(current.raw_response().expect("current S3 response").status().as_u16(), 503);
+    assert_eq!(current.as_service_error().and_then(|error| error.meta().code()), Some("SlowDownRead"));
+    dist.cluster.start_node_from_binary(3, previous).await?;
+    wait_for_upgrade_write_readiness(&clients, &seed.history_bucket, "mixed-list-restored", CREDENTIAL_TIMEOUT).await?;
+    for (path, before) in original_files {
+        assert_eq!(
+            std::fs::read(&path)?,
+            before,
+            "the fault must preserve every original source file: {path:?}"
+        );
+    }
+    for client in [&clients[0], &clients[1]] {
+        let listed = client
+            .list_parts()
+            .bucket(&seed.history_bucket)
+            .key("legacy-multipart.bin")
+            .upload_id(&seed.multipart_upload)
+            .send()
+            .await?;
+        assert_eq!(listed.parts().len(), 1);
+        assert_eq!(listed.parts()[0].e_tag(), Some(seed.multipart_etag.as_str()));
+    }
+    eprintln!(
+        "MPU mixed degraded: one offline disk, three missing part directories; previous returned empty, current returned 503 SlowDownRead; original part restored on both"
+    );
+    Ok(())
+}
+
+async fn complete_legacy_multipart(dist: &DistCluster, seed: &UpgradeSeed) -> TestResult {
+    // Native legacy-source upgrade needs every original participant, not just
+    // the ordinary three-of-four write quorum proven by the earlier probes.
+    let clients = dist.clients()?;
+    crate::upgrade_compatibility_test::wait_for_drive_readmission(
+        &clients,
+        &seed.history_bucket,
+        "legacy-multipart-all-drives",
+        CREDENTIAL_TIMEOUT,
+    )
+    .await?;
+    let root = &clients[0];
+    root.complete_multipart_upload()
+        .bucket(&seed.history_bucket)
+        .key("legacy-multipart.bin")
+        .upload_id(&seed.multipart_upload)
+        .multipart_upload(
+            aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .parts(
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(&seed.multipart_etag)
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await?;
+    for client in &clients {
+        assert_object_bytes(client, &seed.history_bucket, "legacy-multipart.bin", &seed.multipart_body).await?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn four_node_direct_upgrade_preserves_history_and_iam_credentials() -> TestResult {
     init_logging();
     let previous = source_binary()?;
     let mut dist = DistCluster::new_stopped(DistLayout::FourNodeFourDisk).await?;
+    dist.cluster.set_env("RUSTFS_STORAGE_CLASS_RRS", "EC:0");
     capture_upgrade_logs(&mut dist, "direct-upgrade")?;
     dist.start_from_binary(&previous).await?;
 
     let seed = seed_history_and_iam(&dist).await?;
     dist.restart_with_current_binary().await?;
     assert_history_and_iam(&dist, &seed, "direct").await?;
+    complete_legacy_multipart(&dist, &seed).await?;
     Ok(())
 }
 
@@ -419,6 +588,7 @@ async fn four_node_rolling_upgrade_preserves_history_and_iam_credentials() -> Te
     init_logging();
     let previous = source_binary()?;
     let mut dist = DistCluster::new_stopped(DistLayout::FourNodeFourDisk).await?;
+    dist.cluster.set_env("RUSTFS_STORAGE_CLASS_RRS", "EC:0");
     capture_upgrade_logs(&mut dist, "rolling-upgrade")?;
     dist.start_from_binary(&previous).await?;
 
@@ -426,6 +596,7 @@ async fn four_node_rolling_upgrade_preserves_history_and_iam_credentials() -> Te
 
     replace_node_and_wait_for_write_readiness(&mut dist, &seed, 0).await?;
     assert_history_and_iam(&dist, &seed, "one-current-node").await?;
+    compare_degraded_legacy_list_parts(&mut dist, &seed, &previous).await?;
 
     for node_idx in [1, 2] {
         replace_node_and_wait_for_write_readiness(&mut dist, &seed, node_idx).await?;
@@ -434,5 +605,6 @@ async fn four_node_rolling_upgrade_preserves_history_and_iam_credentials() -> Te
 
     replace_node_and_wait_for_write_readiness(&mut dist, &seed, 3).await?;
     assert_history_and_iam(&dist, &seed, "homogeneous-current").await?;
+    complete_legacy_multipart(&dist, &seed).await?;
     Ok(())
 }

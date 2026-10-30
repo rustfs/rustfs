@@ -19,6 +19,7 @@ use super::heal_info::{
 use super::*;
 
 mod startup_gate;
+mod startup_observation;
 use crate::EcstoreResult;
 use crate::storage_api::owner::{
     WriteCommitGuard, WriteCompletion, ecstore_hold_namespace_commit, ecstore_namespace_commits_pending,
@@ -5439,8 +5440,8 @@ async fn scanner_legacy_usage_backup_survives_fencing_and_restart_after_real_met
         .await
         .expect_err("truncated primary must fail in the real object reader");
     assert!(
-        error.to_string().contains("InlineData value out of range"),
-        "unexpected truncated-primary error: {error}"
+        matches!(error, EcstoreError::FileCorrupt),
+        "unexpected truncated-primary error: {error:?}"
     );
     assert_eq!(
         read_config_with_revision(store.clone(), &backup_path)

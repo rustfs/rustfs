@@ -33,7 +33,7 @@ async fn abandoned_listing_drains_candidate_buffered_before_finished() {
             .expect("listing fixture disk"),
         );
     }
-    for cache in [&mut scanner.old_cache, &mut scanner.new_cache, &mut scanner.update_cache] {
+    for cache in [&mut scanner.old_cache, &mut scanner.new_cache] {
         cache.info.name = bucket.to_owned();
     }
     scanner.old_cache.replace(

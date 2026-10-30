@@ -474,6 +474,9 @@ pub struct BucketTargetUsageInfo {
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BucketUsageInfo {
     pub size: u64,
+    /// Bucket identity certified by every set contributing to this snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_incarnation: Option<String>,
     // Following five fields suffixed with V1 are here for backward compatibility
     // Total Size for objects that have not yet been replicated
     pub replication_pending_size_v1: u64,
@@ -2325,6 +2328,9 @@ impl BucketUsageInfo {
     /// Add size summary to this bucket usage
     /// Merge another BucketUsageInfo into this one
     pub fn merge(&mut self, other: &BucketUsageInfo) {
+        if self.bucket_incarnation != other.bucket_incarnation {
+            self.bucket_incarnation = None;
+        }
         self.size += other.size;
         self.objects_count += other.objects_count;
         self.versions_count += other.versions_count;
@@ -3310,6 +3316,31 @@ mod tests {
         assert_eq!(usage1.size, 300);
         assert_eq!(usage1.objects_count, 30);
         assert_eq!(usage1.versions_count, 15);
+    }
+
+    #[test]
+    fn bucket_usage_merge_discards_incompatible_incarnation_proofs() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut same = BucketUsageInfo {
+            bucket_incarnation: Some(id.into()),
+            ..Default::default()
+        };
+        same.merge(&BucketUsageInfo {
+            bucket_incarnation: Some(id.into()),
+            ..Default::default()
+        });
+        assert_eq!(same.bucket_incarnation.as_deref(), Some(id));
+        same.merge(&BucketUsageInfo::default());
+        assert!(same.bucket_incarnation.is_none());
+        let mut different = BucketUsageInfo {
+            bucket_incarnation: Some(id.into()),
+            ..Default::default()
+        };
+        different.merge(&BucketUsageInfo {
+            bucket_incarnation: Some("00000000-0000-4000-8000-000000000002".into()),
+            ..Default::default()
+        });
+        assert!(different.bucket_incarnation.is_none());
     }
 
     #[test]

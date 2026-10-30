@@ -19,7 +19,9 @@ use crate::disk::error_reduce::{count_errs, reduce_write_quorum_errs};
 use crate::disk::{self, DiskAPI};
 use crate::error::{Error, Result};
 use crate::runtime::instance::InstanceContext;
-use crate::runtime::sources::{quarantine_local_disks, reconcile_local_disk_ids};
+use crate::runtime::sources::{
+    quarantine_local_disks, quarantine_local_disks_preserving_bootstrap_routes, reconcile_local_disk_ids,
+};
 use crate::{
     disk::{
         DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET,
@@ -96,7 +98,7 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
     set_drive_count: usize,
     deployment_id: Option<Uuid>,
 ) -> Result<LoadedFormat> {
-    let (formats, errs) = load_format_erasure_all(disks, false).await;
+    let (formats, errs, unformatted_bootstrap_routes) = load_format_erasure_all_observing_bootstrap_routes(disks, false).await;
 
     check_disk_fatal_errs(&errs)?;
 
@@ -137,7 +139,15 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
     if matches!(format_quorum, Some(Err(Error::ErasureReadQuorum)))
         && let Some((format, members)) = select_existing_format_read_quorum(&formats, &errs, set_drive_count)
     {
-        retain_format_quorum_members(instance_ctx, disks, &format, &members, set_drive_count).await?;
+        retain_format_quorum_members(
+            instance_ctx,
+            disks,
+            &format,
+            &members,
+            Some(&unformatted_bootstrap_routes),
+            set_drive_count,
+        )
+        .await?;
         // Loading an existing format grants no authority to initialize pool
         // metadata or migrate formats. The persisted storage classes and each
         // object's EC metadata still determine service and operation quorums.
@@ -158,7 +168,7 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
         match try_migrate_format(disks, &formats, set_count, set_drive_count).await {
             Ok(LegacyFormatOutcome::Migrated { format, quorum_members }) => {
                 info!("Migrated format from MinIO config");
-                retain_format_quorum_members(instance_ctx, disks, &format, &quorum_members, set_drive_count).await?;
+                retain_format_quorum_members(instance_ctx, disks, &format, &quorum_members, None, set_drive_count).await?;
                 return Ok(LoadedFormat {
                     format: *format,
                     pool_meta_bootstrap_authority: PoolMetaBootstrapAuthority::LegacyAdoption,
@@ -206,7 +216,15 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
         None => select_format_erasure_in_quorum(&formats, 0)?,
     };
     check_format_erasure_value_for_topology(&fm, formats.len(), set_drive_count)?;
-    retain_format_quorum_members(instance_ctx, disks, &fm, &quorum_members, set_drive_count).await?;
+    retain_format_quorum_members(
+        instance_ctx,
+        disks,
+        &fm,
+        &quorum_members,
+        Some(&unformatted_bootstrap_routes),
+        set_drive_count,
+    )
+    .await?;
 
     Ok(LoadedFormat {
         format: fm,
@@ -238,9 +256,13 @@ async fn retain_format_quorum_members(
     disks: &mut [Option<DiskStore>],
     format: &FormatV3,
     quorum_members: &[bool],
+    unformatted_bootstrap_routes: Option<&[bool]>,
     set_drive_count: usize,
 ) -> Result<()> {
-    if set_drive_count == 0 || quorum_members.len() != disks.len() {
+    if set_drive_count == 0
+        || quorum_members.len() != disks.len()
+        || unformatted_bootstrap_routes.is_some_and(|routes| routes.len() != disks.len())
+    {
         return Err(Error::CorruptedFormat);
     }
 
@@ -279,11 +301,18 @@ async fn retain_format_quorum_members(
     let mut local_pool_endpoints = Vec::new();
     let mut selected_local_disk_ids = Vec::new();
     let mut quarantined_endpoints = Vec::new();
+    let mut bootstrap_routes = Vec::new();
     for (index, ((disk, endpoint), belongs_to_quorum)) in disks.iter().zip(&endpoints).zip(quorum_members).enumerate() {
         if let Some(endpoint) = endpoint.as_ref().filter(|endpoint| endpoint.is_local) {
             local_pool_endpoints.push(endpoint.to_string());
             if !belongs_to_quorum {
                 quarantined_endpoints.push(endpoint.clone());
+                // An elected formatter may still be publishing this disk.
+                // Preserve only its explicitly unformatted bootstrap path;
+                // every service and voting slot remains quarantined.
+                if unformatted_bootstrap_routes.is_some_and(|routes| routes[index]) {
+                    bootstrap_routes.push(endpoint.clone());
+                }
             }
         }
         if !belongs_to_quorum {
@@ -302,7 +331,11 @@ async fn retain_format_quorum_members(
             selected_local_disk_ids.push((disk_id, disk.endpoint().to_string()));
         }
     }
-    quarantine_local_disks(instance_ctx, &quarantined_endpoints).await?;
+    if bootstrap_routes.is_empty() {
+        quarantine_local_disks(instance_ctx, &quarantined_endpoints).await?;
+    } else {
+        quarantine_local_disks_preserving_bootstrap_routes(instance_ctx, &quarantined_endpoints, &bootstrap_routes).await?;
+    }
 
     for (disk, disk_id) in disks.iter().zip(member_disk_ids) {
         if let Some(disk) = disk {
@@ -369,7 +402,7 @@ async fn init_format_erasure(
     write_format_file_all(disks, &fms).await?;
     let format = get_format_erasure_in_quorum(&fms, 0)?;
     let quorum_members = vec![true; disks.len()];
-    retain_format_quorum_members(instance_ctx, disks, &format, &quorum_members, set_drive_count).await?;
+    retain_format_quorum_members(instance_ctx, disks, &format, &quorum_members, None, set_drive_count).await?;
     Ok(format)
 }
 
@@ -406,38 +439,44 @@ async fn try_migrate_format(
     let mut read_error: Option<Error> = None;
     let mut legacy_formats = vec![None; disks.len()];
 
-    let reads = stream::iter(disks.iter().enumerate().map(|(index, disk)| async move {
-        let Some(disk) = disk else {
-            return (index, None);
-        };
-        let reader = match disk.read_file(MIGRATING_META_BUCKET, FORMAT_CONFIG_FILE).await {
-            Ok(reader) => reader,
-            Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => return (index, None),
-            Err(err) => return (index, Some(Err(err))),
-        };
-        let data = match read_legacy_format_bytes(reader, legacy_format_max_bytes).await {
-            Ok(data) => data,
-            Err(err) => return (index, Some(Err(err))),
-        };
-        if data.is_empty() {
-            return (index, Some(Ok(None)));
-        }
+    let reads = stream::iter(
+        disks
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, disk): (usize, Option<DiskStore>)| async move {
+                let Some(disk) = disk else {
+                    return (index, None);
+                };
+                let reader = match disk.read_file(MIGRATING_META_BUCKET, FORMAT_CONFIG_FILE).await {
+                    Ok(reader) => reader,
+                    Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => return (index, None),
+                    Err(err) => return (index, Some(Err(err))),
+                };
+                let data = match read_legacy_format_bytes(reader, legacy_format_max_bytes).await {
+                    Ok(data) => data,
+                    Err(err) => return (index, Some(Err(err))),
+                };
+                if data.is_empty() {
+                    return (index, Some(Ok(None)));
+                }
 
-        match FormatV3::try_from(data.as_slice()) {
-            Ok(format) => (index, Some(Ok(Some(format)))),
-            Err(err) => {
-                warn!(
-                    event = "legacy_format_decode_failed",
-                    component = "ecstore",
-                    subsystem = "store_init",
-                    disk_index = index,
-                    error = %err,
-                    "failed to decode legacy storage format"
-                );
-                (index, Some(Ok(None)))
-            }
-        }
-    }))
+                match FormatV3::try_from(data.as_slice()) {
+                    Ok(format) => (index, Some(Ok(Some(format)))),
+                    Err(err) => {
+                        warn!(
+                            event = "legacy_format_decode_failed",
+                            component = "ecstore",
+                            subsystem = "store_init",
+                            disk_index = index,
+                            error = %err,
+                            "failed to decode legacy storage format"
+                        );
+                        (index, Some(Ok(None)))
+                    }
+                }
+            }),
+    )
     .buffer_unordered(LEGACY_FORMAT_READ_CONCURRENCY);
     tokio::pin!(reads);
     while let Some((index, read)) = reads.next().await {
@@ -795,22 +834,34 @@ fn validate_format_erasure_layout(format: &FormatV3) -> Result<usize> {
 
 // load_format_erasure_all reads all format.json files
 pub async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) -> (Vec<Option<FormatV3>>, Vec<Option<DiskError>>) {
+    let (formats, errors, _) = load_format_erasure_all_observing_bootstrap_routes(disks, heal).await;
+    (formats, errors)
+}
+
+async fn load_format_erasure_all_observing_bootstrap_routes(
+    disks: &[Option<DiskStore>],
+    heal: bool,
+) -> (Vec<Option<FormatV3>>, Vec<Option<DiskError>>, Vec<bool>) {
     let mut futures = Vec::with_capacity(disks.len());
     let mut datas = Vec::with_capacity(disks.len());
     let mut errors = Vec::with_capacity(disks.len());
 
     for disk in disks.iter() {
         futures.push(async move {
-            if let Some(disk) = disk {
-                load_format_erasure(disk, heal).await
+            let mut unformatted_bootstrap_route = false;
+            let result = if let Some(disk) = disk {
+                load_format_erasure_observing_bootstrap_route(disk, heal, &mut unformatted_bootstrap_route).await
             } else {
                 Err(DiskError::DiskNotFound)
-            }
+            };
+            (result, unformatted_bootstrap_route)
         });
     }
 
     let results = join_all(futures).await;
-    for result in results {
+    let mut unformatted_bootstrap_routes = Vec::with_capacity(disks.len());
+    for (result, unformatted_bootstrap_route) in results {
+        unformatted_bootstrap_routes.push(unformatted_bootstrap_route);
         match result {
             Ok(s) => {
                 datas.push(Some(s));
@@ -841,13 +892,28 @@ pub async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) ->
         );
     }
 
-    (datas, errors)
+    (datas, errors, unformatted_bootstrap_routes)
 }
 
 pub async fn load_format_erasure(disk: &DiskStore, heal: bool) -> disk::error::Result<FormatV3> {
+    let mut unformatted_bootstrap_route = false;
+    load_format_erasure_observing_bootstrap_route(disk, heal, &mut unformatted_bootstrap_route).await
+}
+
+async fn load_format_erasure_observing_bootstrap_route(
+    disk: &DiskStore,
+    heal: bool,
+    unformatted_bootstrap_route: &mut bool,
+) -> disk::error::Result<FormatV3> {
     let data = disk
         .read_all(RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE)
         .await
+        .inspect_err(|error| {
+            // Do not use the normalized error below: DiskNotFound can mean a
+            // stale UUID or unavailable routing, not an absent local format.
+            *unformatted_bootstrap_route =
+                disk.is_local() && matches!(error, DiskError::FileNotFound | DiskError::UnformattedDisk);
+        })
         .map_err(|e| match e {
             DiskError::FileNotFound => DiskError::UnformattedDisk,
             DiskError::DiskNotFound => DiskError::UnformattedDisk,
@@ -1798,6 +1864,226 @@ mod tests {
         );
         assert!(disks[0].is_some() && disks[1].is_some());
         assert!(disks[2].is_none(), "the malformed outlier must be isolated");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn format_observer_preserves_bootstrap_routes_until_the_real_creator_finishes() {
+        use crate::disk::os::prepared_publication_test_hooks::{Stage, install_at};
+        use std::time::Duration;
+
+        let (_root, disks) = local_disks_with_set_width(6, 3).await;
+        let context = Arc::new(InstanceContext::new());
+        let registered = disks.iter().flatten().cloned().collect::<Vec<_>>();
+        record_local_disks(&context, registered).await;
+        *context.local_disk_set_drives().write().await = vec![disks.chunks(3).map(|set| set.to_vec()).collect()];
+        let mut hooks = Vec::new();
+        let mut entered = Vec::new();
+        let mut releases = Vec::new();
+        for slot in [2, 5] {
+            let destination = disks[slot]
+                .as_ref()
+                .expect("paused format disk exists")
+                .get_object_path_for_io_if_local(RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE)
+                .expect("format publication uses a real local backend")
+                .expect("format publication path");
+            let (arrived, arrival) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            hooks.push(install_at(Stage::Rename, &destination, move || {
+                let _ = arrived.send(());
+                let _ = released.recv();
+            }));
+            entered.push(arrival);
+            releases.push(release);
+        }
+        let creator_context = context.clone();
+        let mut creator_disks = disks.clone();
+        let creator = tokio::spawn(async move {
+            let result =
+                connect_load_init_formats_with_instance_ctx(&creator_context, true, &mut creator_disks, 2, 3, None).await;
+            (result, creator_disks)
+        });
+        for arrival in entered {
+            tokio::time::timeout(Duration::from_secs(5), arrival)
+                .await
+                .expect("creator reaches each actual paused format rename")
+                .expect("format rename reports its physical entry");
+        }
+        let partial = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let bytes = format_bytes(&disks).await;
+                if bytes
+                    .iter()
+                    .enumerate()
+                    .all(|(slot, bytes)| bytes.is_some() != matches!(slot, 2 | 5))
+                {
+                    break bytes;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("other physical format publications reach two real copies per three-disk set");
+        let mut observer_disks = disks.clone();
+        let observer = connect_load_init_formats_with_instance_ctx(&context, false, &mut observer_disks, 2, 3, None)
+            .await
+            .expect("the observer loads each set at read quorum without waiting for its third format");
+        assert_eq!(observer.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::None);
+        assert!(observer_disks.chunks(3).all(|set| set.iter().flatten().count() == 2));
+        assert!(
+            observer_disks[2].is_none() && observer_disks[5].is_none(),
+            "unformatted routes are never service votes"
+        );
+        {
+            let slots = context.local_disk_set_drives();
+            let slots = slots.read().await;
+            assert!(
+                slots[0][0][2].is_none() && slots[0][1][2].is_none(),
+                "runtime voting slots must also exclude both unformatted paths"
+            );
+        }
+        assert_eq!(format_bytes(&disks).await, partial, "the observer cannot publish or rewrite formats");
+        {
+            let routes = context.local_disk_map();
+            let routes = routes.read().await;
+            for slot in [2, 5] {
+                let endpoint = disks[slot]
+                    .as_ref()
+                    .expect("original participant exists")
+                    .endpoint()
+                    .to_string();
+                assert!(
+                    routes.get(&endpoint).is_some_and(Option::is_some),
+                    "the actual bootstrap RPC path must survive while its format publisher is in flight"
+                );
+            }
+        }
+        assert!(
+            !creator.is_finished(),
+            "the elected formatter still waits for both actual ALLN publications"
+        );
+        for release in releases {
+            release.send(()).expect("release the actual format rename");
+        }
+        let (created, creator_disks) = tokio::time::timeout(Duration::from_secs(5), creator)
+            .await
+            .expect("the real formatter finishes after its physical publications are released")
+            .expect("format creator joins");
+        let created = created.expect("the original all-unformatted creator commits its complete format");
+        assert_eq!(created.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::Fresh);
+        let (formats, errors) = load_format_erasure_all(&creator_disks, false).await;
+        assert!(errors.iter().all(Option::is_none), "all actual formats are readable: {errors:?}");
+        assert!(formats_match_reference_slots(&formats, &created.format, 0));
+        assert!(
+            observer_disks[2].is_none() && observer_disks[5].is_none(),
+            "bootstrap routing never promotes an observer's votes"
+        );
+        drop(hooks);
+    }
+
+    #[tokio::test]
+    async fn existing_format_keeps_only_explicitly_unformatted_local_bootstrap_routes() {
+        for invalid_format_is_directory in [false, true] {
+            let (_root, mut disks) = local_disks(8).await;
+            let context = Arc::new(InstanceContext::new());
+            let canonical = FormatV3::new(1, 8);
+            for (slot, disk) in disks.iter().enumerate().take(5) {
+                let mut format = canonical.clone();
+                format.erasure.this = canonical.erasure.sets[0][slot];
+                save_format_file(disk, &Some(format))
+                    .await
+                    .expect("actual canonical majority format");
+            }
+            let mut foreign = FormatV3::new(1, 8);
+            foreign.erasure.this = foreign.erasure.sets[0][6];
+            let foreign_id = foreign.erasure.this;
+            save_format_file(&disks[6], &Some(foreign))
+                .await
+                .expect("actual foreign format");
+            disks[6]
+                .as_ref()
+                .expect("foreign disk exists")
+                .set_disk_id_state(Some(Uuid::new_v4()))
+                .await
+                .expect("model a stale wrapper UUID without changing the foreign format");
+            let invalid_path = disks[7]
+                .as_ref()
+                .expect("invalid format participant exists")
+                .path()
+                .join(RUSTFS_META_BUCKET)
+                .join(FORMAT_CONFIG_FILE);
+            tokio::fs::create_dir_all(invalid_path.parent().expect("format parent"))
+                .await
+                .expect("invalid format's real metadata directory");
+            if invalid_format_is_directory {
+                tokio::fs::create_dir(&invalid_path)
+                    .await
+                    .expect("actual format read I/O failure");
+            } else {
+                tokio::fs::write(&invalid_path, b"invalid format JSON")
+                    .await
+                    .expect("actual corrupt format bytes");
+            }
+            let physical_disks = disks.clone();
+            let before = format_bytes(&physical_disks[..7]).await;
+            record_local_disks(&context, disks.iter().flatten().cloned().collect()).await;
+            *context.local_disk_set_drives().write().await = vec![vec![disks.clone()]];
+            let unformatted_endpoint = disks[5]
+                .as_ref()
+                .expect("unformatted participant exists")
+                .endpoint()
+                .to_string();
+            let foreign_endpoint = disks[6].as_ref().expect("foreign participant exists").endpoint().to_string();
+            let invalid_endpoint = disks[7].as_ref().expect("invalid participant exists").endpoint().to_string();
+            context
+                .local_disk_id_map()
+                .write()
+                .await
+                .insert(foreign_id, foreign_endpoint.clone());
+            let (_, errors, bootstrap_routes) = load_format_erasure_all_observing_bootstrap_routes(&disks, false).await;
+            assert!(matches!(errors[5], Some(DiskError::UnformattedDisk)));
+            assert!(
+                matches!(errors[6], Some(DiskError::UnformattedDisk)),
+                "the public error still normalizes stale DiskNotFound"
+            );
+            assert_eq!(bootstrap_routes, [false, false, false, false, false, true, false, false]);
+            let loaded = connect_load_init_formats_with_instance_ctx(&context, false, &mut disks, 1, 8, None)
+                .await
+                .expect("a real formatted majority remains available");
+            assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::None);
+            assert_eq!(disks.iter().flatten().count(), 5);
+            assert!(disks[5..].iter().all(Option::is_none));
+            assert!(
+                context.local_disk_set_drives().read().await[0][0][5..]
+                    .iter()
+                    .all(Option::is_none)
+            );
+            let routes = context.local_disk_map();
+            let routes = routes.read().await;
+            assert!(routes.get(&unformatted_endpoint).is_some_and(Option::is_some));
+            assert!(routes.get(&foreign_endpoint).is_some_and(Option::is_none));
+            assert!(routes.get(&invalid_endpoint).is_some_and(Option::is_none));
+            drop(routes);
+            assert!(!context.local_disk_id_map().read().await.contains_key(&foreign_id));
+            assert_eq!(
+                format_bytes(&physical_disks[..7]).await,
+                before,
+                "route retention cannot rewrite any actual format, including a foreign stale-ID disk"
+            );
+            if invalid_format_is_directory {
+                assert!(
+                    tokio::fs::metadata(&invalid_path)
+                        .await
+                        .expect("invalid format path remains")
+                        .is_dir()
+                );
+            } else {
+                assert_eq!(
+                    tokio::fs::read(&invalid_path).await.expect("corrupt format remains"),
+                    b"invalid format JSON"
+                );
+            }
+        }
     }
 
     #[tokio::test]

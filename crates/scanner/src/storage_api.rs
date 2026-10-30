@@ -43,6 +43,8 @@ pub(crate) use rustfs_ecstore::api::data_usage::{NativeScannerPauseBacklogWriteF
 
 pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys as EcstoreBucketTargetSys;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc as EcstoreLcEventSrc;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::ExpiryState as EcstoreExpiryState;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::{
     apply_expiry_rule as ecstore_apply_expiry_rule, apply_transition_rule as ecstore_apply_transition_rule,
     lifecycle_version_delete_target as ecstore_lifecycle_version_delete_target,
@@ -102,6 +104,10 @@ pub(crate) use rustfs_ecstore::api::disk::{
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::disk::{
     DiskOption as EcstoreDiskOption, DiskStore as EcstoreDiskStore, new_disk as ecstore_new_disk,
+};
+#[cfg(all(test, unix))]
+pub(crate) use rustfs_ecstore::api::disk::{
+    LocalPublicationPause as EcstoreLocalPublicationPause, LocalPublicationStage as EcstoreLocalPublicationStage,
 };
 pub(crate) use rustfs_ecstore::api::error::{
     Error as EcstoreErrorType, Result as EcstoreResultType, StorageError as EcstoreStorageError,
@@ -166,12 +172,19 @@ pub(crate) type EcstoreHealResultItem = <EcstoreStore as storage_contracts::Heal
 
 pub(crate) mod owner {
     #[cfg(test)]
+    pub(crate) use super::EcstoreExpiryState;
+    #[cfg(test)]
     pub(crate) use super::ecstore_set_object_store_resolver;
     #[cfg(test)]
     pub(crate) use super::ecstore_spawn_blocking_with_resource_ownership;
     pub(crate) use super::ecstore_with_background_resource_set;
     #[cfg(test)]
     pub(crate) use super::storage_contracts::DiskSetSelector;
+    #[cfg(all(test, unix))]
+    pub(crate) use super::{
+        EcstoreLocalPublicationPause, EcstoreLocalPublicationStage, ecstore_with_background_disk_io,
+        ecstore_with_background_resource_unit,
+    };
     pub(crate) use super::{
         MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
         ScannerPauseBacklogRetirementReplica, register_scanner_pause_backlog_retirement_planner,

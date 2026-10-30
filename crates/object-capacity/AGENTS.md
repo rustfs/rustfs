@@ -15,8 +15,7 @@ Keep changes narrow and source-driven.
 
 ## Source of Truth
 
-Start with the file that owns the changed behavior; follow callers and shared
-types only as needed:
+Start with the file that owns the changed behavior; follow callers and shared types only as needed:
 
 - Scan/sampling: `src/scan.rs`.
 - Refresh and per-disk cache state: `src/capacity_manager.rs`.
@@ -65,7 +64,7 @@ For code changes, prefer focused verification close to the changed behavior:
 Useful commands:
 
 ```bash
-cargo test -p rustfs-object-capacity
+cargo nextest run -p rustfs-object-capacity --no-tests fail
 cargo test -p rustfs-object-capacity --doc
 cargo bench -p rustfs-object-capacity --bench capacity_scan
 ```

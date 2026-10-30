@@ -15,6 +15,7 @@
 pub mod init_time;
 pub mod last_minute;
 pub mod metrics;
+pub mod startup;
 pub mod usage_candidate;
 
 pub use init_time::{GLOBAL_INIT_TIME, get_global_init_time, set_global_init_time_now};

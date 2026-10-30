@@ -707,13 +707,6 @@ struct ShardedReservationData {
 }
 
 impl ReservationLedgerData {
-    fn store(&self) -> &Arc<ECStore> {
-        match self {
-            Self::Single(data) => &data.store,
-            Self::Sharded(data) => &data.store,
-        }
-    }
-
     fn bucket(&self) -> &str {
         match self {
             Self::Single(data) => &data.bucket,
@@ -765,7 +758,7 @@ impl QuotaReservation {
         let Some(ledger) = self.ledger.as_ref() else {
             return;
         };
-        crate::store::list_objects::observe_list_objects_mutation(ledger.store(), ledger.bucket()).await;
+        crate::store::list_objects::observe_scanner_namespace_mutations(ledger.bucket(), 1);
         match settle(ledger, true).await {
             Ok(()) => self.ledger = None,
             Err(err) => log_deferred_settlement(ledger, "commit_deferred", &err),
@@ -1290,7 +1283,7 @@ async fn reconcile_exact(store: &Arc<ECStore>, bucket: &str, ledger: &mut QuotaL
 }
 
 async fn exact_bucket_usage(store: &Arc<ECStore>, bucket: &str) -> Result<u64> {
-    crate::store::list_objects::observe_list_objects_mutation(store, bucket).await;
+    crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
     Ok(compute_bucket_usage(Arc::clone(store), bucket).await?.size)
 }
 

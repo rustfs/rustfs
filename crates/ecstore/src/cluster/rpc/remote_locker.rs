@@ -41,6 +41,10 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Response};
 use tracing::{debug, info, warn};
 
+const EVENT_NAMESPACE_LOCK_RELEASE: &str = "namespace_lock_release";
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_REMOTE_LOCK: &str = "remote_lock";
+
 fn attach_lock_mutation_body_digest<T: rustfs_protos::CanonicalMutationBody>(request: &mut Request<T>) -> std::io::Result<()> {
     set_tonic_rolling_mutation_body_digest(request)
 }
@@ -232,6 +236,20 @@ pub struct RemoteClient {
 
 impl RemoteClient {
     const ONLINE_CHECK_RESOURCE: &'static str = "health-lock-online";
+
+    fn record_release_ack(&self, lock_id: &LockId) {
+        tracing::trace!(
+            target: "rustfs_ecstore::object_lock_diag",
+            event = EVENT_NAMESPACE_LOCK_RELEASE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REMOTE_LOCK,
+            state = "acknowledged",
+            peer_kind = "remote",
+            lock_id = %lock_id,
+            peer = %self.addr,
+            "Remote namespace lock release acknowledged"
+        );
+    }
 
     pub fn new(endpoint: String) -> Self {
         Self { addr: endpoint }
@@ -1056,7 +1074,6 @@ impl RemoteClient {
 #[async_trait]
 impl LockClient for RemoteClient {
     async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse> {
-        info!("remote acquire_exclusive for {}", request.resource);
         let admission = match self.admit_lock_request("lock") {
             Some(admission) => admission,
             None => return Ok(Self::rpc_backoff_failure_response(request)),
@@ -1204,8 +1221,6 @@ impl LockClient for RemoteClient {
     }
 
     async fn release(&self, lock_id: &LockId) -> Result<bool> {
-        info!("remote release for {}", lock_id);
-
         let unlock_request = Self::create_unlock_request(lock_id);
         let request_string = serde_json::to_string(&unlock_request)
             .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?;
@@ -1225,6 +1240,9 @@ impl LockClient for RemoteClient {
             .into_inner();
         if let Some(error_info) = resp.error_info {
             return Err(LockError::internal(error_info));
+        }
+        if resp.success {
+            self.record_release_ack(lock_id);
         }
         Ok(resp.success)
     }
@@ -1261,7 +1279,13 @@ impl LockClient for RemoteClient {
         Ok(lock_ids
             .iter()
             .enumerate()
-            .map(|(idx, _)| resp.results.get(idx).map(|result| result.success).unwrap_or(false))
+            .map(|(idx, lock_id)| {
+                let result = resp.results.get(idx);
+                if result.is_some_and(|result| result.success && result.error_info.is_none()) {
+                    self.record_release_ack(lock_id);
+                }
+                result.map(|result| result.success).unwrap_or(false)
+            })
             .collect())
     }
 

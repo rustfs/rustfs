@@ -25,6 +25,15 @@ const TLS_CERTIFICATE_PUBLISH: AdminActionRef = AdminActionRef::new("TLSCertific
 const TLS_CERTIFICATE_STATUS: AdminActionRef = AdminActionRef::new("TLSCertificateStatusAdminAction");
 const CONSOLE_LOG: AdminActionRef = AdminActionRef::new("ConsoleLogAdminAction");
 const COMMIT_TABLE: AdminActionRef = AdminActionRef::new("CommitTableAction");
+const ISSUE_PLUGIN_ATTEMPT: AdminActionRef = AdminActionRef::new("IssuePluginAttemptAction");
+const SUBMIT_PLUGIN_JOB: AdminActionRef = AdminActionRef::new("SubmitPluginJobAction");
+const GET_PLUGIN_RUN: AdminActionRef = AdminActionRef::new("GetPluginRunAction");
+const CANCEL_PLUGIN_RUN: AdminActionRef = AdminActionRef::new("CancelPluginRunAction");
+const LIST_PLUGIN_RUNS: AdminActionRef = AdminActionRef::new("ListPluginRunsAction");
+const REPLAY_PLUGIN_RUN: AdminActionRef = AdminActionRef::new("ReplayPluginRunAction");
+const GET_PLUGIN_DELEGATION: AdminActionRef = AdminActionRef::new("GetPluginDelegationAction");
+const CREATE_PLUGIN_DELEGATION: AdminActionRef = AdminActionRef::new("CreatePluginDelegationAction");
+const REVOKE_PLUGIN_DELEGATION: AdminActionRef = AdminActionRef::new("RevokePluginDelegationAction");
 const CREATE_POLICY: AdminActionRef = AdminActionRef::new("CreatePolicyAdminAction");
 const CREATE_USER: AdminActionRef = AdminActionRef::new("CreateUserAdminAction");
 const CREATE_SERVICE_ACCOUNT: AdminActionRef = AdminActionRef::new("CreateServiceAccountAdminAction");
@@ -378,6 +387,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Get, "/rustfs/admin/v3/tier", LIST_TIER, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/tier-stats", LIST_TIER, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/tier/{tier}", LIST_TIER, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/tier/{tier}/deletion-check",
+        LIST_TIER,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/tier/{tier}/cleanup-retry",
+        SET_TIER,
+        RouteRiskLevel::High,
+    ),
     admin(HttpMethod::Delete, "/rustfs/admin/v3/tier/{tiername}", SET_TIER, RouteRiskLevel::High),
     admin(HttpMethod::Put, "/rustfs/admin/v3/tier", SET_TIER, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/tier/{tiername}", SET_TIER, RouteRiskLevel::High),
@@ -655,6 +676,66 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/rustfs/admin/v4/runtime/capabilities",
         SERVER_INFO,
         RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/issue-attempt",
+        ISSUE_PLUGIN_ATTEMPT,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/submit",
+        SUBMIT_PLUGIN_JOB,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/runs/query",
+        GET_PLUGIN_RUN,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/runs/history",
+        LIST_PLUGIN_RUNS,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/runs/cancel",
+        CANCEL_PLUGIN_RUN,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/runs/page",
+        LIST_PLUGIN_RUNS,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/runs/replay",
+        REPLAY_PLUGIN_RUN,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/plugin-delegations/{id}",
+        GET_PLUGIN_DELEGATION,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations",
+        CREATE_PLUGIN_DELEGATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/revoke",
+        REVOKE_PLUGIN_DELEGATION,
+        RouteRiskLevel::High,
     ),
     admin(
         HttpMethod::Get,
@@ -1934,6 +2015,72 @@ mod tests {
     }
 
     #[test]
+    fn plugin_submit_route_is_registered_as_high_risk_authenticated_action() {
+        let path = "/rustfs/admin/v3/plugin-delegations/{id}/submit";
+        assert_action(HttpMethod::Post, path, SUBMIT_PLUGIN_JOB);
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == HttpMethod::Post && spec.path() == path)
+            .expect("submit route policy");
+        assert_eq!(spec.risk_level(), RouteRiskLevel::High);
+    }
+
+    #[test]
+    fn plugin_run_query_route_uses_dedicated_authenticated_action() {
+        let path = "/rustfs/admin/v3/plugin-delegations/{id}/runs/query";
+        assert_action(HttpMethod::Post, path, GET_PLUGIN_RUN);
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == HttpMethod::Post && spec.path() == path)
+            .expect("plugin run query route policy");
+        assert_eq!(spec.risk_level(), RouteRiskLevel::Sensitive);
+    }
+
+    #[test]
+    fn plugin_run_history_route_uses_list_action() {
+        let path = "/rustfs/admin/v3/plugin-delegations/{id}/runs/history";
+        assert_action(HttpMethod::Post, path, LIST_PLUGIN_RUNS);
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == HttpMethod::Post && spec.path() == path)
+            .expect("plugin run history route policy");
+        assert_eq!(spec.risk_level(), RouteRiskLevel::Sensitive);
+    }
+
+    #[test]
+    fn plugin_run_cancel_route_uses_dedicated_authenticated_action() {
+        let path = "/rustfs/admin/v3/plugin-delegations/{id}/runs/cancel";
+        assert_action(HttpMethod::Post, path, CANCEL_PLUGIN_RUN);
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == HttpMethod::Post && spec.path() == path)
+            .expect("plugin run cancel route policy");
+        assert_eq!(spec.risk_level(), RouteRiskLevel::Sensitive);
+    }
+
+    #[test]
+    fn plugin_run_page_route_uses_dedicated_authenticated_action() {
+        let path = "/rustfs/admin/v3/plugin-delegations/{id}/runs/page";
+        assert_action(HttpMethod::Post, path, LIST_PLUGIN_RUNS);
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == HttpMethod::Post && spec.path() == path)
+            .expect("plugin run page route policy");
+        assert_eq!(spec.risk_level(), RouteRiskLevel::Sensitive);
+    }
+
+    #[test]
+    fn plugin_run_replay_route_uses_dedicated_authenticated_action() {
+        let path = "/rustfs/admin/v3/plugin-delegations/{id}/runs/replay";
+        assert_action(HttpMethod::Post, path, REPLAY_PLUGIN_RUN);
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == HttpMethod::Post && spec.path() == path)
+            .expect("plugin run replay route policy");
+        assert_eq!(spec.risk_level(), RouteRiskLevel::Sensitive);
+    }
+
+    #[test]
     fn route_policy_inventory_has_no_internal_overlap() {
         let mut seen = BTreeSet::new();
 
@@ -2374,6 +2521,10 @@ mod tests {
 
     #[test]
     fn route_policy_uses_tier_actions_for_transition_routes() {
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/tier/{tier}/deletion-check", LIST_TIER);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/tier/{tier}/cleanup-retry", SET_TIER);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/tier/{tier}/deletion-check", SET_TIER);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/tier/{tier}/cleanup-retry", LIST_TIER);
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/recovery/records", LIST_TIER);
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/recovery/records/{control_id}", LIST_TIER);
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/recovery/records/{control_id}", SET_TIER);
