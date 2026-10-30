@@ -172,6 +172,7 @@ fn site_replicator_service_account_policy() -> S3Result<Policy> {
         "s3:PutObject",
         "s3:DeleteObject",
         "s3:DeleteObjectVersion",
+        "s3:ForceDeleteObject",
         "s3:ReplicateObject",
         "s3:ReplicateDelete",
         "s3:ReplicateTags",
@@ -192,6 +193,29 @@ fn site_replicator_service_account_policy() -> S3Result<Policy> {
 }"#,
     )
     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("parse site replicator policy failed: {e}")))
+}
+
+/// A replicated force-delete needs an explicit `s3:ForceDeleteObject` on the peer; `s3:*` does not grant it.
+/// Accounts created before the action was added to the policy lack it and must be refreshed in place.
+async fn site_replicator_policy_allows_force_delete(policy: Option<&Policy>) -> bool {
+    let Some(policy) = policy else {
+        return false;
+    };
+    let groups: Option<Vec<String>> = None;
+    let claims = HashMap::new();
+    let conditions = HashMap::new();
+    let args = rustfs_policy::policy::Args {
+        account: SITE_REPLICATOR_SERVICE_ACCOUNT,
+        groups: &groups,
+        action: Action::S3Action(rustfs_policy::policy::action::S3Action::ForceDeleteObjectAction),
+        conditions: &conditions,
+        is_owner: false,
+        claims: &claims,
+        deny_only: false,
+        bucket: "bucket",
+        object: "prefix/",
+    };
+    policy.is_allowed(&args).await
 }
 
 // Lock order: lifecycle -> bucket-mutation admission -> per-bucket mutation
@@ -1657,10 +1681,39 @@ async fn reconcile_site_replicator_service_account() -> S3Result<()> {
         Ok(_) => {
             // Never rebuild on an unread parent: `unwrap_or_default` here would compare an
             // empty string against a real parent and repair a healthy account on every boot.
-            let Ok((credentials, _)) = iam_sys.get_service_account(access_key).await else {
+            let Ok((credentials, stored_policy)) = iam_sys.get_service_account(access_key).await else {
                 return Ok(());
             };
             if credentials.parent_user == parent_user {
+                if site_replicator_policy_allows_force_delete(stored_policy.as_ref()).await {
+                    return Ok(());
+                }
+
+                iam_sys
+                    .update_service_account(
+                        access_key,
+                        UpdateServiceAccountOpts {
+                            session_policy: Some(session_policy),
+                            secret_key: None,
+                            name: None,
+                            description: None,
+                            expiration: None,
+                            status: None,
+                            parent_user: None,
+                            allow_site_replicator_account: true,
+                        },
+                    )
+                    .await
+                    .map_err(ApiError::from)?;
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    result = "service_account_repaired",
+                    reason = "outdated_policy",
+                    parent = %parent_user,
+                    "admin site replication state"
+                );
                 return Ok(());
             }
 
@@ -10659,6 +10712,31 @@ mod tests {
             ..operation_args
         };
         assert!(!policy.is_allowed(&put_policy_args).await);
+    }
+
+    // A replicated force-delete (Console folder delete, `x-rustfs-force-delete: true`) is rejected by the
+    // peer with AccessDenied unless the replication account names `s3:ForceDeleteObject` explicitly.
+    #[tokio::test]
+    async fn test_site_replicator_policy_allows_force_delete_replication() {
+        let policy = site_replicator_service_account_policy().expect("site replicator policy should parse");
+        assert!(site_replicator_policy_allows_force_delete(Some(&policy)).await);
+    }
+
+    // Accounts created before the action was added keep their stored policy until the reconciler refreshes it.
+    #[tokio::test]
+    async fn test_outdated_site_replicator_policy_is_not_treated_as_current() {
+        assert!(!site_replicator_policy_allows_force_delete(None).await);
+
+        let outdated: Policy = serde_json::from_value(serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion", "s3:ReplicateDelete", "s3:*"],
+                "Resource": ["arn:aws:s3:::*/*"]
+            }]
+        }))
+        .expect("outdated policy should parse");
+        assert!(!site_replicator_policy_allows_force_delete(Some(&outdated)).await);
     }
 
     // The replication service account must be able to carry object-lock metadata to the peer.
