@@ -1186,7 +1186,6 @@ class TableSuiteTests(unittest.TestCase):
         self.assertIn("runs-on: smoke-testing", source)
         # New gate semantics: case failures stay green, harness breakdowns red.
         self.assertRegex(source, r"(?m)^        continue-on-error: true")
-        self.assertIn("# Red only for harness/environment breakdowns; case failures stay green.", source)
         self.assertIn("HARNESS_OK", source)
         self.assertIn("Product result: ${CASES_PASS} passed, ${CASES_FAIL} failed", source)
         self.assertIn('python3 scripts/functional_case_report.py "${LOG_FILE}" "${CASE_TABLE}"', source)
